@@ -1,9 +1,35 @@
 #!/bin/bash
 set -euo pipefail
 
+# Get version from SGLang version.py file
+FALLBACK_SGLANG_VERSION="v0.4.10.post2"
+SGLANG_VERSION_FILE="$(dirname "$0")/../python/sglang/version.py"
+
+if [ -f "$SGLANG_VERSION_FILE" ]; then
+  SGLANG_VERSION=$(python3 -c '
+import re, sys
+with open(sys.argv[1], "r") as f:
+    content = f.read()
+    match = re.search(r"__version__\s*=\s*[\"'"'"'](.*?)[\"'"'"']", content)
+    if match:
+        print("v" + match.group(1))
+' "$SGLANG_VERSION_FILE")
+
+  if [ -z "$SGLANG_VERSION" ]; then
+      SGLANG_VERSION="$FALLBACK_SGLANG_VERSION"
+      echo "Warning: Could not parse version from $SGLANG_VERSION_FILE, using fallback version: $SGLANG_VERSION" >&2
+  fi
+else
+  # Fallback version if file is not found
+  SGLANG_VERSION="$FALLBACK_SGLANG_VERSION"
+  echo "Warning: version.py not found, using fallback version: $SGLANG_VERSION" >&2
+fi
+
+echo "Using SGLang version: $SGLANG_VERSION"
+
 # Default base tags (can be overridden by command line arguments)
-DEFAULT_MI30X_BASE_TAG="v0.4.9.post2-rocm630-mi30x"
-DEFAULT_MI35X_BASE_TAG="v0.4.9.post2-rocm700-mi35x"
+DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm630-mi30x"
+DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-rocm700-mi35x"
 
 # Parse command line arguments
 MI30X_BASE_TAG="$DEFAULT_MI30X_BASE_TAG"

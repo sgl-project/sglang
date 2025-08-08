@@ -332,6 +332,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
+            if self._get_enable_thinking_from_request(request):
+                prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 
         image_data = conv.image_data if conv.image_data else None
         video_data = conv.video_data if conv.video_data else None
@@ -838,9 +840,15 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_text = None
             reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
+                is_force_reasoning = (
+                    self.template_manager.force_reasoning
+                    or self._get_enable_thinking_from_request(request)
+                )
                 try:
                     parser = ReasoningParser(
-                        model_type=reasoning_parser, stream_reasoning=False
+                        model_type=reasoning_parser,
+                        stream_reasoning=False,
+                        force_reasoning=is_force_reasoning,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -1003,14 +1011,19 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> tuple[Optional[str], str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
+            is_force_reasoning = (
+                self.template_manager.force_reasoning
+                or self._get_enable_thinking_from_request(request)
+            )
             reasoning_parser_dict[index] = ReasoningParser(
                 self.tokenizer_manager.server_args.reasoning_parser,
                 request.stream_reasoning,
+                is_force_reasoning,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
-    def _get_enable_thinking_from_request(request: ChatCompletionRequest) -> bool:
+    def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
         """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
 
         NOTE: This parameter is only useful for models that support enable_thinking
@@ -1019,7 +1032,7 @@ class OpenAIServingChat(OpenAIServingBase):
         Args:
             request_obj: The request object (or an item from a list of requests).
         Returns:
-            The boolean value of 'enable_thinking' if found and not True, otherwise True.
+            The boolean value of 'enable_thinking' if found, otherwise False.
         """
         if (
             hasattr(request, "chat_template_kwargs")
@@ -1027,7 +1040,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.chat_template_kwargs.get("enable_thinking") is not None
         ):
             return request.chat_template_kwargs.get("enable_thinking")
-        return True
+        return False
 
     async def _process_tool_call_stream(
         self,
