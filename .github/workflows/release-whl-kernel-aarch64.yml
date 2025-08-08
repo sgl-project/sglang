@@ -22,7 +22,7 @@ jobs:
     runs-on: sgl-kernel-release-node-arm
     strategy:
       matrix:
-        python-version: ["3.9"]
+        python-version: ["3.10"]
         cuda-version: ["12.9"]
     steps:
       - uses: actions/checkout@v4
