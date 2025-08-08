@@ -50,11 +50,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import (
-    get_moe_impl_class,
-    should_use_flashinfer_trtllm_moe,
-)
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -162,10 +160,7 @@ class Glm4MoeMLP(nn.Module):
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            should_allreduce_fusion=should_allreduce_fusion,
-        )
+        x, _ = self.down_proj(x, skip_all_reduce=can_fuse_mlp_allreduce, should_allreduce_fusion=should_allreduce_fusion)
         return x
 
 
@@ -535,6 +530,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         self,
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
@@ -555,14 +551,22 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         current_stream.wait_stream(self.alt_stream)
 
         if self.ep_size > 1:
-            if self.tp_size > 1 and not should_allreduce_fusion:
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+            ):
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )
             final_hidden_states += shared_output
         else:
             final_hidden_states += shared_output
-            if self.tp_size > 1 and not should_allreduce_fusion:
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+            ):
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )
@@ -572,6 +576,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         self,
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -690,6 +695,7 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
         )
 
     def forward(
@@ -794,7 +800,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
         )
 
     def determine_num_fused_shared_experts(
-        self, architecture: str = "DeepseekV3ForCausalLM"
+        self, architecture: str = "Glm4MoeForCausalLM"
     ):
         self.num_fused_shared_experts = 0
         if global_server_args_dict["disable_shared_experts_fusion"]:
@@ -806,7 +812,6 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
             or self.config.architectures[0] != architecture
-            or self.config.n_routed_experts != 128
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Only GLM-4.5 on NV-platform with capability >= 80 can use shared experts fusion optimization."
