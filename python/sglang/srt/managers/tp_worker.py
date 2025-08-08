@@ -311,3 +311,6 @@ class TpModelWorker:
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
+
+    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
+        return self.model_runner.lora_manager.validate_lora_batch(lora_ids)
