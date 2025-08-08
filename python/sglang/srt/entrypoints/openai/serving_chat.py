@@ -244,6 +244,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.continue_final_message:
                 assistant_prefix = openai_compatible_messages[-1]["content"]
                 openai_compatible_messages = openai_compatible_messages[:-1]
+        # Handle thinking of zai requests
         if request.thinking:
             request.chat_template_kwargs = (
                 {} if not request.chat_template_kwargs else request.chat_template_kwargs
