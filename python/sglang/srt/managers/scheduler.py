@@ -79,6 +79,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MultiTokenizerRegisterReq,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -247,7 +248,6 @@ class Scheduler(
         # Init inter-process communication
         context = zmq.Context(2)
         self.idle_sleeper = None
-
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -522,6 +522,7 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
             ]
         )
 
@@ -618,6 +619,7 @@ class Scheduler(
                     ),
                     hicache_mem_layout=server_args.hicache_mem_layout,
                     hicache_storage_backend=server_args.hicache_storage_backend,
+                    hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -1063,6 +1065,8 @@ class Scheduler(
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
                 else:
+                    if recv_req.rids is not None:
+                        output.rids = recv_req.rids
                     self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
@@ -1569,7 +1573,10 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                self.tree_cache.check_prefetch_progress(req.rid)
+                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
+                    continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
@@ -2399,6 +2406,10 @@ class Scheduler(
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
+
+    def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
+        self.send_to_detokenizer.send_pyobj(recv_req)
+        return recv_req
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
