@@ -686,7 +686,7 @@ class TritonAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-        sk=None,
+        sinks=None,
     ):
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
@@ -731,7 +731,7 @@ class TritonAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
             sliding_window_size=sliding_window_size,
-            sk=sk,
+            sinks=sinks,
         )
         return o
 
@@ -743,7 +743,7 @@ class TritonAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-        sk=None,
+        sinks=None,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -780,7 +780,7 @@ class TritonAttnBackend(AttentionBackend):
             self.max_kv_splits,
             layer.scaling,
             layer.logit_cap,
-            sk=sk,
+            sinks=sinks,
         )
         return o
 

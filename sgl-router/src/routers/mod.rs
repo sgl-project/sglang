@@ -14,7 +14,6 @@ use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, Generate
 pub mod factory;
 pub mod pd_router;
 pub mod pd_types;
-pub mod request_adapter;
 pub mod router;
 
 pub use factory::RouterFactory;

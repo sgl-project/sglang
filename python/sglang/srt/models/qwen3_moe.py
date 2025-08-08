@@ -295,6 +295,7 @@ class Qwen3MoeAttention(nn.Module):
         attention_bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -353,6 +354,7 @@ class Qwen3MoeAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -458,6 +460,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
+        dual_chunk_attention_config = getattr(
+            config, "dual_chunk_attention_config", None
+        )
         self.self_attn = Qwen3MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -471,6 +476,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            dual_chunk_attention_config=dual_chunk_attention_config,
             alt_stream=alt_stream,
         )
 
@@ -766,7 +772,10 @@ class Qwen3MoeForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-        params_dict = dict(self.named_parameters())
+        # Cache params_dict to avoid repeated expensive traversal of model parameters
+        if not hasattr(self, "_cached_params_dict"):
+            self._cached_params_dict = dict(self.named_parameters())
+        params_dict = self._cached_params_dict
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (
@@ -805,11 +814,22 @@ class Qwen3MoeForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # Track if this is an expert weight to enable early skipping
+                is_expert_weight = False
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
+
+                    # Mark as expert weight regardless of whether we can process it
+                    is_expert_weight = True
+
                     name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        # Expert weight not on this rank, will be skipped below
+                        continue
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -821,6 +841,10 @@ class Qwen3MoeForCausalLM(nn.Module):
                     )
                     break
                 else:
+                    if is_expert_weight:
+                        # This is an expert weight but not mapped to this rank, skip all remaining processing
+                        continue
+
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
@@ -837,11 +861,13 @@ class Qwen3MoeForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
         # TODO mimic deepseek
-        self.routed_experts_weights_of_layer = {
-            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-            for layer_id in range(self.start_layer, self.end_layer)
-            if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
-        }
+        # Lazy initialization of expert weights cache to avoid slowing down load_weights
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
+            }
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
