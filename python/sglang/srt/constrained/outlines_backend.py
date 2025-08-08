@@ -155,7 +155,10 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
             return INVALID_GRAMMAR_OBJ
 
-        jump_forward_map = None
+        # Create jump-forward map for optimization
+        # This enables faster constrained generation by allowing the model
+        # to generate multiple tokens at once when they are deterministic
+        jump_forward_map = OutlinesJumpForwardMap(regex)
         return OutlinesGrammar(guide, jump_forward_map)
 
     def dispatch_ebnf(self, key_string: str):

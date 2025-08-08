@@ -55,7 +55,8 @@ def disk_cache(expire: Optional[float] = None, typed=False, ignore=()):
     if not DISABLE_DISK_CACHE:
         return cache(expire, typed, ignore)
     else:
-        return lambda fn: None
+        # Return a no-op decorator when caching is disabled
+        return lambda fn: fn
 
 
 @disk_cache()
@@ -141,7 +142,8 @@ def init_state_to_jump_forward(regex_string):
 
 class OutlinesJumpForwardMap:
     def __init__(self, regex_string):
-        self.state_to_jump_forward = init_state_to_jump_forward(regex_string)
+        # Handle None return from init_state_to_jump_forward for invalid regexes
+        self.state_to_jump_forward = init_state_to_jump_forward(regex_string) or {}
 
     def jump_forward_symbol(self, state):
         jump_forward_str = ""
