@@ -24,6 +24,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    log_info_on_rank0,
     next_power_of_2,
     round_up,
     set_weight_attrs,
@@ -34,7 +35,6 @@ has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 
 
 if is_flashinfer_available():
-    # from flashinfer.fused_moe import cutlass_fused_moe
     from flashinfer import (
         mxfp8_quantize,
         shuffle_matrix_a,
@@ -63,7 +63,7 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
         mx_axis=1, num_warps=num_warps
     )
-    if is_cuda() and torch.cuda.get_device_capability()[0] == 10:
+    if _is_sm100_supported:
         constraints = {
             "is_persistent": True,
             "epilogue_subtile": 1,
@@ -331,8 +331,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer):
         if self.use_flashinfer:
-            logger.info(
-                "Shuffling MoE weights for FlashInfer, it might take a while..."
+            log_info_on_rank0(
+                logger,
+                "Shuffling MoE weights for FlashInfer MXFP4 moe kernel, it might take a while...",
             )
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
