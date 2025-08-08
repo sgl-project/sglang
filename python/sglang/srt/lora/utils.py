@@ -96,12 +96,21 @@ def get_hidden_dim(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
 
-        # TODO: The current design requires qkv has different shape in lora A and lora B.
-        # This is fixed in a separate PR (8940).
-        if module_name in ["qkv_proj", "kv_proj"]:
+        # TODO: the special handling of qkv will be addressed in #8940.
+        if module_name == "qkv_proj":
             return (
                 config.hidden_size,
+                None,  # qkv_proj is only used in LoRA A
+            )
+        elif module_name == "kv_proj":
+            return (
+                None,  # kv_proj is only used in LoRA B
                 head_dim * config.num_key_value_heads,
+            )
+        elif module_name == "q_proj":
+            return (
+                None,  # q_proj is only used in LoRA B
+                head_dim * config.num_attention_heads,
             )
         elif module_name == "o_proj":
             return (
