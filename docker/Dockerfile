@@ -72,10 +72,10 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.2/sgl_kernel-0.3.2+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.3/sgl_kernel-0.3.3+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi \
  && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.2/sgl_kernel-0.3.2-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.3/sgl_kernel-0.3.3-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi
 
 # Build and install NVSHMEM + DeepEP
