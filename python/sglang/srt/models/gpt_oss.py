@@ -51,6 +51,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
@@ -915,7 +916,7 @@ class GptOssForCausalLM(nn.Module):
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping_fused(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping_fused(
             ckpt_gate_up_proj_name="gate_up_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
