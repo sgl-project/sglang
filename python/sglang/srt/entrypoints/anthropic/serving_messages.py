@@ -39,7 +39,6 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicUsage,
 )
 from sglang.srt.entrypoints.openai.protocol import MessageProcessingResult
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.jinja_template_utils import process_content_for_template_format
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -547,3 +546,36 @@ class AnthropicServingMessages(ABC):
                 err_type="InternalServerError",
                 status_code=500,
             )
+
+    def create_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+        param: Optional[str] = None,
+    ) -> ORJSONResponse:
+        """Create an error response"""
+        # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
+        error = AnthropicErrorResponse(
+            type="error",
+            error=AnthropicError(
+                type=err_type,
+                message=message
+            )
+        )
+        return ORJSONResponse(content=error.model_dump(), status_code=status_code)
+
+    def create_streaming_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+    ) -> str:
+        """Create a streaming error response"""
+        error = AnthropicErrorResponse(
+            type="error",
+            error=AnthropicError(
+                type=err_type,
+                message=message
+            )
+        )
+        return json.dumps({"error": error.model_dump()})
