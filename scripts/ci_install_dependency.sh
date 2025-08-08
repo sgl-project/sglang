@@ -51,6 +51,9 @@ if [ "$MODE_BLACKWELL" != "1" ]; then
     pip install -e lmms-eval/ --break-system-packages
 fi
 
+# For lm_eval evaluating NeedleInAHaystack
+pip install 'lm-eval[longtxt,api,ruler]'
+
 # Install FlashMLA for attention backend tests
 # pip install git+https://github.com/deepseek-ai/FlashMLA.git --break-system-packages
 
