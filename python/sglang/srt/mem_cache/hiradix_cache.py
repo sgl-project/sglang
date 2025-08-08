@@ -470,7 +470,7 @@ class HiRadixCache(RadixCache):
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
             req_id
         ]
-        
+
         if operation.host_indices is None:
             # prefetch has not been issued due to insufficient host memory
             return True
