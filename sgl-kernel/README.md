@@ -188,7 +188,6 @@ Steps to add a new kernel:
         cos_sin_cache=cos_sin_cache,
         pos_ids=positions.long(),
         interleave=(not is_neox),
-        cuda_stream=get_cuda_stream(),
     )
     ```
 
@@ -203,7 +202,6 @@ Steps to add a new kernel:
         cos_sin_cache,
         positions.long(),
         (not is_neox),
-        get_cuda_stream(),
     )
     ```
 
