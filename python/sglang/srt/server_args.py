@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     is_hip,
     is_port_available,
     is_remote_url,
+    is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
 )
@@ -492,10 +493,15 @@ class ServerArgs:
                     "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                 )
             else:
-                self.enable_triton_kernel_moe = True
-                logger.info(
-                    "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
-                )
+                if self.enable_triton_kernel_moe:
+                    assert (
+                        self.ep_size == 1
+                    ), "Triton kernel MoE is only supported when ep_size == 1"
+                if not self.enable_triton_kernel_moe and self.ep_size == 1:
+                    self.enable_triton_kernel_moe = True
+                    logger.info(
+                        "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
+                    )
 
             self.disable_hybrid_swa_memory = True
 
