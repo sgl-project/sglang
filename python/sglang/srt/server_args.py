@@ -1360,6 +1360,7 @@ class ServerArgs:
                 "trtllm_mla",
                 "trtllm_mha",
                 "dual_chunk_flash_attn",
+                "wave",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",

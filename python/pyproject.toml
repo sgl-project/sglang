@@ -83,6 +83,7 @@ srt_hip = [
     "sglang[runtime_common]",
     "torch",
     "petit_kernel==0.0.2",
+    "wave-lang==1.0.1",
 ]
 
 # xpu is not enabled in public vllm and torch whl,
