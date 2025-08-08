@@ -79,7 +79,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
-    MultiTokenizerRegisterReq,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -248,6 +247,7 @@ class Scheduler(
         # Init inter-process communication
         context = zmq.Context(2)
         self.idle_sleeper = None
+
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -473,6 +473,7 @@ class Scheduler(
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
+        self.offload_tags = set()
         self.init_profier()
 
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
@@ -522,7 +523,6 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
             ]
         )
 
@@ -1041,7 +1041,9 @@ class Scheduler(
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
-                self.chunked_req is not None or not self.running_batch.is_empty()
+                self.chunked_req is not None
+                or not self.running_batch.is_empty()
+                or len(self.offload_tags) > 0
             ):
                 self.return_health_check_ct += 1
                 continue
@@ -1065,8 +1067,6 @@ class Scheduler(
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
                 else:
-                    if recv_req.rids is not None:
-                        output.rids = recv_req.rids
                     self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
@@ -2406,10 +2406,6 @@ class Scheduler(
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
-
-    def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
-        self.send_to_detokenizer.send_pyobj(recv_req)
-        return recv_req
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
