@@ -199,7 +199,7 @@ class FusedMoE(torch.nn.Module):
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
-                self.use_triton_kernels, with_bias=with_bias
+                self.use_triton_kernels
             )
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
@@ -809,7 +809,9 @@ class FusedMoE(torch.nn.Module):
                 # If we are in EP mode, we need to move the expert map to GPU.
                 self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
-        if self.expert_map_gpu is not None:
+        if self.expert_map_gpu is not None and isinstance(
+            topk_output, StandardTopKOutput
+        ):
             topk_output = topk_output._replace(
                 topk_ids=self.expert_map_gpu[topk_output.topk_ids]
             )

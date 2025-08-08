@@ -2961,3 +2961,8 @@ class ConcurrentCounter:
         other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
         """
         self.wait_for(lambda count: count == 0)
+
+
+@lru_cache(maxsize=1)
+def is_triton_kernels_available() -> bool:
+    return importlib.util.find_spec("triton_kernels") is not None
