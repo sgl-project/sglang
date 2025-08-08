@@ -2085,7 +2085,7 @@ class ServerArgs:
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
-        # -1 means disabled, skip validation in this case
+        # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         if self.chunked_prefill_size > 0:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
