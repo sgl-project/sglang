@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install GitHub CLI
-        run: sudo apt-get install -y gh jq
+        run: apt-get install -y gh jq
 
       - name: Authenticate GitHub CLI
         env:
