@@ -477,6 +477,7 @@ class FusedMoE(torch.nn.Module):
             not expert_id
             and self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
+            and self.quant_config.is_static_cfg()
         ):
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
@@ -729,7 +730,11 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         tp_rank = self.moe_tp_rank
 
-        if self.quant_config is not None and self.quant_config.get_name() == "mxfp4":
+        if (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "mxfp4"
+            and self.quant_config.is_static_cfg()
+        ):
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)

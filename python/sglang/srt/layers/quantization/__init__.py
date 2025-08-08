@@ -48,12 +48,6 @@ from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from sglang.srt.utils import is_cuda, is_hip, mxfp_supported
-
-is_mxfp_supported = mxfp_supported()
-if is_mxfp_supported:
-    from sglang.srt.layers.quantization.fp4 import MxFp4Config
-
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,
@@ -74,6 +68,9 @@ from sglang.srt.layers.quantization.utils import get_linear_quant_method
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+from sglang.srt.utils import is_cuda, is_hip, mxfp_supported
+
+_is_mxfp_supported = mxfp_supported()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -101,11 +98,11 @@ if is_cuda():
             "mxfp4": Mxfp4Config,
         }
     )
-elif is_mxfp_supported and is_hip():
+elif _is_mxfp_supported and is_hip():
     BASE_QUANTIZATION_METHODS.update(
         {
-            "quark": MxFp4Config,
-            "mxfp4": MxFp4Config,
+            "quark": Mxfp4Config,
+            "mxfp4": Mxfp4Config,
         }
     )
 # VLLM-dependent quantization methods

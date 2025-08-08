@@ -7,6 +7,7 @@ import importlib.util
 import logging
 from typing import TYPE_CHECKING, List, Optional
 
+import aiter
 import torch
 import triton.language as tl
 from torch.nn.parameter import Parameter
@@ -30,6 +31,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     round_up,
     set_weight_attrs,
+    mxfp_supported,
 )
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
@@ -48,6 +50,14 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
+
+_is_hip = is_hip()
+
+if _is_hip:
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.fused_moe import fused_moe
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    from aiter.utility.fp4_utils import e8m0_shuffle
 
 OCP_MX_BLOCK_SIZE = 32
 
@@ -150,12 +160,30 @@ except AttributeError as error:
 
 class Mxfp4Config(QuantizationConfig):
 
-    def __init__(self, ignored_layers: Optional[list[str]] = None):
+    def __init__(
+        self,
+        ignored_layers: Optional[list[str]] = None,
+        is_checkpoint_mxfp4_serialized: bool = False,
+    ):
         super().__init__()
+        self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
 
     @classmethod
     def from_config(cls, config):
+        if _is_hip:
+            if mxfp_supported():
+                quant_method = cls.get_from_keys(config, ["quant_method"])
+                is_checkpoint_mxfp4_serialized = True if quant_method else False
+                return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
+
+            else:
+
+                platform = torch.cuda.get_device_properties(0).gcnArchName
+                raise ValueError(
+                    f"Current platform {platform} not support mxfp4 computation"
+                )
+
         return cls()
 
     @classmethod
@@ -174,6 +202,9 @@ class Mxfp4Config(QuantizationConfig):
     def get_config_filenames(cls) -> list[str]:
         return []
 
+    def is_static_cfg(self):
+        return self.is_checkpoint_mxfp4_serialized
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
@@ -189,15 +220,27 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
+            else:
+                return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
-            return Mxfp4MoEMethod(prefix)
+            if self.is_checkpoint_mxfp4_serialized:
+                use_flashinfer = global_server_args_dict.get(
+                    "enable_flashinfer_mxfp4_moe", False
+                )
+                return Mxfp4MoEMethod(
+                    use_triton_kernels=True,
+                    with_bias=True,
+                    use_flashinfer=use_flashinfer,
+                )
+            else:
+                return Mxfp4DynamicQuantMoEMethod()
         else:
-            raise NotImplementedError("Mxfp4 attention layer is not implemented")
+            if self.is_checkpoint_mxfp4_serialized:
+                raise NotImplementedError("Mxfp4 attention layer is not implemented")
         return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
-
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
@@ -649,3 +692,122 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 activation_alpha=activation_alpha,
                 swiglu_limit=swiglu_limit,
             )
+
+class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # Allocate 2 scales for w1 and w3 respectively.
+        # They will be combined to a single scale after weight loading.
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+        )
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        # Add the quantization method used (per tensor/grouped/channel)
+        # to ensure the weight scales are loaded in properly
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+        )
+
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+    def mxfp4_quantize(self, w):
+        w_shape = w.shape
+        w_need_reshape = True if w.dim() != 2 else False
+
+        if w_need_reshape:
+            w_last_dim_size = w_shape[-1]
+            w = w.view(-1, w_last_dim_size)
+
+        # log_info_on_rank0(logger, f"[Pre-quant] w.shape: {w.shape}")
+        w, mx_scales = dynamic_mxfp4_quant(w)
+        # log_info_on_rank0(logger, f"[Post-quant] w.shape: {w.shape} mx_scales.shape: {mx_scales.shape}")
+
+        if w_need_reshape:
+            w_new_shape = w_shape[:-1] + (w.shape[-1],)
+            w = w.view(w_new_shape)
+
+        # log_info_on_rank0(logger, f"[re-shape] w.shape: {w.shape} mx_scales.shape: {mx_scales.shape}")
+
+        mx_scales = e8m0_shuffle(mx_scales)
+
+        return w, mx_scales
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        w13, w13_mx_scales = self.mxfp4_quantize(layer.w13_weight.data)
+        w2, w2_mx_scales = self.mxfp4_quantize(layer.w2_weight.data)
+
+        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(w13_mx_scales, requires_grad=False)
+
+        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(w2_mx_scales, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_output: TopKOutput,
+        *,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        topk_weights, topk_ids, _ = topk_output
+
+        return fused_moe(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            quant_type=QuantType.per_1x32,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            activation=(
+                ActivationType.Silu if activation == "silu" else ActivationType.Gelu
+            ),
+            doweight_stage1=False,
+        )
