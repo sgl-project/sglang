@@ -147,6 +147,7 @@ impl Router {
             max_concurrent_requests: self.max_concurrent_requests,
             cors_allowed_origins: self.cors_allowed_origins.clone(),
             retry: config::RetryConfig::default(),
+            circuit_breaker: config::CircuitBreakerConfig::default(),
         })
     }
 }
