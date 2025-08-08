@@ -39,6 +39,13 @@ docker run --rm \
    # Install CMake (version >= 3.26) - Robust Installation
    export CMAKE_VERSION_MAJOR=3.31
    export CMAKE_VERSION_MINOR=1
+   # Setting these flags to reduce OOM chance only on ARM
+   if [ \"${ARCH}\" = \"aarch64\" ]; then
+      export CUDA_NVCC_FLAGS=\"-Xcudafe --threads=2\"
+      export MAKEFLAGS='-j2'
+      export CMAKE_BUILD_PARALLEL_LEVEL=2
+      export NINJAFLAGS='-j2'
+   fi
    echo \"Downloading CMake from: https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz\"
    wget https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz
    tar -xzf cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz
