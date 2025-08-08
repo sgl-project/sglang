@@ -28,9 +28,8 @@ spec:
           - --enable-dp-lm-head
           - --dp-size
           - "16"
-          - --enable-deepep-moe
-          - --deepep-mode
-          - low_latency
+          - --moe-a2a-backend
+          - deepep
           - --disaggregation-mode
           - decode
           - --mem-fraction-static
@@ -166,9 +165,8 @@ spec:
           - --enable-dp-lm-head
           - --dp-size
           - "16"
-          - --enable-deepep-moe
-          - --deepep-mode
-          - low_latency
+          - --moe-a2a-backend
+          - deepep
           - --disaggregation-mode
           - decode
           - --mem-fraction-static

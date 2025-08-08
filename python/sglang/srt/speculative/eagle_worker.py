@@ -73,6 +73,7 @@ class EAGLEWorker(TpModelWorker):
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        moe_ep_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -127,6 +128,7 @@ class EAGLEWorker(TpModelWorker):
                 tp_rank=tp_rank,
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
+                moe_ep_rank=moe_ep_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,

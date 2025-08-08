@@ -47,9 +47,9 @@ class Phi4MMProcessorAdapter(ProcessorMixin):
 class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
     models = [Phi4MMForCausalLM]
 
-    def __init__(self, hf_config, server_args, _processor):
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.processor = Phi4MMProcessorAdapter(_processor)
-        super().__init__(hf_config, server_args, self.processor)
+        super().__init__(hf_config, server_args, self.processor, *args, **kwargs)
 
         # the following CONSTANTS come from hugging-face microsoft/Phi-4-multimodal-instruct's processing_phi4mm.py file
         # ref: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py

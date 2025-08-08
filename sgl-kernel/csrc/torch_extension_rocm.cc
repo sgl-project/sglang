@@ -20,6 +20,20 @@ limitations under the License.
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
+   * From csrc/activation
+   */
+  m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
+  m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
+
+  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
+  m.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
+
+  m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
+  m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
+
+  m.def("gelu_quick(Tensor! out, Tensor input) -> ()");
+  m.impl("gelu_quick", torch::kCUDA, &gelu_quick);
+  /*
    * From csrc/allreduce
    */
   m.def(
@@ -78,7 +92,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    */
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
-      "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer, bool "
+      "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
       "pad_sorted_token_ids) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
