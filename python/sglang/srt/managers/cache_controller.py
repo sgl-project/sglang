@@ -243,12 +243,12 @@ class HiCacheController:
                 self.storage_backend = HiCacheFile()
                 self.get_hash_str = get_hash_str
             elif storage_backend == "nixl":
-                from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
+                from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 
                 self.storage_backend = HiCacheNixl()
                 self.get_hash_str = get_hash_str
             elif storage_backend == "mooncake":
-                from sglang.srt.mem_cache.mooncake_store.mooncake_store import (
+                from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                     MooncakeStore,
                     get_hash_str_mooncake,
                 )

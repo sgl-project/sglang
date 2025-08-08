@@ -14,13 +14,9 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_masked_post_quant_fwd,
     tma_align_input_scale,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import (
-    FlashInferFusedMoE,
-    FusedMoE,
-    should_use_flashinfer_trtllm_moe,
-)
+from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.layers.moe.utils import DeepEPMode, should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import (
@@ -48,7 +44,6 @@ _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-
 if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
 
@@ -58,6 +53,22 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
 logger = logging.getLogger(__name__)
+
+
+# TODO(kaixih@nvidia): ideally we should merge this logic into
+# `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
+@torch.compile
+def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
+    temp = x.to(torch.float32).view(torch.int32)
+    exp = torch.bitwise_right_shift(temp, 23)
+    mant = torch.bitwise_and(temp, 0x7FFFFF)
+    is_ru = torch.logical_and(
+        torch.logical_and((mant > 0), (exp != 0xFE)),
+        ~torch.logical_and((exp == 0), (mant <= 0x400000)),
+    )
+    exp = torch.where(is_ru, exp + 1, exp)
+    new_x = exp.to(torch.uint8).view(torch.int)
+    return new_x.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 class EPMoE(FusedMoE):
@@ -81,6 +92,9 @@ class EPMoE(FusedMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
+        activation_alpha: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
+        with_bias: bool = False,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -96,6 +110,9 @@ class EPMoE(FusedMoE):
             activation=activation,
             # apply_router_weight_on_input=apply_router_weight_on_input,
             routed_scaling_factor=routed_scaling_factor,
+            activation_alpha=activation_alpha,
+            swiglu_limit=swiglu_limit,
+            with_bias=with_bias,
         )
 
         self.start_expert_id = self.moe_ep_rank * self.num_local_experts
@@ -203,10 +220,22 @@ class EPMoE(FusedMoE):
 
         dispose_tensor(hidden_states)
 
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            b, s_mn, s_k = gateup_input_scale.shape
+            assert (
+                s_mn % 4 == 0 and s_k % 4 == 0
+            ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
+
         # GroupGemm-0
         gateup_input_fp8 = (
             gateup_input,
-            deep_gemm_wrapper.get_col_major_tma_aligned_tensor(gateup_input_scale),
+            (
+                _cast_to_e8m0_with_rounding_up(gateup_input_scale)
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
+                    gateup_input_scale
+                )
+            ),
         )
         num_groups, m, k = gateup_input_fp8[0].size()
         n = self.w13_weight.size(1)
@@ -214,7 +243,12 @@ class EPMoE(FusedMoE):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            gateup_input_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
+            gateup_input_fp8,
+            self.w13_weight_fp8,
+            gateup_output,
+            masked_m,
+            expected_m,
+            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
         del gateup_input
         del gateup_input_fp8
@@ -245,6 +279,7 @@ class EPMoE(FusedMoE):
             down_input_scale,
             scale_block_size,
             masked_m,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         del gateup_output
 
@@ -252,13 +287,24 @@ class EPMoE(FusedMoE):
         n = self.w2_weight.size(1)
         down_input_fp8 = (
             down_input,
-            deep_gemm_wrapper.get_col_major_tma_aligned_tensor(down_input_scale),
+            (
+                down_input_scale
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
+                    down_input_scale
+                )
+            ),
         )
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
+            down_input_fp8,
+            self.w2_weight_fp8,
+            down_output,
+            masked_m,
+            expected_m,
+            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
         del down_input
         del down_input_fp8
@@ -678,71 +724,29 @@ class DeepEPMoE(EPMoE):
         return down_output
 
 
-class FlashInferEPMoE(EPMoE):
-    def __init__(self, *args, **kwargs):
-        renormalize = kwargs.pop("renormalize", True)
-        num_fused_shared_experts = kwargs.pop("num_fused_shared_experts", 0)
-        use_grouped_topk = kwargs.pop("use_grouped_topk", False)
-        num_expert_group = kwargs.pop("num_expert_group", None)
-        topk_group = kwargs.pop("topk_group", None)
-        correction_bias = kwargs.pop("correction_bias", None)
-        super().__init__(*args, **kwargs)
-        self.renormalize = renormalize
-        self.num_fused_shared_experts = num_fused_shared_experts
-        self.use_grouped_topk = use_grouped_topk
-        if self.use_grouped_topk:
-            assert num_expert_group is not None and topk_group is not None
-        self.num_expert_group = num_expert_group
-        self.topk_group = topk_group
-        self.correction_bias = correction_bias
-        self.use_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
-
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        assert self.use_flashinfer_trtllm_moe
-        assert (
-            self.activation == "silu"
-        ), "Only silu is supported for flashinfer blockscale fp8 moe"
-        assert (
-            self.renormalize
-        ), "Renormalize is required for flashinfer blockscale fp8 moe"
-        assert (
-            self.num_fused_shared_experts == 0
-        ), "Fused shared experts are not supported for flashinfer blockscale fp8 moe"
-        a_q, a_sf = sglang_per_token_group_quant_fp8(hidden_states, self.block_shape[1])
-        # NOTE: scales of hidden states have to be transposed!
-        a_sf_t = a_sf.t().contiguous()
-        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
-
-        return trtllm_fp8_block_scale_moe(
-            routing_logits=router_logits.to(torch.float32),
-            routing_bias=self.correction_bias.to(hidden_states.dtype),
-            hidden_states=a_q,
-            hidden_states_scale=a_sf_t,
-            gemm1_weights=self.w13_weight,
-            gemm1_weights_scale=self.w13_weight_scale_inv,
-            gemm2_weights=self.w2_weight,
-            gemm2_weights_scale=self.w2_weight_scale_inv,
-            num_experts=self.num_experts,
-            top_k=self.top_k,
-            n_group=self.num_expert_group,
-            topk_group=self.topk_group,
-            intermediate_size=self.w2_weight.shape[2],
-            local_expert_offset=self.start_expert_id,
-            local_num_experts=self.num_local_experts,
-            routed_scaling_factor=self.routed_scaling_factor,
-            tile_tokens_dim=get_tile_tokens_dim(
-                hidden_states.shape[0], self.top_k, self.num_experts
-            ),
-            routing_method_type=2,  # DeepSeek-styled routing method
-            use_shuffled_weight=False,
-        )
-
-
 def get_moe_impl_class():
     if global_server_args_dict["moe_a2a_backend"].is_deepep():
         return DeepEPMoE
+
+    # NEW: Direct FP4 detection (bypasses EP requirements)
+    # Check for FP4 quantization with TRTLLM flag, regardless of EP
+    if global_server_args_dict.get("enable_flashinfer_trtllm_moe", False):
+        try:
+            # Check the quantization argument directly
+            quantization = global_server_args_dict.get("quantization")
+            if quantization == "modelopt_fp4":
+                from sglang.srt.layers.moe.fused_moe_triton.layer import (
+                    FlashInferFP4MoE,
+                )
+
+                return FlashInferFP4MoE
+        except:
+            pass
+
+    if should_use_flashinfer_trtllm_moe():
+        return FlashInferFusedMoE
     if global_server_args_dict["enable_flashinfer_cutlass_moe"]:
         return FusedMoE
     if get_moe_expert_parallel_world_size() > 1:
-        return FlashInferEPMoE if should_use_flashinfer_trtllm_moe() else EPMoE
-    return FlashInferFusedMoE if should_use_flashinfer_trtllm_moe() else FusedMoE
+        return EPMoE
+    return FusedMoE

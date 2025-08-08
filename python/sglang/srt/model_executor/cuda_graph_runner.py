@@ -576,11 +576,11 @@ class CudaGraphRunner:
             )
 
         if self.model_runner.server_args.enable_lora:
-            # It is safe to capture CUDA graph using empty LoRA path, as the LoRA kernels will always be launched whenever
-            # `--enable-lora` is set to True (and return immediately if the LoRA path is empty for perf optimization).
-            lora_paths = [None] * bs
+            # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
+            # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
+            lora_ids = [None] * bs
         else:
-            lora_paths = None
+            lora_ids = None
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -589,6 +589,7 @@ class CudaGraphRunner:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=seq_lens,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
@@ -607,11 +608,11 @@ class CudaGraphRunner:
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
-            lora_paths=lora_paths,
+            lora_ids=lora_ids,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
-        if lora_paths is not None:
+        if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
