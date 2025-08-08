@@ -85,7 +85,7 @@ class TestTemplateContentFormatDetection(CustomTestCase):
 
         # Check that image_data was extracted
         self.assertEqual(len(image_data), 1)
-        self.assertEqual(image_data[0], "http://example.com/image.jpg")
+        self.assertEqual(image_data[0].url, "http://example.com/image.jpg")
 
         # Check that content was normalized
         expected_content = [

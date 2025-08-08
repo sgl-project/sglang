@@ -149,6 +149,7 @@ class ServerArgs:
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
     lora_paths: Optional[Union[dict[str, str], dict[str, LoRARef], List[str]]] = None
+    max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
 
@@ -228,6 +229,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
+    tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
@@ -246,6 +248,7 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
+    enable_flashinfer_mxfp4_moe: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -271,6 +274,9 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     sm_group_num: int = 3
+
+    # For tool server
+    tool_server: Optional[str] = None
 
     # Deprecated arguments
     enable_ep_moe: bool = False
@@ -440,6 +446,70 @@ class ServerArgs:
                     "trtllm_mla backend does not support speculative decoding yet."
                 )
 
+        if (
+            self.attention_backend == "trtllm_mha"
+            or self.decode_attention_backend == "trtllm_mha"
+            or self.prefill_attention_backend == "trtllm_mha"
+        ):
+            if not is_sm100_supported():
+                raise ValueError(
+                    "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+                )
+
+            if self.page_size not in [16, 32, 64]:
+                logger.warning(
+                    f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "trtllm_mha backend does not support speculative decoding yet."
+                )
+
+        model_arch = self.get_hf_config().architectures[0]
+        if model_arch in ["GptOssForCausalLM"]:
+            if self.attention_backend is None:
+                # default is triton, but we could have trtllm_mha as an option
+                self.attention_backend = "triton"
+            assert (
+                self.attention_backend == "trtllm_mha"
+                or self.attention_backend == "triton"
+            )
+            quantization_config = getattr(
+                self.get_hf_config(), "quantization_config", None
+            )
+            is_mxfp4_quant_format = (
+                quantization_config is not None
+                and quantization_config.get("quant_method") == "mxfp4"
+            )
+
+            if is_sm100_supported() and is_mxfp4_quant_format:
+                self.enable_flashinfer_mxfp4_moe = True
+                self.enable_triton_kernel_moe = False
+            else:
+                self.enable_triton_kernel_moe = True
+
+            self.disable_hybrid_swa_memory = True
+
+            if is_mxfp4_quant_format:
+                # use bf16 for mxfp4 triton kernels
+                self.dtype = "bfloat16"
+
+        if self.attention_backend == "dual_chunk_flash_attn":
+            logger.warning(
+                "Mixed chunk is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Radix cache is disabled because of using dual chunk flash attention backend"
+            )
+            logger.warning(
+                "Cuda graph is disabled because of using dual chunk flash attention backend"
+            )
+            self.enable_mixed_chunk = False
+            self.disable_cuda_graph = True
+            self.disable_radix_cache = True
+
         # Set page size
         if self.page_size is None:
             self.page_size = 1
@@ -479,6 +549,13 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+
+        if self.enable_flashinfer_trtllm_moe:
+            if not self.disable_shared_experts_fusion:
+                self.disable_shared_experts_fusion = True
+                logger.warning(
+                    "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+                )
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -805,6 +882,7 @@ class ServerArgs:
                 "moe_wna16",
                 "qoq",
                 "w4afp8",
+                "mxfp4",
             ],
             help="The quantization method.",
         )
@@ -867,7 +945,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -1170,6 +1248,7 @@ class ServerArgs:
             choices=[
                 "round_robin",
                 "shortest_queue",
+                "minimum_tokens",
             ],
         )
 
@@ -1238,6 +1317,12 @@ class ServerArgs:
             help="Maximum number of adapters for a running batch, include base-only request.",
         )
         parser.add_argument(
+            "--max-loaded-loras",
+            type=int,
+            default=ServerArgs.max_loaded_loras,
+            help="If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
+        )
+        parser.add_argument(
             "--lora-backend",
             type=str,
             default="triton",
@@ -1259,6 +1344,8 @@ class ServerArgs:
                 "ascend",
                 "triton",
                 "trtllm_mla",
+                "trtllm_mha",
+                "dual_chunk_flash_attn",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
@@ -1651,6 +1738,12 @@ class ServerArgs:
             help="Enabling two micro batches to overlap.",
         )
         parser.add_argument(
+            "--tbo-token-distribution-threshold",
+            type=float,
+            default=ServerArgs.tbo_token_distribution_threshold,
+            help="The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
+        )
+        parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
@@ -1746,6 +1839,11 @@ class ServerArgs:
             "--enable-triton-kernel-moe",
             action="store_true",
             help="Use triton moe grouped gemm kernel.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-mxfp4-moe",
+            action="store_true",
+            help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
         )
 
         # Debug tensor dumps
@@ -1860,6 +1958,14 @@ class ServerArgs:
             help="Disable mmap while loading weight using safetensors.",
         )
 
+        # For tool server
+        parser.add_argument(
+            "--tool-server",
+            type=str,
+            default=None,
+            help="Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",
+        )
+
         # Deprecated arguments
         parser.add_argument(
             "--enable-ep-moe",
@@ -1928,10 +2034,18 @@ class ServerArgs:
         if "Llama4" in model_arch:
             assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
 
-        if "Gemma2ForCausalLM" in model_arch:
+        if model_arch in [
+            "Gemma2ForCausalLM",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma3nForCausalLM",
+            "Gemma3nForConditionalGeneration",
+        ]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
             # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
-            logger.warning("Disable hybrid SWA memory for Gemma2ForCausalLM.")
+            logger.warning(
+                f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
+            )
             self.disable_hybrid_swa_memory = True
 
         # Check LoRA
@@ -1969,21 +2083,23 @@ class ServerArgs:
 
         if self.enable_lora:
             # Normalize lora_paths to a dictionary if it is a list.
+            # TODO (lifuhuang): support specifying pinned adapters in server_args.
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
                 self.lora_paths = {}
                 for lora_path in lora_paths:
                     if "=" in lora_path:
                         name, path = lora_path.split("=", 1)
-                        self.lora_paths[name] = LoRARef(lora_name=name, lora_path=path)
+                        self.lora_paths[name] = LoRARef(
+                            lora_name=name, lora_path=path, pinned=False
+                        )
                     else:
                         self.lora_paths[lora_path] = LoRARef(
-                            lora_name=lora_path,
-                            lora_path=lora_path,
+                            lora_name=lora_path, lora_path=lora_path, pinned=False
                         )
             elif isinstance(self.lora_paths, dict):
                 self.lora_paths = {
-                    k: LoRARef(lora_name=k, lora_path=v)
+                    k: LoRARef(lora_name=k, lora_path=v, pinned=False)
                     for k, v in self.lora_paths.items()
                 }
             elif self.lora_paths is None:
@@ -2007,6 +2123,19 @@ class ServerArgs:
             assert self.lora_paths or (
                 self.max_lora_rank and self.lora_target_modules
             ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+
+            # Validate max_loaded_loras
+            if self.max_loaded_loras is not None:
+                assert self.max_loaded_loras >= self.max_loras_per_batch, (
+                    "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
+                    f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
+                )
+                assert (
+                    not self.lora_paths or len(self.lora_paths) <= self.max_loaded_loras
+                ), (
+                    "The number of LoRA paths should not exceed max_loaded_loras. "
+                    f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
+                )
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
