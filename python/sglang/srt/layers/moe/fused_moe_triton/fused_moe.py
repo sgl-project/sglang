@@ -536,9 +536,7 @@ def fused_moe_kernel(
     if use_int8_w8a16:
         accumulator *= b_scale
     elif use_fp8_w8a8 or use_int8_w8a8:
-        if group_k > 0 and group_n > 0:
-            pass
-        else:
+        if group_k == 0 or group_n == 0:
             accumulator *= a_scale * b_scale
 
     if bias_ptr is not None:

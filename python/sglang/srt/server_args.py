@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     is_hip,
     is_port_available,
     is_remote_url,
+    is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
 )
@@ -481,8 +482,13 @@ class ServerArgs:
                 self.enable_flashinfer_mxfp4_moe = True
                 self.enable_triton_kernel_moe = False
             else:
-                # self.enable_triton_kernel_moe = True
-                self.enable_triton_kernel_moe = False
+                if self.enable_triton_kernel_moe:
+                    assert (
+                        self.ep_size == 1
+                    ), "Triton kernel MoE is only supported when ep_size == 1"
+                if not self.enable_triton_kernel_moe and self.ep_size == 1:
+                    self.enable_triton_kernel_moe = True
+                    logger.warning("Triton kernel MoE is enabled")
 
             self.disable_hybrid_swa_memory = True
 

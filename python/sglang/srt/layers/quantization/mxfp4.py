@@ -25,13 +25,14 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_triton_kernels_available,
     next_power_of_2,
     round_up,
     set_weight_attrs,
 )
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
-has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
+has_triton_kernels = is_triton_kernels_available()
 
 
 if is_flashinfer_available():

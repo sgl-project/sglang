@@ -483,9 +483,6 @@ class FusedMoE(torch.nn.Module):
             else:
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
-                print(
-                    f"param.data.shape: {param.data.shape}, loaded_weight.shape: {loaded_weight.shape}"
-                )
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
