@@ -199,7 +199,7 @@ class FusedMoE(torch.nn.Module):
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
-                self.use_triton_kernels, with_bias=with_bias
+                self.use_triton_kernels
             )
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)

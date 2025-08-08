@@ -481,7 +481,8 @@ class ServerArgs:
                 self.enable_flashinfer_mxfp4_moe = True
                 self.enable_triton_kernel_moe = False
             else:
-                self.enable_triton_kernel_moe = True
+                # self.enable_triton_kernel_moe = True
+                self.enable_triton_kernel_moe = False
 
             self.disable_hybrid_swa_memory = True
 

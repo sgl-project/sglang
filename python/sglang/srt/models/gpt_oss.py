@@ -910,27 +910,12 @@ class GptOssForCausalLM(nn.Module):
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
-
-        if self.quant_config is not None and (self.quant_config.get_name() == "mxfp4"):
-            expert_params_mapping = (
-                get_moe_impl_class().make_expert_params_mapping_fused_mxfp4(
-                    ckpt_gate_up_proj_name="gate_up_proj_blocks",
-                    ckpt_down_proj_name="down_proj_blocks",
-                    ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
-                    ckpt_down_proj_bias_name="down_proj_bias",
-                    ckpt_gate_up_proj_scale_name="gate_up_proj_scales",
-                    ckpt_down_proj_scale_name="down_proj_scales",
-                )
-            )
-        else:
-            expert_params_mapping = (
-                get_moe_impl_class().make_expert_params_mapping_fused(
-                    ckpt_gate_up_proj_name="gate_up_proj",
-                    ckpt_down_proj_name="down_proj",
-                    ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
-                    ckpt_down_proj_bias_name="down_proj_bias",
-                )
-            )
+        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping_fused(
+            ckpt_gate_up_proj_name="gate_up_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
+            ckpt_down_proj_bias_name="down_proj_bias",
+        )
 
         params_dict = dict(self.named_parameters())
         params_checker = {k: False for k, v in params_dict.items()}
