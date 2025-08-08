@@ -175,9 +175,15 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Optional[Literal["deepep"]] = None
-    moe_runner_backend: Literal[
-        "triton", "triton_kernel", "flashinfer_trtllm", "flashinfer_cutlass"
-    ] = "triton"
+    moe_runner_backend: Optional[
+        Literal[
+            "triton",
+            "triton_kernel",
+            "flashinfer_trtllm",
+            "flashinfer_cutlass",
+            "flashinfer_mxfp4",
+        ]
+    ] = None
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -250,7 +256,6 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
-    enable_flashinfer_mxfp4_moe: bool = False
     scheduler_recv_interval: int = 1
 
     # Debug tensor dumps
@@ -506,17 +511,16 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and is_mxfp4_quant_format:
-                self.enable_flashinfer_mxfp4_moe = True
-                self.enable_triton_kernel_moe = False
+                self.moe_runner_backend = "flashinfer_mxfp4"
                 logger.info(
                     "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                 )
             else:
-                if self.enable_triton_kernel_moe:
+                if self.moe_runner_backend == "triton_kernel":
                     assert (
                         self.ep_size == 1
                     ), "Triton kernel MoE is only supported when ep_size == 1"
-                if not self.enable_triton_kernel_moe and self.ep_size == 1:
+                if self.moe_runner_backend is None and self.ep_size == 1:
                     self.moe_runner_backend = "triton_kernel"
                     logger.info(
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."

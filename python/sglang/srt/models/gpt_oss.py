@@ -98,13 +98,10 @@ class GptOssSparseMoeBlock(nn.Module):
         self.activation_alpha = getattr(config, "hidden_act_alpha", 1.702)
         self.swiglu_limit = config.swiglu_limit
 
-        if global_server_args_dict["enable_flashinfer_mxfp4_moe"]:
-            self.topk = None
-        else:
-            self.topk = TopK(
-                top_k=config.num_experts_per_tok,
-                renormalize=True,
-            )
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            renormalize=True,
+        )
 
         self.top_k = config.num_experts_per_tok
         experts_type = get_moe_impl_class()
@@ -127,8 +124,8 @@ class GptOssSparseMoeBlock(nn.Module):
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             activation=self.activation,
-            activation_alpha=self.activation_alpha,
-            swiglu_limit=self.swiglu_limit,
+            alpha=self.activation_alpha,
+            limit=self.swiglu_limit,
             with_bias=True,
             prefix=add_prefix("experts", prefix),
             **extra_kwargs,
@@ -160,17 +157,10 @@ class GptOssSparseMoeBlock(nn.Module):
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.router(hidden_states)
-
-        kwargs = {"hidden_states": hidden_states}
-        if self.topk is not None:
-            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
-        else:
-            kwargs["topk_output"] = (self.top_k, router_logits)
-        final_hidden_states = self.experts(**kwargs)
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

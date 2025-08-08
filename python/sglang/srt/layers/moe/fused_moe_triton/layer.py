@@ -133,8 +133,8 @@ class FusedMoE(torch.nn.Module):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
-        activation_alpha: Optional[float] = None,
-        swiglu_limit: Optional[float] = None,
+        alpha: Optional[float] = None,
+        limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
         with_bias=False,
     ):
@@ -156,8 +156,8 @@ class FusedMoE(torch.nn.Module):
             inplace=inplace,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
-            activation_alpha=activation_alpha,
-            swiglu_limit=swiglu_limit,
+            alpha=alpha,
+            limit=limit,
         )
 
         enable_flashinfer_cutlass_moe = get_moe_runner_backend().is_flashinfer_cutlass()
@@ -204,13 +204,11 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         self.quant_config = quant_config
-        self.use_enable_flashinfer_mxfp4_moe = global_server_args_dict.get(
-            "enable_flashinfer_mxfp4_moe", False
-        )
+        self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
         if (
             self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
-            and self.use_enable_flashinfer_mxfp4_moe
+            and self.use_flashinfer_mxfp4_moe
         ):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size

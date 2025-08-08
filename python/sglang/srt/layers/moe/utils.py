@@ -34,6 +34,7 @@ class MoeRunnerBackend(Enum):
     TRITON_KERNEL = "triton_kernel"
     FLASHINFER = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_MXFP4 = "flashinfer_mxfp4"
 
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON
@@ -46,6 +47,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_cutlass(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_mxfp4(self):
+        return self == MoeRunnerBackend.FLASHINFER_MXFP4
 
 
 class DeepEPMode(Enum):
@@ -79,7 +83,7 @@ DEEPEP_CONFIG: Optional[str] = None
 
 def initialize_moe_config(
     moe_a2a_backend: Optional[str],
-    moe_runner_backend: str,
+    moe_runner_backend: Optional[str],
     deepep_mode: str,
     deepep_config: Optional[str],
     is_tbo_enabled: bool,
@@ -93,7 +97,7 @@ def initialize_moe_config(
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
 
     MOE_A2A_BACKEND = MoeA2ABackend(moe_a2a_backend)
-    MOE_RUNNER_BACKEND = MoeRunnerBackend(moe_runner_backend)
+    MOE_RUNNER_BACKEND = MoeRunnerBackend(moe_runner_backend or "triton")
     DEEPEP_MODE = DeepEPMode(deepep_mode)
     DEEPEP_CONFIG = deepep_config or ""
     IS_TBO_ENABLED = is_tbo_enabled

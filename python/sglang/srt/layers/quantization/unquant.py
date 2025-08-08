@@ -303,8 +303,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     b2=getattr(layer, "w2_weight_bias", None),
                     topk_output=topk_output,
                     moe_runner_config=moe_runner_config,
-                    activation_alpha=activation_alpha,
-                    swiglu_limit=swiglu_limit,
                 )
 
     def forward_cpu(

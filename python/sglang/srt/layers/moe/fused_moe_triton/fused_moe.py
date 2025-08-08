@@ -1028,8 +1028,8 @@ def inplace_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
+    alpha: Optional[float] = None,
+    limit: Optional[float] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -1056,8 +1056,8 @@ def inplace_fused_experts(
         block_shape,
         False,
         routed_scaling_factor,
-        activation_alpha,
-        swiglu_limit,
+        alpha,
+        limit,
     )
 
 
@@ -1084,8 +1084,8 @@ def inplace_fused_experts_fake(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
+    alpha: Optional[float] = None,
+    limit: Optional[float] = None,
 ) -> None:
     pass
 
@@ -1122,8 +1122,8 @@ def outplace_fused_experts(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
+    alpha: Optional[float] = None,
+    limit: Optional[float] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -1150,8 +1150,8 @@ def outplace_fused_experts(
         block_shape,
         no_combine=no_combine,
         routed_scaling_factor=routed_scaling_factor,
-        activation_alpha=activation_alpha,
-        swiglu_limit=swiglu_limit,
+        alpha=alpha,
+        limit=limit,
     )
 
 
@@ -1179,8 +1179,8 @@ def outplace_fused_experts_fake(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
+    alpha: Optional[float] = None,
+    limit: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1213,8 +1213,6 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     if moe_runner_config.inplace:
@@ -1225,10 +1223,10 @@ def fused_experts(
             w2,
             topk_weights,
             topk_ids,
-            moe_runner_config.activation,
-            moe_runner_config.apply_router_weight_on_input,
             b1,
             b2,
+            moe_runner_config.activation,
+            moe_runner_config.apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -1242,8 +1240,8 @@ def fused_experts(
             a2_scale,
             block_shape,
             moe_runner_config.routed_scaling_factor,
-            activation_alpha,
-            swiglu_limit,
+            moe_runner_config.alpha,
+            moe_runner_config.limit,
         )
         return hidden_states
     else:
@@ -1253,10 +1251,10 @@ def fused_experts(
             w2,
             topk_weights,
             topk_ids,
-            moe_runner_config.activation,
-            moe_runner_config.apply_router_weight_on_input,
             b1,
             b2,
+            moe_runner_config.activation,
+            moe_runner_config.apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -1271,8 +1269,8 @@ def fused_experts(
             block_shape,
             no_combine=moe_runner_config.no_combine,
             routed_scaling_factor=moe_runner_config.routed_scaling_factor,
-            activation_alpha=activation_alpha,
-            swiglu_limit=swiglu_limit,
+            alpha=moe_runner_config.alpha,
+            limit=moe_runner_config.limit,
         )
 
 
@@ -1401,8 +1399,8 @@ def fused_experts_impl(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
+    alpha: Optional[float] = None,
+    limit: Optional[float] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1532,12 +1530,12 @@ def fused_experts_impl(
             block_shape=block_shape,
         )
         if activation == "silu":
-            if activation_alpha is not None:
-                assert swiglu_limit is not None
+            if alpha is not None:
+                assert limit is not None
                 intermediate_cache2 = swiglu_with_alpha_and_limit(
                     intermediate_cache1.view(-1, N),
-                    activation_alpha,
-                    swiglu_limit,
+                    alpha,
+                    limit,
                 )
             elif _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -1546,10 +1544,8 @@ def fused_experts_impl(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
         elif activation == "gelu":
-            assert (
-                activation_alpha is None
-            ), "activation_alpha is not supported for gelu"
-            assert swiglu_limit is None, "swiglu_limit is not supported for gelu"
+            assert alpha is None, "alpha is not supported for gelu"
+            assert limit is None, "limit is not supported for gelu"
             if _is_cuda:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
@@ -1656,8 +1652,6 @@ def fused_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1690,9 +1684,9 @@ def fused_moe(
         a2.
     - block_shape: (Optional[List[int]]): Optional block size for block-wise
         quantization.
-    - activation_alpha (Optional[float]): Optional alpha for the activation
+    - alpha (Optional[float]): Optional alpha for the activation
         function.
-    - swiglu_limit (Optional[float]): Optional limit for the swiglu activation
+    - limit (Optional[float]): Optional limit for the swiglu activation
         function.
 
     Returns:
@@ -1719,6 +1713,4 @@ def fused_moe(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
-        activation_alpha=activation_alpha,
-        swiglu_limit=swiglu_limit,
     )
