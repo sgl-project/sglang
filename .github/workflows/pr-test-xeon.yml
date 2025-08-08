@@ -1,17 +1,32 @@
 name: PR Test (Xeon)
+
 on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-xeon.yml"
   pull_request:
-    branches:
-      - main
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-xeon.yml"
   workflow_dispatch:
 
 concurrency:
-  group: pr-test-xeon
+  group: pr-test-xeon-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build-test:
-    if: github.event_name == 'pull_request'
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false
     runs-on: sglang-pvc
     strategy:
       matrix:
@@ -34,16 +49,15 @@ jobs:
             --name ci_sglang_xeon \
             sglang_xeon
 
-      - name: Install Dependency
+      - name: Install dependencies
         timeout-minutes: 20
         run: |
           docker exec ci_sglang_xeon bash -c "python3 -m pip install --upgrade pip"
           docker exec ci_sglang_xeon pip uninstall sgl-kernel -y || true
           docker exec -w /sglang-checkout/sgl-kernel ci_sglang_xeon bash -c "cp pyproject_cpu.toml pyproject.toml && pip install -v ."
-          docker exec -w /sglang-checkout/ ci_sglang_xeon bash -c "pip install -e "python[all_cpu]""
-          docker exec ci_sglang_xeon bash -c "python3 -m pip install pytest expecttest"
+          docker exec -w /sglang-checkout/ ci_sglang_xeon bash -c "pip install -e "python[dev_cpu]""
 
-      - name: Check AMX Support
+      - name: Check AMX support
         id: check_amx
         timeout-minutes: 5
         run: |
@@ -51,7 +65,7 @@ jobs:
             bash -c "python3 -c 'import torch; import sgl_kernel; assert torch._C._cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
         continue-on-error: true
 
-      - name: Run UT Cases
+      - name: Run unit tests
         if: steps.check_amx.outcome == 'success'
         timeout-minutes: 20
         run: |
@@ -63,10 +77,10 @@ jobs:
         run: |
           docker rm -f ci_sglang_xeon || true
 
-  finish:
+  pr-test-xeon-finish:
     if: always()
     needs: [build-test]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
         run: |
