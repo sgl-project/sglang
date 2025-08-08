@@ -5,7 +5,10 @@ from typing import Any, AsyncGenerator, Dict, List, Union
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.code_completion_parser import generate_completion_prompt_from_request
+from sglang.srt.code_completion_parser import (
+    generate_completion_prompt_from_request,
+    set_completion_template_name,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -55,6 +58,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Process prompt
         prompt = request.prompt
         if self.template_manager.completion_template_name is not None:
+            set_completion_template_name(self.template_manager.completion_template_name)
             prompt = generate_completion_prompt_from_request(request)
 
         # Set logprob start length based on echo and logprobs
