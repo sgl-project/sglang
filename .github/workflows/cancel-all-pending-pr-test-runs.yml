@@ -16,11 +16,12 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           gh run list \
+            --repo "$REPO" \
             --workflow pr-test.yml \
             --json databaseId,status \
             --limit 1000 \
             | jq -r '.[] | select(.status=="queued" or .status=="in_progress") | .databaseId' \
             | while read run_id; do
                 echo "Cancelling run ID: $run_id"
-                gh run cancel "$run_id"
+                gh run cancel "$run_id" --repo "$REPO"
               done
