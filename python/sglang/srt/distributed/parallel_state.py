@@ -591,7 +591,7 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if not supports_custom_op():
+        if not supports_custom_op() or is_npu():
             self._all_gather_into_tensor(output, input)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(

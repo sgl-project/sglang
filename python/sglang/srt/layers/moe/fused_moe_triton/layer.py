@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_flashinfer_available,
     is_hip,
+    is_npu,
     next_power_of_2,
     round_up,
 )
@@ -53,6 +54,7 @@ if is_flashinfer_available():
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 
 # Try to import FP4 TRTLLM function if flashinfer is available

@@ -248,13 +248,13 @@ class TopK(CustomOp):
             return torch_npu.npu_moe_gating_top_k(
                 router_logits,
                 k=self.top_k,
-                bias=self.correction_bias,
+                bias=self.correction_bias.to(router_logits.dtype),
                 k_group=self.topk_group,
                 group_count=self.num_expert_group,
                 group_select_mode=1,
                 renorm=0,
                 norm_type=1,
-                routed_scaling_factor=1,
+                routed_scaling_factor=self.routed_scaling_factor,
                 eps=float(1e-20),
             )
         else:
