@@ -197,20 +197,20 @@ class FusedMoE(torch.nn.Module):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
-                self.use_triton_kernels, with_bias=with_bias
+                self.use_triton_kernels
             )
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
         assert self.quant_method is not None
 
         self.quant_config = quant_config
+        self.use_enable_flashinfer_mxfp4_moe = global_server_args_dict.get(
+            "enable_flashinfer_mxfp4_moe", False
+        )
         if (
             self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
-            and (
-                get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_MOE")
-                or get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE")
-            )
+            and self.use_enable_flashinfer_mxfp4_moe
         ):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
@@ -812,9 +812,8 @@ class FusedMoE(torch.nn.Module):
                 topk_output = topk_output._replace(
                     topk_ids=self.expert_map_gpu[topk_output.topk_ids]
                 )
-            else:
-                # TODO(ch-wan): support non-standard topk output
-                pass
+            elif TopKOutputChecker.format_is_triton_kernel(topk_output):
+                raise NotImplementedError()
 
         # Matrix multiply.
         with use_symmetric_memory(get_tp_group()) as sm:

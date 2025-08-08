@@ -126,10 +126,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
-    def __init__(self, use_triton_kernels: bool = False, with_bias: bool = False):
+    def __init__(self, use_triton_kernels: bool = False):
         super().__init__()
         self.use_triton_kernels = use_triton_kernels
-        self.with_bias = with_bias
+        self.with_bias = False
 
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
@@ -151,8 +151,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
+        with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        self.with_bias = with_bias
+
         # Fused gate_up_proj (column parallel)
         w13_weight_n, w13_weight_k = 2 * intermediate_size, hidden_size
         if self.use_triton_kernels:
@@ -296,8 +299,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     hidden_states=x,
                     w1=layer.w13_weight,
                     w2=layer.w2_weight,
+                    b1=getattr(layer, "w13_weight_bias", None),
+                    b2=getattr(layer, "w2_weight_bias", None),
                     topk_output=topk_output,
                     moe_runner_config=moe_runner_config,
+                    activation_alpha=activation_alpha,
+                    swiglu_limit=swiglu_limit,
                 )
 
     def forward_cpu(
