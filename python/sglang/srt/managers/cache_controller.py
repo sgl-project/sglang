@@ -571,9 +571,7 @@ class HiCacheController:
             if any(p is None for p in page_data):
                 break
         # release pre-allocated memory
-        self.mem_pool_host.free(
-            operation.host_indices[operation.completed_tokens :]
-        )
+        self.mem_pool_host.free(operation.host_indices[operation.completed_tokens :])
 
     # Get in one batch
     def mooncake_page_transfer(self, operation):
@@ -621,7 +619,7 @@ class HiCacheController:
                     self.generic_page_transfer(operation)
             except Empty:
                 continue
-    
+
     def _generic_storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
@@ -631,9 +629,7 @@ class HiCacheController:
         hash_value = []
         while remaining_tokens >= self.page_size:
             last_hash = self.get_hash_str(
-                tokens_to_fetch[
-                    storage_hit_count : storage_hit_count + self.page_size
-                ],
+                tokens_to_fetch[storage_hit_count : storage_hit_count + self.page_size],
                 last_hash,
             )
             if not self.storage_backend.exists(last_hash):
@@ -673,7 +669,7 @@ class HiCacheController:
                 else:
                     break
             storage_hit_count = consecutive_hits * self.page_size
-        return hash_value[:storage_hit_count // self.page_size], storage_hit_count
+        return hash_value[: storage_hit_count // self.page_size], storage_hit_count
 
     def prefetch_thread_func(self):
         """
@@ -689,9 +685,13 @@ class HiCacheController:
                     continue
 
                 if self.is_mooncake_backend():
-                    hash_value, storage_hit_count = self._mooncake_storage_hit_query(operation)
+                    hash_value, storage_hit_count = self._mooncake_storage_hit_query(
+                        operation
+                    )
                 else:
-                    hash_value, storage_hit_count = self._generic_storage_hit_query(operation)
+                    hash_value, storage_hit_count = self._generic_storage_hit_query(
+                        operation
+                    )
 
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
@@ -762,7 +762,9 @@ class HiCacheController:
             success = self.storage_backend.exists(operation.hash_value)
             if success is None:
                 # The input hash_value is invalid, skip backup
-                logger.warning(f"Failed to call MooncakeStore.exists: invalid parameters.")
+                logger.warning(
+                    f"Failed to call MooncakeStore.exists: invalid parameters."
+                )
                 pass
             else:
                 set_op_indices = []
@@ -780,21 +782,20 @@ class HiCacheController:
                 set_result = None
                 if len(set_keys) > 0:
                     key_strs, buffer_ptrs, buffer_sizes = (
-                        self.mem_pool_host.get_buffer_meta(
-                            set_keys, set_data_indices
-                        )
+                        self.mem_pool_host.get_buffer_meta(set_keys, set_data_indices)
                     )
                     set_result = self.storage_backend.batch_set(
                         key_strs,
                         target_location=buffer_ptrs,
                         target_sizes=buffer_sizes,
                     )
-                # If all keys are set successfully, mark them as success, 
+                # If all keys are set successfully, mark them as success,
                 # otherwise mark all of them as failed.
-                # TODO: After the Page First PR, we can just mark successful 
+                # TODO: After the Page First PR, we can just mark successful
                 # pages to success.
-                if (set_result is not None and 
-                    len(set_result) == sum(1 for v in set_result if v == 0)):
+                if set_result is not None and len(set_result) == sum(
+                    1 for v in set_result if v == 0
+                ):
                     for i in range(len(set_op_indices)):
                         success[set_op_indices[i]] = 1
                 # Count consecutive prefix of 1s (successful set)

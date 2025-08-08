@@ -57,7 +57,7 @@ class MooncakeStoreConfig:
                 "global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE
             ),
             # Zero copy interface does not need local buffer
-            local_buffer_size= DEFAULT_LOCAL_BUFFER_SIZE,
+            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", "auto"),
             master_server_address=config.get("master_server_address"),
@@ -136,7 +136,7 @@ class MooncakeStore(HiCacheStorage):
 
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
-        warmup_value = bytes(4 *1024) # 4 KB
+        warmup_value = bytes(4 * 1024)  # 4 KB
         assert self.store.put(warmup_key, warmup_value) == 0
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
