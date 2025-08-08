@@ -416,7 +416,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          MODE_BLACKWELL=1 bash scripts/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
