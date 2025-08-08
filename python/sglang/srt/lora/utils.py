@@ -92,11 +92,21 @@ def get_hidden_dim(
         Please implement the function in the model class if it is not.
         You can reference this function in llama.py.
         """
-        if module_name in ["q_proj", "o_proj", "qkv_proj"]:
-            return config.hidden_size, config.hidden_size
-        elif module_name in ["kv_proj"]:
-            return config.hidden_size, config.hidden_size // (
-                config.num_attention_heads // config.num_key_value_heads
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+
+        # TODO: The current design requires qkv has different shape in lora A and lora B.
+        # This is fixed in a separate PR (8940).
+        if module_name in ["qkv_proj", "kv_proj"]:
+            return (
+                config.hidden_size,
+                head_dim * config.num_key_value_heads,
+            )
+        elif module_name == "o_proj":
+            return (
+                head_dim * config.num_attention_heads,
+                config.hidden_size,
             )
         elif module_name == "gate_up_proj":
             return config.hidden_size, config.intermediate_size
