@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 """
-Support attention backend for TRTLLM MLA kernels from flashinfer.
+Support attention backend for TRTLLM MHA kernels from flashinfer.
+The kernel supports sm100 only, with sliding window and attention sink features.
 """
 
 from dataclasses import dataclass
@@ -23,6 +24,9 @@ if TYPE_CHECKING:
 
 # Constants
 DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
+
+# Reuse this workspace buffer across all TRTLLM MHA wrappers
+global_workspace_buffer = None
 
 
 @dataclass
@@ -57,11 +61,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # MHA-specific dimensions
         self.max_context_len = model_runner.model_config.context_len
-        self.sliding_window_size = (
-            model_runner.sliding_window_size
-            if model_runner.sliding_window_size is not None
-            else -1  # -1 indicates full attention
-        )
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
@@ -73,9 +72,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        self.workspace_buffer = torch.empty(
-            self.workspace_size, dtype=torch.int8, device=self.device
-        )
+        # Allocate buffers
+        global global_workspace_buffer
+        if global_workspace_buffer is None:
+            global_workspace_buffer = torch.empty(
+                self.workspace_size,
+                dtype=torch.uint8,
+                device=model_runner.device,
+            )
+        self.workspace_buffer = global_workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -117,10 +122,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         metadata = TRTLLMMHAMetadata()
 
         # Get sequence information
-        metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+        metadata.cache_seqlens_int32 = seq_lens[:bs].to(torch.int32)
 
         # Precompute maximum sequence length
-        metadata.max_seq_len_k = seq_lens.max().item()
+        metadata.max_seq_len_k = self.max_context_len
 
         # Precompute page table
         metadata.page_table = self.decode_cuda_graph_metadata["page_table"][:bs, :]
@@ -149,7 +154,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
         max_len = seq_lens_cpu.max().item()
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-        metadata.max_seq_len_k = max_len
+        metadata.max_seq_len_k = self.max_context_len
 
         metadata.cache_seqlens_int32.copy_(seq_lens)
         page_indices = self.req_to_token[
@@ -217,6 +222,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
@@ -228,7 +234,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
-        # [bs, page_size, num_kv_heads, head_dim] -> [bs, num_kv_heads, page_size, head_dim]
+        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache = k_cache.view(
             -1, self.page_size, layer.tp_k_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
@@ -237,7 +243,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ).permute(0, 2, 1, 3)
         kv_cache = (k_cache, v_cache)
 
-        # TODO: bmm1_scale and bmm2_scale might require modification
+        # TODO: add support for quantization
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
@@ -246,6 +252,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = 1.0
+        # sink: additional value per head in the denominator of the softmax.
+        attention_sink = kwargs.get("sinks", None)
 
         # Call TRT-LLM kernel
         # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
@@ -258,8 +266,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             max_seq_len=self.forward_metadata.max_seq_len_k,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
-            window_left=self.sliding_window_size,
+            window_left=layer.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
+            sinks=attention_sink,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -272,6 +281,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        **kwargs,
     ):
         cache_loc = forward_batch.out_cache_loc
         if save_kv_cache and k is not None:
@@ -279,6 +289,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 layer, cache_loc, k, v, layer.k_scale, layer.v_scale
             )
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         k_cache = k_cache.view(
             -1, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -288,8 +299,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ).permute(0, 2, 1, 3)
         kv_cache = (k_cache, v_cache)
 
-        # TODO: bmm1_scale and bmm2_scale might require modification
-        # TODO: Change once quantization is supported
+        # sink: additional value per head in the denominator of the softmax.
+        attention_sink = kwargs.get("sinks", None)
+        # TODO: add support for quantization
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
@@ -312,8 +324,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             batch_size=forward_batch.batch_size,
             cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
             cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-            window_left=self.sliding_window_size,
+            window_left=layer.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
+            sinks=attention_sink,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
