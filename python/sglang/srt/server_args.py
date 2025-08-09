@@ -2126,12 +2126,11 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
             if self.attention_backend is None:
-                # default is triton, but we could have trtllm_mha as an option
                 self.attention_backend = "triton"
-            assert (
-                self.attention_backend == "trtllm_mha"
-                or self.attention_backend == "triton"
-            )
+            assert self.attention_backend in [
+                "triton",
+                "trtllm_mha",
+            ], f"GptOssForCausalLM requires 'triton' or 'trtllm_mha' attention backend, but got {self.attention_backend}"
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
@@ -2154,11 +2153,9 @@ class ServerArgs:
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
                     )
             self.disable_hybrid_swa_memory = True
-
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
-
         elif "Llama4" in model_arch:
             assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
         elif model_arch in [
