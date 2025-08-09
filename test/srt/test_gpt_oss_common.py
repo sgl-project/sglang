@@ -8,7 +8,9 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
 
 _base_url = DEFAULT_URL_FOR_TEST
@@ -91,9 +93,16 @@ class BaseTestGptOss(CustomTestCase):
             reasoning_effort=reasoning_effort,
         )
 
-        print(f"Evaluation start: {model=} {reasoning_effort=} {expected_score=}")
+        setup = f"model={model} reasoning_effort={reasoning_effort} expected_score={expected_score}"
+
+        print(f"Evaluation start: {setup}")
         metrics = run_eval(args)
-        print(
-            f"Evaluation end: {model=} {reasoning_effort=} {expected_score=} {metrics=}"
-        )
+        print(f"Evaluation end: {setup} {metrics=}")
         self.assertGreaterEqual(metrics["score"], expected_score)
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gpt_oss_common\n"
+                f"Setup: {setup}\n"
+                f"Score: {metrics['score']:.2f}\n"
+            )

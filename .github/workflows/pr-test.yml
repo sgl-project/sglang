@@ -85,7 +85,7 @@ jobs:
           python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 10
 
   unit-test-backend-2-gpu:
-    needs: [check-changes, unit-test-frontend]
+    needs: [check-changes]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
@@ -110,6 +110,10 @@ jobs:
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
     runs-on: 4-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -119,10 +123,10 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu
+          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-8-gpu:
     needs: [check-changes, unit-test-backend-2-gpu]

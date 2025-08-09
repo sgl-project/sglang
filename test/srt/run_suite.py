@@ -111,6 +111,50 @@ suites = {
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_hybrid_attn_backend.py", 100),
     ],
+    "per-commit-2-gpu": [
+        TestFile("models/lora/test_lora_tp.py", 116),
+        TestFile("test_data_parallelism.py", 73),
+        TestFile("test_dp_attention.py", 277),
+        TestFile("test_patch_torch.py", 19),
+        TestFile("test_update_weights_from_distributed.py", 103),
+        TestFile("test_release_memory_occupation.py", 127),
+    ],
+    "per-commit-4-gpu": [
+        TestFile("test_gpt_oss_4gpu.py", 600),
+        TestFile("test_local_attn.py", 250),
+        TestFile("test_pp_single_node.py", 372),
+        TestFile("test_multi_instance_release_memory_occupation.py", 64),
+    ],
+    "per-commit-8-gpu": [
+        # Disabled because it hangs on the CI.
+        # TestFile("test_moe_ep.py", 181),
+        TestFile("test_disaggregation.py", 499),
+        TestFile("test_disaggregation_different_tp.py", 155),
+        TestFile("test_full_deepseek_v3.py", 333),
+    ],
+    "per-commit-8-gpu-b200": [
+        # add more here
+    ],
+    "per-commit-4-gpu-deepep": [
+        TestFile("test_deepep_small.py", 531),
+    ],
+    "per-commit-8-gpu-deepep": [
+        TestFile("test_deepep_large.py", 338),
+    ],
+    "nightly": [
+        TestFile("test_nightly_gsm8k_eval.py"),
+    ],
+    "vllm_dependency_test": [
+        TestFile("test_awq.py", 163),
+        TestFile("test_bnb.py", 5),
+        TestFile("test_gguf.py", 96),
+        TestFile("test_gptqmodel_dynamic.py", 102),
+        TestFile("test_vllm_dependency.py", 185),
+    ],
+}
+
+# Add AMD tests
+suite_amd = {
     "per-commit-amd": [
         TestFile("models/lora/test_lora_backend.py", 99),
         TestFile("models/lora/test_multi_lora_backend.py", 60),
@@ -153,57 +197,25 @@ suites = {
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_awq_dequant.py", 2),
     ],
-    "per-commit-1-ascend-npu": [
-        TestFile("test_ascend_tp1_bf16.py", 400),
-    ],
-    "per-commit-2-ascend-npu": [
-        TestFile("test_ascend_tp2_bf16.py", 400),
-    ],
-    "per-commit-4-ascend-npu": [
-        TestFile("test_ascend_mla_w8a8int8.py", 400),
-    ],
-    "per-commit-2-gpu": [
-        TestFile("models/lora/test_lora_tp.py", 116),
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_dp_attention.py", 277),
-        TestFile("test_patch_torch.py", 19),
-        TestFile("test_update_weights_from_distributed.py", 103),
-        TestFile("test_release_memory_occupation.py", 127),
-    ],
     "per-commit-2-gpu-amd": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
     ],
-    "per-commit-4-gpu": [
-        TestFile("test_gpt_oss_4gpu.py", 600),
-        TestFile("test_local_attn.py", 250),
-        TestFile("test_pp_single_node.py", 372),
-        TestFile("test_multi_instance_release_memory_occupation.py", 64),
-    ],
-    "per-commit-4-gpu-deepep": [
-        TestFile("test_deepep_small.py", 531),
-    ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
-    ],
-    "per-commit-8-gpu": [
-        # Disabled because it hangs on the CI.
-        # TestFile("test_moe_ep.py", 181),
-        TestFile("test_disaggregation.py", 499),
-        TestFile("test_disaggregation_different_tp.py", 155),
-        TestFile("test_full_deepseek_v3.py", 333),
-    ],
-    "per-commit-8-gpu-deepep": [
-        TestFile("test_deepep_large.py", 338),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
     ],
-    "per-commit-8-gpu-b200": [
-        # add more here
+    "nightly-amd": [
+        TestFile("test_nightly_gsm8k_eval_amd.py"),
     ],
+}
+
+# Add Intel Xeon tests
+suite_xeon = {
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
         TestFile("cpu/test_binding.py"),
@@ -219,20 +231,24 @@ suites = {
         TestFile("cpu/test_topk.py"),
         TestFile("test_intel_amx_attention_backend.py"),
     ],
-    "nightly": [
-        TestFile("test_nightly_gsm8k_eval.py"),
+}
+
+# Add Ascend NPU tests
+suite_ascend = {
+    "per-commit-1-ascend-npu": [
+        TestFile("test_ascend_tp1_bf16.py", 400),
     ],
-    "nightly-amd": [
-        TestFile("test_nightly_gsm8k_eval_amd.py"),
+    "per-commit-2-ascend-npu": [
+        TestFile("test_ascend_tp2_bf16.py", 400),
     ],
-    "vllm_dependency_test": [
-        TestFile("test_awq.py", 163),
-        TestFile("test_bnb.py", 5),
-        TestFile("test_gguf.py", 96),
-        TestFile("test_gptqmodel_dynamic.py", 102),
-        TestFile("test_vllm_dependency.py", 185),
+    "per-commit-4-ascend-npu": [
+        TestFile("test_ascend_mla_w8a8int8.py", 400),
     ],
 }
+
+suites.update(suite_amd)
+suites.update(suite_xeon)
+suites.update(suite_ascend)
 
 
 def auto_partition(files, rank, size):
