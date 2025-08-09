@@ -45,7 +45,7 @@ $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org
 if [ "$IS_BLACKWELL" = "1" ]; then
     # TODO auto determine sgl-kernel version
     SGL_KERNEL_VERSION=0.3.2
-    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_SUFFIX
+    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages
@@ -60,7 +60,7 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 
     # Install xformers
-    $PIP_CMD install  xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
+    $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
 fi
 
 # Install FlashMLA for attention backend tests
