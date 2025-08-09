@@ -287,18 +287,26 @@ async def health_generate(request: Request) -> Response:
         # Keep this branch for some internal use cases.
         raise NotImplementedError("Image generation is not supported yet.")
     elif _global_state.tokenizer_manager.is_generation:
-        gri = GenerateReqInput(
-            rid=rid,
-            input_ids=[0],
-            sampling_params=sampling_params,
-            log_metrics=False,
-        )
-        if (
-            _global_state.tokenizer_manager.server_args.disaggregation_mode
-            != DisaggregationMode.NULL
-        ):
-            gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
-            gri.bootstrap_room = 0
+        server_args = _global_state.tokenizer_manager.server_args
+        if server_args.disaggregation_mode == DisaggregationMode.NULL:
+            gri = GenerateReqInput(
+                rid=rid,
+                input_ids=[0],
+                sampling_params=sampling_params,
+                log_metrics=False,
+            )
+        else:
+            gri = GenerateReqInput(
+                rid=rid,
+                input_ids=[[0, 1, 2, 3]] * server_args.dp_size,
+                sampling_params=sampling_params,
+                log_metrics=False,
+                bootstrap_host=[FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
+                bootstrap_room=[
+                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    for i in range(server_args.dp_size)
+                ],
+            )
     else:
         gri = EmbeddingReqInput(
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
