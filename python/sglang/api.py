@@ -15,6 +15,7 @@ from sglang.lang.ir import (
     SglRoleBegin,
     SglRoleEnd,
     SglSelect,
+    SglSeparateReasoning,
     SglVideo,
 )
 
@@ -277,3 +278,9 @@ def assistant_begin():
 
 def assistant_end():
     return SglRoleEnd("assistant")
+
+
+def separate_reasoning(
+    expr: Optional[SglExpr] = None, model_type: Optional[str] = None
+):
+    return SglExprList([expr, SglSeparateReasoning(model_type, expr=expr)])

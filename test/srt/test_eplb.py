@@ -5,7 +5,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import sglang as sgl
-from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -17,7 +16,9 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDynamicEPLB(CustomTestCase):
+class _BaseTestDynamicEPLB(CustomTestCase):
+    extra_args = []
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -33,7 +34,8 @@ class TestDynamicEPLB(CustomTestCase):
                 "--dp",
                 "2",
                 "--enable-dp-attention",
-                "--enable-deepep-moe",
+                "--moe-a2a-backend",
+                "deepep",
                 "--deepep-mode",
                 "normal",
                 "--disable-cuda-graph",
@@ -51,8 +53,13 @@ class TestDynamicEPLB(CustomTestCase):
                 "stat",
                 "--ep-dispatch-algorithm",
                 "static",
+                *cls.extra_args,
             ],
-            env={"SGL_ENABLE_JIT_DEEPGEMM": "0", **os.environ},
+            env={
+                "SGL_ENABLE_JIT_DEEPGEMM": "0",
+                "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
+                **os.environ,
+            },
         )
 
     @classmethod
@@ -72,6 +79,14 @@ class TestDynamicEPLB(CustomTestCase):
         self.assertGreater(metrics["score"], 0.5)
 
 
+class TestDynamicEPLBSimple(_BaseTestDynamicEPLB):
+    pass
+
+
+class TestDynamicEPLBMultiChunk(_BaseTestDynamicEPLB):
+    extra_args = ["--eplb-rebalance-layers-per-chunk", "1"]
+
+
 class TestStaticEPLB(CustomTestCase):
     def test_save_expert_distribution_and_init_expert_location(self):
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "0"
@@ -82,8 +97,7 @@ class TestStaticEPLB(CustomTestCase):
                 trust_remote_code=True,
                 ep_num_redundant_experts=4,
                 enable_dp_attention=True,
-                enable_deepep_moe=True,
-                deepep_mode="normal",
+                moe_a2a_backend="deepep",
                 disable_cuda_graph=True,
                 expert_distribution_recorder_mode="stat",
                 tp_size=2,
