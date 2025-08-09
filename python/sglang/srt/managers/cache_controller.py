@@ -392,21 +392,19 @@ class HiCacheController:
     def write(
         self,
         device_indices: torch.Tensor,
+        host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = 0,
-    ) -> Optional[torch.Tensor]:
+    ):
         """
         Back up KV caches from device memory to host memory.
         """
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
-        if host_indices is None:
-            return None
         self.mem_pool_host.protect_write(host_indices)
         torch.cuda.current_stream().synchronize()
         self.write_queue.put(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
-        return host_indices
+        return
 
     def load(
         self,
