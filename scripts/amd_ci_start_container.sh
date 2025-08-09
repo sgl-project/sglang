@@ -135,8 +135,7 @@ else
 fi
 
 # Find and pull the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
-if [ $? -eq 0 ]; then
+if IMAGE=$(find_latest_image "${GPU_ARCH}"); then
   echo "Pulling Docker image: $IMAGE"
 else
   echo "$FALLBACK_MSG" >&2
