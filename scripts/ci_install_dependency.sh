@@ -23,17 +23,21 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     # so we can only use pip with `--break-system-packages`
     PIP_CMD="pip"
     PIP_SUFFIX="--break-system-packages"
+
+    # Clean up existing installations
+    $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_SUFFIX || true
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
     pip install uv
     export UV_SYSTEM_PYTHON=true
-    PIP_CMD="uv pip" # uv pip is not supported on blackwell CI runner
-    PIP_SUFFIX=""
-fi
 
-# Clean up existing installations
-$PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm $PIP_SUFFIX || true
+    PIP_CMD="uv pip"
+    PIP_SUFFIX=""
+
+    # Clean up existing installations
+    $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm $PIP_SUFFIX || true
+fi
 
 # Install the main package
 $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} --index-strategy unsafe-best-match $PIP_SUFFIX
