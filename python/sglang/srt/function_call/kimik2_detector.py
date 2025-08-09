@@ -24,7 +24,7 @@ class KimiK2Detector(BaseFormatDetector):
     Format Structure:
     ```
     <|tool_calls_section_begin|>
-    <|tool_call_begin|>functions.{func_name}:{index} <|tool_call_argument_begin|>{json_args}<|tool_call_end|>
+    <|tool_call_begin|>functions.{func_name}:{index}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
     <|tool_calls_section_end|>
     ```
 
@@ -219,7 +219,7 @@ class KimiK2Detector(BaseFormatDetector):
 
         def get_info(name: str) -> StructureInfo:
             return StructureInfo(
-                begin=f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:0 <|tool_call_argument_begin|>",
+                begin=f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:0<|tool_call_argument_begin|>",
                 end="<|tool_call_end|><|tool_calls_section_end|>",
                 trigger="<|tool_calls_section_begin|>",
             )
@@ -240,6 +240,6 @@ class KimiK2Detector(BaseFormatDetector):
             sequence_start_token=self.bot_token,
             sequence_end_token=self.eot_token,
             tool_call_separator="",
-            call_rule_fmt='"<|tool_call_begin|>functions.{name}:" [0-9]+ " <|tool_call_argument_begin|>" {arguments_rule} "<|tool_call_end|>"',
+            call_rule_fmt='"<|tool_call_begin|>functions.{name}:"[0-9]+"<|tool_call_argument_begin|>"{arguments_rule}"<|tool_call_end|>"',
             function_format="json",
         )
