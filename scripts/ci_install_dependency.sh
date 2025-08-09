@@ -21,7 +21,7 @@ pip install --upgrade pip
 pip install uv
 
 # Clean up existing installations
-uv pip uninstall -y flashinfer_python sgl-kernel sglang vllm || true
+uv pip uninstall flashinfer_python sgl-kernel sglang vllm || true
 
 # Install the main package
 uv pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION}
