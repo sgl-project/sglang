@@ -90,6 +90,7 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             self.hidden_states = torch.zeros(
@@ -173,6 +174,7 @@ class EAGLEDraftCudaGraphRunner:
         seq_lens = self.seq_lens[:num_seqs]
         out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
         positions = self.positions[:num_tokens]
+        mrope_positions = self.mrope_positions[:, :num_tokens]
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
         hidden_states = self.hidden_states[:num_seqs]
@@ -238,6 +240,7 @@ class EAGLEDraftCudaGraphRunner:
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
+            mrope_positions=mrope_positions,
             global_num_tokens_gpu=global_num_tokens,
             dp_padding_mode=DPPaddingMode.get_default_mode_in_cuda_graph(),
             gathered_buffer=gathered_buffer,
