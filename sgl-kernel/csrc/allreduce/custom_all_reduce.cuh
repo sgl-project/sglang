@@ -208,12 +208,22 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
   // note: we don't reorder the address so the accumulation order is the same
   // for all ranks, ensuring bitwise identical results
   auto dp = *_dp;
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
   // do the actual reduction
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
   }
   multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+
 }
 
 template <typename P>
@@ -240,6 +250,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
     ptrs[i] = (const P*)_dp->ptrs[target];
     tmps[i] = get_tmp_buf<P>(sg.signals[target]);
   }
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
   auto tmp_out = tmps[0];
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
   // stage 1: reduce scatter
@@ -263,6 +278,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
       }
     }
   }
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+
 }
 
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
