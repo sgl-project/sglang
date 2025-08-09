@@ -19,7 +19,7 @@ apt install -y git libnuma-dev
 # Install uv
 pip install --upgrade pip
 pip install uv
-export UV_SYSTEM=true
+export UV_SYSTEM_PYTHON=true
 
 # Clean up existing installations
 uv pip uninstall flashinfer_python sgl-kernel sglang vllm || true
