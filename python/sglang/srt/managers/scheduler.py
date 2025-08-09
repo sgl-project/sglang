@@ -64,6 +64,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -119,13 +120,14 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
+from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import validate_input_length
+from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -137,7 +139,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
-    DeepEPMode,
     DynamicGradMode,
     broadcast_pyobj,
     configure_gc_logger,
@@ -200,15 +201,19 @@ class Scheduler(
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
+        moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        dp_balance_meta: Optional[DPBalanceMeta] = None,
     ):
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
+        self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
         self.dp_rank = dp_rank
         self.tp_size = server_args.tp_size
+        self.moe_ep_size = server_args.ep_size
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
@@ -310,6 +315,7 @@ class Scheduler(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
             pp_rank=pp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
@@ -322,6 +328,7 @@ class Scheduler(
             self.draft_worker = EAGLEWorker(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
                 server_args=server_args,
                 nccl_port=port_args.nccl_port,
                 target_worker=self.tp_worker,
@@ -466,8 +473,10 @@ class Scheduler(
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
+        self.offload_tags = set()
         self.init_profier()
 
+        self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
             if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
@@ -517,6 +526,15 @@ class Scheduler(
             ]
         )
 
+        self.balance_meta = dp_balance_meta
+        if (
+            server_args.enable_dp_attention
+            and server_args.load_balance_method == "minimum_tokens"
+        ):
+            assert dp_balance_meta is not None
+
+        self.recv_dp_balance_id_this_term = []
+
     def init_tokenizer(self):
         server_args = self.server_args
 
@@ -564,7 +582,23 @@ class Scheduler(
                 page_size=self.page_size,
             )
         else:
-            if self.enable_hierarchical_cache:
+            if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
+                # lazy import to avoid JIT overhead
+                from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
+
+                self.tree_cache = RadixCacheCpp(
+                    disable=False,
+                    use_hicache=self.enable_hierarchical_cache,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool_allocator,
+                    tp_cache_group=self.tp_cpu_group,
+                    page_size=self.page_size,
+                    hicache_ratio=server_args.hicache_ratio,
+                    hicache_size=server_args.hicache_size,
+                    hicache_write_policy=server_args.hicache_write_policy,
+                    enable_kv_cache_events=self.enable_kv_cache_events,
+                )
+            elif self.enable_hierarchical_cache:
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -583,7 +617,9 @@ class Scheduler(
                         == "fa3"  # hot fix for incompatibility
                         else server_args.hicache_io_backend
                     ),
+                    hicache_mem_layout=server_args.hicache_mem_layout,
                     hicache_storage_backend=server_args.hicache_storage_backend,
+                    hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -914,6 +950,14 @@ class Scheduler(
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+
+        if self.recv_skipper is not None:
+            last_forward_mode = (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            )
+            if not self.recv_skipper.handle(last_forward_mode):
+                return []
+
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0:
                 recv_reqs = []
@@ -997,7 +1041,9 @@ class Scheduler(
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
-                self.chunked_req is not None or not self.running_batch.is_empty()
+                self.chunked_req is not None
+                or not self.running_batch.is_empty()
+                or len(self.offload_tags) > 0
             ):
                 self.return_health_check_ct += 1
                 continue
@@ -1027,6 +1073,12 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        if (
+            self.server_args.enable_dp_attention
+            and self.server_args.load_balance_method == "minimum_tokens"
+        ):
+            self.recv_dp_balance_id_this_term.append(recv_req.dp_balance_id)
+
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1052,7 +1104,7 @@ class Scheduler(
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 stream=recv_req.stream,
-                lora_path=recv_req.lora_path,
+                lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
@@ -1437,6 +1489,11 @@ class Scheduler(
 
         # Handle DP attention
         if need_dp_attn_preparation:
+            if (
+                self.server_args.load_balance_method == "minimum_tokens"
+                and self.forward_ct % 40 == 0
+            ):
+                self.handle_dp_balance_data(ret)
             ret = self.prepare_mlp_sync_batch(ret)
 
         return ret
@@ -1491,18 +1548,15 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            lora_set = set([req.lora_path for req in self.running_batch.reqs])
+            lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if (
-                self.enable_lora
-                and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
-                > self.max_loras_per_batch
+
+            if self.enable_lora and not self.tp_worker.can_run_lora_batch(
+                lora_set
+                | set([req.lora_id for req in adder.can_run_list])
+                | set([req.lora_id])
             ):
                 self.running_batch.batch_is_full = True
                 break
@@ -1519,7 +1573,10 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                self.tree_cache.check_prefetch_progress(req.rid)
+                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
+                    continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
@@ -1738,6 +1795,9 @@ class Scheduler(
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
 
+        self.maybe_send_health_check_signal()
+
+    def maybe_send_health_check_signal(self):
         if self.return_health_check_ct:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
@@ -1756,11 +1816,93 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
             enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
-            enable_deepep_moe=self.server_args.enable_deepep_moe,
-            deepep_mode=DeepEPMode[self.server_args.deepep_mode],
+            enable_deepep_moe=MoeA2ABackend(
+                self.server_args.moe_a2a_backend
+            ).is_deepep(),
+            deepep_mode=DeepEPMode(self.server_args.deepep_mode),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )
+
+    def handle_dp_balance_data(self, local_batch: ScheduleBatch):
+        def gather_dp_balance_info(holding_tokens_list) -> Union[None, List[List[int]]]:
+            """gather recv_dp_balance_id_this_term and holding tokens per worker for dp balance"""
+            recv_list = self.recv_dp_balance_id_this_term
+            assert len(recv_list) <= 511, (
+                "The number of requests received this round is too large. "
+                "Please increase gather_tensor_size and onfly_info_size."
+            )
+            # The maximum size of the tensor used for gathering data from all workers.
+            gather_tensor_size = 512
+
+            # recv_tensor: | holding_tokens | len(recv_dp_balance_id) | recv_dp_balance_ids
+            recv_tensor = torch.zeros(gather_tensor_size, dtype=torch.int32)
+            recv_tensor[0] = holding_tokens_list
+            recv_tensor[1] = len(
+                recv_list
+            )  # The first element is the length of the list.
+            recv_tensor[2 : len(recv_list) + 2] = torch.tensor(
+                recv_list, dtype=torch.int32
+            )
+
+            if self.tp_rank == 0:
+                gathered_list = [
+                    torch.zeros(gather_tensor_size, dtype=torch.int32)
+                    for _ in range(self.balance_meta.num_workers)
+                ]
+            else:
+                gathered_list = None
+
+            torch.distributed.gather(
+                recv_tensor, gathered_list, group=self.tp_cpu_group
+            )
+
+            gathered_id_list_per_worker = None
+            if self.tp_rank == 0:
+                gathered_id_list_per_worker = []
+                holding_tokens_list = []
+                for tensor in gathered_list:
+                    holding_tokens_list.append(tensor[0].item())
+                    list_length = tensor[1].item()
+                    gathered_id_list_per_worker.append(
+                        tensor[2 : list_length + 2].tolist()
+                    )
+
+            return gathered_id_list_per_worker, holding_tokens_list
+
+        def write_shared_dp_balance_info(new_recv_rid_lists, local_tokens):
+            meta = self.balance_meta
+
+            with meta.mutex:
+                onfly_list: List[Dict[int, int]] = meta.get_shared_onfly()
+                assert len(new_recv_rid_lists) == len(
+                    onfly_list
+                ), "num_worker not equal"
+                # 1.Check if the rid received by each worker this round is present in onfly.
+                #   If it is, remove the corresponding onfly item.
+                worker_id = 0
+                for new_recv_rids, on_fly_reqs in zip(new_recv_rid_lists, onfly_list):
+                    for new_recv_rid in new_recv_rids:
+                        assert (
+                            new_recv_rid in on_fly_reqs
+                        ), f"{new_recv_rid=} not in {worker_id=} {on_fly_reqs=}, data consistency is wrong"
+                        del on_fly_reqs[new_recv_rid]
+                    worker_id += 1
+                # 2. Atomically write local_tokens and onfly into shm under the mutex
+                meta.set_shared_onfly_info(onfly_list)
+                meta.set_shared_local_tokens(local_tokens)
+
+        holding_tokens = self.get_load()
+
+        new_recv_dp_balance_id_list, holding_token_list = gather_dp_balance_info(
+            holding_tokens
+        )
+
+        self.recv_dp_balance_id_this_term.clear()
+        if self.tp_rank == 0:  # only first worker write info
+            write_shared_dp_balance_info(
+                new_recv_dp_balance_id_list, holding_token_list
+            )
 
     @staticmethod
     def prepare_mlp_sync_batch_raw(
@@ -2338,11 +2480,19 @@ class IdleSleeper:
 
     def __init__(self, sockets):
         self.poller = zmq.Poller()
+        self.last_empty_time = time.time()
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
     def maybe_sleep(self):
         self.poller.poll(1000)
+        if (
+            global_config.torch_empty_cache_interval > 0
+            and time.time() - self.last_empty_time
+            > global_config.torch_empty_cache_interval
+        ):
+            self.last_empty_time = time.time()
+            torch.cuda.empty_cache()
 
 
 def is_health_check_generate_req(recv_req):
@@ -2358,9 +2508,11 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    balance_meta: Optional[DPBalanceMeta] = None,
 ):
     # Generate the prefix
     prefix = ""
@@ -2368,6 +2520,8 @@ def run_scheduler_process(
         prefix += f" DP{dp_rank}"
     if server_args.tp_size > 1:
         prefix += f" TP{tp_rank}"
+    if server_args.ep_size > 1:
+        prefix += f" EP{moe_ep_rank}"
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
 
@@ -2391,7 +2545,16 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank)
+        scheduler = Scheduler(
+            server_args,
+            port_args,
+            gpu_id,
+            tp_rank,
+            moe_ep_rank,
+            pp_rank,
+            dp_rank,
+            dp_balance_meta=balance_meta,
+        )
         pipe_writer.send(
             {
                 "status": "ready",

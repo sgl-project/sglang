@@ -37,6 +37,7 @@ import logging
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
+from itertools import chain
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -84,10 +85,10 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disable_radix_cache",
     "enable_dp_attention",
     "enable_two_batch_overlap",
+    "tbo_token_distribution_threshold",
     "enable_dp_lm_head",
-    "enable_deepep_moe",
+    "moe_a2a_backend",
     "deepep_mode",
-    "enable_ep_moe",
     "enable_flashinfer_cutlass_moe",
     "enable_flashinfer_trtllm_moe",
     "enable_flashinfer_allreduce_fusion",
@@ -107,7 +108,10 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "num_reserved_decode_tokens",
     "weight_loader_disable_mmap",
     "enable_triton_kernel_moe",
+    "enable_flashinfer_mxfp4_moe",
     "enable_multimodal",
+    "enable_symm_mem",
+    "quantization",
 ]
 
 # Put some global args for easy access
@@ -422,7 +426,7 @@ class Req:
         token_ids_logprob: List[int] = None,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
-        lora_path: Optional[str] = None,
+        lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
@@ -466,7 +470,7 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
-        self.lora_path = lora_path
+        self.lora_id = lora_id
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -844,6 +848,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
+    # The original sequence lengths, Qwen-1M related
+    orig_seq_lens: torch.Tensor = None  # shape: [b], int32
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
@@ -916,8 +922,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert isinstance(tree_cache, SWARadixCache) or isinstance(
-                tree_cache, SWAChunkCache
+            assert (
+                tree_cache is None
+                or isinstance(tree_cache, SWARadixCache)
+                or isinstance(tree_cache, SWAChunkCache)
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
@@ -1127,6 +1135,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
+        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
@@ -1137,10 +1146,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        input_ids_tensor = torch.tensor(sum(input_ids, []), dtype=torch.int64).to(
+        input_ids_tensor = torch.tensor(
+            list(chain.from_iterable(input_ids)), dtype=torch.int64
+        ).to(self.device, non_blocking=True)
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+        orig_seq_lens_tensor = torch.tensor(orig_seq_lens, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
         prefix_lens_tensor = torch.tensor(
@@ -1256,6 +1268,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
         self.seq_lens = seq_lens_tensor
+        self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
@@ -1503,6 +1516,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
@@ -1557,9 +1571,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1
+            self.orig_seq_lens = self.orig_seq_lens + 1
         else:
             # A faster in-place version
             self.seq_lens.add_(1)
+            self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
         # free memory
@@ -1623,6 +1639,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
+        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         self.output_ids = self.output_ids[keep_indices_device]
@@ -1655,6 +1672,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
@@ -1704,6 +1722,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             or attention_backend_str == "flashmla"
             or attention_backend_str == "cutlass_mla"
             or attention_backend_str == "ascend"
+            or attention_backend_str == "trtllm_mha"
+            or attention_backend_str == "aiter"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
@@ -1728,6 +1748,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
+            orig_seq_lens=self.orig_seq_lens,
             out_cache_loc=self.out_cache_loc,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
@@ -1749,7 +1770,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
-            lora_paths=[req.lora_path for req in self.reqs],
+            lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             token_type_ids=self.token_type_ids,
@@ -1890,10 +1911,13 @@ class ModelWorkerBatch:
     encoder_out_cache_loc: Optional[torch.Tensor]
 
     # For LoRA
-    lora_paths: Optional[List[str]]
+    lora_ids: Optional[List[str]]
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # The original sequence lengths, Qwen-1M related
+    orig_seq_lens: Optional[torch.Tensor] = None
 
     # The input Embeds
     input_embeds: Optional[torch.Tensor] = None

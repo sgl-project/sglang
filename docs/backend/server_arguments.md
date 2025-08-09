@@ -148,14 +148,14 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--file-storage-path` | The path of the file storage in backend. | sglang_storage |
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | False |
 | `--reasoning-parser` | Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}. | None |
-| `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', and 'kimi_k2'. | None |
+| `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'. | None |
 
 ## Data parallelism
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--dp-size` | The data parallelism size. | 1 |
-| `--load-balance-method` | The load balancing strategy for data parallelism. | round_robin |
+| `--load-balance-method` | The load balancing strategy for data parallelism. Options include: 'round_robin', 'minimum_tokens'. The Minimum Token algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers. | round_robin |
 
 ## Multi-node distributed serving
 
@@ -181,6 +181,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--lora-target-modules` | The union set of all target modules where LoRA should be applied (e.g., `q_proj`, `k_proj`, `gate_proj`). If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of different target modules after server startup. You can also set it to `all` to enable LoRA for all supported modules. However, enabling LoRA on additional modules introduces a minor performance overhead. If your application is performance-sensitive, we recommend only specifying the modules for which you plan to load adapters. | None |
 | `--lora-paths` | The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}. | None |
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | 8 |
+| `--max-loaded-loras` | If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`. | None |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | triton |
 
 ## Kernel backend
@@ -188,8 +189,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--attention-backend` | Choose the kernels for attention layers. | None |
-| `decode_attention_backend` | (Experimental) This argument specifies the backend for decode attention computation. Note that this argument has priority over `attention_backend`. | None |
-| `prefill_attention_backend` | (Experimental) This argument specifies the backend for prefill attention computation. Note that this argument has priority over `attention_backend`. | None |
+| `--prefill-attention-backend` | (Experimental) This argument specifies the backend for prefill attention computation. Note that this argument has priority over `attention_backend`. | None |
+| `--decode-attention-backend` | (Experimental) This argument specifies the backend for decode attention computation. Note that this argument has priority over `attention_backend`. | None |
 | `--sampling-backend` | Choose the kernels for sampling layers. | None |
 | `--grammar-backend` | Choose the backend for grammar-guided decoding. | None |
 | `--mm-attention-backend` | Set multimodal attention backend. | None |
@@ -212,8 +213,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--ep-size` | The expert parallelism size. | 1 |
-| `--enable-ep-moe` | Enabling expert parallelism for moe. The ep size is equal to the tp size. | False |
-| `--enable-deepep-moe` | Enabling DeepEP MoE implementation for EP MoE. | False |
+| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | None |
 | `--enable-flashinfer-cutlass-moe` | Enabling Flashinfer Cutlass MoE implementation for high throughput. | False |
 | `--enable-flashinfer-trtllm-moe` | Enabling Flashinfer Trtllm MoE implementation for low latency. | False |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
@@ -252,6 +252,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-cuda-graph-padding` | Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed. | False |
 | `--enable-profile-cuda-graph` | Enable profiling of cuda graph capture. | False |
 | `--enable-nccl-nvls` | Enable NCCL NVLS for prefill heavy requests when available. | False |
+| `--enable-symm-mem` | Enable NCCL symmetric memory for fast collectives. | False |
 | `--enable-tokenizer-batch-encode` | Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds. | False |
 | `--disable-outlines-disk-cache` | Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency. | False |
 | `--disable-custom-all-reduce` | Disable the custom all-reduce kernel and fall back to NCCL. | False |
@@ -261,6 +262,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-dp-attention` | Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported. | False |
 | `--enable-dp-lm-head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | False |
 | `--enable-two-batch-overlap` | Enabling two micro batches to overlap. | False |
+| `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | 0.48 |
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | False |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | 32 |
 | `--torchao-config` | Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row. |  |
