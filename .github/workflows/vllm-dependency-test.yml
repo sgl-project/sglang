@@ -34,7 +34,7 @@ jobs:
           pip install "bitsandbytes>=0.44.0"
           pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
 
-      - name: Run VLLM dependency tests
+      - name: Run vLLM dependency tests
         timeout-minutes: 60
         run: |
           cd test/srt
