@@ -207,7 +207,6 @@ class ScalarType:
         return not self._finite_values_only
 
     def has_nans(self) -> bool:
-
         return self.nan_repr != NanRepr.NONE
 
     def is_ieee_754(self) -> bool:
@@ -215,9 +214,7 @@ class ScalarType:
         If the type is a floating point type that follows IEEE 754
         conventions
         """
-
         return self.nan_repr == NanRepr.IEEE_754 and not self._finite_values_only
-
 
     def __str__(self) -> str:
         """
