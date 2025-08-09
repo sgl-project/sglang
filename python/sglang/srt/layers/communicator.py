@@ -193,8 +193,7 @@ class LayerCommunicator:
         else:
             if (
                 residual is not None
-                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-                and hidden_states._sglang_needs_allreduce_fusion
+                and getattr(hidden_states, "_sglang_needs_allreduce_fusion", False)
             ):
                 hidden_states, residual = (
                     self.input_layernorm.forward_with_allreduce_fusion(
