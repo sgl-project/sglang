@@ -202,7 +202,8 @@ suites = {
         TestFile("test_full_deepseek_v3.py", 250),
     ],
     "per-commit-8-gpu-b200": [
-        # add more here
+        TestFile("test_gpt_oss_1gpu.py", 600),
+        TestFile("test_gpt_oss_4gpu.py", 600),
     ],
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
