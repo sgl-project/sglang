@@ -296,13 +296,16 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # q, k = self.rotary_emb(positions, q, k)
-        q, k = self.rotary_emb(positions, q, k,
-                    layer=self.attn, # RadixAttention
-                    forward_batch=forward_batch,
-                    save_kv_cache=True,
-                    value=v,
-                    start_layer=self.start_layer
-                    )
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            layer=self.attn,  # RadixAttention
+            forward_batch=forward_batch,
+            save_kv_cache=True,
+            value=v,
+            start_layer=self.start_layer,
+        )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -370,7 +373,7 @@ class GptOssDecoderLayer(nn.Module):
             sliding_window_size=self.sliding_window_size,
             layer_type=config.layer_types[layer_id],
             params_dtype=config.torch_dtype,
-            start_layer=start_layer
+            start_layer=start_layer,
         )
 
         self.layer_id = layer_id
@@ -480,7 +483,7 @@ class GptOssModel(nn.Module):
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
-            start_layer = self.start_layer
+            start_layer=self.start_layer,
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -225,11 +225,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
-        cache_loc = forward_batch.out_cache_loc
-        if save_kv_cache and k is not None:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
+        # cache_loc = forward_batch.out_cache_loc
+        # if save_kv_cache and k is not None:
+        #     forward_batch.token_to_kv_pool.set_kv_buffer(
+        #         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+        #     )
 
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -283,11 +283,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
-        cache_loc = forward_batch.out_cache_loc
-        if save_kv_cache and k is not None:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
+        # cache_loc = forward_batch.out_cache_loc
+        # if save_kv_cache and k is not None:
+        #     forward_batch.token_to_kv_pool.set_kv_buffer(
+        #         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+        #     )
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)

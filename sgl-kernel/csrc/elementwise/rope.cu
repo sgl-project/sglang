@@ -31,23 +31,23 @@ void apply_rope_pos_ids_cos_sin_cache(
     bool save_kv_cache,
     at::Tensor k_buffer_ptr,
     at::Tensor v_buffer_ptr,
-    float k_scale, float v_scale,
+    float k_scale,
+    float v_scale,
     at::Tensor v,
     bool is_capture_mode,
     int64_t alt_stream_ptr  // Additional stream for overlap
-  ) {
+) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
-  if(save_kv_cache)
-  {
+  if (save_kv_cache) {
     CHECK_LAST_DIM_CONTIGUOUS(v);
     CHECK_LAST_DIM_CONTIGUOUS(k_buffer_ptr);
     CHECK_LAST_DIM_CONTIGUOUS(v_buffer_ptr);
     CHECK_DIM(3, k_buffer_ptr);  // k_buffer: (nnz, H_K, D)
     CHECK_DIM(3, v_buffer_ptr);  // v_buffer: (nnz, H_V, D)
-    CHECK_DIM(3, v);  // v: (nnz, H_V, D)
+    CHECK_DIM(3, v);             // v: (nnz, H_V, D)
   }
-    
+
   CHECK_INPUT(cos_sin_cache);
   CHECK_INPUT(pos_ids);
   auto device = q.device();
@@ -56,8 +56,7 @@ void apply_rope_pos_ids_cos_sin_cache(
   CHECK_EQ(pos_ids.device(), device);
   CHECK_DIM(3, q);  // q: (nnz, H_Q, D)
   CHECK_DIM(3, k);  // k: (nnz, H_K, D)
-  
-  
+
   // cos_sin_cache: (max_seq_len, R)
   // First half of R is cos, second half is sin
   CHECK_DIM(2, cos_sin_cache);
@@ -107,7 +106,7 @@ void apply_rope_pos_ids_cos_sin_cache(
     return true;
   });
 
-  if (save_kv_cache) {    
+  if (save_kv_cache) {
     // Handle dtype and scaling
     if (k_rope.scalar_type() != k_buffer_ptr.scalar_type()) {
       if (k_scale != 1.0f) {
@@ -120,21 +119,21 @@ void apply_rope_pos_ids_cos_sin_cache(
       k_rope = k_rope.to(k_buffer_ptr.scalar_type());
       v = v.to(v_buffer_ptr.scalar_type());
     }
-  
+
     if (is_capture_mode && alt_stream_ptr != 0) {
       cudaStream_t alt_stream = reinterpret_cast<cudaStream_t>(alt_stream_ptr);
       cudaStream_t main_stream = stream;
-      
+
       // Wait for main stream to complete RoPE
       cudaStreamWaitEvent(alt_stream, nullptr, 0);
-      
+
       // Copy K on main stream
       k_buffer_ptr.copy_(k_rope, /*non_blocking=*/true);
-      
+
       // Copy V on alternate stream
       at::cuda::CUDAStreamGuard guard(at::cuda::getStreamFromExternal(alt_stream, device.index()));
       v_buffer_ptr.copy_(v, /*non_blocking=*/true);
-      
+
       // Main stream waits for alt stream
       cudaStreamWaitEvent(main_stream, nullptr, 0);
     } else {

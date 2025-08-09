@@ -246,7 +246,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
-    layer: Any = None, # RadixAttention
+    layer: Any = None,  # RadixAttention
     forward_batch: ForwardBatch = None,
     save_kv_cache: bool = False,
     value: Optional[torch.Tensor] = None,
@@ -339,9 +339,9 @@ def apply_rope_with_cos_sin_cache_inplace(
         save_kv_cache,
         k_buffer_ptr,
         v_buffer_ptr,
-        1.0 if k_scale is None else k_scale, 1.0 if v_scale is not None else v_scale,
+        1.0 if k_scale is None else k_scale,
+        1.0 if v_scale is not None else v_scale,
         value.view(value.shape[0], -1, head_size),
         is_capture_mode,
-        0 if alt_stream is None else alt_stream
-
+        0 if alt_stream is None else alt_stream,
     )
