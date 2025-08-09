@@ -34,6 +34,7 @@ from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip,
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
+        AscendDeepEPLLOutput,
         DeepEPLLOutput,
         DeepEPNormalOutput,
         DispatchOutput,
@@ -387,7 +388,8 @@ class DeepEPMoE(EPMoE):
             return_recv_hook=True,
         )
 
-        if self.deepep_mode.enable_low_latency():
+        if self.deepep_mode.enable_low_latency() and not _is_npu:
+            # NPU supports low_latency deepep without deepgemm
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
@@ -404,7 +406,7 @@ class DeepEPMoE(EPMoE):
             )
             # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
-        else:
+        elif not _is_npu:
             self.w13_weight_fp8 = (
                 self.w13_weight,
                 (
@@ -459,6 +461,8 @@ class DeepEPMoE(EPMoE):
         if _use_aiter:
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(dispatch_output)
+        if _is_npu:
+            return self.forward_npu(dispatch_output)
         if dispatch_output.format.is_deepep_normal():
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
@@ -722,6 +726,60 @@ class DeepEPMoE(EPMoE):
         )
 
         return down_output
+
+    def forward_npu(
+        self,
+        dispatch_output: DeepEPLLOutput,
+    ):
+        if TYPE_CHECKING:
+            assert isinstance(dispatch_output, AscendDeepEPLLOutput)
+        hidden_states, topk_idx, topk_weights, _, seg_indptr, _ = dispatch_output
+        assert self.quant_method is not None
+        assert self.activation == "silu"
+
+        # NOTE: Ascend's Dispatch & Combine does not support FP16
+        output_dtype = torch.bfloat16
+
+        pertoken_scale = hidden_states[1]
+        hidden_states = hidden_states[0]
+
+        group_list_type = 1
+        seg_indptr = seg_indptr.to(torch.int64)
+
+        import torch_npu
+
+        # gmm1: gate_up_proj
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[self.w13_weight],
+            scale=[self.w13_weight_scale.to(output_dtype)],
+            per_token_scale=[pertoken_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=seg_indptr,
+            output_dtype=output_dtype,
+        )[0]
+
+        # act_fn: swiglu
+        hidden_states = torch_npu.npu_swiglu(hidden_states)
+
+        hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+
+        # gmm2: down_proj
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[self.w2_weight],
+            scale=[self.w2_weight_scale.to(output_dtype)],
+            per_token_scale=[swiglu_out_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=seg_indptr,
+            output_dtype=output_dtype,
+        )[0]
+
+        return hidden_states
 
 
 def get_moe_impl_class():

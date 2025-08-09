@@ -497,6 +497,17 @@ class TestEBNFGeneration(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="empty_param_func",
+                    description="Function with empty parameters",
+                    parameters={
+                        "properties": {},
+                        "required": [],
+                    },
+                ),
+            ),
         ]
 
         self.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
@@ -630,16 +641,21 @@ class TestEBNFGeneration(unittest.TestCase):
         self.assertIsNotNone(ebnf)
         # Check that the EBNF contains expected patterns for XML format
         self.assertIn('"<tool_call>" function_call "</tool_call>"', ebnf)
-        self.assertIn('"get_weather" "\\n" arguments_get_weather', ebnf)
+        self.assertIn('"get_weather" "\\n" ( arguments_get_weather "\\n" )?', ebnf)
         self.assertIn(
             '"<arg_key>location</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>" ( "\\n" ( "<arg_key>unit</arg_key>" "\\n" "<arg_value>" ("celsius" | "fahrenheit") "</arg_value>" ) )?',
             ebnf,
         )
-        self.assertIn('"search" "\\n" arguments_search', ebnf)
+        self.assertIn('"search" "\\n" ( arguments_search "\\n" )?', ebnf)
         self.assertIn(
             '"<arg_key>query</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>"',
             ebnf,
         )
+        self.assertIn(
+            '"empty_param_func" "\\n" ( arguments_empty_param_func "\\n" )?', ebnf
+        )
+        self.assertIn('arguments_empty_param_func ::= ""', ebnf)
+
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
             ctx = self.grammar_compiler.compile_grammar(ebnf)

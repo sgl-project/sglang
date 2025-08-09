@@ -430,15 +430,41 @@ class RouterArgs:
                 RouterArgs.max_concurrent_requests,
             ),
             cors_allowed_origins=getattr(args, f"{prefix}cors_allowed_origins", []),
-            retry_max_retries=getattr(args, f"{prefix}retry_max_retries"),
-            retry_initial_backoff_ms=getattr(args, f"{prefix}retry_initial_backoff_ms"),
-            retry_max_backoff_ms=getattr(args, f"{prefix}retry_max_backoff_ms"),
-            retry_backoff_multiplier=getattr(args, f"{prefix}retry_backoff_multiplier"),
-            retry_jitter_factor=getattr(args, f"{prefix}retry_jitter_factor"),
-            cb_failure_threshold=getattr(args, f"{prefix}cb_failure_threshold"),
-            cb_success_threshold=getattr(args, f"{prefix}cb_success_threshold"),
-            cb_timeout_duration_secs=getattr(args, f"{prefix}cb_timeout_duration_secs"),
-            cb_window_duration_secs=getattr(args, f"{prefix}cb_window_duration_secs"),
+            retry_max_retries=getattr(
+                args, f"{prefix}retry_max_retries", RouterArgs.retry_max_retries
+            ),
+            retry_initial_backoff_ms=getattr(
+                args,
+                f"{prefix}retry_initial_backoff_ms",
+                RouterArgs.retry_initial_backoff_ms,
+            ),
+            retry_max_backoff_ms=getattr(
+                args, f"{prefix}retry_max_backoff_ms", RouterArgs.retry_max_backoff_ms
+            ),
+            retry_backoff_multiplier=getattr(
+                args,
+                f"{prefix}retry_backoff_multiplier",
+                RouterArgs.retry_backoff_multiplier,
+            ),
+            retry_jitter_factor=getattr(
+                args, f"{prefix}retry_jitter_factor", RouterArgs.retry_jitter_factor
+            ),
+            cb_failure_threshold=getattr(
+                args, f"{prefix}cb_failure_threshold", RouterArgs.cb_failure_threshold
+            ),
+            cb_success_threshold=getattr(
+                args, f"{prefix}cb_success_threshold", RouterArgs.cb_success_threshold
+            ),
+            cb_timeout_duration_secs=getattr(
+                args,
+                f"{prefix}cb_timeout_duration_secs",
+                RouterArgs.cb_timeout_duration_secs,
+            ),
+            cb_window_duration_secs=getattr(
+                args,
+                f"{prefix}cb_window_duration_secs",
+                RouterArgs.cb_window_duration_secs,
+            ),
         )
 
     @staticmethod

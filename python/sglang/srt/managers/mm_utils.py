@@ -614,8 +614,7 @@ def general_mm_embed_routine(
         input_ids: Input token IDs tensor
         forward_batch: Batch information for model forward pass
         language_model: Base language model to use
-        image_data_embedding_func: Function to embed image data
-        audio_data_embedding_func: Function to embed audio data
+        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
         placeholder_tokens: Token IDs for multimodal placeholders
         **kwargs: Additional arguments passed to language model
 

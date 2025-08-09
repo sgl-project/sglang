@@ -570,10 +570,6 @@ class HiCacheController:
                     )
                     completed_tokens += self.page_size
             else:
-                # operation terminated by controller, release pre-allocated memory
-                self.mem_pool_host.free(
-                    operation.host_indices[operation.completed_tokens :]
-                )
                 break
 
     def mooncake_page_transfer(self, operation):
@@ -599,6 +595,14 @@ class HiCacheController:
                     self.generic_page_transfer(operation, batch_size=128)
                 else:
                     self.generic_page_transfer(operation)
+
+                if self.tp_world_size > 1:
+                    # to ensure all TP workers release the host memory at the same time
+                    torch.distributed.barrier(group=self.prefetch_tp_group)
+                # operation terminated by controller, release pre-allocated memory
+                self.mem_pool_host.free(
+                    operation.host_indices[operation.completed_tokens :]
+                )
             except Empty:
                 continue
 
@@ -626,7 +630,9 @@ class HiCacheController:
                     continue
 
                 storage_hit_count = 0
-                if self.prefetch_rate_limit_check():
+                if (
+                    operation.host_indices is not None
+                ) and self.prefetch_rate_limit_check():
                     last_hash = operation.last_hash
                     tokens_to_fetch = operation.token_ids
 
@@ -670,7 +676,8 @@ class HiCacheController:
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
-                    self.mem_pool_host.free(operation.host_indices)
+                    if operation.host_indices is not None:
+                        self.mem_pool_host.free(operation.host_indices)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
