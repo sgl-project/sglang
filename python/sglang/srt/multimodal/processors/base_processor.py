@@ -207,8 +207,9 @@ class BaseMultimodalProcessor(ABC):
         ]
 
     def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None, **kwargs
-    ):
+        self, input_text, images=None, videos=None, audios=None,
+        **kwargs
+    ) -> dict:
         """
         process multimodal data with transformers AutoProcessor
         """
@@ -217,10 +218,11 @@ class BaseMultimodalProcessor(ABC):
         if videos:
             kwargs["videos"] = videos
         if audios:
-            kwargs["audios"] = audios
-            if self.__class__.__name__ == "Gemma3nSGLangProcessor":
+            if self.arch == "Gemma3nProcessor" or self.arch == "Qwen2AudioForConditionalGeneration":
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
+            else:
+                kwargs["audios"] = audios
 
         processor = self._processor
         if (
@@ -268,7 +270,7 @@ class BaseMultimodalProcessor(ABC):
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:") :]
+                path = image[len("video:"):]
                 # Estimate frames for the video
                 vr = VideoReader(path, ctx=cpu(0))
                 num_frames = len(vr)
@@ -561,6 +563,7 @@ class BaseMultimodalProcessor(ABC):
         ret = self.process_mm_data(
             input_text=input_text, images=images, audios=audios, videos=videos, **kwargs
         )
+        print(f"{ret.keys()=}")
 
         input_ids = ret["input_ids"].flatten()
         collected_items = self.collect_mm_items_from_processor_output(ret)
@@ -607,12 +610,6 @@ class BaseMultimodalProcessor(ABC):
         all_collected_items: list[MultimodalDataItem] = []
         input_ids = None
 
-        # Handle dict items (already processed)
-        for dict_item in dict_items:
-            all_collected_items.extend(
-                self.collect_mm_items_from_processor_output(dict_item)
-            )
-
         # Handle raw items (need processing)
         if raw_images or raw_audios or raw_videos:
             collected_items, input_ids, ret = self._process_and_collect_mm_items(
@@ -622,9 +619,15 @@ class BaseMultimodalProcessor(ABC):
                 videos=raw_videos,
                 **kwargs,
             )
-            all_collected_items.extend(collected_items)
+            all_collected_items = collected_items
         else:
             ret = None
+
+        # Handle dict items (already processed)
+        for dict_item in dict_items:
+            all_collected_items.extend(
+                self.collect_mm_items_from_processor_output(dict_item)
+            )
 
         # Fallback tokenization if no raw items were processed
         if input_ids is None:
