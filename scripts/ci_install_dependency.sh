@@ -17,8 +17,8 @@ bash "${SCRIPT_DIR}/killall_sglang.sh"
 apt install -y git libnuma-dev
 
 # Install uv
-pip install --upgrade pip
-pip install uv
+pip install --upgrade pip --break-system-packages
+pip install uv --break-system-packages
 export UV_SYSTEM_PYTHON=true
 
 # Clean up existing installations
