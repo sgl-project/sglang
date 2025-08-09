@@ -27,7 +27,51 @@ AUDIO_TRUMP_SPEECH_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test
 AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/bird_song.mp3"
 
 
-class AudioOpenAITestMixin:
+class TestOpenAIOmniServer(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.base_url += "/v1"
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def get_audio_request_kwargs(self):
+        return self.get_request_kwargs()
+
+    def get_vision_request_kwargs(self):
+        return self.get_request_kwargs()
+
+    def get_request_kwargs(self):
+        return {}
+
+    def get_or_download_file(self, url: str) -> str:
+        cache_dir = os.path.expanduser("~/.cache")
+        if url is None:
+            raise ValueError()
+        file_name = url.split("/")[-1]
+        file_path = os.path.join(cache_dir, file_name)
+        os.makedirs(cache_dir, exist_ok=True)
+
+        if not os.path.exists(file_path):
+            response = requests.get(url)
+            response.raise_for_status()
+
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+        return file_path
+
+
+class AudioOpenAITestMixin(TestOpenAIOmniServer):
     def prepare_audio_messages(self, prompt, audio_file_name):
         messages = [
             {
@@ -104,7 +148,7 @@ class AudioOpenAITestMixin:
         assert "bird" in audio_response
 
 
-class ImageOpenAITestMixin:
+class ImageOpenAITestMixin(TestOpenAIOmniServer):
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -369,7 +413,7 @@ class ImageOpenAITestMixin:
         self.assertGreater(len(video_response), 0)
 
 
-class VideoOpenAITestMixin:
+class VideoOpenAITestMixin(TestOpenAIOmniServer):
     def prepare_video_messages(self, video_path):
         messages = [
             {
@@ -432,47 +476,3 @@ class VideoOpenAITestMixin:
         ), f"video_response: {video_response}, should contain 'black' or 'dark'"
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
-
-
-class TestOpenAIVisionServer(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def get_audio_request_kwargs(self):
-        return self.get_request_kwargs()
-
-    def get_vision_request_kwargs(self):
-        return self.get_request_kwargs()
-
-    def get_request_kwargs(self):
-        return {}
-
-    def get_or_download_file(self, url: str) -> str:
-        cache_dir = os.path.expanduser("~/.cache")
-        if url is None:
-            raise ValueError()
-        file_name = url.split("/")[-1]
-        file_path = os.path.join(cache_dir, file_name)
-        os.makedirs(cache_dir, exist_ok=True)
-
-        if not os.path.exists(file_path):
-            response = requests.get(url)
-            response.raise_for_status()
-
-            with open(file_path, "wb") as f:
-                f.write(response.content)
-        return file_path

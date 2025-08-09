@@ -9,9 +9,7 @@ import unittest
 from test_vision_openai_server_common import *
 
 
-class TestQwen2VLServer(
-    ImageOpenAITestMixin, VideoOpenAITestMixin, TestOpenAIVisionServer
-):
+class TestQwen2VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
@@ -32,9 +30,7 @@ class TestQwen2VLServer(
         cls.base_url += "/v1"
 
 
-class TestQwen2_5_VLServer(
-    ImageOpenAITestMixin, VideoOpenAITestMixin, TestOpenAIVisionServer
-):
+class TestQwen2_5_VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -128,7 +124,7 @@ class TestVLMContextLengthIssue(CustomTestCase):
 #         cls.base_url += "/v1"
 
 
-class TestMinicpmvServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
+class TestMinicpmvServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "openbmb/MiniCPM-V-2_6"
@@ -149,7 +145,7 @@ class TestMinicpmvServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestInternVL2_5Server(ImageOpenAITestMixin, TestOpenAIVisionServer):
+class TestInternVL2_5Server(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "OpenGVLab/InternVL2_5-2B"
@@ -168,9 +164,7 @@ class TestInternVL2_5Server(ImageOpenAITestMixin, TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestMinicpmoServer(
-    ImageOpenAITestMixin, AudioOpenAITestMixin, TestOpenAIVisionServer
-):
+class TestMinicpmoServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "openbmb/MiniCPM-o-2_6"
@@ -191,7 +185,7 @@ class TestMinicpmoServer(
         cls.base_url += "/v1"
 
 
-class TestMimoVLServer(TestOpenAIVisionServer):
+class TestMimoVLServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "XiaomiMiMo/MiMo-VL-7B-RL"
@@ -214,5 +208,5 @@ class TestMimoVLServer(TestOpenAIVisionServer):
 
 
 if __name__ == "__main__":
-    del TestOpenAIVisionServer
+    del TestOpenAIOmniServer
     unittest.main()

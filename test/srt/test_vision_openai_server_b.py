@@ -3,7 +3,7 @@ import unittest
 from test_vision_openai_server_common import *
 
 
-class TestPixtralServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
+class TestPixtralServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "mistral-community/pixtral-12b"
@@ -24,7 +24,7 @@ class TestPixtralServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestMistral3_1Server(ImageOpenAITestMixin, TestOpenAIVisionServer):
+class TestMistral3_1Server(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
@@ -45,7 +45,7 @@ class TestMistral3_1Server(ImageOpenAITestMixin, TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestDeepseekVL2Server(ImageOpenAITestMixin, TestOpenAIVisionServer):
+class TestDeepseekVL2Server(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/deepseek-vl2-small"
@@ -66,7 +66,7 @@ class TestDeepseekVL2Server(ImageOpenAITestMixin, TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestJanusProServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
+class TestJanusProServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/Janus-Pro-7B"
@@ -87,10 +87,6 @@ class TestJanusProServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
     def test_video_images_chat_completion(self):
-        pass
-
-    def test_single_image_chat_completion(self):
-        # Skip this test because it is flaky
         pass
 
 
@@ -121,7 +117,7 @@ class TestJanusProServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
 #         cls.base_url += "/v1"
 
 
-class TestGemma3itServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
+class TestGemma3itServer(ImageOpenAITestMixin, TestOpenAIOmniServer):
     @classmethod
     def setUpClass(cls):
         cls.model = "google/gemma-3-4b-it"
@@ -143,9 +139,7 @@ class TestGemma3itServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestGemma3nServer(
-    ImageOpenAITestMixin, AudioOpenAITestMixin, TestOpenAIVisionServer
-):
+class TestGemma3nServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "google/gemma-3n-E4B-it"
@@ -171,7 +165,7 @@ class TestGemma3nServer(
         # self._test_audio_ambient_completion()
 
 
-class TestQwen2AudioServer(AudioOpenAITestMixin, TestOpenAIVisionServer):
+class TestQwen2AudioServer(AudioOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-Audio-7B-Instruct"
@@ -190,7 +184,7 @@ class TestQwen2AudioServer(AudioOpenAITestMixin, TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestKimiVLServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
+class TestKimiVLServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
@@ -216,9 +210,7 @@ class TestKimiVLServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
         pass
 
 
-class TestPhi4MMServer(
-    ImageOpenAITestMixin, AudioOpenAITestMixin, TestOpenAIVisionServer
-):
+class TestPhi4MMServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         # Manually download LoRA adapter_config.json as it's not downloaded by the model loader by default.
@@ -280,7 +272,7 @@ class TestPhi4MMServer(
         # self._test_audio_ambient_completion()
 
 
-class TestVILAServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
+class TestVILAServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
@@ -331,5 +323,5 @@ class TestVILAServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
 
 
 if __name__ == "__main__":
-    del TestOpenAIVisionServer
+    del TestOpenAIOmniServer
     unittest.main()
