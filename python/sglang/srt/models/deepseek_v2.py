@@ -1273,7 +1273,13 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        if not (
+            self.current_attention_backend == "trtllm_mla"
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+        ):
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
 
@@ -1286,8 +1292,24 @@ class DeepseekV2AttentionMLA(nn.Module):
             or self.current_attention_backend == "cutlass_mla"
             or self.current_attention_backend == "trtllm_mla"
         ):
+            extra_args = {}
+            if (
+                self.current_attention_backend == "trtllm_mla"
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+            ):
+                extra_args = {
+                    "cos_sin_cache": self.rotary_emb.cos_sin_cache,
+                    "is_neox": self.rotary_emb.is_neox_style,
+                }
             attn_output = self.attn_mqa(
-                q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
+                q_nope_out,
+                k_nope,
+                k_nope,
+                forward_batch,
+                q_rope=q_pe,
+                k_rope=k_pe,
+                **extra_args,
             )
         else:
             q = torch.cat([q_nope_out, q_pe], dim=-1)
