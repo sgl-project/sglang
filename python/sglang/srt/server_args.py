@@ -2119,9 +2119,9 @@ class ServerArgs:
                 if num_enabled_backends == 0:
                     # TODO shall we use mxfp4 or mxfp4_bf16 by default?
                     self.enable_flashinfer_mxfp4_moe = True
-                logger.warning(
-                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
-                )
+                    logger.warning(
+                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                    )
             else:
                 if self.enable_triton_kernel_moe:
                     assert (
