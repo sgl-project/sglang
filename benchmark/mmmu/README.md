@@ -36,7 +36,7 @@ python3 bench_sglang.py --response-answer-regex "<\|begin_of_box\|>(.*)<\|end_of
 
 You can use `--extra-request-body` to specify additional OpenAI request parameters. E.g.,
 ```
-python3 bench_sglang.py --extra_request_body '{"max_new_tokens": 128, "temperature": 0.01}'
+python3 bench_sglang.py --extra-request-body '{"max_new_tokens": 128, "temperature": 0.01}'
 ```
 
 ### Evaluate hf
