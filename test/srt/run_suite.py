@@ -110,6 +110,7 @@ suites = {
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_hybrid_attn_backend.py", 100),
+        TestFile("test_chunked_logprobs.py", 300),
     ],
     "per-commit-amd": [
         TestFile("models/lora/test_lora_backend.py", 99),
