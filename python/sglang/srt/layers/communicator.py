@@ -254,6 +254,12 @@ class LayerCommunicator:
                 allow_reduce_scatter=self.allow_reduce_scatter,
             )
 
+    def should_mlp_skip_all_reduce(self, forward_batch: ForwardBatch):
+        can_fuse_mlp_allreduce = self.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.should_use_reduce_scatter(forward_batch)
+        return can_fuse_mlp_allreduce or use_reduce_scatter
+
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         # TODO improve these codes
         return (
