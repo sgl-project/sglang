@@ -554,7 +554,7 @@ class CommunicateSummableTensorPairFn:
             hidden_states,
         )
 
-        if hidden_states.data_ptr() is global_hidden_states.data_ptr():
+        if hidden_states.untyped_storage() is global_hidden_states.untyped_storage():
             hidden_states = torch.empty_like(hidden_states)
 
         if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
