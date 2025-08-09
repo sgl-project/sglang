@@ -251,6 +251,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
+    enable_flashinfer_mxfp4_bf16_moe: bool = False
     scheduler_recv_interval: int = 1
 
     # Debug tensor dumps
@@ -1806,6 +1807,11 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action="store_true",
             help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-mxfp4-bf16-moe",
+            action="store_true",
+            help="Enable FlashInfer MXFP4 MoE backend with bf16 input precision for modelopt_fp4 quant on Blackwell.",
         )
         parser.add_argument(
             "--scheduler-recv-interval",
