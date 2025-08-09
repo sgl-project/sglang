@@ -36,7 +36,6 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_zero_points,
     verify_marlin_supported,
 )
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
 from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     replace_parameter,
@@ -57,6 +56,7 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import fused_marlin_moe
+    from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 
 logger = logging.getLogger(__name__)

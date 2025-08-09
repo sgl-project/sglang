@@ -11,11 +11,15 @@ import numpy
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 
 def is_layer_skipped(
