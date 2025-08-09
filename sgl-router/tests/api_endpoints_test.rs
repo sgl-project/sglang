@@ -8,7 +8,9 @@ use axum::{
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{PolicyConfig, RetryConfig, RouterConfig, RoutingMode};
+use sglang_router_rs::config::{
+    CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+};
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -45,6 +47,7 @@ impl TestContext {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1087,6 +1090,7 @@ mod error_tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
@@ -1434,6 +1438,7 @@ mod pd_mode_tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
 
         // Create app context
@@ -1588,6 +1593,7 @@ mod request_id_tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(

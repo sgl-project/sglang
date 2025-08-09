@@ -75,6 +75,9 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
 
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
+
     def forward_extend(
         self,
         q,

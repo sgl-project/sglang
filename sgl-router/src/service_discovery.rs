@@ -589,6 +589,7 @@ mod tests {
             false,
             None,
             crate::config::types::RetryConfig::default(),
+            crate::config::types::CircuitBreakerConfig::default(),
         )
         .unwrap();
         Arc::new(router) as Arc<dyn RouterTrait>

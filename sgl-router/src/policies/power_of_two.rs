@@ -90,6 +90,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         // Increment processed counter
         workers[selected_idx].increment_processed();
         RouterMetrics::record_processed_request(workers[selected_idx].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
 
         Some(selected_idx)
     }

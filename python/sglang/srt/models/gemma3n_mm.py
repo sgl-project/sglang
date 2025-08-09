@@ -501,20 +501,26 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
 
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim
-        if module_name in ["q_proj", "qkv_proj"]:
+        # TODO: the special handling of qkv will be addressed in #8940.
+        if module_name == "qkv_proj":
             return (
                 self.config.hidden_size,
+                None,  # qkv_proj is only used in LoRA A
+            )
+        elif module_name == "kv_proj":
+            return (
+                None,  # kv_proj is only used in LoRA B
+                self.config.head_dim * self.config.num_key_value_heads,
+            )
+        elif module_name == "q_proj":
+            return (
+                None,  # q_proj is only used in LoRA B
                 self.config.head_dim * self.config.num_attention_heads,
             )
         elif module_name in ["o_proj"]:
             return (
                 self.config.head_dim * self.config.num_attention_heads,
                 self.config.hidden_size,
-            )
-        elif module_name in ["kv_proj"]:
-            return (
-                self.config.hidden_size,
-                self.config.head_dim * self.config.num_key_value_heads,
             )
         elif module_name == "gate_up_proj":
             assert len(set(self.config.intermediate_size)) == 1, (

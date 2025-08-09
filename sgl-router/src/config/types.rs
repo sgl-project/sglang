@@ -41,6 +41,8 @@ pub struct RouterConfig {
     pub cors_allowed_origins: Vec<String>,
     /// Retry configuration
     pub retry: RetryConfig,
+    /// Circuit breaker configuration
+    pub circuit_breaker: CircuitBreakerConfig,
 }
 
 /// Routing mode configuration
@@ -208,6 +210,30 @@ impl Default for RetryConfig {
     }
 }
 
+/// Circuit breaker configuration for worker reliability
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures before opening circuit
+    pub failure_threshold: u32,
+    /// Number of consecutive successes before closing circuit
+    pub success_threshold: u32,
+    /// Time before attempting to recover from open state (in seconds)
+    pub timeout_duration_secs: u64,
+    /// Window duration for failure tracking (in seconds)
+    pub window_duration_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            success_threshold: 2,
+            timeout_duration_secs: 30,
+            window_duration_secs: 60,
+        }
+    }
+}
+
 /// Metrics configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsConfig {
@@ -249,6 +275,7 @@ impl Default for RouterConfig {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         }
     }
 }
@@ -360,6 +387,7 @@ mod tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -788,6 +816,7 @@ mod tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
 
         assert!(config.mode.is_pd_mode());
@@ -840,6 +869,7 @@ mod tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -888,6 +918,7 @@ mod tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
 
         assert!(config.has_service_discovery());

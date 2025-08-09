@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import builtins
 import inspect
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Type, Union
+from typing import TYPE_CHECKING, Dict, Optional, Type
 
 import torch
 

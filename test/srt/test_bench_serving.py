@@ -1,7 +1,6 @@
 import asyncio
 import itertools
 import unittest
-from random import random, uniform
 
 import requests
 
