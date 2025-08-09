@@ -1870,6 +1870,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         ):
             return False
 
+        if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
+            return False
+
+        if self.is_nextn:
+            return False
+
         return True
 
     def forward(
@@ -1896,11 +1902,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        can_fuse_mlp_allreduce = (
-            self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
-            and not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
-            and not self.is_nextn
-        )
+        can_fuse_mlp_allreduce = self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
