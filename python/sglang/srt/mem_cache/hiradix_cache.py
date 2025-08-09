@@ -471,6 +471,10 @@ class HiRadixCache(RadixCache):
             req_id
         ]
 
+        if operation.host_indices is None:
+            # prefetch has not been issued due to insufficient host memory
+            return True
+
         if not self.can_terminate_prefetch(operation):
             return False
 
@@ -565,10 +569,6 @@ class HiRadixCache(RadixCache):
         if host_indices is None:
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            last_host_node.release_host()
-            # no sufficient host memory to prefetch
-            return
         operation = self.cache_controller.prefetch(
             req_id, host_indices, new_input_tokens, last_hash
         )
