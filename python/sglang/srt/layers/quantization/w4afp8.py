@@ -116,6 +116,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         assert "weight_loader" in extra_weight_attrs
 
         # Fused gate_up_proj (column parallel)
@@ -154,7 +157,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
             torch.zeros(
@@ -166,7 +168,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         # Input scales
         w13_input_scale = torch.nn.Parameter(
@@ -182,6 +183,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
+
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+        )
+
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         # Pre-populate the strides
         device = layer.w13_weight.device

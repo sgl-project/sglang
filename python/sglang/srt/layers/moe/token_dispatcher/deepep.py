@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -299,7 +300,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not get_bool_env_var(
+            "SGLANG_USE_W4A8"
+        ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -345,7 +348,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
-
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
@@ -368,10 +370,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=(
+                128
+                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and not get_bool_env_var("SGLANG_USE_W4A8")
+                else 1
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
-
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
             num_tokens_per_rank=num_tokens_per_rank,
