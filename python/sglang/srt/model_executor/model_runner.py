@@ -882,7 +882,7 @@ class ModelRunner:
         infered_device = torch.cuda.current_device()
 
         named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, infered_device))
+            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
         if load_format == "direct":
