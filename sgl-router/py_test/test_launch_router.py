@@ -212,7 +212,7 @@ class TestLaunchRouter(unittest.TestCase):
 
     def test_policy_validation(self):
         """Test that policy validation works correctly for PD and regular modes."""
-        from sglang_router.launch_router import RouterArgs, launch_router
+        from sglang_router.launch_router import launch_router
 
         # Test 1: PowerOfTwo requires at least 2 workers
         args = self.create_router_args(
