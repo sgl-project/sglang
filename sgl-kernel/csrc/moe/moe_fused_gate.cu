@@ -356,7 +356,7 @@ __device__ void moe_fused_gate_impl(
               shared_bias[shared_idx] = static_cast<T>(-FLT_MAX);  // 注意这里应该是-FLT_MAX
             }
             // Whether or not in the current tile, ensure that the expert has been cleared in the global state.
-            thread_read_ptr[expert_mod] = static_cast<T>(-FLT_MAX); 
+            thread_read_ptr[expert_mod] = static_cast<T>(-FLT_MAX);
 
             // Reset and recalculate global maximums
             global_max_val = static_cast<T>(-FLT_MAX);
@@ -368,7 +368,7 @@ __device__ void moe_fused_gate_impl(
             for (int i = 0; i < params.VPT; ++i) {
               // Skip the cleared expert
               if (i == expert_mod) continue;
-              
+
               int tile_idx = i / 32;
               int local_idx = i % 32;
 
@@ -380,14 +380,15 @@ __device__ void moe_fused_gate_impl(
                 val = recalculate_sigmoid(i, thread_read_ptr) + bias_thread_read_ptr[i];
               }
 
-              if (cmp_gt(val, global_max_val) && !cmp_eq(val, static_cast<T>(-FLT_MAX)) && 
+              if (cmp_gt(val, global_max_val) && !cmp_eq(val, static_cast<T>(-FLT_MAX)) &&
                   !cmp_eq(val, static_cast<T>(FLT_MAX))) {
                 global_max_val_second = global_max_val;
                 global_max_second_idx = global_max_idx;
                 global_max_val = val;
                 global_max_idx = i;
-              } else if (cmp_gt(val, global_max_val_second) && !cmp_eq(val, static_cast<T>(-FLT_MAX)) && 
-                         !cmp_eq(val, static_cast<T>(FLT_MAX))) {
+              } else if (
+                  cmp_gt(val, global_max_val_second) && !cmp_eq(val, static_cast<T>(-FLT_MAX)) &&
+                  !cmp_eq(val, static_cast<T>(FLT_MAX))) {
                 global_max_val_second = val;
                 global_max_second_idx = i;
               }
@@ -673,25 +674,24 @@ std::vector<at::Tensor> moe_fused_gate(
 
   if (num_expert_group == 1 && num_experts > 128) {
     auto gate = (1.0f / (1.0f + (-input).exp())) + bias;
-    
+
     int64_t topk_excluding_shared = topk - num_fused_shared_experts;
     auto topk_result = gate.topk(topk_excluding_shared, 1, true, true);
-    
+
     output.narrow(1, 0, topk_excluding_shared).copy_(std::get<0>(topk_result));
     indices.narrow(1, 0, topk_excluding_shared).copy_(std::get<1>(topk_result));
-    
+
     if (num_fused_shared_experts > 0) {
-        auto output_sum = std::get<0>(topk_result).sum(1);
-        for (int64_t i = 0; i < num_fused_shared_experts; ++i) {
-            indices.select(1, topk_excluding_shared + i).fill_(num_experts + i);
-            output.select(1, topk_excluding_shared + i).copy_(
-                output_sum / static_cast<float>(routed_scaling_factor));
-        }
+      auto output_sum = std::get<0>(topk_result).sum(1);
+      for (int64_t i = 0; i < num_fused_shared_experts; ++i) {
+        indices.select(1, topk_excluding_shared + i).fill_(num_experts + i);
+        output.select(1, topk_excluding_shared + i).copy_(output_sum / static_cast<float>(routed_scaling_factor));
+      }
     }
-    
+
     auto row_sums = output.sum(1, true);
     output.div_(row_sums);
-    
+
     return {output, indices};
   }
   // Compute grid dimensions based on runtime value for num_expert_group.
