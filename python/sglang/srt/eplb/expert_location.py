@@ -13,6 +13,7 @@
 # ==============================================================================
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,8 @@ class ExpertLocationMetadata:
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+    broken_nodes: torch.Tensor
+    last_broken_nodes: torch.Tensor
 
     # -------------------------------- properties ------------------------------------
 
@@ -151,6 +154,15 @@ class ExpertLocationMetadata:
         num_groups = model_config_for_expert_location.num_groups
         num_nodes = server_args.nnodes
 
+        # If called from `compute_initial_expert_location_metadata`,
+        # `_global_expert_location_metadata` can be None.
+        if _global_expert_location_metadata is None:
+            broken_ranks = torch.zeros(
+                (common["ep_size"],), dtype=torch.int32, device="cuda"
+            )
+        else:
+            broken_ranks = _global_expert_location_metadata.broken_nodes
+
         physical_to_logical_map, logical_to_all_physical_map, expert_count = (
             eplb_algorithms.rebalance_experts(
                 tokens_per_expert=logical_count,
@@ -163,6 +175,7 @@ class ExpertLocationMetadata:
                     num_groups=num_groups,
                     num_nodes=num_nodes,
                 ),
+                broken_ranks=broken_ranks,
             )
         )
 
@@ -217,6 +230,15 @@ class ExpertLocationMetadata:
         logical_to_all_physical_map_num_valid = torch.count_nonzero(
             logical_to_all_physical_map != -1, dim=-1
         )
+        # If called from the initialization stage,
+        # `_global_expert_location_metadata` can be None.
+        if _global_expert_location_metadata is None:
+            broken_nodes = torch.zeros((ep_size,), dtype=torch.int32, device="cuda")
+        else:
+            broken_nodes = _global_expert_location_metadata.broken_nodes
+        broken_indices = broken_nodes.nonzero().view(-1)
+        assert broken_indices.numel() <= 1
+        avoid_rank = broken_indices[0].item() if broken_indices.numel() == 1 else -1
 
         return ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
@@ -225,16 +247,31 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map_cpu=logical_to_all_physical_map_padded.cpu(),
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             logical_to_rank_dispatch_physical_map=(
-                compute_logical_to_rank_dispatch_physical_map(
-                    logical_to_all_physical_map=logical_to_all_physical_map,
-                    num_gpus=ep_size,
-                    num_physical_experts=num_physical_experts,
-                    # TODO improve when we have real EP rank
-                    ep_rank=torch.distributed.get_rank() % ep_size,
+                (
+                    (
+                        compute_logical_to_rank_dispatch_physical_map_avoid_rank(
+                            logical_to_all_physical_map=logical_to_all_physical_map,
+                            num_gpus=ep_size,
+                            num_physical_experts=num_physical_experts,
+                            # TODO improve when we have real EP rank
+                            ep_rank=torch.distributed.get_rank() % ep_size,
+                            avoid_rank=avoid_rank,
+                        )
+                    )
+                    if avoid_rank != -1
+                    else compute_logical_to_rank_dispatch_physical_map(
+                        logical_to_all_physical_map=logical_to_all_physical_map,
+                        num_gpus=ep_size,
+                        num_physical_experts=num_physical_experts,
+                        # TODO improve when we have real EP rank
+                        ep_rank=torch.distributed.get_rank() % ep_size,
+                    )
                 )
                 if server_args.ep_dispatch_algorithm == "static"
                 else None
             ),
+            broken_nodes=broken_nodes,
+            last_broken_nodes=broken_nodes.clone(),
         )
 
     # -------------------------------- mutation ------------------------------------
@@ -331,6 +368,207 @@ def _pad_nested_array(arr, pad_value):
         for outer in arr
     ]
     return padded
+
+
+def compute_logical_to_rank_dispatch_physical_map_remote_first(
+    logical_to_all_physical_map: torch.Tensor,
+    num_gpus: int,
+    num_physical_experts: int,
+    ep_rank: int,
+    seed: int = 42,
+):
+    """Computes a static dispatch map from logical to physical experts, prioritizing remote experts.
+    This function creates a dispatch map where each (GPU, logical expert) pair is assigned a
+    specific physical expert. The key difference from the default implementation is its preference
+    for assigning tasks to experts on different GPUs (remote experts) to potentially improve
+    workload distribution across the system, falling back to local experts only when no remote
+    options are available.
+    1.  **Remote-First Assignment**: For each GPU, it identifies all available physical experts
+        located on other GPUs. If such experts exist, it selects one with the lowest current
+        load to handle the request.
+    2.  **Load Balancing**: It maintains a load counter for each physical expert to ensure that
+        requests are distributed as evenly as possible among the available candidates.
+    3.  **Local Fallback**: If a logical expert has no physical replicas on other GPUs, the
+        algorithm will assign a local expert (from the same GPU) instead.
+    4.  **Deterministic Tie-Breaking**: The process is made deterministic by using a fixed seed.
+        When multiple experts have the same load, shuffling the candidates before selection
+        ensures fair tie-breaking.
+    Args:
+        logical_to_all_physical_map (torch.Tensor): A 3D tensor mapping each logical expert
+            to its physical replicas. Shape: `(num_layers, num_logical_experts, num_replicas)`.
+        num_gpus (int): The total number of GPUs in the expert parallel group.
+        num_physical_experts (int): The total number of physical experts.
+        ep_rank (int): The rank of the current process within the expert parallel group.
+        seed (int): A seed for the random number generator to ensure deterministic behavior.
+    Returns:
+        torch.Tensor: A 2D tensor for the current `ep_rank` that maps each logical expert
+                      to a physical expert. Shape: `(num_layers, num_logical_experts)`.
+    """
+    r = random.Random(seed)
+
+    # 计算每个GPU上的物理专家数量
+    num_local_physical_experts = num_physical_experts // num_gpus
+    # 获取映射表的维度信息
+    num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+    dtype = logical_to_all_physical_map.dtype
+
+    # 创建一个用于存储最终分派映射的张量，并用-1填充
+    logical_to_rank_dispatch_physical_map = torch.full(
+        size=(num_gpus, num_layers, num_logical_experts),
+        fill_value=-1,
+        dtype=dtype,
+    )
+
+    # 遍历每一层
+    for layer_id in range(num_layers):
+        # 遍历该层中的每一个逻辑专家
+        for logical_expert_id in range(num_logical_experts):
+            # 获取当前逻辑专家的所有物理副本ID
+            candidate_physical_expert_ids = _logical_to_all_physical_raw(
+                logical_to_all_physical_map, layer_id, logical_expert_id
+            )
+            # 获取当前逻辑专家在所有GPU上的分派映射视图
+            output_partial = logical_to_rank_dispatch_physical_map[
+                :, layer_id, logical_expert_id
+            ]
+
+            # 为每个物理专家初始化负载计数器
+            load = {p_id: 0 for p_id in candidate_physical_expert_ids}
+
+            # 遍历所有GPU，为每个GPU分配一个专家
+            for gpu_id in range(num_gpus):
+                # --- 远程优先选择阶段 ---
+                # 找出所有不位于当前GPU上的物理专家（即远程专家）
+                remote_experts = [
+                    p_id
+                    for p_id in candidate_physical_expert_ids
+                    if _compute_gpu_id_of_physical_expert(
+                        p_id, num_local_physical_experts
+                    )
+                    != gpu_id
+                ]
+
+                # 如果存在远程专家，则从远程专家中选择；否则，从所有候选专家中选择（本地回退）
+                if remote_experts:
+                    experts_to_choose_from = remote_experts
+                else:
+                    experts_to_choose_from = candidate_physical_expert_ids
+
+                # 为了在负载相同时打破僵局，随机打乱候选专家列表
+                r.shuffle(experts_to_choose_from)
+
+                # --- 负载均衡选择 ---
+                # 从候选专家中选择一个当前负载最低的专家
+                chosen_expert = min(experts_to_choose_from, key=lambda p_id: load[p_id])
+
+                # 将选中的专家分配给当前GPU
+                output_partial[gpu_id] = chosen_expert
+                # 更新被选中专家的负载计数
+                load[chosen_expert] += 1
+
+    # 断言确保所有条目都已被成功分配
+    assert torch.all(logical_to_rank_dispatch_physical_map != -1)
+
+    # 获取原始张量的设备信息
+    device = logical_to_all_physical_map.device
+    # 返回属于当前ep_rank的分派映射表，并移动到正确的设备上
+    return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)
+
+
+def compute_logical_to_rank_dispatch_physical_map_avoid_rank(
+    logical_to_all_physical_map: torch.Tensor,
+    num_gpus: int,
+    num_physical_experts: int,
+    ep_rank: int,
+    avoid_rank: int,
+    seed: int = 42,
+):
+    """计算一个静态分派映射表，避免向特定rank调度任务。
+    此函数旨在创建一个分派映射，其中每个 (GPU, 逻辑专家) 对被分配一个特定的物理专家，
+    同时避免将任务分配给 `avoid_rank` 上的专家。如果过滤后没有可用专家，则会回退到使用所有可用专家。
+    1.  **避免特定Rank**: 对于每个逻辑专家，它会首先过滤掉位于 `avoid_rank` 上的所有物理专家。
+    2.  **负载均衡**: 在剩余的专家中，它使用负载计数器来确保请求在可用的候选专家中均匀分配。
+    3.  **回退机制**: 如果过滤后没有可用的专家（例如，所有专家都在 `avoid_rank` 上），
+        该算法将回退到在所有候选专家（包括在 `avoid_rank` 上的专家）中进行选择，以确保任务能够被分配。
+    4.  **确定性**: 整个过程通过固定的随机种子来保证确定性。
+    Args:
+        logical_to_all_physical_map (torch.Tensor): 一个三维张量，映射每个逻辑专家到其所有物理副本。
+            形状为 `(num_layers, num_logical_experts, num_replicas)`。
+        num_gpus (int): 专家并行组中的 GPU 总数。
+        num_physical_experts (int): 物理专家的总数。
+        ep_rank (int): 当前进程在专家并行组中的排名。
+        avoid_rank (int): 需要避免调度的 GPU rank。
+        seed (int): 用于随机数生成器的种子，以确保确定性行为。
+    Returns:
+        torch.Tensor: 一个二维张量，为当前的 `ep_rank` 映射每个逻辑专家到一个物理专家。
+                      形状为 `(num_layers, num_logical_experts)`。
+    """
+    r = random.Random(seed)
+
+    # 计算每个GPU上的物理专家数量
+    num_local_physical_experts = num_physical_experts // num_gpus
+    # 获取映射表的维度信息
+    num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+    dtype = logical_to_all_physical_map.dtype
+
+    # 创建一个用于存储最终分派映射的张量，并用-1填充
+    logical_to_rank_dispatch_physical_map = torch.full(
+        size=(num_gpus, num_layers, num_logical_experts),
+        fill_value=-1,
+        dtype=dtype,
+    )
+
+    # 遍历每一层
+    for layer_id in range(num_layers):
+        # 遍历该层中的每一个逻辑专家
+        for logical_expert_id in range(num_logical_experts):
+            # 获取当前逻辑专家的所有物理副本ID
+            candidate_physical_expert_ids = _logical_to_all_physical_raw(
+                logical_to_all_physical_map, layer_id, logical_expert_id
+            )
+
+            # 筛选出不位于 avoid_rank 上的专家
+            experts_to_choose_from = [
+                p_id
+                for p_id in candidate_physical_expert_ids
+                if _compute_gpu_id_of_physical_expert(p_id, num_local_physical_experts)
+                != avoid_rank
+            ]
+
+            # 如果筛选后没有专家可用，则回退到使用所有候选专家
+            if not experts_to_choose_from:
+                logger.info("fallback to candidate_physical_expert_ids")
+                experts_to_choose_from = candidate_physical_expert_ids
+
+            # 获取当前逻辑专家在所有GPU上的分派映射视图
+            output_partial = logical_to_rank_dispatch_physical_map[
+                :, layer_id, logical_expert_id
+            ]
+
+            # 为每个物理专家初始化负载计数器
+            load = {p_id: 0 for p_id in experts_to_choose_from}
+
+            # 遍历所有GPU，为每个GPU分配一个专家
+            for gpu_id in range(num_gpus):
+                # 为了在负载相同时打破僵局，随机打乱候选专家列表
+                shuffled_experts = list(experts_to_choose_from)
+                r.shuffle(shuffled_experts)
+
+                # 从候选专家中选择一个当前负载最低的专家
+                chosen_expert = min(shuffled_experts, key=lambda p_id: load[p_id])
+
+                # 将选中的专家分配给当前GPU
+                output_partial[gpu_id] = chosen_expert
+                # 更新被选中专家的负载计数
+                load[chosen_expert] += 1
+
+    # 断言确保所有条目都已被成功分配
+    assert torch.all(logical_to_rank_dispatch_physical_map != -1)
+
+    # 获取原始张量的设备信息
+    device = logical_to_all_physical_map.device
+    # 返回属于当前ep_rank的分派映射表，并移动到正确的设备上
+    return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)
 
 
 # TODO optimize performance (rewrite and/or run in separate process with overlap)

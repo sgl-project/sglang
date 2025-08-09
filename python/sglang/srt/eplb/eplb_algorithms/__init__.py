@@ -21,6 +21,7 @@ def rebalance_experts(
     num_groups: Optional[int],
     num_nodes: int,
     algorithm: EplbAlgorithm,
+    broken_ranks: torch.Tensor,
 ):
     if algorithm in [EplbAlgorithm.deepseek, EplbAlgorithm.deepseek_hierarchical]:
         return deepseek.rebalance_experts(
@@ -30,6 +31,7 @@ def rebalance_experts(
             num_nodes=num_nodes,
             num_gpus=num_physical_experts // num_local_physical_experts,
             enable_hierarchical=algorithm == EplbAlgorithm.deepseek_hierarchical,
+            broken_ranks=broken_ranks,
         )
 
     if algorithm in [

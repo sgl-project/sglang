@@ -174,6 +174,7 @@ def rebalance_experts(
     num_nodes: int,
     num_gpus: int,
     enable_hierarchical: bool,
+    broken_ranks: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Entry point for expert-parallelism load balancer.
@@ -193,7 +194,16 @@ def rebalance_experts(
 
     num_layers, num_logical_experts = weight.shape
     weight = weight.float().cpu()
-    if enable_hierarchical:
+    num_broken_ranks = broken_ranks.sum().item()
+    num_local_experts = num_replicas // num_gpus
+    num_ok_gpus = num_gpus - num_broken_ranks
+    if num_broken_ranks > 0:
+        # Must fall back to global load-balance policy
+        # and fix some params
+        phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+            weight, num_local_experts * num_ok_gpus, 1, 1, num_ok_gpus
+        )
+    elif enable_hierarchical:
         # use hierarchical load-balance policy
         phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
             weight, num_replicas, num_groups, num_nodes, num_gpus
@@ -213,10 +223,22 @@ def rebalance_experts(
     log2phy.view(num_layers, -1).scatter_(
         -1,
         phy2log * maxlogcnt + phyrank,
-        torch.arange(num_replicas, dtype=torch.int64, device=log2phy.device).expand(
-            num_layers, -1
-        ),
+        torch.arange(
+            num_local_experts * num_ok_gpus, dtype=torch.int64, device=log2phy.device
+        ).expand(num_layers, -1),
     )
+    if num_broken_ranks > 0:
+        phy2log_slices = list(phy2log.view(num_layers, num_ok_gpus, -1).unbind(dim=1))
+        broken_ranks_list = broken_ranks.tolist()
+        for idx, broken in enumerate(broken_ranks_list):
+            if broken:
+                phy2log_slices.insert(idx, torch.zeros_like(phy2log_slices[0]))
+                log2phy = torch.where(
+                    log2phy >= idx * num_local_experts,
+                    log2phy + num_local_experts,
+                    log2phy,
+                )
+        phy2log = torch.stack(phy2log_slices, dim=1).contiguous().view(num_layers, -1)
     return phy2log, log2phy, logcnt
 
 
