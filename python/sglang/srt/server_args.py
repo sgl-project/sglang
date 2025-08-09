@@ -251,6 +251,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
+    enable_flashinfer_mxfp4_bf16_moe: bool = False
     scheduler_recv_interval: int = 1
 
     # Debug tensor dumps
@@ -1808,6 +1809,11 @@ class ServerArgs:
             help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
         )
         parser.add_argument(
+            "--enable-flashinfer-mxfp4-bf16-moe",
+            action="store_true",
+            help="Enable FlashInfer MXFP4 MoE backend with bf16 input precision for modelopt_fp4 quant on Blackwell.",
+        )
+        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -2103,11 +2109,18 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and is_mxfp4_quant_format:
-                self.enable_flashinfer_mxfp4_moe = True
-                self.enable_triton_kernel_moe = False
-                logger.warning(
-                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                # TODO we should use --moe-backend
+                num_enabled_backends = (
+                    int(self.enable_flashinfer_mxfp4_moe)
+                    + int(self.enable_flashinfer_mxfp4_bf16_moe)
+                    + int(self.enable_triton_kernel_moe)
                 )
+                assert num_enabled_backends <= 1
+                if num_enabled_backends == 0:
+                    self.enable_flashinfer_mxfp4_moe = True
+                    logger.warning(
+                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                    )
             else:
                 if self.enable_triton_kernel_moe:
                     assert (
