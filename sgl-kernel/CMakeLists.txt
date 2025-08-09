@@ -278,6 +278,7 @@ set(SOURCES
     "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
     "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
     "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
+    "csrc/memory/store.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
