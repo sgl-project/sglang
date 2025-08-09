@@ -10,7 +10,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.qwen_vl import smart_resize
+from sglang.srt.multimodal.processors.qwen_vl import resize_image_async
 
 
 class DotsVLMImageProcessor(BaseMultimodalProcessor):
@@ -70,26 +70,17 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        def resize_image(image, size_factor: int = self.IMAGE_FACTOR) -> Image.Image:
-            width, height = image.size
-            min_pixels = self.MIN_PIXELS
-            max_pixels = self.MAX_PIXELS
-            resized_height, resized_width = smart_resize(
-                height,
-                width,
-                factor=size_factor,
-                min_pixels=min_pixels,
-                max_pixels=max_pixels,
-            )
-            image = image.resize((resized_width, resized_height))
-            return image
-
-        async def resize_image_async(image):
-            return resize_image(image)
-
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
+            resize_tasks = [
+                resize_image_async(
+                    image,
+                    min_pixels=self.MIN_PIXELS,
+                    max_pixels=self.MAX_PIXELS,
+                    size_factor=self.IMAGE_FACTOR,
+                )
+                for image in base_output.images
+            ]
             base_output.images = await asyncio.gather(*resize_tasks)
 
         combined_mm_item, input_ids, _ = self.process_and_combine_mm_data(
