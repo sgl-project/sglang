@@ -85,7 +85,7 @@ jobs:
           python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 10
 
   unit-test-backend-2-gpu:
-    needs: [check-changes, unit-test-frontend]
+    needs: [check-changes]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
