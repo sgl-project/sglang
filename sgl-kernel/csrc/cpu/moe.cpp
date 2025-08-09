@@ -972,6 +972,7 @@ static inline void check_moe_scales(
 // topk_weights: [M, topk]
 // topk_ids: [M, topk] (int32_t)
 //
+
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states,
     at::Tensor& w1,
@@ -981,8 +982,11 @@ at::Tensor fused_experts_cpu(
     bool inplace,
     bool use_int8_w8a8,
     bool use_fp8_w8a16,
+    bool use_int4_w4a16,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
+    const std::optional<at::Tensor>& w1_zero,
+    const std::optional<at::Tensor>& w2_zero,
     const std::optional<std::vector<int64_t>> block_size,
     const std::optional<at::Tensor>& a1_scale,
     const std::optional<at::Tensor>& a2_scale,
@@ -1028,8 +1032,8 @@ at::Tensor fused_experts_cpu(
   // check weight shapes
   CHECK_EQ(w2.size(0), E);
   CHECK_EQ(w2.size(1), K);
-  CHECK_EQ(packed_w1.size(2), packed_K);
-  CHECK_EQ(packed_w2.size(2), packed_N);
+  CHECK_EQ(packed_w1.size(2), packed_K / (use_int4_w4a16 ? 2 : 1));
+  CHECK_EQ(packed_w2.size(2), packed_N / (use_int4_w4a16 ? 2 : 1));
 
   // check scales
   check_moe_scales(use_int8_w8a8, use_fp8_w8a16, w1_scale, w2_scale, block_size, a1_scale, a2_scale);
@@ -1098,6 +1102,9 @@ at::Tensor fused_experts_cpu(
   if (use_fp8_w8a16) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * BLOCK_N * std::max(K, N) * 2;
   }
+  if (use_int4_w4a16) {
+    buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * BLOCK_N * std::max(K, N) * 2;
+  }
 
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
 
@@ -1163,6 +1170,40 @@ at::Tensor fused_experts_cpu(
           block_size_N,
           block_size_K,
           topk_weights_.data_ptr<float>(),
+          sorted_ids,
+          expert_ids,
+          offsets,
+          M,
+          N,
+          K,
+          E,
+          topk,
+          num_tokens_post_pad);
+    } else if (use_int4_w4a16) {
+      scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
+      float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));  // Ctmp is ignored?
+      scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
+      scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
+      const int group_size = K / w1_zero.value().size(1);
+
+      // TODO: check scales and zeros
+      fused_experts_int4_w4a16_kernel_impl<scalar_t>(
+          out_hidden_states.data_ptr<scalar_t>(),
+          intermediate_cache0,
+          intermediate_cache1,
+          intermediate_cache2,
+          A_tmp,
+          B_tmp,
+          C_tmp,
+          hidden_states.data_ptr<scalar_t>(),
+          reinterpret_cast<const at::quint4x2*>(packed_w1.data_ptr<uint8_t>()),
+          reinterpret_cast<const at::quint4x2*>(packed_w2.data_ptr<uint8_t>()),
+          w1_zero.value().data_ptr<uint8_t>(),
+          w2_zero.value().data_ptr<uint8_t>(),
+          w1_scale.value().data_ptr<scalar_t>(),
+          w2_scale.value().data_ptr<scalar_t>(),
+          group_size,
+          topk_weights.data_ptr<float>(),
           sorted_ids,
           expert_ids,
           offsets,
