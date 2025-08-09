@@ -49,6 +49,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "Fp8LinearMethod",
     "BlockInt8LinearMethod",
     "MarlinLinearMethod",
+    "AWQW4A8MacheteLinearMethod",
     "QQQLinearMethod",
     "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod",
@@ -140,6 +141,7 @@ class LinearBase(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
+        self.prefix = prefix
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:

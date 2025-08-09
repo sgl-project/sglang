@@ -847,6 +847,7 @@ class ServerArgs:
                 "qoq",
                 "w4afp8",
                 "mxfp4",
+                "w4a8_machete",
             ],
             help="The quantization method.",
         )

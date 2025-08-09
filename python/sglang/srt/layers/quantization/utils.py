@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from copy import deepcopy
 from types import MappingProxyType
@@ -9,6 +11,8 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy
 import torch
+from sgl_kernel import machete_prepack_B
+from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
@@ -474,3 +478,104 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
         g_idx.to(device=orig_device),
         sort_indices.to(device=orig_device),
     )
+
+
+def pack_rows(
+    q_w: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+):
+    assert q_w.shape == (size_k, size_n)
+
+    pack_factor = get_pack_factor(num_bits)
+    assert size_k % pack_factor == 0
+
+    orig_device = q_w.device
+
+    q_w = q_w.cpu().numpy().astype(numpy.uint32)
+
+    q_res = numpy.zeros((size_k // pack_factor, size_n), dtype=numpy.uint32)
+
+    for i in range(pack_factor):
+        q_res |= q_w[i::pack_factor, :] << num_bits * i
+
+    q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
+    return q_res
+
+
+def unpack_qweight(qweight: torch.Tensor, bits: int):
+    AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
+
+    shifts = torch.arange(0, 32, bits, device=qweight.device)
+    # unpacking columnwise
+    iweights = torch.bitwise_right_shift(qweight[:, :, None], shifts[None, None, :]).to(
+        torch.int8  # smallest dtype available
+    )
+    iweights = iweights.view(iweights.shape[0], -1)
+
+    reverse_order_tensor = torch.arange(
+        iweights.shape[-1],
+        dtype=torch.int32,
+        device=iweights.device,
+    )
+
+    reverse_order_tensor = reverse_order_tensor.view(-1, 32 // bits)
+    reverse_order_tensor = reverse_order_tensor[:, AWQ_REVERSE_ORDER]
+    reverse_order_tensor = reverse_order_tensor.view(-1)
+
+    iweights = iweights[:, reverse_order_tensor]
+    iweights = torch.bitwise_and(iweights, (2**bits) - 1)
+
+    return iweights
+
+
+def machete_repack(model_qweight):
+    wtype = scalar_types.uint4b8
+    stype = torch.bfloat16
+    atype = torch.float8_e4m3fn
+    w_q = unpack_qweight(model_qweight, bits=4)
+    k, n = w_q.shape
+    w_q = pack_rows(w_q, wtype.size_bits, *w_q.shape)
+    if n % 128 != 0:
+        remainder = (n + 127) // 128 * 128 - n
+        w_q = torch.nn.functional.pad(w_q, (0, remainder), mode="constant", value=0)
+    w_q = w_q.t().contiguous().t()
+    return machete_prepack_B(w_q, atype, wtype, stype)
+
+
+def machete_quantize_and_pack(
+    atype: torch.dtype,
+    w: torch.Tensor,
+    wtype: ScalarType,
+    stype: Optional[torch.dtype],
+    group_size: Optional[int],
+    zero_points: bool = False,
+):
+    assert wtype.is_integer(), "TODO: support floating point weights"
+
+    w_ref, w_q, w_s, w_zp = quantize_weights(
+        w,
+        wtype,
+        group_size=group_size,
+        zero_points=zero_points,
+        ref_zero_points_after_scales=True,
+    )
+
+    w_q = pack_rows(w_q, wtype.size_bits, *w_q.shape)
+    w_q = w_q.t().contiguous().t()  # convert to col major
+
+    w_q_machete = machete_prepack_B(w_q, atype, wtype, stype)
+    return w_ref, w_q_machete, w_s, w_zp
+
+
+def parse_machete_config(input_size, output_size):
+    machete_config_path = os.path.join(os.path.dirname(__file__), "configs/machete_mm_linear.json")
+    with open(machete_config_path, "r") as f:
+        machete_config = json.load(f)
+    for k_n, schedules in machete_config.items():
+        k, n = k_n.split("_")
+        if (input_size == int(k)) and (output_size == int(n)):
+            schedules = dict((int(k), v) for k, v in schedules.items())
+            return schedules
+    return None
