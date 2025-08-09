@@ -1835,6 +1835,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            allow_fuse_mlp_allreduce_with_next_layer=not (
+                (self.layer_id == self.config.num_hidden_layers - 1)
+                or self.is_nextn
+            ),
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
@@ -1847,9 +1851,6 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
         """Check if MLP allreduce can be fused with next layer's add_rmsnorm"""
 
-        if self.layer_id == self.config.num_hidden_layers - 1:
-            return False
-
         if get_tensor_model_parallel_world_size() <= 1:
             return False
 
@@ -1861,9 +1862,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             return False
 
         if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
-            return False
-
-        if self.is_nextn:
             return False
 
         return True
