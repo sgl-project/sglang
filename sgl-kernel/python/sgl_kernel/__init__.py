@@ -23,6 +23,8 @@ from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
+    fused_add_rmsnorm_quant,
+    fused_rmsnorm_quant,
     gelu_and_mul,
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
