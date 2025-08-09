@@ -197,6 +197,7 @@ class ModelConfig:
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "DotsVLMForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -657,6 +658,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 multimodal_model_archs = [
     "CLIPModel",
     "DeepseekVL2ForCausalLM",
+    "DotsVLMForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
