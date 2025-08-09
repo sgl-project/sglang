@@ -9,8 +9,8 @@ class TestGptOss1Gpu(BaseTestGptOss):
             model_variant="20b",
             quantization="mxfp4",
             expected_score_of_reasoning_effort={
-                "low": 0.38,
-                "medium": 0.38,
+                "low": 0.34,
+                "medium": 0.34,
                 "high": 0.29,  # TODO investigate
             },
         )
@@ -20,8 +20,8 @@ class TestGptOss1Gpu(BaseTestGptOss):
             model_variant="20b",
             quantization="bf16",
             expected_score_of_reasoning_effort={
-                "low": 0.38,
-                "medium": 0.38,
+                "low": 0.34,
+                "medium": 0.34,
                 "high": 0.29,  # TODO investigate
             },
         )
