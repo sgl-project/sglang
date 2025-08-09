@@ -212,8 +212,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.topk_indices_dtype = None
         self.use_triton_kernels = global_server_args_dict["enable_triton_kernel_moe"]
         self.with_bias = False
-        self.enable_flashinfer_mxfp4_moe = global_server_args_dict["enable_flashinfer_mxfp4_moe"]
-        self.enable_flashinfer_mxfp4_bf16_moe = global_server_args_dict["enable_flashinfer_mxfp4_bf16_moe"]
+        self.enable_flashinfer_mxfp4_moe = global_server_args_dict[
+            "enable_flashinfer_mxfp4_moe"
+        ]
+        self.enable_flashinfer_mxfp4_bf16_moe = global_server_args_dict[
+            "enable_flashinfer_mxfp4_bf16_moe"
+        ]
 
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
@@ -248,7 +252,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # for to hold non-uniform sharded tensor as well as swizzling
         intermediate_size_per_partition_after_pad = intermediate_size
         if _is_sm100_supported:
-            if self.enable_flashinfer_mxfp4_moe or self.enable_flashinfer_mxfp4_bf16_moe:
+            if (
+                self.enable_flashinfer_mxfp4_moe
+                or self.enable_flashinfer_mxfp4_bf16_moe
+            ):
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size, 256
                 )
