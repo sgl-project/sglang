@@ -21,7 +21,6 @@ apt install -y git libnuma-dev
 if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
     # so we can only use pip with `--break-system-packages`
-    pip install --upgrade pip --break-system-packages
     PIP_CMD="pip --break-system-packages"
 else
     # In normal cases, we use uv, which is much faster than pip.
