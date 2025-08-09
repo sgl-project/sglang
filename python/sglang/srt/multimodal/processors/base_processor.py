@@ -269,7 +269,7 @@ class BaseMultimodalProcessor(ABC):
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:"):]
+                path = image[len("video:") :]
                 # Estimate frames for the video
                 vr = VideoReader(path, ctx=cpu(0))
                 num_frames = len(vr)
