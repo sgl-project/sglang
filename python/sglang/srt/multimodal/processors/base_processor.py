@@ -207,7 +207,8 @@ class BaseMultimodalProcessor(ABC):
         ]
 
     def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None, **kwargs
+        self, input_text, images=None, videos=None, audios=None,
+        **kwargs
     ) -> dict:
         """
         process multimodal data with transformers AutoProcessor
@@ -272,7 +273,7 @@ class BaseMultimodalProcessor(ABC):
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:") :]
+                path = image[len("video:"):]
                 # Estimate frames for the video
                 vr = VideoReader(path, ctx=cpu(0))
                 num_frames = len(vr)
@@ -565,6 +566,7 @@ class BaseMultimodalProcessor(ABC):
         ret = self.process_mm_data(
             input_text=input_text, images=images, audios=audios, videos=videos, **kwargs
         )
+        print(f"{ret.keys()=}")
 
         input_ids = ret["input_ids"].flatten()
         collected_items = self.collect_mm_items_from_processor_output(ret)
