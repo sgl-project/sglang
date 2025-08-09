@@ -902,6 +902,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
 
@@ -944,6 +947,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             enable_custom_logit_processor=enable_custom_logit_processor,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            is_prefill_only=all(
+                req.sampling_params.max_new_tokens == 0 for req in reqs
+            ),
             chunked_req=chunked_req,
         )
 
