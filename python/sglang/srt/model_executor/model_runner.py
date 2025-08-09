@@ -498,11 +498,14 @@ class ModelRunner:
                 self.mem_fraction_static *= 0.85
 
         if (
-            server_args.attention_backend == "fa3"
-            and server_args.enable_hierarchical_cache
+            server_args.enable_hierarchical_cache
             and server_args.hicache_io_backend == "kernel"
         ):
-            if server_args.decode_attention_backend is None:
+            # if `decode_attention_backend` is not set, we can override it
+            if (
+                server_args.decode_attention_backend is None
+                and server_args.attention_backend == "fa3"
+            ):
                 if not self.use_mla_backend:
                     server_args.decode_attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
@@ -517,7 +520,7 @@ class ModelRunner:
                 )
             # if we cannot override `decode_attention_backend`, we have to fallback to `direct`
             # which may not be optimal for performance especially when page size is small.
-            if server_args.decode_attention_backend == "fa3":
+            elif server_args.decode_attention_backend == "fa3":
                 server_args.hicache_io_backend = "direct"
                 logger.info(
                     "FlashAttention3 decode attention is not compatible with hierarchical cache. "
