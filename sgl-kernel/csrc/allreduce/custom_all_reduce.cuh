@@ -223,7 +223,6 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
-
 }
 
 template <typename P>
@@ -282,7 +281,6 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
-
 }
 
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
