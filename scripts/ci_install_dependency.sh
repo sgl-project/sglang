@@ -52,7 +52,7 @@ if [ "$IS_BLACKWELL" != "1" ]; then
 fi
 
 # Install FlashMLA for attention backend tests
-# pip install git+https://github.com/deepseek-ai/FlashMLA.git
+# uv pip install git+https://github.com/deepseek-ai/FlashMLA.git
 
 # Show current packages
 uv pip list
