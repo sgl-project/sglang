@@ -2122,7 +2122,8 @@ class ServerArgs:
         )
 
     def model_specific_adjustments(self):
-        model_arch = self.get_hf_config().architectures[0]
+        hf_config = self.get_hf_config()
+        model_arch = hf_config.architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
             if self.attention_backend is None:
                 # default is triton, but we could have trtllm_mha as an option
@@ -2131,16 +2132,15 @@ class ServerArgs:
                 self.attention_backend == "trtllm_mha"
                 or self.attention_backend == "triton"
             )
-            quantization_config = getattr(
-                self.get_hf_config(), "quantization_config", None
-            )
+            quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
                 and quantization_config.get("quant_method") == "mxfp4"
             )
+
             if is_sm100_supported() and is_mxfp4_quant_format:
                 self.moe_runner_backend = "flashinfer_mxfp4"
-                logger.info(
+                logger.warning(
                     "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                 )
             else:
@@ -2150,7 +2150,7 @@ class ServerArgs:
                     ), "Triton kernel MoE is only supported when ep_size == 1"
                 if self.moe_runner_backend is None and self.ep_size == 1:
                     self.moe_runner_backend = "triton_kernel"
-                    logger.info(
+                    logger.warning(
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
                     )
             self.disable_hybrid_swa_memory = True
