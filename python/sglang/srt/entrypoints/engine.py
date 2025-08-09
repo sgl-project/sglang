@@ -67,6 +67,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
+    get_bool_env_var,
     get_zmq_socket,
     is_cuda,
     kill_process_tree,
@@ -646,7 +647,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
-    if _is_cuda:
+    if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
             "0.3.3",
