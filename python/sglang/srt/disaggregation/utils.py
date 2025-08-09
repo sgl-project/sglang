@@ -4,11 +4,12 @@ import dataclasses
 import os
 import random
 import threading
+import time
 import warnings
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import requests
@@ -19,6 +20,8 @@ from sglang.srt.utils import get_ip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_metrics_mixin import SchedulerMetricsCollector
 
 #########################
 # Constants & Enums
@@ -345,6 +348,62 @@ def register_disaggregation_server(
         warnings.warn(
             f"Failed to register disaggregation server: {res.status_code} {res.text}"
         )
+
+
+#########################
+# Monitor Metrics
+#########################
+
+
+def get_metrics_collector(scheduler: Scheduler):
+    if scheduler.enable_metrics:
+        return scheduler.metrics_collector
+    return None
+
+
+class KVCacheTransferLatencyMonitor:
+    def __init__(
+        self,
+        metrics_collector: Optional[SchedulerMetricsCollector] = None,
+    ):
+        self.metrics_collector = metrics_collector
+        self.kvcache_transfer_latency_table: Dict[int, Dict[str, float]] = {}
+
+    def collect_begin_timestamp(self, room: int, dst_id: str):
+        if self.metrics_collector is None:
+            return
+
+        if room not in self.kvcache_transfer_latency_table:
+            self.kvcache_transfer_latency_table[room] = {dst_id: -time.time()}
+        else:
+            if dst_id not in self.kvcache_transfer_latency_table[room]:
+                self.kvcache_transfer_latency_table[room][dst_id] = 0
+
+            self.kvcache_transfer_latency_table[room][dst_id] -= time.time()
+
+    def collect_finish_timestamp(self, room: int, dst_id: str, ret: int):
+        if self.metrics_collector is None:
+            return
+
+        assert room in self.kvcache_transfer_latency_table
+        assert dst_id in self.kvcache_transfer_latency_table[room]
+        if ret != 0:
+            self.kvcache_transfer_latency_table[room][dst_id] = 0
+        else:
+            self.kvcache_transfer_latency_table[room][dst_id] += time.time()
+
+    def record(self, room: int, dst_id: str):
+        if self.metrics_collector is not None:
+            self.metrics_collector.observe_kvcache_transfer_latency(
+                self.kvcache_transfer_latency_table[room].pop(dst_id)
+            )
+
+    def pop_room(self, room: int):
+        if (
+            self.metrics_collector is not None
+            and room in self.kvcache_transfer_latency_table
+        ):
+            self.kvcache_transfer_latency_table.pop(room)
 
 
 #########################
