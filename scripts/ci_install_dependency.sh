@@ -25,7 +25,7 @@ export UV_SYSTEM_PYTHON=true
 uv pip uninstall flashinfer_python sgl-kernel sglang vllm || true
 
 # Install the main package
-uv pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION}
+uv pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION}  --index-strategy unsafe-best-match
 
 if [ "$IS_BLACKWELL" = "1" ]; then
     # TODO auto determine sgl-kernel version
