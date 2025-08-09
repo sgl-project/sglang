@@ -302,7 +302,8 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
-            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            # TODO: understand why this fixes the race, why no cpu-gpu sync fixed it?
+            max_extend_len = torch.max(forward_batch.extend_seq_lens)
             num_kv_splits = None
 
         self.forward_metadata = ForwardMetadata(
@@ -670,6 +671,10 @@ class TritonAttnBackend(AttentionBackend):
             sliding_window_size = -1
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
+        
+        # TODO: understand why this fixes the race
+        if isinstance(self.forward_metadata.max_extend_len, torch.Tensor):
+            self.forward_metadata.max_extend_len = self.forward_metadata.max_extend_len.item()
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
