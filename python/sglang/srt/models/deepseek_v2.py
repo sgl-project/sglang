@@ -1907,7 +1907,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch
         )
         hidden_states = self.mlp(
-            hidden_states, forward_batch, can_fuse_mlp_allreduce, use_reduce_scatter
+            hidden_states, forward_batch,
+            can_fuse_mlp_allreduce=can_fuse_mlp_allreduce,
+            use_reduce_scatter=use_reduce_scatter,
         )
 
         if can_fuse_mlp_allreduce:
