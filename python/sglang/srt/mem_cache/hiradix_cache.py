@@ -127,24 +127,36 @@ class HiRadixCache(RadixCache):
         return height
 
     def write_backup(self, node: TreeNode, write_back=False):
-        host_indices = self.cache_controller.write(
-            device_indices=node.value,
-            node_id=node.id,
-        )
+        host_indices = self.cache_controller.mem_pool_host.alloc(len(node.value))
         if host_indices is None:
             self.evict_host(len(node.value))
-            host_indices = self.cache_controller.write(
+            host_indices = self.cache_controller.mem_pool_host.alloc(len(node.value))
+
+        allocated = bool(host_indices is not None)
+        to_init_backup = allocated
+        if self.enable_storage and self.tp_world_size > 1:
+            # todo: mitigate the overhead of this sync, which is not needed for most cases
+            to_init_tensor = torch.tensor(allocated, dtype=torch.int)
+            torch.distributed.all_reduce(
+                to_init_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            to_init_backup = bool(to_init_tensor.item())
+        if to_init_backup:
+            self.cache_controller.write(
                 device_indices=node.value,
+                host_indices=host_indices,
                 node_id=node.id,
             )
-        if host_indices is not None:
             node.host_value = host_indices
-            assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
         else:
+            if allocated:
+                self.cache_controller.mem_pool_host.free(host_indices)
             return 0
 
         return len(host_indices)
