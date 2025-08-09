@@ -768,14 +768,13 @@ class FlashAttentionBackend(AttentionBackend):
                 o = result
         else:
             if (
-                not global_server_args_dict["disable_chunked_prefix_cache"]
-                and forward_batch.attn_attend_prefix_cache is not None
+                forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
             ):
                 # Do multi-head attention with chunked prefix cache
-
                 if forward_batch.attn_attend_prefix_cache:
+                    assert not global_server_args_dict["disable_chunked_prefix_cache"]
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
@@ -784,7 +783,8 @@ class FlashAttentionBackend(AttentionBackend):
                     chunk_idx = forward_batch.prefix_chunk_idx
                     assert chunk_idx >= 0
 
-                    output, lse, *rest = flash_attn_varlen_func(
+                    assert forward_batch.mha_return_lse
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -798,7 +798,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
-                    output, lse, *rest = flash_attn_varlen_func(
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -808,9 +808,13 @@ class FlashAttentionBackend(AttentionBackend):
                         max_seqlen_k=metadata.max_seq_len_q,
                         softmax_scale=layer.scaling,
                         causal=True,
-                        return_softmax_lse=True,
+                        return_softmax_lse=forward_batch.mha_return_lse,
                     )
-                return output, lse
+                if forward_batch.mha_return_lse:
+                    output, lse, *rest = output
+                    lse = torch.transpose(lse, 0, 1).contiguous()
+                    return output, lse
+                return output
             else:
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
