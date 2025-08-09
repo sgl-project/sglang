@@ -352,9 +352,11 @@ __device__ void moe_fused_gate_impl(
 
             // Clear in shared memory if in current tile
             if (tile_idx == current_tile_idx) {
-              int shared_idx = thread_shared_offset + local_idx * (WARP_SIZE + 1);
-              shared_bias[shared_idx] = static_cast<T>(FLT_MAX);
+              int shared_idx = thread_shared_offset + local_idx * WARP_SIZE;
+              shared_bias[shared_idx] = static_cast<T>(-FLT_MAX);  // 注意这里应该是-FLT_MAX
             }
+            // Whether or not in the current tile, ensure that the expert has been cleared in the global state.
+            thread_read_ptr[expert_mod] = static_cast<T>(-FLT_MAX); 
 
             // Reset and recalculate global maximums
             global_max_val = static_cast<T>(-FLT_MAX);
@@ -364,23 +366,28 @@ __device__ void moe_fused_gate_impl(
 
 #pragma unroll
             for (int i = 0; i < params.VPT; ++i) {
+              // Skip the cleared expert
+              if (i == expert_mod) continue;
+              
               int tile_idx = i / 32;
               int local_idx = i % 32;
 
               T val;
               if (tile_idx == current_tile_idx) {
-                int shared_idx = thread_shared_offset + local_idx * (WARP_SIZE + 1);
+                int shared_idx = thread_shared_offset + local_idx * WARP_SIZE;
                 val = shared_bias[shared_idx];
               } else {
                 val = recalculate_sigmoid(i, thread_read_ptr) + bias_thread_read_ptr[i];
               }
 
-              if (cmp_gt(val, global_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
+              if (cmp_gt(val, global_max_val) && !cmp_eq(val, static_cast<T>(-FLT_MAX)) && 
+                  !cmp_eq(val, static_cast<T>(FLT_MAX))) {
                 global_max_val_second = global_max_val;
                 global_max_second_idx = global_max_idx;
                 global_max_val = val;
                 global_max_idx = i;
-              } else if (cmp_gt(val, global_max_val_second) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
+              } else if (cmp_gt(val, global_max_val_second) && !cmp_eq(val, static_cast<T>(-FLT_MAX)) && 
+                         !cmp_eq(val, static_cast<T>(FLT_MAX))) {
                 global_max_val_second = val;
                 global_max_second_idx = i;
               }
