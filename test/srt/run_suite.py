@@ -78,6 +78,7 @@ suites = {
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
+        TestFile("test_multi_tokenizer.py", 200),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 234),
         TestFile("test_penalty.py", 41),
