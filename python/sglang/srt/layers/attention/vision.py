@@ -245,6 +245,8 @@ class VisionTritonAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor],
+        bsz: int,
+        seq_len: int,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -253,6 +255,8 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
 
         # [b * s, head, head_size]
         output = torch.empty_like(q)
@@ -401,7 +405,11 @@ class VisionAttention(nn.Module):
         # priority: server_args > passed qkv_backend > sdpa
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
-                qkv_backend = "sdpa"
+                if is_cuda():
+                    # Double prefill throughput by setting attn backend to Triton on CUDA
+                    qkv_backend = "triton_attn"
+                else:
+                    qkv_backend = "sdpa"
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         else:
             qkv_backend = global_server_args_dict["mm_attention_backend"]

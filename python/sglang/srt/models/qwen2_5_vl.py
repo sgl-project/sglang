@@ -114,7 +114,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         num_heads: int,
         hidden_act="silu",
         norm_layer: Type[nn.Module] = None,
-        attn_implementation: Optional[str] = "sdpa",
+        attn_implementation: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -123,7 +123,12 @@ class Qwen2_5_VisionBlock(nn.Module):
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = Qwen2RMSNorm(dim, eps=1e-6)
         self.norm2 = Qwen2RMSNorm(dim, eps=1e-6)
-        if attn_implementation == "sdpa":
+
+        if attn_implementation is None:
+            softmax_in_single_precision = False
+            qkv_backend = None
+            flatten_batch = True
+        elif attn_implementation == "sdpa":
             softmax_in_single_precision = False
             qkv_backend = "sdpa"
             flatten_batch = True
@@ -268,7 +273,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
                     num_heads=num_heads,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="sdpa",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                 )
