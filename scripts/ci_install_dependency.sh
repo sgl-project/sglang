@@ -2,68 +2,71 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
-MODE_BLACKWELL=${MODE_BLACKWELL:-0}
+IS_BLACKWELL=${IS_BLACKWELL:-0}
 
-CU_VERSION="cu126"
-if [ "$MODE_BLACKWELL" = "1" ]; then
+if [ "$IS_BLACKWELL" = "1" ]; then
     CU_VERSION="cu129"
+else
+    CU_VERSION="cu126"
 fi
 
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
-if [ "$MODE_BLACKWELL" = "1" ]; then
-    apt-get install -y git libnuma-dev
-fi
+# Install apt packages
+apt install -y git libnuma-dev
 
-# Update pip
-if [ "$MODE_BLACKWELL" != "1" ]; then
+# Install uv
+if [ "$IS_BLACKWELL" = "1" ]; then
+    # The blackwell CI runner has some issues with pip and uv,
+    # so we can only use pip with `--break-system-packages`
+    PIP_CMD="pip"
+    PIP_INSTALL_SUFFIX="--break-system-packages"
+
+    # Clean up existing installations
+    $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
+else
+    # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
-fi
+    pip install uv
+    export UV_SYSTEM_PYTHON=true
 
-# Clean up existing installations
-pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm --break-system-packages || true
-pip cache purge || true
-rm -rf /root/.cache/flashinfer
-# TODO handle other python versions
-rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
-rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
+    PIP_CMD="uv pip"
+    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
+
+    # Clean up existing installations
+    $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
+fi
 
 # Install the main package
-pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} --break-system-packages
+$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
-if [ "$MODE_BLACKWELL" = "1" ]; then
+if [ "$IS_BLACKWELL" = "1" ]; then
     # TODO auto determine sgl-kernel version
     SGL_KERNEL_VERSION=0.3.2
-    pip3 install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}-cp39-abi3-manylinux2014_x86_64.whl --break-system-packages
+    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages
-pip list
+$PIP_CMD list
 
 # Install additional dependencies
-pip install mooncake-transfer-engine==0.3.5 nvidia-cuda-nvrtc-cu12 --break-system-packages
+$PIP_CMD install mooncake-transfer-engine==0.3.5 nvidia-cuda-nvrtc-cu12 py-spy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
 
-if [ "$MODE_BLACKWELL" != "1" ]; then
+if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
     git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-    pip install -e lmms-eval/ --break-system-packages
+    $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
+
+    # Install xformers
+    $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
 fi
 
 # Install FlashMLA for attention backend tests
-# pip install git+https://github.com/deepseek-ai/FlashMLA.git --break-system-packages
-
-# Install hf_xet
-pip install huggingface_hub[hf_xet] --break-system-packages
-
-if [ "$MODE_BLACKWELL" != "1" ]; then
-    # Install xformers
-    pip install -U xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps --force-reinstall --break-system-packages
-fi
-
-# To help dumping traces when timeout occurred
-pip install py-spy --break-system-packages
+# $PIP_CMD install git+https://github.com/deepseek-ai/FlashMLA.git $PIP_INSTALL_SUFFIX
 
 # Show current packages
-pip list
+$PIP_CMD list
+
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
