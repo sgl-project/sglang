@@ -391,7 +391,12 @@ class ModelRunner:
                 2.3 Otherwise, we will use triton backend.
             """
 
-            if not self.use_mla_backend:
+            if server_args.prefill_attention_backend is not None and (
+                server_args.prefill_attention_backend
+                == server_args.decode_attention_backend
+            ):  # override the default attention backend
+                server_args.attention_backend = server_args.prefill_attention_backend
+            elif not self.use_mla_backend:
                 # MHA architecture
                 if (
                     is_hopper_with_cuda_12_3()
