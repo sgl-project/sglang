@@ -397,7 +397,6 @@ class ModelRunner:
                     is_hopper_with_cuda_12_3()
                     and is_no_spec_infer_or_topk_one(server_args)
                     and is_fa3_default_architecture(self.model_config.hf_config)
-                    and (not server_args.enable_hierarchical_cache)
                 ):
                     server_args.attention_backend = "fa3"
                 elif _is_hip:
@@ -410,12 +409,8 @@ class ModelRunner:
                     )
             else:
                 # MLA architecture
-                if is_hopper_with_cuda_12_3() and (
-                    not server_args.enable_hierarchical_cache
-                ):
+                if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
-                elif is_sm100_supported():
-                    server_args.attention_backend = "flashinfer"
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
@@ -428,7 +423,9 @@ class ModelRunner:
                 elif _is_npu:
                     server_args.attention_backend = "ascend"
                 else:
-                    server_args.attention_backend = "triton"
+                    server_args.attention_backend = (
+                        "flashinfer" if is_sm100_supported() else "triton"
+                    )
             logger.info(
                 f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default."
             )
@@ -499,6 +496,32 @@ class ModelRunner:
         if server_args.attention_backend == "aiter":
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
+
+        if (
+            server_args.attention_backend == "fa3"
+            and server_args.enable_hierarchical_cache
+        ):
+            if server_args.decode_attention_backend is None:
+                if not self.use_mla_backend:
+                    server_args.decode_attention_backend = (
+                        "flashinfer" if is_flashinfer_available() else "triton"
+                    )
+                else:
+                    server_args.decode_attention_backend = (
+                        "flashinfer" if is_sm100_supported() else "triton"
+                    )
+                logger.info(
+                    "FlashAttention3 decode attention is not compatible with hierarchical cache. "
+                    f"Setting decode_attention_backend to '{server_args.decode_attention_backend}'."
+                )
+            # if we cannot override `decode_attention_backend`, we have to fallback to `direct`
+            # which may not be optimal for performance especially when page size is small.
+            if server_args.decode_attention_backend == "fa3":
+                server_args.hicache_io_backend = "direct"
+                logger.info(
+                    "FlashAttention3 decode attention is not compatible with hierarchical cache. "
+                    "Setting hicache_io_backend to 'direct'."
+                )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
