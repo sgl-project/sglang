@@ -66,6 +66,10 @@ jobs:
         run: |
           bash scripts/ci_install_rust.sh
 
+      - name: Install SGLang package
+        run: |
+          pip install -e python/
+
       - name: Build python binding
         run: |
           source "$HOME/.cargo/env"
