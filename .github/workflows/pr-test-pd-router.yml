@@ -1,4 +1,4 @@
-name: Test Disaggregation Mode
+name: PR Test (PD Router)
 
 on:
   push:
