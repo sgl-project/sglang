@@ -152,11 +152,13 @@ class LayerCommunicator:
         post_attention_layernorm: torch.nn.Module,
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
+        allow_fuse_mlp_allreduce_with_next_layer: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
         self.allow_reduce_scatter = allow_reduce_scatter
+        self.allow_fuse_mlp_allreduce_with_next_layer = allow_fuse_mlp_allreduce_with_next_layer
 
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -253,6 +255,27 @@ class LayerCommunicator:
             is CommunicateSummableTensorPairFn._scatter_hidden_states
             and forward_batch.dp_padding_mode.is_max_len()
         )
+
+    def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch: ForwardBatch) -> bool:
+        """Check if MLP allreduce can be fused with next layer's add_rmsnorm"""
+
+        if not self.allow_fuse_mlp_allreduce_with_next_layer:
+            return False
+
+        if get_tensor_model_parallel_world_size() <= 1:
+            return False
+
+        if not support_and_enable_flashinfer_allreduce_fusion():
+            return False
+
+        input_ids = getattr(forward_batch, "input_ids", None)
+        if input_ids is not None and (input_ids.shape[0] == 0 or input_ids.shape[0] > 128):
+            return False
+
+        if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
+            return False
+
+        return True
 
 
 def support_and_enable_flashinfer_allreduce_fusion():

@@ -1848,24 +1848,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
-    def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
-        """Check if MLP allreduce can be fused with next layer's add_rmsnorm"""
-
-        if get_tensor_model_parallel_world_size() <= 1:
-            return False
-
-        if not support_and_enable_flashinfer_allreduce_fusion():
-            return False
-
-        input_ids = getattr(forward_batch, "input_ids", None)
-        if input_ids is not None and (input_ids.shape[0] == 0 or input_ids.shape[0] > 128):
-            return False
-
-        if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
-            return False
-
-        return True
-
     def forward(
         self,
         positions: torch.Tensor,
