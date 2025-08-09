@@ -22,7 +22,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
     # so we can only use pip with `--break-system-packages`
     PIP_CMD="pip"
-    PIP_SUFFIX="--break-system-packages"
+    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --break-system-packages"
 
     # Clean up existing installations
     $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_SUFFIX || true
@@ -33,14 +33,14 @@ else
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
-    PIP_SUFFIX=""
+    PIP_INSTALL_SUFFIX=""
 
     # Clean up existing installations
     $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm $PIP_SUFFIX || true
 fi
 
 # Install the main package
-$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} --index-strategy unsafe-best-match $PIP_SUFFIX
+$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" = "1" ]; then
     # TODO auto determine sgl-kernel version
@@ -52,19 +52,19 @@ fi
 $PIP_CMD list
 
 # Install additional dependencies
-$PIP_CMD install mooncake-transfer-engine==0.3.5 nvidia-cuda-nvrtc-cu12 py-spy huggingface_hub[hf_xet] $PIP_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.5 nvidia-cuda-nvrtc-cu12 py-spy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
     git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-    $PIP_CMD install -e lmms-eval/ $PIP_SUFFIX
+    $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 
     # Install xformers
-    $PIP_CMD install  xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_SUFFIX
+    $PIP_CMD install  xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
 fi
 
 # Install FlashMLA for attention backend tests
-# $PIP_CMD install git+https://github.com/deepseek-ai/FlashMLA.git $PIP_SUFFIX
+# $PIP_CMD install git+https://github.com/deepseek-ai/FlashMLA.git $PIP_INSTALL_SUFFIX
 
 # Show current packages
 $PIP_CMD list
