@@ -202,6 +202,7 @@ suites = {
         TestFile("test_full_deepseek_v3.py", 250),
     ],
     "per-commit-8-gpu-b200": [
+        # TODO move it to 1-gpu or 4-gpu runner when we have one
         TestFile("test_gpt_oss_1gpu.py", 600),
         TestFile("test_gpt_oss_4gpu.py", 600),
     ],
