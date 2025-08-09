@@ -125,7 +125,14 @@ void apply_rope_pos_ids_cos_sin_cache(
       cudaStream_t main_stream = stream;
 
       // Wait for main stream to complete RoPE
-      cudaStreamWaitEvent(alt_stream, nullptr, 0);
+      // Create event for synchronization
+      cudaEvent_t event;
+      cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+
+      // Record event on main stream after RoPE completion
+      cudaEventRecord(event, main_stream);
+
+      cudaStreamWaitEvent(alt_stream, event, 0);
 
       // Copy K on main stream
       k_buffer_ptr.copy_(k_rope, /*non_blocking=*/true);
@@ -134,8 +141,12 @@ void apply_rope_pos_ids_cos_sin_cache(
       at::cuda::CUDAStreamGuard guard(at::cuda::getStreamFromExternal(alt_stream, device.index()));
       v_buffer_ptr.copy_(v, /*non_blocking=*/true);
 
+      // Record event on alt stream after V copy
+      cudaEventRecord(event, alt_stream);
       // Main stream waits for alt stream
-      cudaStreamWaitEvent(main_stream, nullptr, 0);
+      cudaStreamWaitEvent(main_stream, event, 0);
+      // Clean up
+      cudaEventDestroy(event);
     } else {
       // Synchronous copy
       k_buffer_ptr.copy_(k_rope, /*non_blocking=*/true);
