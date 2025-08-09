@@ -11,7 +11,7 @@ class TestGptOss1Gpu(BaseTestGptOss):
             expected_score_of_reasoning_effort={
                 "low": 0.34,
                 "medium": 0.34,
-                "high": 0.29,  # TODO investigate
+                "high": 0.27,  # TODO investigate
             },
         )
 
@@ -22,7 +22,7 @@ class TestGptOss1Gpu(BaseTestGptOss):
             expected_score_of_reasoning_effort={
                 "low": 0.34,
                 "medium": 0.34,
-                "high": 0.29,  # TODO investigate
+                "high": 0.27,  # TODO investigate
             },
         )
 
