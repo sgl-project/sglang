@@ -66,9 +66,9 @@ jobs:
         run: |
           bash scripts/ci_install_rust.sh
 
-      - name: Install Python deps (sglang + extras)
+      - name: Install Python deps 
         run: |
-          bash scripts/ci_install_dependency.sh
+          python3 -m pip install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/cu126
 
       - name: Build python binding
         run: |
