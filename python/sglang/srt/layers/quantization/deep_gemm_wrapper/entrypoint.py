@@ -25,15 +25,19 @@ if ENABLE_JIT_DEEPGEMM:
         from deep_gemm import (
             m_grouped_fp8_gemm_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
         )
+        from deep_gemm.config import get_num_sms as _get_num_sms
+        from deep_gemm.config import set_num_sms as _set_num_sms
     else:
         from deep_gemm import gemm_fp8_fp8_bf16_nt as _gemm_nt_f8f8bf16_raw
         from deep_gemm import get_col_major_tma_aligned_tensor
+        from deep_gemm import get_num_sms as _get_num_sms
         from deep_gemm import (
             m_grouped_gemm_fp8_fp8_bf16_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
         )
         from deep_gemm import (
             m_grouped_gemm_fp8_fp8_bf16_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
         )
+        from deep_gemm import set_num_sms as _set_num_sms
 
 
 def grouped_gemm_nt_f8f8bf16_masked(
@@ -102,9 +106,9 @@ def configure_deep_gemm_num_sms(num_sms):
     if num_sms is None:
         yield
     else:
-        original_num_sms = deep_gemm.get_num_sms()
-        deep_gemm.set_num_sms(num_sms)
+        original_num_sms = _get_num_sms()
+        _set_num_sms(num_sms)
         try:
             yield
         finally:
-            deep_gemm.set_num_sms(original_num_sms)
+            _set_num_sms(original_num_sms)
