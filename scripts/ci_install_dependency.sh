@@ -42,7 +42,7 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     pip install -e lmms-eval/
 
     # Install xformers
-    pip install -U xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps --force-reinstall
+    pip install -U xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps
 fi
 
 # Install FlashMLA for attention backend tests
