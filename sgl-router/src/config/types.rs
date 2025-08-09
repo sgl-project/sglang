@@ -197,6 +197,10 @@ pub struct RetryConfig {
     pub max_backoff_ms: u64,
     /// Backoff multiplier for exponential backoff
     pub backoff_multiplier: f32,
+    /// Jitter factor applied to backoff (0.0 - 1.0)
+    /// Effective delay D' = D * (1 + U[-j, +j])
+    #[serde(default = "default_retry_jitter_factor")]
+    pub jitter_factor: f32,
 }
 
 impl Default for RetryConfig {
@@ -206,8 +210,13 @@ impl Default for RetryConfig {
             initial_backoff_ms: 100,
             max_backoff_ms: 10000,
             backoff_multiplier: 2.0,
+            jitter_factor: 0.1,
         }
     }
+}
+
+fn default_retry_jitter_factor() -> f32 {
+    0.1
 }
 
 /// Circuit breaker configuration for worker reliability
