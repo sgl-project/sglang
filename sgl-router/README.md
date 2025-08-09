@@ -43,6 +43,7 @@ python -m build && pip install --force-reinstall dist/*.whl
 ```
 
 #### Option B: Development Mode
+
 ```bash
 pip install -e .
 ```
