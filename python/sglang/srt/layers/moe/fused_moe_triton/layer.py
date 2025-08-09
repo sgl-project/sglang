@@ -209,6 +209,7 @@ class FusedMoE(torch.nn.Module):
         self.use_enable_flashinfer_mxfp4_moe = global_server_args_dict.get(
             "enable_flashinfer_mxfp4_moe", False
         )
+        # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
         if (
             self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
