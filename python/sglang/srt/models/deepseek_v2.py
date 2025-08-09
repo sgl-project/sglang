@@ -217,9 +217,7 @@ class DeepseekV2MLP(nn.Module):
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=skip_all_reduce
-        )
+        x, _ = self.down_proj(x, skip_all_reduce=skip_all_reduce)
         return x
 
 
@@ -536,7 +534,8 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_cpu(
-        self, hidden_states: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
         skip_all_reduce: bool = False,
     ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
@@ -1834,8 +1833,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             allow_fuse_mlp_allreduce_with_next_layer=not (
-                (self.layer_id == self.config.num_hidden_layers - 1)
-                or self.is_nextn
+                (self.layer_id == self.config.num_hidden_layers - 1) or self.is_nextn
             ),
         )
 
@@ -1871,8 +1869,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         hidden_states = self.mlp(
-            hidden_states, forward_batch,
-            skip_all_reduce=self.layer_communicator.should_mlp_skip_all_reduce(forward_batch),
+            hidden_states,
+            forward_batch,
+            skip_all_reduce=self.layer_communicator.should_mlp_skip_all_reduce(
+                forward_batch
+            ),
         )
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
