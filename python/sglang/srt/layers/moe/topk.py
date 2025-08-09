@@ -308,10 +308,11 @@ class TopK(CustomOp):
                     "routed_scaling_factor != 1 is not supported for npu_moe_gating_top_k, set to 1"
                 )
 
+            router_logits = router_logits.to(torch.float32)
             return torch_npu.npu_moe_gating_top_k(
                 router_logits,
                 k=self.topk_config.top_k,
-                bias=self.topk_config.correction_bias,
+                bias=self.topk_config.correction_bias.to(torch.float32),
                 k_group=self.topk_config.topk_group,
                 group_count=self.topk_config.num_expert_group,
                 group_select_mode=1,

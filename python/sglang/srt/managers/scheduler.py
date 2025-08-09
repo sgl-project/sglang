@@ -68,6 +68,7 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     initialize_moe_config,
+    is_tbo_enabled,
 )
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -1834,7 +1835,6 @@ class Scheduler(
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-            enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )
@@ -1929,7 +1929,6 @@ class Scheduler(
         disable_cuda_graph: bool,
         spec_algorithm,
         speculative_num_draft_tokens,
-        enable_two_batch_overlap: bool,
         require_mlp_tp_gather: bool,
         disable_overlap_schedule: bool,
     ):
@@ -1979,7 +1978,7 @@ class Scheduler(
                     local_batch,
                     get_deepep_mode(),
                     get_moe_a2a_backend().is_deepep(),
-                    enable_two_batch_overlap,
+                    is_tbo_enabled(),
                 ),
             ],
             dtype=torch.int64,
