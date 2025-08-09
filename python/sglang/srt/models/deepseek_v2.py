@@ -1847,10 +1847,10 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
         """Check if MLP allreduce can be fused with next layer's add_rmsnorm"""
 
-        if (
-            self.layer_id == self.config.num_hidden_layers - 1
-            or get_tensor_model_parallel_world_size() <= 1
-        ):
+        if (self.layer_id == self.config.num_hidden_layers - 1):
+            return False
+
+        if get_tensor_model_parallel_world_size() <= 1:
             return False
 
         if not support_and_enable_flashinfer_allreduce_fusion():
