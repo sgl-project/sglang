@@ -35,7 +35,7 @@ fi
 $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
 
 # Install the main package
-$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION}  --index-strategy unsafe-best-match
+$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} --index-strategy unsafe-best-match
 
 if [ "$IS_BLACKWELL" = "1" ]; then
     # TODO auto determine sgl-kernel version
