@@ -500,6 +500,7 @@ class ModelRunner:
         if (
             server_args.attention_backend == "fa3"
             and server_args.enable_hierarchical_cache
+            and server_args.hicache_io_backend == "kernel"
         ):
             if server_args.decode_attention_backend is None:
                 if not self.use_mla_backend:
@@ -520,7 +521,7 @@ class ModelRunner:
                 server_args.hicache_io_backend = "direct"
                 logger.info(
                     "FlashAttention3 decode attention is not compatible with hierarchical cache. "
-                    "Setting hicache_io_backend to 'direct'."
+                    f"Setting hicache_io_backend to '{server_args.hicache_io_backend}'."
                 )
 
     def init_torch_distributed(self):
