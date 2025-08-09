@@ -98,7 +98,6 @@ if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
-
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
