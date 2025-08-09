@@ -24,7 +24,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // model_runner.tp_size
         )
 
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        self.v_head_dim = getattr(
+            model_runner.model_config, "v_head_dim", model_runner.model_config.head_dim
+        )
 
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
