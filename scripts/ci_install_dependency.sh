@@ -17,7 +17,10 @@ bash "${SCRIPT_DIR}/killall_sglang.sh"
 apt install -y git libnuma-dev
 
 # Install uv
-pip install --upgrade pip --break-system-packages
+if [ "$IS_BLACKWELL" != "1" ]; then
+    # The blackwell CI runner has some issues with pip
+    pip install --upgrade pip --break-system-packages
+fi
 pip install uv --break-system-packages
 export UV_SYSTEM_PYTHON=true
 
