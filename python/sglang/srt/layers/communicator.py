@@ -247,7 +247,7 @@ class LayerCommunicator:
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
-        # TODO improve this check
+        # TODO improve these codes
         return (
             self.allow_reduce_scatter
             and self._communicate_summable_tensor_pair_fn
