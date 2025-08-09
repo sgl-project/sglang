@@ -26,7 +26,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 else
     pip install --upgrade pip
     pip install uv
-    UV_SYSTEM_PYTHON=true
+    export UV_SYSTEM_PYTHON=true
     PIP_CMD="uv pip" # uv pip is not supported on blackwell CI runner
 fi
 
