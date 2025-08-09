@@ -47,6 +47,8 @@ class OpenAIServingScore(OpenAIServingBase):
                 label_token_ids=request.label_token_ids,
                 apply_softmax=request.apply_softmax,
                 item_first=request.item_first,
+                instruction=request.instruction,
+                rerank_type=request.rerank_type,
                 request=raw_request,
             )
 
