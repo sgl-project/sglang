@@ -8,16 +8,10 @@ import unittest
 
 from test_vision_openai_server_common import *
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
 
-
-class TestQwen2VLServer(TestOpenAIVisionServer):
+class TestQwen2VLServer(
+    ImageOpenAITestMixin, VideoOpenAITestMixin, TestOpenAIVisionServer
+):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
@@ -37,11 +31,10 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
-        self._test_video_chat_completion()
 
-
-class TestQwen2_5_VLServer(TestOpenAIVisionServer):
+class TestQwen2_5_VLServer(
+    ImageOpenAITestMixin, VideoOpenAITestMixin, TestOpenAIVisionServer
+):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -60,9 +53,6 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        self._test_video_chat_completion()
 
 
 class TestVLMContextLengthIssue(CustomTestCase):
@@ -137,11 +127,8 @@ class TestVLMContextLengthIssue(CustomTestCase):
 #         )
 #         cls.base_url += "/v1"
 
-#     def test_video_chat_completion(self):
-#         pass
 
-
-class TestMinicpmvServer(TestOpenAIVisionServer):
+class TestMinicpmvServer(ImageOpenAITestMixin, TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
         cls.model = "openbmb/MiniCPM-V-2_6"
@@ -162,7 +149,7 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestInternVL2_5Server(TestOpenAIVisionServer):
+class TestInternVL2_5Server(ImageOpenAITestMixin, TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
         cls.model = "OpenGVLab/InternVL2_5-2B"
@@ -181,7 +168,9 @@ class TestInternVL2_5Server(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestMinicpmoServer(TestOpenAIVisionServer):
+class TestMinicpmoServer(
+    ImageOpenAITestMixin, AudioOpenAITestMixin, TestOpenAIVisionServer
+):
     @classmethod
     def setUpClass(cls):
         cls.model = "openbmb/MiniCPM-o-2_6"
@@ -200,10 +189,6 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
-
-    def test_audio_chat_completion(self):
-        self._test_audio_speech_completion()
-        self._test_audio_ambient_completion()
 
 
 class TestMimoVLServer(TestOpenAIVisionServer):
