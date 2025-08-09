@@ -207,8 +207,7 @@ class BaseMultimodalProcessor(ABC):
         ]
 
     def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None,
-        **kwargs
+        self, input_text, images=None, videos=None, audios=None, **kwargs
     ) -> dict:
         """
         process multimodal data with transformers AutoProcessor
@@ -218,7 +217,10 @@ class BaseMultimodalProcessor(ABC):
         if videos:
             kwargs["videos"] = videos
         if audios:
-            if self.arch == "Gemma3nProcessor" or self.arch == "Qwen2AudioForConditionalGeneration":
+            if (
+                self.arch == "Gemma3nProcessor"
+                or self.arch == "Qwen2AudioForConditionalGeneration"
+            ):
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
             else:
@@ -270,7 +272,7 @@ class BaseMultimodalProcessor(ABC):
         estimated_frames_list = []
         for image in image_data:
             if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:"):]
+                path = image[len("video:") :]
                 # Estimate frames for the video
                 vr = VideoReader(path, ctx=cpu(0))
                 num_frames = len(vr)

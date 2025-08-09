@@ -29,9 +29,7 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
-        self.ATTR_NAME_TO_MODALITY.update({
-            "feature_attention_mask": Modality.AUDIO
-        })
+        self.ATTR_NAME_TO_MODALITY.update({"feature_attention_mask": Modality.AUDIO})
 
     async def process_mm_data_async(
         self,
