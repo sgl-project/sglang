@@ -66,9 +66,9 @@ jobs:
         run: |
           bash scripts/ci_install_rust.sh
 
-      - name: Install SGLang package
+      - name: Install Python deps (sglang + extras)
         run: |
-          pip install -e python/
+          bash scripts/ci_install_dependency.sh
 
       - name: Build python binding
         run: |
