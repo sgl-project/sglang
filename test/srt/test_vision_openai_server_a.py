@@ -208,5 +208,10 @@ class TestMimoVLServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
 
 
 if __name__ == "__main__":
-    del TestOpenAIOmniServer
+    del (
+        TestOpenAIOmniServerBase,
+        ImageOpenAITestMixin,
+        VideoOpenAITestMixin,
+        AudioOpenAITestMixin,
+    )
     unittest.main()

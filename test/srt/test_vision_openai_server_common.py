@@ -27,7 +27,7 @@ AUDIO_TRUMP_SPEECH_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test
 AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/bird_song.mp3"
 
 
-class TestOpenAIOmniServer(CustomTestCase):
+class TestOpenAIOmniServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
@@ -71,7 +71,7 @@ class TestOpenAIOmniServer(CustomTestCase):
         return file_path
 
 
-class AudioOpenAITestMixin(TestOpenAIOmniServer):
+class AudioOpenAITestMixin(TestOpenAIOmniServerBase):
     def prepare_audio_messages(self, prompt, audio_file_name):
         messages = [
             {
@@ -148,7 +148,7 @@ class AudioOpenAITestMixin(TestOpenAIOmniServer):
         assert "bird" in audio_response
 
 
-class ImageOpenAITestMixin(TestOpenAIOmniServer):
+class ImageOpenAITestMixin(TestOpenAIOmniServerBase):
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -413,7 +413,7 @@ class ImageOpenAITestMixin(TestOpenAIOmniServer):
         self.assertGreater(len(video_response), 0)
 
 
-class VideoOpenAITestMixin(TestOpenAIOmniServer):
+class VideoOpenAITestMixin(TestOpenAIOmniServerBase):
     def prepare_video_messages(self, video_path):
         messages = [
             {

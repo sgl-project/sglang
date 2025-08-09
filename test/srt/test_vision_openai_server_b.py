@@ -117,7 +117,7 @@ class TestJanusProServer(ImageOpenAITestMixin):
 #         cls.base_url += "/v1"
 
 
-class TestGemma3itServer(ImageOpenAITestMixin, TestOpenAIOmniServer):
+class TestGemma3itServer(ImageOpenAITestMixin, TestOpenAIOmniServerBase):
     @classmethod
     def setUpClass(cls):
         cls.model = "google/gemma-3-4b-it"
@@ -323,5 +323,10 @@ class TestVILAServer(ImageOpenAITestMixin):
 
 
 if __name__ == "__main__":
-    del TestOpenAIOmniServer
+    del (
+        TestOpenAIOmniServerBase,
+        ImageOpenAITestMixin,
+        VideoOpenAITestMixin,
+        AudioOpenAITestMixin,
+    )
     unittest.main()
