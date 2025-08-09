@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    get_metrics_collector,
     is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
@@ -140,6 +141,7 @@ class PrefillBootstrapQueue:
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
+            get_metrics_collector(self.scheduler),
         )
         return kv_manager
 
