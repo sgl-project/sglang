@@ -1,7 +1,9 @@
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
+
+from python.sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -244,6 +246,12 @@ def apply_rope_with_cos_sin_cache_inplace(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
+    layer: Any = None, # RadixAttention
+    forward_batch: ForwardBatch = None,
+    save_kv_cache: bool = False,
+    value: Optional[torch.Tensor] = None,
+    start_layer: Optional[int] = None,
+    is_capture_mode: bool = False,
 ) -> None:
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
@@ -277,6 +285,48 @@ def apply_rope_with_cos_sin_cache_inplace(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
+    ## fused from memory_pool set_kv_buffer
+    """
+    if layer_id_override is not None:
+        layer_id = layer_id_override
+    else:
+        layer_id = layer.layer_id
+    if cache_k.dtype != self.dtype:
+        if k_scale is not None:
+            cache_k.div_(k_scale)
+        if v_scale is not None:
+            cache_v.div_(v_scale)
+        cache_k = cache_k.to(self.dtype)
+        cache_v = cache_v.to(self.dtype)
+
+    if self.store_dtype != self.dtype:
+        cache_k = cache_k.view(self.store_dtype)
+        cache_v = cache_v.view(self.store_dtype)
+
+    if get_is_capture_mode() and self.alt_stream is not None:
+        # Overlap the copy of K and V cache for small batch size
+        current_stream = self.device_module.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+        with self.device_module.stream(self.alt_stream):
+            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+        current_stream.wait_stream(self.alt_stream)
+    else:
+        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+    """
+    layer_id = layer.layer_id
+    token_to_kv_pool = forward_batch.token_to_kv_pool
+    start_layer = token_to_kv_pool.start_layer
+    k_buffer = token_to_kv_pool.k_buffer
+    v_buffer = token_to_kv_pool.v_buffer
+    alt_stream = token_to_kv_pool.alt_stream
+    cache_loc = forward_batch.out_cache_loc
+    k_buffer_ptr = k_buffer[layer_id - start_layer][cache_loc].contiguous()
+    v_buffer_ptr = v_buffer[layer_id - start_layer][cache_loc].contiguous()
+
+    k_scale, v_scale = layer.k_scale, layer.v_scale
+
     torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
         query.view(query.shape[0], -1, head_size),
         key.view(key.shape[0], -1, head_size),
@@ -286,4 +336,12 @@ def apply_rope_with_cos_sin_cache_inplace(
         positions.long(),
         (not is_neox),
         get_cuda_stream(),
+        save_kv_cache,
+        k_buffer_ptr,
+        v_buffer_ptr,
+        1.0 if k_scale is None else k_scale, 1.0 if v_scale is not None else v_scale,
+        value.view(value.shape[0], -1, head_size),
+        is_capture_mode,
+        0 if alt_stream is None else alt_stream
+
     )

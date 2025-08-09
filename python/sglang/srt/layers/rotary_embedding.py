@@ -222,8 +222,14 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        layer: Any = None, # RadixAttention
+        forward_batch = None,
+        save_kv_cache: bool = False,
+        value: Optional[torch.Tensor] = None,
+        start_layer: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -231,6 +237,12 @@ class RotaryEmbedding(CustomOp):
                 head_size=self.head_size,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=save_kv_cache,
+                value=value,
+                start_layer=start_layer,
+                is_capture_mode=get_is_capture_mode(),
             )
         else:
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
