@@ -82,6 +82,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "chunked_prefill_size",
     "device",
     "disable_chunked_prefix_cache",
+    "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_radix_cache",
     "enable_dp_attention",
     "enable_two_batch_overlap",

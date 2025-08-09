@@ -222,6 +222,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
+    disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
@@ -706,7 +707,6 @@ class ServerArgs:
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
 
-        # Propagate env vars
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
@@ -1483,7 +1483,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-cutlass-moe",
             action="store_true",
-            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Used for high-throughput scenarios. Supports MoE-EP",
         )
         parser.add_argument(
             "--enable-flashinfer-trtllm-moe",
@@ -1712,6 +1712,11 @@ class ServerArgs:
             "--enable-symm-mem",
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-cutlass-moe-fp4-allgather",
+            action="store_true",
+            help="Disables quantize before all-gather for flashinfer cutlass moe.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",
