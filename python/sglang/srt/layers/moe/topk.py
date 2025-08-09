@@ -262,7 +262,6 @@ class TopK(CustomOp):
                 topk_config=self.topk_config,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
-                apply_routed_scaling_factor_on_output=self.apply_routed_scaling_factor_on_output,
             )
 
     def forward_cpu(
