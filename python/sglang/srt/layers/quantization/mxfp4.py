@@ -572,6 +572,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Based on profiling results, we need to quantize x to mxfp8 here to achieve better performance
             x_quant, x_scale = mxfp8_quantize(x, False, output_hidden_size=self.hidden_size)  # to mxfp8
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            assert x_quant.shape[-1] == self.hidden_size
 
             top_k, router_logits = topk_output
 
