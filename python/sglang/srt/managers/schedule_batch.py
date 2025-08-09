@@ -109,6 +109,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "weight_loader_disable_mmap",
     "enable_triton_kernel_moe",
     "enable_flashinfer_mxfp4_moe",
+    "enable_flashinfer_mxfp4_bf16_moe",
     "enable_multimodal",
     "enable_symm_mem",
     "quantization",
