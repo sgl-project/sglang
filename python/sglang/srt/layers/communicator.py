@@ -242,7 +242,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if can_fuse_mlp_allreduce: # TODO
+        if self.should_fuse_mlp_allreduce_with_next_layer(forward_batch):
             hidden_states._sglang_needs_allreduce_fusion = True
             return hidden_states, residual
         else:
