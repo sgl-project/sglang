@@ -111,6 +111,13 @@ __Notice:__ `--privileged` and `--network=host` are required by RDMA, which is t
 __Notice:__ The following docker command is based on Atlas A3 machines. If you are using A2, make sure only `davinci[0-7]` are mapped into container.
 
 ```shell
+# Clone the SGLang repository
+git clone https://github.com/sgl-project/sglang.git
+cd sglang/docker
+
+# Build the docker image
+docker build -t sglang-npu:main -f Dockerfile.npu .
+
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
     --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
@@ -123,7 +130,7 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
 drun --env "HF_TOKEN=<secret>" \
-    v0.4.10.post2-cann8.2.rc1.alpha003-a3 \
+    sglang-npu:main \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
 ```
 
@@ -135,11 +142,12 @@ Running DeepSeek with PD disaggregation on 2 x A3 SuperPods.
 Model weights could be found [here](https://modelers.cn/models/State_Cloud/Deepseek-R1-bf16-hfd-w8a8).
 
 Prefill:
-```
+
+```shell
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 
-drun v0.4.10.post2-cann8.2.rc1.alpha003-a3 \
+drun sglang-npu:main \
     python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
     --trust-remote-code \
     --attention-backend ascend \
@@ -158,13 +166,14 @@ drun v0.4.10.post2-cann8.2.rc1.alpha003-a3 \
 ```
 
 Decode:
-```
+
+```shell
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 export HCCL_BUFFSIZE=200
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
 
-drun v0.4.10.post2-cann8.2.rc1.alpha003-a3 \
+drun sglang-npu:main \
     python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
     --trust-remote-code \
     --attention-backend ascend \
@@ -185,8 +194,9 @@ drun v0.4.10.post2-cann8.2.rc1.alpha003-a3 \
 ```
 
 Mini_LB:
-```
-drun v0.4.10.post2-cann8.2.rc1.alpha003-a3 \
+
+```shell
+drun sglang-npu:main \
     python -m sglang.srt.disaggregation.launch_lb \
     --prefill http://<PREFILL_HOST_IP>:8000 \
     --decode http://<DECODE_HOST_IP>:8001 \

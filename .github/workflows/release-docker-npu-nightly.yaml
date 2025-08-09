@@ -7,7 +7,7 @@ on:
       - ".github/workflows/release-docker-npu-nightly.yaml"
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 0 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
@@ -18,8 +18,8 @@ jobs:
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
-        cann_version: ['8.2.rc1.alpha003']
-        device_type: ['a3']
+        cann_version: ["8.2.rc1"]
+        device_type: ["a3"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
