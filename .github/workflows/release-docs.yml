@@ -5,8 +5,8 @@ on:
     branches:
       - main
     paths:
-      - 'docs/**'
-      - 'python/sglang/version.py'
+      - "docs/**"
+      - "python/sglang/version.py"
       - "python/sglang/**"
   workflow_dispatch:
 
@@ -24,7 +24,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          find /public_sglang_ci/runner-a-gpu-1/_work/_tool/Python/3.9.21/x64/lib/python3.9/site-packages -name "sgl-kernel*" -exec rm -rf {} + || true
+          find /public_sglang_ci/runner-a-gpu-1/_work/_tool/Python/3.10.13/x64/lib/python3.10/site-packages -name "sgl-kernel*" -exec rm -rf {} + || true
           bash scripts/ci_install_dependency.sh
           pip install -r docs/requirements.txt
           apt-get update

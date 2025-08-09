@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -16,6 +16,8 @@ def fused_moe_router_kernel(
     moe_router_weight_ptr,  # input (num_experts, hidden_dim)
     topk_weights_ptr,  # output (bs, topk)
     topk_ids_ptr,  # output (bs, topk)
+    correction_bias_ptr,
+    is_correction_bias: tl.constexpr,
     num_experts: tl.constexpr,
     topk: tl.constexpr,
     moe_softcapping: tl.constexpr,
@@ -48,6 +50,11 @@ def fused_moe_router_kernel(
     top = exped - 1
     bottom = exped + 1
     logits_softcapped = top / bottom * moe_softcapping
+
+    # Add bias after softcapping
+    if is_correction_bias:
+        bias = tl.load(correction_bias_ptr + tl.arange(0, num_experts))
+        logits_softcapped = logits_softcapped + bias
 
     # topk
     # assert 1 <= topk <= num_experts
@@ -109,6 +116,7 @@ def fused_moe_router_impl(
     router_weight: torch.Tensor,
     topk: int,
     moe_softcapping: float,
+    correction_bias: Optional[torch.Tensor] = None,
 ):
     assert len(x.shape) == 2 and x.shape[1] == router_weight.shape[1]
     bs, hidden_dim = x.shape
@@ -117,23 +125,23 @@ def fused_moe_router_impl(
     # router_logits = torch.empty((bs, num_experts), dtype=torch.float32, device=x.device)
     topk_weights = torch.empty((bs, topk), dtype=torch.float32, device=x.device)
     topk_ids = torch.empty((bs, topk), dtype=torch.int32, device=x.device)
+    is_correction_bias = correction_bias is not None
 
-    grid = lambda meta: (bs,)
-
-    min_num_warps = 16 if _is_hip else 32
-
+    max_warps = 16 if _is_hip else 32
     config = {
         "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
         "num_warps": max(
-            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), min_num_warps), 4
+            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
         ),
     }
 
-    fused_moe_router_kernel[grid](
+    fused_moe_router_kernel[(bs,)](
         x,
         router_weight,
         topk_weights,
         topk_ids,
+        correction_bias,
+        is_correction_bias=is_correction_bias,
         num_experts=num_experts,
         topk=topk,
         moe_softcapping=moe_softcapping,
@@ -153,7 +161,7 @@ def fused_moe_router_large_bs_kernel(
     topk_ids_ptr,  # output (bs, topk)
     bs,
     num_experts: tl.constexpr,
-    topk: tl.constexpr,  # only support topk == 1
+    topk: tl.constexpr,  # only support topk <= 2
     moe_softcapping: tl.constexpr,
     moe_renormalize: tl.constexpr,  # not supported
     K: tl.constexpr,
@@ -204,24 +212,52 @@ def fused_moe_router_large_bs_kernel(
     logits_softcapped = (exped - 1) / (exped + 1) * moe_softcapping
 
     # 5. top1
-    cond = tl.arange(0, BLOCK_SIZE_N)[None, :] < num_experts
-    top1 = tl.argmax(tl.where(cond, logits_softcapped, float("-inf")), axis=1)
+    arange_block_size_n = tl.arange(0, BLOCK_SIZE_N)[None, :]
+    cond_top1 = arange_block_size_n < num_experts
+    top1 = tl.argmax(tl.where(cond_top1, logits_softcapped, float("-inf")), axis=1)
     top1_v = tl.max(
-        tl.where(cond, logits_softcapped, float("-inf")), axis=1, keep_dims=True
+        tl.where(cond_top1, logits_softcapped, float("-inf")), axis=1, keep_dims=True
     )
-    invsumexp = 1.0 / tl.sum(
-        tl.where(cond, tl.exp(logits_softcapped - top1_v), 0.0), axis=1
+    top1_invsumexp = 1.0 / tl.sum(
+        tl.where(cond_top1, tl.exp(logits_softcapped - top1_v), 0.0), axis=1
     )
 
-    # 6. store to output
-    offs_topk = pid * topk * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    topk_mask = offs_topk < bs
-    tl.store(topk_ids_ptr + offs_topk, top1, mask=topk_mask)
+    # 6. store top1 to output
+    offs_top1 = pid * topk * BLOCK_SIZE_M + topk * tl.arange(0, BLOCK_SIZE_M)
+    top1_mask = offs_top1 < bs * topk
+    tl.store(topk_ids_ptr + offs_top1, top1, mask=top1_mask)
     tl.store(
-        topk_weights_ptr + offs_topk,
-        invsumexp,
-        mask=topk_mask,
+        topk_weights_ptr + offs_top1,
+        top1_invsumexp,
+        mask=top1_mask,
     )
+
+    # 7. handle topk == 2
+    if topk == 2:
+        cond_top2 = (arange_block_size_n < num_experts) and (
+            arange_block_size_n != top1[:, None]
+        )
+        top2 = tl.argmax(
+            tl.where(cond_top2, logits_softcapped, float("-inf")),
+            axis=1,
+            keep_dims=True,
+        )
+        top2_v = tl.sum(
+            logits_softcapped * (arange_block_size_n == top2), axis=1, keep_dims=True
+        )
+        top2_invsumexp = tl.exp(top2_v - top1_v) * top1_invsumexp[:, None]
+
+        # store top2
+        offs_top2 = (
+            pid * topk * BLOCK_SIZE_M + topk * tl.arange(0, BLOCK_SIZE_M)[:, None] + 1
+        )
+        top2_mask = offs_top2 < bs * topk
+        tl.store(topk_ids_ptr + offs_top2, top2, mask=top2_mask)
+        tl.store(
+            topk_weights_ptr + offs_top2,
+            top2_invsumexp,
+            mask=top2_mask,
+        )
 
 
 def fused_moe_router_large_bs_impl(
@@ -239,7 +275,7 @@ def fused_moe_router_large_bs_impl(
 
     assert num_experts <= BLOCK_SIZE_N
     assert hidden_dim % BLOCK_SIZE_K == 0
-    assert topk == 1
+    assert topk <= 2
 
     topk_weights = torch.empty((bs, topk), dtype=torch.float32, device=x.device)
     topk_ids = torch.empty((bs, topk), dtype=torch.int32, device=x.device)
@@ -273,6 +309,7 @@ def fused_moe_router_shim(
     gating_output,
     topk,
     renormalize,
+    correction_bias: Optional[torch.Tensor] = None,
 ):
     assert not renormalize
     assert (
@@ -286,7 +323,7 @@ def fused_moe_router_shim(
     BLOCK_SIZE_K = 256
     if (
         bs >= 512
-        and topk == 1
+        and topk <= 2
         and num_experts <= BLOCK_SIZE_N
         and hidden_dim % BLOCK_SIZE_K == 0
     ):
@@ -305,6 +342,7 @@ def fused_moe_router_shim(
             router_weight=gating_output,
             topk=topk,
             moe_softcapping=moe_softcapping,
+            correction_bias=correction_bias,
         )
 
 

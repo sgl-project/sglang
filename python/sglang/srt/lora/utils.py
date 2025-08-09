@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Set, Tuple
+from typing import Iterable, Optional, Set, Tuple
 
 import torch
 
@@ -92,11 +92,30 @@ def get_hidden_dim(
         Please implement the function in the model class if it is not.
         You can reference this function in llama.py.
         """
-        if module_name in ["q_proj", "o_proj", "qkv_proj"]:
-            return config.hidden_size, config.hidden_size
-        elif module_name in ["kv_proj"]:
-            return config.hidden_size, config.hidden_size // (
-                config.num_attention_heads // config.num_key_value_heads
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+
+        # TODO: the special handling of qkv will be addressed in #8940.
+        if module_name == "qkv_proj":
+            return (
+                config.hidden_size,
+                None,  # qkv_proj is only used in LoRA A
+            )
+        elif module_name == "kv_proj":
+            return (
+                None,  # kv_proj is only used in LoRA B
+                head_dim * config.num_key_value_heads,
+            )
+        elif module_name == "q_proj":
+            return (
+                None,  # q_proj is only used in LoRA B
+                head_dim * config.num_attention_heads,
+            )
+        elif module_name == "o_proj":
+            return (
+                head_dim * config.num_attention_heads,
+                config.hidden_size,
             )
         elif module_name == "gate_up_proj":
             return config.hidden_size, config.intermediate_size
@@ -106,9 +125,11 @@ def get_hidden_dim(
             raise NotImplementedError()
 
 
-def get_normalized_lora_weight_names(name: str) -> Tuple[List[str], List[str]]:
+def get_normalized_lora_weight_names(
+    target_modules: Iterable[str],
+) -> Tuple[set[str], set[str]]:
     """
-    Mapping a target module name to names of the normalized LoRA weights.
+    Mapping a list of target module name to names of the normalized LoRA weights.
     Returned tuple contains (name for Lora A, name for Lora B)
     """
     params_mapping = {
@@ -120,8 +141,13 @@ def get_normalized_lora_weight_names(name: str) -> Tuple[List[str], List[str]]:
         "qkv_proj": (["qkv_proj"], ["q_proj", "kv_proj"]),
         "gate_up_proj": (["gate_up_proj"], ["gate_up_proj"]),
     }
-    stacked = params_mapping.get(name, ([name], [name]))
-    return stacked
+
+    result = (set(), set())
+    for name in target_modules:
+        lora_a, lora_b = params_mapping.get(name, ([name], [name]))
+        result[0].update(lora_a)
+        result[1].update(lora_b)
+    return result
 
 
 def get_stacked_multiply(module_name: str) -> int:
