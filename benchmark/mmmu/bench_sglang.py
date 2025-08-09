@@ -11,6 +11,7 @@ The eval output will be logged
 
 import argparse
 import asyncio
+import re
 import sys
 import time
 import traceback
@@ -145,7 +146,17 @@ async def eval_mmmu(args) -> None:
             _, response = await process_sample(
                 client, sample, sampling_params, lora_path
             )
-            process_result(response, sample, answer_dict, out_samples)
+            answer = (
+                re.search(args.response_answer_regex, response)
+                if response is not None
+                else None
+            )
+            process_result(
+                answer.group(1) if answer else response,
+                sample,
+                answer_dict,
+                out_samples,
+            )
     else:
         semaphore = asyncio.Semaphore(args.concurrency)
         tasks = [
@@ -157,7 +168,17 @@ async def eval_mmmu(args) -> None:
 
         for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
             sample, response = await coro
-            process_result(response, sample, answer_dict, out_samples)
+            answer = (
+                re.search(args.response_answer_regex, response)
+                if response is not None
+                else None
+            )
+            process_result(
+                answer.group(1) if answer else response,
+                sample,
+                answer_dict,
+                out_samples,
+            )
 
     if args.profile:
         print("Stopping profiler...")

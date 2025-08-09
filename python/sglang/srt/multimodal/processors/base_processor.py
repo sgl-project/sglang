@@ -22,13 +22,19 @@ class BaseMultiModalProcessorOutput:
     input_text: str
 
     # frames loaded from image, in given order
-    images: Optional[list[Union[Image.Image, dict]]] = None
+    images: Optional[list[Union[Image.Image, dict]]] = dataclasses.field(
+        default_factory=list
+    )
 
     # videos
-    videos: Optional[list[Union[torch.Tensor, dict]]] = None
+    videos: Optional[list[Union[torch.Tensor, dict]]] = dataclasses.field(
+        default_factory=list
+    )
 
     # audios
-    audios: Optional[list[Union[np.ndarray, dict]]] = None
+    audios: Optional[list[Union[np.ndarray, dict]]] = dataclasses.field(
+        default_factory=list
+    )
 
     def organize_results(self) -> List[Tuple[Modality, Any]]:
         """
