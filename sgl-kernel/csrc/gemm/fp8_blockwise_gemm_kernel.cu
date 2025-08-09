@@ -30,10 +30,13 @@
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
+#include "cutlass_extensions/gemm/cutlass_gemm_caller.cuh"
+#include "cutlass_extensions/gemm/fp8_blockwise_gemm_sm90_dispatch.cuh"
 #include "utils.h"
 
 using namespace cute;
 
+// TODO(yuan-luo): To be obsoleted.
 template <typename SchedulerType, typename OutType, typename TileShape, typename ClusterShape>
 void launch_sm90_fp8_blockwise_scaled_mm(
     torch::Tensor& out,
@@ -297,6 +300,7 @@ void launch_sm100_fp8_blockwise_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status))
 }
 
+// TODO(yuan-luo): To be obsoleted.
 template <typename OutType>
 void sm90_fp8_blockwise_dispatch_shape(
     torch::Tensor& out,
@@ -394,10 +398,10 @@ torch::Tensor fp8_blockwise_scaled_mm(
   if (sm_version == 90) {
     torch::Tensor scales_b_contiguous = scales_b.contiguous();
     if (out_dtype == torch::kBFloat16) {
-      sm90_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
+      cutlass_gemm_blockwise_sm90_fp8_dispatch<cutlass::bfloat16_t>(
           out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b_contiguous);
     } else {
-      sm90_fp8_blockwise_dispatch_shape<cutlass::half_t>(
+      cutlass_gemm_blockwise_sm90_fp8_dispatch<cutlass::half_t>(
           out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b_contiguous);
     }
     return out_padded.slice(0, 0, original_rows);
