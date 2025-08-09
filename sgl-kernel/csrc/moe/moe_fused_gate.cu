@@ -357,6 +357,7 @@ __device__ void moe_fused_gate_impl(
             }
             // Whether or not in the current tile, ensure that the expert has been cleared in the global state.
             thread_read_ptr[expert_mod] = static_cast<T>(-FLT_MAX);
+            bias_thread_read_ptr[expert_mod] = static_cast<T>(-FLT_MAX);
 
             // Reset and recalculate global maximums
             global_max_val = static_cast<T>(-FLT_MAX);
@@ -516,6 +517,7 @@ __device__ void moe_fused_gate_impl(
       }
 
       indices_ptr[idx] = static_cast<int32_t>(expert);
+      bias_thread_read_ptr[expert_to_clear_in_thread] = static_cast<T>(-FLT_MAX);
     }
 
     // accumulate sum for all elements
