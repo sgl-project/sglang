@@ -11,7 +11,7 @@ from sgl_kernel import (
 )
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
-    post_reorder_triton_kernel,
+    post_reorder_triton_kernel_for_cutlass_moe,
     pre_reorder_triton_kernel_for_cutlass_moe,
     run_cutlass_moe_ep_preproess,
 )
@@ -199,14 +199,13 @@ def cutlass_w4a8_moe(
     )
 
     output = torch.empty_like(a)
-    post_reorder_triton_kernel[(m,)](
+    post_reorder_triton_kernel_for_cutlass_moe[(m,)](
         c2,
         output,
         src2dst,
-        topk_ids_,
+        local_topk_ids,
         topk_weights,
-        start_expert_id,
-        end_expert_id,
+        num_experts,
         topk,
         k,
         0,
