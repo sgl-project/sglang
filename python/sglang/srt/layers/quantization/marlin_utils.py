@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import numpy
 import torch
-from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -25,6 +24,13 @@ from sglang.srt.utils import get_device_capability
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
+
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 try:
     from vllm import _custom_ops as ops

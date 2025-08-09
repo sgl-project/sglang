@@ -6,7 +6,6 @@ import warnings
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch
-from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
@@ -52,6 +51,8 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda:
     from sgl_kernel import awq_dequantize, fused_marlin_moe
+    from sgl_kernel.scalar_type import scalar_types
+
 elif _is_hip:
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
