@@ -1278,7 +1278,7 @@ class RowParallelLinear(LinearBase):
             param.load_row_parallel_weight(loaded_weight)
 
 
-    def forward(self, input_, skip_all_reduce=False, should_allreduce_fusion=False):
+    def forward(self, input_, skip_all_reduce=False):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1296,7 +1296,7 @@ class RowParallelLinear(LinearBase):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
             sm.tag(output_parallel)
 
-        if self.reduce_results and self.tp_size > 1 and (not skip_all_reduce) and (not should_allreduce_fusion):
+        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
