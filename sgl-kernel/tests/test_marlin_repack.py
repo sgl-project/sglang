@@ -2,20 +2,16 @@ import numpy as np
 import pytest
 import torch
 from sgl_kernel import awq_marlin_repack, gptq_marlin_repack
-
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.quantization.utils import (
+    gptq_quantize_weights,
     pack_cols,
     pack_rows,
     quantize_weights,
     sort_weights,
-    gptq_quantize_weights
 )
-from sglang.test.test_marlin_utils import (
-    get_weight_perm,
-    marlin_weights,
-)
+from sglang.test.test_marlin_utils import get_weight_perm, marlin_weights
 
 GPTQ_MARLIN_TILE = 16
 MARLIN_K_CHUNKS = [128]
@@ -31,6 +27,7 @@ MNK_FACTORS = [
     (257, 13, 11),
     (658, 13, 11),
 ]
+
 
 def awq_pack(
     q_w: torch.Tensor,
@@ -85,15 +82,15 @@ def test_awq_marlin_repack_correct(num_bits, k_tiles, n_tiles, group_size):
     torch.testing.assert_close(out_gpu, q_w_marlin)
 
 
-
 @pytest.mark.parametrize("k_chunk", MARLIN_K_CHUNKS)
 @pytest.mark.parametrize("n_chunk", MARLIN_N_CHUNKS)
-@pytest.mark.parametrize("quant_type",[scalar_types.uint4b8])
+@pytest.mark.parametrize("quant_type", [scalar_types.uint4b8])
 @pytest.mark.parametrize("group_size", [-1, 32, 64, 128])
 @pytest.mark.parametrize("act_order", [False, True])
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
-def test_gptq_marlin_repack(k_chunk, n_chunk, quant_type, group_size,
-                            act_order, mnk_factors):
+def test_gptq_marlin_repack(
+    k_chunk, n_chunk, quant_type, group_size, act_order, mnk_factors
+):
     m_factor, n_factor, k_factor = mnk_factors
 
     size_k = k_chunk * k_factor
@@ -119,7 +116,8 @@ def test_gptq_marlin_repack(k_chunk, n_chunk, quant_type, group_size,
 
     # Quantize (and apply act_order if provided)
     w_ref, q_w, s, g_idx, rand_perm = gptq_quantize_weights(
-        b_weight, quant_type, group_size, act_order)
+        b_weight, quant_type, group_size, act_order
+    )
 
     q_w_gptq = pack_rows(q_w, quant_type.size_bits, size_k, size_n)
 
@@ -134,9 +132,10 @@ def test_gptq_marlin_repack(k_chunk, n_chunk, quant_type, group_size,
         q_w, size_k, size_n, quant_type.size_bits, marlin_layout_perm
     )
 
-
     # Run Marlin repack GPU kernel
-    q_w_marlin = gptq_marlin_repack(q_w_gptq, sort_indices, size_k, size_n, quant_type.size_bits)
+    q_w_marlin = gptq_marlin_repack(
+        q_w_gptq, sort_indices, size_k, size_n, quant_type.size_bits
+    )
 
     torch.cuda.synchronize()
 
