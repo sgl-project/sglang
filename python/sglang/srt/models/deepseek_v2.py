@@ -1881,12 +1881,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             skip_all_reduce=can_fuse_mlp_allreduce or use_reduce_scatter,
         )
 
-        if can_fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
 
         return hidden_states, residual
 

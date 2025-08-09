@@ -242,13 +242,17 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        return self._communicate_summable_tensor_pair_fn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
-            context=self._context,
-            allow_reduce_scatter=self.allow_reduce_scatter,
-        )
+        if can_fuse_mlp_allreduce: # TODO
+            hidden_states._sglang_needs_allreduce_fusion = True
+            return hidden_states, residual
+        else:
+            return self._communicate_summable_tensor_pair_fn(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+                context=self._context,
+                allow_reduce_scatter=self.allow_reduce_scatter,
+            )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         # TODO improve these codes
