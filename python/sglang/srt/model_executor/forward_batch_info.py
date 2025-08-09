@@ -668,9 +668,6 @@ class ForwardBatch:
                 self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
                 self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
                 self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
-                self.extend_input_logprob_token_ids_gpu = (
-                    self.extend_input_logprob_token_ids_gpu
-                )
             else:
                 setattr(self, "_original_batch_size", self.batch_size)
                 if self.spec_info is not None:
