@@ -201,8 +201,8 @@ async def preprocess_video(
 class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         # The regex that matches expanded image tokens.
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
@@ -227,7 +227,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         image_data: List[Union[str, bytes]],
         input_text,
         request_obj,
-        max_req_input_len,
         *args,
         **kwargs,
     ):
@@ -237,7 +236,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             image_data=image_data,
             video_data=request_obj.video_data,
             multimodal_tokens=self.mm_tokens,
-            max_req_input_len=max_req_input_len,
         )
 
         # Qwen-specific: resize images if they are raw Image objects

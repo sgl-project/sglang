@@ -14,11 +14,12 @@ class TestFile:
 suites = {
     "per-commit": [
         TestFile("models/lora/test_lora.py", 200),
-        TestFile("models/lora/test_lora_eviction.py", 120),
+        TestFile("models/lora/test_lora_eviction.py", 200),
         TestFile("models/lora/test_lora_backend.py", 99),
         TestFile("models/lora/test_multi_lora_backend.py", 60),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
-        TestFile("models/lora/test_lora_update.py", 700),
+        TestFile("models/lora/test_lora_update.py", 800),
+        TestFile("models/lora/test_lora_qwen3.py", 97),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -37,7 +38,6 @@ suites = {
         TestFile("openai_server/basic/test_serving_embedding.py", 10),
         TestFile("openai_server/basic/test_openai_embedding.py", 141),
         TestFile("openai_server/basic/test_openai_server.py", 149),
-        TestFile("openai_server/features/test_cache_report.py", 100),
         TestFile("openai_server/features/test_enable_thinking.py", 70),
         TestFile("openai_server/features/test_json_constrained.py", 98),
         TestFile("openai_server/features/test_json_mode.py", 90),
@@ -63,6 +63,7 @@ suites = {
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
+        TestFile("test_gpt_oss_1gpu.py", 600),
         TestFile("test_hicache.py", 116),
         TestFile("test_hicache_mla.py", 127),
         TestFile("test_hicache_storage.py", 127),
@@ -85,6 +86,7 @@ suites = {
         TestFile("test_radix_attention.py", 105),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_retract_decode.py", 54),
+        TestFile("test_request_queue_validation.py", 30),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
@@ -100,13 +102,14 @@ suites = {
         TestFile("test_triton_sliding_window.py", 250),
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_update_weights_from_tensor.py", 48),
-        TestFile("test_vertex_endpoint.py", 31),
+        TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vlm_input_format.py", 300),
-        TestFile("test_vision_openai_server_a.py", 584),
-        TestFile("test_vision_openai_server_b.py", 556),
+        TestFile("test_vision_openai_server_a.py", 989),
+        TestFile("test_vision_openai_server_b.py", 620),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_hybrid_attn_backend.py", 100),
     ],
     "per-commit-amd": [
         TestFile("models/lora/test_lora_backend.py", 99),
@@ -150,14 +153,19 @@ suites = {
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_awq_dequant.py", 2),
     ],
-    "per-commit-npu": [
-        TestFile("test_ascend_attention_backend.py", 400),
+    "per-commit-1-ascend-npu": [
+        TestFile("test_ascend_tp1_bf16.py", 400),
+    ],
+    "per-commit-2-ascend-npu": [
+        TestFile("test_ascend_tp2_bf16.py", 400),
+    ],
+    "per-commit-4-ascend-npu": [
+        TestFile("test_ascend_mla_w8a8int8.py", 400),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_dp_attention.py", 277),
-        TestFile("test_mla_tp.py", 170),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
         TestFile("test_release_memory_occupation.py", 127),
@@ -165,11 +173,11 @@ suites = {
     "per-commit-2-gpu-amd": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
-        TestFile("test_mla_tp.py", 170),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
     ],
     "per-commit-4-gpu": [
+        TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 372),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
@@ -192,6 +200,9 @@ suites = {
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
+    ],
+    "per-commit-8-gpu-b200": [
+        # add more here
     ],
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
