@@ -9,8 +9,8 @@ logger = logging.getLogger(__name__)
 
 try:
     from mcp import ClientSession
-except ImportError:
-    logger.warning("Ignoring mcp import error")
+except ImportError as e:
+    mcp = e
 
 from openai_harmony import Author, Message, Role, StreamState, TextContent
 
