@@ -740,7 +740,6 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             max_loaded_loras=self.max_loaded_loras,
             disable_cuda_graph=self.disable_cuda_graph,
             cuda_graph_max_bs=self.cuda_graph_max_bs,
-            disable_radix_cache=True,
             enable_lora=self.enable_lora,
         )
         self.handle.__enter__()
@@ -870,7 +869,6 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             str(self.max_loras_per_batch),
             "--lora-backend",
             self.lora_backend,
-            "--disable-radix-cache",
             "--random-seed",
             "42",
             "--max-running-request",
