@@ -719,30 +719,20 @@ impl PDRouter {
             return Err("No decode workers available. Please check if decode servers are configured and healthy.".to_string());
         }
 
-        // Select prefill worker using prefill policy, considering circuit availability
-        let available_prefill: Vec<Box<dyn Worker>> = prefill_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .map(|w| w.clone_worker())
-            .collect();
+        // Select prefill worker using prefill policy
         let prefill_idx = self
             .prefill_policy
-            .select_worker(&available_prefill, request_text)
+            .select_worker(&prefill_workers, request_text)
             .ok_or("Failed to select prefill worker")?;
 
-        // Select decode worker using decode policy, considering circuit availability
-        let available_decode: Vec<Box<dyn Worker>> = decode_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .map(|w| w.clone_worker())
-            .collect();
+        // Select decode worker using decode policy
         let decode_idx = self
             .decode_policy
-            .select_worker(&available_decode, request_text)
+            .select_worker(&decode_workers, request_text)
             .ok_or("Failed to select decode worker")?;
 
-        let prefill = available_prefill[prefill_idx].clone_worker();
-        let decode = available_decode[decode_idx].clone_worker();
+        let prefill = prefill_workers[prefill_idx].clone_worker();
+        let decode = decode_workers[decode_idx].clone_worker();
         Ok((prefill, decode))
     }
 
