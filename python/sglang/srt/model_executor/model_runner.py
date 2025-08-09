@@ -1272,6 +1272,8 @@ class ModelRunner:
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
+                        need_sort=self.server_args.disaggregation_mode
+                        in ("decode", "prefill"),
                     )
                 else:
                     self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
@@ -1279,6 +1281,8 @@ class ModelRunner:
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
+                        need_sort=self.server_args.disaggregation_mode
+                        in ("decode", "prefill"),
                     )
             else:
                 if _is_npu:
@@ -1288,6 +1292,8 @@ class ModelRunner:
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
+                        need_sort=self.server_args.disaggregation_mode
+                        in ("decode", "prefill"),
                     )
                 else:
                     self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
@@ -1296,6 +1302,8 @@ class ModelRunner:
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
+                        need_sort=self.server_args.disaggregation_mode
+                        in ("decode", "prefill"),
                     )
         else:
             assert self.is_draft_worker
