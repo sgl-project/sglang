@@ -56,11 +56,11 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     $PIP_CMD install -e lmms-eval/ $PIP_SUFFIX
 
     # Install xformers
-    $PIP_CMD install -U xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_SUFFIX
+    $PIP_CMD install  xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_SUFFIX
 fi
 
 # Install FlashMLA for attention backend tests
-# $PIP_CMD install git+https://github.com/deepseek-ai/FlashMLA.git
+# $PIP_CMD install git+https://github.com/deepseek-ai/FlashMLA.git $PIP_SUFFIX
 
 # Show current packages
 $PIP_CMD list
