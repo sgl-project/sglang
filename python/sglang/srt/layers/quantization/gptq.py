@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 try:
@@ -1061,13 +1062,13 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        **kwargs,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         # Delay the import to avoid circular dependency
 
-        assert activation == "silu", "Only SiLU activation is supported."
+        assert (
+            moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
 
         # The input must currently be float16
         orig_dtype = x.dtype
