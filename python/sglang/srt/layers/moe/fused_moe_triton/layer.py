@@ -147,6 +147,7 @@ class FusedMoE(torch.nn.Module):
 
         self.layer_id = layer_id
         self.top_k = top_k
+        self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
         self.expert_map_cpu = None
