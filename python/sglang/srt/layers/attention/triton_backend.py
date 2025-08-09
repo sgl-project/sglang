@@ -300,7 +300,7 @@ class TritonAttnBackend(AttentionBackend):
             )
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
-                forward_batch.extend_prefix_lens.sum().item(),
+                sum(forward_batch.extend_prefix_lens_cpu),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -333,7 +333,7 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
-            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             num_kv_splits = None
 
         self.forward_metadata = ForwardMetadata(
