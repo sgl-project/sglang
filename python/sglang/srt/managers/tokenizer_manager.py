@@ -161,14 +161,23 @@ class ReqState:
     input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
     output_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
     output_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
+    output_token_original_logprobs_val: List[float] = dataclasses.field(
+        default_factory=list
+    )
     input_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
     input_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
     output_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
     output_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
+    output_top_original_logprobs_val: List[List[float]] = dataclasses.field(
+        default_factory=list
+    )
     input_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+    output_token_ids_original_logprobs_val: List = dataclasses.field(
+        default_factory=list
+    )
 
 
 class TokenizerManager:
@@ -1637,6 +1646,9 @@ class TokenizerManager:
         state.output_token_logprobs_idx.extend(
             recv_obj.output_token_logprobs_idx[recv_obj_index]
         )
+        state.output_token_original_logprobs_val.extend(
+            recv_obj.output_token_original_logprobs_val[recv_obj_index]
+        )
         meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
             state.input_token_logprobs_val,
             state.input_token_logprobs_idx,
@@ -1644,6 +1656,11 @@ class TokenizerManager:
         )
         meta_info["output_token_logprobs"] = self.detokenize_logprob_tokens(
             state.output_token_logprobs_val,
+            state.output_token_logprobs_idx,
+            return_text_in_logprobs,
+        )
+        meta_info["output_token_original_logprobs"] = self.detokenize_logprob_tokens(
+            state.output_token_original_logprobs_val,
             state.output_token_logprobs_idx,
             return_text_in_logprobs,
         )
@@ -1662,6 +1679,9 @@ class TokenizerManager:
             state.output_top_logprobs_idx.extend(
                 recv_obj.output_top_logprobs_idx[recv_obj_index]
             )
+            state.output_top_original_logprobs_val.extend(
+                recv_obj.output_top_original_logprobs_val[recv_obj_index]
+            )
             meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
                 state.input_top_logprobs_val,
                 state.input_top_logprobs_idx,
@@ -1671,6 +1691,13 @@ class TokenizerManager:
                 state.output_top_logprobs_val,
                 state.output_top_logprobs_idx,
                 return_text_in_logprobs,
+            )
+            meta_info["output_top_original_logprobs"] = (
+                self.detokenize_top_logprobs_tokens(
+                    state.output_top_original_logprobs_val,
+                    state.output_top_logprobs_idx,
+                    return_text_in_logprobs,
+                )
             )
 
         if token_ids_logprob is not None:
@@ -1687,6 +1714,9 @@ class TokenizerManager:
             state.output_token_ids_logprobs_idx.extend(
                 recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
             )
+            state.output_token_ids_original_logprobs_val.extend(
+                recv_obj.output_token_ids_original_logprobs_val[recv_obj_index]
+            )
             meta_info["input_token_ids_logprobs"] = self.detokenize_top_logprobs_tokens(
                 state.input_token_ids_logprobs_val,
                 state.input_token_ids_logprobs_idx,
@@ -1695,6 +1725,13 @@ class TokenizerManager:
             meta_info["output_token_ids_logprobs"] = (
                 self.detokenize_top_logprobs_tokens(
                     state.output_token_ids_logprobs_val,
+                    state.output_token_ids_logprobs_idx,
+                    return_text_in_logprobs,
+                )
+            )
+            meta_info["output_token_ids_original_logprobs"] = (
+                self.detokenize_top_logprobs_tokens(
+                    state.output_token_ids_original_logprobs_val,
                     state.output_token_ids_logprobs_idx,
                     return_text_in_logprobs,
                 )
