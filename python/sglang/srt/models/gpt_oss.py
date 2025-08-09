@@ -98,7 +98,10 @@ class GptOssSparseMoeBlock(nn.Module):
         self.activation_alpha = getattr(config, "hidden_act_alpha", 1.702)
         self.swiglu_limit = config.swiglu_limit
 
-        if global_server_args_dict["enable_flashinfer_mxfp4_moe"]:
+        if (
+            global_server_args_dict["enable_flashinfer_mxfp4_moe"]
+            or global_server_args_dict["enable_flashinfer_mxfp4_bf16_moe"]
+        ):
             self.topk = None
         else:
             self.topk = TopK(
