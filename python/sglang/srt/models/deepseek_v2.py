@@ -46,6 +46,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
+    support_and_enable_flashinfer_allreduce_fusion,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -141,9 +142,6 @@ if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
-
-_is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and is_sm100_supported()
 
 
 logger = logging.getLogger(__name__)
@@ -1855,10 +1853,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         ):
             return False
 
-        if not global_server_args_dict["enable_flashinfer_allreduce_fusion"]:
-            return False
-
-        if not _is_sm100_supported or not _is_flashinfer_available:
+        if not support_and_enable_flashinfer_allreduce_fusion():
             return False
 
         input_ids = getattr(forward_batch, "input_ids", None)

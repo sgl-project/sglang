@@ -255,6 +255,14 @@ class LayerCommunicator:
         )
 
 
+def support_and_enable_flashinfer_allreduce_fusion():
+    return (
+        _is_sm100_supported
+        and _is_flashinfer_available
+        and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
+    )
+
+
 @dataclass
 class CommunicateContext:
     process_group_sizes: Dict[ScatterMode, int]
@@ -437,9 +445,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
             # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
             if (
-                _is_sm100_supported
-                and _is_flashinfer_available
-                and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
+                support_and_enable_flashinfer_allreduce_fusion()
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
