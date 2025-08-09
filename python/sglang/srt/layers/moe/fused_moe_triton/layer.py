@@ -215,7 +215,6 @@ class FusedMoE(torch.nn.Module):
             and self.use_enable_flashinfer_mxfp4_moe
         ):
             hidden_size = round_up(hidden_size, 256)
-        self.hidden_size = hidden_size
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
