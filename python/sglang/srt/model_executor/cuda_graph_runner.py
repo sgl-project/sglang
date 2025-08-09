@@ -28,9 +28,10 @@ import tqdm
 from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
+    use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.dp_attention import DPPaddingMode, get_attention_tp_size
@@ -342,26 +343,30 @@ class CudaGraphRunner:
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
-                    self.gathered_buffer = torch.zeros(
-                        (
-                            self.max_num_token * self.dp_size,
-                            self.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.model_runner.dtype,
-                    )
+                    with use_symmetric_memory(get_tp_group(), disable_war=True) as sm:
+                        self.gathered_buffer = torch.zeros(
+                            (
+                                self.max_num_token * self.dp_size,
+                                self.model_runner.model_config.hidden_size,
+                            ),
+                            dtype=self.model_runner.dtype,
+                        )
+                        sm.tag(self.gathered_buffer)
                 else:
                     assert self.require_attn_tp_gather
                     self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )
-                    self.gathered_buffer = torch.zeros(
-                        (
-                            self.max_num_token,
-                            self.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.model_runner.dtype,
-                    )
+                    with use_symmetric_memory(get_tp_group(), disable_war=True) as sm:
+                        self.gathered_buffer = torch.zeros(
+                            (
+                                self.max_num_token,
+                                self.model_runner.model_config.hidden_size,
+                            ),
+                            dtype=self.model_runner.dtype,
+                        )
+                        sm.tag(self.gathered_buffer)
             else:
                 self.global_num_tokens_gpu = None
                 self.global_num_tokens_for_logprob_gpu = None
