@@ -544,9 +544,6 @@ class ServerArgs:
             self.ep_dispatch_algorithm is None
         ):
             self.ep_dispatch_algorithm = "static"
-            logger.warning(
-                "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
-            )
 
         if self.enable_eplb:
             assert self.ep_size > 1 or self.moe_a2a_backend is not None
