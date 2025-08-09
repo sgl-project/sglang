@@ -1766,8 +1766,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
-        self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.self_attn = DeepseekV2AttentionMLA(

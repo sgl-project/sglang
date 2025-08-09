@@ -160,6 +160,9 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.allow_fuse_mlp_allreduce_with_next_layer = allow_fuse_mlp_allreduce_with_next_layer
 
+        self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
+        self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
+
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
             input_mode=self.layer_scatter_modes.layer_input_mode,
