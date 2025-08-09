@@ -24,6 +24,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     pip install --upgrade pip --break-system-packages
     PIP_CMD="pip --break-system-packages"
 else
+    # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
     pip install uv
     export UV_SYSTEM_PYTHON=true
