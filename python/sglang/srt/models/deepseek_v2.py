@@ -1858,16 +1858,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         ):
             return False
 
-        if not global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False):
+        if not global_server_args_dict["enable_flashinfer_allreduce_fusion"]:
             return False
 
         if not _is_sm100_supported or not _is_flashinfer_available:
             return False
 
-        if hasattr(forward_batch, "input_ids") and (
-            forward_batch.input_ids.shape[0] == 0
-            or forward_batch.input_ids.shape[0] > 128
-        ):
+        input_ids = getattr(forward_batch, "input_ids", None)
+        if input_ids is not None and (input_ids.shape[0] == 0 or input_ids.shape[0] > 128):
             return False
 
         if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
