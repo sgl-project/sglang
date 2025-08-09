@@ -36,6 +36,14 @@ pub fn init_metrics() {
         "sgl_router_retries_total",
         "Total number of request retries by route"
     );
+    describe_histogram!(
+        "sgl_router_retry_backoff_duration_seconds",
+        "Backoff duration in seconds by attempt index"
+    );
+    describe_counter!(
+        "sgl_router_retries_exhausted_total",
+        "Total number of requests that exhausted retries by route"
+    );
 
     // Worker metrics
     describe_gauge!(
@@ -181,6 +189,20 @@ impl RouterMetrics {
 
     pub fn record_retry(route: &str) {
         counter!("sgl_router_retries_total",
+            "route" => route.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_retry_backoff_duration(duration: Duration, attempt: u32) {
+        histogram!("sgl_router_retry_backoff_duration_seconds",
+            "attempt" => attempt.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn record_retries_exhausted(route: &str) {
+        counter!("sgl_router_retries_exhausted_total",
             "route" => route.to_string()
         )
         .increment(1);

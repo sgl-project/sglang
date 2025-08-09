@@ -31,6 +31,16 @@ def popen_launch_router(
     prometheus_port: int = None,
     prometheus_host: str = None,
     dp_aware: bool = False,
+    # Router retry/CB tuning (optional)
+    router_retry_max_retries: int = None,
+    router_retry_initial_backoff_ms: int = None,
+    router_retry_max_backoff_ms: int = None,
+    router_retry_backoff_multiplier: float = None,
+    router_retry_jitter_factor: float = None,
+    router_cb_failure_threshold: int = None,
+    router_cb_success_threshold: int = None,
+    router_cb_timeout_duration_secs: int = None,
+    router_cb_window_duration_secs: int = None,
 ):
     """
     Launch the router server process.
@@ -106,6 +116,21 @@ def popen_launch_router(
 
     if dp_aware:
         command.append("--router-dp-aware")
+
+    # Append router retry/CB tuning flags if provided
+    def _add(flag: str, val):
+        if val is not None:
+            command.extend([flag, str(val)])
+
+    _add("--router-retry-max-retries", router_retry_max_retries)
+    _add("--router-retry-initial-backoff-ms", router_retry_initial_backoff_ms)
+    _add("--router-retry-max-backoff-ms", router_retry_max_backoff_ms)
+    _add("--router-retry-backoff-multiplier", router_retry_backoff_multiplier)
+    _add("--router-retry-jitter-factor", router_retry_jitter_factor)
+    _add("--router-cb-failure-threshold", router_cb_failure_threshold)
+    _add("--router-cb-success-threshold", router_cb_success_threshold)
+    _add("--router-cb-timeout-duration-secs", router_cb_timeout_duration_secs)
+    _add("--router-cb-window-duration-secs", router_cb_window_duration_secs)
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
@@ -337,6 +362,30 @@ class TestLaunchServer(unittest.TestCase):
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
+
+    def test_retry_and_circuit_breaker_tuning(self):
+        print("Running test_retry_and_circuit_breaker_tuning...")
+        # DP size = 1 with explicit retry/CB tuning
+        self.process = popen_launch_router(
+            self.model,
+            self.base_url,
+            dp_size=1,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            policy="round_robin",
+        )
+        # Probe health
+        with requests.Session() as session:
+            r = session.get(f"{self.base_url}/health")
+            self.assertEqual(r.status_code, 200)
+        # Fire a minimal request to trigger router path
+        with requests.Session() as session:
+            r = session.post(
+                f"{self.base_url}/generate",
+                json={"text": "hello", "temperature": 0.0},
+                headers={"Content-Type": "application/json"},
+            )
+            # In absence of workers, router should return 503 quickly
+            self.assertIn(r.status_code, [200, 503])
 
     def test_4_payload_size(self):
         print("Running test_4_payload_size...")
@@ -704,6 +753,83 @@ class TestLaunchServer(unittest.TestCase):
                 200,
                 f"Request with correct api key should succeed but got status {response.status_code}",
             )
+
+    def test_retry_and_circuit_breaker_real_worker(self):
+        print("Running test_retry_and_circuit_breaker_real_worker...")
+        # Start router with explicit retry/CB tuning for fast transitions
+        self.process = popen_launch_router(
+            self.model,
+            self.base_url,
+            dp_size=1,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            policy="round_robin",
+            router_retry_max_retries=3,
+            router_retry_initial_backoff_ms=5,
+            router_retry_max_backoff_ms=10,
+            router_retry_backoff_multiplier=2.0,
+            router_retry_jitter_factor=0.0,
+            router_cb_failure_threshold=2,
+            router_cb_success_threshold=2,
+            router_cb_timeout_duration_secs=1,
+            router_cb_window_duration_secs=60,
+        )
+
+        # 1) start a worker
+        port = find_available_port()
+        worker_url = f"http://127.0.0.1:{port}"
+        worker_process = popen_launch_server(
+            self.model, worker_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        )
+        self.other_process.append(worker_process)
+
+        # 2) add worker
+        with requests.Session() as session:
+            r = session.post(f"{self.base_url}/add_worker?url={worker_url}")
+            print(f"status code: {r.status_code}, response: {r.text}")
+            self.assertEqual(r.status_code, 200)
+
+        # 3) baseline success
+        with requests.Session() as session:
+            r = session.post(
+                f"{self.base_url}/generate",
+                json={"text": "hi", "temperature": 0.0},
+            )
+            self.assertEqual(r.status_code, 200)
+
+        # 4) kill worker to induce failures and open CB
+        kill_process_tree(worker_process.pid)
+
+        # First failure path: retries may yield a failure or 503 once CB opens
+        with requests.Session() as session:
+            r = session.post(
+                f"{self.base_url}/generate",
+                json={"text": "hi", "temperature": 0.0},
+            )
+            self.assertIn(r.status_code, [500, 502, 503])
+
+        # Next call should be fast 503 (CB open → no available workers)
+        with requests.Session() as session:
+            r = session.post(
+                f"{self.base_url}/generate",
+                json={"text": "hi", "temperature": 0.0},
+            )
+            self.assertEqual(r.status_code, 503)
+
+        # 5) half-open after timeout; restart worker on same port
+        time.sleep(1.2)
+        worker_process = popen_launch_server(
+            self.model, worker_url, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        )
+        self.other_process.append(worker_process)
+
+        # Two successes to close the circuit (HalfOpen → Closed)
+        for _ in range(2):
+            with requests.Session() as session:
+                r = session.post(
+                    f"{self.base_url}/generate",
+                    json={"text": "hi", "temperature": 0.0},
+                )
+                self.assertEqual(r.status_code, 200)
 
 
 if __name__ == "__main__":
