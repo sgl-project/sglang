@@ -344,7 +344,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
         # 2. Quantization of all components to FP8 format
         # 3. Output placement into pre-allocated tensors
-        flashinfer.rope.mla_rope_quantize(
+        flashinfer.rope.mla_rope_quantize_fp8(
             q_rope=q_rope,
             k_rope=k_rope,
             q_nope=q_nope,
