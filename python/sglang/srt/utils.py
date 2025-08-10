@@ -41,6 +41,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
@@ -231,6 +232,10 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
+
+
+def random_uuid() -> str:
+    return str(uuid.uuid4().hex)
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -810,7 +815,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 vr = VideoReader(tmp_file.name, ctx=ctx)
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
-                video_bytes = base64.b64decode(encoded)
+                video_bytes = pybase64.b64decode(encoded)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
@@ -818,7 +823,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             elif os.path.isfile(video_file):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
-                video_bytes = base64.b64decode(video_file)
+                video_bytes = pybase64.b64decode(video_file)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
@@ -2956,3 +2961,8 @@ class ConcurrentCounter:
         other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
         """
         self.wait_for(lambda count: count == 0)
+
+
+@lru_cache(maxsize=1)
+def is_triton_kernels_available() -> bool:
+    return importlib.util.find_spec("triton_kernels") is not None

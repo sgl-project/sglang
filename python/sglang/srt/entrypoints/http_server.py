@@ -32,6 +32,7 @@ from typing import AsyncIterator, Callable, Dict, Optional
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 
 import numpy as np
 import orjson
@@ -56,6 +57,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     ModelCard,
     ModelList,
+    ResponsesRequest,
     ScoringRequest,
     V1RerankReqInput,
 )
@@ -147,6 +149,37 @@ async def lifespan(fast_api_app: FastAPI):
     )
 
     server_args: ServerArgs = fast_api_app.server_args
+
+    tool_server = None
+    if server_args.tool_server == "demo":
+        from sglang.srt.entrypoints.openai.tool_server import DemoToolServer
+
+        tool_server = DemoToolServer()
+    elif server_args.tool_server:
+        from sglang.srt.entrypoints.openai.tool_server import MCPToolServer
+
+        tool_server = MCPToolServer()
+        await tool_server.add_tool_server(server_args.tool_server)
+
+    try:
+        from sglang.srt.entrypoints.openai.serving_responses import (
+            OpenAIServingResponses,
+        )
+
+        fast_api_app.state.openai_serving_responses = OpenAIServingResponses(
+            _global_state.tokenizer_manager,
+            _global_state.template_manager,
+            enable_prompt_tokens_details=True,
+            enable_force_include_usage=True,
+            tool_server=tool_server,
+        )
+    except Exception as e:
+        # print stack trace
+        import traceback
+
+        traceback.print_exc()
+        logger.warning(f"Can not initialize OpenAIServingResponses, error: {e}")
+
     if server_args.warmups is not None:
         await execute_warmups(
             server_args.disaggregation_mode,
@@ -843,6 +876,42 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
     )
 
 
+@app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
+async def v1_responses_request(request: dict, raw_request: Request):
+    """Endpoint for the responses API with reasoning support."""
+
+    request_obj = ResponsesRequest(**request)
+    result = await raw_request.app.state.openai_serving_responses.create_responses(
+        request_obj, raw_request
+    )
+
+    # Handle streaming responses
+    if isinstance(result, AsyncGenerator):
+        return StreamingResponse(
+            result,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    return result
+
+
+@app.get("/v1/responses/{response_id}")
+async def v1_retrieve_responses(response_id: str, raw_request: Request):
+    """Retrieve a response by ID."""
+    return await raw_request.app.state.openai_serving_responses.retrieve_responses(
+        response_id
+    )
+
+
+@app.post("/v1/responses/{response_id}/cancel")
+async def v1_cancel_responses(response_id: str, raw_request: Request):
+    """Cancel a background response."""
+    return await raw_request.app.state.openai_serving_responses.cancel_responses(
+        response_id
+    )
+
+
 @app.api_route(
     "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
 )
@@ -1103,6 +1172,8 @@ def _wait_and_warmup(
             pipe_finish_writer,
         ):
             return
+    else:
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     logger.info("The server is fired up and ready to roll!")
 

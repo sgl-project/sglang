@@ -259,7 +259,7 @@ class Engine(EngineBase):
                     f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
                 )
 
-        logger.info(f"data_parallel_rank: {data_parallel_rank}")
+        logger.debug(f"data_parallel_rank: {data_parallel_rank}")
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -492,12 +492,13 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str):
+    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
         """Load a new LoRA adapter without re-launching the engine."""
 
         obj = LoadLoRAAdapterReqInput(
             lora_name=lora_name,
             lora_path=lora_path,
+            pinned=pinned,
         )
 
         loop = asyncio.get_event_loop()
@@ -649,7 +650,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.2",
+            "0.3.3",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
