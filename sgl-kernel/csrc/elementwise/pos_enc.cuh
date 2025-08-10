@@ -57,8 +57,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferHeadParallelis
     size_t k_buffer_stride_h,
     size_t v_buffer_stride_n,
     size_t v_buffer_stride_h,
-    DType k_scale,
-    DType v_scale,
+    float k_scale,
+    float v_scale,
     IdType* __restrict__ cache_loc) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   uint32_t by = blockIdx.y;
@@ -118,7 +118,11 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferHeadParallelis
       }
       k_vec.cast_store(k_rope_ptr + tx * vec_size);
       k_vec.cast_store(k_buffer_ptr + tx * vec_size);
-      v.cast_store(v_buffer_ptr + tx * vec_size);
+
+      vec_t<float, vec_size> v_vec;
+      v_vec.cast_load(v_ptr + tx * vec_size);
+      v_vec.cast_store(v_buffer_ptr + tx * vec_size);
+      // v.cast_store(v_buffer_ptr + tx * vec_size);
     }
   }
 }
@@ -152,8 +156,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferKernel(
     size_t k_buffer_stride_h,
     size_t v_buffer_stride_n,
     size_t v_buffer_stride_h,
-    DType k_scale,
-    DType v_scale,
+    float k_scale,
+    float v_scale,
     IdType* __restrict__ cache_loc) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bdy = blockDim.y;
@@ -214,7 +218,10 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferKernel(
       }
       k_vec.cast_store(k_rope_ptr + tx * vec_size);
       k_vec.cast_store(k_buffer_ptr + tx * vec_size);  // store the k_rope to the k_buffer
-      v.cast_store(v_buffer_ptr + tx * vec_size);      // store the v to the v_buffer
+      // v.cast_store(v_buffer_ptr + tx * vec_size);      // store the v to the v_buffer
+      vec_t<float, vec_size> v_vec;
+      v_vec.cast_load(v_ptr + tx * vec_size);
+      v_vec.cast_store(v_buffer_ptr + tx * vec_size);
     }
   }
 }
@@ -252,8 +259,8 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
     IdType* cache_loc,
     bool interleave,
     cudaStream_t stream = nullptr,
-    DType k_scale = 1.0f,
-    DType v_scale = 1.0f) {
+    float k_scale = 1.0f,
+    float v_scale = 1.0f) {
   int dev_id = 0;
   int num_sms = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
