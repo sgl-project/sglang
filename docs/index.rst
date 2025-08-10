@@ -39,14 +39,15 @@ The core features include:
 
    advanced_features/speculative_decoding.ipynb
    advanced_features/structured_outputs.ipynb
+   advanced_features/structured_outputs_for_reasoning_models.ipynb
    advanced_features/function_calling.ipynb
    advanced_features/separate_reasoning.ipynb
-   advanced_features/structured_outputs_for_reasoning_models.ipynb
    advanced_features/custom_chat_template.md
    advanced_features/quantization.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md
    advanced_features/vlm_query.ipynb
+   advanced_features/router.md
 
 .. toctree::
    :maxdepth: 1
@@ -59,6 +60,7 @@ The core features include:
    supported_models/rerank_models.md
    supported_models/support_new_models.md
    supported_models/transformers_fallback.md
+   supported_models/modelscope.md
 
 .. toctree::
    :maxdepth: 1
@@ -75,12 +77,16 @@ The core features include:
    :maxdepth: 1
    :caption: Developer Guide
 
+   developer_guide/contribution_guide.md
    developer_guide/development_guide_using_docker.md
 
 .. toctree::
    :maxdepth: 1
    :caption: References
 
+   references/faq.md
+   references/environment_variables.md
+   references/production_metrics.md
    references/custom_chat_template.md
-   references/frontend/frontend.rst
-   references/blog.md
+   references/frontend/frontend_index.rst
+   references/learn_more.md
