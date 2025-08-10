@@ -41,7 +41,7 @@ jobs:
           make compile
 
 
-  finish:
+  notebook-finish:
     needs: [
       run-all-notebooks
     ]
