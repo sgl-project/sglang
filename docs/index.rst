@@ -20,8 +20,8 @@ The core features include:
    :maxdepth: 1
    :caption: Basic Usage
 
-   basic_usage/send_request.ipynb
-   basic_usage/openai_api.rst
+   basic_usage/send_request
+   basic_usage/openai_api
    basic_usage/offline_engine_api.ipynb
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
