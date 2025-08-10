@@ -68,7 +68,6 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
