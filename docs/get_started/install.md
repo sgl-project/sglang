@@ -2,7 +2,7 @@
 
 You can install SGLang using one of the methods below.
 
-This page primarily applies to NVIDIA GPU platforms.
+This page primarily applies to common NVIDIA GPU platforms.
 For other or newer platforms, please refer to the dedicated pages for [NVIDIA Blackwell GPUs](../platforms/blackwell_gpu.md), [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md).
 
 ## Method 1: With pip or uv
@@ -39,7 +39,7 @@ pip install -e "python[all]"
 
 ## Method 3: Using docker
 
-The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
+The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash

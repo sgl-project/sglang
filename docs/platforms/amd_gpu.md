@@ -1,15 +1,16 @@
 # AMD GPUs
 
-This document describes how to set up an AMD-based environment for [SGLang](https://github.com/sgl-project/sglang). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues) on the SGLang repository.
+This document describes how run SGLang on AMD GPUs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## System Configuration
 
 When using AMD GPUs (such as MI300X), certain system-level optimizations help ensure stable performance. Here we take MI300X as an example. AMD provides official documentation for MI300X optimization and system tuning:
 
 - [AMD MI300X Tuning Guides](https://rocm.docs.amd.com/en/latest/how-to/tuning-guides/mi300x/index.html)
-  - [LLM inference performance validation on AMD Instinct MI300X](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference/vllm-benchmark.html)
-  - [AMD Instinct MI300X System Optimization](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html)
-  - [AMD Instinct MI300X Workload Optimization](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html)
+- [LLM inference performance validation on AMD Instinct MI300X](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference/vllm-benchmark.html)
+- [AMD Instinct MI300X System Optimization](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html)
+- [AMD Instinct MI300X Workload Optimization](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html)
+- [Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html)
 
 **NOTE:** We strongly recommend reading these docs and guides entirely to fully utilize your system.
 
@@ -35,22 +36,30 @@ You can automate or verify this change using [this helpful script](https://githu
 
 Again, please go through the entire documentation to confirm your system is using the recommended configuration.
 
-## Installing SGLang
-
-For general installation instructions, see the official [SGLang Installation Docs](../start/install.md). Below are the AMD-specific steps summarized for convenience.
+## Install SGLang
 
 ### Install from Source
 
 ```bash
-git clone https://github.com/sgl-project/sglang.git
+# Use the last release branch
+git clone -b v0.5.0rc0 https://github.com/sgl-project/sglang.git
 cd sglang
 
+# Compile sgl-kernel
 pip install --upgrade pip
-pip install sgl-kernel --force-reinstall --no-deps
+cd sgl-kernel
+python setup_rocm.py install
+
+# Install sglang python package
+cd ..
 pip install -e "python[all_hip]"
 ```
 
 ### Install Using Docker (Recommended)
+
+The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
+
+The steps below shows how to build an image from scratch.
 
 1. Build the docker image.
 
