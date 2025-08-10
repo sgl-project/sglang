@@ -382,6 +382,12 @@ class ModelRunner:
             )
             server_args.attention_backend = "torch_native"
 
+        if server_args.prefill_attention_backend is not None and (
+            server_args.prefill_attention_backend
+            == server_args.decode_attention_backend
+        ):  # override the default attention backend
+            server_args.attention_backend = server_args.prefill_attention_backend
+
         if server_args.attention_backend is None:
             """
             Auto select the fastest attention backend.
@@ -401,7 +407,6 @@ class ModelRunner:
                     is_hopper_with_cuda_12_3()
                     and is_no_spec_infer_or_topk_one(server_args)
                     and is_fa3_default_architecture(self.model_config.hf_config)
-                    and (not server_args.enable_hierarchical_cache)
                 ):
                     server_args.attention_backend = "fa3"
                 elif _is_hip:
@@ -414,9 +419,7 @@ class ModelRunner:
                     )
             else:
                 # MLA architecture
-                if is_hopper_with_cuda_12_3() and (
-                    not server_args.enable_hierarchical_cache
-                ):
+                if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
                 elif is_sm100_supported():
                     server_args.attention_backend = "flashinfer"
@@ -503,6 +506,27 @@ class ModelRunner:
         if server_args.attention_backend == "aiter":
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
+
+        if (
+            server_args.enable_hierarchical_cache
+            and server_args.hicache_io_backend == "kernel"
+        ):
+            # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
+            if server_args.decode_attention_backend is None:
+                if not self.use_mla_backend:
+                    server_args.decode_attention_backend = (
+                        "flashinfer" if is_flashinfer_available() else "triton"
+                    )
+                else:
+                    server_args.decode_attention_backend = (
+                        "flashinfer" if is_sm100_supported() else "triton"
+                    )
+            elif server_args.decode_attention_backend == "fa3":
+                server_args.hicache_io_backend = "direct"
+                logger.warning(
+                    "FlashAttention3 decode backend is not compatible with hierarchical cache. "
+                    f"Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
+                )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -1509,6 +1533,12 @@ class ModelRunner:
 
             logger.info(f"Intel AMX attention backend is enabled.")
             return IntelAMXAttnBackend(self)
+        elif self.server_args.attention_backend == "dual_chunk_flash_attn":
+            from sglang.srt.layers.attention.dual_chunk_flashattention_backend import (
+                DualChunkFlashAttentionBackend,
+            )
+
+            return DualChunkFlashAttentionBackend(self)
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
 

@@ -152,12 +152,11 @@ impl Tree {
                         parent: RwLock::new(Some(Arc::clone(&curr))),
                     });
 
-                    // Increment char count when creating new node with tenant
+                    // Attach tenant to the new node (map is empty here) and increment count once
                     self.tenant_char_count
                         .entry(tenant.to_string())
                         .and_modify(|count| *count += curr_text_count)
                         .or_insert(curr_text_count);
-
                     new_node
                         .tenant_last_access_time
                         .insert(tenant.to_string(), timestamp_ms);
@@ -213,32 +212,38 @@ impl Tree {
 
                         prev = Arc::clone(&new_node);
 
-                        // Increment char count for the tenant in the new split node
-                        if !prev.tenant_last_access_time.contains_key(tenant) {
-                            self.tenant_char_count
-                                .entry(tenant.to_string())
-                                .and_modify(|count| *count += matched_text_count)
-                                .or_insert(matched_text_count);
+                        // Atomically attach tenant to the new split node and increment count once
+                        match prev.tenant_last_access_time.entry(tenant.to_string()) {
+                            Entry::Vacant(v) => {
+                                self.tenant_char_count
+                                    .entry(tenant.to_string())
+                                    .and_modify(|count| *count += matched_text_count)
+                                    .or_insert(matched_text_count);
+                                v.insert(timestamp_ms);
+                            }
+                            Entry::Occupied(mut o) => {
+                                o.insert(timestamp_ms);
+                            }
                         }
-
-                        prev.tenant_last_access_time
-                            .insert(tenant.to_string(), timestamp_ms);
 
                         curr_idx += shared_count;
                     } else {
                         // move to next node
                         prev = Arc::clone(&matched_node);
 
-                        // Increment char count when adding tenant to existing node
-                        if !prev.tenant_last_access_time.contains_key(tenant) {
-                            self.tenant_char_count
-                                .entry(tenant.to_string())
-                                .and_modify(|count| *count += matched_node_text_count)
-                                .or_insert(matched_node_text_count);
+                        // Atomically attach tenant to existing node and increment count once
+                        match prev.tenant_last_access_time.entry(tenant.to_string()) {
+                            Entry::Vacant(v) => {
+                                self.tenant_char_count
+                                    .entry(tenant.to_string())
+                                    .and_modify(|count| *count += matched_node_text_count)
+                                    .or_insert(matched_node_text_count);
+                                v.insert(timestamp_ms);
+                            }
+                            Entry::Occupied(mut o) => {
+                                o.insert(timestamp_ms);
+                            }
                         }
-
-                        prev.tenant_last_access_time
-                            .insert(tenant.to_string(), timestamp_ms);
                         curr_idx += shared_count;
                     }
                 }
@@ -260,29 +265,26 @@ impl Tree {
 
             curr = prev.clone();
 
-            match curr.children.entry(first_char) {
-                Entry::Occupied(entry) => {
-                    let matched_node = entry.get().clone();
-                    let shared_count =
-                        shared_prefix_count(&matched_node.text.read().unwrap(), &curr_text);
+            if let Some(entry) = curr.children.get(&first_char) {
+                let matched_node = entry.value().clone();
+                let matched_text_guard = matched_node.text.read().unwrap();
+                let shared_count = shared_prefix_count(&matched_text_guard, &curr_text);
+                let matched_node_text_count = matched_text_guard.chars().count();
+                drop(matched_text_guard);
 
-                    let matched_node_text_count = matched_node.text.read().unwrap().chars().count();
-
-                    if shared_count == matched_node_text_count {
-                        // Full match with current node's text, continue to next node
-                        curr_idx += shared_count;
-                        prev = Arc::clone(&matched_node);
-                    } else {
-                        // Partial match, stop here
-                        curr_idx += shared_count;
-                        prev = Arc::clone(&matched_node);
-                        break;
-                    }
-                }
-                Entry::Vacant(_) => {
-                    // No match found, stop here
+                if shared_count == matched_node_text_count {
+                    // Full match with current node's text, continue to next node
+                    curr_idx += shared_count;
+                    prev = Arc::clone(&matched_node);
+                } else {
+                    // Partial match, stop here
+                    curr_idx += shared_count;
+                    prev = Arc::clone(&matched_node);
                     break;
                 }
+            } else {
+                // No match found, stop here
+                break;
             }
         }
 
@@ -330,35 +332,32 @@ impl Tree {
 
             curr = prev.clone();
 
-            match curr.children.entry(first_char) {
-                Entry::Occupied(entry) => {
-                    let matched_node = entry.get().clone();
+            if let Some(entry) = curr.children.get(&first_char) {
+                let matched_node = entry.value().clone();
 
-                    // Only continue matching if this node belongs to the specified tenant
-                    if !matched_node.tenant_last_access_time.contains_key(tenant) {
-                        break;
-                    }
-
-                    let shared_count =
-                        shared_prefix_count(&matched_node.text.read().unwrap(), &curr_text);
-
-                    let matched_node_text_count = matched_node.text.read().unwrap().chars().count();
-
-                    if shared_count == matched_node_text_count {
-                        // Full match with current node's text, continue to next node
-                        curr_idx += shared_count;
-                        prev = Arc::clone(&matched_node);
-                    } else {
-                        // Partial match, stop here
-                        curr_idx += shared_count;
-                        prev = Arc::clone(&matched_node);
-                        break;
-                    }
-                }
-                Entry::Vacant(_) => {
-                    // No match found, stop here
+                // Only continue matching if this node belongs to the specified tenant
+                if !matched_node.tenant_last_access_time.contains_key(tenant) {
                     break;
                 }
+
+                let matched_text_guard = matched_node.text.read().unwrap();
+                let shared_count = shared_prefix_count(&matched_text_guard, &curr_text);
+                let matched_node_text_count = matched_text_guard.chars().count();
+                drop(matched_text_guard);
+
+                if shared_count == matched_node_text_count {
+                    // Full match with current node's text, continue to next node
+                    curr_idx += shared_count;
+                    prev = Arc::clone(&matched_node);
+                } else {
+                    // Partial match, stop here
+                    curr_idx += shared_count;
+                    prev = Arc::clone(&matched_node);
+                    break;
+                }
+            } else {
+                // No match found, stop here
+                break;
             }
         }
 
@@ -444,12 +443,11 @@ impl Tree {
 
             // Decrement when removing tenant from node
             if node.tenant_last_access_time.contains_key(&tenant) {
+                let node_len = node.text.read().unwrap().chars().count();
                 self.tenant_char_count
                     .entry(tenant.clone())
                     .and_modify(|count| {
-                        if *count > 0 {
-                            *count -= node.text.read().unwrap().chars().count();
-                        }
+                        *count = count.saturating_sub(node_len);
                     });
             }
 
@@ -458,9 +456,11 @@ impl Tree {
 
             // Remove empty nodes
             if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
-                if let Some(parent) = node.parent.write().unwrap().as_ref() {
-                    let first_char = node.text.read().unwrap().chars().next().unwrap();
-                    parent.children.remove(&first_char);
+                if let Some(parent) = node.parent.read().unwrap().as_ref() {
+                    let text_guard = node.text.read().unwrap();
+                    if let Some(first_char) = text_guard.chars().next() {
+                        parent.children.remove(&first_char);
+                    }
                 }
             }
 
@@ -507,8 +507,10 @@ impl Tree {
             // remove empty nodes
             if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
                 if let Some(parent) = curr.parent.read().unwrap().as_ref() {
-                    let first_char = curr.text.read().unwrap().chars().next().unwrap();
-                    parent.children.remove(&first_char);
+                    let text_guard = curr.text.read().unwrap();
+                    if let Some(first_char) = text_guard.chars().next() {
+                        parent.children.remove(&first_char);
+                    }
                 }
             }
 
@@ -659,9 +661,9 @@ impl Tree {
 //  Unit tests
 #[cfg(test)]
 mod tests {
-    use rand::distributions::Alphanumeric;
-    use rand::distributions::DistString;
-    use rand::thread_rng;
+    use rand::distr::Alphanumeric;
+    use rand::distr::SampleString;
+    use rand::rng as thread_rng;
     use rand::Rng;
     use std::thread;
     use std::time::Instant;
@@ -1254,27 +1256,27 @@ mod tests {
         for thread_id in 0..4 {
             let tree = Arc::clone(&tree);
             let handle = thread::spawn(move || {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let tenant = format!("tenant{}", thread_id + 1);
                 let prefix = format!("prefix{}", thread_id);
 
                 while start_time.elapsed() < test_duration {
                     // Random decision: match or insert (70% match, 30% insert)
-                    if rng.gen_bool(0.7) {
+                    if rng.random_bool(0.7) {
                         // Perform match operation
-                        let random_len = rng.gen_range(3..10);
+                        let random_len = rng.random_range(3..10);
                         let search_str = format!("{}{}", prefix, random_string(random_len));
                         let (_matched, _) = tree.prefix_match(&search_str);
                     } else {
                         // Perform insert operation
-                        let random_len = rng.gen_range(5..15);
+                        let random_len = rng.random_range(5..15);
                         let insert_str = format!("{}{}", prefix, random_string(random_len));
                         tree.insert(&insert_str, &tenant);
                         // println!("Thread {} inserted: {}", thread_id, insert_str);
                     }
 
                     // Small random sleep to vary timing
-                    thread::sleep(Duration::from_millis(rng.gen_range(10..100)));
+                    thread::sleep(Duration::from_millis(rng.random_range(10..100)));
                 }
             });
             handles.push(handle);
