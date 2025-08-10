@@ -44,10 +44,11 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         image_processor = processor.image_processor
 
         try:
-            image, image_size = load_image(image_data.url)
+            url = image_data.url if isinstance(image_data, ImageData) else image_data
+            image, image_size = load_image(url)
             if image_size is not None:
                 # It is a video with multiple images
-                image_hash = hash(image_data.url)
+                image_hash = hash(url)
                 pixel_values = image_processor(image)["pixel_values"]
                 for _ in range(len(pixel_values)):
                     pixel_values[_] = pixel_values[_].astype(np.float16)
@@ -55,7 +56,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 return pixel_values, image_hash, image_size
             else:
                 # It is an image
-                image_hash = hash(image_data.url)
+                image_hash = hash(url)
                 if image_aspect_ratio == "pad":
                     image = expand2square(
                         image,
