@@ -14,7 +14,7 @@ The core features include:
    :maxdepth: 1
    :caption: Get Started
 
-   start/install.md
+   get_started/install.md
 
 .. toctree::
    :maxdepth: 1
@@ -51,6 +51,7 @@ The core features include:
    :maxdepth: 1
    :caption: Developer Guide
 
+   developer_guide/development_guide_using_docker.md
 
 .. toctree::
    :maxdepth: 1
