@@ -50,6 +50,8 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 
+_is_npu = is_npu()
+
 
 @dataclass
 class GraphCaptureContext:
@@ -591,7 +593,7 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if not supports_custom_op():
+        if _is_npu or not supports_custom_op():
             self._all_gather_into_tensor(output, input)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(
@@ -1127,7 +1129,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=not is_npu(),
+        use_pynccl=not _is_npu,
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_hpu_communicator=True,
