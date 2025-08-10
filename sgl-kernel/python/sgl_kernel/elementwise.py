@@ -276,6 +276,21 @@ def apply_rope_with_cos_sin_cache_inplace(
 
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+    value : Optional[torch.Tensor]
+        Value tensor, shape: ``(nnz, num_v_heads * head_size)``.
+        If provided, the function will also apply RoPE to the value tensor.
+    k_buffer : Optional[torch.Tensor]
+        Buffer for keys, shape: ``(nnz, num_k_heads * head_size)``.
+        If provided, the function will set the buffer inplace.
+    v_buffer : Optional[torch.Tensor]
+        Buffer for values, shape: ``(nnz, num_v_heads * head_size)``.
+        If provided, the function will set the buffer inplace.
+    k_scale : Optional[float]
+        Scale factor for keys. If not provided, defaults to 1.0.
+    v_scale : Optional[float]
+        Scale factor for values. If not provided, defaults to 1.0.
+    cache_loc : Optional[torch.Tensor]
+        Cache location tensor, used for indexing kv cache.
     Note
     ----
     The rotary dimension is determined by the cosine cache and sine cache.
@@ -284,35 +299,6 @@ def apply_rope_with_cos_sin_cache_inplace(
         raise ValueError("cos_sin_cache should be float32")
 
     ## fused from memory_pool set_kv_buffer
-    """
-    if layer_id_override is not None:
-        layer_id = layer_id_override
-    else:
-        layer_id = layer.layer_id
-    if cache_k.dtype != self.dtype:
-        if k_scale is not None:
-            cache_k.div_(k_scale)
-        if v_scale is not None:
-            cache_v.div_(v_scale)
-        cache_k = cache_k.to(self.dtype)
-        cache_v = cache_v.to(self.dtype)
-
-    if self.store_dtype != self.dtype:
-        cache_k = cache_k.view(self.store_dtype)
-        cache_v = cache_v.view(self.store_dtype)
-
-    if get_is_capture_mode() and self.alt_stream is not None:
-        # Overlap the copy of K and V cache for small batch size
-        current_stream = self.device_module.current_stream()
-        self.alt_stream.wait_stream(current_stream)
-        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-        with self.device_module.stream(self.alt_stream):
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-        current_stream.wait_stream(self.alt_stream)
-    else:
-        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-    """
     if (
         k_buffer is not None
         and v_buffer is not None
