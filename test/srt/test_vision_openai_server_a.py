@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestLLava(ImageOpenAITestMixin):
+class TestLlava(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
