@@ -18,6 +18,7 @@ from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_shuffle
 from torch.nn import Module
 
+from sglang.environ import envs
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -27,14 +28,14 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.utils import get_bool_env_var, set_weight_attrs
+from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
 logger = logging.getLogger(__name__)
 
-use_dynamic_mxfp4_linear = get_bool_env_var("SGLANG_USE_DYNAMIC_MXFP4_linear")
+use_dynamic_mxfp4_linear = envs.SGLANG_USE_DYNAMIC_MXFP4_LINEAR.value
 
 OCP_MX_BLOCK_SIZE = 32
 
