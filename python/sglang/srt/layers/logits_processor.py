@@ -437,9 +437,14 @@ class LogitsProcessor(nn.Module):
                 pruned_lens,
             )
 
-        # If the number of tokens is less than the chunk size, we process the
-        # input logprobs in a single chunk
-        if pruned_states.shape[0] <= LOGITS_PROCESSER_CHUNK_SIZE:
+        # If the number of tokens is less than the chunk size, or all-gather DP
+        # attention is enabled, we process the input logprobs in the old way with
+        # no chunking. In the dp attention case, chunking can be enabled by setting
+        # "enable_dp_lm_head" in the config.
+        if (
+            pruned_states.shape[0] <= LOGITS_PROCESSER_CHUNK_SIZE
+            or self.do_tensor_parallel_all_gather_dp_attn
+        ):
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
