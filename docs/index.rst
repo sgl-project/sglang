@@ -82,3 +82,4 @@ The core features include:
 
    references/custom_chat_template.md
    references/frontend/index.rst
+   references/blog.md
