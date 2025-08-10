@@ -53,19 +53,7 @@ docker run --gpus all \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 ```
 
-## Method 4: Using docker compose
-
-<details>
-<summary>More</summary>
-
-> This method is recommended if you plan to serve it as a service.
-> A better approach is to use the [k8s-sglang-service.yaml](https://github.com/sgl-project/sglang/blob/main/docker/k8s-sglang-service.yaml).
-
-1. Copy the [compose.yml](https://github.com/sgl-project/sglang/blob/main/docker/compose.yaml) to your local machine
-2. Execute the command `docker compose up -d` in your terminal.
-</details>
-
-## Method 5: Using Kubernetes
+## Method 4: Using Kubernetes
 
 Please check out [OME](https://github.com/sgl-project/ome), a Kubernetes operator for enterprise-grade management and serving of large language models (LLMs).
 
@@ -80,6 +68,18 @@ Please check out [OME](https://github.com/sgl-project/ome), a Kubernetes operato
 
    Modify the LLM model path and arguments as necessary, then execute command `kubectl apply -f docker/k8s-sglang-distributed-sts.yaml`, to create two nodes k8s statefulset and serving service.
 
+</details>
+
+## Method 5: Using docker compose
+
+<details>
+<summary>More</summary>
+
+> This method is recommended if you plan to serve it as a service.
+> A better approach is to use the [k8s-sglang-service.yaml](https://github.com/sgl-project/sglang/blob/main/docker/k8s-sglang-service.yaml).
+
+1. Copy the [compose.yml](https://github.com/sgl-project/sglang/blob/main/docker/compose.yaml) to your local machine
+2. Execute the command `docker compose up -d` in your terminal.
 </details>
 
 ## Method 6: Run on Kubernetes or Clouds with SkyPilot

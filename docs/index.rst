@@ -67,6 +67,7 @@ The core features include:
    platforms/amd_gpu.md
    platforms/blackwell_gpu.md
    platforms/cpu_server.md
+   platforms/tpu.md
    platforms/nvidia_jetson.md
    platforms/ascend_npu.md
 

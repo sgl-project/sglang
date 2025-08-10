@@ -1,6 +1,6 @@
 # Blackwell GPUs
 
-We will release the correct wheels soon. Before that, please try to compile from source or check the docker images from [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags).
+We will release the pre-built wheels soon. Before that, please try to compile from source or check the blackwell docker images from [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags).
 
 ## B200 with x86 CPUs
 TODO

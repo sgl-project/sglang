@@ -3,5 +3,5 @@
 ## Install
 TODO
 
-## Send a request
+## Examples
 TODO

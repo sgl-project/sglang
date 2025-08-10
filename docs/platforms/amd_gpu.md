@@ -38,6 +38,8 @@ Again, please go through the entire documentation to confirm your system is usin
 
 ## Install SGLang
 
+You can install SGLang using one of the methods below.
+
 ### Install from Source
 
 ```bash
@@ -77,10 +79,10 @@ The steps below shows how to build an image from scratch.
        -v /data:/data'
    ```
 
-If you are using RDMA, please note that:
+   If you are using RDMA, please note that:
+     - `--network host` and `--privileged` are required by RDMA. If you don't need RDMA, you can remove them.
+     - You may need to set `NCCL_IB_GID_INDEX` if you are using RoCE, for example: `export NCCL_IB_GID_INDEX=3`.
 
-1. `--network host` and `--privileged` are required by RDMA. If you don't need RDMA, you can remove them.
-2. You may need to set `NCCL_IB_GID_INDEX` if you are using RoCE, for example: `export NCCL_IB_GID_INDEX=3`.
 3. Launch the server.
 
    **NOTE:** Replace `<secret>` below with your [huggingface hub token](https://huggingface.co/docs/hub/en/security-tokens).
