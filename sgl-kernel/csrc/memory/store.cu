@@ -70,6 +70,13 @@ __global__ void store_kv_cache_128x2(
 }  // namespace
 
 auto store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v) -> void {
+  const auto max_tokens = k_cache.size(0);
+  const auto num_tokens = out_loc.size(0);
+  k_cache = k_cache.view({max_tokens, -1});
+  v_cache = v_cache.view({max_tokens, -1});
+  k = k.view({num_tokens, -1});
+  v = v.view({num_tokens, -1});
+
   TORCH_CHECK(
       k_cache.is_cuda() && v_cache.is_cuda() && out_loc.is_cuda() && k.is_cuda() && v.is_cuda(),
       "All tensors must be CUDA tensors");
@@ -77,7 +84,6 @@ auto store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, 
   TORCH_CHECK(k_cache.strides() == v_cache.strides(), "k_cache and v_cache must have the same strides");
   TORCH_CHECK(k.sizes() == v.sizes(), "k and v must have the same size");
   TORCH_CHECK(k.strides() == v.strides(), "k and v must have the same strides");
-  TORCH_CHECK(k.dim() == 2 && k_cache.dim() == 2, "k and k_cache must be 2D tensors");
   TORCH_CHECK(k.stride(-1) == 1 && k_cache.stride(-1) == 1, "k and k_cache must be contiguous in head.");
   TORCH_CHECK(k.size(-1) == k_cache.size(-1), "k and k_cache must have the same head size");
   TORCH_CHECK(out_loc.dim() == 1 && out_loc.is_contiguous(), "out_loc must be a 1D contiguous tensor");
