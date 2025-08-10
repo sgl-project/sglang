@@ -138,7 +138,7 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_chat = OpenAIServingChat(
-        _global_state.tokenizer_manager, _global_state.template_manager, server_args.disable_harmony
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -176,7 +176,6 @@ async def lifespan(fast_api_app: FastAPI):
             tool_server=tool_server,
         )
     except Exception as e:
-        # print stack trace
         import traceback
 
         traceback.print_exc()
