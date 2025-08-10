@@ -42,7 +42,8 @@ class AscendAttnBackend(AttentionBackend):
             mask_value = 1
         self.mask = (
             torch.masked_fill(
-                torch.zeros(size=(max_seq_len, max_seq_len)), mask_flag, mask_value
+                torch.zeros(size=(max_seq_len, max_seq_len)
+                            ), mask_flag, mask_value
             )
             .to(dtype)
             .to(self.device)
@@ -93,7 +94,8 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
+            layer.layer_id)
 
         if not self.use_mla:
             query = q.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -119,13 +121,16 @@ class AscendAttnBackend(AttentionBackend):
             return output
         else:
             if layer.qk_head_dim != layer.v_head_dim:
-                o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+                o = q.new_empty(
+                    (q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
             else:
                 o = torch.empty_like(q)
 
             use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
             q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            k_ = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+            v_ = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
             o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
             causal = True
@@ -137,6 +142,8 @@ class AscendAttnBackend(AttentionBackend):
 
             self.native_attn._run_sdpa_forward_extend(
                 q_,
+                k_,
+                v_,
                 o_,
                 k_cache.view(
                     -1, layer.tp_k_head_num, (self.kv_lora_rank + self.qk_rope_head_dim)
@@ -146,7 +153,9 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.extend_prefix_lens,
+                forward_batch.extend_prefix_lens_cpu,
                 forward_batch.extend_seq_lens,
+                forward_batch.extend_seq_lens_cpu,
                 scaling=layer.scaling,
                 enable_gqa=use_gqa,
                 causal=causal,
@@ -167,8 +176,10 @@ class AscendAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
         if not self.use_mla:
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                layer.layer_id)
+            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
+                layer.layer_id)
 
             query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
             num_tokens = query.shape[0]
