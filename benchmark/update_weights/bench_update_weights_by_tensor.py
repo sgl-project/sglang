@@ -13,7 +13,11 @@ from loguru import logger
 from transformers import AutoModelForCausalLM
 from verl.workers.rollout.sglang_rollout.sglang_rollout import AsyncEngine
 
-from sglang.srt.model_executor.model_runner import LocalSerializedTensor, FlattenedTensorBucket, FlattenedTensorMetadata
+from sglang.srt.model_executor.model_runner import (
+    FlattenedTensorBucket,
+    FlattenedTensorMetadata,
+    LocalSerializedTensor,
+)
 from sglang.srt.utils import MultiprocessingSerializer
 
 parser = argparse.ArgumentParser()
@@ -34,9 +38,6 @@ parser.add_argument(
     help="Use flattened tensor buckets for better memory efficiency",
 )
 args = parser.parse_args()
-
-
-
 
 
 def get_named_tensor_buckets(
@@ -428,14 +429,14 @@ def main():
         bucket_sizes = [
             # (0, "per-tensor"),
             # (512 * 1024 * 1024, "512MB"),  # 512MB
-            #(1024 * 1024 * 1024, "1GB"),  # 1GB
+            # (1024 * 1024 * 1024, "1GB"),  # 1GB
         ]
 
         # Add flattened bucket variants
         flattened_bucket_sizes = [
             # (512 * 1024 * 1024, "512MB-flat"),  # 512MB flattened
             (1024 * 1024 * 1024, "1GB-flat"),  # 1GB flattened
-            #(2 * 1024 * 1024 * 1024, "2GB-flat"),  # 2GB flattened
+            # (2 * 1024 * 1024 * 1024, "2GB-flat"),  # 2GB flattened
         ]
         bucket_sizes.extend(flattened_bucket_sizes)
 
@@ -471,7 +472,9 @@ def main():
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(args.profile_dir),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    args.profile_dir
+                ),
                 profile_memory=True,
                 with_stack=True,
                 record_shapes=True,
