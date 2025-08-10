@@ -432,7 +432,10 @@ class ServerArgs:
             )
             self.page_size = 128
 
-        if self.attention_backend == "trtllm_mla":
+        if (
+            self.attention_backend == "trtllm_mla"
+            or self.decode_attention_backend == "trtllm_mla"
+        ):
             if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."

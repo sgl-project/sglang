@@ -1194,6 +1194,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _enable_fuse_rope(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.current_attention_backend == "trtllm_mla"
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+        )
+
     def forward_absorb_prepare(
         self,
         positions: torch.Tensor,
@@ -1274,11 +1281,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if not (
-            self.current_attention_backend == "trtllm_mla"
-            and forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
-        ):
+        if not self._enable_fuse_rope(forward_batch):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
@@ -1293,11 +1296,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             or self.current_attention_backend == "trtllm_mla"
         ):
             extra_args = {}
-            if (
-                self.current_attention_backend == "trtllm_mla"
-                and forward_batch.forward_mode.is_decode_or_idle()
-                and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
-            ):
+            if self._enable_fuse_rope(forward_batch):
                 extra_args = {
                     "cos_sin_cache": self.rotary_emb.cos_sin_cache,
                     "is_neox": self.rotary_emb.is_neox_style,

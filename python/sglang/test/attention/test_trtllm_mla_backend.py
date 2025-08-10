@@ -498,7 +498,7 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Run forward decode with separate MLA components
                 output = trtllm_backend.forward_decode(
-                    q_nope, k_nope, v, layer, fb, q_rope=q_rope, k_rope=k_rope
+                    q_nope, k_nope, None, layer, fb, q_rope=q_rope, k_rope=k_rope
                 )
 
                 # Basic checks
@@ -610,7 +610,7 @@ class TestTRTLLMMLA(CustomTestCase):
                 out_trtllm = trtllm_backend.forward_decode(
                     q_nope_trt,
                     k_nope_trt,
-                    v_trt,
+                    None,
                     layer,
                     fb_trtllm,
                     q_rope=q_rope_trt,
@@ -684,7 +684,7 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Run forward decode with separate MLA components
                 output = backend.forward_decode(
-                    q_nope, k_nope, v, layer, fb, q_rope=q_rope, k_rope=k_rope
+                    q_nope, k_nope, None, layer, fb, q_rope=q_rope, k_rope=k_rope
                 )
 
                 expected_shape = (
