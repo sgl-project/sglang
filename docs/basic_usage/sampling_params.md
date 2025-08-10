@@ -1,7 +1,6 @@
 # Sampling Parameters
 
 This doc describes the sampling parameters of the SGLang Runtime. It is the low-level endpoint of the runtime.
-
 If you want a high-level endpoint that can automatically handle chat templates, consider using the [OpenAI Compatible API](./openai_api_completions.ipynb).
 
 ## `/generate` Endpoint

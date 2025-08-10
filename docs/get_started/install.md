@@ -3,7 +3,7 @@
 You can install SGLang using one of the methods below.
 
 This page primarily applies to NVIDIA GPU platforms.
-For other platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd.md), [Intel Xeon CPUs](../platforms/cpu.md), and [NVIDIA Jetson](../platforms/nvidia_jetson.md).
+For other platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [NVIDIA Jetson](../platforms/nvidia_jetson.md), and [Ascend NPUs](../platforms/ascend_npu.md).
 
 ## Method 1: With pip or uv
 
@@ -36,7 +36,7 @@ pip install -e "python[all]"
 
 - SGLang currently uses torch 2.8 and flashinfer for torch 2.8. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the FlashInfer pypi package is called `flashinfer-python` instead of `flashinfer`.
 
-If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](../references/development_guide_using_docker.md#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
+If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](../developer_guide/development_guide_using_docker.md#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
 
 ## Method 3: Using docker
 

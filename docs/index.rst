@@ -20,6 +20,12 @@ The core features include:
    :maxdepth: 1
    :caption: Basic Usage
 
+   basic_usage/send_request.ipynb
+   basic_usage/openai_api_completions.ipynb
+   basic_usage/openai_api_vision.ipynb
+   basic_usage/openai_api_embeddings.ipynb
+   basic_usage/native_api.ipynb
+   basic_usage/sampling_params.md
    basic_usage/deepseek.md
    basic_usage/gpt_oss.md
    basic_usage/llama4.md
@@ -38,14 +44,21 @@ The core features include:
    :maxdepth: 1
    :caption: Supported Models
 
+   supported_models/generative_models.md
+   supported_models/multimodal_language_models.md
+   supported_models/embedding_models.md
+   supported_models/reward_models.md
+   supported_models/support_new_models.md
+   supported_models/transformers_fallback.md
 
 .. toctree::
    :maxdepth: 1
    :caption: Hardware Platforms
 
-   platform/amd.md
-   platform/cpu.md
-   platform/nvidia_jetson.md
+   platforms/amd.md
+   platforms/cpu.md
+   platforms/nvidia_jetson.md
+   platforms/ascend_npu.md
 
 .. toctree::
    :maxdepth: 1
