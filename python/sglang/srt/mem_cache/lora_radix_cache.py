@@ -3,19 +3,27 @@
 import heapq
 import time
 from collections import defaultdict
-from typing import List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
+else:
+    Req = Any  # Placeholder for Req type when not type checking
+
 
 class LoRAKey:
-    lora_id: str  # lora_id of adaptor, should be hash value of adaptor path
-    token_ids: List[int]  # token_ids of the key
+
+    def __init__(self, lora_id: str, token_ids: List[int]):
+        self.lora_id = (
+            lora_id  # lora_id of adaptor, should be hash value of adaptor path
+        )
+        self.token_ids = token_ids  # token_ids of the key
 
     def __len__(self):
         return len(self.token_ids)
@@ -97,7 +105,12 @@ class LoRARadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
 
-    def match_prefix(self, key: LoRAKey, **kwargs) -> MatchResult:
+    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
+        raise ValueError(
+            "LoRARadixCache needs both token ids and lora id as inputs for matching. Please use match_prefix_with_lora_id instead."
+        )
+
+    def match_prefix_with_lora_id(self, key: LoRAKey, **kwargs) -> MatchResult:
         """Find the matching prefix from the lora radix tree.
         Args:
             key: A LoRAKey to find a matching prefix.
@@ -157,9 +170,8 @@ class LoRARadixCache(BasePrefixCache):
         page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(
-            token_ids[:page_aligned_len], page_aligned_kv_indices
-        )
+        lora_key = LoRAKey(lora_id=req.lora_id, token_ids=token_ids[:page_aligned_len])
+        new_prefix_len = self.insert(lora_key, page_aligned_kv_indices)
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
@@ -183,13 +195,14 @@ class LoRARadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
+        inserted_key = LoRAKey(lora_id=req.lora_id, token_ids=page_aligned_token_ids)
+        new_prefix_len = self.insert(inserted_key, page_aligned_kv_indices)
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
+        new_indices, new_last_node, _, _ = self.match_prefix_with_lora_id(inserted_key)
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
             new_indices[len(req.prefix_indices) :],

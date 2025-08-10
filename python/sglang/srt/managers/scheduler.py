@@ -632,6 +632,12 @@ class Scheduler(
                     disable=server_args.disable_radix_cache,
                 )
             elif self.enable_lora:
+                assert (
+                    not self.enable_hierarchical_cache
+                ), "LoRA radix cache doesn't support hierarchical cache"
+                assert (
+                    self.schedule_policy == "fcfs"
+                ), "LoRA radix cache only supports FCFS policy"
                 self.tree_cache = LoRARadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
