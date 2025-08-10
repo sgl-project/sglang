@@ -81,5 +81,5 @@ The core features include:
    :caption: References
 
    references/custom_chat_template.md
-   references/frontend/index.rst
+   references/frontend/frontend.rst
    references/blog.md
