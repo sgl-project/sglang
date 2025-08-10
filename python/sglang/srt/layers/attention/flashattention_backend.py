@@ -17,8 +17,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 from sgl_kernel import merge_state_v2
+from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @dataclass
