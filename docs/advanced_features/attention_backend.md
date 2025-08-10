@@ -21,7 +21,7 @@ The "❌" and "✅" symbols in the table above under "Page Size > 1" indicate wh
 
 ## User guide
 
-#### Launch command for different attention backends.
+### Launch command for different attention backends.
 
 - FlashInfer (Default for Non-Hopper Machines, e.g., A100, A40)
 ```bash

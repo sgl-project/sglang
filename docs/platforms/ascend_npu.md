@@ -1,4 +1,4 @@
-# Ascend GPUs
+# Ascend NPUs
 
 ## Install
 TODO

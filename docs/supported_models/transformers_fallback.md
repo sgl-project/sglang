@@ -14,13 +14,13 @@ python3 -m sglang.launch_server \
   --model-impl transformers
 ```
 
-#### Supported features
+## Supported features
 
-##### Quantization
+### Quantization
 
 Transformers fall back has supported most of available quantization in SGLang (except GGUF). See [Quantization page](https://docs.sglang.ai/backend/quantization.html) for more information about supported quantization in SGLang.
 
-##### Remote code
+### Remote code
 
 This fallback also means that any model on the hub that can be used in `transformers` with `trust_remote_code=True` that correctly implements attention can be used in production!
 
