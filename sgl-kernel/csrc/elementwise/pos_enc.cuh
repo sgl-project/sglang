@@ -416,9 +416,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
     bool interleave,
     cudaStream_t stream = nullptr,
     DType k_scale = 1.0f,
-    DType v_scale = 1.0f,
-    bool is_capture_mode = False,
-    cudaStream_t alt_stream = nullptr, ) {
+    DType v_scale = 1.0f) {
   int dev_id = 0;
   int num_sms = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));

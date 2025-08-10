@@ -103,10 +103,7 @@ void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
     float k_scale,
     float v_scale,
     at::Tensor v,
-    at::Tensor cache_loc,
-    bool is_capture_mode,
-    int64_t alt_stream_ptr  // Additional stream for overlap
-) {
+    at::Tensor cache_loc, ) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   CHECK_LAST_DIM_CONTIGUOUS(v);
@@ -154,7 +151,6 @@ void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
   size_t v_buffer_stride_h = v_buffer_ptr.stride(1);
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  cudaStream_t alt_stream = reinterpret_cast<cudaStream_t>(alt_stream_ptr);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
         static_cast<c_type*>(q.data_ptr()),
@@ -189,59 +185,11 @@ void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
         interleave,
         stream,
         k_scale,
-        v_scale,
-        is_capture_mode,
-        alt_stream, );
+        v_scale);
     TORCH_CHECK(
         status == cudaSuccess,
         "BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer failed with error code " +
             std::string(cudaGetErrorString(status)));
     return true;
   });
-
-  // // Handle dtype and scaling
-  // if (k_rope.scalar_type() != k_buffer_ptr.scalar_type()) {
-  //   if (k_scale != 1.0f) {
-  //     k_rope.div_(k_scale);
-  //   }
-  //   if (v_scale != 1.0f) {
-  //     v.div_(v_scale);
-  //   }
-  //   // Convert to buffer dtype
-  //   k_rope = k_rope.to(k_buffer_ptr.scalar_type());
-  //   v = v.to(v_buffer_ptr.scalar_type());
-  // }
-
-  // if (is_capture_mode && alt_stream_ptr != 0) {
-  //   cudaStream_t alt_stream = reinterpret_cast<cudaStream_t>(alt_stream_ptr);
-  //   cudaStream_t main_stream = stream;
-
-  //   // Wait for main stream to complete RoPE
-  //   // Create event for synchronization
-  //   cudaEvent_t event;
-  //   cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-
-  //   // Record event on main stream after RoPE completion
-  //   cudaEventRecord(event, main_stream);
-
-  //   cudaStreamWaitEvent(alt_stream, event, 0);
-
-  //   // Copy K on main stream
-  //   k_buffer_ptr.copy_(k_rope, /*non_blocking=*/true);
-
-  //   // Copy V on alternate stream
-  //   at::cuda::CUDAStreamGuard guard(at::cuda::getStreamFromExternal(alt_stream, device.index()));
-  //   v_buffer_ptr.copy_(v, /*non_blocking=*/true);
-
-  //   // Record event on alt stream after V copy
-  //   cudaEventRecord(event, alt_stream);
-  //   // Main stream waits for alt stream
-  //   cudaStreamWaitEvent(main_stream, event, 0);
-  //   // Clean up
-  //   cudaEventDestroy(event);
-  // } else {
-  //   // Synchronous copy
-  //   k_buffer_ptr.copy_(k_rope, /*non_blocking=*/true);
-  //   v_buffer_ptr.copy_(v, /*non_blocking=*/true);
-  // }
 }
