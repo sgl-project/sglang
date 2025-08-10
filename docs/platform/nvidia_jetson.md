@@ -1,4 +1,4 @@
-# Apply SGLang on NVIDIA Jetson Orin
+# NVIDIA Jetson Orin
 
 ## Prerequisites
 

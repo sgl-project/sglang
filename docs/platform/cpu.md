@@ -1,4 +1,4 @@
-# SGLang on CPU
+# CPU Servers
 
 The document addresses how to set up the [SGLang](https://github.com/sgl-project/sglang) environment and run LLM inference on CPU servers.
 Specifically, SGLang is well optimized on the CPUs equipped with Intel® AMX® Instructions,

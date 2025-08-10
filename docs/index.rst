@@ -12,77 +12,43 @@ The core features include:
 
 .. toctree::
    :maxdepth: 1
-   :caption: Installation
+   :caption: Get Started
 
    start/install.md
 
 .. toctree::
    :maxdepth: 1
-   :caption: Backend Tutorial
+   :caption: Basic Usage
 
-   references/deepseek
-   references/llama4
-   backend/send_request.ipynb
-   backend/openai_api_completions.ipynb
-   backend/openai_api_vision.ipynb
-   backend/openai_api_embeddings.ipynb
-   backend/native_api.ipynb
-   backend/offline_engine_api.ipynb
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Advanced Backend Configurations
-
-   backend/server_arguments.md
-   backend/sampling_params.md
-   backend/hyperparameter_tuning.md
-   backend/attention_backend.md
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Supported Models
-
-   supported_models/generative_models.md
-   supported_models/multimodal_language_models.md
-   supported_models/embedding_models.md
-   supported_models/reward_models.md
-   supported_models/support_new_models.md
-   supported_models/transformers_fallback.md
 
 .. toctree::
    :maxdepth: 1
    :caption: Advanced Features
 
-   backend/speculative_decoding.ipynb
-   backend/structured_outputs.ipynb
-   backend/function_calling.ipynb
-   backend/separate_reasoning.ipynb
-   backend/structured_outputs_for_reasoning_models.ipynb
-   backend/custom_chat_template.md
-   backend/quantization.md
-   backend/lora.ipynb
-   backend/pd_disaggregation.md
-   backend/vlm_query.ipynb
 
 .. toctree::
    :maxdepth: 1
-   :caption: Frontend Tutorial
+   :caption: Performance Tuning
 
-   frontend/frontend.ipynb
-   frontend/choices_methods.md
 
 .. toctree::
    :maxdepth: 1
-   :caption: SGLang Router
+   :caption: Supported Models
 
-   router/router.md
 
 .. toctree::
-      :maxdepth: 1
-      :caption: References
+   :maxdepth: 1
+   :caption: Hardware Platforms
 
-      references/general
-      references/hardware
-      references/advanced_deploy
-      references/performance_analysis_and_optimization
-      references/developer
+   platform/amd.md
+   platform/cpu.md
+   platform/nvidia_jetson.md
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Developer Guide
+
+
+.. toctree::
+   :maxdepth: 1
+   :caption: References

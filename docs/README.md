@@ -7,6 +7,7 @@ We recommend new contributors start from writing documentation, which helps you 
 ### Install Dependency
 
 ```bash
+apt-get update && apt-get install -y pandoc parallel retry
 pip install -r requirements.txt
 ```
 
@@ -20,6 +21,7 @@ Update your Jupyter notebooks in the appropriate subdirectories under `docs/`. I
 ```bash
 # 1) Compile all Jupyter notebooks
 make compile
+make html
 
 # 2) Compile and Preview documentation locally with auto-build
 # This will automatically rebuild docs when files change

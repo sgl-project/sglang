@@ -1,4 +1,4 @@
-# SGLang on AMD
+# AMD GPUs
 
 This document describes how to set up an AMD-based environment for [SGLang](https://github.com/sgl-project/sglang). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues) on the SGLang repository.
 

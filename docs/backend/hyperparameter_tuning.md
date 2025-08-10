@@ -58,5 +58,5 @@ Data parallelism is better for throughput. When there is enough GPU memory, alwa
 
 - `torch.compile` accelerates small models on small batch sizes. You can enable it with `--enable-torch-compile`.
 - Try other quantization (e.g. FP8 quantization with `--quantization fp8`)
-- Try other parallelism strategies (e.g. expert parallelism) or DP attention for deepseek models (with `--enable-dp-attention --dp-size 8`).
+- Try other parallelism strategies (e.g. [expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/)) or DP attention for deepseek models (with `--enable-dp-attention --dp-size 8`).
 - If the workload has many shared prefixes, try `--schedule-policy lpm`. Here, `lpm` stands for longest prefix match. It reorders requests to encourage more cache hits but introduces more scheduling overhead.
