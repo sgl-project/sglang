@@ -20,14 +20,14 @@ The core features include:
    :maxdepth: 1
    :caption: Basic Usage
 
-   basic_usage/send_request
-   basic_usage/openai_api
-   basic_usage/offline_engine_api
-   basic_usage/native_api
-   basic_usage/sampling_params
-   basic_usage/deepseek
-   basic_usage/gpt_oss
-   basic_usage/llama4
+   basic_usage/send_request.ipynb
+   basic_usage/openai_api.rst
+   basic_usage/offline_engine_api.ipynb
+   basic_usage/native_api.ipynb
+   basic_usage/sampling_params.md
+   basic_usage/deepseek.md
+   basic_usage/gpt_oss.md
+   basic_usage/llama4.md
 
 .. toctree::
    :maxdepth: 1
