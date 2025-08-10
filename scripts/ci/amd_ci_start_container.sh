@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Get version from SGLang version.py file
 FALLBACK_SGLANG_VERSION="v0.4.10.post2"
-SGLANG_VERSION_FILE="$(dirname "$0")/../python/sglang/version.py"
+SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
 
 if [ -f "$SGLANG_VERSION_FILE" ]; then
   SGLANG_VERSION=$(python3 -c '
