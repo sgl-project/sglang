@@ -604,7 +604,6 @@ class TestTRTLLMMLA(CustomTestCase):
                     q_nope_ref = q_nope_ref.to(torch.float8_e4m3fn).to(dtype)
                     k_rope_ref = k_rope_ref.to(torch.float8_e4m3fn).to(dtype)
                     k_nope_ref = k_nope_ref.to(torch.float8_e4m3fn).to(dtype)
-                    # v_ref = v_ref.to(torch.float8_e4m3fn).to(dtype)
 
                 # Run forward decode on both backends
                 out_trtllm = trtllm_backend.forward_decode(

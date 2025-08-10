@@ -399,7 +399,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Save KV cache if requested
         if save_kv_cache:
-            assert v is None, "For populating trtllm_mla kv cache, v should be None."
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
