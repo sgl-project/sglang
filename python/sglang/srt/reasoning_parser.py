@@ -201,12 +201,12 @@ class GPTOSSDetector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True):
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
         # TypeScript uses channel tokens instead of simple start/end tokens
         super().__init__(
             "<|channel|>analysis<|message|>",
             "<|end|>",
-            force_reasoning=False,
+            force_reasoning=True,  # TODO: Test if this is true.
             stream_reasoning=stream_reasoning,
         )
         self.final_channel_start = "<|start|>assistant<|channel|>final<|message|>"
@@ -217,73 +217,96 @@ class GPTOSSDetector(BaseReasoningFormatDetector):
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses both analysis and final channels.
+        Tool call channels are preserved in normal_text for downstream processing.
         """
-        reasoning_text = ""
-        normal_text = ""
+        reasoning_parts = []
+        normal_parts = []
+        current_pos = 0
 
-        # Extract ALL analysis channel content (can be multiple)
-        analysis_parts = []
-        remaining = text
-        while self.think_start_token in remaining:
-            analysis_start = remaining.find(self.think_start_token) + len(
-                self.think_start_token
-            )
-            analysis_end = remaining.find(self.think_end_token, analysis_start)
-
-            if analysis_end != -1:
-                analysis_parts.append(remaining[analysis_start:analysis_end].strip())
-                remaining = remaining[analysis_end + len(self.think_end_token) :]
+        # Process text sequentially to preserve tool calls between analysis sections
+        while current_pos < len(text):
+            # Look for next analysis channel
+            analysis_start_idx = text.find(self.think_start_token, current_pos)
+            
+            if analysis_start_idx == -1:
+                # No more analysis channels, rest goes to remaining
+                break
+            
+            # Preserve any content before this analysis channel (could include tool calls)
+            if analysis_start_idx > current_pos:
+                between_content = text[current_pos:analysis_start_idx]
+                # This content will be added to normal_parts later
+                normal_parts.append(between_content)
+            
+            # Extract analysis content
+            analysis_content_start = analysis_start_idx + len(self.think_start_token)
+            analysis_end_idx = text.find(self.think_end_token, analysis_content_start)
+            
+            if analysis_end_idx != -1:
+                reasoning_parts.append(text[analysis_content_start:analysis_end_idx].strip())
+                current_pos = analysis_end_idx + len(self.think_end_token)
             else:
                 # Analysis not complete
-                analysis_parts.append(remaining[analysis_start:].strip())
-                reasoning_text = "".join(analysis_parts)
+                reasoning_parts.append(text[analysis_content_start:].strip())
+                reasoning_text = "".join(reasoning_parts)
                 return StreamingParseResult(reasoning_text=reasoning_text)
 
-        # Combine all analysis parts
-        if analysis_parts:
-            reasoning_text = "".join(analysis_parts)
+        # Add any remaining text after all analysis sections
+        if current_pos < len(text):
+            remaining = text[current_pos:]
+            normal_parts.append(remaining)
+        
+        # Now process the collected normal_parts for commentary channels
+        full_normal_text = "".join(normal_parts)
+        
+        # Extract non-tool-call commentary content for reasoning
+        idx = 0
+        while idx < len(full_normal_text):
+            # Check for commentary channel without "to=" (not a tool call)
+            if full_normal_text[idx:].startswith("<|channel|>commentary<|message|>"):
+                msg_start = idx + len("<|channel|>commentary<|message|>")
+                msg_end = full_normal_text.find("<|end|>", msg_start)
+                if msg_end != -1:
+                    reasoning_parts.append(full_normal_text[msg_start:msg_end].strip())
+                    idx = msg_end + len("<|end|>")
+                else:
+                    idx += 1
+            else:
+                idx += 1
 
-        # Check for final channel
-        if self.final_channel_start in remaining:
-            final_start = remaining.find(self.final_channel_start)
+        # Combine all reasoning parts
+        reasoning_text = "".join(reasoning_parts)
 
-            # Capture any intermediate content between analysis and final channels
-            intermediate_content = ""
-            if final_start > 0:
-                intermediate_content = remaining[:final_start].strip()
-
+        # Process full_normal_text for final output
+        normal_text = ""
+        if self.final_channel_start in full_normal_text:
+            final_start = full_normal_text.find(self.final_channel_start)
             final_content_start = final_start + len(self.final_channel_start)
-            final_end = remaining.find(self.final_channel_end, final_content_start)
+            final_end = full_normal_text.find(self.final_channel_end, final_content_start)
 
             if final_end != -1:
-                final_text = remaining[final_content_start:final_end].strip()
-                # Include intermediate content in normal_text
-                normal_text = (
-                    (intermediate_content + final_text).strip()
-                    if intermediate_content
-                    else final_text
-                )
-                # Add any remaining text after final channel
-                remaining_after_final = remaining[
-                    final_end + len(self.final_channel_end) :
-                ].strip()
-                if remaining_after_final:
-                    normal_text = (
-                        (normal_text + remaining_after_final).strip()
-                        if normal_text
-                        else remaining_after_final
-                    )
+                # Extract content before final channel (includes tool calls)
+                before_final = full_normal_text[:final_start].strip()
+                # Extract final channel content
+                final_text = full_normal_text[final_content_start:final_end].strip()
+                # Extract content after final channel  
+                after_final = full_normal_text[final_end + len(self.final_channel_end):].strip()
+                
+                # Combine all parts
+                parts = []
+                if before_final:
+                    parts.append(before_final)
+                if final_text:
+                    parts.append(final_text)
+                if after_final:
+                    parts.append(after_final)
+                normal_text = " ".join(parts)
             else:
-                # Final channel not complete
-                final_text = remaining[final_content_start:].strip()
-                normal_text = (
-                    (intermediate_content + final_text).strip()
-                    if intermediate_content
-                    else final_text
-                )
+                # Final channel not complete, include everything
+                normal_text = full_normal_text.strip()
         else:
-            # No final channel, treat remaining as normal text
-            normal_text = remaining.strip()
+            # No final channel, treat all as normal text (includes tool calls)
+            normal_text = full_normal_text.strip()
 
         return StreamingParseResult(
             normal_text=normal_text, reasoning_text=reasoning_text
