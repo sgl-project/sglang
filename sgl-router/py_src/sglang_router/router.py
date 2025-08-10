@@ -104,13 +104,11 @@ class Router:
         decode_policy: Optional[PolicyType] = None,
         max_concurrent_requests: int = 64,
         cors_allowed_origins: List[str] = None,
-        # Retry configuration
         retry_max_retries: int = 3,
         retry_initial_backoff_ms: int = 100,
         retry_max_backoff_ms: int = 10_000,
         retry_backoff_multiplier: float = 2.0,
         retry_jitter_factor: float = 0.1,
-        # Circuit breaker configuration
         cb_failure_threshold: int = 5,
         cb_success_threshold: int = 2,
         cb_timeout_duration_secs: int = 30,

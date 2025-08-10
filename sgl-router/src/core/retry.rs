@@ -2,6 +2,7 @@ use crate::config::types::RetryConfig;
 use axum::response::Response;
 use rand::Rng;
 use std::time::Duration;
+use tracing::debug;
 
 /// Computes exponential backoff with optional jitter.
 #[derive(Debug, Clone)]
@@ -62,11 +63,14 @@ impl RetryExecutor {
             match operation(attempt).await {
                 Ok(val) => return Ok(val),
                 Err(_) => {
-                    attempt += 1;
-                    if attempt >= max {
+                    // Use the number of failures so far (0-indexed) to compute delay,
+                    // so the first retry uses `initial_backoff_ms`.
+                    let is_last = attempt + 1 >= max;
+                    if is_last {
                         return Err(RetryError::MaxRetriesExceeded);
                     }
                     let delay = BackoffCalculator::calculate_delay(config, attempt);
+                    attempt += 1; // advance to the next attempt after computing delay
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -133,7 +137,14 @@ impl RetryExecutor {
 
             // Backoff before next attempt
             let next_attempt = attempt + 1;
-            let delay = BackoffCalculator::calculate_delay(config, next_attempt);
+            // Compute delay based on the number of failures so far (0-indexed)
+            let delay = BackoffCalculator::calculate_delay(config, attempt);
+            debug!(
+                attempt = attempt,
+                next_attempt = next_attempt,
+                delay_ms = delay.as_millis() as u64,
+                "Retry backoff"
+            );
             on_backoff(delay, next_attempt);
             tokio::time::sleep(delay).await;
 

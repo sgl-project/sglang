@@ -6,6 +6,7 @@ use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use tracing::{debug, info, warn};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -77,7 +78,35 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Record the outcome of a request to this worker
     fn record_outcome(&self, success: bool) {
+        // Record outcome-level metric with worker label
+        let outcome_str = if success { "success" } else { "failure" };
+        RouterMetrics::record_cb_outcome(self.url(), outcome_str);
+
+        // Record into circuit breaker and infer state change for metrics
+        let before = self.circuit_breaker().state();
         self.circuit_breaker().record_outcome(success);
+        let after = self.circuit_breaker().state();
+
+        if before != after {
+            let from = match before {
+                crate::core::CircuitState::Closed => "closed",
+                crate::core::CircuitState::Open => "open",
+                crate::core::CircuitState::HalfOpen => "half_open",
+            };
+            let to = match after {
+                crate::core::CircuitState::Closed => "closed",
+                crate::core::CircuitState::Open => "open",
+                crate::core::CircuitState::HalfOpen => "half_open",
+            };
+            RouterMetrics::record_cb_state_transition(self.url(), from, to);
+        }
+
+        let state_code = match self.circuit_breaker().state() {
+            crate::core::CircuitState::Closed => 0u8,
+            crate::core::CircuitState::Open => 1u8,
+            crate::core::CircuitState::HalfOpen => 2u8,
+        };
+        RouterMetrics::set_cb_state(self.url(), state_code);
     }
 
     // === DP-aware methods ===
