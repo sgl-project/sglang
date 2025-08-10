@@ -8,10 +8,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from sglang.environ import envs
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -175,9 +175,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-        import os
-
-        if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
+        if envs.SGLANG_ENABLE_TORCH_COMPILE:
             return self.forward_native(positions, query, key, offsets)
         else:
             rotary_mode = "half"

@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.environ import envs
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -23,7 +24,7 @@ if is_cuda():
 
 logger = logging.getLogger(__name__)
 
-SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+SYNC_TOKEN_IDS_ACROSS_TP = envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.value
 
 
 class Sampler(nn.Module):
