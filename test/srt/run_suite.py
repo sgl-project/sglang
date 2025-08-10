@@ -59,6 +59,7 @@ suites = {
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
+        TestFile("test_flexprefill_attention.py", 20),
         # TestFile("test_flashmla.py", 352),
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_function_call_parser.py", 10),

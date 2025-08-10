@@ -63,6 +63,9 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
 fi
 
+# For lm_eval evaluating NeedleInAHaystack
+pip install 'lm-eval[longtxt,api,ruler]'
+
 # Install FlashMLA for attention backend tests
 # $PIP_CMD install git+https://github.com/deepseek-ai/FlashMLA.git $PIP_INSTALL_SUFFIX
 
