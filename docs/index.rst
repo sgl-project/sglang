@@ -42,7 +42,6 @@ The core features include:
    advanced_features/structured_outputs_for_reasoning_models.ipynb
    advanced_features/function_calling.ipynb
    advanced_features/separate_reasoning.ipynb
-   advanced_features/custom_chat_template.md
    advanced_features/quantization.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md

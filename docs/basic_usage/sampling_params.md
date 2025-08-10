@@ -184,9 +184,9 @@ You can specify a JSON schema, regular expression or [EBNF](https://en.wikipedia
 
 SGLang supports two grammar backends:
 
-- [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
 - [XGrammar](https://github.com/mlc-ai/xgrammar) (default): Supports JSON schema, regular expression, and EBNF constraints.
   - XGrammar currently uses the [GGML BNF format](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md).
+- [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
 
 If instead you want to initialize the Outlines backend, you can use `--grammar-backend outlines` flag:
 

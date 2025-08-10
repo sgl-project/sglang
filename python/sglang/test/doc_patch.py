@@ -15,7 +15,7 @@ import sglang.srt.server_args as server_args_mod
 from sglang.utils import execute_shell_command, reserve_port
 
 DEFAULT_MAX_RUNNING_REQUESTS = 128
-DEFAULT_MAX_TOTAL_TOKENS = 20480
+DEFAULT_MAX_TOTAL_TOKENS = 20480  # To allow multiple servers on the same machine
 
 _original_post_init = server_args_mod.ServerArgs.__post_init__
 
