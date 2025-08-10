@@ -52,7 +52,7 @@ The object is defined at `sampling_params.py::SamplingParams`. You can also read
 
 ### Constrained decoding
 
-Please refer to our dedicated guide on [constrained decoding](./structured_outputs.ipynb) for the following parameters.
+Please refer to our dedicated guide on [constrained decoding](../advanced_features/structured_outputs.ipynb) for the following parameters.
 
 | Argument        | Type/Default                    | Description                                                                                                                                    |
 |-----------------|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -251,7 +251,7 @@ response = requests.post(
 print(response.json())
 ```
 
-Detailed example in [structured outputs](./structured_outputs.ipynb).
+Detailed example in [structured outputs](../advanced_features/structured_outputs.ipynb).
 
 ### Custom logit processor
 

@@ -39,6 +39,17 @@ The core features include:
    advanced_features/attention_backend.md
    advanced_features/hyperparameter_tuning.md
 
+   backend/speculative_decoding.ipynb
+   backend/structured_outputs.ipynb
+   backend/function_calling.ipynb
+   backend/separate_reasoning.ipynb
+   backend/structured_outputs_for_reasoning_models.ipynb
+   backend/custom_chat_template.md
+   backend/quantization.md
+   backend/lora.ipynb
+   backend/pd_disaggregation.md
+   backend/vlm_query.ipynb
+
 .. toctree::
    :maxdepth: 1
    :caption: Supported Models
