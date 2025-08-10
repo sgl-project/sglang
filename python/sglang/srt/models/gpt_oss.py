@@ -293,13 +293,20 @@ class GptOssAttention(nn.Module):
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        if forward_batch.attn_backend.__class__.__name__ == "TRTLLMHAAttnBackend":
+            ## we only support rope_with_kv_buffer fusion for trtllm_mha backend now
+            save_kv_cache = True
+        else:
+            save_kv_cache = False
+
         q, k = self.rotary_emb(
             positions,
             q,
             k,
             layer=self.attn,  # RadixAttention
             forward_batch=forward_batch,
-            save_kv_cache=True,  # here we update kv cache fused in rope
+            save_kv_cache=save_kv_cache,  # here we update kv cache fused in rope
             value=v,
         )
         inner_state = q, k, v, forward_batch
@@ -310,7 +317,15 @@ class GptOssAttention(nn.Module):
         if inner_state is None:
             return hidden_states
         # save_kv_cache=False, as we fused it already in rotary_emb
-        attn_output = self.attn(*inner_state, sinks=self.sinks, save_kv_cache=False)
+        if forward_batch.attn_backend.__class__.__name__ == "TRTLLMHAAttnBackend":
+            ## we only support rope_with_kv_buffer for trtllm_mha backend now
+            save_kv_cache = False
+        else:
+            save_kv_cache = True
+
+        attn_output = self.attn(
+            *inner_state, sinks=self.sinks, save_kv_cache=save_kv_cache
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
