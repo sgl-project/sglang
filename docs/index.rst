@@ -79,6 +79,8 @@ The core features include:
 
    developer_guide/contribution_guide.md
    developer_guide/development_guide_using_docker.md
+   developer_guide/accuracy_evaluation.md
+   developer_guide/benchmark_and_profiling.md
 
 .. toctree::
    :maxdepth: 1
@@ -89,4 +91,5 @@ The core features include:
    references/production_metrics.md
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
+   references/multi_node_deployment/multi_node_index.rst
    references/learn_more.md
