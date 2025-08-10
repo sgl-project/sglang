@@ -41,9 +41,11 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -84,6 +86,7 @@ from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import FileCacheManager
+from typing_extensions import Literal
 
 from sglang.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -238,6 +241,10 @@ def is_flashinfer_available():
 
 
 _ENABLE_TORCH_INFERENCE_MODE = envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.value
+
+
+def random_uuid() -> str:
+    return str(uuid.uuid4().hex)
 
 
 class DynamicGradMode(_DecoratorContextManager):
@@ -740,9 +747,18 @@ def load_audio(
     return audio
 
 
+@dataclass
+class ImageData:
+    url: str
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+
+
 def load_image(
-    image_file: Union[Image.Image, str, bytes],
+    image_file: Union[Image.Image, str, ImageData, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
     image = image_size = None
     if isinstance(image_file, Image.Image):
         image = image_file
@@ -766,7 +782,7 @@ def load_image(
     elif isinstance(image_file, str):
         image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
-        raise ValueError(f"Invalid image: {image}")
+        raise ValueError(f"Invalid image: {image_file}")
 
     return image, image_size
 
@@ -803,7 +819,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 vr = VideoReader(tmp_file.name, ctx=ctx)
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
-                video_bytes = base64.b64decode(encoded)
+                video_bytes = pybase64.b64decode(encoded)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
@@ -811,7 +827,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             elif os.path.isfile(video_file):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
-                video_bytes = base64.b64decode(video_file)
+                video_bytes = pybase64.b64decode(video_file)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
@@ -2117,6 +2133,10 @@ def next_power_of_2(n: int):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
+def round_up(x: int, y: int) -> int:
+    return ((x - 1) // y + 1) * y
+
+
 setattr(triton, "next_power_of_2", next_power_of_2)
 
 
@@ -2836,6 +2856,17 @@ def parse_module_path(module_path, function_name, create_dummy):
     return final_module, None
 
 
+def mxfp_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
@@ -2934,3 +2965,8 @@ class ConcurrentCounter:
         other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
         """
         self.wait_for(lambda count: count == 0)
+
+
+@lru_cache(maxsize=1)
+def is_triton_kernels_available() -> bool:
+    return importlib.util.find_spec("triton_kernels") is not None

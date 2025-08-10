@@ -189,8 +189,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--attention-backend` | Choose the kernels for attention layers. | None |
-| `decode_attention_backend` | (Experimental) This argument specifies the backend for decode attention computation. Note that this argument has priority over `attention_backend`. | None |
-| `prefill_attention_backend` | (Experimental) This argument specifies the backend for prefill attention computation. Note that this argument has priority over `attention_backend`. | None |
+| `--prefill-attention-backend` | (Experimental) This argument specifies the backend for prefill attention computation. Note that this argument has priority over `attention_backend`. | None |
+| `--decode-attention-backend` | (Experimental) This argument specifies the backend for decode attention computation. Note that this argument has priority over `attention_backend`. | None |
 | `--sampling-backend` | Choose the kernels for sampling layers. | None |
 | `--grammar-backend` | Choose the backend for grammar-guided decoding. | None |
 | `--mm-attention-backend` | Set multimodal attention backend. | None |
@@ -262,6 +262,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-dp-attention` | Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported. | False |
 | `--enable-dp-lm-head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | False |
 | `--enable-two-batch-overlap` | Enabling two micro batches to overlap. | False |
+| `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | 0.48 |
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | False |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | 32 |
 | `--torchao-config` | Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row. |  |
