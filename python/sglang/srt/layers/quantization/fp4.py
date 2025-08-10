@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import fnmatch
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional
 
-import aiter
 import torch
 import torch.nn.functional as F
 from aiter import ActivationType, QuantType, dtypes
@@ -29,16 +27,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.quark.schemes import QuarkScheme, QuarkW4A4MXFP4
-from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_device_capability,
-    log_info_on_rank0,
-    mxfp_supported,
-    set_weight_attrs,
-)
+from sglang.srt.utils import get_bool_env_var, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
