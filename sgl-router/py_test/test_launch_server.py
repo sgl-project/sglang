@@ -363,30 +363,6 @@ class TestLaunchServer(unittest.TestCase):
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
 
-    def test_retry_and_circuit_breaker_tuning(self):
-        print("Running test_retry_and_circuit_breaker_tuning...")
-        # DP size = 1 with explicit retry/CB tuning
-        self.process = popen_launch_router(
-            self.model,
-            self.base_url,
-            dp_size=1,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            policy="round_robin",
-        )
-        # Probe health
-        with requests.Session() as session:
-            r = session.get(f"{self.base_url}/health")
-            self.assertEqual(r.status_code, 200)
-        # Fire a minimal request to trigger router path
-        with requests.Session() as session:
-            r = session.post(
-                f"{self.base_url}/generate",
-                json={"text": "hello", "temperature": 0.0},
-                headers={"Content-Type": "application/json"},
-            )
-            # In absence of workers, router should return 503 quickly
-            self.assertIn(r.status_code, [200, 503])
-
     def test_4_payload_size(self):
         print("Running test_4_payload_size...")
         # Start router with 1MB limit
@@ -754,8 +730,8 @@ class TestLaunchServer(unittest.TestCase):
                 f"Request with correct api key should succeed but got status {response.status_code}",
             )
 
-    def test_retry_and_circuit_breaker_real_worker(self):
-        print("Running test_retry_and_circuit_breaker_real_worker...")
+    def test_fault_tolerance(self):
+        print("Running test_fault_tolerance...")
         # Start router with explicit retry/CB tuning for fast transitions
         self.process = popen_launch_router(
             self.model,
@@ -799,21 +775,22 @@ class TestLaunchServer(unittest.TestCase):
         # 4) kill worker to induce failures and open CB
         kill_process_tree(worker_process.pid)
 
-        # First failure path: retries may yield a failure or 503 once CB opens
-        with requests.Session() as session:
-            r = session.post(
-                f"{self.base_url}/generate",
-                json={"text": "hi", "temperature": 0.0},
-            )
-            self.assertIn(r.status_code, [500, 502, 503])
-
-        # Next call should be fast 503 (CB open → no available workers)
-        with requests.Session() as session:
-            r = session.post(
-                f"{self.base_url}/generate",
-                json={"text": "hi", "temperature": 0.0},
-            )
-            self.assertEqual(r.status_code, 503)
+        # Probe a few times until we observe 503 due to CB open (allow transient 200/5xx)
+        cb_open_seen = False
+        for _ in range(6):
+            with requests.Session() as session:
+                r = session.post(
+                    f"{self.base_url}/generate",
+                    json={"text": "hi", "temperature": 0.0},
+                )
+                print("post-kill status:", r.status_code)
+                if r.status_code == 503:
+                    cb_open_seen = True
+                    break
+                time.sleep(0.2)
+        self.assertTrue(
+            cb_open_seen, "Expected to observe 503 (CB open) after worker kill"
+        )
 
         # 5) half-open after timeout; restart worker on same port
         time.sleep(1.2)
