@@ -71,8 +71,8 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
 
   CUDA_DRV(cuDeviceGetDevResource((CUdevice)device, &input, CU_DEV_RESOURCE_TYPE_SM));
 
-  const unsigned minCount = smA + smB;
-  const unsigned minCountA = smA;
+  const int64_t minCount = smA + smB;
+  const int64_t minCountA = smA;
   TORCH_CHECK(minCount <= input.sm.smCount, "Not enough SMs available for the requested configuration");
 
   unsigned nbGroups = 1;
