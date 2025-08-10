@@ -2,6 +2,11 @@ import unittest
 
 from test_vision_openai_server_common import *
 
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    popen_launch_server,
+)
+
 
 class TestPixtralServer(ImageOpenAITestMixin):
     @classmethod
@@ -159,10 +164,9 @@ class TestGemma3nServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
         )
         cls.base_url += "/v1"
 
-    def test_audio_chat_completion(self):
-        self._test_audio_speech_completion()
-        # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
-        # self._test_audio_ambient_completion()
+    # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
+    def test_audio_ambient_completion(self):
+        pass
 
 
 class TestQwen2AudioServer(AudioOpenAITestMixin):
@@ -266,10 +270,9 @@ class TestPhi4MMServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
             }
         }
 
-    def test_audio_chat_completion(self):
-        self._test_audio_speech_completion()
-        # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
-        # self._test_audio_ambient_completion()
+    # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
+    def test_audio_ambient_completion(self):
+        pass
 
 
 class TestVILAServer(ImageOpenAITestMixin):

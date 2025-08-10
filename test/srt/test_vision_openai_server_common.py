@@ -8,12 +8,7 @@ import requests
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
 
 # image
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
@@ -30,23 +25,15 @@ AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-fi
 class TestOpenAIOmniServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
+        cls.model = ""
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
+        cls.process = None
         cls.base_url += "/v1"
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def get_audio_request_kwargs(self):
-        return self.get_request_kwargs()
 
     def get_vision_request_kwargs(self):
         return self.get_request_kwargs()
@@ -91,6 +78,9 @@ class AudioOpenAITestMixin(TestOpenAIOmniServerBase):
 
         return messages
 
+    def get_audio_request_kwargs(self):
+        return self.get_request_kwargs()
+
     def get_audio_response(self, url: str, prompt, category):
         audio_file_path = self.get_or_download_file(url)
         client = openai.Client(api_key="sk-123456", base_url=self.base_url)
@@ -119,7 +109,7 @@ class AudioOpenAITestMixin(TestOpenAIOmniServerBase):
 
         return audio_response.lower()
 
-    def _test_audio_speech_completion(self):
+    def test_audio_speech_completion(self):
         # a fragment of Trump's speech
         audio_response = self.get_audio_response(
             AUDIO_TRUMP_SPEECH_URL,
@@ -138,7 +128,7 @@ class AudioOpenAITestMixin(TestOpenAIOmniServerBase):
                 check_word in audio_response
             ), f"audio_response: ｜{audio_response}｜ should contain ｜{check_word}｜"
 
-    def _test_audio_ambient_completion(self):
+    def test_audio_ambient_completion(self):
         # bird song
         audio_response = self.get_audio_response(
             AUDIO_BIRD_SONG_URL,

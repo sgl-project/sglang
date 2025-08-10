@@ -8,6 +8,26 @@ import unittest
 
 from test_vision_openai_server_common import *
 
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    popen_launch_server,
+)
+
+
+class TestLLava(ImageOpenAITestMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.base_url += "/v1"
+
 
 class TestQwen2VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     @classmethod
@@ -185,7 +205,7 @@ class TestMinicpmoServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
         cls.base_url += "/v1"
 
 
-class TestMimoVLServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
+class TestMimoVLServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "XiaomiMiMo/MiMo-VL-7B-RL"
