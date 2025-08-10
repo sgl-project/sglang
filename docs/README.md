@@ -50,13 +50,8 @@ pre-commit run --all-files
 **To launch and kill the server:**
 
 ```python
-from sglang.test.test_utils import is_in_ci
+from sglang.test.doc_patch import launch_server_cmd
 from sglang.utils import wait_for_server, print_highlight, terminate_process
-
-if is_in_ci():
-    from patch import launch_server_cmd
-else:
-    from sglang.utils import launch_server_cmd
 
 server_process, port = launch_server_cmd(
     """
@@ -76,11 +71,7 @@ terminate_process(server_process)
 ```python
 # Launch Engine
 import sglang as sgl
-import asyncio
-from sglang.test.test_utils import is_in_ci
-
-if is_in_ci():
-    import patch
+import sglang.test.doc_patch
 
 llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
 
@@ -91,7 +82,7 @@ llm.shutdown()
 ### **Why this approach?**
 
 - **Dynamic Port Allocation**: Avoids port conflicts by selecting an available port at runtime, enabling multiple server instances to run in parallel.
-- **Optimized for CI**: The `patch` version of `launch_server_cmd` and `sgl.Engine()` in CI environments helps manage GPU memory dynamically, preventing conflicts and improving test parallelism.
+- **Optimized for CI**: The `doc_patch` version of `launch_server_cmd` and `sgl.Engine()` in CI environments helps manage GPU memory dynamically, preventing conflicts and improving test parallelism.
 - **Better Parallel Execution**: Ensures smooth concurrent tests by avoiding fixed port collisions and optimizing memory usage.
 
 ### **Model Selection**
