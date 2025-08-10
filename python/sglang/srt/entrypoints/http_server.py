@@ -464,9 +464,11 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 async def flush_cache():
     """Flush the radix cache."""
     ret = await _global_state.tokenizer_manager.flush_cache()
-    return Response(
-        content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+    return ORJSONResponse(
+        content={
+            "message": "Cache flushed. Please check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)",
+            "success": ret.success
+        },
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
