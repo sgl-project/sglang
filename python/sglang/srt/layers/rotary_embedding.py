@@ -229,11 +229,11 @@ class RotaryEmbedding(CustomOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
             # import importlib.util
             # spec = importlib.util.spec_from_file_location("apply_rope_with_cos_sin_cache_inplace", "/sgl-workspace/sglang/sgl-kernel/python/sgl_kernel/elementwise.py")
             # elementwise = importlib.util.module_from_spec(spec)
             # spec.loader.exec_module(elementwise)
-
             # elementwise.apply_rope_with_cos_sin_cache_inplace(
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
@@ -249,7 +249,9 @@ class RotaryEmbedding(CustomOp):
                 is_capture_mode=get_is_capture_mode(),
             )
         else:
-            assert not save_kv_cache, "save_kv_cache is not supported for vllm_rotary_embedding."
+            assert (
+                not save_kv_cache
+            ), "save_kv_cache is not supported for vllm_rotary_embedding."
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             self.vllm_rotary_embedding(
                 positions,

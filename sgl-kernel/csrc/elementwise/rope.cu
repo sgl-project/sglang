@@ -13,9 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pos_enc.cuh"
 #include <flashinfer/pos_enc.cuh>
 
+#include "pos_enc.cuh"
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
@@ -28,11 +28,9 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor cos_sin_cache,
     at::Tensor pos_ids,
     bool interleave,
-    int64_t cuda_stream,
-) {
+    int64_t cuda_stream) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
-
   CHECK_INPUT(cos_sin_cache);
   CHECK_INPUT(pos_ids);
   auto device = q.device();
@@ -41,7 +39,6 @@ void apply_rope_pos_ids_cos_sin_cache(
   CHECK_EQ(pos_ids.device(), device);
   CHECK_DIM(3, q);  // q: (nnz, H_Q, D)
   CHECK_DIM(3, k);  // k: (nnz, H_K, D)
-
   // cos_sin_cache: (max_seq_len, R)
   // First half of R is cos, second half is sin
   CHECK_DIM(2, cos_sin_cache);
@@ -62,7 +59,6 @@ void apply_rope_pos_ids_cos_sin_cache(
   size_t k_rope_stride_h = k_rope.stride(1);
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  cudaStream_t alt_stream = reinterpret_cast<cudaStream_t>(alt_stream_ptr);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
         static_cast<c_type*>(q.data_ptr()),
@@ -85,24 +81,13 @@ void apply_rope_pos_ids_cos_sin_cache(
         k_rope_stride_n,
         k_rope_stride_h,
         interleave,
-        stream,
-        static_cast<c_type*>(k_buffer_ptr.data_ptr()),
-        static_cast<c_type*>(v_buffer_ptr.data_ptr()),
-        k_scale,
-        v_scale,
-        static_cast<c_type*>(v.data_ptr()),
-        is_capture_mode,
-        alt_stream,
-
-    );
+        stream);
     TORCH_CHECK(
         status == cudaSuccess,
         "BatchQKApplyRotaryPosIdsCosSinCache failed with error code " + std::string(cudaGetErrorString(status)));
     return true;
   });
 }
-
-
 
 void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
     at::Tensor q,
@@ -131,7 +116,6 @@ void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
   CHECK_DIM(3, v_buffer_ptr);  // v_buffer: (nnz, H_V, D)
   CHECK_DIM(3, v);             // v: (nnz, H_V, D)
   CHECK_DIM(1, cache_loc);     // v: (n)
-  
 
   CHECK_INPUT(cos_sin_cache);
   CHECK_INPUT(pos_ids);
@@ -207,14 +191,13 @@ void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
         k_scale,
         v_scale,
         is_capture_mode,
-        alt_stream,
-    );
+        alt_stream, );
     TORCH_CHECK(
         status == cudaSuccess,
-        "BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer failed with error code " + std::string(cudaGetErrorString(status)));
+        "BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer failed with error code " +
+            std::string(cudaGetErrorString(status)));
     return true;
   });
-
 
   // // Handle dtype and scaling
   // if (k_rope.scalar_type() != k_buffer_ptr.scalar_type()) {
@@ -261,5 +244,4 @@ void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
   //   k_buffer_ptr.copy_(k_rope, /*non_blocking=*/true);
   //   v_buffer_ptr.copy_(v, /*non_blocking=*/true);
   // }
-  
 }

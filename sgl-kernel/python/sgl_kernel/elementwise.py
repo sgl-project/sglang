@@ -4,7 +4,6 @@ import torch
 from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
 
 
-
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
 # Kudos to @yzh119
 def rmsnorm(
@@ -246,7 +245,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
     layer: Any = None,  # RadixAttention
-    forward_batch = None,
+    forward_batch=None,
     save_kv_cache: bool = False,
     value: Optional[torch.Tensor] = None,
     is_capture_mode: bool = False,
@@ -329,7 +328,6 @@ def apply_rope_with_cos_sin_cache_inplace(
         v_buffer_ptr = v_buffer[layer_id - start_layer]
 
         k_scale, v_scale = layer.k_scale, layer.v_scale
-
 
         torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer.default(
             query.view(query.shape[0], -1, head_size),
