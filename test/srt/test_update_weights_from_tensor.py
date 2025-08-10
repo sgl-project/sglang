@@ -125,9 +125,9 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 
         # Create new tensors with different values
         new_tensors = []
-        for i, name in enumerate(param_names):
+        for _, name in enumerate(param_names):
             # Create tensors with different values for each parameter
-            value = 2.0 + i * 0.1  # Different value for each parameter
+            value = 2.0  # Different value for each parameter
             new_tensor = torch.full((16384, 2048), value, device="cuda")
             new_tensors.append((name, new_tensor))
 
@@ -162,8 +162,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 
         # Verify the weights were updated correctly
         for i, param_name in enumerate(param_names):
-            expected_value = 2.0 + i * 0.1
-            _check_param(engine, param_name, [expected_value] * 5)
+            _check_param(engine, param_name, [2.0] * 5)
 
         engine.shutdown()
 

@@ -3,6 +3,7 @@ from typing import List, Tuple
 
 import torch
 
+
 @dataclass
 class FlattenedTensorMetadata:
     """Metadata for a tensor in a flattened bucket"""
@@ -13,6 +14,7 @@ class FlattenedTensorMetadata:
     start_idx: int
     end_idx: int
     numel: int
+
 
 class FlattenedTensorBucket:
     """
@@ -91,8 +93,6 @@ class FlattenedTensorBucket:
         reconstructed = [None] * len(self.metadata)
 
         for i, meta in enumerate(self.metadata):
-            # use narrow to do zero-copy slice
-            # tensor_slice = self.flattened_tensor.narrow(0, meta.start_idx, meta.numel)
             tensor = self.flattened_tensor[meta.start_idx : meta.end_idx].reshape(
                 meta.shape
             )

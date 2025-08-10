@@ -901,7 +901,6 @@ class ModelRunner:
         flattened_tensor_bucket_dict,
     ):
         """Handle flattened bucket format for weight updates"""
-        print(flattened_tensor_bucket_dict)
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
         metadata = flattened_tensor_bucket_dict["metadata"]
 
