@@ -1,1 +1,0 @@
-../doc_patch.py

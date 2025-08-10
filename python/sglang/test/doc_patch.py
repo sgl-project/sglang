@@ -1,3 +1,5 @@
+"""Do some monkey patch to make the documentation compilation faster and more reliable."""
+
 import weakref
 
 import nest_asyncio
