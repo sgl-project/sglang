@@ -88,7 +88,7 @@ class GPTOSSDetector(BaseFormatDetector):
         # Handle function calls with to= parameter
         idx = text.find(self.bot_token)
         normal_text = text[:idx] if idx != -1 else ""
-        
+
         last_match_end = 0
         for match in self.function_call_pattern.finditer(text):
             full_function_name = match.group(1)
@@ -115,20 +115,23 @@ class GPTOSSDetector(BaseFormatDetector):
                     )
                 )
                 tool_index += 1
-        
+
         # Include any remaining text after all function calls
         if last_match_end > 0 and last_match_end < len(text):
             remaining_text = text[last_match_end:]
             # Remove analysis channel content since that's handled by reasoning parser
             # But keep any text after the analysis ends
-            if "<|channel|>analysis" in remaining_text or "analysis<|message|>" in remaining_text:
+            if (
+                "<|channel|>analysis" in remaining_text
+                or "analysis<|message|>" in remaining_text
+            ):
                 # Find the end of analysis section(s)
                 temp = remaining_text
                 while "<|channel|>analysis" in temp or "analysis<|message|>" in temp:
                     # Find the start of analysis section (could be either format)
                     start1 = temp.find("<|channel|>analysis")
                     start2 = temp.find("analysis<|message|>")
-                    
+
                     if start1 == -1 and start2 == -1:
                         break
                     elif start1 == -1:
@@ -137,11 +140,11 @@ class GPTOSSDetector(BaseFormatDetector):
                         start = start1
                     else:
                         start = min(start1, start2)
-                    
+
                     end = temp.find("<|end|>", start)
                     if end != -1:
                         # Remove the analysis section but keep text after it
-                        temp = temp[:start] + temp[end + len("<|end|>"):]
+                        temp = temp[:start] + temp[end + len("<|end|>") :]
                     else:
                         # Incomplete analysis, remove from start
                         temp = temp[:start]
@@ -149,9 +152,13 @@ class GPTOSSDetector(BaseFormatDetector):
                 remaining_text = temp.strip()
             else:
                 remaining_text = remaining_text.strip()
-            
+
             if remaining_text:
-                normal_text = (normal_text + remaining_text).strip() if normal_text else remaining_text
+                normal_text = (
+                    (normal_text + remaining_text).strip()
+                    if normal_text
+                    else remaining_text
+                )
 
         return StreamingParseResult(normal_text=normal_text.strip(), calls=calls)
 
