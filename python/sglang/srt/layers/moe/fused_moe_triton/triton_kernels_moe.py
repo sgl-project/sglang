@@ -82,7 +82,7 @@ def triton_kernel_moe_forward(
         routing_data,
         gather_idx,
         scatter_idx,
-        inplace=moe_runner_config.inplace,
+        inplace=False,  # triton kernel doesn't support inplace
         activation=moe_runner_config.activation,
         apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
@@ -223,7 +223,7 @@ def triton_kernel_moe_with_bias_forward(
         routing_data=routing_data,
         gather_indx=gather_idx,
         scatter_indx=scatter_idx,
-        inplace=moe_runner_config.inplace,
+        inplace=False,  # triton kernel doesn't support inplace
         activation=moe_runner_config.activation,
         use_fp8_w8a8=use_fp8_w8a8,
         per_channel_quant=per_channel_quant,
