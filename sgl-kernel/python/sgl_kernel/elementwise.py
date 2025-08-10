@@ -3,7 +3,6 @@ from typing import Any, Optional
 import torch
 from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
 
-from python.sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -247,7 +246,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
     layer: Any = None,  # RadixAttention
-    forward_batch: ForwardBatch = None,
+    forward_batch = None,
     save_kv_cache: bool = False,
     value: Optional[torch.Tensor] = None,
     start_layer: Optional[int] = None,
