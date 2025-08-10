@@ -20,6 +20,9 @@ The core features include:
    :maxdepth: 1
    :caption: Basic Usage
 
+   basic_usage/deepseek.md
+   basic_usage/gpt_oss.md
+   basic_usage/llama4.md
 
 .. toctree::
    :maxdepth: 1
