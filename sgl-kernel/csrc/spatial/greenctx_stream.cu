@@ -7,8 +7,6 @@
 #include "cuda_utils.h"
 #include "greenctx_stream.h"
 
-#if CUDA_VERSION >= 12040
-
 static std::vector<int64_t> create_greenctx_stream_fallback(CUgreenCtx gctx[2]) {
   CUstream streamA, streamB;
   CUcontext ctx;
@@ -27,6 +25,7 @@ static std::vector<int64_t> create_greenctx_stream_fallback(CUgreenCtx gctx[2]) 
 }
 
 typedef CUresult(CUDAAPI* PFN_cuGreenCtxStreamCreate)(CUstream*, CUgreenCtx, unsigned int, int);
+typedef CUresult(CUDAAPI* PFN_cuGreenCtxDestroy)(CUgreenCtx);
 
 static std::vector<int64_t> create_greenctx_stream_direct_dynamic(CUgreenCtx gctx[2]) {
   static PFN_cuGreenCtxStreamCreate pfn = nullptr;
@@ -48,8 +47,15 @@ static std::vector<int64_t> create_greenctx_stream_direct_dynamic(CUgreenCtx gct
   return {(int64_t)streamA, (int64_t)streamB};
 }
 
-inline void destroy_green_context(int64_t h) {
-  if (h) CUDA_DRV(cuGreenCtxDestroy(reinterpret_cast<CUgreenCtx>(h)));
+inline void safe_destroy_green_context(CUgreenCtx gctx) {
+  if (!gctx) return;
+  static PFN_cuGreenCtxDestroy pfn = nullptr;
+  static std::once_flag pfn_probed_flag;
+
+  std::call_once(
+      pfn_probed_flag, []() { cuGetProcAddress("cuGreenCtxDestroy", reinterpret_cast<void**>(&pfn), 0, 0, nullptr); });
+
+  if (pfn) CUDA_DRV(pfn(gctx));
 }
 
 std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device) {
@@ -86,7 +92,7 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
 
   std::vector<int64_t> streams = create_greenctx_stream_direct_dynamic(gctx);
 
-  CUDA_DRV(cuGreenCtxDestroy(gctx[2]));
+  safe_destroy_green_context(gctx[2]);
 
   std::vector<int64_t> vec = {
       streams[0],  // streamA
@@ -96,18 +102,3 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
 
   return vec;
 }
-
-#else
-
-std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device) {
-  TORCH_CHECK(
-      false,
-      "Green Contexts feature requires CUDA Toolkit 12.4 or newer. Current CUDA version: " +
-          std::to_string(CUDA_VERSION));
-
-  // This is a stub function that should never be reached
-  // Return empty vector to satisfy return type requirement
-  return {};
-}
-
-#endif
