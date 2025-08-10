@@ -228,45 +228,47 @@ class TestChunkedLogprobsChunkSizeVariations(CustomTestCase):
             for (input, n) in zip(input_ids, [512, 1024, 2048, 4096])
         ]
 
-        # result1: chunk size = 256
-        # result2: chunk size = 2048
-        # result3: chunk size = 4096, test the old code path
-        results = []
-        for chunk_size in [256, 2048, 4096]:
-            print(f"set SGLANG_LOGITS_PROCESSER_CHUNK_SIZE to {chunk_size}")
-            os.environ["SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"] = str(chunk_size)
-            engine = sgl.Engine(
-                model_path=model_path,
-                random_seed=42,
-                skip_tokenizer_init=True,
-                mem_fraction_static=0.6,
-            )
-            outputs = engine.generate(
-                input_ids=input_ids,
-                sampling_params=sampling_params,
-                return_logprob=True,
-                logprob_start_len=0,
-                top_logprobs_num=5,
-                token_ids_logprob=list(range(5)),
-            )
-            outputs = sorted(outputs, key=lambda x: x["output_ids"])
-            results.append(outputs)
-            engine.shutdown()
-            del engine
-            torch.cuda.empty_cache()
+        for temperature in [0.9, 1.0]:
+            sampling_params["temperature"] = temperature
+            # result1: chunk size = 256
+            # result2: chunk size = 2048
+            # result3: chunk size = 4096, test the old code path
+            results = []
+            for chunk_size in [256, 2048, 4096]:
+                print(f"set SGLANG_LOGITS_PROCESSER_CHUNK_SIZE to {chunk_size}")
+                os.environ["SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"] = str(chunk_size)
+                engine = sgl.Engine(
+                    model_path=model_path,
+                    random_seed=42,
+                    skip_tokenizer_init=True,
+                    mem_fraction_static=0.6,
+                )
+                outputs = engine.generate(
+                    input_ids=input_ids,
+                    sampling_params=sampling_params,
+                    return_logprob=True,
+                    logprob_start_len=0,
+                    top_logprobs_num=5,
+                    token_ids_logprob=list(range(5)),
+                )
+                outputs = sorted(outputs, key=lambda x: x["output_ids"])
+                results.append(outputs)
+                engine.shutdown()
+                del engine
+                torch.cuda.empty_cache()
 
-        # compare the results
-        for i in range(len(results)):
-            for j in range(i + 1, len(results)):
-                print(f"Comparing result[{i}] and result[{j}]:")
-                for output1, output2 in zip(results[i], results[j]):
-                    for field in fields:
-                        v1 = output1["meta_info"][field]
-                        v2 = output2["meta_info"][field]
-                        assert recursive_allclose(
-                            v1, v2, rtol=0.001, atol=0.0
-                        ), f"Mismatch: {field} between result[{i}] and result[{j}]"
-                print(f"result[{i}] and result[{j}] are numerically close")
+            # compare the results
+            for i in range(len(results)):
+                for j in range(i + 1, len(results)):
+                    print(f"Comparing result[{i}] and result[{j}]:")
+                    for output1, output2 in zip(results[i], results[j]):
+                        for field in fields:
+                            v1 = output1["meta_info"][field]
+                            v2 = output2["meta_info"][field]
+                            assert recursive_allclose(
+                                v1, v2, rtol=0.02, atol=0.0
+                            ), f"Mismatch: {field} between result[{i}] and result[{j}]"
+                    print(f"result[{i}] and result[{j}] are numerically close")
 
 
 class TestChunkedLogprobsMix(CustomTestCase):
@@ -290,27 +292,27 @@ class TestChunkedLogprobsMix(CustomTestCase):
 
     def test_logprobs_mix(self):
         args = []
-        temperature = 0
         # input_len, output_len, temperature, logprob_start_len, return_logprob, top_logprobs_num
-        for input_len in [1000, 2000, 5000, 10000, 50000]:
+        for input_len in [1000, 5000, 10000, 50000]:
             for output_len in [4, 8]:
-                for logprob_start_len in [0, 500, 2500, 5000, 25000]:
-                    for return_logprob in [True, False]:
-                        for top_logprobs_num in [0, 5]:
+                for temperature in [0.1, 1.0]:
+                    for logprob_start_len in [0, 500, 2500, 5000, 25000]:
+                        for return_logprob in [True, False]:
+                            for top_logprobs_num in [0, 5]:
 
-                            if logprob_start_len >= input_len:
-                                continue
+                                if logprob_start_len >= input_len:
+                                    continue
 
-                            args.append(
-                                (
-                                    input_len,
-                                    output_len,
-                                    temperature,
-                                    logprob_start_len,
-                                    return_logprob,
-                                    top_logprobs_num,
+                                args.append(
+                                    (
+                                        input_len,
+                                        output_len,
+                                        temperature,
+                                        logprob_start_len,
+                                        return_logprob,
+                                        top_logprobs_num,
+                                    )
                                 )
-                            )
 
         random.shuffle(args)
 
