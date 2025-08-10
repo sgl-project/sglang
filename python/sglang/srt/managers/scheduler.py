@@ -146,7 +146,6 @@ from sglang.srt.utils import (
     configure_logger,
     disable_request_logging,
     get_available_gpu_memory,
-    get_bool_env_var,
     get_zmq_socket,
     is_cpu,
     kill_itself_when_parent_died,
@@ -480,7 +479,7 @@ class Scheduler(
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
-            if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+            if envs.SGLANG_ENABLE_COLOCATED_BATCH_GEN.value
             else None
         )
 
@@ -494,7 +493,7 @@ class Scheduler(
         )
         self.init_disaggregation()
 
-        if get_bool_env_var("SGLANG_GC_LOG"):
+        if envs.SGLANG_GC_LOG.value:
             configure_gc_logger()
 
         # Init request dispatcher

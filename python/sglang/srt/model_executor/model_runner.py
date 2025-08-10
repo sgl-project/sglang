@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from sglang.environ import envs
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -107,7 +108,6 @@ from sglang.srt.utils import (
     dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
-    get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
     is_fa3_default_architecture,
@@ -258,9 +258,7 @@ class ModelRunner:
             set_global_expert_location_metadata(
                 compute_initial_expert_location_metadata(server_args, self.model_config)
             )
-            if self.tp_rank == 0 and get_bool_env_var(
-                "SGLANG_LOG_EXPERT_LOCATION_METADATA"
-            ):
+            if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.value:
                 logger.info(
                     f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
                 )
@@ -608,7 +606,7 @@ class ModelRunner:
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1 and not self.is_draft_worker:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
-                if get_bool_env_var("SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
+                if envs.SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK.value:
                     logger.warning(
                         "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
                         f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"

@@ -116,6 +116,13 @@ class Envs:
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
+    SGLANG_RECORD_STEP_TIME = EnvBool(False)
+    SGLANG_GC_LOG = EnvBool(False)
+    SGLANG_FORCE_SHUTDOWN = EnvBool(False)
+    SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
+    SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
+    SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
@@ -133,6 +140,7 @@ class Envs:
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -154,6 +162,7 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
+    SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -183,6 +192,7 @@ class Envs:
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
     SGLANG_SUPPORT_CUTLASS_BLOCK_FP8 = EnvBool(False)
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
+    SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
 
     # fmt: on
 

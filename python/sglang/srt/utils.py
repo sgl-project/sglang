@@ -181,23 +181,6 @@ def is_blackwell():
 _warned_bool_env_var_keys = set()
 
 
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    value = value.lower()
-
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
-
-    if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
-            logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
-            )
-        _warned_bool_env_var_keys.add(value)
-
-    return value in truthy_values
-
-
 def get_int_env_var(name: str, default: int = 0) -> int:
     value = os.getenv(name)
     if value is None or not value.strip():
@@ -1782,7 +1765,7 @@ def set_gpu_proc_affinity(
 
 @lru_cache(maxsize=2)
 def disable_request_logging() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
+    return envs.SGLANG_DISABLE_REQUEST_LOGGING.value
 
 
 def dataclass_to_string_truncated(

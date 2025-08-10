@@ -18,9 +18,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
-from sglang.srt.utils import get_bool_env_var
+from sglang.environ import envs
 
-SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+SGLANG_TEST_REQUEST_TIME_STATS = envs.SGLANG_TEST_REQUEST_TIME_STATS.value
 
 
 @dataclass

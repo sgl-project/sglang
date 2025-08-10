@@ -96,7 +96,6 @@ from sglang.srt.utils import (
     add_prefix,
     bind_or_assign,
     cpu_has_amx_support,
-    get_bool_env_var,
     get_device_sm,
     get_int_env_var,
     is_cpu,
@@ -909,9 +908,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
         )
-        self.rocm_fused_decode_mla = get_bool_env_var(
-            "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
-        )
+        self.rocm_fused_decode_mla = envs.SGLANG_ROCM_FUSED_DECODE_MLA.value
 
         # TODO: Design a finer way to determine the threshold
         self.chunked_prefix_cache_threshold = get_int_env_var(

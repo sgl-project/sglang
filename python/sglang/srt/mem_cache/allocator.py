@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.environ import envs
+
 """
 Copyright 2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +29,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
-from sglang.srt.utils import get_bool_env_var, next_power_of_2
+from sglang.srt.utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -420,7 +422,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         super().__init__(size, page_size, dtype, device, kvcache)
         self.num_pages = size // page_size
-        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self.debug_mode = envs.SGLANG_DEBUG_MEMORY_POOL.value
         self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
         self.clear()
 
