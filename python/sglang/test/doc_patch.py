@@ -1,4 +1,9 @@
-"""Do some monkey patch to make the documentation compilation faster and more reliable."""
+"""
+Do some monkey patch to make the documentation compilation faster and more reliable.
+
+- Avoid port conflicts
+- Reduce the server launch time
+"""
 
 import weakref
 
