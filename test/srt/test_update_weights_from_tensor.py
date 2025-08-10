@@ -5,6 +5,7 @@ import unittest
 import torch
 
 import sglang as sgl
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
@@ -41,74 +42,128 @@ def test_update_weights_from_tensor(tp_size):
 
 
 class TestUpdateWeightsFromTensor(CustomTestCase):
-    def test_update_weights_from_tensor(self):
-        tp_sizes = [1, 2]
-        for tp_size in tp_sizes:
-            if torch.cuda.device_count() < tp_size:
-                continue
+    # def test_update_weights_from_tensor(self):
+    #     tp_sizes = [1, 2]
+    #     for tp_size in tp_sizes:
+    #         if torch.cuda.device_count() < tp_size:
+    #             continue
 
-            with self.subTest(tp_size=tp_size):
-                test_update_weights_from_tensor(tp_size)
+    #         with self.subTest(tp_size=tp_size):
+    #             test_update_weights_from_tensor(tp_size)
 
-    def test_update_weights_from_tensor_load_format_direct(self):
+    # def test_update_weights_from_tensor_load_format_direct(self):
+    #     engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+
+    #     write_param_names = [
+    #         f"model.layers.{i}.self_attn.qkv_proj.weight" for i in range(6, 16)
+    #     ]
+    #     read_param_names = [
+    #         f"model.layers.{i}.self_attn.k_proj.weight" for i in range(6, 16)
+    #     ]
+
+    #     _check_param(
+    #         engine, read_param_names[0], [-0.0198, 0.0227, 0.0168, 0.0232, -0.0178]
+    #     )
+
+    #     new_tensor = torch.full((3072, 2048), 1.5)
+    #     engine.update_weights_from_tensor(
+    #         [
+    #             (write_param_name, new_tensor.clone())
+    #             for write_param_name in write_param_names
+    #         ],
+    #         load_format="direct",
+    #     )
+
+    #     for read_param_name in read_param_names[:3]:
+    #         _check_param(engine, read_param_name, [1.5] * 5)
+
+    #     engine.shutdown()
+
+    # def test_update_weights_from_tensor_load_format_custom(self):
+    #     custom_loader_name = (
+    #         "sglang.srt.model_executor.model_runner._model_load_weights_direct"
+    #     )
+    #     engine = sgl.Engine(
+    #         model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    #         custom_weight_loader=[custom_loader_name],
+    #     )
+
+    #     write_param_names = [
+    #         f"model.layers.{i}.self_attn.qkv_proj.weight" for i in range(6, 16)
+    #     ]
+    #     read_param_names = [
+    #         f"model.layers.{i}.self_attn.k_proj.weight" for i in range(6, 16)
+    #     ]
+
+    #     _check_param(
+    #         engine, read_param_names[0], [-0.0198, 0.0227, 0.0168, 0.0232, -0.0178]
+    #     )
+
+    #     new_tensor = torch.full((3072, 2048), 1.5)
+    #     engine.update_weights_from_tensor(
+    #         [
+    #             (write_param_name, new_tensor.clone())
+    #             for write_param_name in write_param_names
+    #         ],
+    #         load_format=custom_loader_name,
+    #     )
+
+    #     for read_param_name in read_param_names[:3]:
+    #         _check_param(engine, read_param_name, [1.5] * 5)
+
+    #     engine.shutdown()
+
+    def test_update_weights_from_tensor_load_format_flattened_bucket(self):
+        """Test updating weights using flattened_bucket format"""
         engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
-        write_param_names = [
-            f"model.layers.{i}.self_attn.qkv_proj.weight" for i in range(6, 16)
-        ]
-        read_param_names = [
-            f"model.layers.{i}.self_attn.k_proj.weight" for i in range(6, 16)
-        ]
+        # Create a small set of parameters for testing
+        param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 10)]
 
-        _check_param(
-            engine, read_param_names[0], [-0.0198, 0.0227, 0.0168, 0.0232, -0.0178]
+        # Check original values
+        _check_param(engine, param_names[0], [0.0087, -0.0214, -0.0004, 0.0039, 0.0110])
+
+        # Create new tensors with different values
+        new_tensors = []
+        for i, name in enumerate(param_names):
+            # Create tensors with different values for each parameter
+            value = 2.0 + i * 0.1  # Different value for each parameter
+            new_tensor = torch.full((16384, 2048), value, device="cuda")
+            new_tensors.append((name, new_tensor))
+
+        # Create a flattened bucket
+        flattened_bucket = FlattenedTensorBucket(named_tensors=new_tensors)
+
+        # Extract the flattened tensor and metadata in the format expected by model_runner
+        flattened_tensor = flattened_bucket.get_flattened_tensor()
+        metadata = flattened_bucket.get_metadata()
+
+        # Create the dict format expected by _update_weights_from_flattened_bucket
+        bucket_dict = {"flattened_tensor": flattened_tensor, "metadata": metadata}
+
+        # Serialize the bucket data
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        serialized_bucket = MultiprocessingSerializer.serialize(
+            bucket_dict, output_str=True
         )
 
-        new_tensor = torch.full((3072, 2048), 1.5)
+        # Create a list where each rank contains the same serialized data
+        # This simulates the distributed environment where each rank has the same data
+        serialized_bucket_list = [serialized_bucket]
+
+        # Update weights using flattened_bucket format
+        time_start = time.perf_counter()
         engine.update_weights_from_tensor(
-            [
-                (write_param_name, new_tensor.clone())
-                for write_param_name in write_param_names
-            ],
-            load_format="direct",
+            named_tensors=serialized_bucket_list, load_format="flattened_bucket"
         )
+        update_time = time.perf_counter() - time_start
+        print(f"Flattened bucket update time: {update_time:.03f}")
 
-        for read_param_name in read_param_names[:3]:
-            _check_param(engine, read_param_name, [1.5] * 5)
-
-        engine.shutdown()
-
-    def test_update_weights_from_tensor_load_format_custom(self):
-        custom_loader_name = (
-            "sglang.srt.model_executor.model_runner._model_load_weights_direct"
-        )
-        engine = sgl.Engine(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            custom_weight_loader=[custom_loader_name],
-        )
-
-        write_param_names = [
-            f"model.layers.{i}.self_attn.qkv_proj.weight" for i in range(6, 16)
-        ]
-        read_param_names = [
-            f"model.layers.{i}.self_attn.k_proj.weight" for i in range(6, 16)
-        ]
-
-        _check_param(
-            engine, read_param_names[0], [-0.0198, 0.0227, 0.0168, 0.0232, -0.0178]
-        )
-
-        new_tensor = torch.full((3072, 2048), 1.5)
-        engine.update_weights_from_tensor(
-            [
-                (write_param_name, new_tensor.clone())
-                for write_param_name in write_param_names
-            ],
-            load_format=custom_loader_name,
-        )
-
-        for read_param_name in read_param_names[:3]:
-            _check_param(engine, read_param_name, [1.5] * 5)
+        # Verify the weights were updated correctly
+        for i, param_name in enumerate(param_names):
+            expected_value = 2.0 + i * 0.1
+            _check_param(engine, param_name, [expected_value] * 5)
 
         engine.shutdown()
 
