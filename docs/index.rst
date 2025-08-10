@@ -35,6 +35,9 @@ The core features include:
    :maxdepth: 1
    :caption: Advanced Features
 
+   advanced_features/server_arguments.md
+   advanced_features/attention_backend.md
+   advanced_features/hyperparameter_tuning.md
 
 .. toctree::
    :maxdepth: 1
