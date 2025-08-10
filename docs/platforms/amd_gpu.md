@@ -57,7 +57,7 @@ pip install -e "python[all_hip]"
 
 ### Install Using Docker (Recommended)
 
-The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
+The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile.rocm](https://github.com/sgl-project/sglang/tree/main/docker).
 
 The steps below shows how to build an image from scratch.
 
