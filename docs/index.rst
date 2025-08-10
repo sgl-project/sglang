@@ -21,9 +21,7 @@ The core features include:
    :caption: Basic Usage
 
    basic_usage/send_request.ipynb
-   basic_usage/openai_api_completions.ipynb
-   basic_usage/openai_api_vision.ipynb
-   basic_usage/openai_api_embeddings.ipynb
+   basic_usage/openai_api.rst
    basic_usage/offline_engine_api.ipynb
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
