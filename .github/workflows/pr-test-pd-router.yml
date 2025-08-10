@@ -5,13 +5,13 @@ on:
     branches: [ main ]
     paths:
       - 'python/sglang/srt/disaggregation/**'
-      - 'scripts/ci_start_disaggregation_servers.sh'
+      - 'scripts/ci/ci_start_disaggregation_servers.sh'
       - 'sgl-router/**'
   pull_request:
     branches: [ main ]
     paths:
       - 'python/sglang/srt/disaggregation/**'
-      - 'scripts/ci_start_disaggregation_servers.sh'
+      - 'scripts/ci/ci_start_disaggregation_servers.sh'
       - 'sgl-router/**'
   workflow_dispatch:
 
@@ -44,7 +44,7 @@ jobs:
 
     - name: Setup Rust
       run: |
-        bash scripts/ci_install_rust.sh
+        bash scripts/ci/ci_install_rust.sh
 
     - name: Cache Rust dependencies
       uses: actions/cache@v4
@@ -132,7 +132,7 @@ jobs:
       id: start_servers
       run: |
         echo "Starting disaggregation servers..."
-        bash scripts/ci_start_disaggregation_servers.sh &
+        bash scripts/ci/ci_start_disaggregation_servers.sh &
         SERVER_PID=$!
         echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
 

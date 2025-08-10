@@ -2,7 +2,7 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
-bash scripts/ci_install_dependency.sh
+bash scripts/ci/ci_install_dependency.sh
 
 export GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
 export NVSHMEM_DIR=/opt/nvshmem/install
