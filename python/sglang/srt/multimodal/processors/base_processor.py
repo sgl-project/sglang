@@ -145,9 +145,6 @@ class MultimodalSpecialTokens:
         return self.combined_regex
 
 
-from transformers.models.qwen2_audio.processing_qwen2_audio import Qwen2AudioProcessor
-
-
 class BaseMultimodalProcessor(ABC):
     models = []
 
