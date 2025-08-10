@@ -28,7 +28,6 @@ import threading
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
-import zmq.asyncio
 from PIL.Image import Image
 
 from sglang.environ import envs
@@ -69,7 +68,6 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
-    get_bool_env_var,
     get_zmq_socket,
     is_cuda,
     kill_process_tree,
