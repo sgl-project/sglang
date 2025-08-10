@@ -123,7 +123,8 @@ class HiPAttentionBackend(AttentionBackend):
         )
 
         if self._block_table is not None:
-            self._block_table[: _table.shape[0]] = _table
+            # NOTE FIXME BUG Disable cuda graph make this line bugged.
+            self._block_table[: _table.shape[0]] = _table # if this line bugged, no --disable-cuda-graph
         else:
             self._block_table = _table
 
