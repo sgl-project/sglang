@@ -661,9 +661,9 @@ impl Tree {
 //  Unit tests
 #[cfg(test)]
 mod tests {
-    use rand::distributions::Alphanumeric;
-    use rand::distributions::DistString;
-    use rand::thread_rng;
+    use rand::distr::Alphanumeric;
+    use rand::distr::SampleString;
+    use rand::rng as thread_rng;
     use rand::Rng;
     use std::thread;
     use std::time::Instant;
@@ -1256,27 +1256,27 @@ mod tests {
         for thread_id in 0..4 {
             let tree = Arc::clone(&tree);
             let handle = thread::spawn(move || {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let tenant = format!("tenant{}", thread_id + 1);
                 let prefix = format!("prefix{}", thread_id);
 
                 while start_time.elapsed() < test_duration {
                     // Random decision: match or insert (70% match, 30% insert)
-                    if rng.gen_bool(0.7) {
+                    if rng.random_bool(0.7) {
                         // Perform match operation
-                        let random_len = rng.gen_range(3..10);
+                        let random_len = rng.random_range(3..10);
                         let search_str = format!("{}{}", prefix, random_string(random_len));
                         let (_matched, _) = tree.prefix_match(&search_str);
                     } else {
                         // Perform insert operation
-                        let random_len = rng.gen_range(5..15);
+                        let random_len = rng.random_range(5..15);
                         let insert_str = format!("{}{}", prefix, random_string(random_len));
                         tree.insert(&insert_str, &tenant);
                         // println!("Thread {} inserted: {}", thread_id, insert_str);
                     }
 
                     // Small random sleep to vary timing
-                    thread::sleep(Duration::from_millis(rng.gen_range(10..100)));
+                    thread::sleep(Duration::from_millis(rng.random_range(10..100)));
                 }
             });
             handles.push(handle);
