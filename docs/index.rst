@@ -41,11 +41,6 @@ The core features include:
 
 .. toctree::
    :maxdepth: 1
-   :caption: Performance Tuning
-
-
-.. toctree::
-   :maxdepth: 1
    :caption: Supported Models
 
    supported_models/generative_models.md
@@ -73,3 +68,5 @@ The core features include:
 .. toctree::
    :maxdepth: 1
    :caption: References
+
+   references/custom_chat_template.md
