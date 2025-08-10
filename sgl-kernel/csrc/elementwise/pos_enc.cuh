@@ -13,174 +13,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_POS_ENC_CUH_
-#define FLASHINFER_POS_ENC_CUH_
+#ifndef SGL_POS_ENC_CUH_
+#define SGL_POS_ENC_CUH_
 
-#include <cmath>
-#include <cstdint>
-#include <flashinfer/layout.cuh>
-#include <flashinfer/math.cuh>
-#include <flashinfer/utils.cuh>
-#include <flashinfer/vec_dtypes.cuh>
-#include <iostream>
-#include <string>
+// #include <cmath>
+// #include <cstdint>
+// #include <flashinfer/layout.cuh>
+// #include <flashinfer/math.cuh>
+// #include <flashinfer/utils.cuh>
+// #include <flashinfer/vec_dtypes.cuh>
+// #include <iostream>
+// #include <string>
+#include <flashinfer/pos_enc.cuh>  // upstream
 
 namespace flashinfer {
-
-/*!
- * \brief An enumeration class that defines different modes for applying RoPE
- *   (Rotary Positional Embeddings).
- */
-enum class PosEncodingMode {
-  // No rotary positional embeddings
-  kNone = 0U,
-  // Apply Llama-style rope.
-  kRoPELlama = 1U,
-  // Apply ALiBi bias
-  kALiBi = 2U
-};
-
-/*!
- * \brief Apply RoPE (Rotary Positional Embeddings) to x[0: head_dim],
- *   return thread-local vector
- * \tparam vec_size A template integer indicates the vector size used
- *   in the kernel
- * \tparam bdx A template integer indicates the blockDim.x
- * \tparam T A template type indicates the x data type
- * \param x A pointer to the start of x data
- * \param freq A vector of float indicates the thread-local rope frequency
- * \param offset A integer indicates the offset of the position in RoPE
- */
-template <uint32_t vec_size, uint32_t bdx, typename T>
-__device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope(
-    const T* x, const vec_t<float, vec_size>& freq, int32_t offset, const uint32_t rotary_dim = vec_size * bdx) {
-  vec_t<float, vec_size> permuted_vec, vec;
-  vec.cast_load(x + threadIdx.x * vec_size);
-
-  if (threadIdx.x * vec_size < rotary_dim) {
-    permuted_vec.cast_load(
-        x + ((threadIdx.x * vec_size < rotary_dim / 2) ? threadIdx.x * vec_size + rotary_dim / 2
-                                                       : threadIdx.x * vec_size - rotary_dim / 2));
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      float embed = float(offset) * freq[i];
-      float cos, sin;
-      __sincosf(embed, &sin, &cos);
-      vec[i] = vec[i] * cos + ((threadIdx.x * vec_size < rotary_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
-    }
-  }
-  return vec;
-}
-
-template <uint32_t vec_size, uint32_t bdx, typename T>
-__device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin(
-    const T* x,
-    const vec_t<float, vec_size>& cos,
-    const vec_t<float, vec_size>& sin,
-    const uint32_t rotary_dim = vec_size * bdx) {
-  vec_t<float, vec_size> permuted_vec, vec;
-  vec.cast_load(x + threadIdx.x * vec_size);
-
-  if (threadIdx.x * vec_size < rotary_dim) {
-    permuted_vec.cast_load(
-        x + ((threadIdx.x * vec_size < rotary_dim / 2) ? threadIdx.x * vec_size + rotary_dim / 2
-                                                       : threadIdx.x * vec_size - rotary_dim / 2));
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      vec[i] =
-          vec[i] * cos[i] + ((threadIdx.x * vec_size < rotary_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin[i];
-    }
-  }
-  return vec;
-}
-
-/*!
- * \brief Apply RoPE (Rotary Positional Embeddings) to x[0: head_dim] with interleave,
- *   return thread-local vector.
- * \tparam vec_size A template integer indicates the vector size used
- *   in the kernel
- * \tparam bdx A template integer indicates the blockDim.x
- * \tparam T A template type indicates the x data type
- * \param x A pointer to the start of x data
- * \param freq A vector of float indicates the thread-local rope frequency
- * \param offset A integer indicates the offset of the position in RoPE
- */
-template <uint32_t vec_size, uint32_t bdx, typename T>
-__device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_interleave(
-    const T* x, const vec_t<float, vec_size>& freq, int32_t offset, const uint32_t rotary_dim = vec_size * bdx) {
-  vec_t<float, vec_size> vec, vec_before;
-  vec.cast_load(x + threadIdx.x * vec_size);
-
-  if (threadIdx.x * vec_size < rotary_dim) {
-    vec_before = vec;
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      float embed = float(offset) * freq[i];
-      float cos, sin;
-      __sincosf(embed, &sin, &cos);
-      vec[i] = vec[i] * cos + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin;
-    }
-  }
-  return vec;
-}
-
-template <uint32_t vec_size, uint32_t bdx, typename T>
-__device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_interleave(
-    const T* x,
-    const vec_t<float, vec_size>& cos,
-    const vec_t<float, vec_size>& sin,
-    const uint32_t rotary_dim = vec_size * bdx) {
-  vec_t<float, vec_size> vec, vec_before;
-  vec.cast_load(x + threadIdx.x * vec_size);
-
-  if (threadIdx.x * vec_size < rotary_dim) {
-    vec_before = vec;
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      vec[i] = vec[i] * cos[i] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i];
-    }
-  }
-  return vec;
-}
-
-/*
-HACK (ByronHsu): in the interleave mode with cos_sin_cache, we actually only use the first half of
-cos and sin
-
-For example,
-In the below example, the vec_size is 4
-the computation in the kernel is:
-    [x1, x2, x3, x4...] * [cos1, cos1, cos2, cos2] + [-x2, x1, -x4, x3...] * [sin1, sin1, sin2,
-sin2] the data we loaded are:
-    - loaded vec = [x1, x2, x3, x4]
-    - loaded cos = [cos1, cos2, cos3, cos4]
-    - loaded sin = [sin1, sin2, sin3, sin4]
-But only the first half of cos and sin is used in the computation.
-
-However, we argue the additional overhead is acceptable:
-    1. loading additional elements of cos and sin is not adding much overhead. The arithmetic
-intensity is the same as non-interleave mode. Each elements of cos and sin is load twice
-    2. we don't want two code paths of cos and sin vector for interleave and non-interleave mode.
-*/
-template <uint32_t vec_size, uint32_t bdx, typename T>
-__device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_interleave_reuse_half(
-    const T* x,
-    const vec_t<float, vec_size>& cos,
-    const vec_t<float, vec_size>& sin,
-    const uint32_t rotary_dim = vec_size * bdx) {
-  vec_t<float, vec_size> vec, vec_before;
-  vec.cast_load(x + threadIdx.x * vec_size);
-
-  if (threadIdx.x * vec_size < rotary_dim) {
-    vec_before = vec;
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      // i / 2 is to get the index of the first half of cos and sin
-      vec[i] = vec[i] * cos[i / 2] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i / 2];
-    }
-  }
-  return vec;
-}
 
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType, typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferHeadParallelismKernel(
@@ -373,15 +219,6 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferKernel(
   }
 }
 
-#define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
-  if (interleave) {                                      \
-    const bool INTERLEAVE = true;                        \
-    __VA_ARGS__                                          \
-  } else {                                               \
-    const bool INTERLEAVE = false;                       \
-    __VA_ARGS__                                          \
-  }
-
 template <typename DType, typename IdType>
 cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
     DType* q,
@@ -497,4 +334,4 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
 
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_POS_ENC_CUH_
+#endif  // SGL_POS_ENC_CUH_

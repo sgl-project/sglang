@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/pos_enc.cuh>
+// #include <flashinfer/pos_enc.cuh>
 
 #include "pos_enc.cuh"
 #include "pytorch_extension_utils.h"
@@ -103,7 +103,7 @@ void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
     float k_scale,
     float v_scale,
     at::Tensor v,
-    at::Tensor cache_loc, ) {
+    at::Tensor cache_loc) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   CHECK_LAST_DIM_CONTIGUOUS(v);
