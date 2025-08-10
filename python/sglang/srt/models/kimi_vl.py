@@ -144,7 +144,7 @@ class KimiVLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = (
-            torch.cat([item.pixel_values for item in items], dim=0)
+            torch.cat([item.feature for item in items], dim=0)
             .type(self.vision_tower.dtype)
             .to(self.vision_tower.device)
         )
