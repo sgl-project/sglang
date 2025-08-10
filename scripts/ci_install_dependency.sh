@@ -10,6 +10,9 @@ else
     CU_VERSION="cu126"
 fi
 
+# Disable compilation caching
+export TORCHINDUCTOR_DISABLE_CACHE=1
+
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
