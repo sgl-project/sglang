@@ -25,6 +25,7 @@ from sglang.srt.utils import get_device_capability
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 try:
     from vllm import _custom_ops as ops
@@ -206,11 +207,11 @@ def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
     )[0]
 
 
-def check_moe_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
+def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
     hidden_size = layer.hidden_size
     intermediate_size_per_partition = layer.intermediate_size_per_partition
     # apply_router_weight_on_input is not supported for moe marlin
-    supports_router_weight = not layer.apply_router_weight_on_input
+    supports_router_weight = not layer.moe_runner_config.apply_router_weight_on_input
     # moe marlin requires the activation to be silu
     supports_activation = layer.activation == "silu"
 
