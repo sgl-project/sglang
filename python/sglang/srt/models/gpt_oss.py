@@ -293,14 +293,13 @@ class GptOssAttention(nn.Module):
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # q, k = self.rotary_emb(positions, q, k)
         q, k = self.rotary_emb(
             positions,
             q,
             k,
             layer=self.attn,  # RadixAttention
             forward_batch=forward_batch,
-            save_kv_cache=True,
+            save_kv_cache=True,  # here we update kv cache fused in rope
             value=v,
         )
         inner_state = q, k, v, forward_batch
@@ -310,7 +309,8 @@ class GptOssAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        attn_output = self.attn(*inner_state, sinks=self.sinks)
+        # save_kv_cache=False, as we fused it already in rotary_emb
+        attn_output = self.attn(*inner_state, sinks=self.sinks, save_kv_cache=False)
         output, _ = self.o_proj(attn_output)
         return output
 

@@ -244,11 +244,12 @@ def apply_rope_with_cos_sin_cache_inplace(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
-    layer: Any = None,  # RadixAttention
-    forward_batch=None,
-    save_kv_cache: bool = False,
     value: Optional[torch.Tensor] = None,
-    is_capture_mode: bool = False,
+    k_buffer: Optional[torch.Tensor] = None,
+    v_buffer: Optional[torch.Tensor] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    cache_loc: Optional[torch.Tensor] = None,
 ) -> None:
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
@@ -312,23 +313,12 @@ def apply_rope_with_cos_sin_cache_inplace(
         self.k_buffer[layer_id - self.start_layer][loc] = cache_k
         self.v_buffer[layer_id - self.start_layer][loc] = cache_v
     """
-    if save_kv_cache:
-        layer_id = layer.layer_id
-        token_to_kv_pool = forward_batch.token_to_kv_pool
-        start_layer = token_to_kv_pool.start_layer
-        k_buffer = token_to_kv_pool.k_buffer
-        v_buffer = token_to_kv_pool.v_buffer
-        alt_stream = token_to_kv_pool.alt_stream
-        cache_loc = forward_batch.out_cache_loc
-        # print(cache_loc.shape, cache_loc, cache_loc.dtype, cache_loc.is_contiguous(), k_buffer[layer_id - start_layer].shape)
-        # print(query.view(query.shape[0], -1, head_size).shape, key.view(key.shape[0], -1, head_size).shape)
-        # print(positions, positions.shape)
-        # exit(0)
-        k_buffer_ptr = k_buffer[layer_id - start_layer]
-        v_buffer_ptr = v_buffer[layer_id - start_layer]
-
-        k_scale, v_scale = layer.k_scale, layer.v_scale
-
+    if (
+        k_buffer is not None
+        and v_buffer is not None
+        and value is not None
+        and cache_loc is not None
+    ):
         torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer.default(
             query.view(query.shape[0], -1, head_size),
             key.view(key.shape[0], -1, head_size),
@@ -338,14 +328,12 @@ def apply_rope_with_cos_sin_cache_inplace(
             positions.long(),
             (not is_neox),
             get_cuda_stream(),
-            k_buffer_ptr.view(k_buffer_ptr.shape[0], -1, head_size),
-            v_buffer_ptr.view(v_buffer_ptr.shape[0], -1, head_size),
+            k_buffer.view(k_buffer.shape[0], -1, head_size),
+            v_buffer.view(v_buffer.shape[0], -1, head_size),
             1.0 if k_scale is None else k_scale,
             1.0 if v_scale is None else v_scale,
             value.view(value.shape[0], -1, head_size),
             cache_loc.long(),
-            is_capture_mode,
-            0 if alt_stream is None else alt_stream,
         )
     else:
         torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
