@@ -211,9 +211,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
-        self.use_marlin = (
-            get_bool_env_var("SGLANG_FORCE_FP8_MARLIN") and MARLIN_FP8_AVAILABLE
-        )
+        self.use_marlin = envs.SGLANG_FORCE_FP8_MARLIN.value and MARLIN_FP8_AVAILABLE
         # Disable marlin for ROCm
         if _is_hip:
             self.use_marlin = False
@@ -617,7 +615,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
             if (
-                get_bool_env_var("SGLANG_CUTLASS_MOE")
+                envs.SGLANG_CUTLASS_MOE.value
                 and self.cutlass_fp8_supported
                 and (is_sm100_supported() or is_sm90_supported())
             ):
@@ -1031,7 +1029,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 return ret
 
         if (
-            get_bool_env_var("SGLANG_CUTLASS_MOE")
+            envs.SGLANG_CUTLASS_MOE.value
             and self.cutlass_fp8_supported
             and self.block_quant
             and (is_sm100_supported() or is_sm90_supported())
