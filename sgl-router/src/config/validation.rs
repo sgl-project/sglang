@@ -23,8 +23,11 @@ impl ConfigValidator {
 
         Self::validate_compatibility(config)?;
 
-        Self::validate_retry(&config.retry)?;
-        Self::validate_circuit_breaker(&config.circuit_breaker)?;
+        // Validate effective retry/CB configs (respect disable flags)
+        let retry_cfg = config.effective_retry_config();
+        let cb_cfg = config.effective_circuit_breaker_config();
+        Self::validate_retry(&retry_cfg)?;
+        Self::validate_circuit_breaker(&cb_cfg)?;
 
         Ok(())
     }

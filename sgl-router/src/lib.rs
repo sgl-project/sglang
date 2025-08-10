@@ -170,6 +170,8 @@ impl Router {
                 timeout_duration_secs: self.cb_timeout_duration_secs,
                 window_duration_secs: self.cb_window_duration_secs,
             },
+            disable_retries: false,
+            disable_circuit_breaker: false,
         })
     }
 }

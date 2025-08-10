@@ -43,6 +43,12 @@ pub struct RouterConfig {
     pub retry: RetryConfig,
     /// Circuit breaker configuration
     pub circuit_breaker: CircuitBreakerConfig,
+    /// Disable retries (overrides retry.max_retries to 1 when true)
+    #[serde(default)]
+    pub disable_retries: bool,
+    /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
+    #[serde(default)]
+    pub disable_circuit_breaker: bool,
 }
 
 /// Routing mode configuration
@@ -285,6 +291,8 @@ impl Default for RouterConfig {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         }
     }
 }
@@ -320,6 +328,24 @@ impl RouterConfig {
     /// Check if metrics are enabled
     pub fn has_metrics(&self) -> bool {
         self.metrics.is_some()
+    }
+
+    /// Compute the effective retry config considering disable flag
+    pub fn effective_retry_config(&self) -> RetryConfig {
+        let mut cfg = self.retry.clone();
+        if self.disable_retries {
+            cfg.max_retries = 1;
+        }
+        cfg
+    }
+
+    /// Compute the effective circuit breaker config considering disable flag
+    pub fn effective_circuit_breaker_config(&self) -> CircuitBreakerConfig {
+        let mut cfg = self.circuit_breaker.clone();
+        if self.disable_circuit_breaker {
+            cfg.failure_threshold = u32::MAX;
+        }
+        cfg
     }
 }
 
@@ -397,6 +423,8 @@ mod tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -826,6 +854,8 @@ mod tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -879,6 +909,8 @@ mod tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -928,6 +960,8 @@ mod tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         assert!(config.has_service_discovery());

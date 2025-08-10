@@ -158,16 +158,7 @@ def main():
         default=31000,
         help="Base port number for data parallel workers",
     )
-    # Retry and CB config passthrough
-    parser.add_argument("--router-retry-max-retries", type=int, default=3)
-    parser.add_argument("--router-retry-initial-backoff-ms", type=int, default=100)
-    parser.add_argument("--router-retry-max-backoff-ms", type=int, default=10_000)
-    parser.add_argument("--router-retry-backoff-multiplier", type=float, default=2.0)
-    parser.add_argument("--router-retry-jitter-factor", type=float, default=0.1)
-    parser.add_argument("--router-cb-failure-threshold", type=int, default=5)
-    parser.add_argument("--router-cb-success-threshold", type=int, default=2)
-    parser.add_argument("--router-cb-timeout-duration-secs", type=int, default=30)
-    parser.add_argument("--router-cb-window-duration-secs", type=int, default=60)
+    # No extra retry/CB flags here; RouterArgs.add_cli_args already defines them with router- prefix
 
     args = parser.parse_args()
     server_args = ServerArgs.from_cli_args(args)

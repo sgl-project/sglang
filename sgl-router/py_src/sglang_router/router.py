@@ -113,6 +113,8 @@ class Router:
         cb_success_threshold: int = 2,
         cb_timeout_duration_secs: int = 30,
         cb_window_duration_secs: int = 60,
+        disable_retries: bool = False,
+        disable_circuit_breaker: bool = False,
     ):
         if selector is None:
             selector = {}
@@ -167,6 +169,8 @@ class Router:
             cb_success_threshold=cb_success_threshold,
             cb_timeout_duration_secs=cb_timeout_duration_secs,
             cb_window_duration_secs=cb_window_duration_secs,
+            disable_retries=disable_retries,
+            disable_circuit_breaker=disable_circuit_breaker,
         )
 
     def start(self) -> None:
