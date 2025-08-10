@@ -530,6 +530,7 @@ mod tests {
                     last_transition_time: None,
                     message: None,
                     reason: None,
+                    observed_generation: None,
                 };
                 pod_status.conditions = Some(vec![condition]);
             }
@@ -567,6 +568,7 @@ mod tests {
                     last_transition_time: None,
                     message: None,
                     reason: None,
+                    observed_generation: None,
                 }]),
                 ..Default::default()
             }),
