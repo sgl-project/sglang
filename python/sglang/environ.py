@@ -141,6 +141,7 @@ class Envs:
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
+    SGLANG_ENABLE_FLASHINFER_GEMM = EnvBool(False)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
@@ -170,6 +171,7 @@ class Envs:
 
     # vLLM dependencies
     USE_VLLM_CUSTOM_ALLREDUCE = EnvBool(False)
+    USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
@@ -177,6 +179,7 @@ class Envs:
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
+    SGLANG_SUPPORT_CUTLASS_BLOCK_FP8 = EnvBool(False)
 
     # fmt: on
 

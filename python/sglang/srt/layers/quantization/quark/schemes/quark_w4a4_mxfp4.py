@@ -14,7 +14,6 @@ from aiter.utility.fp4_utils import e8m0_shuffle
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
-from sglang.srt.utils import get_bool_env_var
 
 __all__ = ["QuarkW4A4MXFP4"]
 
