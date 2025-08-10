@@ -101,17 +101,21 @@ class TestLoRALayer(CustomTestCase):
                     model_type="generation",
                     lora_paths=lora_paths,
                     max_loras_per_batch=3,
+                    lora_extra_vocab_size=4,
                     lora_backend=backend,
                     disable_cuda_graph=True,
                     disable_radix_cache=True,
                     cuda_graph_max_bs=1,
                 ) as srt_runner:
+                    self.ensure_reproducibility()
                     srt_outputs = srt_runner.forward(
                         prompts,
                         max_new_tokens=max_new_tokens,
                         lora_paths=batch_lora_paths,
                     )
-                    print(srt_outputs.output_strs)
+                    print("SRT prefill:", srt_outputs.top_input_logprobs)
+                    print("SRT decode:", srt_outputs.top_output_logprobs)
+                    print("SRT outputs:", [s for s in srt_outputs.output_strs])
 
     def _create_base_embedding_layer(
         self, vocab_size: int, embed_dim: int, device: str

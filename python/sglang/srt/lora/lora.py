@@ -88,6 +88,10 @@ class LoRAAdapter(nn.Module):
                 self.layers[layer_id].weights[name] = loaded_weight.cpu()
             elif "input_embeddings" in name:
                 self.new_embeddings[name] = loaded_weight.cpu()
+                assert loaded_weight.shape[0] == self.config.extra_vocab_size, (
+                    f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
+                    f"but the loaded weight has {loaded_weight.shape[0]} embeddings"
+                )
             else:
                 self.weights[name] = loaded_weight.cpu()
 

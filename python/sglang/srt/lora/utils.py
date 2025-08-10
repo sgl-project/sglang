@@ -163,7 +163,7 @@ def get_weight_name(
 
 
 # TODO: [PR #4274] For future use to simplify the mapping between HF module names and customized module names.
-EMBEDDING_NAMES = {"embed_tokens", "lm_head"}
+EMBEDDING_NAMES = {"embed_tokens"}
 COLUMN_PARALLELISM_LINEAR_LORA_NAMES = ["gate_proj", "up_proj"]
 MERGED_COLUMN_PARALLELISM_LINEAR_LORA_NAMES = ["gate_up_proj"]
 QKV_PARALLELISM_LINEAR_LORA_NAMES = ["qkv_proj"]

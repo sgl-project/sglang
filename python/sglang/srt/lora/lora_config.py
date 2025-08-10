@@ -24,6 +24,7 @@ class LoRAConfig:
         path: str,
     ) -> None:
         self.path = path
+        self.weights_dir = self._get_weights_dir()
         self.hf_config = self.get_lora_config()
         self.added_tokens = self.get_added_tokens()
         self.target_modules = self.hf_config["target_modules"]
@@ -41,19 +42,20 @@ class LoRAConfig:
             len(self.added_tokens) if self.added_tokens is not None else 0
         )
 
+    def _get_weights_dir(self):
+        if not os.path.isdir(self.path):
+            return snapshot_download(self.path, allow_patterns=["*.json"])
+        else:
+            return self.path
+
     def get_added_tokens(self, dummy=False):
         if dummy:
             raise NotImplementedError()
         else:
-            if not os.path.isdir(self.path):
-                weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
-            else:
-                weights_dir = self.path
             added_tokens_config_name = "added_tokens.json"
-            if os.path.exists(os.path.join(weights_dir, added_tokens_config_name)):
-                with open(
-                    os.path.join(weights_dir, added_tokens_config_name), "r"
-                ) as f:
+            added_tokens_path = os.path.join(self.weights_dir, added_tokens_config_name)
+            if os.path.exists(added_tokens_path):
+                with open(added_tokens_path, "r") as f:
                     return json.load(f)
             else:
                 return None
@@ -62,10 +64,6 @@ class LoRAConfig:
         if dummy:
             raise NotImplementedError()
         else:
-            if not os.path.isdir(self.path):
-                weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
-            else:
-                weights_dir = self.path
             config_name = "adapter_config.json"
-            with open(os.path.join(weights_dir, config_name), "r") as f:
+            with open(os.path.join(self.weights_dir, config_name), "r") as f:
                 return json.load(f)
