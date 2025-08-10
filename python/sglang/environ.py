@@ -176,6 +176,7 @@ class Envs:
     HF_HUB_DISABLE_XET = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
+    SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
 
     # fmt: on
 
