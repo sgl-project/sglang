@@ -71,7 +71,6 @@ class TestCase:
     lora_target_modules: Optional[List] = None
     max_new_tokens: int = 32
     max_loaded_loras: Optional[int] = None
-    run_in_ci: bool = False
 
 
 def create_batch_data(adapters: Union[str, list]) -> List[tuple[str, str]]:
@@ -82,7 +81,6 @@ def create_batch_data(adapters: Union[str, list]) -> List[tuple[str, str]]:
 
 BASIC_TESTS = [
     TestCase(
-        run_in_ci=True,
         description="dynamic lora update with initial lora_paths",
         base="meta-llama/Llama-3.1-8B-Instruct",
         max_loras_per_batch=3,
@@ -177,7 +175,6 @@ BASIC_TESTS = [
     ),
     TestCase(
         description="dynamic lora update without initial lora_paths",
-        run_in_ci=True,
         base="meta-llama/Llama-3.1-8B-Instruct",
         enable_lora=True,
         max_lora_rank=256,
@@ -564,7 +561,6 @@ MAX_LOADED_LORAS_TESTS = [
 EVICTION_TESTS = [
     TestCase(
         description="dynamic lora update with evictions",
-        run_in_ci=True,
         base="meta-llama/Llama-3.1-8B-Instruct",
         max_loras_per_batch=2,
         all_adapters=[
@@ -1245,9 +1241,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
         """
         Test dynamic LoRA updates in engine mode.
         """
-        test_cases = ALL_TESTS
-        if is_in_ci():
-            test_cases = [tc for tc in ALL_TESTS if tc.run_in_ci]
+        test_cases = BASIC_TESTS if is_in_ci() else ALL_TESTS
         self._run_dynamic_adapter_updates(
             mode=LoRAUpdateTestSessionMode.ENGINE,
             test_cases=test_cases,
@@ -1257,10 +1251,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
         """
         Test dynamic LoRA updates in server mode.
         """
-        test_cases = ALL_TESTS
-        if is_in_ci():
-            test_cases = [tc for tc in ALL_TESTS if tc.run_in_ci]
-
+        test_cases = BASIC_TESTS if is_in_ci() else ALL_TESTS
         self._run_dynamic_adapter_updates(
             mode=LoRAUpdateTestSessionMode.SERVER, test_cases=test_cases
         )
