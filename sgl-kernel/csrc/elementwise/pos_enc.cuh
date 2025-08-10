@@ -192,7 +192,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferHeadParallelis
     IdType* __restrict__ pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t rotary_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t v_stride_n, size_t v_stride_h,
     size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
-  size_t k_buffer_stride_n, size_t k_buffer_stride_h, size_t v_buffer_stride_n, size_t v_buffer_stride_h) {
+    size_t k_buffer_stride_n, size_t k_buffer_stride_h, size_t v_buffer_stride_n, size_t v_buffer_stride_h,
+    DType k_scale, DType v_scale, IdType* __restrict__ cache_loc) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   uint32_t by = blockIdx.y;
   const uint32_t bdy = blockDim.y;
@@ -241,8 +242,9 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferHeadParallelis
       DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
       DType* k_rope_ptr =
           k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
-      DType* k_buffer_ptr = k_buffer + get_elem_offset_impl(idx, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
-      DType* v_buffer_ptr = v_buffer + get_elem_offset_impl(idx, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
+      const IdType cache_offset = cache_loc[idx];
+      DType* k_buffer_ptr = k_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
+      DType* v_buffer_ptr = v_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
       vec_t<float, vec_size> k_vec;
       if constexpr (interleave) {
         k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin,
@@ -264,7 +266,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferKernel(
     IdType* __restrict__ pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t rotary_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t v_stride_n, size_t v_stride_h,
     size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
-    size_t k_buffer_stride_n, size_t k_buffer_stride_h, size_t v_buffer_stride_n, size_t v_buffer_stride_h) {
+    size_t k_buffer_stride_n, size_t k_buffer_stride_h, size_t v_buffer_stride_n, size_t v_buffer_stride_h,
+    DType k_scale, DType v_scale, IdType* __restrict__ cache_loc) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bdy = blockDim.y;
 
@@ -314,10 +317,11 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferKernel(
       DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
       DType* k_rope_ptr =
           k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
+      const IdType cache_offset = cache_loc[idx];
       DType* k_buffer_ptr =
-          k_buffer + get_elem_offset_impl(idx, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
+          k_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
       DType* v_buffer_ptr =
-          v_buffer + get_elem_offset_impl(idx, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
+          v_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
       vec_t<float, vec_size> k_vec;
       if constexpr (interleave) {
         k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin,
@@ -347,6 +351,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
     uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim,
     uint32_t head_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t v_stride_n, size_t v_stride_h,
     size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h, size_t k_buffer_stride_n, size_t k_buffer_stride_h, size_t v_buffer_stride_n, size_t v_buffer_stride_h,
+    IdType* cache_loc,
     bool interleave, cudaStream_t stream = nullptr,
     DType k_scale = 1.0f,
     DType v_scale = 1.0f,
@@ -398,7 +403,8 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
                       (void*)&v_buffer_stride_n,
                       (void*)&v_buffer_stride_h,
                       (void*)&k_scale,
-                      (void*)&v_scale};
+                      (void*)&v_scale,
+                      (void*)&cache_loc};
       auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx,
                                                                 DType, IdType>;
 

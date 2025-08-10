@@ -118,6 +118,7 @@ void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
     float k_scale,
     float v_scale,
     at::Tensor v,
+    at::Tensor cache_loc,
     bool is_capture_mode,
     int64_t alt_stream_ptr  // Additional stream for overlap
 ) {
@@ -129,10 +130,12 @@ void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
   CHECK_DIM(3, k_buffer_ptr);  // k_buffer: (nnz, H_K, D)
   CHECK_DIM(3, v_buffer_ptr);  // v_buffer: (nnz, H_V, D)
   CHECK_DIM(3, v);             // v: (nnz, H_V, D)
+  CHECK_DIM(1, cache_loc);     // v: (n)
   
 
   CHECK_INPUT(cos_sin_cache);
   CHECK_INPUT(pos_ids);
+  CHECK_INPUT(cache_loc);
   auto device = q.device();
   CHECK_EQ(k.device(), device);
   CHECK_EQ(cos_sin_cache.device(), device);
@@ -198,6 +201,7 @@ void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
         k_buffer_stride_h,
         v_buffer_stride_n,
         v_buffer_stride_h,
+        static_cast<int64_t*>(cache_loc.data_ptr()),
         interleave,
         stream,
         k_scale,

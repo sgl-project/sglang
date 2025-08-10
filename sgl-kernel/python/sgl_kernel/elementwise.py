@@ -249,7 +249,6 @@ def apply_rope_with_cos_sin_cache_inplace(
     forward_batch = None,
     save_kv_cache: bool = False,
     value: Optional[torch.Tensor] = None,
-    start_layer: Optional[int] = None,
     is_capture_mode: bool = False,
 ) -> None:
     r"""
@@ -322,8 +321,12 @@ def apply_rope_with_cos_sin_cache_inplace(
         v_buffer = token_to_kv_pool.v_buffer
         alt_stream = token_to_kv_pool.alt_stream
         cache_loc = forward_batch.out_cache_loc
-        k_buffer_ptr = k_buffer[layer_id - start_layer][cache_loc].contiguous()
-        v_buffer_ptr = v_buffer[layer_id - start_layer][cache_loc].contiguous()
+        # print(cache_loc.shape, cache_loc, cache_loc.dtype, cache_loc.is_contiguous(), k_buffer[layer_id - start_layer].shape)
+        # print(query.view(query.shape[0], -1, head_size).shape, key.view(key.shape[0], -1, head_size).shape)
+        # print(positions, positions.shape)
+        # exit(0)
+        k_buffer_ptr = k_buffer[layer_id - start_layer]
+        v_buffer_ptr = v_buffer[layer_id - start_layer]
 
         k_scale, v_scale = layer.k_scale, layer.v_scale
 
@@ -337,11 +340,12 @@ def apply_rope_with_cos_sin_cache_inplace(
             positions.long(),
             (not is_neox),
             get_cuda_stream(),
-            k_buffer_ptr,
-            v_buffer_ptr,
+            k_buffer_ptr.view(k_buffer_ptr.shape[0], -1, head_size),
+            v_buffer_ptr.view(v_buffer_ptr.shape[0], -1, head_size),
             1.0 if k_scale is None else k_scale,
             1.0 if v_scale is None else v_scale,
             value.view(value.shape[0], -1, head_size),
+            cache_loc.long(),
             is_capture_mode,
             0 if alt_stream is None else alt_stream,
         )
