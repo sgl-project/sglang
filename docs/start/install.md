@@ -3,7 +3,7 @@
 You can install SGLang using one of the methods below.
 
 This page primarily applies to NVIDIA GPU platforms.
-For other platforms, please refer to the dedicated pages for [AMD GPUs](../platform/amd.md), [Intel Xeon CPUs](../platform/cpu.md), and [NVIDIA Jetson](../platform/nvidia_jetson.md).
+For other platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd.md), [Intel Xeon CPUs](../platforms/cpu.md), and [NVIDIA Jetson](../platforms/nvidia_jetson.md).
 
 ## Method 1: With pip or uv
 
