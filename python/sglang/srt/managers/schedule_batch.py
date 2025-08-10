@@ -1714,16 +1714,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             attention_backend_str = global_server_args_dict["prefill_attention_backend"]
         # Create seq_lens_cpu when needed
         if (
-            attention_backend_str == "fa3"
-            or (
-                global_server_args_dict["use_mla_backend"]
-                and attention_backend_str == "flashinfer"
-            )
-            or attention_backend_str == "flashmla"
-            or attention_backend_str == "cutlass_mla"
-            or attention_backend_str == "ascend"
-            or attention_backend_str == "trtllm_mha"
-            or attention_backend_str == "aiter"
+            attention_backend_str
+            in [
+                "fa3",
+                "flashinfer",
+                "flashmla",
+                "cutlass_mla",
+                "ascend",
+                "trtllm_mha",
+                "aiter",
+            ]
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
