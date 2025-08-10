@@ -1,5 +1,3 @@
-# TODO(ch-wan): this file will be moved to sglang/srt/layers/moe/token_dispatcher/deepep.py
-
 from __future__ import annotations
 
 import logging
@@ -22,22 +20,26 @@ from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
-    DeepEPMode,
     get_bool_env_var,
     get_int_env_var,
     is_hip,
+    is_npu,
     load_json_config,
 )
+
+_is_npu = is_npu()
 
 try:
     from deep_ep import Buffer, Config
 
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
+    if not _is_npu:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
 
     use_deepep = True
 except ImportError:
@@ -87,8 +89,24 @@ class DeepEPLLOutput(NamedTuple):
         return DispatchOutputFormat.deepep_ll
 
 
+class AscendDeepEPLLOutput(NamedTuple):
+    """AscendDeepEP low latency dispatch output."""
+
+    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
+    topk_idx: torch.Tensor
+    topk_weights: torch.Tensor
+    masked_m: torch.Tensor
+    seg_indptr: torch.Tensor
+    expected_m: int
+
+    @property
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.deepep_ll
+
+
 assert isinstance(DeepEPNormalOutput, DispatchOutput)
 assert isinstance(DeepEPLLOutput, DispatchOutput)
+assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -150,26 +168,27 @@ class DeepEPBuffer:
                 num_rdma_bytes,
             )
 
-        if deepep_mode == DeepEPMode.normal:
+        if deepep_mode == DeepEPMode.NORMAL:
             num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
-        elif deepep_mode in [DeepEPMode.low_latency, DeepEPMode.auto]:
+        elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
             num_qps_per_rank = num_experts // group.size()
         else:
             raise NotImplementedError
 
-        total_num_sms = torch.cuda.get_device_properties(
-            device="cuda"
-        ).multi_processor_count
-        if (
-            (deepep_mode != DeepEPMode.low_latency)
-            and not global_server_args_dict["enable_two_batch_overlap"]
-            and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
-        ):
-            logger.warning(
-                f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. "
-                f"This may result in highly suboptimal performance. "
-                f"Consider using --deepep-config to change the behavior."
-            )
+        if not _is_npu:
+            total_num_sms = torch.cuda.get_device_properties(
+                device="cuda"
+            ).multi_processor_count
+            if (
+                (deepep_mode != DeepEPMode.LOW_LATENCY)
+                and not global_server_args_dict["enable_two_batch_overlap"]
+                and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
+            ):
+                logger.warning(
+                    f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. "
+                    f"This may result in highly suboptimal performance. "
+                    f"Consider using --deepep-config to change the behavior."
+                )
 
         cls._buffer = Buffer(
             group,
@@ -514,13 +533,24 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             masked_m
         )
 
-        return DeepEPLLOutput(
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            masked_m,
-            expected_m,
-        )
+        if _is_npu:
+            deepep_output = AscendDeepEPLLOutput(
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                masked_m,
+                self.handle[1],
+                expected_m,
+            )
+        else:
+            deepep_output = DeepEPLLOutput(
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                masked_m,
+                expected_m,
+            )
+        return deepep_output
 
     def _dispatch_core(
         self,
@@ -611,7 +641,7 @@ class DeepEPDispatcher(BaseDispatcher):
         num_local_experts: int = None,
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
-        deepep_mode: DeepEPMode = DeepEPMode.auto,
+        deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
@@ -697,9 +727,9 @@ class DeepEPDispatcher(BaseDispatcher):
         resolved_deepep_mode = self.deepep_mode.resolve(
             forward_batch.is_extend_in_batch
         )
-        if resolved_deepep_mode == DeepEPMode.normal:
+        if resolved_deepep_mode == DeepEPMode.NORMAL:
             return self._normal_dispatcher
-        elif resolved_deepep_mode == DeepEPMode.low_latency:
+        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
             return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")

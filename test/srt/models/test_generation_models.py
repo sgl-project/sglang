@@ -42,7 +42,7 @@ class ModelCase:
     model_path: str
     tp_size: int = 1
     prefill_tolerance: float = 5e-2
-    decode_tolerance: float = 5e-2
+    decode_tolerance: float = 6e-2  # Increased to fix numerical error in issue #8614.
     rouge_l_tolerance: float = 1
     skip_long_prompt: bool = False
     trust_remote_code: bool = False
@@ -67,6 +67,7 @@ ALL_MODELS = [
     ModelCase("openai-community/gpt2"),
     ModelCase("microsoft/phi-1_5", trust_remote_code=True),
     ModelCase("adept/persimmon-8b-chat"),
+    ModelCase("inclusionAI/Ling-lite", trust_remote_code=True),
     ModelCase("microsoft/Phi-3-small-8k-instruct", trust_remote_code=True),
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
     ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),

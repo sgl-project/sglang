@@ -358,6 +358,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_v=device_pool.v_buffer[layer_id],
                     src_indices=host_indices,
                     dst_indices=device_indices,
+                    layer_id=layer_id,
                     item_size=self.token_stride_size,
                     src_layout_dim=self.layout_dim,
                 )
@@ -585,6 +586,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                     dst=device_pool.kv_buffer[layer_id],
                     src_indices=host_indices,
                     dst_indices=device_indices,
+                    layer_id=layer_id,
                     item_size=self.token_stride_size,
                     src_layout_dim=self.layout_dim,
                 )
@@ -618,7 +620,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             elif self.layout == "page_first":
                 transfer_kv_all_layer_mla_lf_pf(
                     src_layers=device_pool.data_ptrs,
-                    dst_k=self.kv_buffer,
+                    dst=self.kv_buffer,
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     item_size=self.token_stride_size,

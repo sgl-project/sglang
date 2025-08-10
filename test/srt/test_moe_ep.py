@@ -27,7 +27,6 @@ class TestEpMoE(CustomTestCase):
                 "2",
                 "--ep-size",
                 "2",
-                "--enable-ep-moe",
             ],
         )
 
@@ -75,7 +74,6 @@ class TestEpMoEFP8(CustomTestCase):
                 "2",
                 "--ep-size",
                 "2",
-                "--enable-ep-moe",
                 "--quantization",
                 "fp8",
             ],
