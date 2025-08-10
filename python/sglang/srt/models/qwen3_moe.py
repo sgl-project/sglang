@@ -28,20 +28,13 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    parallel_state,
-    split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    get_local_attention_dp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -463,7 +456,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-        self.local_dp_size = get_local_attention_dp_size()
 
         # Qwen3MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True

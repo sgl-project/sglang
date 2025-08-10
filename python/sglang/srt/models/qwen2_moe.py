@@ -17,8 +17,6 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
-from dataclasses import dataclass
-from enum import Enum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
@@ -39,11 +37,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    get_local_attention_dp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -51,7 +45,7 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -320,7 +314,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-        self.local_dp_size = get_local_attention_dp_size()
 
         # Qwen2MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True

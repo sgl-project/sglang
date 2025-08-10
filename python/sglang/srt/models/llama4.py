@@ -28,11 +28,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    get_local_attention_dp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -359,7 +355,6 @@ class Llama4DecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
-        self.local_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
