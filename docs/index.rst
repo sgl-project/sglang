@@ -64,8 +64,9 @@ The core features include:
    :maxdepth: 1
    :caption: Hardware Platforms
 
-   platforms/amd.md
-   platforms/cpu.md
+   platforms/amd_gpu.md
+   platforms/blackwell_gpu.md
+   platforms/cpu_server.md
    platforms/nvidia_jetson.md
    platforms/ascend_npu.md
 
