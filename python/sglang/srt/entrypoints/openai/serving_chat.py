@@ -78,6 +78,14 @@ class OpenAIServingChat(OpenAIServingBase):
             and not request.tools
         ):
             return "Tools cannot be empty if tool choice is set to required."
+        
+        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        server_context_length = self.tokenizer_manager.server_args.context_length
+        if max_output_tokens is not None and max_output_tokens > server_context_length:
+            return (
+                f"max_completion_tokens is too large: {max_output_tokens} ."
+                f"This model supports at most {server_context_length} completion tokens."
+            )
 
         return None
 
@@ -217,9 +225,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
             )
         except Exception:
-            #  This except branch will be triggered when the chosen model
-            #  has a different tools input format that is not compatible
-            #  with openAI's apply_chat_template tool_call format, like Mistral.
+            # This except branch will be triggered when the chosen model
+            # has a different tools input format that is not compatible
+            # with openAI's apply_chat_template tool_call format, like Mistral.
             tools = (
                 [t if "function" in t else {"function": t} for t in tools]
                 if tools
