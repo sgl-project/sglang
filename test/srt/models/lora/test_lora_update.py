@@ -71,6 +71,7 @@ class TestCase:
     lora_target_modules: Optional[List] = None
     max_new_tokens: int = 32
     max_loaded_loras: Optional[int] = None
+    run_in_ci: bool = False
 
 
 def create_batch_data(adapters: Union[str, list]) -> List[tuple[str, str]]:
@@ -81,6 +82,7 @@ def create_batch_data(adapters: Union[str, list]) -> List[tuple[str, str]]:
 
 BASIC_TESTS = [
     TestCase(
+        run_in_ci=True,
         description="dynamic lora update with initial lora_paths",
         base="meta-llama/Llama-3.1-8B-Instruct",
         max_loras_per_batch=3,
@@ -175,6 +177,7 @@ BASIC_TESTS = [
     ),
     TestCase(
         description="dynamic lora update without initial lora_paths",
+        run_in_ci=True,
         base="meta-llama/Llama-3.1-8B-Instruct",
         enable_lora=True,
         max_lora_rank=256,
@@ -223,6 +226,53 @@ BASIC_TESTS = [
                 data=create_batch_data(
                     [
                         None,
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "pbevan11/llama-3.1-8b-ocr-correction",
+                        None,
+                    ]
+                ),
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
+                ),
+                expected_error="not loaded",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
+                expected_error="not loaded",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(None),
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
                         "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
                         "pbevan11/llama-3.1-8b-ocr-correction",
                         None,
@@ -514,6 +564,7 @@ MAX_LOADED_LORAS_TESTS = [
 EVICTION_TESTS = [
     TestCase(
         description="dynamic lora update with evictions",
+        test_in_ci=True,
         base="meta-llama/Llama-3.1-8B-Instruct",
         max_loras_per_batch=2,
         all_adapters=[
@@ -1195,6 +1246,8 @@ class TestLoRADynamicUpdate(CustomTestCase):
         Test dynamic LoRA updates in engine mode.
         """
         test_cases = ALL_TESTS
+        if is_in_ci():
+            test_cases = [tc for tc in ALL_TESTS if tc.run_in_ci]
         self._run_dynamic_adapter_updates(
             mode=LoRAUpdateTestSessionMode.ENGINE,
             test_cases=test_cases,
@@ -1204,8 +1257,9 @@ class TestLoRADynamicUpdate(CustomTestCase):
         """
         Test dynamic LoRA updates in server mode.
         """
-        # In CI, we only run the first test case to save time, as the engine test should be mostly sufficient for ensuring correctness.
-        test_cases = BASIC_TESTS if is_in_ci() else ALL_TESTS
+        test_cases = ALL_TESTS
+        if is_in_ci():
+            test_cases = [tc for tc in ALL_TESTS if tc.run_in_ci]
 
         self._run_dynamic_adapter_updates(
             mode=LoRAUpdateTestSessionMode.SERVER, test_cases=test_cases
