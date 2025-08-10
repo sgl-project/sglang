@@ -17,8 +17,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @dataclass
@@ -629,6 +629,7 @@ class FlashAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         if k is not None:
             assert v is not None
@@ -737,6 +738,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
+                sinks=sinks,
             )
 
             if use_cascade_attn:
@@ -757,6 +759,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
+                    sinks=sinks,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
@@ -898,6 +901,7 @@ class FlashAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -985,6 +989,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    sinks=sinks,
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
@@ -1003,6 +1008,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    sinks=sinks,
                 )
             else:
                 page_table = metadata.page_table
@@ -1030,6 +1036,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
+                    sinks=sinks,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -1050,6 +1057,7 @@ class FlashAttentionBackend(AttentionBackend):
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
+                            sinks=sinks,
                         )
                     )
                     o, _ = merge_state_v2(
