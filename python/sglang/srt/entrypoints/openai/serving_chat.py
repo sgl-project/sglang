@@ -781,12 +781,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_content = output_msgs[0].content[0].text
                     final_content = parser.current_content
                 else:
-                    if len(output_msgs) != 2:
-                        raise ValueError(
-                            "Expected 2 output messages (reasoning and final), "
-                            f"but got {len(output_msgs)}."
-                        )
-                    reasoning_msg, final_msg = output_msgs
+                    reasoning_msg = None
+                    final_msg = None
+                    for msg in output_msgs:
+                        if msg.channel == "analysis":
+                            reasoning_msg = msg
+                        elif msg.channel == "final":
+                            final_msg = msg
                     reasoning_content = reasoning_msg.content[0].text
                     final_content = final_msg.content[0].text
                     is_tool_call = final_msg.recipient is not None
