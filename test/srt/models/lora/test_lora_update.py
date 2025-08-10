@@ -564,7 +564,7 @@ MAX_LOADED_LORAS_TESTS = [
 EVICTION_TESTS = [
     TestCase(
         description="dynamic lora update with evictions",
-        test_in_ci=True,
+        run_in_ci=True,
         base="meta-llama/Llama-3.1-8B-Instruct",
         max_loras_per_batch=2,
         all_adapters=[
