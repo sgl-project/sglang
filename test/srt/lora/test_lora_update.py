@@ -229,6 +229,53 @@ BASIC_TESTS = [
                     ]
                 ),
             ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
+                ),
+                expected_error="not loaded",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
+                expected_error="not loaded",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(None),
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "pbevan11/llama-3.1-8b-ocr-correction",
+                        None,
+                    ]
+                ),
+            ),
         ],
     ),
 ]
@@ -1194,7 +1241,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
         """
         Test dynamic LoRA updates in engine mode.
         """
-        test_cases = ALL_TESTS
+        test_cases = BASIC_TESTS if is_in_ci() else ALL_TESTS
         self._run_dynamic_adapter_updates(
             mode=LoRAUpdateTestSessionMode.ENGINE,
             test_cases=test_cases,
@@ -1204,9 +1251,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
         """
         Test dynamic LoRA updates in server mode.
         """
-        # In CI, we only run the first test case to save time, as the engine test should be mostly sufficient for ensuring correctness.
         test_cases = BASIC_TESTS if is_in_ci() else ALL_TESTS
-
         self._run_dynamic_adapter_updates(
             mode=LoRAUpdateTestSessionMode.SERVER, test_cases=test_cases
         )
