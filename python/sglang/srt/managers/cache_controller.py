@@ -433,7 +433,9 @@ class HiCacheController:
         if self.io_backend == "kernel":
             return host_indices.to(self.mem_pool_device.device), device_indices
         elif self.io_backend == "direct":
-            return host_indices, device_indices.cpu()
+            device_indices = device_indices.cpu()
+            host_indices, idx = host_indices.sort()
+            return host_indices, device_indices.index_select(0, idx)
         else:
             raise ValueError(f"Unsupported io backend")
 
