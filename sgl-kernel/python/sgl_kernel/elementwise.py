@@ -314,33 +314,45 @@ def apply_rope_with_cos_sin_cache_inplace(
         self.k_buffer[layer_id - self.start_layer][loc] = cache_k
         self.v_buffer[layer_id - self.start_layer][loc] = cache_v
     """
-    layer_id = layer.layer_id
-    token_to_kv_pool = forward_batch.token_to_kv_pool
-    start_layer = token_to_kv_pool.start_layer
-    k_buffer = token_to_kv_pool.k_buffer
-    v_buffer = token_to_kv_pool.v_buffer
-    alt_stream = token_to_kv_pool.alt_stream
-    cache_loc = forward_batch.out_cache_loc
-    k_buffer_ptr = k_buffer[layer_id - start_layer][cache_loc].contiguous()
-    v_buffer_ptr = v_buffer[layer_id - start_layer][cache_loc].contiguous()
+    if save_kv_cache:
+        layer_id = layer.layer_id
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        start_layer = token_to_kv_pool.start_layer
+        k_buffer = token_to_kv_pool.k_buffer
+        v_buffer = token_to_kv_pool.v_buffer
+        alt_stream = token_to_kv_pool.alt_stream
+        cache_loc = forward_batch.out_cache_loc
+        k_buffer_ptr = k_buffer[layer_id - start_layer][cache_loc].contiguous()
+        v_buffer_ptr = v_buffer[layer_id - start_layer][cache_loc].contiguous()
 
-    k_scale, v_scale = layer.k_scale, layer.v_scale
+        k_scale, v_scale = layer.k_scale, layer.v_scale
 
-    torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
-        query.view(query.shape[0], -1, head_size),
-        key.view(key.shape[0], -1, head_size),
-        query.view(query.shape[0], -1, head_size),
-        key.view(key.shape[0], -1, head_size),
-        cos_sin_cache,
-        positions.long(),
-        (not is_neox),
-        get_cuda_stream(),
-        save_kv_cache,
-        k_buffer_ptr,
-        v_buffer_ptr,
-        1.0 if k_scale is None else k_scale,
-        1.0 if v_scale is None else v_scale,
-        value.view(value.shape[0], -1, head_size),
-        is_capture_mode,
-        0 if alt_stream is None else alt_stream,
-    )
+
+        torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer.default(
+            query.view(query.shape[0], -1, head_size),
+            key.view(key.shape[0], -1, head_size),
+            query.view(query.shape[0], -1, head_size),
+            key.view(key.shape[0], -1, head_size),
+            cos_sin_cache,
+            positions.long(),
+            (not is_neox),
+            get_cuda_stream(),
+            k_buffer_ptr,
+            v_buffer_ptr,
+            1.0 if k_scale is None else k_scale,
+            1.0 if v_scale is None else v_scale,
+            value.view(value.shape[0], -1, head_size),
+            is_capture_mode,
+            0 if alt_stream is None else alt_stream,
+        )
+    else:
+        torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
+            query.view(query.shape[0], -1, head_size),
+            key.view(key.shape[0], -1, head_size),
+            query.view(query.shape[0], -1, head_size),
+            key.view(key.shape[0], -1, head_size),
+            cos_sin_cache,
+            positions.long(),
+            (not is_neox),
+            get_cuda_stream(),
+        )
