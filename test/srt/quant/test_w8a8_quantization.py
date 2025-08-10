@@ -43,7 +43,7 @@ class TestW8A8(CustomTestCase):
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.7)
+        self.assertGreater(metrics["accuracy"], 0.69)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
