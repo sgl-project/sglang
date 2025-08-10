@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import fnmatch
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional
 
-import aiter
 import torch
 import torch.nn.functional as F
 from aiter import ActivationType, QuantType, dtypes
@@ -20,6 +18,7 @@ from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_shuffle
 from torch.nn import Module
 
+from sglang.environ import envs
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -29,23 +28,14 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.quark.schemes import QuarkScheme, QuarkW4A4MXFP4
-from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_device_capability,
-    log_info_on_rank0,
-    mxfp_supported,
-    set_weight_attrs,
-)
+from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
 logger = logging.getLogger(__name__)
 
-use_dynamic_mxfp4_linear = get_bool_env_var("SGLANG_USE_DYNAMIC_MXFP4_linear")
+use_dynamic_mxfp4_linear = envs.SGLANG_USE_DYNAMIC_MXFP4_LINEAR.value
 
 OCP_MX_BLOCK_SIZE = 32
 

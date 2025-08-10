@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.environ import envs
+
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
@@ -66,11 +68,11 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
     is_npu,
+    is_use_aiter,
     log_info_on_rank0,
     next_power_of_2,
     print_warning_once,
@@ -90,8 +92,8 @@ _is_cpu = is_cpu()
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
-_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_hip_int4 = envs.SGLANG_INT4_WEIGHT.value
+_use_aiter = is_use_aiter()
 
 if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter import ActivationType, QuantType
@@ -208,9 +210,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
-        self.use_marlin = (
-            get_bool_env_var("SGLANG_FORCE_FP8_MARLIN") and MARLIN_FP8_AVAILABLE
-        )
+        self.use_marlin = envs.SGLANG_FORCE_FP8_MARLIN.value and MARLIN_FP8_AVAILABLE
         # Disable marlin for ROCm
         if _is_hip:
             self.use_marlin = False
@@ -614,7 +614,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
             if (
-                get_bool_env_var("SGLANG_CUTLASS_MOE")
+                envs.SGLANG_CUTLASS_MOE.value
                 and self.cutlass_fp8_supported
                 and (is_sm100_supported() or is_sm90_supported())
             ):
@@ -964,7 +964,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
             layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
-        elif get_bool_env_var("SGLANG_MOE_PADDING"):
+        elif envs.SGLANG_MOE_PADDING.value:
             # If ROCm, apply weight padding (min. Mem channel contention) only if set
             layer.w13_weight = torch.nn.Parameter(
                 F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
@@ -1028,7 +1028,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 return ret
 
         if (
-            get_bool_env_var("SGLANG_CUTLASS_MOE")
+            envs.SGLANG_CUTLASS_MOE.value
             and self.cutlass_fp8_supported
             and self.block_quant
             and (is_sm100_supported() or is_sm90_supported())

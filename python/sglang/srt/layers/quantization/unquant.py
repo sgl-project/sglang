@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -16,9 +16,8 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
-    is_hip,
+    is_use_aiter,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -31,9 +30,8 @@ has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 
 
 _is_cpu_amx_available = cpu_has_amx_support()
-_is_hip = is_hip()
 _is_cpu = is_cpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = is_use_aiter()
 
 if _use_aiter:
     from aiter import ActivationType

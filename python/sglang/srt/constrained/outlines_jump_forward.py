@@ -25,7 +25,7 @@ import interegular
 from interegular import InvalidSyntax
 from outlines.caching import cache
 
-from sglang.srt.utils import get_bool_env_var
+from sglang.environ import envs
 
 try:
     # outlines >= 0.1.0
@@ -38,7 +38,7 @@ except ImportError:
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 
 # Env var was set in sglang.srt.server_args.ServerArgs.__post__init__
-DISABLE_DISK_CACHE = get_bool_env_var("SGLANG_DISABLE_OUTLINES_DISK_CACHE", "true")
+DISABLE_DISK_CACHE = envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.value
 
 logger = logging.getLogger(__name__)
 

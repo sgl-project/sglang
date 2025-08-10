@@ -28,8 +28,9 @@ import threading
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
-import zmq.asyncio
 from PIL.Image import Image
+
+from sglang.environ import envs
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -67,7 +68,6 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
-    get_bool_env_var,
     get_zmq_socket,
     is_cuda,
     kill_process_tree,
@@ -647,7 +647,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
-    if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
+    if _is_cuda and not envs.SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK.value:
         assert_pkg_version(
             "sgl-kernel",
             "0.3.3",

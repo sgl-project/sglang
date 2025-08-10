@@ -20,17 +20,17 @@ import torch
 import torch.distributed
 from torch.distributed import P2POp
 
+from sglang.environ import envs
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
 
-_LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
+_LOG_INPUT = envs.SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT.value
 
 
 class ExpertLocationUpdater:
@@ -67,7 +67,7 @@ class ExpertLocationUpdater:
 
 
 def _update_expert_weights(**kwargs):
-    if get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_CANARY"):
+    if envs.SGLANG_EXPERT_LOCATION_UPDATER_CANARY.value:
         return _update_expert_weights_with_canary(**kwargs)
     else:
         return _update_expert_weights_raw(**kwargs)
@@ -129,7 +129,7 @@ def _update_expert_weights_raw(
     nnodes: int,
     rank: int,
 ):
-    log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
+    log_metrics = envs.SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS.value
 
     temp_buffers = create_temp_buffers(
         routed_experts_weights_of_layer[update_layer_ids[0]]

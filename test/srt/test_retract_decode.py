@@ -1,7 +1,7 @@
-import os
 import unittest
 from types import SimpleNamespace
 
+from sglang.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 class TestRetractDecode(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TEST_RETRACT"] = "1"
+        envs.SGLANG_TEST_RETRACT.set(True)
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -44,7 +44,7 @@ class TestRetractDecode(CustomTestCase):
 class TestRetractDecodeChunkCache(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TEST_RETRACT"] = "1"
+        envs.SGLANG_TEST_RETRACT.set(True)
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST

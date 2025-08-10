@@ -4,12 +4,11 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import get_bool_env_var, is_hip, is_hpu, is_npu
+from sglang.environ import envs
+from sglang.srt.utils import is_hip, is_hpu, is_npu
 
 logger = logging.getLogger(__name__)
-use_vllm_custom_allreduce = get_bool_env_var(
-    "USE_VLLM_CUSTOM_ALLREDUCE", default="false"
-)
+use_vllm_custom_allreduce = envs.USE_VLLM_CUSTOM_ALLREDUCE.value
 
 if not is_hpu():
     # ROCm does not use vllm custom allreduce

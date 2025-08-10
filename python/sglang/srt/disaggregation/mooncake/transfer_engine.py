@@ -1,7 +1,8 @@
 import logging
 from typing import List, Optional
 
-from sglang.srt.utils import get_bool_env_var, get_free_port, maybe_wrap_ipv6_address
+from sglang.environ import envs
+from sglang.srt.utils import get_free_port, maybe_wrap_ipv6_address
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ class MooncakeTransferEngine:
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
-        if get_bool_env_var("ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE", "false"):
+        if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.value:
             hostname += f":{get_free_port()}:npu_{self.gpu_id}"
             ret_value = self.engine.initialize(
                 hostname,

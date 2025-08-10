@@ -598,7 +598,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
 
 def get_model(pretrained_model_name_or_path: str) -> str:
-    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
+    if _get_bool_env_var("SGLANG_USE_MODELSCOPE"):
         import huggingface_hub.constants
         from modelscope import snapshot_download
 

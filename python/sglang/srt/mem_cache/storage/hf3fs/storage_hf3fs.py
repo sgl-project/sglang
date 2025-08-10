@@ -2,7 +2,6 @@ import atexit
 import concurrent.futures
 import json
 import logging
-import os
 import signal
 import threading
 from abc import ABC, abstractmethod
@@ -11,6 +10,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.environ import envs
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
 
@@ -113,8 +113,6 @@ def synchronized():
 
 
 class HiCacheHF3FS(HiCacheStorage):
-    default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
-
     def __init__(
         self,
         rank: int,
@@ -169,12 +167,12 @@ class HiCacheHF3FS(HiCacheStorage):
     def from_env_config(
         rank: int, bytes_per_page: int, dtype: torch.dtype
     ) -> "HiCacheHF3FS":
+        config_path = envs.SGLANG_HICACHE_HF3FS_CONFIG_PATH.value
         from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
             Hf3fsGlobalMetadataClient,
             Hf3fsLocalMetadataClient,
         )
 
-        config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
             return HiCacheHF3FS(
                 rank=rank,
