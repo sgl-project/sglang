@@ -32,7 +32,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
