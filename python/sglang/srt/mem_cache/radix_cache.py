@@ -336,7 +336,7 @@ class RadixCache(BasePrefixCache):
             return 0
 
         if node is None:
-            warnings.warn("this should be not happend")
+            warnings.warn("this should be not happened")
             return 0
 
         delta = 0
@@ -348,7 +348,7 @@ class RadixCache(BasePrefixCache):
             node.lock_ref -= 1
             node = node.parent
             if node is None:
-                warnings.warn("this should be not happend")
+                warnings.warn("this should be not happened")
                 break
         return delta
 
