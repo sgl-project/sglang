@@ -140,6 +140,45 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         return query, key
 
 
+class MHATokenToKVPool:
+    def __init__(
+        self,
+        # TODO args
+    ):
+        self._create_buffers()
+
+    def _create_buffers(self):
+        self.k_buffer = [
+            torch.zeros(
+                (self.size + self.page_size, self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
+        self.v_buffer = [
+            torch.zeros(
+                (self.size + self.page_size, self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            for _ in range(self.layer_num)
+        ]
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+
+
 @pytest.mark.parametrize(
     "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads, save_kv_cache",
     [
