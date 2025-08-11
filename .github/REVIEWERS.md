@@ -1,21 +1,25 @@
 # Area Reviewer
 
-Here are some reviewers for common areas. You can ping them to review your code.
+Here are some reviewers for common areas. You can ping them to review your code if you touch related parts.
 
-## Hardware-specific areas
+## Hardware platforms
+- general @Alcanderian
 - AMD GPU @HaiShaw
 - Blackwell GPU @kushanam @trevor-m @zhyncs
 - CPU @mingfeima
 
 ## Kernel
 - general @zhyncs @ispobock @HandH1998 @BBuf @yizhang2077 @HaiShaw
+- triton attention backend @ispobock
+- flash attention @hebiao064
 
-## Scheduler
-- scheduler @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
+## Scheduler and memory pool
+- general @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 - constrained decoding @hnyls2002
-- hierarhical Cache @xiezhq-hermann @DarkSharpness
+- hierarhical cache @xiezhq-hermann @DarkSharpness
 - lora @Fridge003 @Ying1123 @lifuhuang
 - speculative decoding @merrymercy @Ying1123  @kssteven418
+- sliding window attention @hanming-lu
 
 ## Parallelism
 - expert parallelism @fzyzcjy @ch-wan
@@ -23,7 +27,7 @@ Here are some reviewers for common areas. You can ping them to review your code.
 - pipeline parallelism @Ying1123
 - tensor parallelism @merrymercy
 
-## PD Disaggregation
+## PD disaggregation
 - general @ByronHsu @ShangmingCai @@ShangmingCai @hnyls2002
 - Mooncake backend @ShangmingCai
 
@@ -41,3 +45,6 @@ Here are some reviewers for common areas. You can ping them to review your code.
 ## Model
 - multimodal models @mickqian @JustinTong0323
 - other new models @zhaochenyang20
+
+## Reinforcment learning
+- general @zhaochenyang20 @hebiao064 @fzyzcjy @zhuzilin
