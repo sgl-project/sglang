@@ -71,6 +71,7 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg
 
+
 class GptOssConfig(PretrainedConfig):
     model_type = "gpt_oss"
 
@@ -325,11 +326,15 @@ class GptOssAttention(nn.Module):
             positions,
             q,
             k,
-            fused_set_kv_buffer_arg=_create_fused_set_kv_buffer_arg(
-                value=v,
-                layer=self.attn,
-                forward_batch=forward_batch,
-            ) if _enable_fused_set_kv_buffer() else None,
+            fused_set_kv_buffer_arg=(
+                _create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if _enable_fused_set_kv_buffer()
+                else None
+            ),
         )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -339,8 +344,9 @@ class GptOssAttention(nn.Module):
         if inner_state is None:
             return hidden_states
         attn_output = self.attn(
-            *inner_state, sinks=self.sinks,
-            save_kv_cache=not _enable_fused_set_kv_buffer()
+            *inner_state,
+            sinks=self.sinks,
+            save_kv_cache=not _enable_fused_set_kv_buffer(),
         )
         output, _ = self.o_proj(attn_output)
         return output

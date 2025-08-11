@@ -20,24 +20,23 @@
 
 namespace flashinfer {
 
-__device__ __forceinline__ void load_v_vec(
-    vec_t<float, vec_size>& v_vec
-    // TODO args
+__device__ __forceinline__ void load_v_vec(vec_t<float, vec_size>& v_vec
+                                           // TODO args
 ) {
-    DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
-    v_vec.cast_load(v_ptr + tx * vec_size);
+  DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
+  v_vec.cast_load(v_ptr + tx * vec_size);
 }
 
 __device__ __forceinline__ void save_kv_buffer_ptr(
     // TODO args
 ) {
-    const IdType cache_offset = cache_loc[idx];
-    DType* k_buffer_ptr =
-        k_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
-    DType* v_buffer_ptr =
-        v_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
-    k_vec.cast_store(k_buffer_ptr + tx * vec_size);
-    v_vec.cast_store(v_buffer_ptr + tx * vec_size);
+  const IdType cache_offset = cache_loc[idx];
+  DType* k_buffer_ptr =
+      k_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
+  DType* v_buffer_ptr =
+      v_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
+  k_vec.cast_store(k_buffer_ptr + tx * vec_size);
+  v_vec.cast_store(v_buffer_ptr + tx * vec_size);
 }
 
 template <

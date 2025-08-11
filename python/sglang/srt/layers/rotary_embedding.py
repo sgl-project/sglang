@@ -26,7 +26,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 if _is_cuda:
-    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace, FusedSetKVBufferArg
+    from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 

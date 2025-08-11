@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytest
 import torch
-from sgl_kernel import apply_rope_with_cos_sin_cache_inplace, FusedSetKVBufferArg
+from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
 
 
 # vLLM torch native
@@ -141,7 +141,9 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
 
         return query, key
 
+
 _KV_POOL_SIZE = 2000
+
 
 class MHATokenToKVPool:
     def __init__(
@@ -193,7 +195,20 @@ class MHATokenToKVPool:
     [
         # GPT-OSS cases
         *[
-            (64, 64, 4096, 8000, False, torch.bfloat16, "cuda", batch_size, seq_len, 64, 8, save_kv_cache)
+            (
+                64,
+                64,
+                4096,
+                8000,
+                False,
+                torch.bfloat16,
+                "cuda",
+                batch_size,
+                seq_len,
+                64,
+                8,
+                save_kv_cache,
+            )
             for save_kv_cache in (False, True)
             for batch_size, seq_len in (
                 (1, 1),
@@ -201,7 +216,6 @@ class MHATokenToKVPool:
                 (2, 512),
             )
         ],
-
         # Other cases
         (64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1, False),
         (256, 128, 4096, 10000, True, torch.bfloat16, "cuda", 2, 512, 4, 2, False),
@@ -243,7 +257,9 @@ def test_correctness(
         value = torch.randn(
             batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
         )
-        out_cache_loc = torch.randperm(_KV_POOL_SIZE, dtype=torch.int64, device=device)[:batch_size * seq_len].clone()
+        out_cache_loc = torch.randperm(_KV_POOL_SIZE, dtype=torch.int64, device=device)[
+            : batch_size * seq_len
+        ].clone()
 
     if save_kv_cache:
         pool_ref = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
@@ -257,15 +273,21 @@ def test_correctness(
         pool_ref.set_kv_buffer(loc=out_cache_loc, cache_k=key_ref_out, cache_v=value)
 
     query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(
-        pos_ids, query_flashinfer, key_flashinfer,
-        fused_set_kv_buffer_arg=FusedSetKVBufferArg(
-            value=value,
-            k_buffer=pool_flashinfer.k_buffer[0],
-            v_buffer=pool_flashinfer.v_buffer[0],
-            k_scale=None,
-            v_scale=None,
-            cache_loc=out_cache_loc,
-        ) if save_kv_cache else None,
+        pos_ids,
+        query_flashinfer,
+        key_flashinfer,
+        fused_set_kv_buffer_arg=(
+            FusedSetKVBufferArg(
+                value=value,
+                k_buffer=pool_flashinfer.k_buffer[0],
+                v_buffer=pool_flashinfer.v_buffer[0],
+                k_scale=None,
+                v_scale=None,
+                cache_loc=out_cache_loc,
+            )
+            if save_kv_cache
+            else None
+        ),
     )
 
     torch.testing.assert_close(

@@ -325,7 +325,19 @@ def apply_rope_with_cos_sin_cache_inplace(
         (not is_neox),
         get_cuda_stream(),
         fused_set_kv_buffer_arg.value if fused_set_kv_buffer_arg is not None else None,
-        fused_set_kv_buffer_arg.k_buffer if fused_set_kv_buffer_arg is not None else None,
-        fused_set_kv_buffer_arg.v_buffer if fused_set_kv_buffer_arg is not None else None,
-        fused_set_kv_buffer_arg.cache_loc if fused_set_kv_buffer_arg is not None else None,
+        (
+            fused_set_kv_buffer_arg.k_buffer
+            if fused_set_kv_buffer_arg is not None
+            else None
+        ),
+        (
+            fused_set_kv_buffer_arg.v_buffer
+            if fused_set_kv_buffer_arg is not None
+            else None
+        ),
+        (
+            fused_set_kv_buffer_arg.cache_loc
+            if fused_set_kv_buffer_arg is not None
+            else None
+        ),
     )
