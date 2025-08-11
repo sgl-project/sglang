@@ -446,7 +446,7 @@ class ServerArgs:
                     f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
-            
+
             if self.speculative_algorithm is not None:
                 raise ValueError(
                     "trtllm_mla backend does not support speculative decoding yet."
