@@ -143,6 +143,10 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
 @pytest.mark.parametrize(
     "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads",
     [
+        # GPT-OSS cases
+        TODO,
+
+        # Other cases
         (64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1),
         (256, 128, 4096, 10000, True, torch.bfloat16, "cuda", 2, 512, 4, 2),
         (512, 128, 311, 10000, True, torch.bfloat16, "cuda", 3, 39, 4, 2),
