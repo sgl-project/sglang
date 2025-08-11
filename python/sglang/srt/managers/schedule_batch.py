@@ -37,6 +37,7 @@ import logging
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
+from itertools import chain
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -1145,9 +1146,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        input_ids_tensor = torch.tensor(sum(input_ids, []), dtype=torch.int64).to(
-            self.device, non_blocking=True
-        )
+        input_ids_tensor = torch.tensor(
+            list(chain.from_iterable(input_ids)), dtype=torch.int64
+        ).to(self.device, non_blocking=True)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
@@ -1713,15 +1714,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             attention_backend_str = global_server_args_dict["prefill_attention_backend"]
         # Create seq_lens_cpu when needed
         if (
-            attention_backend_str == "fa3"
-            or (
-                global_server_args_dict["use_mla_backend"]
-                and attention_backend_str == "flashinfer"
-            )
-            or attention_backend_str == "flashmla"
-            or attention_backend_str == "cutlass_mla"
-            or attention_backend_str == "ascend"
-            or attention_backend_str == "trtllm_mha"
+            attention_backend_str
+            in [
+                "fa3",
+                "flashinfer",
+                "flashmla",
+                "cutlass_mla",
+                "ascend",
+                "trtllm_mha",
+                "aiter",
+            ]
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
