@@ -74,6 +74,19 @@ class RouterArgs:
     max_concurrent_requests: int = 64
     # CORS allowed origins
     cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
+    # Retry configuration
+    retry_max_retries: int = 3
+    retry_initial_backoff_ms: int = 100
+    retry_max_backoff_ms: int = 10_000
+    retry_backoff_multiplier: float = 2.0
+    retry_jitter_factor: float = 0.1
+    disable_retries: bool = False
+    # Circuit breaker configuration
+    cb_failure_threshold: int = 5
+    cb_success_threshold: int = 2
+    cb_timeout_duration_secs: int = 30
+    cb_window_duration_secs: int = 60
+    disable_circuit_breaker: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -289,6 +302,63 @@ class RouterArgs:
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
         )
+        # Retry configuration
+        parser.add_argument(
+            f"--{prefix}retry-max-retries",
+            type=int,
+            default=RouterArgs.retry_max_retries,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-initial-backoff-ms",
+            type=int,
+            default=RouterArgs.retry_initial_backoff_ms,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-max-backoff-ms",
+            type=int,
+            default=RouterArgs.retry_max_backoff_ms,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-backoff-multiplier",
+            type=float,
+            default=RouterArgs.retry_backoff_multiplier,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-jitter-factor",
+            type=float,
+            default=RouterArgs.retry_jitter_factor,
+        )
+        parser.add_argument(
+            f"--{prefix}disable-retries",
+            action="store_true",
+            help="Disable retries (equivalent to setting retry_max_retries=1)",
+        )
+        # Circuit breaker configuration
+        parser.add_argument(
+            f"--{prefix}cb-failure-threshold",
+            type=int,
+            default=RouterArgs.cb_failure_threshold,
+        )
+        parser.add_argument(
+            f"--{prefix}cb-success-threshold",
+            type=int,
+            default=RouterArgs.cb_success_threshold,
+        )
+        parser.add_argument(
+            f"--{prefix}cb-timeout-duration-secs",
+            type=int,
+            default=RouterArgs.cb_timeout_duration_secs,
+        )
+        parser.add_argument(
+            f"--{prefix}cb-window-duration-secs",
+            type=int,
+            default=RouterArgs.cb_window_duration_secs,
+        )
+        parser.add_argument(
+            f"--{prefix}disable-circuit-breaker",
+            action="store_true",
+            help="Disable circuit breaker (equivalent to setting cb_failure_threshold to u32::MAX)",
+        )
         parser.add_argument(
             f"--{prefix}max-concurrent-requests",
             type=int,
@@ -372,6 +442,19 @@ class RouterArgs:
                 RouterArgs.max_concurrent_requests,
             ),
             cors_allowed_origins=getattr(args, f"{prefix}cors_allowed_origins", []),
+            retry_max_retries=getattr(args, f"{prefix}retry_max_retries"),
+            retry_initial_backoff_ms=getattr(args, f"{prefix}retry_initial_backoff_ms"),
+            retry_max_backoff_ms=getattr(args, f"{prefix}retry_max_backoff_ms"),
+            retry_backoff_multiplier=getattr(args, f"{prefix}retry_backoff_multiplier"),
+            retry_jitter_factor=getattr(args, f"{prefix}retry_jitter_factor"),
+            cb_failure_threshold=getattr(args, f"{prefix}cb_failure_threshold"),
+            cb_success_threshold=getattr(args, f"{prefix}cb_success_threshold"),
+            cb_timeout_duration_secs=getattr(args, f"{prefix}cb_timeout_duration_secs"),
+            cb_window_duration_secs=getattr(args, f"{prefix}cb_window_duration_secs"),
+            disable_retries=getattr(args, f"{prefix}disable_retries", False),
+            disable_circuit_breaker=getattr(
+                args, f"{prefix}disable_circuit_breaker", False
+            ),
         )
 
     @staticmethod
@@ -558,6 +641,17 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             request_id_headers=router_args.request_id_headers,
             max_concurrent_requests=router_args.max_concurrent_requests,
             cors_allowed_origins=router_args.cors_allowed_origins,
+            retry_max_retries=router_args.retry_max_retries,
+            retry_initial_backoff_ms=router_args.retry_initial_backoff_ms,
+            retry_max_backoff_ms=router_args.retry_max_backoff_ms,
+            retry_backoff_multiplier=router_args.retry_backoff_multiplier,
+            retry_jitter_factor=router_args.retry_jitter_factor,
+            cb_failure_threshold=router_args.cb_failure_threshold,
+            cb_success_threshold=router_args.cb_success_threshold,
+            cb_timeout_duration_secs=router_args.cb_timeout_duration_secs,
+            cb_window_duration_secs=router_args.cb_window_duration_secs,
+            disable_retries=router_args.disable_retries,
+            disable_circuit_breaker=router_args.disable_circuit_breaker,
         )
 
         router.start()

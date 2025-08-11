@@ -8,10 +8,10 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "sgl-kernel"
-version = "0.3.2"
+version = "0.3.3"
 description = "Kernel Library for SGLang"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -34,6 +34,6 @@ exclude = [
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
 
-wheel.py-api = "cp39"
+wheel.py-api = "cp310"
 wheel.license-files = []
 wheel.packages = ["python/sgl_kernel"]

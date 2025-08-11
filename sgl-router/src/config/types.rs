@@ -41,6 +41,14 @@ pub struct RouterConfig {
     pub cors_allowed_origins: Vec<String>,
     /// Retry configuration
     pub retry: RetryConfig,
+    /// Circuit breaker configuration
+    pub circuit_breaker: CircuitBreakerConfig,
+    /// Disable retries (overrides retry.max_retries to 1 when true)
+    #[serde(default)]
+    pub disable_retries: bool,
+    /// Disable circuit breaker (overrides circuit_breaker.failure_threshold to u32::MAX when true)
+    #[serde(default)]
+    pub disable_circuit_breaker: bool,
 }
 
 /// Routing mode configuration
@@ -195,6 +203,10 @@ pub struct RetryConfig {
     pub max_backoff_ms: u64,
     /// Backoff multiplier for exponential backoff
     pub backoff_multiplier: f32,
+    /// Jitter factor applied to backoff (0.0 - 1.0)
+    /// Effective delay D' = D * (1 + U[-j, +j])
+    #[serde(default = "default_retry_jitter_factor")]
+    pub jitter_factor: f32,
 }
 
 impl Default for RetryConfig {
@@ -204,6 +216,35 @@ impl Default for RetryConfig {
             initial_backoff_ms: 100,
             max_backoff_ms: 10000,
             backoff_multiplier: 2.0,
+            jitter_factor: 0.1,
+        }
+    }
+}
+
+fn default_retry_jitter_factor() -> f32 {
+    0.1
+}
+
+/// Circuit breaker configuration for worker reliability
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures before opening circuit
+    pub failure_threshold: u32,
+    /// Number of consecutive successes before closing circuit
+    pub success_threshold: u32,
+    /// Time before attempting to recover from open state (in seconds)
+    pub timeout_duration_secs: u64,
+    /// Window duration for failure tracking (in seconds)
+    pub window_duration_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            success_threshold: 2,
+            timeout_duration_secs: 30,
+            window_duration_secs: 60,
         }
     }
 }
@@ -249,6 +290,9 @@ impl Default for RouterConfig {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         }
     }
 }
@@ -284,6 +328,24 @@ impl RouterConfig {
     /// Check if metrics are enabled
     pub fn has_metrics(&self) -> bool {
         self.metrics.is_some()
+    }
+
+    /// Compute the effective retry config considering disable flag
+    pub fn effective_retry_config(&self) -> RetryConfig {
+        let mut cfg = self.retry.clone();
+        if self.disable_retries {
+            cfg.max_retries = 1;
+        }
+        cfg
+    }
+
+    /// Compute the effective circuit breaker config considering disable flag
+    pub fn effective_circuit_breaker_config(&self) -> CircuitBreakerConfig {
+        let mut cfg = self.circuit_breaker.clone();
+        if self.disable_circuit_breaker {
+            cfg.failure_threshold = u32::MAX;
+        }
+        cfg
     }
 }
 
@@ -360,6 +422,9 @@ mod tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -788,6 +853,9 @@ mod tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -840,6 +908,9 @@ mod tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -888,6 +959,9 @@ mod tests {
             max_concurrent_requests: 64,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         assert!(config.has_service_discovery());

@@ -245,10 +245,11 @@ class TopK(CustomOp):
 
         # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
         if global_num_experts == 256:
+            router_logits = router_logits.to(torch.float32)
             return torch_npu.npu_moe_gating_top_k(
                 router_logits,
                 k=self.top_k,
-                bias=self.correction_bias,
+                bias=self.correction_bias.to(torch.float32),
                 k_group=self.topk_group,
                 group_count=self.num_expert_group,
                 group_select_mode=1,
@@ -440,7 +441,9 @@ def grouped_topk_cpu(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
+    assert not apply_routed_scaling_factor_on_output
     assert expert_location_dispatch_info is None
     return torch.ops.sgl_kernel.grouped_topk_cpu(
         hidden_states,

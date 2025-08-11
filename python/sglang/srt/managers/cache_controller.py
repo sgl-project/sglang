@@ -16,6 +16,7 @@ limitations under the License.
 import logging
 import math
 import threading
+import time
 from queue import Empty, Full, PriorityQueue, Queue
 from typing import TYPE_CHECKING, List, Optional
 
@@ -168,12 +169,13 @@ class StorageOperation:
         host_indices: torch.Tensor,
         token_ids: List[int],
         last_hash: Optional[str] = None,
+        hash_value: Optional[List[str]] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
-        self.hash_value = []
+        self.hash_value = hash_value if hash_value is not None else []
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -194,6 +196,8 @@ class PrefetchOperation(StorageOperation):
 
         self._done_flag = False
         self._lock = threading.Lock()
+
+        self.start_time = time.monotonic()
 
         super().__init__(host_indices, token_ids, last_hash)
 
@@ -278,6 +282,12 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
+            self.prefetch_capacity_limit = int(
+                0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
+            )
+            # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
+            self.prefetch_tokens_occupied = 0
+
             # create a new communication group for synchronizing storage operations across TP workers
             self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
             if self.tp_world_size > 1:
@@ -424,7 +434,9 @@ class HiCacheController:
         if self.io_backend == "kernel":
             return host_indices.to(self.mem_pool_device.device), device_indices
         elif self.io_backend == "direct":
-            return host_indices, device_indices.cpu()
+            device_indices = device_indices.cpu()
+            host_indices, idx = host_indices.sort()
+            return host_indices, device_indices.index_select(0, idx)
         else:
             raise ValueError(f"Unsupported io backend")
 
@@ -525,7 +537,7 @@ class HiCacheController:
         host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
-    ) -> int:
+    ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
@@ -561,10 +573,6 @@ class HiCacheController:
                     )
                     completed_tokens += self.page_size
             else:
-                # operation terminated by controller, release pre-allocated memory
-                self.mem_pool_host.free(
-                    operation.host_indices[operation.completed_tokens :]
-                )
                 break
 
     def mooncake_page_transfer(self, operation):
@@ -586,10 +594,30 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if self.is_mooncake_backend():
                     self.mooncake_page_transfer(operation)
+                elif self.storage_backend_type == "hf3fs":
+                    self.generic_page_transfer(operation, batch_size=128)
                 else:
                     self.generic_page_transfer(operation)
+
+                if self.tp_world_size > 1:
+                    # to ensure all TP workers release the host memory at the same time
+                    torch.distributed.barrier(group=self.prefetch_tp_group)
+                # operation terminated by controller, release pre-allocated memory
+                self.mem_pool_host.free(
+                    operation.host_indices[operation.completed_tokens :]
+                )
             except Empty:
                 continue
+
+    def prefetch_rate_limit_check(self) -> bool:
+        """
+        Rate limit the prefetching operations to avoid overwhelming the storage backend.
+        """
+        # cancel prefetch if too much memory is occupied
+        if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+            return False
+        # todo: more sophisticated rate limiting based on storage backend performance
+        return True
 
     def prefetch_thread_func(self):
         """
@@ -604,34 +632,38 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                last_hash = operation.last_hash
-                tokens_to_fetch = operation.token_ids
-
                 storage_hit_count = 0
-                remaining_tokens = len(tokens_to_fetch)
-                hash_value = []
-                while remaining_tokens >= self.page_size:
-                    last_hash = self.get_hash_str(
-                        tokens_to_fetch[
-                            storage_hit_count : storage_hit_count + self.page_size
-                        ],
-                        last_hash,
-                    )
+                if (
+                    operation.host_indices is not None
+                ) and self.prefetch_rate_limit_check():
+                    last_hash = operation.last_hash
+                    tokens_to_fetch = operation.token_ids
 
-                    # todo, more unified interface
-                    if not self.is_mooncake_backend():
-                        if not self.storage_backend.exists(last_hash):
-                            break
-                    hash_value.append(last_hash)
-                    storage_hit_count += self.page_size
-                    remaining_tokens -= self.page_size
+                    remaining_tokens = len(tokens_to_fetch)
+                    hash_value = []
+                    while remaining_tokens >= self.page_size:
+                        last_hash = self.get_hash_str(
+                            tokens_to_fetch[
+                                storage_hit_count : storage_hit_count + self.page_size
+                            ],
+                            last_hash,
+                        )
 
-                if self.is_mooncake_backend():
-                    # deferring to batch exists for mooncake store
-                    exist_result = self.storage_backend.exists(hash_value)
-                    storage_hit_count = (
-                        sum(1 for v in exist_result.values() if v != 0) * self.page_size
-                    )
+                        # todo, more unified interface
+                        if not self.is_mooncake_backend():
+                            if not self.storage_backend.exists(last_hash):
+                                break
+                        hash_value.append(last_hash)
+                        storage_hit_count += self.page_size
+                        remaining_tokens -= self.page_size
+
+                    if self.is_mooncake_backend():
+                        # deferring to batch exists for mooncake store
+                        exist_result = self.storage_backend.exists(hash_value)
+                        storage_hit_count = (
+                            sum(1 for v in exist_result.values() if v != 0)
+                            * self.page_size
+                        )
 
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
@@ -647,7 +679,8 @@ class HiCacheController:
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
-                    self.mem_pool_host.free(operation.host_indices)
+                    if operation.host_indices is not None:
+                        self.mem_pool_host.free(operation.host_indices)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
@@ -670,12 +703,12 @@ class HiCacheController:
         self,
         host_indices: torch.Tensor,
         token_ids: List[int],
-        last_hash: Optional[str] = None,
+        hash_value: Optional[List[str]] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
-        operation = StorageOperation(host_indices, token_ids, last_hash)
+        operation = StorageOperation(host_indices, token_ids, hash_value=hash_value)
         self.backup_queue.put(operation)
         return operation.id
 
@@ -730,26 +763,10 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                last_hash = operation.last_hash
-                tokens_to_backup = operation.token_ids
-
-                backup_hit_count = 0
-                remaining_tokens = len(tokens_to_backup)
-                hash_value = []
-                while remaining_tokens >= self.page_size:
-                    last_hash = self.get_hash_str(
-                        tokens_to_backup[
-                            backup_hit_count : backup_hit_count + self.page_size
-                        ],
-                        last_hash,
-                    )
-                    backup_hit_count += self.page_size
-                    hash_value.append(last_hash)
-                    remaining_tokens -= self.page_size
-                operation.hash_value = hash_value
-
                 if self.is_mooncake_backend():
                     self.mooncake_page_backup(operation)
+                elif self.storage_backend_type == "hf3fs":
+                    self.generic_page_backup(operation, batch_size=128)
                 else:
                     self.generic_page_backup(operation)
 
@@ -768,7 +785,6 @@ class HiCacheController:
                 self.ack_backup_queue.put(
                     (
                         operation.id,
-                        operation.hash_value[: min_completed_tokens // self.page_size],
                         min_completed_tokens,
                     )
                 )

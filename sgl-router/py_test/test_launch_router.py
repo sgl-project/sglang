@@ -53,6 +53,17 @@ class TestLaunchRouter(unittest.TestCase):
             prefill=None,
             decode=None,
             worker_urls=[],
+            retry_max_retries=3,
+            retry_initial_backoff_ms=100,
+            retry_max_backoff_ms=10_000,
+            retry_backoff_multiplier=2.0,
+            retry_jitter_factor=0.1,
+            cb_failure_threshold=5,
+            cb_success_threshold=2,
+            cb_timeout_duration_secs=30,
+            cb_window_duration_secs=60,
+            disable_retries=False,
+            disable_circuit_breaker=False,
         )
 
     def create_router_args(self, **kwargs):

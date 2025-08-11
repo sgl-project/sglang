@@ -104,6 +104,17 @@ class Router:
         decode_policy: Optional[PolicyType] = None,
         max_concurrent_requests: int = 64,
         cors_allowed_origins: List[str] = None,
+        retry_max_retries: int = 3,
+        retry_initial_backoff_ms: int = 100,
+        retry_max_backoff_ms: int = 10_000,
+        retry_backoff_multiplier: float = 2.0,
+        retry_jitter_factor: float = 0.1,
+        cb_failure_threshold: int = 5,
+        cb_success_threshold: int = 2,
+        cb_timeout_duration_secs: int = 30,
+        cb_window_duration_secs: int = 60,
+        disable_retries: bool = False,
+        disable_circuit_breaker: bool = False,
     ):
         if selector is None:
             selector = {}
@@ -149,6 +160,17 @@ class Router:
             decode_policy=decode_policy,
             max_concurrent_requests=max_concurrent_requests,
             cors_allowed_origins=cors_allowed_origins,
+            retry_max_retries=retry_max_retries,
+            retry_initial_backoff_ms=retry_initial_backoff_ms,
+            retry_max_backoff_ms=retry_max_backoff_ms,
+            retry_backoff_multiplier=retry_backoff_multiplier,
+            retry_jitter_factor=retry_jitter_factor,
+            cb_failure_threshold=cb_failure_threshold,
+            cb_success_threshold=cb_success_threshold,
+            cb_timeout_duration_secs=cb_timeout_duration_secs,
+            cb_window_duration_secs=cb_window_duration_secs,
+            disable_retries=disable_retries,
+            disable_circuit_breaker=disable_circuit_breaker,
         )
 
     def start(self) -> None:

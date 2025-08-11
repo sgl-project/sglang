@@ -2,12 +2,12 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
-use sglang_router_rs::core::{BasicWorker, WorkerType};
+use sglang_router_rs::core::{BasicWorker, Worker, WorkerType};
 use sglang_router_rs::openai_api_types::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::routers::bootstrap_injector::inject_bootstrap_fields;
+use sglang_router_rs::routers::pd_types::{generate_room_id, get_hostname, RequestWithBootstrap};
 
 fn create_test_worker() -> BasicWorker {
     BasicWorker::new(
@@ -16,6 +16,16 @@ fn create_test_worker() -> BasicWorker {
             bootstrap_port: Some(5678),
         },
     )
+}
+
+// Helper function to get bootstrap info from worker
+fn get_bootstrap_info(worker: &BasicWorker) -> (String, Option<u16>) {
+    let hostname = get_hostname(worker.url());
+    let bootstrap_port = match worker.worker_type() {
+        WorkerType::Prefill { bootstrap_port } => bootstrap_port.clone(),
+        _ => None,
+    };
+    (hostname, bootstrap_port)
 }
 
 /// Create a default GenerateRequest for benchmarks with minimal fields set
@@ -331,35 +341,56 @@ fn bench_bootstrap_injection(c: &mut Criterion) {
     let completion_req = create_sample_completion_request();
     let large_chat_req = create_large_chat_completion_request();
     let worker = create_test_worker();
+    let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
 
     group.bench_function("generate_bootstrap_injection", |b| {
         b.iter(|| {
-            let mut json = to_value(black_box(&generate_req)).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &generate_req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let json = to_value(black_box(&request_with_bootstrap)).unwrap();
             black_box(json);
         });
     });
 
     group.bench_function("chat_completion_bootstrap_injection", |b| {
         b.iter(|| {
-            let mut json = to_value(black_box(&chat_req)).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &chat_req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let json = to_value(black_box(&request_with_bootstrap)).unwrap();
             black_box(json);
         });
     });
 
     group.bench_function("completion_bootstrap_injection", |b| {
         b.iter(|| {
-            let mut json = to_value(black_box(&completion_req)).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &completion_req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let json = to_value(black_box(&request_with_bootstrap)).unwrap();
             black_box(json);
         });
     });
 
     group.bench_function("large_chat_completion_bootstrap_injection", |b| {
         b.iter(|| {
-            let mut json = to_value(black_box(&large_chat_req)).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &large_chat_req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let json = to_value(black_box(&request_with_bootstrap)).unwrap();
             black_box(json);
         });
     });
@@ -441,6 +472,7 @@ fn bench_throughput_by_size(c: &mut Criterion) {
     };
 
     let worker = create_test_worker();
+    let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
 
     for (name, req) in [
         ("small", &small_generate),
@@ -449,6 +481,7 @@ fn bench_throughput_by_size(c: &mut Criterion) {
     ] {
         let json = to_string(req).unwrap();
         let size_bytes = json.len();
+        let hostname_clone = hostname.clone();
 
         group.throughput(Throughput::Bytes(size_bytes as u64));
         group.bench_with_input(BenchmarkId::new("serialize", name), &req, |b, req| {
@@ -472,10 +505,16 @@ fn bench_throughput_by_size(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("bootstrap_inject", name),
             &req,
-            |b, req| {
+            move |b, req| {
+                let hostname = hostname_clone.clone();
                 b.iter(|| {
-                    let mut json = to_value(req).unwrap();
-                    inject_bootstrap_fields(&mut json, &worker).unwrap();
+                    let request_with_bootstrap = RequestWithBootstrap {
+                        original: req,
+                        bootstrap_host: hostname.clone(),
+                        bootstrap_port,
+                        bootstrap_room: generate_room_id(),
+                    };
+                    let json = to_value(&request_with_bootstrap).unwrap();
                     black_box(json);
                 });
             },
@@ -493,17 +532,21 @@ fn bench_full_round_trip(c: &mut Criterion) {
     let chat_json = to_string(&create_sample_chat_completion_request()).unwrap();
     let completion_json = to_string(&create_sample_completion_request()).unwrap();
     let worker = create_test_worker();
+    let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
 
     group.bench_function("generate_openai_to_pd_pipeline", |b| {
         b.iter(|| {
             // Deserialize OpenAI request
             let req: GenerateRequest = from_str(black_box(&generate_json)).unwrap();
-            // Convert to JSON Value
-            let mut json = to_value(&req).unwrap();
-            // Inject bootstrap fields
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
+            // Create wrapper with bootstrap fields
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
             // Serialize final request
-            let pd_json = to_string(&json).unwrap();
+            let pd_json = to_string(&request_with_bootstrap).unwrap();
             black_box(pd_json);
         });
     });
@@ -511,9 +554,13 @@ fn bench_full_round_trip(c: &mut Criterion) {
     group.bench_function("chat_completion_openai_to_pd_pipeline", |b| {
         b.iter(|| {
             let req: ChatCompletionRequest = from_str(black_box(&chat_json)).unwrap();
-            let mut json = to_value(&req).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
-            let pd_json = to_string(&json).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let pd_json = to_string(&request_with_bootstrap).unwrap();
             black_box(pd_json);
         });
     });
@@ -521,9 +568,13 @@ fn bench_full_round_trip(c: &mut Criterion) {
     group.bench_function("completion_openai_to_pd_pipeline", |b| {
         b.iter(|| {
             let req: CompletionRequest = from_str(black_box(&completion_json)).unwrap();
-            let mut json = to_value(&req).unwrap();
-            inject_bootstrap_fields(&mut json, &worker).unwrap();
-            let pd_json = to_string(&json).unwrap();
+            let request_with_bootstrap = RequestWithBootstrap {
+                original: &req,
+                bootstrap_host: hostname.clone(),
+                bootstrap_port,
+                bootstrap_room: generate_room_id(),
+            };
+            let pd_json = to_string(&request_with_bootstrap).unwrap();
             black_box(pd_json);
         });
     });
@@ -575,10 +626,16 @@ fn benchmark_summary(c: &mut Criterion) {
     );
 
     // Measure bootstrap injection (replaces adaptation)
+    let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
     let start = Instant::now();
     for _ in 0..1000 {
-        let mut json = to_value(&generate_req).unwrap();
-        let _ = black_box(inject_bootstrap_fields(&mut json, &worker));
+        let request_with_bootstrap = RequestWithBootstrap {
+            original: &generate_req,
+            bootstrap_host: hostname.clone(),
+            bootstrap_port,
+            bootstrap_room: generate_room_id(),
+        };
+        let _ = black_box(to_value(&request_with_bootstrap).unwrap());
     }
     let inject_time = start.elapsed().as_nanos() / 1000;
     println!("  * Bootstrap Injection (avg): {:>6} ns/req", inject_time);

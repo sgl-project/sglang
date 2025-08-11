@@ -36,6 +36,28 @@ pub fn init_metrics() {
         "sgl_router_retries_total",
         "Total number of request retries by route"
     );
+    describe_histogram!(
+        "sgl_router_retry_backoff_duration_seconds",
+        "Backoff duration in seconds by attempt index"
+    );
+    describe_counter!(
+        "sgl_router_retries_exhausted_total",
+        "Total number of requests that exhausted retries by route"
+    );
+
+    // Circuit breaker metrics
+    describe_gauge!(
+        "sgl_router_cb_state",
+        "Circuit breaker state per worker (0=closed, 1=open, 2=half_open)"
+    );
+    describe_counter!(
+        "sgl_router_cb_state_transitions_total",
+        "Total number of circuit breaker state transitions by worker"
+    );
+    describe_counter!(
+        "sgl_router_cb_outcomes_total",
+        "Total number of circuit breaker outcomes by worker and outcome type (success/failure)"
+    );
 
     // Worker metrics
     describe_gauge!(
@@ -186,6 +208,20 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    pub fn record_retry_backoff_duration(duration: Duration, attempt: u32) {
+        histogram!("sgl_router_retry_backoff_duration_seconds",
+            "attempt" => attempt.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn record_retries_exhausted(route: &str) {
+        counter!("sgl_router_retries_exhausted_total",
+            "route" => route.to_string()
+        )
+        .increment(1);
+    }
+
     // Worker metrics
     pub fn set_active_workers(count: usize) {
         gauge!("sgl_router_active_workers").set(count as f64);
@@ -320,6 +356,31 @@ impl RouterMetrics {
             "worker" => worker.to_string()
         )
         .set(count as f64);
+    }
+
+    // Circuit breaker metrics
+    pub fn set_cb_state(worker: &str, state_code: u8) {
+        gauge!("sgl_router_cb_state",
+            "worker" => worker.to_string()
+        )
+        .set(state_code as f64);
+    }
+
+    pub fn record_cb_state_transition(worker: &str, from: &str, to: &str) {
+        counter!("sgl_router_cb_state_transitions_total",
+            "worker" => worker.to_string(),
+            "from" => from.to_string(),
+            "to" => to.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_cb_outcome(worker: &str, outcome: &str) {
+        counter!("sgl_router_cb_outcomes_total",
+            "worker" => worker.to_string(),
+            "outcome" => outcome.to_string()
+        )
+        .increment(1);
     }
 }
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import builtins
 import inspect
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Type, Union
+from typing import TYPE_CHECKING, Dict, Optional, Type
 
 import torch
 
@@ -26,8 +26,9 @@ try:
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
     VLLM_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     VLLM_AVAILABLE = False
+    VLLM_IMPORT_ERROR = e
 
     # Define empty classes as placeholders when vllm is not available
     class DummyConfig:
@@ -137,7 +138,8 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
-            "Please install vllm by `pip install vllm==0.9.0.1`"
+            f"Please install vllm by `pip install vllm==0.9.0.1`\n"
+            f"Import error: {VLLM_IMPORT_ERROR}"
         )
 
     return QUANTIZATION_METHODS[quantization]

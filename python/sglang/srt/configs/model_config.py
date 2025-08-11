@@ -27,6 +27,7 @@ from sglang.srt.hf_transformers_utils import (
     get_context_length,
     get_generation_config,
     get_hf_text_config,
+    get_sparse_attention_config,
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -63,13 +64,12 @@ class ModelConfig:
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
-
+        # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.model_impl = model_impl
 
-        # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
@@ -133,6 +133,12 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Ernie4_5_MoeForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
+
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
@@ -270,15 +276,16 @@ class ModelConfig:
         # Verify quantization
         self._verify_quantization()
 
+        # Verify dual-chunk attention config
+        self._verify_dual_chunk_attention_config()
+
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
 
-        config = self.hf_config
-
         # multimodal
-        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
-            config, "image_token_index", None
-        )
+        self.image_token_id = getattr(
+            self.hf_config, "image_token_id", None
+        ) or getattr(self.hf_config, "image_token_index", None)
 
     @staticmethod
     def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
@@ -296,6 +303,13 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             **kwargs,
         )
+
+    def get_total_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
+    def get_num_attention_heads(self, tensor_parallel_size) -> int:
+        total_num_attention_heads = self.num_attention_heads
+        return max(1, total_num_attention_heads // tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
@@ -484,6 +498,23 @@ class ModelConfig:
                     self.quantization,
                 )
 
+    def _verify_dual_chunk_attention_config(self) -> None:
+        if hasattr(self.hf_config, "dual_chunk_attention_config"):
+            # Try loading the sparse attention config
+            sparse_attn_config = get_sparse_attention_config(self.model_path)
+            if not sparse_attn_config:
+                return
+            self.hf_config.dual_chunk_attention_config["sparse_attention_config"] = (
+                sparse_attn_config
+            )
+            if (
+                "sparse_attention_enabled"
+                not in self.hf_config.dual_chunk_attention_config
+            ):
+                self.hf_config.dual_chunk_attention_config[
+                    "sparse_attention_enabled"
+                ] = True
+
     def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids is not None:
@@ -628,6 +659,8 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
+    "Glm4vForConditionalGeneration",
+    "Glm4vMoeForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",

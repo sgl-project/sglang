@@ -36,19 +36,19 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Evaluate Accuracy
         timeout-minutes: 30
         run: |
-          bash scripts/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
-          bash scripts/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
-          bash scripts/amd_ci_exec.sh python3 models/test_qwen_models.py
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
+          bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
 
   accuracy-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -62,17 +62,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Evaluate accuracy (TP=2)
         timeout-minutes: 30
         run: |
-          bash scripts/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_moe_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_moe_eval_accuracy_large.py
 
   mla-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -86,17 +86,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: MLA TEST
         timeout-minutes: 30
         run: |
-          bash scripts/amd_ci_exec.sh python3 test_mla.py
+          bash scripts/ci/amd_ci_exec.sh python3 test_mla.py
 
   performance-test-1-gpu-part-1-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -110,33 +110,33 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Benchmark single latency
         timeout-minutes: 20
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
 
       - name: Benchmark online latency
         timeout-minutes: 15
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
 
       - name: Benchmark offline throughput
         timeout-minutes: 15
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
 
       - name: Benchmark offline throughput (Non-streaming, small batch size)
         timeout-minutes: 15
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
 
   performance-test-1-gpu-part-2-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -150,27 +150,27 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 15
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
 
       - name: Benchmark offline throughput (w/ Triton)
         timeout-minutes: 15
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
 
       - name: Benchmark offline throughput (w/ FP8)
         timeout-minutes: 15
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   bench-test-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -184,37 +184,37 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Benchmark dummy grok (TP=2)
         timeout-minutes: 30
         run: |
-          bash scripts/amd_ci_exec.sh python3 models/test_dummy_grok_models.py
+          bash scripts/ci/amd_ci_exec.sh python3 models/test_dummy_grok_models.py
 
       - name: Benchmark single latency (TP=2)
         timeout-minutes: 25
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
       - name: Benchmark single latency + torch.compile (TP=2)
         timeout-minutes: 25
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
 
       - name: Benchmark offline throughput (TP=2)
         timeout-minutes: 25
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
 
       - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
         timeout-minutes: 25
         run: |
-          bash scripts/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
   unit-test-backend-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -230,17 +230,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 50
         run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 7
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 7
 
   unit-test-backend-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -254,17 +254,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 40
         run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd
 
   unit-test-backend-8-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -278,22 +278,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 3600
 
       - name: Run CustomAllReduce test
         timeout-minutes: 20
         run: |
-          bash scripts/amd_ci_exec.sh -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 -m unittest test_custom_allreduce.TestCustomAllReduce
+          bash scripts/ci/amd_ci_exec.sh -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 -m unittest test_custom_allreduce.TestCustomAllReduce
 
   unit-test-sgl-kernel-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -308,13 +308,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/amd_ci_install_dependency.sh
+          bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
@@ -323,7 +323,7 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
           docker exec -w /sglang-checkout/sgl-kernel/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
 
-  finish:
+  pr-test-amd-finish:
     if: always()
     needs: [
       accuracy-test-1-gpu-amd, mla-test-1-gpu-amd, bench-test-2-gpu-amd,
