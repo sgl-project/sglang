@@ -15,12 +15,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-# from flash_attn.cute import utils
-# from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
-# from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-# from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
-# from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
-# from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from flash_fwd_sm100 import FlashAttentionForwardSm100
 
 
 def _green(x: str) -> str:
@@ -229,22 +224,17 @@ def _flash_attn_fwd(
         compute_capability,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
-        if compute_capability == 10:
-            fa_fwd = FlashAttentionForwardSm100(
-                head_dim,
-                head_dim_v,
-                is_causal=causal,
-                is_local=local,
-                qhead_per_kvhead=qhead_per_kvhead,
-                is_persistent=not causal
-                and not local
-                and cu_seqlens_q is None
-                and seqused_q is None,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
-            )
+        fa_fwd = FlashAttentionForwardSm100(
+            head_dim,
+            head_dim_v,
+            is_causal=causal,
+            is_local=local,
+            qhead_per_kvhead=qhead_per_kvhead,
+            is_persistent=not causal
+            and not local
+            and cu_seqlens_q is None
+            and seqused_q is None,
+        )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd,
