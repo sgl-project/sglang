@@ -45,7 +45,7 @@ from .data_processing import(
     get_mooncake_trace,
     SampleOutput
 )
-
+from datasets import load_dataset
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 global args
@@ -408,7 +408,7 @@ async def async_request_dynamo(
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
-            "model": request_func_input.model,
+            "model": "Meta-Llama-3-8B-Instruct",
             "prompt": prompt,
             "temperature": 0.0,
             "best_of": 1,
@@ -463,6 +463,8 @@ async def async_request_dynamo(
 
                     output.generated_text = generated_text
                     output.success = True
+                    # if output.ttft == 0.0:
+                        # print("=================================")
                     output.latency = latency
                     output.output_len = request_func_input.output_len
                 else:
@@ -508,10 +510,6 @@ async def async_request_loongserve(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data:")
-
-                        data = json.loads(chunk)
-                        output.generated_text += data["text_output"]
                         timestamp = time.perf_counter()
                         # First token
                         if ttft == 0.0:
@@ -601,6 +599,10 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
         )
+        input_length = [r[1] for r in input_requests]
+        output_length = [r[2] for r in input_requests]
+        print(f"max input length: {max(input_length)} min input length: {min(input_length)}, mean input length: {np.mean(input_length)}")
+        print(f"max output length: {max(output_length)} min output length: {min(output_length)}, mean output length: {np.mean(output_length)}")
     elif args.dataset_name == "random":
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
@@ -626,9 +628,19 @@ def get_dataset(args, tokenizer):
             num_prompts=args.num_prompts,
             tokenizer=tokenizer
         )
+        input_length = [r[1] for r in input_requests]
+        output_length = [r[2] for r in input_requests]
+        print(f"max input length: {max(input_length)} min input length: {min(input_length)}, mean input length: {np.mean(input_length)}")
+        print(f"max output length: {max(output_length)} min output length: {min(output_length)}, mean output length: {np.mean(output_length)}")
+    elif args.dataset_name == "mooncake":
+        input_requests = sample_mooncake_requests(
+            model_name=args.model,
+            num_requests=args.num_prompts,
+            dataset_path=args.dataset_path,
+        )
     elif args.dataset_name == "synthesis":
         input_requests = sample_synthesis_requests(
-            num_requests=args.num_prompts, input_length=args.synthesis_input_length, output_length=args.synthesis_output_length,
+            num_requests=args.num_prompts, input_length=args.synthesis_input_length, output_length=args.synthesis_output_length,tokenizer=tokenizer
         )
     elif args.dataset_name == "synthesis_shuffle":
         input_requests = sample_synthesis_requests(
@@ -645,6 +657,11 @@ def get_dataset(args, tokenizer):
             loogle_path=args.dataset_path,
             long_req_ratio=args.long_req_ratio,
             tokenizer=tokenizer
+        )
+    elif args.dataset_name == "open-thoughts":
+        input_requests = sample_open_thoughts_requests(
+            num_prompts=args.num_prompts,
+            tokenizer=tokenizer,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
@@ -757,12 +774,36 @@ def sample_openai_requests(
         requests.extend(conversation)
     return requests
 
+def sample_mooncake_requests(
+    model_name: str,
+    num_requests: int,
+    dataset_path: str
+):
+    conversations, _ = get_mooncake_trace(
+        model_name=model_name,
+        dataset_path=dataset_path,
+        max_sum_len=100000,
+    )
+    input_requests = []
+    for conversation in conversations:
+        input_requests.extend(conversation)
+    input_requests = input_requests[:num_requests]
+    return input_requests
 
 def sample_synthesis_requests(
         num_requests: int,
         input_length: int,
-        output_length:int) -> List[Tuple[str, int, int]]:
-    sample_results: List[Tuple[str, int, int]] = [(str(input_length), input_length, output_length)] * num_requests
+        output_length:int,
+        tokenizer:PreTrainedTokenizer) -> List[Tuple[str, int, int]]:
+    sample_results: List[Tuple[str, int, int]] = []
+    gap = 0
+    for i in range(num_requests):
+        input_ids = [i + 200 + gap for _ in range(input_length)]
+        while(len(tokenizer.tokenize(tokenizer.decode(input_ids))) != input_length):
+            gap += 1
+            input_ids = [i + 200 + gap for _ in range(input_length)]
+        assert len(tokenizer.tokenize(tokenizer.decode(input_ids))) == input_length
+        sample_results.append((tokenizer.decode(input_ids), input_length, output_length))
     return sample_results
 
 def sample_azure_requests(num_requests: int, data_path: str) -> List[Tuple[str, int, int]]:
@@ -798,6 +839,24 @@ def sample_mixed_requests(num_requests: int, loogle_path:str, long_req_ratio: in
     sample_requests = long_requests + short_requests
     random.shuffle(sample_requests)
     return sample_requests
+
+def sample_open_thoughts_requests(
+    num_prompts: int,
+    tokenizer: PreTrainedTokenizerBase = None,
+) -> List[Tuple[str, int, int]]:
+    ds = load_dataset("open-thoughts/OpenThoughts-114k", split="train")
+    input_requests = []
+    for i in range(num_prompts):
+        if i >= len(ds):
+            break
+        prompt = ds[i]["system"] + ds[i]["conversations"][0]["value"]
+        completion = ds[i]["conversations"][1]["value"]
+        prompt_token_ids = tokenizer.encode(prompt)
+        completion_token_ids = tokenizer.encode(completion)
+        prompt_len = len(prompt_token_ids)
+        output_len = len(completion_token_ids)
+        input_requests.append((prompt, prompt_len, output_len))
+    return input_requests  
 
 def sample_sharegpt_requests(
     dataset_path: str,
@@ -1051,13 +1110,14 @@ async def get_request(
         
 async def get_request_from_trace(
     reqs: List[Tuple[str, int, int]],
-    traces: list[float]
+    traces: list[float],
+    trace_start_time: float
 ) -> AsyncGenerator[Tuple[str, int, int], None]:
     assert len(reqs) == len(traces)
     num_requests = len(reqs)
     start_timestamp = time.time()
     for idx in range(num_requests):
-        target = start_timestamp + traces[idx]
+        target = start_timestamp + traces[idx] - trace_start_time * args.trace_rate_scale
         time_to_sleep = target - time.time()
         if time_to_sleep > 0:
             await asyncio.sleep(time_to_sleep)
@@ -1073,6 +1133,7 @@ def calculate_metrics(
     request_rate: int,
     input: int = 0,
     output: int = 0,
+    traces: list[float] = None
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     global args
     output_lens: List[int] = []
@@ -1106,45 +1167,69 @@ def calculate_metrics(
             output_lens.append(0)
             retokenized_output_lens.append(0)
 
-    # itl_p99 = np.percentile(itls or 0, 99) * 1000
-    # # if itl_p99 > 70 and itl_p99 < 90 :
-    # # if ttfts[-1]<1000:
-    # with open(f"/workspace/source/PD-Multiplexing/res/sharegpt/pdmux_config1.csv", "a+") as f:
-    #     writer = csv.writer(f)
-    #     row = [
-    #         args.batch_limit,
-    #         args.capacity_limit,
-    #         request_rate,
-    #         completed,
-    #         "%.2f" % (np.mean(ttfts or 0) * 1000),
-    #         "%.2f" % (np.percentile(ttfts or 0, 99) * 1000),
-    #         "%.2f" % (np.mean(tpots or 0) * 1000),
-    #         "%.2f" % (np.percentile(tpots or 0, 99) * 1000),
-    #         "%.2f" % (np.mean(itls or 0) * 1000),
-    #         "%.2f" % (np.percentile(itls or 0, 99) * 1000),
-    #     ]
-    #     for i in range(len(ttfts)):
-    #         row.append('%.2f'%(ttfts[i] * 1000))
-    #     for i in range(len(tpots)):
-    #         row.append('%.2f'%(tpots[i] * 1000))
-    #     for i in range(len(itls)):
-    #         row.append('%.2f'%(itls[i] * 1000))
-    #     writer.writerow(row)
-    # with open(f"/workspace/source/PD-Multiplexing/res/sharegpt/pdmux_general_config1.csv", "a+") as f:
-    #     writer = csv.writer(f)
-    #     row = [
-    #         args.batch_limit,
-    #         args.capacity_limit,
-    #         request_rate,
-    #         completed,
-    #         "%.2f" % (np.mean(ttfts or 0) * 1000),
-    #         "%.2f" % (np.percentile(ttfts or 0, 99) * 1000),
-    #         "%.2f" % (np.mean(tpots or 0) * 1000),
-    #         "%.2f" % (np.percentile(tpots or 0, 99) * 1000),
-    #         "%.2f" % (np.mean(itls or 0) * 1000),
-    #         "%.2f" % (np.percentile(itls or 0, 99) * 1000),
-    #     ]
-    #     writer.writerow(row)
+    itl_p99 = np.percentile(itls or 0, 99) * 1000
+    # if itl_p99 > 70 and itl_p99 < 90 :
+    # if ttfts[-1]<1000:
+    if backend == "sglang":
+        if args.chunk_size:
+            backend = "chunked"
+        else:
+            backend = "yoda"
+    if args.dataset_name == "mooncake-trace":
+        if "conv" in args.dataset_path:
+            dataset_name = "mooncake-trace-conv"
+        else:
+            dataset_name = "mooncake-trace-tool"
+    else:
+        dataset_name = args.dataset_name
+    model_size = '8B' if '8B' in args.model else '70B'
+    with open(f"/workspace/source/PD-Multiplexing/res/{model_size}/{dataset_name}/{backend}.jsonl", "a+") as f:
+        data = {
+            "chunk size": args.chunk_size,
+            "batch limit": args.batch_limit,
+            "capacity limit": args.capacity_limit,
+            "request_rate": request_rate,
+            "trace_rate_scale": args.trace_rate_scale,
+            "trace_start_time": args.trace_start_time,
+            "trace_end_time": args.trace_end_time,
+            "completed": completed,
+            "ttft mean":"%.2f" % (np.mean(ttfts or 0) * 1000),
+            "ttft p99":"%.2f" % (np.percentile(ttfts or 0, 99) * 1000),
+            "tpot mean":"%.2f" % (np.mean(tpots or 0) * 1000),
+            "tpot p99":"%.2f" % (np.percentile(tpots or 0, 99) * 1000),
+            "itl mean":"%.2f" % (np.mean(itls or 0) * 1000),
+            "itl p99":"%.2f" % (np.percentile(itls or 0, 99) * 1000),
+            "ttfts":[ttft * 1000 for ttft in ttfts],
+            "topts":[tpot * 1000 for tpot in tpots],
+            "itls": [[i * 1000 for i in output.itl] for output in outputs if output.success],
+            "timestamps":[t - args.trace_start_time * args.trace_rate_scale for t in traces] if traces else None
+        }
+        json_line = json.dumps(data)
+        f.write(json_line + "\n")
+    if not os.path.exists(f"/workspace/source/PD-Multiplexing/res/{model_size}/{dataset_name}/{backend}_general.csv"):
+            with open(f"/workspace/source/PD-Multiplexing/res/{model_size}/{dataset_name}/{backend}_general.csv", 'w', newline='') as f:
+                writer = csv.writer(f)
+                headers = ["chunk size", "batch limit", "capacity limit", "request rate", "trace_rate_scale", "trace_start_time", "trace_end_time","completed", "ttft mean", "ttft p99", "tpot mean","tpot p99", "itl mean", "itl p99"]
+                writer.writerow(headers)
+    with open(f"/workspace/source/PD-Multiplexing/res/{model_size}/{dataset_name}/{backend}_general.csv", "a+") as f:
+        writer = csv.writer(f)
+        row = [
+            args.chunk_size,
+            args.batch_limit,
+            args.capacity_limit,
+            request_rate,
+            args.trace_rate_scale,
+            args.trace_start_time,
+            args.trace_end_time,
+            completed,
+            "%.2f" % (np.mean(ttfts or 0) * 1000),
+            "%.2f" % (np.percentile(ttfts or 0, 99) * 1000),
+            "%.2f" % (np.mean(tpots or 0) * 1000),
+            "%.2f" % (np.percentile(tpots or 0, 99) * 1000),
+            "%.2f" % (np.mean(itls or 0) * 1000),
+            "%.2f" % (np.percentile(itls or 0, 99) * 1000),
+        ]
+        writer.writerow(row)
     
     
 
@@ -1219,25 +1304,25 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
-    print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len = input_requests[0]
-    test_input = RequestFuncInput(
-        model=model_id,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        lora_name=lora_name,
-        extra_request_body=extra_request_body,
-    )
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
-        )
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
+    # print("Starting initial single prompt test run...")
+    # test_prompt, test_prompt_len, test_output_len = input_requests[0]
+    # test_input = RequestFuncInput(
+    #     model=model_id,
+    #     prompt=test_prompt,
+    #     api_url=api_url,
+    #     prompt_len=test_prompt_len,
+    #     output_len=test_output_len,
+    #     lora_name=lora_name,
+    #     extra_request_body=extra_request_body,
+    # )
+    # test_output = await request_func(request_func_input=test_input)
+    # if not test_output.success:
+    #     raise ValueError(
+    #         "Initial test run failed - Please make sure benchmark arguments "
+    #         f"are correctly specified. Error: {test_output.error}"
+    #     )
+    # else:
+    #     print("Initial test run completed. Starting main benchmark run...")
 
     time.sleep(1.5)
 
@@ -1263,8 +1348,8 @@ async def benchmark(
             break
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
     print("warm up done ...")
-    time.sleep(5)
-
+    os.system(f"bash /workspace/source/PD-Multiplexing/python/sglang/flush_sglang.sh 30000")
+    time.sleep(5)    
     if profile:
         print("Starting profiler...")
         profile_output = await async_request_profile(
@@ -1472,7 +1557,7 @@ async def benchmark_trace(
     lora_name: str,
     extra_request_body: Dict[str, Any],
     profile: bool,
-    trace_rate_scale: float = 1
+    trace_rate_scale: float = 1,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1512,7 +1597,7 @@ async def benchmark_trace(
 
     print("warm up ...")
     tasks: List[asyncio.Task] = []
-    async for request in get_request_from_trace(reqs, traces):
+    async for request in get_request_from_trace(reqs, traces, args.trace_start_time):
         prompt, prompt_len, output_len = request
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -1531,6 +1616,7 @@ async def benchmark_trace(
         if len(tasks) >= 10:
             break
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    os.system(f"bash /workspace/source/PD-Multiplexing/python/sglang/flush_sglang.sh 30000")
     print("warm up done ...")
     time.sleep(5)
 
@@ -1546,7 +1632,7 @@ async def benchmark_trace(
 
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request_from_trace(reqs, traces):
+    async for request in get_request_from_trace(reqs, traces, args.trace_start_time):
         prompt, prompt_len, output_len = request
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -1584,6 +1670,7 @@ async def benchmark_trace(
         request_rate=None,
         input=args.synthesis_input_length,
         output=args.synthesis_output_length,
+        traces=traces
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -1774,6 +1861,7 @@ def run_benchmark(args_: argparse.Namespace):
             "gserver": 9988,
             "truss": 8080,
             "dynamo":8000,
+            "loongserve":8400,
         }.get(args.backend, 30000)
 
     model_url = (
@@ -1865,9 +1953,12 @@ def run_benchmark(args_: argparse.Namespace):
         conversations, traces = get_mooncake_trace(model_name=model_id, dataset_path=args.dataset_path, max_sum_len=100000)
         input_requests = []
         for conversation in conversations:
-            requests.extend(conversation)
+            input_requests.extend(conversation)
         scale = args.trace_rate_scale
-        scaled_traces = [trace * scale for trace in traces]      
+
+        selected_requests = [r for r,t in zip(input_requests, traces) if  t >= args.trace_start_time and (args.trace_end_time < 0 or t <= args.trace_end_time)]
+        selected_traces = [t for t in traces if t >= args.trace_start_time and (args.trace_end_time < 0 or t <= args.trace_end_time)]
+        selected_traces = [trace * scale for trace in selected_traces]    
     else:    
         input_requests = get_dataset(args, tokenizer)
 
@@ -1879,14 +1970,14 @@ def run_benchmark(args_: argparse.Namespace):
                 base_url=base_url,
                 model_id=model_id,
                 tokenizer=tokenizer,
-                reqs=input_requests,
-                traces=scaled_traces,
+                reqs=selected_requests,
+                traces=selected_traces,
                 max_concurrency=args.max_concurrency,
                 disable_tqdm=args.disable_tqdm,
                 lora_name=args.lora_name,
                 extra_request_body=extra_request_body,
                 profile=args.profile,
-                trace_rate_scale=scale
+                trace_rate_scale=scale,
             )
         )
     elif not args.multi:
@@ -1967,7 +2058,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "generated-shared-prefix", "synthesis", "synthesis_shuffle", "azure", "loogle", "leval","sharegpt-prefix", "mooncake-trace", "mixed"],
+        choices=["sharegpt", "random", "generated-shared-prefix", "synthesis", "synthesis_shuffle", "azure", "loogle", "leval","sharegpt-prefix", "mooncake-trace", "mooncake","mixed", "open-thoughts"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -2144,7 +2235,7 @@ if __name__ == "__main__":
     )
     group.add_argument(
         "--capacity-limit",
-        type=int,
+        type=str,
         default=0,
         help="Target length in tokens for questions in generated-shared-prefix dataset",
     )
@@ -2169,6 +2260,16 @@ if __name__ == "__main__":
         "--trace-rate-scale",
         type=float,
         default=1.0,
+    )
+    group.add_argument(
+        "--trace-start-time",
+        type=float,
+        default=0.0
+    )
+    group.add_argument(
+        "--trace-end-time",
+        type=float,
+        default=-1
     )
     
     args = parser.parse_args()
