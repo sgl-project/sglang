@@ -131,8 +131,6 @@ def set_global_state(global_state: _GlobalState):
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    server_args: ServerArgs = fast_api_app.server_args
-
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
