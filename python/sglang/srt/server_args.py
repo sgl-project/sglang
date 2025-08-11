@@ -276,7 +276,7 @@ class ServerArgs:
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
-    sm_group_num: int = 3
+    sm_group_num: int = 8
 
     # Deprecated arguments
     enable_ep_moe: bool = False
@@ -2002,6 +2002,22 @@ class ServerArgs:
         assert (
             self.chunked_prefill_size % self.page_size == 0
         ), "chunked_prefill_size must be divisible by page_size"
+        
+        # Check PDMux
+        
+        if self.enable_pdmux:
+            assert (
+                self.pp_size == 1
+            ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
+            assert (
+                self.chunked_prefill_size == -1
+            ), "PD-Multiplexing is not compatible with chunked prefill."
+            assert (
+                self.disaggregation_mode == "null"
+            ), "PD-Multiplexing is not compatible with disaggregation mode."
+            assert (
+                self.disable_overlap_schedule
+            ), "PD-Multiplexing is not compatible with overlap schedule."
 
     def check_lora_server_args(self):
         assert (
