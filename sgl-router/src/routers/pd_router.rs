@@ -2,7 +2,10 @@
 // This module handles routing for disaggregated prefill-decode systems
 use super::pd_types::{api_path, PDRouterError};
 use crate::config::types::{CircuitBreakerConfig as ConfigCircuitBreakerConfig, RetryConfig};
-use crate::core::{CircuitBreakerConfig, HealthChecker, Worker, WorkerFactory, WorkerLoadGuard};
+use crate::core::{
+    is_retryable_status, CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory,
+    WorkerLoadGuard,
+};
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
@@ -459,8 +462,80 @@ impl PDRouter {
         Ok(original)
     }
 
-    // Execute the dual dispatch to prefill and decode servers
-    async fn execute_dual_dispatch(
+    // Execute the dual dispatch to prefill and decode servers with retries
+    async fn execute_dual_dispatch_with_retry(
+        &self,
+        headers: Option<&HeaderMap>,
+        json_request: Value,
+        route: &str,
+        is_stream: bool,
+        return_logprob: bool,
+        request_text: Option<&str>,
+    ) -> Response {
+        let start_time = Instant::now();
+
+        RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            // Operation per attempt
+            {
+                let json_request = json_request.clone();
+                move |attempt: u32| {
+                    let json_request = json_request.clone();
+                    async move {
+                        // Select workers for this attempt (may change if some become unavailable)
+                        let (prefill, decode) = match self.select_pd_pair(request_text).await {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                RouterMetrics::record_pd_error("server_selection");
+                                return Self::handle_server_selection_error(e);
+                            }
+                        };
+
+                        debug!(
+                            "PD retry attempt {} using prefill={} decode={}",
+                            attempt,
+                            prefill.url(),
+                            decode.url()
+                        );
+
+                        // Execute the actual dual dispatch
+                        let response = self
+                            .execute_dual_dispatch_internal(
+                                headers,
+                                json_request,
+                                route,
+                                prefill.as_ref(),
+                                decode.as_ref(),
+                                is_stream,
+                                return_logprob,
+                                start_time,
+                            )
+                            .await;
+
+                        // Record outcomes for circuit breakers
+                        let is_success = response.status().is_success();
+                        prefill.record_outcome(is_success);
+                        decode.record_outcome(is_success);
+
+                        response
+                    }
+                }
+            },
+            // Should retry predicate
+            |res, _attempt| is_retryable_status(res.status()),
+            // On backoff hook
+            |delay, attempt| {
+                RouterMetrics::record_retry(route);
+                RouterMetrics::record_retry_backoff_duration(delay, attempt);
+            },
+            // On exhausted hook
+            || RouterMetrics::record_retries_exhausted(route),
+        )
+        .await
+    }
+
+    // Internal method that performs the actual dual dispatch (without retry logic)
+    async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
         json_request: Value,
@@ -696,7 +771,7 @@ impl PDRouter {
         self.prefill_policy.needs_request_text() || self.decode_policy.needs_request_text()
     }
 
-    // Select a pair of prefill and decode servers
+    // Select a pair of prefill and decode servers considering circuit breaker state
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
@@ -719,20 +794,56 @@ impl PDRouter {
             return Err("No decode workers available. Please check if decode servers are configured and healthy.".to_string());
         }
 
-        // Select prefill worker using prefill policy
+        // Filter available workers (healthy + circuit breaker not open)
+        let available_prefill: Vec<&Box<dyn Worker>> = prefill_workers
+            .iter()
+            .filter(|w| w.is_available())
+            .collect();
+        let available_decode: Vec<&Box<dyn Worker>> =
+            decode_workers.iter().filter(|w| w.is_available()).collect();
+
+        if available_prefill.is_empty() {
+            return Err(
+                "No available prefill workers (all circuits open or unhealthy)".to_string(),
+            );
+        }
+        if available_decode.is_empty() {
+            return Err("No available decode workers (all circuits open or unhealthy)".to_string());
+        }
+
+        // Select prefill worker using prefill policy from available workers
         let prefill_idx = self
             .prefill_policy
             .select_worker(&prefill_workers, request_text)
             .ok_or("Failed to select prefill worker")?;
 
-        // Select decode worker using decode policy
+        // Select decode worker using decode policy from available workers
         let decode_idx = self
             .decode_policy
             .select_worker(&decode_workers, request_text)
             .ok_or("Failed to select decode worker")?;
 
-        let prefill = prefill_workers[prefill_idx].clone_worker();
-        let decode = decode_workers[decode_idx].clone_worker();
+        // Check if selected workers are available
+        let prefill = if prefill_workers[prefill_idx].is_available() {
+            prefill_workers[prefill_idx].clone_worker()
+        } else {
+            // Policy selected unavailable worker, try to find any available
+            available_prefill
+                .first()
+                .ok_or("No available prefill workers")?
+                .clone_worker()
+        };
+
+        let decode = if decode_workers[decode_idx].is_available() {
+            decode_workers[decode_idx].clone_worker()
+        } else {
+            // Policy selected unavailable worker, try to find any available
+            available_decode
+                .first()
+                .ok_or("No available decode workers")?
+                .clone_worker()
+        };
+
         Ok((prefill, decode))
     }
 
@@ -1449,8 +1560,6 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
     ) -> Response {
-        let start = Instant::now();
-
         // Extract flags for routing logic
         let is_stream = body.stream;
         let return_logprob = body.return_logprob;
@@ -1469,18 +1578,11 @@ impl RouterTrait for PDRouter {
             None
         };
 
-        // Select servers
-        let (prefill, decode) = match self.select_pd_pair(request_text).await {
+        // For initial server selection to inject bootstrap fields
+        let (prefill, _) = match self.select_pd_pair(request_text).await {
             Ok(pair) => pair,
             Err(e) => return Self::handle_server_selection_error(e),
         };
-
-        // Log routing decision
-        info!(
-            "PD routing decision route=/generate prefill_url={} decode_url={}",
-            prefill.url(),
-            decode.url()
-        );
 
         let batch_size = Self::get_generate_batch_size(body);
         let original = match serde_json::to_value(body) {
@@ -1492,16 +1594,14 @@ impl RouterTrait for PDRouter {
             Err(e) => return Self::handle_serialization_error(e),
         };
 
-        // Execute dual dispatch
-        self.execute_dual_dispatch(
+        // Execute dual dispatch with retries
+        self.execute_dual_dispatch_with_retry(
             headers,
             json,
             "/generate",
-            prefill.as_ref(),
-            decode.as_ref(),
             is_stream,
             return_logprob,
-            start,
+            request_text,
         )
         .await
     }
@@ -1511,8 +1611,6 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
     ) -> Response {
-        let start = Instant::now();
-
         // Extract flags for routing logic
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
@@ -1537,18 +1635,11 @@ impl RouterTrait for PDRouter {
             None
         };
 
-        // Select servers
-        let (prefill, decode) = match self.select_pd_pair(request_text).await {
+        // For initial server selection to inject bootstrap fields
+        let (prefill, _) = match self.select_pd_pair(request_text).await {
             Ok(pair) => pair,
             Err(e) => return Self::handle_server_selection_error(e),
         };
-
-        // Log routing decision
-        info!(
-            "PD routing decision route=/v1/chat/completions prefill_url={} decode_url={}",
-            prefill.url(),
-            decode.url()
-        );
 
         let batch_size = Self::get_chat_batch_size(body);
         let original = match serde_json::to_value(body) {
@@ -1560,16 +1651,14 @@ impl RouterTrait for PDRouter {
             Err(e) => return Self::handle_serialization_error(e),
         };
 
-        // Execute dual dispatch
-        self.execute_dual_dispatch(
+        // Execute dual dispatch with retries
+        self.execute_dual_dispatch_with_retry(
             headers,
             json,
             "/v1/chat/completions",
-            prefill.as_ref(),
-            decode.as_ref(),
             is_stream,
             return_logprob,
-            start,
+            request_text,
         )
         .await
     }
@@ -1579,8 +1668,6 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
     ) -> Response {
-        let start = Instant::now();
-
         // Extract flags for routing logic
         let is_stream = body.stream;
         let return_logprob = body.logprobs.is_some();
@@ -1595,18 +1682,11 @@ impl RouterTrait for PDRouter {
             None
         };
 
-        // Select servers
-        let (prefill, decode) = match self.select_pd_pair(request_text).await {
+        // For initial server selection to inject bootstrap fields
+        let (prefill, _) = match self.select_pd_pair(request_text).await {
             Ok(pair) => pair,
             Err(e) => return Self::handle_server_selection_error(e),
         };
-
-        // Log routing decision
-        info!(
-            "PD routing decision route=/v1/completions prefill_url={} decode_url={}",
-            prefill.url(),
-            decode.url()
-        );
 
         let batch_size = Self::get_completion_batch_size(body);
         let original = match serde_json::to_value(body) {
@@ -1618,16 +1698,14 @@ impl RouterTrait for PDRouter {
             Err(e) => return Self::handle_serialization_error(e),
         };
 
-        // Execute dual dispatch
-        self.execute_dual_dispatch(
+        // Execute dual dispatch with retries
+        self.execute_dual_dispatch_with_retry(
             headers,
             json,
             "/v1/completions",
-            prefill.as_ref(),
-            decode.as_ref(),
             is_stream,
             return_logprob,
-            start,
+            request_text,
         )
         .await
     }

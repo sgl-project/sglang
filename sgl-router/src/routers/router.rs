@@ -1,5 +1,7 @@
 use crate::config::types::{CircuitBreakerConfig as ConfigCircuitBreakerConfig, RetryConfig};
-use crate::core::{CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory};
+use crate::core::{
+    is_retryable_status, CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory,
+};
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
@@ -397,18 +399,6 @@ impl Router {
         Some(available[idx].clone_worker())
     }
 
-    fn is_retryable_status(status: StatusCode) -> bool {
-        matches!(
-            status,
-            StatusCode::REQUEST_TIMEOUT
-                | StatusCode::TOO_MANY_REQUESTS
-                | StatusCode::INTERNAL_SERVER_ERROR
-                | StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-        )
-    }
-
     pub async fn route_typed_request<
         T: crate::openai_api_types::GenerationRequest + serde::Serialize + Clone,
     >(
@@ -461,7 +451,7 @@ impl Router {
                 response
             },
             // should_retry predicate
-            |res, _attempt| Self::is_retryable_status(res.status()),
+            |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
             |delay, attempt| {
                 RouterMetrics::record_retry(route);
@@ -476,7 +466,7 @@ impl Router {
             let duration = start.elapsed();
             RouterMetrics::record_request(route);
             RouterMetrics::record_generate_duration(duration);
-        } else if !Self::is_retryable_status(response.status()) {
+        } else if !is_retryable_status(response.status()) {
             RouterMetrics::record_request_error(route, "non_retryable_error");
         }
 
