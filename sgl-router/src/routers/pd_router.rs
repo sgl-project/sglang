@@ -20,6 +20,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use reqwest::Client;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -44,6 +45,16 @@ pub struct PDRouter {
     pub circuit_breaker_config: CircuitBreakerConfig,
     _prefill_health_checker: Option<HealthChecker>,
     _decode_health_checker: Option<HealthChecker>,
+}
+
+// Request context for PD router operations
+#[derive(Clone)]
+struct PDRequestContext {
+    route: &'static str,
+    batch_size: Option<usize>,
+    is_stream: bool,
+    return_logprob: bool,
+    request_text: Option<String>,
 }
 
 impl PDRouter {
@@ -462,31 +473,35 @@ impl PDRouter {
         Ok(original)
     }
 
-    // Execute the dual dispatch to prefill and decode servers with retries
-    async fn execute_dual_dispatch_with_retry(
+    // Execute the dual dispatch to prefill and decode servers with retries and bootstrap injection
+    async fn execute_dual_dispatch_with_retry_generic<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
-        json_request: Value,
-        route: &str,
-        prefill: Box<dyn Worker>,
-        decode: Box<dyn Worker>,
-        is_stream: bool,
-        return_logprob: bool,
+        original_request: &T,
+        context: PDRequestContext,
     ) -> Response {
         let start_time = Instant::now();
 
+        let route = context.route;
         RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // Operation per attempt
             {
-                let json_request = json_request.clone();
-                let prefill = prefill.clone_worker();
-                let decode = decode.clone_worker();
+                let original_request = original_request.clone();
                 move |attempt: u32| {
-                    let json_request = json_request.clone();
-                    let prefill = prefill.clone_worker();
-                    let decode = decode.clone_worker();
+                    let original_request = original_request.clone();
+                    let context = context.clone();
                     async move {
+                        // Select workers fresh for each attempt
+                        let (prefill, decode) =
+                            match self.select_pd_pair(context.request_text.as_deref()).await {
+                                Ok(pair) => pair,
+                                Err(e) => {
+                                    RouterMetrics::record_pd_error("server_selection");
+                                    return Self::handle_server_selection_error(e);
+                                }
+                            };
+
                         debug!(
                             "PD retry attempt {} using prefill={} decode={}",
                             attempt,
@@ -494,16 +509,32 @@ impl PDRouter {
                             decode.url()
                         );
 
+                        // Serialize the original request
+                        let mut json_request = match serde_json::to_value(&original_request) {
+                            Ok(v) => v,
+                            Err(e) => return Self::handle_serialization_error(e),
+                        };
+
+                        // Inject bootstrap based on current prefill worker
+                        json_request = match Self::inject_bootstrap_into_value(
+                            json_request,
+                            prefill.as_ref(),
+                            context.batch_size,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => return Self::handle_serialization_error(e),
+                        };
+
                         // Execute the actual dual dispatch
                         let response = self
                             .execute_dual_dispatch_internal(
                                 headers,
                                 json_request,
-                                route,
+                                context.route,
                                 prefill.as_ref(),
                                 decode.as_ref(),
-                                is_stream,
-                                return_logprob,
+                                context.is_stream,
+                                context.return_logprob,
                                 start_time,
                             )
                             .await;
@@ -1549,51 +1580,42 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
     ) -> Response {
-        // Extract flags for routing logic
+        // Extract parameters
         let is_stream = body.stream;
         let return_logprob = body.return_logprob;
 
-        // Extract text for cache-aware routing only if needed
+        // Extract text for cache-aware routing
         let request_text = if self.policies_need_request_text() {
-            body.text.as_deref().or_else(|| {
-                body.prompt.as_ref().and_then(|p| match p {
-                    crate::openai_api_types::StringOrArray::String(s) => Some(s.as_str()),
-                    crate::openai_api_types::StringOrArray::Array(v) => {
-                        v.first().map(|s| s.as_str())
-                    }
+            body.text
+                .as_deref()
+                .or_else(|| {
+                    body.prompt.as_ref().and_then(|p| match p {
+                        crate::openai_api_types::StringOrArray::String(s) => Some(s.as_str()),
+                        crate::openai_api_types::StringOrArray::Array(v) => {
+                            v.first().map(|s| s.as_str())
+                        }
+                    })
                 })
-            })
+                .map(|s| s.to_string())
         } else {
             None
         };
 
-        // Select servers for this request
-        let (prefill, decode) = match self.select_pd_pair(request_text).await {
-            Ok(pair) => pair,
-            Err(e) => return Self::handle_server_selection_error(e),
-        };
-
+        // Calculate batch size
         let batch_size = Self::get_generate_batch_size(body);
-        let original = match serde_json::to_value(body) {
-            Ok(v) => v,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
-        let json = match Self::inject_bootstrap_into_value(original, prefill.as_ref(), batch_size) {
-            Ok(v) => v,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
 
-        // Execute dual dispatch with retries using the same worker pair
-        self.execute_dual_dispatch_with_retry(
-            headers,
-            json,
-            "/generate",
-            prefill,
-            decode,
+        // Create context
+        let context = PDRequestContext {
+            route: "/generate",
+            batch_size,
             is_stream,
             return_logprob,
-        )
-        .await
+            request_text,
+        };
+
+        // Execute with retry and bootstrap injection
+        self.execute_dual_dispatch_with_retry_generic(headers, body, context)
+            .await
     }
 
     async fn route_chat(
@@ -1601,23 +1623,19 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
     ) -> Response {
-        // Extract flags for routing logic
+        // Extract parameters
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
 
-        // Extract text for cache-aware routing from chat messages only if needed
+        // Extract text for cache-aware routing
         let request_text = if self.policies_need_request_text() {
             body.messages.first().and_then(|msg| match msg {
-                crate::openai_api_types::ChatMessage::User { content, .. } => {
-                    match content {
-                        crate::openai_api_types::UserMessageContent::Text(text) => {
-                            Some(text.as_str())
-                        }
-                        crate::openai_api_types::UserMessageContent::Parts(_) => None, // Skip complex content
-                    }
-                }
+                crate::openai_api_types::ChatMessage::User { content, .. } => match content {
+                    crate::openai_api_types::UserMessageContent::Text(text) => Some(text.clone()),
+                    crate::openai_api_types::UserMessageContent::Parts(_) => None,
+                },
                 crate::openai_api_types::ChatMessage::System { content, .. } => {
-                    Some(content.as_str())
+                    Some(content.clone())
                 }
                 _ => None,
             })
@@ -1625,33 +1643,21 @@ impl RouterTrait for PDRouter {
             None
         };
 
-        // Select servers for this request
-        let (prefill, decode) = match self.select_pd_pair(request_text).await {
-            Ok(pair) => pair,
-            Err(e) => return Self::handle_server_selection_error(e),
-        };
-
+        // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
-        let original = match serde_json::to_value(body) {
-            Ok(v) => v,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
-        let json = match Self::inject_bootstrap_into_value(original, prefill.as_ref(), batch_size) {
-            Ok(v) => v,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
 
-        // Execute dual dispatch with retries using the same worker pair
-        self.execute_dual_dispatch_with_retry(
-            headers,
-            json,
-            "/v1/chat/completions",
-            prefill,
-            decode,
+        // Create context
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size,
             is_stream,
             return_logprob,
-        )
-        .await
+            request_text,
+        };
+
+        // Execute with retry and bootstrap injection
+        self.execute_dual_dispatch_with_retry_generic(headers, body, context)
+            .await
     }
 
     async fn route_completion(
@@ -1659,47 +1665,37 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
     ) -> Response {
-        // Extract flags for routing logic
+        // Extract parameters
         let is_stream = body.stream;
         let return_logprob = body.logprobs.is_some();
 
-        // Extract text for cache-aware routing only if needed
+        // Extract text for cache-aware routing
         let request_text = if self.policies_need_request_text() {
             match &body.prompt {
-                crate::openai_api_types::StringOrArray::String(s) => Some(s.as_str()),
-                crate::openai_api_types::StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
+                crate::openai_api_types::StringOrArray::String(s) => Some(s.clone()),
+                crate::openai_api_types::StringOrArray::Array(v) => {
+                    v.first().map(|s| s.to_string())
+                }
             }
         } else {
             None
         };
 
-        // Select servers for this request
-        let (prefill, decode) = match self.select_pd_pair(request_text).await {
-            Ok(pair) => pair,
-            Err(e) => return Self::handle_server_selection_error(e),
-        };
-
+        // Calculate batch size
         let batch_size = Self::get_completion_batch_size(body);
-        let original = match serde_json::to_value(body) {
-            Ok(v) => v,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
-        let json = match Self::inject_bootstrap_into_value(original, prefill.as_ref(), batch_size) {
-            Ok(v) => v,
-            Err(e) => return Self::handle_serialization_error(e),
-        };
 
-        // Execute dual dispatch with retries using the same worker pair
-        self.execute_dual_dispatch_with_retry(
-            headers,
-            json,
-            "/v1/completions",
-            prefill,
-            decode,
+        // Create context
+        let context = PDRequestContext {
+            route: "/v1/completions",
+            batch_size,
             is_stream,
             return_logprob,
-        )
-        .await
+            request_text,
+        };
+
+        // Execute with retry and bootstrap injection
+        self.execute_dual_dispatch_with_retry_generic(headers, body, context)
+            .await
     }
 
     async fn flush_cache(&self) -> Response {
