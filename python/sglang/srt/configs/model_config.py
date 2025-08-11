@@ -342,13 +342,18 @@ class ModelConfig:
                 self.hf_config.num_attention_heads,
             )
         if self.hf_config.model_type in ["nemotron-nas"]:
-            for block in self.hf_config.block_configs:
-                if not block.attention.no_op:
-                    return (
-                        self.hf_config.num_attention_heads
-                        // block.attention.n_heads_in_group
-                    )
-            raise RuntimeError("Couldn't determine number of kv heads")
+            nkvh = {
+                self.hf_config.num_attention_heads // block.attention.n_heads_in_group
+                for block in self.hf_config.block_configs
+                if not block.attention.no_op
+            }
+            if len(nkvh) == 0:
+                raise RuntimeError("Couldn't determine number of kv heads")
+            if len(nkvh) > 1:
+                raise ValueError(
+                    "Variable GQA (VGQA) is not yet supported for nemotron-nas in sglang"
+                )
+            return next(iter(nkvh))
 
         attributes = [
             # For Falcon:
