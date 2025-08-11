@@ -41,6 +41,7 @@ jobs:
           make compile
 
       - name: Push HTML to sgl-project.github.io
+        timeout-minutes: 60
         run: |
           cd docs
           make html
