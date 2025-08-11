@@ -1047,6 +1047,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = self.seq_lens.sum().item()
         new_allocate_lens = self.seq_lens + alloc_len_per_eagle_decode(worker)
         assert torch.all(new_allocate_lens > self.spec_info.allocate_lens), f"new_allocate_lens={new_allocate_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
+        assert torch.all(self.seq_lens <= self.spec_info.allocate_lens), f"self.seq_lens={self.seq_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
         num_needed_tokens = (
             (new_allocate_lens - self.spec_info.allocate_lens).sum().item()
         )
@@ -1610,7 +1611,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         keep_indices: Optional[List[int]] = None,
     ):
         if self.verify_done is not None:
-            self.verify_done.wait()
+            self.verify_done.synchronize()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
