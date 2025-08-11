@@ -249,6 +249,7 @@ def test_correctness(
         dtype=torch.int64,
         device=device,
     )
+    TODO_should_be_unique
 
     pool_ref = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
     pool_flashinfer = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
@@ -276,7 +277,8 @@ def test_correctness(
         query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
-    assert torch.all(TODO_kv_ref == TODO_kv_flashinfer)
+    assert torch.all(pool_ref.k_buffer[0] == pool_flashinfer.k_buffer[0])
+    assert torch.all(pool_ref.v_buffer[0] == pool_flashinfer.v_buffer[0])
 
 
 if __name__ == "__main__":
