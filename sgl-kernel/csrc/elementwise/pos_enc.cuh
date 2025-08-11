@@ -281,10 +281,8 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     size_t v_buffer_stride_h,
     IdType* cache_loc,
     bool interleave,
-    cudaStream_t stream = nullptr,
-    float k_scale = 1.0f,
-    float v_scale = 1.0f,
-    bool save_kv_cache) {
+    bool save_kv_cache,
+    cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));

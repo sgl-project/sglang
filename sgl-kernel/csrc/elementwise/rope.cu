@@ -123,10 +123,8 @@ void apply_rope_pos_ids_cos_sin_cache(
         v_buffer_stride_h,
         cache_loc_ptr,
         interleave,
-        stream,
-        k_scale,
-        v_scale,
-        save_kv_cache);
+        save_kv_cache,
+        stream);
     TORCH_CHECK(
         status == cudaSuccess,
         "BatchQKApplyRotaryPosIdsCosSinCacheEnhanced failed with error code " +
