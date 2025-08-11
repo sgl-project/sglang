@@ -1436,7 +1436,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
+            help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -2000,16 +2000,14 @@ class ServerArgs:
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
-        assert (
-            self.chunked_prefill_size % self.page_size == 0
-        ), "chunked_prefill_size must be divisible by page_size"
+        # Skip validation if chunked prefill is disabled (i.e., size <= 0).
+        if self.chunked_prefill_size > 0:
+            assert (
+                self.chunked_prefill_size % self.page_size == 0
+            ), "chunked_prefill_size must be divisible by page_size"
 
     def check_lora_server_args(self):
-        assert (
-            self.max_loras_per_batch > 0
-            # FIXME
-            and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and radix attention is in progress"
+        assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
