@@ -8,9 +8,6 @@ Usage:
 python3 -m sglang.bench_serving --backend sglang --num-prompt 10
 
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
-
-python -m sglang.bench_serving  --backend-oai-chat --dataset-name random-image --num-prompts 10 --host 127.0.0.1 \
-       --port 9005 --max-concurrency=4 --request-rate=8 --random-image-num-images 2
 """
 
 import argparse
