@@ -83,12 +83,8 @@ impl Router {
         let core_cb_config = CircuitBreakerConfig {
             failure_threshold: circuit_breaker_config.failure_threshold,
             success_threshold: circuit_breaker_config.success_threshold,
-            timeout_duration: std::time::Duration::from_secs(
-                circuit_breaker_config.timeout_duration_secs,
-            ),
-            window_duration: std::time::Duration::from_secs(
-                circuit_breaker_config.window_duration_secs,
-            ),
+            timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
+            window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
         // Create Worker trait objects from URLs

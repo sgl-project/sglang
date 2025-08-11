@@ -232,12 +232,8 @@ impl PDRouter {
         let core_cb_config = CircuitBreakerConfig {
             failure_threshold: circuit_breaker_config.failure_threshold,
             success_threshold: circuit_breaker_config.success_threshold,
-            timeout_duration: std::time::Duration::from_secs(
-                circuit_breaker_config.timeout_duration_secs,
-            ),
-            window_duration: std::time::Duration::from_secs(
-                circuit_breaker_config.window_duration_secs,
-            ),
+            timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
+            window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
         // Convert URLs to Worker trait objects
@@ -474,7 +470,7 @@ impl PDRouter {
     }
 
     // Execute the dual dispatch to prefill and decode servers with retries and bootstrap injection
-    async fn execute_dual_dispatch_with_retry_generic<T: Serialize + Clone>(
+    async fn execute_dual_dispatch<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
@@ -1614,8 +1610,7 @@ impl RouterTrait for PDRouter {
         };
 
         // Execute with retry and bootstrap injection
-        self.execute_dual_dispatch_with_retry_generic(headers, body, context)
-            .await
+        self.execute_dual_dispatch(headers, body, context).await
     }
 
     async fn route_chat(
@@ -1656,8 +1651,7 @@ impl RouterTrait for PDRouter {
         };
 
         // Execute with retry and bootstrap injection
-        self.execute_dual_dispatch_with_retry_generic(headers, body, context)
-            .await
+        self.execute_dual_dispatch(headers, body, context).await
     }
 
     async fn route_completion(
@@ -1694,8 +1688,7 @@ impl RouterTrait for PDRouter {
         };
 
         // Execute with retry and bootstrap injection
-        self.execute_dual_dispatch_with_retry_generic(headers, body, context)
-            .await
+        self.execute_dual_dispatch(headers, body, context).await
     }
 
     async fn flush_cache(&self) -> Response {
