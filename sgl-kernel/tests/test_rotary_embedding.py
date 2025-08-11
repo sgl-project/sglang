@@ -122,12 +122,21 @@ def test_correctness(
     )
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
     if save_kv_cache:
-        assert torch.all(
-            pool_ref.k_buffer[0] == pool_flashinfer.k_buffer[0]
-        ), f"{pool_ref.k_buffer[0]=} {pool_flashinfer.k_buffer[0]=}"
-        assert torch.all(
-            pool_ref.v_buffer[0] == pool_flashinfer.v_buffer[0]
-        ), f"{pool_ref.v_buffer[0]=} {pool_flashinfer.v_buffer[0]=}"
+        _assert_exactly_equal(pool_ref.k_buffer[0], pool_flashinfer.k_buffer[0])
+        _assert_exactly_equal(pool_ref.v_buffer[0], pool_flashinfer.v_buffer[0])
+
+
+def _assert_exactly_equal(a, b):
+    if not torch.all(a == b):
+        mask_diff = a != b
+        raise AssertionError(
+            f"{mask_diff.sum()=} "
+            f"{a[mask_diff]=} {b[mask_diff]=} "
+            f"{torch.nonzero(mask_diff)=} "
+            f"{a.shape=} "
+            f"{a=} {b=}"
+        )
+
 
 
 if __name__ == "__main__":
