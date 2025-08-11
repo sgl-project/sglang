@@ -310,26 +310,10 @@ def apply_rope_with_cos_sin_cache_inplace(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
-    ## fused from memory_pool set_kv_buffer
-    if (
-        k_buffer is not None
-        and v_buffer is not None
-        and value is not None
-        and cache_loc is not None
-    ):
-        save_kv_cache = True
-        k_buffer = k_buffer.view(k_buffer.shape[0], -1, head_size)
-        v_buffer = v_buffer.view(v_buffer.shape[0], -1, head_size)
-        value = value.view(value.shape[0], -1, head_size)
-        # cache_loc = cache_loc.long()
-    else:
-        save_kv_cache = False
-        k_buffer = None
-        v_buffer = None
-        value = None
-        cache_loc = None
-
-    assert cache_loc.dtype == torch.int64
+    if (a := fused_set_kv_buffer_arg) is not None:
+        assert a.k_scale is None, "k_scale is not yet supported"
+        assert a.v_scale is None, "v_scale is not yet supported"
+        assert a.cache_loc.dtype == torch.int64, f"{a.cache_loc.dtype=}"
 
     torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer.default(
         query.view(query.shape[0], -1, head_size),
