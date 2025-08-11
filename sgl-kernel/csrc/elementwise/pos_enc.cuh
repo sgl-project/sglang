@@ -28,7 +28,7 @@ template <
     uint32_t bdx,
     typename DType,
     typename IdType>
-__global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferHeadParallelismKernel(
+__global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel(
     DType* q,
     DType* k,
     DType* v,
@@ -138,7 +138,7 @@ template <
     uint32_t bdx,
     typename DType,
     typename IdType>
-__global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferKernel(
+__global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
     DType* q,
     DType* k,
     DType* v,
@@ -250,7 +250,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferKernel(
   }
 
 template <typename DType, typename IdType>
-cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
+cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     DType* q,
     DType* k,
     DType* v,
@@ -334,7 +334,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
             (void*)&k_scale,
             (void*)&v_scale,
             (void*)&cache_loc};
-        auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferKernel<
+        auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel<
             SAVE_KV_CACHE,
             INTERLEAVE,
             HEAD_DIM,
@@ -355,7 +355,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
         } else {
           dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
           dim3 nthrs(bdx, bdy);
-          auto kernel_1 = BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBufferHeadParallelismKernel<
+          auto kernel_1 = BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel<
               SAVE_KV_CACHE,
               INTERLEAVE,
               HEAD_DIM,
