@@ -68,6 +68,7 @@ if _is_npu:
         useMindIETurbo = False
     else:
         useMindIETurbo = True
+    ACL_FORMAT_FRACTAL_NZ = 29
 
 
 # func refers to RMSNorm.__init__
@@ -584,11 +585,11 @@ class NPU_W8A8LinearMethodImpl:
         if original_dtype != torch.int8:
             x = torch_npu.npu_quantize(
                 x,
-                layer.aclnn_input_scale,
+                layer.aclnn_input_scale_reciprocal,
                 layer.aclnn_input_offset,
                 torch.qint8,
                 -1,
-                True,
+                False,
             )
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in Attention TP>1 case)
@@ -610,9 +611,17 @@ class NPU_W8A8LinearMethodImpl:
             layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
             requires_grad=False,
         )
+        layer.aclnn_input_scale_reciprocal = 1 / torch.nn.Parameter(
+            layer.input_scale.data.repeat(expanding_factor), requires_grad=False
+        )
         layer.aclnn_input_offset = torch.nn.Parameter(
-            layer.input_offset.data.repeat(expanding_factor).to(device="npu"),
+            layer.input_offset.data.repeat(expanding_factor).to(
+                layer.aclnn_input_scale.dtype
+            ),
             requires_grad=False,
+        )
+        layer.weight.data = torch_npu.npu_format_cast(
+            layer.weight.data, ACL_FORMAT_FRACTAL_NZ
         )
         if self.transpose_weight:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
@@ -807,6 +816,9 @@ class NPU_W8A8DynamicLinearMethodImpl:
     def process_weights_after_loading(self, layer):
         if self.transpose_weight:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+        layer.weight.data = torch_npu.npu_format_cast(
+            layer.weight.data, ACL_FORMAT_FRACTAL_NZ
+        )
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()
