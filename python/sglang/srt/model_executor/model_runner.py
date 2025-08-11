@@ -205,7 +205,8 @@ class ModelRunner:
         self.is_hybrid = model_config.is_hybrid
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
-
+        self.gemm_ar_attn_op = None
+        self.gemm_ar_mlp_op = None
         self.forward_pass_id = 0
 
         # Model-specific adjustment
@@ -251,9 +252,7 @@ class ModelRunner:
         )
         self._model_update_group = {}
 
-        self.gemm_ar_overlap_group = None
-        self.gemm_ar_attn_op = None
-        self.gemm_ar_mlp_op = None
+        
         
 
     def initialize(self, min_per_gpu_memory: float):
@@ -292,9 +291,13 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
-
-        if self.device == 'cuda':
+        
+        if self.device == 'cuda' and get_int_env_var('SGL_USE_TP_OVERLAP', 0) == 1:
+            logger.info(
+                f"Initialize Gemm-AllReduce Overlap Operator..."
+            )
             self.init_overlap_gemm_allreduce_operator()
+
         # Check if the model is using hybrid SWA
         if (
             not self.server_args.disable_hybrid_swa_memory
@@ -337,7 +340,7 @@ class ModelRunner:
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
-
+        
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -375,6 +378,7 @@ class ModelRunner:
                 eagle_aux_hidden_state_layer_ids = None
 
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
+        
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -1320,8 +1324,7 @@ class ModelRunner:
     def init_overlap_gemm_allreduce_operator(self):
         if get_int_env_var('SGL_USE_TP_OVERLAP', 0) != 1:
             return
-
-        from sglang.srt.distributed import parallel_state as ps
+        
         from triton_dist.layers.nvidia import GemmARLayer
         
         _TP_OVERLAP_GROUP = torch.distributed.new_group(ranks=self.tp_group.ranks, backend='gloo')
@@ -1352,6 +1355,7 @@ class ModelRunner:
                 each.self_attn.o_proj.gemm_ar_attn_op = self.gemm_ar_attn_op
             if each.mlp.down_proj:
                 each.mlp.down_proj.gemm_ar_mlp_op = self.gemm_ar_mlp_op
+        
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
