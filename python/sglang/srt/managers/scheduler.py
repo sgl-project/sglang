@@ -322,7 +322,6 @@ class Scheduler(
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
         )
-        self.port_args = port_args
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():

@@ -1000,7 +1000,7 @@ class MooncakeKVManager(BaseKVManager):
                 self.update_status(room, KVPoll.Failed)
                 affected_rooms.append(room)
         logger.error(
-            f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), affected {len(affected_rooms)} requests"
+            f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), {len(affected_rooms)} requests affected"
         )
 
     def stop_all_threads(self):
