@@ -20,17 +20,18 @@
 
 namespace flashinfer {
 
-__device__ __forceinline__ void act_save_kv_cache() {
+__device__ __forceinline__ void load_v_vec() {
     DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
+    v_vec.cast_load(v_ptr + tx * vec_size);
+}
+
+__device__ __forceinline__ void save_kv_buffer_ptr() {
     const IdType cache_offset = cache_loc[idx];
     DType* k_buffer_ptr =
         k_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
     DType* v_buffer_ptr =
         v_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
     k_vec.cast_store(k_buffer_ptr + tx * vec_size);
-
-    vec_t<float, vec_size> v_vec;
-    v_vec.cast_load(v_ptr + tx * vec_size);
     v_vec.cast_store(v_buffer_ptr + tx * vec_size);
 }
 
@@ -117,6 +118,11 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
 
       DType* k_rope_ptr = k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
 
+      vec_t<float, vec_size> v_vec;
+      if constexpr (save_kv_cache) {
+        load_v_vec();
+      }
+
       vec_t<float, vec_size> k_vec;
       if constexpr (interleave) {
         k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
@@ -126,7 +132,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
       k_vec.cast_store(k_rope_ptr + tx * vec_size);
 
       if constexpr (save_kv_cache) {
-        act_save_kv_cache();
+        save_kv_buffer_ptr();
       }
     }
   }
@@ -216,6 +222,11 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
 
       DType* k_rope_ptr = k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
 
+      vec_t<float, vec_size> v_vec;
+      if constexpr (save_kv_cache) {
+        load_v_vec();
+      }
+
       vec_t<float, vec_size> k_vec;
       if constexpr (interleave) {
         k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
@@ -225,7 +236,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
       k_vec.cast_store(k_rope_ptr + tx * vec_size);
 
       if constexpr (save_kv_cache) {
-        act_save_kv_cache();
+        save_kv_buffer_ptr();
       }
     }
   }
