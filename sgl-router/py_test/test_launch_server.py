@@ -31,6 +31,16 @@ def popen_launch_router(
     prometheus_port: int = None,
     prometheus_host: str = None,
     dp_aware: bool = False,
+    # Router retry/CB tuning (optional)
+    router_retry_max_retries: int = None,
+    router_retry_initial_backoff_ms: int = None,
+    router_retry_max_backoff_ms: int = None,
+    router_retry_backoff_multiplier: float = None,
+    router_retry_jitter_factor: float = None,
+    router_cb_failure_threshold: int = None,
+    router_cb_success_threshold: int = None,
+    router_cb_timeout_duration_secs: int = None,
+    router_cb_window_duration_secs: int = None,
 ):
     """
     Launch the router server process.
@@ -106,6 +116,21 @@ def popen_launch_router(
 
     if dp_aware:
         command.append("--router-dp-aware")
+
+    # Append router retry/CB tuning flags if provided
+    def _add(flag: str, val):
+        if val is not None:
+            command.extend([flag, str(val)])
+
+    _add("--router-retry-max-retries", router_retry_max_retries)
+    _add("--router-retry-initial-backoff-ms", router_retry_initial_backoff_ms)
+    _add("--router-retry-max-backoff-ms", router_retry_max_backoff_ms)
+    _add("--router-retry-backoff-multiplier", router_retry_backoff_multiplier)
+    _add("--router-retry-jitter-factor", router_retry_jitter_factor)
+    _add("--router-cb-failure-threshold", router_cb_failure_threshold)
+    _add("--router-cb-success-threshold", router_cb_success_threshold)
+    _add("--router-cb-timeout-duration-secs", router_cb_timeout_duration_secs)
+    _add("--router-cb-window-duration-secs", router_cb_window_duration_secs)
 
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
