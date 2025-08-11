@@ -59,6 +59,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 
+    /// Check if this policy needs request text for routing decisions
+    fn needs_request_text(&self) -> bool {
+        false // Default: most policies don't need request text
+    }
+
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
@@ -104,7 +109,7 @@ pub(crate) fn get_healthy_worker_indices(workers: &[Box<dyn Worker>]) -> Vec<usi
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.is_healthy())
+        .filter(|(_, w)| w.is_healthy() && w.circuit_breaker().can_execute())
         .map(|(idx, _)| idx)
         .collect()
 }

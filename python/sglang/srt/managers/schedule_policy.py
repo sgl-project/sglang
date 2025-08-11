@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 # This can prevent the server from being too conservative.
 # Note that this only clips the estimation in the scheduler but does not change the stop
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
+CLIP_MAX_NEW_TOKENS = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
 
@@ -305,7 +305,7 @@ class PrefillAdder:
                 [
                     min(
                         (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                        CLIP_MAX_NEW_TOKENS,
                     )
                     * self.new_token_ratio
                     for r in running_batch.reqs
@@ -388,7 +388,7 @@ class PrefillAdder:
             0,
             req.extend_input_len,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
                 if not truncated
                 else 0
             ),
@@ -455,7 +455,9 @@ class PrefillAdder:
         if not self.is_hybrid:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
-            cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
+            cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
+                req.extend_input_len
+            )
             tokens_freed = 0
             for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
                 # tokens_left gives a reservative calculation as the last token is not stored
@@ -475,7 +477,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
         else:
             if self.rem_chunk_tokens == 0:
@@ -497,7 +499,7 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
+            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
@@ -542,7 +544,7 @@ class PrefillAdder:
                     input_tokens,
                     min(
                         req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                        CLIP_MAX_NEW_TOKENS,
                     ),
                 )
             else:

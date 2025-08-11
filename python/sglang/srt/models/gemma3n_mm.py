@@ -492,5 +492,43 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             loaded_params.add(name)
         return loaded_params
 
+    lora_pattern = re.compile(
+        r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self.lora_pattern.match(module_name))
+
+    def get_hidden_dim(self, module_name):
+        # return input_dim, output_dim
+        if module_name == "qkv_proj":
+            return (
+                self.config.hidden_size,
+                self.config.head_dim
+                * (
+                    self.config.num_attention_heads
+                    + self.config.num_key_value_heads * 2
+                ),
+            )
+        elif module_name == "o_proj":
+            return (
+                self.config.head_dim * self.config.num_attention_heads,
+                self.config.hidden_size,
+            )
+        elif module_name == "gate_up_proj":
+            assert len(set(self.config.intermediate_size)) == 1, (
+                "Currently SGLang requires uniform intermediate size for all layers. "
+                "Please file an issue if you need support for non-uniform intermediate sizes."
+            )
+            return self.config.hidden_size, self.config.intermediate_size[0] * 2
+        elif module_name == "down_proj":
+            assert len(set(self.config.intermediate_size)) == 1, (
+                "Currently SGLang requires uniform intermediate size for all layers. "
+                "Please file an issue if you need support for non-uniform intermediate sizes."
+            )
+            return self.config.intermediate_size[0], self.config.hidden_size
+        else:
+            raise NotImplementedError()
+
 
 EntryClass = Gemma3nForConditionalGeneration

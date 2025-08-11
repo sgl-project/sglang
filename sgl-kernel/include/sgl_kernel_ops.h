@@ -230,7 +230,6 @@ void moe_align_block_size(
     torch::Tensor sorted_token_ids,
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
-    torch::Tensor token_cnts_buffer,
     torch::Tensor cumsum_buffer,
     bool pad_sorted_token_ids);
 
@@ -419,6 +418,7 @@ void transfer_kv_per_layer_pf_lf(
     at::Tensor dst_v,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
+    int64_t layer_id,
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
@@ -463,6 +463,7 @@ void transfer_kv_per_layer_mla_pf_lf(
     at::Tensor dst,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
+    int64_t layer_id,
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,

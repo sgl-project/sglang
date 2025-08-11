@@ -76,6 +76,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req_pool_indices, dtype=torch.int64, device=self.device
         )
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.orig_seq_lens = torch.tensor(
+            seq_lens, dtype=torch.int32, device=self.device
+        )
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 
@@ -88,6 +91,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.extend_lens = [r.extend_input_len for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+        self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(

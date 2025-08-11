@@ -185,8 +185,9 @@ class TopK(CustomOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
         if self.use_triton_kernels:
+            # renormalize=True is equivalent to sm_first=False
             routing_data, gather_idx, scatter_idx = routing(
-                router_logits, self.top_k, self.renormalize
+                router_logits, self.top_k, sm_first=not self.renormalize
             )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
         else:
@@ -244,10 +245,11 @@ class TopK(CustomOp):
 
         # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
         if global_num_experts == 256:
+            router_logits = router_logits.to(torch.float32)
             return torch_npu.npu_moe_gating_top_k(
                 router_logits,
                 k=self.top_k,
-                bias=self.correction_bias,
+                bias=self.correction_bias.to(torch.float32),
                 k_group=self.topk_group,
                 group_count=self.num_expert_group,
                 group_select_mode=1,
@@ -397,8 +399,12 @@ def grouped_topk_gpu(
         .reshape(num_token, -1)
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+    # TODO: NPU can't support directly evaluating a comparison for now
     topk_weights, topk_ids = torch.topk(
-        tmp_scores, k=topk, dim=-1, sorted=num_fused_shared_experts > 0
+        tmp_scores,
+        k=topk,
+        dim=-1,
+        sorted=(True if num_fused_shared_experts > 0 else False),
     )
     if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
@@ -435,7 +441,9 @@ def grouped_topk_cpu(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
+    assert not apply_routed_scaling_factor_on_output
     assert expert_location_dispatch_info is None
     return torch.ops.sgl_kernel.grouped_topk_cpu(
         hidden_states,
@@ -488,8 +496,12 @@ def biased_grouped_topk_impl(
     tmp_scores = scores_for_choice.masked_fill(
         ~score_mask.bool(), float("-inf")
     )  # [n, e]
+    # TODO: NPU can't support directly evaluating a comparison for now
     _, topk_ids = torch.topk(
-        tmp_scores, k=topk, dim=-1, sorted=num_fused_shared_experts > 0
+        tmp_scores,
+        k=topk,
+        dim=-1,
+        sorted=(True if num_fused_shared_experts > 0 else False),
     )
     topk_weights = scores.gather(1, topk_ids)
 

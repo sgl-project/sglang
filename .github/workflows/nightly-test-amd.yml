@@ -28,14 +28,14 @@ jobs:
       - name: Setup docker
         run: |
           touch github_summary.md
-          bash scripts/amd_ci_start_container.sh
+          bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Nightly Test
         run: |
-          bash scripts/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
+          bash scripts/ci/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
