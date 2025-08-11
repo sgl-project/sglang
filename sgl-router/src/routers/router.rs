@@ -167,6 +167,28 @@ impl Router {
             );
         }
 
+        // Spawn in a regular OS thread to avoid runtime conflicts
+        let worker_urls_owned = worker_urls.to_vec();
+        let handle = std::thread::spawn(move || {
+            Self::wait_for_healthy_workers_blocking(&worker_urls_owned, timeout_secs, interval_secs)
+        });
+
+        // Wait for the thread to complete
+        handle
+            .join()
+            .map_err(|_| "Thread panicked while waiting for workers".to_string())?
+    }
+
+    fn wait_for_healthy_workers_blocking(
+        worker_urls: &[String],
+        timeout_secs: u64,
+        interval_secs: u64,
+    ) -> Result<(), String> {
+        info!(
+            "Waiting for {} workers to become healthy (timeout: {}s)",
+            worker_urls.len(),
+            timeout_secs
+        );
         let start_time = std::time::Instant::now();
         let sync_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))

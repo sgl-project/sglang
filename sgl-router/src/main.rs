@@ -1,12 +1,45 @@
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, MetricsConfig,
-    PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, MetricsConfig, PolicyConfig,
+    RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
 use sglang_router_rs::service_discovery::ServiceDiscoveryConfig;
 use std::collections::HashMap;
+
+// Helper function to parse prefill arguments from command line
+fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut prefill_entries = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        if args[i] == "--prefill" && i + 1 < args.len() {
+            let url = args[i + 1].clone();
+            let bootstrap_port = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
+                // Check if next arg is a port number
+                if let Ok(port) = args[i + 2].parse::<u16>() {
+                    i += 1; // Skip the port argument
+                    Some(port)
+                } else if args[i + 2].to_lowercase() == "none" {
+                    i += 1; // Skip the "none" argument
+                    None
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            prefill_entries.push((url, bootstrap_port));
+            i += 2; // Skip --prefill and URL
+        } else {
+            i += 1;
+        }
+    }
+
+    prefill_entries
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "sglang-router")]
@@ -24,14 +57,18 @@ Examples:
 
   # PD disaggregated mode with same policy for both
   sglang-router --pd-disaggregation \
-    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 \
-    --decode http://decode1:8001 --decode http://decode2:8001 \
+    --prefill http://127.0.0.1:30001 9001 \
+    --prefill http://127.0.0.2:30002 9002 \
+    --decode http://127.0.0.3:30003 \
+    --decode http://127.0.0.4:30004 \
     --policy cache_aware
 
   # PD mode with different policies for prefill and decode
   sglang-router --pd-disaggregation \
-    --prefill http://prefill1:8000 --prefill http://prefill2:8000 \
-    --decode http://decode1:8001 --decode http://decode2:8001 \
+    --prefill http://127.0.0.1:30001 9001 \
+    --prefill http://127.0.0.2:30002 \
+    --decode http://127.0.0.3:30003 \
+    --decode http://127.0.0.4:30004 \
     --prefill-policy cache_aware --decode-policy power_of_two
 "#)]
 struct CliArgs {
@@ -55,12 +92,8 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     pd_disaggregation: bool,
 
-    /// Prefill server URLs (format: URL or URL:BOOTSTRAP_PORT, can be specified multiple times)
-    #[arg(long, value_delimiter = ',')]
-    prefill: Vec<String>,
-
-    /// Decode server URLs (can be specified multiple times)
-    #[arg(long, value_delimiter = ',')]
+    /// Decode server URL (can be specified multiple times)
+    #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
@@ -228,29 +261,6 @@ impl CliArgs {
         map
     }
 
-    /// Parse prefill URLs with optional bootstrap ports
-    /// Format can be either "URL" or "URL@PORT" where PORT is the bootstrap port
-    fn parse_prefill_urls(&self) -> Vec<(String, Option<u16>)> {
-        self.prefill
-            .iter()
-            .map(|url_str| {
-                // Check if there's a bootstrap port specified with @ separator
-                if let Some(at_pos) = url_str.rfind('@') {
-                    let url = url_str[..at_pos].to_string();
-                    let port_str = &url_str[at_pos + 1..];
-                    let bootstrap_port = if port_str.to_lowercase() == "none" {
-                        None
-                    } else {
-                        port_str.parse::<u16>().ok()
-                    };
-                    (url, bootstrap_port)
-                } else {
-                    (url_str.clone(), None)
-                }
-            })
-            .collect()
-    }
-
     /// Convert policy string to PolicyConfig
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
@@ -271,10 +281,12 @@ impl CliArgs {
     }
 
     /// Convert CLI arguments to RouterConfig
-    fn to_router_config(&self) -> ConfigResult<RouterConfig> {
+    fn to_router_config(
+        &self,
+        prefill_urls: Vec<(String, Option<u16>)>,
+    ) -> ConfigResult<RouterConfig> {
         // Determine routing mode
         let mode = if self.pd_disaggregation {
-            let prefill_urls = self.parse_prefill_urls();
             let decode_urls = self.decode.clone();
 
             // Validate PD configuration if not using service discovery
@@ -413,19 +425,54 @@ impl CliArgs {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse CLI arguments
-    let cli_args = CliArgs::parse();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse prefill arguments manually before clap parsing
+    let prefill_urls = parse_prefill_args();
+
+    // Filter out prefill arguments and their values before passing to clap
+    let mut filtered_args: Vec<String> = Vec::new();
+    let raw_args: Vec<String> = std::env::args().collect();
+    let mut i = 0;
+
+    while i < raw_args.len() {
+        if raw_args[i] == "--prefill" && i + 1 < raw_args.len() {
+            // Skip --prefill and its URL
+            i += 2;
+            // Also skip bootstrap port if present
+            if i < raw_args.len() && !raw_args[i].starts_with("--") {
+                if raw_args[i].parse::<u16>().is_ok() || raw_args[i].to_lowercase() == "none" {
+                    i += 1;
+                }
+            }
+        } else {
+            filtered_args.push(raw_args[i].clone());
+            i += 1;
+        }
+    }
+
+    // Parse CLI arguments with clap using filtered args
+    let cli_args = CliArgs::parse_from(filtered_args);
 
     // Print startup info
     println!("SGLang Router starting...");
     println!("Host: {}:{}", cli_args.host, cli_args.port);
-    println!("Mode: {}", if cli_args.pd_disaggregation { "PD Disaggregated" } else { "Regular" });
+    println!(
+        "Mode: {}",
+        if cli_args.pd_disaggregation {
+            "PD Disaggregated"
+        } else {
+            "Regular"
+        }
+    );
     println!("Policy: {}", cli_args.policy);
 
+    if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
+        println!("Prefill nodes: {:?}", prefill_urls);
+        println!("Decode nodes: {:?}", cli_args.decode);
+    }
+
     // Convert to RouterConfig
-    let router_config = cli_args.to_router_config()?;
+    let router_config = cli_args.to_router_config(prefill_urls)?;
 
     // Validate configuration
     router_config.validate()?;
@@ -433,8 +480,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create ServerConfig
     let server_config = cli_args.to_server_config(router_config);
 
-    // Start server
-    server::startup(server_config).await?;
+    // Create a new runtime for the server (like Python binding does)
+    let runtime = tokio::runtime::Runtime::new()?;
+
+    // Block on the async startup function
+    runtime.block_on(async move { server::startup(server_config).await })?;
 
     Ok(())
 }
