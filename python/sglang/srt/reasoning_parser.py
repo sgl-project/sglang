@@ -202,7 +202,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
         # TypeScript uses channel tokens instead of simple start/end tokens
         super().__init__(
             "<|channel|>analysis<|message|>",
@@ -214,7 +214,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
         self.final_channel_end = "<|return|>"
         self._in_final_channel = False
         self._analysis_complete = False
-        self._in_reasoning = force_reasoning
+        self._in_reasoning = True
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
@@ -281,55 +281,33 @@ class GptOssDetector(BaseReasoningFormatDetector):
             remaining = text[current_pos:]
             normal_parts.append(remaining)
 
-        # Now process the collected normal_parts for commentary channels
+        # Process non-analysis content for commentary sections
         full_normal_text = "".join(normal_parts)
 
-        # Use regex to extract and remove non-tool-call commentary content
-        # Pattern to match commentary without "to=" (not a tool call)
+        # Extract reasoning from non-tool-call commentary sections
+        # Tool calls have "to=" in their header, regular commentary does not
         commentary_pattern = re.compile(
-            r"<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)",
-            re.DOTALL,
-        )
-
-        # Find all matches and extract content for reasoning
-        for match in commentary_pattern.finditer(full_normal_text):
-            # Check if this is a tool call by looking backward for "to="
-            start_pos = match.start()
-            # Look backwards up to 100 characters to see if there's a "to=" before the match
-            lookback_start = max(0, start_pos - 100)
-            lookback_text = full_normal_text[lookback_start:start_pos]
-
-            # If no "to=" found in the lookback, this is regular commentary
-            if "to=" not in lookback_text:
-                reasoning_parts.append(match.group(1).strip())
-
-        # Remove non-tool-call commentary sections from normal text
-        # Match any commentary that is NOT a tool call (doesn't have "to=" directly after "commentary")
-        removal_pattern = re.compile(
-            r"<\|start\|>assistant<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)(?:<\|start\|>assistant)?",
+            r"<\|start\|>assistant<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)",
             re.DOTALL,
         )
 
         cleaned_text = full_normal_text
-
-        # Process matches from end to beginning to avoid index shifting
-        for match in reversed(list(removal_pattern.finditer(full_normal_text))):
-            # Get the full match including what comes before <|channel|>commentary
-            full_match_start = match.start()
-
-            # Look for "to=" between <|channel|>commentary and <|message|>
-            commentary_start = full_match_start + len(
-                "<|start|>assistant<|channel|>commentary"
-            )
-            message_start = full_normal_text.find("<|message|>", commentary_start)
-
-            if message_start != -1:
-                between_text = full_normal_text[commentary_start:message_start]
-                # If there's no "to=" in this section, it's not a tool call
-                if " to=" not in between_text:
-                    cleaned_text = (
-                        cleaned_text[: match.start()] + cleaned_text[match.end() :]
-                    )
+        for match in reversed(list(commentary_pattern.finditer(full_normal_text))):
+            # Check if this commentary is a tool call by looking at the text before <|message|>
+            match_start = match.start()
+            # Find the start of this commentary section
+            commentary_start = full_normal_text.rfind("<|channel|>commentary", 0, match_start)
+            if commentary_start != -1:
+                # Extract text between "commentary" and "<|message|>"
+                message_pos = full_normal_text.find("<|message|>", commentary_start)
+                if message_pos != -1:
+                    between_text = full_normal_text[commentary_start:message_pos]
+                    # If no "to=" found, this is regular commentary (reasoning content)
+                    if " to=" not in between_text:
+                        content = match.group(1).strip()
+                        reasoning_parts.append(content)
+                        # Remove this commentary section from normal text
+                        cleaned_text = cleaned_text[:match.start()] + cleaned_text[match.end():]
 
         full_normal_text = cleaned_text
 
@@ -471,7 +449,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             else:
                 break
 
-        # Process complete commentary sections (non-tool calls)
+        # Process complete commentary sections
         commentary_pattern = re.compile(
             r"<\|start\|>assistant<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)",
             re.DOTALL,
@@ -480,23 +458,16 @@ class GptOssDetector(BaseReasoningFormatDetector):
         for match in reversed(list(commentary_pattern.finditer(self._buffer))):
             # Check if this is a tool call
             start_pos = match.start()
-            lookback_start = max(0, start_pos - 50)
-            lookback_text = self._buffer[lookback_start:start_pos]
+            commentary_content = match.group(1).strip()
+            if self.stream_reasoning and commentary_content:
+                result.reasoning_text += commentary_content
 
-            if "to=" not in lookback_text:
-                # Not a tool call, extract for reasoning
-                commentary_content = match.group(1).strip()
-                if self.stream_reasoning and commentary_content:
-                    result.reasoning_text += commentary_content
-
-                # Remove this commentary section
-                self._buffer = (
-                    self._buffer[: match.start()] + self._buffer[match.end() :]
-                )
-                # Clean up any standalone <|start|>assistant
-                self._buffer = re.sub(
-                    r"<\|start\|>assistant(?=<\|start\|>assistant)", "", self._buffer
-                )
+            # Remove this commentary section
+            self._buffer = self._buffer[: match.start()] + self._buffer[match.end() :]
+            # Clean up any standalone <|start|>assistant
+            self._buffer = re.sub(
+                r"<\|start\|>assistant(?=<\|start\|>assistant)", "", self._buffer
+            )
 
         # Handle final channel completion
         if self.final_channel_start in self._buffer:

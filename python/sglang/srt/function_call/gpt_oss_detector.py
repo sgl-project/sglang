@@ -78,22 +78,23 @@ class GptOssDetector(BaseFormatDetector):
         calls = []
         tool_index = 0
 
-        # Handle commentary without to= parameter (action plans)
-        commentary_match = self.commentary_pattern.search(text)
-        if commentary_match:
-            # Commentary content is treated as normal text
-            normal_text = commentary_match.group(1)
-            return StreamingParseResult(normal_text=normal_text, calls=[])
-
-        # Handle function calls with to= parameter
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx] if idx != -1 else ""
-
-        last_match_end = 0
+        # Process the entire text to handle mixed commentary and tool calls
+        normal_text_parts = []
+        
+        # Find all commentary sections (both with and without to=)
+        all_commentary_pattern = re.compile(
+            r"<\|channel\|>commentary(?:\s+to=[^<]*)?<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)",
+            re.DOTALL,
+        )
+        
+        # Track processed positions to avoid double-processing
+        processed_ranges = []
+        
+        # First, extract all tool calls
         for match in self.function_call_pattern.finditer(text):
             full_function_name = match.group(1)
             args_content = match.group(2)
-            last_match_end = match.end()
+            processed_ranges.append((match.start(), match.end()))
 
             function_name = (
                 full_function_name.split(".")[-1]
@@ -116,9 +117,26 @@ class GptOssDetector(BaseFormatDetector):
                 )
                 tool_index += 1
 
-        # Include any remaining text after all function calls
-        if last_match_end > 0 and last_match_end < len(text):
-            remaining_text = text[last_match_end:]
+        # Then, find non-tool-call commentary sections for normal text
+        for match in all_commentary_pattern.finditer(text):
+            # Check if this match overlaps with any processed tool call
+            match_start, match_end = match.start(), match.end()
+            is_tool_call = any(
+                start <= match_start < end or start < match_end <= end
+                for start, end in processed_ranges
+            )
+            
+            # If this commentary is not part of a tool call, include it in normal text
+            if not is_tool_call:
+                content = match.group(1).strip()
+                if content:
+                    normal_text_parts.append(content)
+
+        # Handle remaining text after all matches
+        if processed_ranges:
+            last_match_end = max(end for _, end in processed_ranges)
+            if last_match_end < len(text):
+                remaining_text = text[last_match_end:]
 
             # Clean up <|start|>assistant prefixes and extract final content
             # Remove standalone <|start|>assistant prefixes
@@ -145,13 +163,11 @@ class GptOssDetector(BaseFormatDetector):
             remaining_text = remaining_text.strip()
 
             if remaining_text:
-                normal_text = (
-                    (normal_text + remaining_text).strip()
-                    if normal_text
-                    else remaining_text
-                )
+                normal_text_parts.append(remaining_text)
 
-        return StreamingParseResult(normal_text=normal_text.strip(), calls=calls)
+        # Combine all normal text parts
+        final_normal_text = " ".join(part for part in normal_text_parts if part).strip()
+        return StreamingParseResult(normal_text=final_normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
