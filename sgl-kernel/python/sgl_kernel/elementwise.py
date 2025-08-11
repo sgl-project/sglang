@@ -315,7 +315,7 @@ def apply_rope_with_cos_sin_cache_inplace(
         assert a.v_scale is None, "v_scale is not yet supported"
         assert a.cache_loc.dtype == torch.int64, f"{a.cache_loc.dtype=}"
 
-    torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer.default(
+    torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
         query.view(query.shape[0], -1, head_size),
         key.view(key.shape[0], -1, head_size),
         query.view(query.shape[0], -1, head_size),
@@ -324,11 +324,8 @@ def apply_rope_with_cos_sin_cache_inplace(
         positions.long(),
         (not is_neox),
         get_cuda_stream(),
+        value,
         k_buffer,
         v_buffer,
-        1.0 if k_scale is None else k_scale,
-        1.0 if v_scale is None else v_scale,
-        value,
         cache_loc,
-        save_kv_cache,
     )
