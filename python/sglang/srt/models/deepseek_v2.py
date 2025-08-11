@@ -2024,7 +2024,7 @@ class DeepseekV2Model(nn.Module):
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
-                prefix=add_prefix(f"layers.{idx}", prefix),
+                prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
