@@ -234,7 +234,7 @@ def write_data_for_multi_tokenizer(
     return port_args_shm, server_args_shm, scheduler_info_shm
 
 
-def init_multi_tokenizer() -> ServerArgs:
+async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
     pid = os.getpid()
     main_pid = get_main_process_id()
@@ -262,7 +262,7 @@ def init_multi_tokenizer() -> ServerArgs:
         completion_template=server_args.completion_template,
     )
     # register multi tokenizer
-    tokenizer_manager.register_to_main_tokenizer_manager()
+    await tokenizer_manager.register_to_main_tokenizer_manager()
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     set_global_state(
@@ -280,7 +280,7 @@ async def lifespan(fast_api_app: FastAPI):
     server_args = getattr(fast_api_app, "server_args", None)
     if server_args is None:
         # for multi-tokenizer
-        fast_api_app.server_args = init_multi_tokenizer()
+        fast_api_app.server_args = await init_multi_tokenizer()
         fast_api_app.warmup_thread = threading.Thread(
             target=_wait_and_warmup,
             args=(
@@ -358,7 +358,7 @@ async def lifespan(fast_api_app: FastAPI):
             pid = os.getpid()
             logger.info(f"uvicorn worker {pid} ending...")
             warmup_thread.join()
-            logger.info(f"uvicorn {pid} ended")
+            logger.info(f"uvicorn worker {pid} ended.")
 
 
 # Fast API

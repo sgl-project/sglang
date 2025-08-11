@@ -290,6 +290,7 @@ class DetokenizerManager:
         if worker_id_int not in self.tokenizer_mapping:
             socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
             self.tokenizer_mapping[worker_id_int] = socket
+            self.tokenizer_mapping[worker_id_int].send_pyobj(recv_obj)
             logger.info(
                 f"Detokenizer Manager Created ZMQ socket for worker {worker_id} with ipc_name {ipc_name}"
             )

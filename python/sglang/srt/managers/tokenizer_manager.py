@@ -431,6 +431,9 @@ class TokenizerManager:
         self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.register_multi_tokenizer_communicator = _Communicator(
+            self.send_to_scheduler, 2
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -500,6 +503,10 @@ class TokenizerManager:
                 (
                     LoRAUpdateResult,
                     self.update_lora_adapter_communicator.handle_recv,
+                ),
+                (
+                    MultiTokenizerRegisterReq,
+                    self.register_multi_tokenizer_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -1585,6 +1592,7 @@ class TokenizerManager:
             if worker_id_int not in self.tokenizer_mapping:
                 socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
                 self.tokenizer_mapping[worker_id_int] = socket
+                self.tokenizer_mapping[worker_id_int].send_pyobj(recv_obj)
                 logger.info(
                     f"Main Tokenizer Manager Created ZMQ socket for worker {worker_id} with ipc_name {ipc_name}"
                 )
@@ -1924,13 +1932,13 @@ class TokenizerManager:
                         f"Failed to send result to worker {worker_id}: {e}"
                     ) from e
 
-    def register_to_main_tokenizer_manager(self):
+    async def register_to_main_tokenizer_manager(self):
         """Register this worker to the main TokenizerManager"""
-        req = MultiTokenizerRegisterReq()
-        req.rids = [f"{self.worker_id}_registertokenizer"]
+        # create a handle loop to receive messages from the main TokenizerManager
+        self.auto_create_handle_loop()
+        req = MultiTokenizerRegisterReq(rids=["register_multitokenizer"])
         req.ipc_name = self.tokenizer_ipc_name
-        self.send_to_scheduler.send_pyobj(req)
-        time.sleep(5)
+        await self.register_multi_tokenizer_communicator(req)
 
     def _handle_batch_output(
         self,
