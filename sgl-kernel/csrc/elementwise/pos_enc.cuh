@@ -23,8 +23,9 @@ namespace flashinfer {
 namespace kv_buffer_saver {
 
 template <typename DType, uint32_t vec_size>
-__device__ __forceinline__ void load_v_vec(
+__device__ __forceinline__ void prepare(
     vec_t<float, vec_size>& v_vec,
+    IdType& kv_cache_offset,
     const DType* v,
     const uint32_t idx,
     const uint32_t tx,
@@ -33,10 +34,13 @@ __device__ __forceinline__ void load_v_vec(
     const size_t v_stride_h) {
   const DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
   v_vec.cast_load(v_ptr + tx * vec_size);
+
+  kv_cache_offset = kv_cache_loc[idx];
 }
 
 template <typename DType, typename IdType, uint32_t vec_size>
-__device__ __forceinline__ void save_kv_buffer_ptr(
+__device__ __forceinline__ void save(
+    const IdType& kv_cache_offset,
     const vec_t<float, vec_size>& k_vec,
     const vec_t<float, vec_size>& v_vec,
     const DType* k_buffer,
@@ -49,16 +53,15 @@ __device__ __forceinline__ void save_kv_buffer_ptr(
     const size_t k_buffer_stride_h,
     const size_t v_buffer_stride_n,
     const size_t v_buffer_stride_h) {
-  const IdType cache_offset = kv_cache_loc[idx];
   const DType* k_buffer_ptr =
-      k_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
+      k_buffer + get_elem_offset_impl(kv_cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
   const DType* v_buffer_ptr =
-      v_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
+      v_buffer + get_elem_offset_impl(kv_cache_offset, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
   k_vec.cast_store(k_buffer_ptr + tx * vec_size);
   v_vec.cast_store(v_buffer_ptr + tx * vec_size);
 }
 
-}
+}  // namespace kv_buffer_saver
 
 template <
     bool save_kv_cache,
@@ -144,8 +147,10 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
       DType* k_rope_ptr = k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
 
       vec_t<float, vec_size> v_vec;
+      IdType kv_cache_offset;
       if constexpr (save_kv_cache) {
-        load_v_vec<DType, vec_size>(v_vec, v, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
+        kv_buffer_saver::prepare<DType, vec_size>(
+            v_vec, kv_cache_offset, v, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
       }
 
       vec_t<float, vec_size> k_vec;
@@ -158,6 +163,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
 
       if constexpr (save_kv_cache) {
         save_kv_buffer_ptr<DType, IdType, vec_size>(
+            kv_cache_offset,
             k_vec,
             v_vec,
             k_buffer,
