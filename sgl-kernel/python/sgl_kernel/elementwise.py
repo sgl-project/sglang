@@ -241,6 +241,9 @@ if torch.version.hip is not None:
 @dataclass
 class FusedSetKVBufferArg:
     """
+    value : Optional[torch.Tensor]
+        Value tensor, shape: ``(nnz, num_v_heads * head_size)``.
+        If provided, the function will also apply RoPE to the value tensor.
     k_buffer : Optional[torch.Tensor]
         Buffer for keys, shape: ``(nnz, num_k_heads * head_size)``.
         If provided, the function will set the buffer inplace.
@@ -255,6 +258,7 @@ class FusedSetKVBufferArg:
         Cache location tensor, used for indexing kv cache.
     """
 
+    value: torch.Tensor
     k_buffer: torch.Tensor
     v_buffer: torch.Tensor
     k_scale: Optional[float]
@@ -269,7 +273,6 @@ def apply_rope_with_cos_sin_cache_inplace(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
-    value: Optional[torch.Tensor] = None,
     fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
 ) -> None:
     r"""
@@ -297,9 +300,6 @@ def apply_rope_with_cos_sin_cache_inplace(
 
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
-    value : Optional[torch.Tensor]
-        Value tensor, shape: ``(nnz, num_v_heads * head_size)``.
-        If provided, the function will also apply RoPE to the value tensor.
     fused_set_kv_buffer_arg : FusedSetKVBufferArg
         Fuse the set-kv-buffer operation into this kernel
 

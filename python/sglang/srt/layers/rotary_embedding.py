@@ -26,7 +26,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 if _is_cuda:
-    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
+    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace, FusedSetKVBufferArg
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 
@@ -222,6 +222,7 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
@@ -231,17 +232,12 @@ class RotaryEmbedding(CustomOp):
                 head_size=self.head_size,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
-                value=value,
-                k_buffer=k_buffer_ptr,
-                v_buffer=v_buffer_ptr,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                cache_loc=cache_loc,
+                fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
             )
         else:
             assert (
-                not save_kv_cache
-            ), "save_kv_cache is not supported for vllm_rotary_embedding."
+                fused_set_kv_buffer_arg is None
+            ), "save kv cache is not supported for vllm_rotary_embedding."
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             self.vllm_rotary_embedding(
                 positions,
