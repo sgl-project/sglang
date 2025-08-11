@@ -243,14 +243,7 @@ def test_correctness(
         value = torch.randn(
             batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
         )
-        out_cache_loc = torch.randint(
-            0,
-            _KV_POOL_SIZE,
-            (batch_size * seq_len,),
-            dtype=torch.int64,
-            device=device,
-        )
-        TODO_should_be_unique
+        out_cache_loc = torch.randperm(_KV_POOL_SIZE, dtype=torch.int64, device=device)[:batch_size * seq_len].clone()
 
     if save_kv_cache:
         pool_ref = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
