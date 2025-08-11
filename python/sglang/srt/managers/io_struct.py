@@ -99,24 +99,23 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # Whether to return hidden states
+    return_hidden_states: Union[List[bool], bool] = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
+    # Session info for continual prompting
+    session_params: Optional[Union[List[Dict], Dict]] = None
+
     # The path to the LoRA adaptors
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    # Session info for continual prompting
-    session_params: Optional[Union[List[Dict], Dict]] = None
-
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
-
-    # Whether to return hidden states
-    return_hidden_states: Union[List[bool], bool] = False
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -125,6 +124,9 @@ class GenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # For background responses (OpenAI responses API)
+    background: bool = False
 
     def contains_mm_input(self) -> bool:
         return (
@@ -559,6 +561,9 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+
+    # For background responses (OpenAI responses API)
+    background: bool = False
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -1076,6 +1081,8 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+    # Whether to pin the LoRA adapter in memory.
+    pinned: bool = False
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
 
@@ -1084,6 +1091,7 @@ class LoadLoRAAdapterReqInput:
             lora_id=self.lora_id,
             lora_name=self.lora_name,
             lora_path=self.lora_path,
+            pinned=self.pinned,
         )
 
 

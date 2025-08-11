@@ -120,6 +120,7 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
+from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
@@ -472,8 +473,10 @@ class Scheduler(
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
+        self.offload_tags = set()
         self.init_profier()
 
+        self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
             if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
@@ -608,14 +611,10 @@ class Scheduler(
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
-                    hicache_io_backend=(
-                        "direct"
-                        if server_args.attention_backend
-                        == "fa3"  # hot fix for incompatibility
-                        else server_args.hicache_io_backend
-                    ),
+                    hicache_io_backend=server_args.hicache_io_backend,
                     hicache_mem_layout=server_args.hicache_mem_layout,
                     hicache_storage_backend=server_args.hicache_storage_backend,
+                    hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -946,6 +945,14 @@ class Scheduler(
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+
+        if self.recv_skipper is not None:
+            last_forward_mode = (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            )
+            if not self.recv_skipper.handle(last_forward_mode):
+                return []
+
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0:
                 recv_reqs = []
@@ -1029,7 +1036,9 @@ class Scheduler(
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
-                self.chunked_req is not None or not self.running_batch.is_empty()
+                self.chunked_req is not None
+                or not self.running_batch.is_empty()
+                or len(self.offload_tags) > 0
             ):
                 self.return_health_check_ct += 1
                 continue
@@ -1538,14 +1547,11 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if (
-                self.enable_lora
-                and len(
-                    lora_set
-                    | set([req.lora_id for req in adder.can_run_list])
-                    | set([req.lora_id])
-                )
-                > self.max_loras_per_batch
+
+            if self.enable_lora and not self.tp_worker.can_run_lora_batch(
+                lora_set
+                | set([req.lora_id for req in adder.can_run_list])
+                | set([req.lora_id])
             ):
                 self.running_batch.batch_is_full = True
                 break
@@ -1562,7 +1568,10 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                self.tree_cache.check_prefetch_progress(req.rid)
+                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
+                    continue
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
