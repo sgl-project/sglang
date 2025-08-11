@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytest
 import torch
-from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
+from sgl_kernel import apply_rope_with_cos_sin_cache_inplace, FusedSetKVBufferArg
 
 
 # vLLM torch native
@@ -125,6 +125,7 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -132,6 +133,7 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
             positions=positions,
             query=query,
             key=key,
+            fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
             head_size=self.head_size,
             cos_sin_cache=self.cos_sin_cache,
             is_neox=self.is_neox_style,
@@ -235,14 +237,19 @@ def test_correctness(
     query_flashinfer, key_flashinfer = query.clone(), key.clone()
 
     query_ref_out, key_ref_out = rope_ref.forward_native(pos_ids, query_ref, key_ref)
+    if save_kv_cache:
+        TODO.set_kv_buffer(TODO)
+
     query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(
-        pos_ids, query_flashinfer, key_flashinfer
+        pos_ids, query_flashinfer, key_flashinfer,
+        fused_set_kv_buffer_arg=TODO if save_kv_cache else None,
     )
 
     torch.testing.assert_close(
         query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
+    assert torch.all(TODO_kv_ref == TODO_kv_flashinfer)
 
 
 if __name__ == "__main__":
