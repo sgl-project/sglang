@@ -20,15 +20,28 @@
 
 namespace flashinfer {
 
-__device__ __forceinline__ void load_v_vec(vec_t<float, vec_size>& v_vec
-                                           // TODO args
+template<typename DType, uint32_t vec_size>
+__device__ __forceinline__ void load_v_vec(
+    vec_t<float, vec_size>& v_vec,
+    const uint32_t idx,
+    const uint32_t tx,
+    const uint32_t kv_head_idx,
+    const size_t v_stride_n,
+    const size_t v_stride_h,
 ) {
   DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
   v_vec.cast_load(v_ptr + tx * vec_size);
 }
 
+template<typename DType, typename IdType, uint32_t vec_size>
 __device__ __forceinline__ void save_kv_buffer_ptr(
-    // TODO args
+    const uint32_t idx,
+    const uint32_t tx,
+    const uint32_t kv_head_idx,
+    size_t k_buffer_stride_n,
+    size_t k_buffer_stride_h,
+    size_t v_buffer_stride_n,
+    size_t v_buffer_stride_h,
 ) {
   const IdType cache_offset = cache_loc[idx];
   DType* k_buffer_ptr =
@@ -124,7 +137,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
 
       vec_t<float, vec_size> v_vec;
       if constexpr (save_kv_cache) {
-        load_v_vec(v_vec);
+        load_v_vec<DType, vec_size>( v_vec, idx, tx, kv_head_idx, v_stride_n, v_stride_h );
       }
 
       vec_t<float, vec_size> k_vec;
@@ -136,7 +149,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
       k_vec.cast_store(k_rope_ptr + tx * vec_size);
 
       if constexpr (save_kv_cache) {
-        save_kv_buffer_ptr();
+        save_kv_buffer_ptr<DType, IdType, vec_size>( idx, tx, kv_head_idx, k_buffer_stride_n, k_buffer_stride_h, v_buffer_stride_n, v_buffer_stride_h );
       }
     }
   }
@@ -228,7 +241,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
 
       vec_t<float, vec_size> v_vec;
       if constexpr (save_kv_cache) {
-        load_v_vec(v_vec);
+        load_v_vec<DType, vec_size>( v_vec, idx, tx, kv_head_idx, v_stride_n, v_stride_h );
       }
 
       vec_t<float, vec_size> k_vec;
@@ -240,7 +253,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
       k_vec.cast_store(k_rope_ptr + tx * vec_size);
 
       if constexpr (save_kv_cache) {
-        save_kv_buffer_ptr();
+        save_kv_buffer_ptr<DType, IdType, vec_size>( idx, tx, kv_head_idx, k_buffer_stride_n, k_buffer_stride_h, v_buffer_stride_n, v_buffer_stride_h );
       }
     }
   }
