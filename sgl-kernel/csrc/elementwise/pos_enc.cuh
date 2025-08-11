@@ -20,7 +20,9 @@
 
 namespace flashinfer {
 
-__device__ __forceinline__ void load_v_vec() {
+__device__ __forceinline__ void load_v_vec(
+    vec_t<float, vec_size>& v_vec
+) {
     DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
     v_vec.cast_load(v_ptr + tx * vec_size);
 }
@@ -120,7 +122,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
 
       vec_t<float, vec_size> v_vec;
       if constexpr (save_kv_cache) {
-        load_v_vec();
+        load_v_vec(v_vec);
       }
 
       vec_t<float, vec_size> k_vec;
@@ -224,7 +226,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
 
       vec_t<float, vec_size> v_vec;
       if constexpr (save_kv_cache) {
-        load_v_vec();
+        load_v_vec(v_vec);
       }
 
       vec_t<float, vec_size> k_vec;
