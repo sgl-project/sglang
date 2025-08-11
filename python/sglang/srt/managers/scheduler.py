@@ -1260,7 +1260,7 @@ class Scheduler(
     def _pass_queued_limit_validation(
         self, recv_req: Req, heapify: bool = False
     ) -> bool:
-        """Returns True if the given request can be added to the queue. If at capacity, abort incoming or existing request to free up the queue if needed."""
+        """Returns True if the given request can be added to the queue. If at capacity, abort incoming or existing request to free up the queue."""
         # If no limit is configured, or the limit hasn't been reached, skip validation.
         if (
             self.max_queued_requests is None
