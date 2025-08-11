@@ -327,6 +327,7 @@ class PDRegistryRequest:
                 f"Invalid mode: {self.mode}. Must be 'prefill' or 'decode'."
             )
 
+
 def register_disaggregation_server(
     mode: str, server_port: int, bootstrap_port: int, pdlb_url: str
 ):

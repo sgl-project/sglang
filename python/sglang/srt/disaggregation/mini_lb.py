@@ -417,20 +417,20 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
 
     server_url = obj.server_url
     if server_url in load_balancer.prefill_servers:
-        # if len(load_balancer.prefill_servers) <= 1:
-        #     raise HTTPException(
-        #         status_code=400,
-        #         detail=f"Cannot convert {server_url} to decode, at least one prefill server is required.",
-        #     )
+        if len(load_balancer.prefill_servers) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot convert {server_url} to decode, at least one prefill server is required.",
+            )
         current_role = "prefill"
         load_balancer.remove_prefill_server(server_url)
         logger.info(f"Stop sending req to {server_url}.Waiting for prefill to finish all reqs.")
     elif server_url in load_balancer.decode_servers:
-        # if len(load_balancer.decode_servers) <= 1:
-        #     raise HTTPException(
-        #         status_code=500,
-        #         detail=f"Cannot convert {server_url} to prefill, at least one decode server is required.",
-        #     )
+        if len(load_balancer.decode_servers) <= 1:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Cannot convert {server_url} to prefill, at least one decode server is required.",
+            )
         current_role = "decode"
         load_balancer.remove_decode_server(server_url)
         logger.info(f"Stop sending req to {server_url}.Waiting for decode to finish all reqs.")
@@ -474,7 +474,13 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
         
     # wait scheduler event loop ready
     async with aiohttp.ClientSession() as session:
-        response = await session.get(f"{server_url}/get_server_info")
+        try:
+            response = await session.get(f"{server_url}/get_server_info",timeout=10)
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Can not recieve server info from {server_url} in 10s, maybe role conversion failed.",
+            )
 
     finished_time = time.perf_counter()
     logger.info(f"Convert role finished in {(finished_time-wating_time):.2f}s, response: {content}")
