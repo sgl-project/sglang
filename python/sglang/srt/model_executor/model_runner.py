@@ -1323,18 +1323,18 @@ class ModelRunner:
             max_M=self.model_config.hf_config.max_position_embeddings, 
             N=self.model_config.hf_config.hidden_size, 
             K=(self.model_config.hf_config.hidden_size // self.tp_size),
-            input_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
+            input_dtype=self.model_config.dtype,
+            output_dtype=self.model_config.dtype,
             local_world_size=self.tp_size, persistent=True, copy_to_local=False,
             use_ll_kernel=False, NUM_COMM_SMS=2)
-        
+        torch.distributed.breakpoint()
         self.gemm_ar_mlp_op = GemmARLayer(
             tp_group=ps._TP_OVERLAP_GROUP,
             max_M=self.model_config.hf_config.max_position_embeddings, 
             N=self.model_config.hf_config.hidden_size, 
             K=(self.model_config.hf_config.intermediate_size // self.tp_size),
-            input_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
+            input_dtype=self.model_config.dtype,
+            output_dtype=self.model_config.dtype,
             local_world_size=self.tp_size, persistent=True, copy_to_local=False,
             use_ll_kernel=False, NUM_COMM_SMS=2)
         
