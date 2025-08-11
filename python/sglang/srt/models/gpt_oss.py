@@ -204,10 +204,13 @@ def _create_fused_set_kv_buffer_arg(
     layer_id = layer.layer_id
     token_to_kv_pool = forward_batch.token_to_kv_pool
 
+    k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+    v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+
     return FusedSetKVBufferArg(
         value=value,
-        k_buffer=token_to_kv_pool.get_key_buffer(layer_id),
-        v_buffer=token_to_kv_pool.get_value_buffer(layer_id),
+        k_buffer=k_buffer.view(k_buffer.shape[0], -1),
+        v_buffer=v_buffer.view(v_buffer.shape[0], -1),
         k_scale=layer.k_scale,
         v_scale=layer.v_scale,
         cache_loc=forward_batch.out_cache_loc,
