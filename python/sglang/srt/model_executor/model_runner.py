@@ -135,11 +135,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
 
-import nvshmem.core.utils
-from triton_dist.utils import init_nvshmem_by_torch_process_group
-
-nvshmem.core.utils._configure_logging(level="DEBUG")
-
 
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
@@ -1321,6 +1316,7 @@ class ModelRunner:
             return
 
         from triton_dist.layers.nvidia import GemmARLayer
+        from triton_dist.utils import init_nvshmem_by_torch_process_group
 
         _TP_OVERLAP_GROUP = torch.distributed.new_group(
             ranks=self.tp_group.ranks, backend="gloo"
