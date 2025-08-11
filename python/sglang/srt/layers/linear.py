@@ -1277,7 +1277,6 @@ class RowParallelLinear(LinearBase):
             # It does not support additional parameters.
             param.load_row_parallel_weight(loaded_weight)
 
-
     def forward(self, input_, skip_all_reduce=False):
         if self.input_is_parallel:
             input_parallel = input_

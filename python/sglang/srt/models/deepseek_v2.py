@@ -208,7 +208,6 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-
     def forward(
         self,
         x,
@@ -1897,7 +1896,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             and not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
             and not self.is_nextn
         )
-
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(

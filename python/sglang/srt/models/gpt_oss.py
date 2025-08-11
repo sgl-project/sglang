@@ -64,7 +64,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers, is_cuda, is_flashinfer_available
+from sglang.srt.utils import add_prefix, is_cuda, is_flashinfer_available, make_layers
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
@@ -154,8 +154,8 @@ class GptOssSparseMoeBlock(nn.Module):
         )
 
     def forward(
-        self, 
-        hidden_states: torch.Tensor, 
+        self,
+        hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
@@ -172,7 +172,7 @@ class GptOssSparseMoeBlock(nn.Module):
         ]
 
     def forward_normal(
-        self, 
+        self,
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
@@ -476,9 +476,7 @@ class GptOssDecoderLayer(nn.Module):
             and not self.is_nextn
         )
 
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion
-        )
+        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
