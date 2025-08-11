@@ -186,7 +186,7 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
-class GPTOSSDetector(BaseReasoningFormatDetector):
+class GptOssDetector(BaseReasoningFormatDetector):
     """
     Detector for T4-style reasoning format.
 
@@ -207,13 +207,14 @@ class GPTOSSDetector(BaseReasoningFormatDetector):
         super().__init__(
             "<|channel|>analysis<|message|>",
             "<|end|>",
-            force_reasoning=True,  # TODO: Test if this is true.
+            force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
         self.final_channel_start = "<|start|>assistant<|channel|>final<|message|>"
         self.final_channel_end = "<|return|>"
         self._in_final_channel = False
         self._analysis_complete = False
+        self._in_reasoning = force_reasoning
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
@@ -231,6 +232,7 @@ class GPTOSSDetector(BaseReasoningFormatDetector):
         ):
             # Split on "assistantfinal"
             parts = text.split("assistantfinal", 1)
+            self._in_reasoning = False
             if len(parts) == 2:
                 reasoning_text = parts[0][
                     len("analysis") :
@@ -390,83 +392,137 @@ class GPTOSSDetector(BaseReasoningFormatDetector):
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
-        Streaming incremental parsing for TypeScript two-channel format.
+        Streaming incremental parsing for GPT-OSS format.
+
+        This is a simplified streaming implementation that accumulates content
+        and delegates to the non-streaming parser for complex multi-channel parsing.
+        TODO: Implement proper incremental parsing for better streaming performance.
         """
         self._buffer += new_text
-        current_text = self._buffer
 
-        tokens = [
-            self.think_start_token,
-            self.think_end_token,
-            self.final_channel_start,
-            self.final_channel_end,
-        ]
-        # Check if we're at a potential token boundary
-        if any(
-            token.startswith(current_text) and token != current_text for token in tokens
-        ):
+        if not self._in_reasoning:
+            return StreamingParseResult(normal_text=new_text)
+
+        # Check if we have complete sections to process
+        # For GPT-OSS, we need to wait for complete channel sections
+        # HACK: For now, use simplified approach - wait for key markers before processing
+        key_markers = ["<|end|>", "<|call|>", "<|return|>", "assistantfinal"]
+        has_complete_section = any(marker in self._buffer for marker in key_markers)
+
+        if not has_complete_section:
+            # Still accumulating, don't process yet
             return StreamingParseResult()
 
-        # Handle analysis channel
-        if not self._analysis_complete:
-            if self.think_start_token in current_text:
-                # Strip analysis start token
-                if not self.stripped_think_start:
-                    start_idx = current_text.find(self.think_start_token)
-                    current_text = current_text[
-                        start_idx + len(self.think_start_token) :
-                    ]
-                    self.stripped_think_start = True
-                    self._in_reasoning = True
-                    self._buffer = current_text
+        # Handle simplified format (analysis...assistantfinal) with true incremental streaming
+        if (
+            "<|channel|>" not in self._buffer
+        ):  # Simplified format without channel markers
+            if self._buffer.startswith("analysis"):
+                # Check if we have the transition to assistantfinal
+                if "assistantfinal" in self._buffer:
+                    self._in_reasoning = False
+                    # Complete reasoning section - extract and stream it
+                    parts = self._buffer.split("assistantfinal", 1)
+                    reasoning_text = parts[0][len("analysis") :].strip()
+                    final_content = parts[1].strip()
 
-            # Check for end of analysis
-            if self._in_reasoning and self.think_end_token in current_text:
-                end_idx = current_text.find(self.think_end_token)
-                reasoning_text = current_text[:end_idx]
-                self._buffer = current_text[end_idx + len(self.think_end_token) :]
-                self._in_reasoning = False
-                self._analysis_complete = True
-
-                return StreamingParseResult(reasoning_text=reasoning_text.rstrip())
-            elif self._in_reasoning and self.stream_reasoning:
-                # Stream analysis content
-                self._buffer = ""
-                return StreamingParseResult(reasoning_text=current_text)
-            else:
-                # Accumulate analysis content
-                return StreamingParseResult()
-
-        # Handle final channel
-        if self._analysis_complete or not self._in_reasoning:
-            if self.final_channel_start in current_text:
-                if not self._in_final_channel:
-                    start_idx = current_text.find(self.final_channel_start)
-                    current_text = current_text[
-                        start_idx + len(self.final_channel_start) :
-                    ]
-                    self._in_final_channel = True
-                    self._buffer = current_text
-
-            # Check for end of final channel
-            elif self._in_final_channel:
-                if self.final_channel_end in current_text:
-                    end_idx = current_text.find(self.final_channel_end)
-                    normal_text = current_text[:end_idx]
+                    # Clear buffer and return both reasoning and final content
                     self._buffer = ""
-                    self._in_final_channel = False
-
-                    return StreamingParseResult(normal_text=normal_text.rstrip())
+                    return StreamingParseResult(
+                        reasoning_text=reasoning_text if self.stream_reasoning else "",
+                        normal_text=final_content,
+                    )
+                elif self.stream_reasoning:
+                    # Stream reasoning content incrementally as it arrives
+                    current_reasoning = self._buffer[len("analysis") :].strip()
+                    self._buffer = ""
+                    return StreamingParseResult(reasoning_text=current_reasoning)
                 else:
-                    # Stream final content (still accumulating)
-                    self._buffer = ""
-                    return StreamingParseResult(normal_text=current_text)
-            elif not self._in_reasoning and not self._in_final_channel:
-                # Regular text before any channel
+                    # Wait for assistantfinal
+                    return StreamingParseResult()
+            elif self._buffer.startswith("assistantfinal"):
+                # Direct final content without analysis
+                final_content = self._buffer[len("assistantfinal") :].strip()
                 self._buffer = ""
-                return StreamingParseResult(normal_text=new_text)
+                return StreamingParseResult(normal_text=final_content)
 
-        return StreamingParseResult()
+        # For full channel format, process sections as they complete
+        result = StreamingParseResult()
+
+        # Process complete analysis sections
+        while (
+            self.think_start_token in self._buffer
+            and self.think_end_token in self._buffer
+        ):
+            start_idx = self._buffer.find(self.think_start_token)
+            start_pos = start_idx + len(self.think_start_token)
+            end_pos = self._buffer.find(self.think_end_token, start_pos)
+
+            if end_pos != -1:
+                reasoning_content = self._buffer[start_pos:end_pos].strip()
+                if self.stream_reasoning and reasoning_content:
+                    result.reasoning_text += reasoning_content
+
+                # Remove processed analysis section
+                self._buffer = (
+                    self._buffer[:start_idx]
+                    + self._buffer[end_pos + len(self.think_end_token) :]
+                )
+            else:
+                break
+
+        # Process complete commentary sections (non-tool calls)
+        commentary_pattern = re.compile(
+            r"<\|start\|>assistant<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)",
+            re.DOTALL,
+        )
+
+        for match in reversed(list(commentary_pattern.finditer(self._buffer))):
+            # Check if this is a tool call
+            start_pos = match.start()
+            lookback_start = max(0, start_pos - 50)
+            lookback_text = self._buffer[lookback_start:start_pos]
+
+            if "to=" not in lookback_text:
+                # Not a tool call, extract for reasoning
+                commentary_content = match.group(1).strip()
+                if self.stream_reasoning and commentary_content:
+                    result.reasoning_text += commentary_content
+
+                # Remove this commentary section
+                self._buffer = (
+                    self._buffer[: match.start()] + self._buffer[match.end() :]
+                )
+                # Clean up any standalone <|start|>assistant
+                self._buffer = re.sub(
+                    r"<\|start\|>assistant(?=<\|start\|>assistant)", "", self._buffer
+                )
+
+        # Handle final channel completion
+        if self.final_channel_start in self._buffer:
+            final_start = self._buffer.find(self.final_channel_start)
+            final_content_start = final_start + len(self.final_channel_start)
+
+            # Check if final channel is complete
+            final_end = self._buffer.find(self.final_channel_end, final_content_start)
+            if final_end != -1:
+                # Complete final channel - process everything
+                final_result = self.detect_and_parse(self._buffer)
+                self._buffer = ""
+                return StreamingParseResult(
+                    normal_text=final_result.normal_text,
+                    reasoning_text=result.reasoning_text + final_result.reasoning_text,
+                )
+            else:
+                # Extract content before final channel (e.g. tool calls)
+                before_final = self._buffer[:final_start]
+                if before_final:
+                    # Output tool calls for processing
+                    result.normal_text += before_final
+                    # Keep the final channel part in buffer
+                    self._buffer = self._buffer[final_start:]
+
+        return result
 
 
 class ReasoningParser:
@@ -487,7 +543,7 @@ class ReasoningParser:
         "glm45": Qwen3Detector,
         "kimi": KimiDetector,
         "step3": DeepSeekR1Detector,
-        "gpt-oss": GPTOSSDetector,
+        "gpt-oss": GptOssDetector,
     }
 
     def __init__(

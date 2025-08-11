@@ -14,7 +14,7 @@ from sglang.srt.function_call.core_types import (
 logger = logging.getLogger(__name__)
 
 
-class GPTOSSDetector(BaseFormatDetector):
+class GptOssDetector(BaseFormatDetector):
     """
     Detector for T4-style function calls with channel format.
 
@@ -163,13 +163,24 @@ class GPTOSSDetector(BaseFormatDetector):
         # Check if we have a tool call
         has_tool_call = "<|channel|>commentary to=" in current_text
 
-        if not has_tool_call:
+        if not has_tool_call and current_text:
             # Check for commentary without function calls
             commentary_match = self.commentary_pattern.search(current_text)
             if commentary_match:
                 commentary_content = commentary_match.group(1)
                 self._buffer = current_text[commentary_match.end() :]
                 return StreamingParseResult(normal_text=commentary_content, calls=[])
+
+            # Check for final channel content
+            final_pattern = re.compile(
+                r"<\|channel\|>final<\|message\|>(.*?)(?:<\|return\|>|$)",
+                re.DOTALL,
+            )
+            final_match = final_pattern.search(current_text)
+            if final_match:
+                final_content = final_match.group(1).strip()
+                self._buffer = ""
+                return StreamingParseResult(normal_text=final_content, calls=[])
 
             self._buffer = ""
             return StreamingParseResult(normal_text=new_text, calls=[])
@@ -217,56 +228,79 @@ class GPTOSSDetector(BaseFormatDetector):
                         "name": function_name,
                         "arguments": {},
                     }
-                else:
-                    # Stream arguments incrementally
-                    argument_diff = (
-                        args_content[
-                            len(self.streamed_args_for_tool[self.current_tool_id]) :
-                        ]
-                        if args_content.startswith(
-                            self.streamed_args_for_tool[self.current_tool_id]
-                        )
-                        else args_content
-                    )
-
-                    # Remove <|call|> if present in the diff
-                    parsed_args_diff = argument_diff.split("<|call|>", 1)[0]
-
-                    if parsed_args_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=parsed_args_diff,
-                            )
-                        )
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += parsed_args_diff
+                    self.streamed_args_for_tool[self.current_tool_id] = ""
 
                 # Check if we have a complete function call
                 complete_match = self.function_call_pattern.search(current_text)
                 if complete_match:
                     args_content = complete_match.group(2)
+
                     try:
                         parsed_args = json.loads(args_content)
                         self.prev_tool_call_arr[self.current_tool_id][
                             "arguments"
                         ] = parsed_args
+
+                        # Send complete arguments if we haven't sent them yet
+                        if not self.streamed_args_for_tool[self.current_tool_id]:
+                            # Send the complete arguments as JSON string
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    name=None,
+                                    parameters=json.dumps(
+                                        parsed_args, ensure_ascii=False
+                                    ),
+                                )
+                            )
+                            self.streamed_args_for_tool[self.current_tool_id] = (
+                                json.dumps(parsed_args, ensure_ascii=False)
+                            )
                     except json.JSONDecodeError:
                         pass
 
                     # Remove the completed function call from buffer
-                    self._buffer = current_text[complete_match.end() :]
+                    remaining_after_call = current_text[complete_match.end() :]
+
+                    # Clean up <|start|>assistant prefixes and extract final content
+                    remaining_after_call = re.sub(
+                        r"<\|start\|>assistant(?!\w)", "", remaining_after_call
+                    )
+
+                    # Extract content from final channel if present
+                    final_pattern = re.compile(
+                        r"<\|channel\|>final<\|message\|>(.*?)(?:<\|return\|>|$)",
+                        re.DOTALL,
+                    )
+                    final_match = final_pattern.search(remaining_after_call)
+
+                    if final_match:
+                        before_final = remaining_after_call[
+                            : final_match.start()
+                        ].strip()
+                        final_content = final_match.group(1).strip()
+
+                        parts = []
+                        if before_final:
+                            parts.append(before_final)
+                        if final_content:
+                            parts.append(final_content)
+                        remaining_after_call = " ".join(parts) if parts else ""
+
+                    self._buffer = remaining_after_call.strip()
 
                     # Reset state for next tool call
-                    if self.current_tool_id < len(self.prev_tool_call_arr):
-                        self.prev_tool_call_arr[self.current_tool_id].clear()
                     self.current_tool_name_sent = False
-                    self.streamed_args_for_tool[self.current_tool_id] = ""
                     self.current_tool_id += 1
 
-                    return StreamingParseResult(normal_text="", calls=calls)
+                    # Return final content if available
+                    final_text = ""
+                    if final_match and final_content:
+                        final_text = final_content
+                    elif remaining_after_call:
+                        final_text = remaining_after_call
+
+                    return StreamingParseResult(normal_text=final_text, calls=calls)
 
             return StreamingParseResult(normal_text="", calls=calls)
 
