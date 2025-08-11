@@ -11,9 +11,13 @@ Here are some reviewers for common areas. You can ping them to review your code 
 ## Kernel
 - general @zhyncs @ispobock @HandH1998 @BBuf @yizhang2077 @HaiShaw
 - triton attention backend @ispobock
+- aiter attention backend @HaiShaw @kkHuang-amd @valarLip
 - flash attention backend @hebiao064
 - flashinfer attention backend @Fridge003
 - moe kernel @BBuf @fzyzcjy @ch-wan @Alcanderian
+
+## Data type and model quantization
+- general @HaiShaw @kkHuang-amd @BBuf @fzyzcjy @haohui
 
 ## Scheduler and memory pool
 - general @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
