@@ -141,6 +141,7 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
 
         return query, key
 
+_KV_POOL_SIZE = 200
 
 class MHATokenToKVPool:
     def __init__(
@@ -150,7 +151,7 @@ class MHATokenToKVPool:
     ):
         self.head_num = head_num
         self.head_dim = head_dim
-        self.size = 200
+        self.size = _KV_POOL_SIZE
         self.page_size = 1
         self.store_dtype = torch.bfloat16
         self.device = "cuda"
@@ -178,14 +179,11 @@ class MHATokenToKVPool:
 
     def set_kv_buffer(
         self,
-        layer: RadixAttention,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
     ):
+        layer_id = 0
         self.k_buffer[layer_id - self.start_layer][loc] = cache_k
         self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
@@ -241,6 +239,16 @@ def test_correctness(
     key = torch.randn(
         batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
     )
+    value = torch.randn(
+        batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
+    )
+    cache_loc = torch.randint(
+        0,
+        _KV_POOL_SIZE,
+        (batch_size * seq_len,),
+        dtype=torch.int64,
+        device=device,
+    )
 
     pool_ref = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
     pool_flashinfer = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
@@ -250,11 +258,13 @@ def test_correctness(
 
     query_ref_out, key_ref_out = rope_ref.forward_native(pos_ids, query_ref, key_ref)
     if save_kv_cache:
-        TODO.set_kv_buffer(TODO)
+        pool_ref.set_kv_buffer(loc=cache_loc, cache_k=key_ref_out, cache_v=value)
 
     query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(
         pos_ids, query_flashinfer, key_flashinfer,
-        fused_set_kv_buffer_arg=TODO if save_kv_cache else None,
+        fused_set_kv_buffer_arg=FusedSetKVBufferArg(
+
+        ) if save_kv_cache else None,
     )
 
     torch.testing.assert_close(
