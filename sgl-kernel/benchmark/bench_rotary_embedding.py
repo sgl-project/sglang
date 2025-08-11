@@ -73,8 +73,8 @@ def benchmark(batch_size, seq_len, save_kv_cache, provider):
         fused_set_kv_buffer_arg=(
             FusedSetKVBufferArg(
                 value=inputs["value"],
-                k_buffer=pool_flashinfer.k_buffer[0],
-                v_buffer=pool_flashinfer.v_buffer[0],
+                k_buffer=pool_flashinfer.k_buffer[0].view(-1, num_kv_heads * head_size),
+                v_buffer=pool_flashinfer.v_buffer[0].view(-1, num_kv_heads * head_size),
                 k_scale=None,
                 v_scale=None,
                 cache_loc=inputs["out_cache_loc"],
