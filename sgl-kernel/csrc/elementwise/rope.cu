@@ -92,43 +92,73 @@ void apply_rope_pos_ids_cos_sin_cache(
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
-    cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
-        static_cast<c_type*>(q.data_ptr()),
-        static_cast<c_type*>(k.data_ptr()),
-        v_ptr,
-        static_cast<c_type*>(q_rope.data_ptr()),
-        static_cast<c_type*>(k_rope.data_ptr()),
-        k_buffer_ptr,
-        v_buffer_ptr,
-        static_cast<float*>(cos_sin_cache.data_ptr()),
-        static_cast<int64_t*>(pos_ids.data_ptr()),
-        nnz,
-        num_qo_heads,
-        num_kv_heads,
-        rotary_dim,
-        head_dim,
-        q_stride_n,
-        q_stride_h,
-        k_stride_n,
-        k_stride_h,
-        v_stride_n,
-        v_stride_h,
-        q_rope_stride_n,
-        q_rope_stride_h,
-        k_rope_stride_n,
-        k_rope_stride_h,
-        k_buffer_stride_n,
-        k_buffer_stride_h,
-        v_buffer_stride_n,
-        v_buffer_stride_h,
-        cache_loc_ptr,
-        interleave,
-        save_kv_cache,
-        stream);
-    TORCH_CHECK(
-        status == cudaSuccess,
-        "BatchQKApplyRotaryPosIdsCosSinCacheEnhanced failed with error code " +
-            std::string(cudaGetErrorString(status)));
+    // TODO temporarily only use `BatchQKApplyRotaryPosIdsCosSinCacheEnhanced` when save_kv_cache
+    // to avoid changing original code path; but switch to this branch unconditionally later
+    if (save_kv_cache) {
+      cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
+          static_cast<c_type*>(q.data_ptr()),
+          static_cast<c_type*>(k.data_ptr()),
+          v_ptr,
+          static_cast<c_type*>(q_rope.data_ptr()),
+          static_cast<c_type*>(k_rope.data_ptr()),
+          k_buffer_ptr,
+          v_buffer_ptr,
+          static_cast<float*>(cos_sin_cache.data_ptr()),
+          static_cast<int64_t*>(pos_ids.data_ptr()),
+          nnz,
+          num_qo_heads,
+          num_kv_heads,
+          rotary_dim,
+          head_dim,
+          q_stride_n,
+          q_stride_h,
+          k_stride_n,
+          k_stride_h,
+          v_stride_n,
+          v_stride_h,
+          q_rope_stride_n,
+          q_rope_stride_h,
+          k_rope_stride_n,
+          k_rope_stride_h,
+          k_buffer_stride_n,
+          k_buffer_stride_h,
+          v_buffer_stride_n,
+          v_buffer_stride_h,
+          cache_loc_ptr,
+          interleave,
+          save_kv_cache,
+          stream);
+      TORCH_CHECK(
+          status == cudaSuccess,
+          "BatchQKApplyRotaryPosIdsCosSinCacheEnhanced failed with error code " +
+              std::string(cudaGetErrorString(status)));
+    } else {
+      cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
+          static_cast<c_type*>(q.data_ptr()),
+          static_cast<c_type*>(k.data_ptr()),
+          static_cast<c_type*>(q_rope.data_ptr()),
+          static_cast<c_type*>(k_rope.data_ptr()),
+          static_cast<float*>(cos_sin_cache.data_ptr()),
+          static_cast<int64_t*>(pos_ids.data_ptr()),
+          nnz,
+          num_qo_heads,
+          num_kv_heads,
+          rotary_dim,
+          head_dim,
+          q_stride_n,
+          q_stride_h,
+          k_stride_n,
+          k_stride_h,
+          q_rope_stride_n,
+          q_rope_stride_h,
+          k_rope_stride_n,
+          k_rope_stride_h,
+          interleave,
+          stream);
+      TORCH_CHECK(
+          status == cudaSuccess,
+          "BatchQKApplyRotaryPosIdsCosSinCache failed with error code " + std::string(cudaGetErrorString(status)));
+    }
     return true;
   });
 }
