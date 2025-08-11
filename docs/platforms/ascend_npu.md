@@ -87,7 +87,7 @@ git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
 
 #### Triton on Ascend
 
-_Notice:_ We recommend installing triton-ascend from source due to its rapid development, the version on PYPI can't keep up for know. This problem will be solved on Sep. 2025, afterwards `pip install` would be the one and only installing method. 
+_Notice:_ We recommend installing triton-ascend from source due to its rapid development, the version on PYPI can't keep up for know. This problem will be solved on Sep. 2025, afterwards `pip install` would be the one and only installing method.
 
 Please follow Triton-on-Ascend's [installation guide from source](https://gitee.com/ascend/triton-ascend#2%E6%BA%90%E4%BB%A3%E7%A0%81%E5%AE%89%E8%A3%85-triton-ascend) to install the latest `triton-ascend` package.
 
