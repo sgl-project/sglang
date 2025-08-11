@@ -32,6 +32,7 @@ configs = [
         line_names=["SGL Kernel"],
         styles=[("green", "-")],
         ylabel="us",
+        plot_name="bench_rotary_embedding",
         args={},
     )
 )
