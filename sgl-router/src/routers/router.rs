@@ -1,5 +1,7 @@
 use crate::config::types::{CircuitBreakerConfig as ConfigCircuitBreakerConfig, RetryConfig};
-use crate::core::{CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory};
+use crate::core::{
+    is_retryable_status, CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory,
+};
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
@@ -81,12 +83,8 @@ impl Router {
         let core_cb_config = CircuitBreakerConfig {
             failure_threshold: circuit_breaker_config.failure_threshold,
             success_threshold: circuit_breaker_config.success_threshold,
-            timeout_duration: std::time::Duration::from_secs(
-                circuit_breaker_config.timeout_duration_secs,
-            ),
-            window_duration: std::time::Duration::from_secs(
-                circuit_breaker_config.window_duration_secs,
-            ),
+            timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
+            window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
         // Create Worker trait objects from URLs
@@ -397,18 +395,6 @@ impl Router {
         Some(available[idx].clone_worker())
     }
 
-    fn is_retryable_status(status: StatusCode) -> bool {
-        matches!(
-            status,
-            StatusCode::REQUEST_TIMEOUT
-                | StatusCode::TOO_MANY_REQUESTS
-                | StatusCode::INTERNAL_SERVER_ERROR
-                | StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-        )
-    }
-
     pub async fn route_typed_request<
         T: crate::openai_api_types::GenerationRequest + serde::Serialize + Clone,
     >(
@@ -461,7 +447,7 @@ impl Router {
                 response
             },
             // should_retry predicate
-            |res, _attempt| Self::is_retryable_status(res.status()),
+            |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
             |delay, attempt| {
                 RouterMetrics::record_retry(route);
@@ -476,7 +462,7 @@ impl Router {
             let duration = start.elapsed();
             RouterMetrics::record_request(route);
             RouterMetrics::record_generate_duration(duration);
-        } else if !Self::is_retryable_status(response.status()) {
+        } else if !is_retryable_status(response.status()) {
             RouterMetrics::record_request_error(route, "non_retryable_error");
         }
 

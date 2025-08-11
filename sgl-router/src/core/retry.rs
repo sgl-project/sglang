@@ -1,8 +1,22 @@
 use crate::config::types::RetryConfig;
+use axum::http::StatusCode;
 use axum::response::Response;
 use rand::Rng;
 use std::time::Duration;
 use tracing::debug;
+
+/// Check if an HTTP status code indicates a retryable error
+pub fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
 
 /// Computes exponential backoff with optional jitter.
 #[derive(Debug, Clone)]
@@ -21,8 +35,8 @@ impl BackoffCalculator {
         // Apply jitter in range [-j, +j]
         let jitter = config.jitter_factor.max(0.0).min(1.0);
         if jitter > 0.0 {
-            let mut rng = rand::thread_rng();
-            let jitter_scale: f32 = rng.gen_range(-jitter..=jitter);
+            let mut rng = rand::rng();
+            let jitter_scale: f32 = rng.random_range(-jitter..=jitter);
             let jitter_ms = (delay_ms as f32 * jitter_scale)
                 .round()
                 .max(-(delay_ms as f32));
