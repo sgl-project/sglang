@@ -424,12 +424,7 @@ def grouped_topk_gpu(
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     if lp_dispatch:
-        num_logical_experts = gating_output.shape[
-            1
-        ]  # Number of experts in gating output
-        log2phy_prob = get_log2phy_prob(
-            topk_ids, num_logical_experts, expert_location_dispatch_info
-        )
+        log2phy_prob = get_log2phy_prob(topk_ids, expert_location_dispatch_info)
         topk_ids = topk_ids_logical_to_physical(
             topk_ids, expert_location_dispatch_info, log2phy_prob
         )
@@ -531,12 +526,7 @@ def biased_grouped_topk_impl(
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
     if lp_dispatch:
-        num_logical_experts = gating_output.shape[
-            1
-        ]  # Number of experts in gating output
-        log2phy_prob = get_log2phy_prob(
-            topk_ids, num_logical_experts, expert_location_dispatch_info
-        )
+        log2phy_prob = get_log2phy_prob(topk_ids, expert_location_dispatch_info)
         topk_ids = topk_ids_logical_to_physical(
             topk_ids, expert_location_dispatch_info, log2phy_prob
         )
@@ -609,12 +599,7 @@ def biased_grouped_topk_gpu(
             routed_scaling_factor,
         )
         if lp_dispatch:
-            num_logical_experts = gating_output.shape[
-                1
-            ]  # Number of experts in gating output
-            log2phy_prob = get_log2phy_prob(
-                topk_ids, num_logical_experts, expert_location_dispatch_info
-            )
+            log2phy_prob = get_log2phy_prob(topk_ids, expert_location_dispatch_info)
 
         # TODO merge into kernel
         if (expert_location_dispatch_info is not None) or (

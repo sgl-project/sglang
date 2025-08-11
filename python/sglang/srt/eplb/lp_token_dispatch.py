@@ -142,7 +142,6 @@ def send_log2phy_prob_broadcast(log2phy_prob: torch.Tensor):
 
 def get_log2phy_prob(
     topk_ids: torch.Tensor,
-    num_logical_experts: int,
     expert_location_dispatch_info: ExpertLocationDispatchInfo,
 ):
     """Using Linear Programming to get the redundant token distribution probability
@@ -155,6 +154,9 @@ def get_log2phy_prob(
         Tensor of shape (num_logical_experts,) containing global token counts for each expert
     """
     device = topk_ids.device
+    num_logical_experts = expert_location_dispatch_info.partial_logical_to_all_physical_map_num_valid.shape[
+        0
+    ]
     # Step 1: Count local logical expert tokens
     local_counts = count_logical_expert_tokens(topk_ids, num_logical_experts)
 

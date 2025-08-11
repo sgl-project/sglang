@@ -595,22 +595,9 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             if self._lp_dispatch:
-                torch.distributed.reduce(
-                    torch.zeros(
-                        expert_location_dispatch_info.partial_logical_to_all_physical_map_num_valid.shape[
-                            0
-                        ]
-                    ).to(device=hidden_states.device),
-                    dst=0,
-                    group=get_world_group().device_group,
-                    op=torch.distributed.ReduceOp.SUM,
-                )
-                torch.distributed.broadcast(
-                    torch.zeros_like(
-                        expert_location_dispatch_info.partial_logical_to_all_physical_map
-                    ).to(device=hidden_states.device),
-                    src=0,
-                    group=get_world_group().device_group,
+                get_log2phy_prob(
+                    torch.tensor([[]], device=hidden_states.device),
+                    expert_location_dispatch_info,
                 )
             topk_idx = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -678,22 +665,9 @@ class DeepseekV2MoE(nn.Module):
                 )
         else:
             if self._lp_dispatch:
-                torch.distributed.reduce(
-                    torch.zeros(
-                        expert_location_dispatch_info.partial_logical_to_all_physical_map_num_valid.shape[
-                            0
-                        ]
-                    ).to(device=hidden_states.device),
-                    dst=0,
-                    group=get_world_group().device_group,
-                    op=torch.distributed.ReduceOp.SUM,
-                )
-                torch.distributed.broadcast(
-                    torch.zeros_like(
-                        expert_location_dispatch_info.partial_logical_to_all_physical_map
-                    ).to(device=hidden_states.device),
-                    src=0,
-                    group=get_world_group().device_group,
+                get_log2phy_prob(
+                    torch.tensor([[]], device=hidden_states.device),
+                    expert_location_dispatch_info,
                 )
             state.topk_idx_local = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
