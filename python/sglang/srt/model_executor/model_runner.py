@@ -362,7 +362,6 @@ class ModelRunner:
             except:
                 # if there is no aux layer, set to None
                 eagle_aux_hidden_state_layer_ids = None
-
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
     def model_specific_adjustment(self):

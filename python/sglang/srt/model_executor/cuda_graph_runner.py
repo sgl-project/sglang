@@ -27,6 +27,7 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -332,7 +333,29 @@ class CudaGraphRunner:
 
             # Speculative_inference
             if model_runner.spec_algorithm.is_eagle3():
-                self.model_runner.model.set_eagle3_layers_to_capture()
+                # load draft config
+                draft_model_config = ModelConfig.from_server_args(
+                    self.model_runner.server_args,
+                    model_path=(
+                        self.model_runner.server_args.speculative_draft_model_path
+                    ),
+                    is_draft_model=True,
+                )
+
+                try:
+                    # get the aux layer from draft model config
+                    eagle_config = getattr(
+                        draft_model_config.hf_config, "eagle_config", None
+                    )
+                    eagle_aux_hidden_state_layer_ids = eagle_config[
+                        "eagle_aux_hidden_state_layer_ids"
+                    ]
+                except:
+                    # if there is no aux layer, set to None
+                    eagle_aux_hidden_state_layer_ids = None
+                self.model_runner.model.set_eagle3_layers_to_capture(
+                    eagle_aux_hidden_state_layer_ids
+                )
 
             if self.is_encoder_decoder:
                 # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
