@@ -42,8 +42,7 @@ class AscendAttnBackend(AttentionBackend):
             mask_value = 1
         self.mask = (
             torch.masked_fill(
-                torch.zeros(size=(max_seq_len, max_seq_len)
-                            ), mask_flag, mask_value
+                torch.zeros(size=(max_seq_len, max_seq_len)), mask_flag, mask_value
             )
             .to(dtype)
             .to(self.device)
@@ -94,8 +93,7 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-            layer.layer_id)
+        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
         if not self.use_mla:
             query = q.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -121,8 +119,7 @@ class AscendAttnBackend(AttentionBackend):
             return output
         else:
             if layer.qk_head_dim != layer.v_head_dim:
-                o = q.new_empty(
-                    (q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+                o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
             else:
                 o = torch.empty_like(q)
 
@@ -176,10 +173,8 @@ class AscendAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
         if not self.use_mla:
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-                layer.layer_id)
-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-                layer.layer_id)
+            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
             num_tokens = query.shape[0]
