@@ -78,7 +78,18 @@ class SchedulerOutputProcessorMixin:
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
+                    if self.page_size == 1:
+                        self.token_to_kv_pool_allocator.free(
+                            batch.out_cache_loc[j : j + 1]
+                        )
+                    else:
+                        # Only free when the extra token is in a new page
+                        if (
+                            len(req.origin_input_ids) + len(req.output_ids) - 1
+                        ) % self.page_size == 0:
+                            self.token_to_kv_pool_allocator.free(
+                                batch.out_cache_loc[j : j + 1]
+                            )
                     continue
 
                 if req.is_chunked <= 0:
