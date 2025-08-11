@@ -1,6 +1,6 @@
 # Attention Backend
 
-SGLang supports multiple attention backends. Each of them have different pros and cons.
+SGLang supports multiple attention backends. Each of them has different pros and cons.
 You can test them according to your needs.
 
 ## Supporting matrix for different attention backends
