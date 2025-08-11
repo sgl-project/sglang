@@ -141,18 +141,26 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
 
 
 @pytest.mark.parametrize(
-    "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads",
+    "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads, save_kv_cache",
     [
         # GPT-OSS cases
-        TODO,
+        *[
+            (64, 64, 4096, 8000, False, torch.bfloat16, "cuda", batch_size, seq_len, 64, 8, save_kv_cache)
+            for save_kv_cache in (False, True)
+            for batch_size, seq_len in (
+                (1, 1),
+                (32, 1),
+                (2, 512),
+            )
+        ],
 
         # Other cases
-        (64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1),
-        (256, 128, 4096, 10000, True, torch.bfloat16, "cuda", 2, 512, 4, 2),
-        (512, 128, 311, 10000, True, torch.bfloat16, "cuda", 3, 39, 4, 2),
-        (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 32, 8),
-        (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 16, 4),
-        (512, 128, 311, 10000, False, torch.bfloat16, "cuda", 3, 39, 4, 2),
+        (64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1, False),
+        (256, 128, 4096, 10000, True, torch.bfloat16, "cuda", 2, 512, 4, 2, False),
+        (512, 128, 311, 10000, True, torch.bfloat16, "cuda", 3, 39, 4, 2, False),
+        (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 32, 8, False),
+        (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 16, 4, False),
+        (512, 128, 311, 10000, False, torch.bfloat16, "cuda", 3, 39, 4, 2, False),
     ],
 )
 def test_correctness(
@@ -167,6 +175,7 @@ def test_correctness(
     seq_len: int,
     num_q_heads: int,
     num_kv_heads: int,
+    save_kv_cache: bool,
 ):
     rope_ref = RotaryEmbedding(
         head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
