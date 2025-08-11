@@ -58,8 +58,6 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && git clone --depth 1 https://github.com/sgl-project/sglang.git \
  && cd sglang \
  && case "$CUDA_VERSION" in \
-      12.6.1) CUINDEX=126 ;; \
-      12.8.1) CUINDEX=128 ;; \
       12.9.1) CUINDEX=129 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
@@ -168,12 +166,6 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     pandas \
     matplotlib \
     tabulate
-
-# Install flashinfer from source to fix a bug
-# https://github.com/flashinfer-ai/flashinfer/pull/1413
-# FIXME: remove this once flashinfer release > 0.2.10
-WORKDIR /sgl-workspace
-RUN git clone https://github.com/flashinfer-ai/flashinfer.git --recursive && cd flashinfer && python3 -m pip install -v .
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
