@@ -41,14 +41,14 @@ void apply_rope_pos_ids_cos_sin_cache(
     TORCH_CHECK(k_buffer.has_value());
     TORCH_CHECK(v_buffer.has_value());
     TORCH_CHECK(kv_cache_loc.has_value());
-    CHECK_LAST_DIM_CONTIGUOUS(v);
-    CHECK_LAST_DIM_CONTIGUOUS(k_buffer);
-    CHECK_LAST_DIM_CONTIGUOUS(v_buffer);
-    CHECK_DIM(3, k_buffer);   // k_buffer: (nnz, H_K, D)
-    CHECK_DIM(3, v_buffer);   // v_buffer: (nnz, H_V, D)
-    CHECK_DIM(3, v);          // v: (nnz, H_V, D)
-    CHECK_DIM(1, kv_cache_loc);  // v: (n)
-    CHECK_INPUT(kv_cache_loc);
+    CHECK_LAST_DIM_CONTIGUOUS(v.value();
+    CHECK_LAST_DIM_CONTIGUOUS(k_buffer.value());
+    CHECK_LAST_DIM_CONTIGUOUS(v_buffer.value());
+    CHECK_DIM(3, k_buffer.value());   // k_buffer: (nnz, H_K, D)
+    CHECK_DIM(3, v_buffer.value());   // v_buffer: (nnz, H_V, D)
+    CHECK_DIM(3, v.value());          // v: (nnz, H_V, D)
+    CHECK_DIM(1, kv_cache_loc.value());  // v: (n)
+    CHECK_INPUT(kv_cache_loc.value());
   }
   size_t k_buffer_stride_n = save_kv_cache ? k_buffer->stride(0) : 0;
   size_t k_buffer_stride_h = save_kv_cache ? k_buffer->stride(1) : 0;
@@ -56,9 +56,6 @@ void apply_rope_pos_ids_cos_sin_cache(
   size_t v_buffer_stride_h = save_kv_cache ? v_buffer->stride(1) : 0;
   size_t v_stride_n = save_kv_cache ? v->stride(0) : 0;
   size_t v_stride_h = save_kv_cache ? v->stride(1) : 0;
-  auto v_ptr = save_kv_cache ? static_cast<c_type*>(v->data_ptr()) : nullptr;
-  auto k_buffer_ptr = save_kv_cache ? static_cast<c_type*>(k_buffer->data_ptr()) : nullptr;
-  auto v_buffer_ptr = save_kv_cache ? static_cast<c_type*>(v_buffer->data_ptr()) : nullptr;
   auto kv_cache_loc_ptr = save_kv_cache ? static_cast<int64_t*>(kv_cache_loc->data_ptr()) : nullptr;
 
   CHECK_INPUT(cos_sin_cache);
@@ -92,6 +89,10 @@ void apply_rope_pos_ids_cos_sin_cache(
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
+    auto v_ptr = save_kv_cache ? static_cast<c_type*>(v->data_ptr()) : nullptr;
+    auto k_buffer_ptr = save_kv_cache ? static_cast<c_type*>(k_buffer->data_ptr()) : nullptr;
+    auto v_buffer_ptr = save_kv_cache ? static_cast<c_type*>(v_buffer->data_ptr()) : nullptr;
+
     // TODO temporarily only use `BatchQKApplyRotaryPosIdsCosSinCacheEnhanced` when save_kv_cache
     // to avoid changing original code path; but this branch is feature-complete and should switch to this later
     if (save_kv_cache) {
