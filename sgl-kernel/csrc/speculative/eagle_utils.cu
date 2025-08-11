@@ -305,3 +305,187 @@ void verify_tree_greedy(
       num_spec_step,
       num_draft_tokens);
 }
+
+
+template <typename DType, typename IdType, typename IdType2>
+__global__ void VerifyTreeRelaxed(
+    IdType* predicts,
+    IdType* accept_index,
+    IdType* accept_token_num,  // mutable
+    IdType2* candidates,
+    IdType2* retrive_index,  // [bs, num_draft_tokens]
+    IdType2* retrive_next_token,
+    IdType2* retrive_next_sibling,
+    IdType2* target_topk_ids,
+    DType* target_topk_probs,
+    uint32_t batch_size,
+    uint32_t num_speculative_tokens,  // num_spec_step
+    uint32_t num_draft_tokens,
+    IdType* relax_top_ks,
+    DType* relax_ratios,
+    uint32_t top_k) {
+  uint32_t bx = blockIdx.x;
+
+  uint32_t relax_top_k = relax_top_ks[bx];
+  DType relax_ratio = relax_ratios[bx];
+
+  IdType2 last_accepted_retrive_idx = retrive_index[bx * num_draft_tokens];
+  accept_index[bx * num_speculative_tokens] = last_accepted_retrive_idx;
+  uint32_t num_accepted_tokens = 0;
+  IdType2 cur_index = 0;
+
+  for (uint32_t j = 1; j < num_speculative_tokens; ++j) {
+    cur_index = retrive_next_token[bx * num_draft_tokens + cur_index];
+    bool found_match = false;
+    while (cur_index != -1 && !found_match) {
+      IdType2 draft_index = retrive_index[bx * num_draft_tokens + cur_index];
+      IdType2 draft_token_id = candidates[bx * num_draft_tokens + cur_index];
+
+      IdType2 cur_prob_offset = bx * num_draft_tokens * top_k + last_accepted_retrive_idx * top_k;
+      DType target_top1_prob = target_topk_probs[cur_prob_offset];
+
+      for (uint32_t k = 0; k < relax_top_k; ++k) {
+        IdType2 target_token_id = target_topk_ids[cur_prob_offset + k];
+        DType target_prob = target_topk_probs[cur_prob_offset + k];
+
+        if (draft_token_id == target_token_id && target_prob >= target_top1_prob * relax_ratio) {
+          // accept token
+          predicts[last_accepted_retrive_idx] = target_token_id;
+          ++num_accepted_tokens;
+          accept_index[bx * num_speculative_tokens + num_accepted_tokens] = draft_index;
+          last_accepted_retrive_idx = draft_index;
+          found_match = true;
+          break;
+        }
+      }
+      if (!found_match) {
+        cur_index = retrive_next_sibling[bx * num_draft_tokens + cur_index];
+      }
+    }
+    if (!found_match) break;
+  }
+  accept_token_num[bx] = num_accepted_tokens;
+  IdType2 final_offset = bx * num_draft_tokens * top_k + last_accepted_retrive_idx * top_k;
+  predicts[last_accepted_retrive_idx] = target_topk_ids[final_offset];
+}
+
+
+// predicts: [tot_num_draft_tokens]
+// accept_index: [bs, num_spec_step]
+// accept_token_num: [bs]
+// candidates: [bs, num_draft_tokens]
+// retrive_index: [bs, num_draft_tokens]
+// retrive_next_token: [bs, num_draft_tokens]
+// retrive_next_sibling: [bs, num_draft_tokens]
+// target_topk_ids: [bs, num_draft_tokens, topk]
+// target_topk_probs: [bs, num_draft_tokens, topk]
+// relax_top_ks: [bs]
+// relax_ratios: [bs]
+void verify_tree_relaxed(
+    at::Tensor predicts,
+    at::Tensor accept_index,
+    at::Tensor accept_token_num,  // mutable
+    at::Tensor candidates,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    at::Tensor target_topk_ids,
+    at::Tensor target_topk_probs,
+    at::Tensor relax_top_ks,
+    at::Tensor relax_ratios,
+    int64_t cuda_stream = 0) {
+  CHECK_INPUT(candidates);
+  CHECK_INPUT(retrive_index);
+  CHECK_INPUT(retrive_next_token);
+  CHECK_INPUT(retrive_next_sibling);
+  CHECK_INPUT(target_topk_ids);
+  CHECK_INPUT(target_topk_probs);
+  CHECK_INPUT(relax_top_ks);
+  CHECK_INPUT(relax_ratios);
+  auto device = target_topk_ids.device();
+  CHECK_EQ(candidates.device(), device);
+  CHECK_EQ(retrive_index.device(), device);
+  CHECK_EQ(retrive_next_token.device(), device);
+  CHECK_EQ(retrive_next_sibling.device(), device);
+  CHECK_EQ(target_topk_ids.device(), device);
+  CHECK_EQ(target_topk_probs.device(), device);
+  CHECK_DIM(1, predicts);
+  CHECK_DIM(2, accept_index);
+  CHECK_DIM(1, accept_token_num);
+  CHECK_DIM(2, candidates);
+  CHECK_DIM(2, retrive_index);
+  CHECK_DIM(2, retrive_next_token);
+  CHECK_DIM(2, retrive_next_sibling);
+  CHECK_DIM(3, target_topk_ids);
+  CHECK_DIM(3, target_topk_probs);
+  CHECK_DIM(1, relax_top_ks);
+  CHECK_DIM(1, relax_ratios);
+  unsigned int batch_size = candidates.size(0);
+  unsigned int num_spec_step = accept_index.size(1);
+  unsigned int num_draft_tokens = candidates.size(1);
+  unsigned int top_k = target_topk_ids.size(2);
+  CHECK_EQ(batch_size, accept_index.size(0));
+  CHECK_EQ(batch_size, accept_token_num.size(0));
+  CHECK_EQ(batch_size, retrive_index.size(0));
+  CHECK_EQ(batch_size, retrive_next_token.size(0));
+  CHECK_EQ(batch_size, retrive_next_sibling.size(0));
+  CHECK_EQ(batch_size, target_topk_ids.size(0));
+  CHECK_EQ(batch_size, target_topk_probs.size(0));
+  CHECK_EQ(num_draft_tokens, retrive_index.size(1));
+  CHECK_EQ(num_draft_tokens, retrive_next_token.size(1));
+  CHECK_EQ(num_draft_tokens, retrive_next_sibling.size(1));
+  CHECK_EQ(num_draft_tokens, target_topk_ids.size(1));
+  CHECK_EQ(num_draft_tokens, target_topk_probs.size(1));
+  CHECK_EQ(batch_size, accept_index.size(0));
+  CHECK_EQ(batch_size, accept_token_num.size(0));
+  CHECK_EQ(batch_size, relax_top_ks.size(0));
+  CHECK_EQ(batch_size, relax_ratios.size(0));
+  if (predicts.scalar_type() != at::kInt) {
+    throw std::runtime_error("Expected 'predicts' to be of type int (torch.int32).");
+  }
+  if (accept_index.scalar_type() != at::kInt) {
+    throw std::runtime_error("Expected 'accept_index' to be of type int (torch.int32).");
+  }
+  if (accept_token_num.scalar_type() != at::kInt) {
+    throw std::runtime_error("Expected 'accept_token_num' to be of type int (torch.int32).");
+  }
+  if (candidates.scalar_type() != at::kLong) {
+    throw std::runtime_error("Expected 'candidates' to be of type long (torch.int64).");
+  }
+  if (retrive_index.scalar_type() != at::kLong) {
+    throw std::runtime_error("Expected 'retrive_index' to be of type long (torch.int64).");
+  }
+  if (retrive_next_token.scalar_type() != at::kLong) {
+    throw std::runtime_error("Expected 'retrive_next_token' to be of type long (torch.int64).");
+  }
+  if (retrive_next_sibling.scalar_type() != at::kLong) {
+    throw std::runtime_error("Expected 'retrive_next_sibling' to be of type long (torch.int64).");
+  }
+  if (target_topk_ids.scalar_type() != at::kLong) {
+    throw std::runtime_error("Expected 'target_topk_ids' to be of type long (torch.int64).");
+  }
+  if (target_topk_probs.scalar_type() != at::kFloat) {
+    throw std::runtime_error("Expected 'target_topk_probs' to be of type float (torch.float32).");
+  }
+
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  dim3 grid(batch_size);
+  dim3 block(1);
+
+  VerifyTreeRelaxed<float, int32_t, int64_t><<<grid, block, 0, stream>>>(
+      static_cast<int32_t*>(predicts.data_ptr()),
+      static_cast<int32_t*>(accept_index.data_ptr()),
+      static_cast<int32_t*>(accept_token_num.data_ptr()),
+      static_cast<int64_t*>(candidates.data_ptr()),
+      static_cast<int64_t*>(retrive_index.data_ptr()),
+      static_cast<int64_t*>(retrive_next_token.data_ptr()),
+      static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+      static_cast<int64_t*>(target_topk_ids.data_ptr()),
+      static_cast<float*>(target_topk_probs.data_ptr()),
+      batch_size,
+      num_spec_step,
+      num_draft_tokens,
+      static_cast<int32_t*>(relax_top_ks.data_ptr()),
+      static_cast<float*>(relax_ratios.data_ptr()),
+      top_k);
+}

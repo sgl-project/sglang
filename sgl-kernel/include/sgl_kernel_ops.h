@@ -389,6 +389,20 @@ void build_tree_kernel_efficient(
     int64_t draft_token_num,
     int64_t tree_mask_mode);
 
+void verify_tree_relaxed(
+    at::Tensor predicts,          // mutable
+    at::Tensor accept_index,      // mutable
+    at::Tensor accept_token_num,  // mutable
+    at::Tensor candidates,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    at::Tensor target_topk_ids,
+    at::Tensor target_topk_probs,
+    at::Tensor relax_top_ks,
+    at::Tensor relax_ratios,
+    int64_t cuda_stream = 0);
+
 void segment_packbits(
     at::Tensor x,
     at::Tensor input_indptr,
