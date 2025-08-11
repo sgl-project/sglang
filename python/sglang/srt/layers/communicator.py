@@ -152,11 +152,18 @@ class LayerCommunicator:
         post_attention_layernorm: torch.nn.Module,
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
+        allow_fuse_mlp_allreduce_with_next_layer: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
         self.allow_reduce_scatter = allow_reduce_scatter
+        self.allow_fuse_mlp_allreduce_with_next_layer = (
+            allow_fuse_mlp_allreduce_with_next_layer
+        )
+
+        self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
+        self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
 
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -191,10 +198,8 @@ class LayerCommunicator:
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
-            if (
-                residual is not None
-                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-                and hidden_states._sglang_needs_allreduce_fusion
+            if residual is not None and getattr(
+                hidden_states, "_sglang_needs_allreduce_fusion", False
             ):
                 hidden_states, residual = (
                     self.input_layernorm.forward_with_allreduce_fusion(
@@ -238,21 +243,67 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        return self._communicate_summable_tensor_pair_fn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
-            context=self._context,
-            allow_reduce_scatter=self.allow_reduce_scatter,
+        if self.should_fuse_mlp_allreduce_with_next_layer(forward_batch):
+            hidden_states._sglang_needs_allreduce_fusion = True
+            return hidden_states, residual
+        else:
+            return self._communicate_summable_tensor_pair_fn(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+                context=self._context,
+                allow_reduce_scatter=self.allow_reduce_scatter,
+            )
+
+    def should_mlp_skip_all_reduce(self, forward_batch: ForwardBatch):
+        can_fuse_mlp_allreduce = self.should_fuse_mlp_allreduce_with_next_layer(
+            forward_batch
         )
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.should_use_reduce_scatter(forward_batch)
+        return can_fuse_mlp_allreduce or use_reduce_scatter
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
+        # TODO improve these codes
         return (
             self.allow_reduce_scatter
             and self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
             and forward_batch.dp_padding_mode.is_max_len()
         )
+
+    def should_fuse_mlp_allreduce_with_next_layer(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        """Check if MLP allreduce can be fused with next layer's add_rmsnorm"""
+
+        if not self.allow_fuse_mlp_allreduce_with_next_layer:
+            return False
+
+        if get_tensor_model_parallel_world_size() <= 1:
+            return False
+
+        if not support_and_enable_flashinfer_allreduce_fusion():
+            return False
+
+        input_ids = getattr(forward_batch, "input_ids", None)
+        if input_ids is not None and (
+            input_ids.shape[0] == 0 or input_ids.shape[0] > 128
+        ):
+            return False
+
+        if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
+            return False
+
+        return True
+
+
+def support_and_enable_flashinfer_allreduce_fusion():
+    return (
+        _is_sm100_supported
+        and _is_flashinfer_available
+        and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
+    )
 
 
 @dataclass
@@ -436,11 +487,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
         else:
             # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
             # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
-            if (
-                _is_sm100_supported
-                and _is_flashinfer_available
-                and hasattr(layernorm, "forward_with_allreduce_fusion")
-                and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
+            if support_and_enable_flashinfer_allreduce_fusion() and hasattr(
+                layernorm, "forward_with_allreduce_fusion"
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
