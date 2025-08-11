@@ -182,8 +182,9 @@ class GenerationBatchResult:
     bid: int
     can_run_cuda_graph: bool
     copy_done: torch.cuda.Event
-    spec_info: Optional[SpecInfo]
     accept_length: Optional[torch.Tensor]
+    new_seq_lens: Optional[torch.Tensor]
+    allocate_lens: Optional[torch.Tensor]
 
 
 @dataclass
@@ -1511,16 +1512,28 @@ class Scheduler(
         else:
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
+
+            total_kv_indices = set(range(1, self.max_total_num_tokens + 1))
+            evictable_kv_indices = set(self.tree_cache.evictable_kv_indices())
+            available_kv_indices = set(self.token_to_kv_pool_allocator.free_pages.tolist())
+
+            kv_indices_leak = total_kv_indices != (evictable_kv_indices | available_kv_indices)
+            missing_kv_indices = total_kv_indices - (evictable_kv_indices | available_kv_indices)
+
             memory_leak = (available_size + evictable_size) != (
                 self.max_total_num_tokens
                 if not self.enable_hierarchical_cache
                 else self.max_total_num_tokens - protected_size
+            ) or kv_indices_leak
+            token_msg = (
+                f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {kv_indices_leak=}\n"
             )
-            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+            if kv_indices_leak:
+                token_msg += f"{len(total_kv_indices)=}, {len(evictable_kv_indices)=}, {len(available_kv_indices)=}, {len(missing_kv_indices)=}, {total_kv_indices=}, {evictable_kv_indices=}, {available_kv_indices=}, {missing_kv_indices=}\n"
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
-            # raise ValueError(msg)
+            raise ValueError(msg)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             req_total_size = (
@@ -1535,7 +1548,7 @@ class Scheduler(
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
-            # raise ValueError(msg)
+            raise ValueError(msg)
 
         if (
             self.enable_metrics
@@ -1927,8 +1940,12 @@ class Scheduler(
                 bid=model_worker_batch.bid,
                 can_run_cuda_graph=forward_output.can_run_cuda_graph,
                 copy_done=copy_done,
-                spec_info=spec_info,
                 accept_length=forward_output.accept_length,
+                # this doesn't change overlap
+                # new_seq_lens=spec_info.new_seq_lens.clone(), # spec_info fields may be modified by next batch, so clone
+                # allocate_lens=spec_info.allocate_lens.clone(),
+                new_seq_lens=spec_info.new_seq_lens,
+                allocate_lens=spec_info.allocate_lens,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
