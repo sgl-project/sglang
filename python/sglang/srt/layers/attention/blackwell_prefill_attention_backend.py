@@ -19,23 +19,47 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
-class BlackwellAttentionBackend(AttentionBackend):
+class BlackwellPrefillAttentionBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
-        print("BlackwellAttentionBackend init")
-        assert False, "!!! FUCK !!!"
+        print("BlackwellPrefillAttentionBackend init")
+        assert False, "!!! FUCK 2 !!!"
         super().__init__(model_runner)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         pass
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: RadixAttention, forward_batch: ForwardBatch, save_kv_cache: bool = True):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
         return self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
 
-    def forward_extend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: RadixAttention, forward_batch: ForwardBatch, save_kv_cache: bool = True):
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
         return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
 
-    def forward_decode(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: RadixAttention, forward_batch: ForwardBatch, save_kv_cache: bool = True):
-        raise NotImplementedError("BlackwellAttentionBackend does not support forward_decode")
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        raise NotImplementedError("BlackwellPrefillAttentionBackend does not support forward_decode")
 
     def support_triton(self):
         return False

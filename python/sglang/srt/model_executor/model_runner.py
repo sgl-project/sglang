@@ -1449,10 +1449,10 @@ class ModelRunner:
                 "With your setup, please use `--attention-backend flashinfer` instead."
             )
             from sglang.srt.layers.attention.blackwell_prefill_attention_backend import (
-                BlackwellAttentionBackend,
+                BlackwellPrefillAttentionBackend,
             )
 
-            return BlackwellAttentionBackend(self)
+            return BlackwellPrefillAttentionBackend(self)
         elif backend_str == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,

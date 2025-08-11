@@ -2094,6 +2094,7 @@ class ServerArgs:
             if self.attention_backend is None:
                 self.attention_backend = "triton"
             assert self.attention_backend in [
+                "fa4",
                 "triton",
                 "trtllm_mha",
             ], f"GptOssForCausalLM requires 'triton' or 'trtllm_mha' attention backend, but got {self.attention_backend}"
