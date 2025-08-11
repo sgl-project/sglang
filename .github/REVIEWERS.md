@@ -11,14 +11,16 @@ Here are some reviewers for common areas. You can ping them to review your code 
 ## Kernel
 - general @zhyncs @ispobock @HandH1998 @BBuf @yizhang2077 @HaiShaw
 - triton attention backend @ispobock
-- flash attention @hebiao064
+- flash attention backend @hebiao064
+- flashinfer attention backend @Fridge003
+- moe kernel @BBuf @fzyzcjy @ch-wan @Alcanderian
 
 ## Scheduler and memory pool
 - general @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 - constrained decoding @hnyls2002
 - hierarhical cache @xiezhq-hermann @DarkSharpness
 - lora @Fridge003 @Ying1123 @lifuhuang
-- speculative decoding @merrymercy @Ying1123  @kssteven418
+- speculative decoding @merrymercy @Ying1123 @kssteven418 @Qiaolin-Yu
 - sliding window attention @hanming-lu
 
 ## Parallelism
