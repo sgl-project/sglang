@@ -105,7 +105,6 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
 
       vec_t<float, vec_size> v_vec;
       if constexpr (save_kv_cache) {
-        DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
         v_vec.cast_load(v_ptr + tx * vec_size);
       }
 
@@ -118,12 +117,14 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
       k_vec.cast_store(k_rope_ptr + tx * vec_size);
 
       if constexpr (save_kv_cache) {
+        DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
         const IdType cache_offset = cache_loc[idx];
         DType* k_buffer_ptr =
             k_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
         DType* v_buffer_ptr =
             v_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
         k_vec.cast_store(k_buffer_ptr + tx * vec_size);
+
         v_vec.cast_store(v_buffer_ptr + tx * vec_size);
       }
     }
