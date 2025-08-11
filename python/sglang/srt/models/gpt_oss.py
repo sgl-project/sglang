@@ -306,7 +306,14 @@ class GptOssAttention(nn.Module):
             positions,
             q,
             k,
-            fused_set_kv_buffer_arg=FusedSetKVBufferArg(TODO) if _enable_fused_set_kv_buffer() else None,
+            fused_set_kv_buffer_arg=FusedSetKVBufferArg(
+                value=TODO,
+                k_buffer=TODO,
+                v_buffer=TODO,
+                k_scale=TODO,
+                v_scale=TODO,
+                cache_loc=TODO,
+            ) if _enable_fused_set_kv_buffer() else None,
         )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
