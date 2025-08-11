@@ -341,7 +341,7 @@ __global__ void VerifyTreeRelaxed(
       IdType2 draft_index = retrive_index[bx * num_draft_tokens + cur_index];
       IdType2 draft_token_id = candidates[bx * num_draft_tokens + cur_index];
 
-      IdType2 cur_prob_offset = bx * num_draft_tokens * top_k + last_accepted_retrive_idx * top_k;
+      IdType2 cur_prob_offset = last_accepted_retrive_idx * top_k;
       DType target_top1_prob = target_topk_probs[cur_prob_offset];
 
       for (uint32_t k = 0; k < relax_top_k; ++k) {
@@ -365,7 +365,7 @@ __global__ void VerifyTreeRelaxed(
     if (!found_match) break;
   }
   accept_token_num[bx] = num_accepted_tokens;
-  IdType2 final_offset = bx * num_draft_tokens * top_k + last_accepted_retrive_idx * top_k;
+  IdType2 final_offset = last_accepted_retrive_idx * top_k;
   predicts[last_accepted_retrive_idx] = target_topk_ids[final_offset];
 }
 
@@ -436,8 +436,6 @@ void verify_tree_relaxed(
   CHECK_EQ(num_draft_tokens, retrive_next_sibling.size(1));
   CHECK_EQ(num_draft_tokens, target_topk_ids.size(1));
   CHECK_EQ(num_draft_tokens, target_topk_probs.size(1));
-  CHECK_EQ(batch_size, accept_index.size(0));
-  CHECK_EQ(batch_size, accept_token_num.size(0));
   CHECK_EQ(batch_size, relax_top_ks.size(0));
   CHECK_EQ(batch_size, relax_ratios.size(0));
   if (predicts.scalar_type() != at::kInt) {
