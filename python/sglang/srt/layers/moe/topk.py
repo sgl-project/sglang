@@ -494,7 +494,7 @@ def biased_grouped_topk_impl(
     topk_weights = scores.gather(1, topk_ids)
 
     if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
+        topk_ids[:, -num_fused_shared_experts:] = torch.randint(
             low=num_experts,
             high=num_experts + num_fused_shared_experts,
             size=(topk_ids.size(0),),
