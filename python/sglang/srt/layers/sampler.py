@@ -16,7 +16,7 @@ if is_cuda():
     from sgl_kernel import (
         min_p_sampling_from_probs,
         top_k_renorm_prob,
-        top_k_top_p_sampling_from_probs,
+        top_k_top_p_sampling_from_logits,
         top_p_renorm_prob,
     )
 
@@ -76,22 +76,23 @@ class Sampler(nn.Module):
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:
             # Post process logits
-            logits.div_(sampling_info.temperatures)
-            logits[:] = torch.softmax(logits, dim=-1)
-            probs = logits
-            del logits
-
             if True:  # Keep this redundant check to simplify some internal code sync
                 if global_server_args_dict["sampling_backend"] == "flashinfer":
                     if sampling_info.need_min_p_sampling:
+                        logits.div_(sampling_info.temperatures)
+                        logits[:] = torch.softmax(logits, dim=-1)
+                        probs = logits
+                        del logits
+
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
                         batch_next_token_ids = min_p_sampling_from_probs(
                             probs, sampling_info.min_ps
                         )
                     else:
-                        batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                            probs.contiguous(),
+                        logits.div_(sampling_info.temperatures)
+                        batch_next_token_ids = top_k_top_p_sampling_from_logits(
+                            logits,
                             sampling_info.top_ks,
                             sampling_info.top_ps,
                             filter_apply_order="joint",
@@ -99,6 +100,11 @@ class Sampler(nn.Module):
                         )
                 elif global_server_args_dict["sampling_backend"] == "pytorch":
                     # A slower fallback implementation with torch native operations.
+                    logits.div_(sampling_info.temperatures)
+                    logits[:] = torch.softmax(logits, dim=-1)
+                    probs = logits
+                    del logits
+
                     batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                         probs,
                         sampling_info.top_ks,
@@ -112,6 +118,11 @@ class Sampler(nn.Module):
                     )
 
             if return_logprob:
+                if (
+                    global_server_args_dict["sampling_backend"] == "flashinfer"
+                    and not sampling_info.need_min_p_sampling
+                ):
+                    probs = torch.softmax(logits, dim=-1)
                 # clamp to avoid -inf
                 logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
