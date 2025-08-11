@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::info;
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone)]

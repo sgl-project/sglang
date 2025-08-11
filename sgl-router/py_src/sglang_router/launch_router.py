@@ -80,12 +80,12 @@ class RouterArgs:
     retry_max_backoff_ms: int = 10_000
     retry_backoff_multiplier: float = 2.0
     retry_jitter_factor: float = 0.1
+    disable_retries: bool = False
     # Circuit breaker configuration
     cb_failure_threshold: int = 5
     cb_success_threshold: int = 2
     cb_timeout_duration_secs: int = 30
     cb_window_duration_secs: int = 60
-    disable_retries: bool = False
     disable_circuit_breaker: bool = False
 
     @staticmethod
@@ -333,11 +333,6 @@ class RouterArgs:
             action="store_true",
             help="Disable retries (equivalent to setting retry_max_retries=1)",
         )
-        parser.add_argument(
-            f"--{prefix}disable-circuit-breaker",
-            action="store_true",
-            help="Disable circuit breaker (equivalent to setting cb_failure_threshold to u32::MAX)",
-        )
         # Circuit breaker configuration
         parser.add_argument(
             f"--{prefix}cb-failure-threshold",
@@ -358,6 +353,11 @@ class RouterArgs:
             f"--{prefix}cb-window-duration-secs",
             type=int,
             default=RouterArgs.cb_window_duration_secs,
+        )
+        parser.add_argument(
+            f"--{prefix}disable-circuit-breaker",
+            action="store_true",
+            help="Disable circuit breaker (equivalent to setting cb_failure_threshold to u32::MAX)",
         )
         parser.add_argument(
             f"--{prefix}max-concurrent-requests",

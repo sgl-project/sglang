@@ -62,6 +62,8 @@ class TestLaunchRouter(unittest.TestCase):
             cb_success_threshold=2,
             cb_timeout_duration_secs=30,
             cb_window_duration_secs=60,
+            disable_retries=False,
+            disable_circuit_breaker=False,
         )
 
     def create_router_args(self, **kwargs):

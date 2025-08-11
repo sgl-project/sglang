@@ -736,7 +736,6 @@ class TestLaunchServer(unittest.TestCase):
         self.process = popen_launch_router(
             self.model,
             self.base_url,
-            dp_size=1,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             policy="round_robin",
             router_retry_max_retries=3,

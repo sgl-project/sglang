@@ -65,11 +65,13 @@ struct Router {
     retry_max_backoff_ms: u64,
     retry_backoff_multiplier: f32,
     retry_jitter_factor: f32,
+    disable_retries: bool,
     // Circuit breaker configuration
     cb_failure_threshold: u32,
     cb_success_threshold: u32,
     cb_timeout_duration_secs: u64,
     cb_window_duration_secs: u64,
+    disable_circuit_breaker: bool,
 }
 
 impl Router {
@@ -220,11 +222,13 @@ impl Router {
         retry_max_backoff_ms = 10_000,
         retry_backoff_multiplier = 2.0,
         retry_jitter_factor = 0.1,
+        disable_retries = false,
         // Circuit breaker defaults
         cb_failure_threshold = 5,
         cb_success_threshold = 2,
         cb_timeout_duration_secs = 30,
-        cb_window_duration_secs = 60
+        cb_window_duration_secs = 60,
+        disable_circuit_breaker = false,
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -266,10 +270,12 @@ impl Router {
         retry_max_backoff_ms: u64,
         retry_backoff_multiplier: f32,
         retry_jitter_factor: f32,
+        disable_retries: bool,
         cb_failure_threshold: u32,
         cb_success_threshold: u32,
         cb_timeout_duration_secs: u64,
         cb_window_duration_secs: u64,
+        disable_circuit_breaker: bool,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -311,10 +317,12 @@ impl Router {
             retry_max_backoff_ms,
             retry_backoff_multiplier,
             retry_jitter_factor,
+            disable_retries,
             cb_failure_threshold,
             cb_success_threshold,
             cb_timeout_duration_secs,
             cb_window_duration_secs,
+            disable_circuit_breaker,
         })
     }
 
