@@ -22,7 +22,7 @@ namespace flashinfer {
 
 namespace kv_buffer_saver {
 
-template <typename DType, uint32_t vec_size>
+template <typename DType, typename IdType, uint32_t vec_size>
 __device__ __forceinline__ void prepare(
     vec_t<float, vec_size>& v_vec,
     IdType& kv_cache_offset,
@@ -149,7 +149,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
       vec_t<float, vec_size> v_vec;
       IdType kv_cache_offset;
       if constexpr (save_kv_cache) {
-        kv_buffer_saver::prepare<DType, vec_size>(
+        kv_buffer_saver::prepare<DType, IdType, vec_size>(
             v_vec, kv_cache_offset, v, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
       }
 
@@ -268,7 +268,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
       vec_t<float, vec_size> v_vec;
       IdType kv_cache_offset;
       if constexpr (save_kv_cache) {
-        kv_buffer_saver::prepare<DType, vec_size>(
+        kv_buffer_saver::prepare<DType, IdType, vec_size>(
             v_vec, kv_cache_offset, v, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
       }
 
