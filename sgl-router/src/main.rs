@@ -81,7 +81,7 @@ struct CliArgs {
     port: u16,
 
     /// List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)
-    #[arg(long, value_delimiter = ' ', num_args = 0..)]
+    #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
     /// Load balancing policy to use
@@ -157,7 +157,7 @@ struct CliArgs {
     service_discovery: bool,
 
     /// Label selector for Kubernetes service discovery (format: key1=value1 key2=value2)
-    #[arg(long, value_delimiter = ' ', num_args = 0..)]
+    #[arg(long, num_args = 0..)]
     selector: Vec<String>,
 
     /// Port to use for discovered worker pods
@@ -169,11 +169,11 @@ struct CliArgs {
     service_discovery_namespace: Option<String>,
 
     /// Label selector for prefill server pods in PD mode
-    #[arg(long, value_delimiter = ' ', num_args = 0..)]
+    #[arg(long, num_args = 0..)]
     prefill_selector: Vec<String>,
 
     /// Label selector for decode server pods in PD mode
-    #[arg(long, value_delimiter = ' ', num_args = 0..)]
+    #[arg(long, num_args = 0..)]
     decode_selector: Vec<String>,
 
     /// Port to expose Prometheus metrics
@@ -185,7 +185,7 @@ struct CliArgs {
     prometheus_host: String,
 
     /// Custom HTTP headers to check for request IDs
-    #[arg(long, value_delimiter = ' ', num_args = 0..)]
+    #[arg(long, num_args = 0..)]
     request_id_headers: Vec<String>,
 
     /// Request timeout in seconds
@@ -197,7 +197,7 @@ struct CliArgs {
     max_concurrent_requests: usize,
 
     /// CORS allowed origins
-    #[arg(long, value_delimiter = ' ', num_args = 0..)]
+    #[arg(long, num_args = 0..)]
     cors_allowed_origins: Vec<String>,
 
     // Retry configuration
