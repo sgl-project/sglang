@@ -327,7 +327,7 @@ def apply_rope_with_cos_sin_cache_inplace(
         positions.long(),
         (not is_neox),
         get_cuda_stream(),
-        fused_set_kv_buffer_arg.value if fused_set_kv_buffer_arg is not None else None,
+        _view_3d(fused_set_kv_buffer_arg.value) if fused_set_kv_buffer_arg is not None else None,
         (
             _view_3d(fused_set_kv_buffer_arg.k_buffer)
             if fused_set_kv_buffer_arg is not None
