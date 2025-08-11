@@ -547,7 +547,7 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         num_dummy_heads = 0
 
         if num_heads % tp_size != 0:
-            num_dummy_heads = ((num_heads + tp_size) // tp_size) * tp_size - num_heads
+            num_dummy_heads = ((num_heads + tp_size - 1) // tp_size) * tp_size - num_heads
 
         setattr(self.config.vision_config, "head_dim", head_dim)
         setattr(self.config.vision_config, "num_dummy_heads", num_dummy_heads)
