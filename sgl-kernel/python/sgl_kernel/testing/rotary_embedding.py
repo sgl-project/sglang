@@ -190,3 +190,25 @@ class MHATokenToKVPool:
         self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
 
+def create_inputs(
+    head_size: int,
+    batch_size: int,
+    seq_len: int,
+    device,
+    dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+):
+    pos_ids = torch.arange(seq_len, device=device).repeat(batch_size)
+    query = torch.randn(
+        batch_size * seq_len, num_q_heads * head_size, dtype=dtype, device=device
+    )
+    key = torch.randn(
+        batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
+    )
+    value = torch.randn(
+        batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
+    )
+    out_cache_loc = torch.randperm(MHATokenToKVPool.KV_POOL_SIZE, dtype=torch.int64, device=device)[: batch_size * seq_len].clone()
+
+    return dict(pos_ids=pos_ids, query=query, key=key, value=value, out_cache_loc=out_cache_loc)
