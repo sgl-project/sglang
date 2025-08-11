@@ -28,17 +28,6 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         pass
 
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-    ):
-        return self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
-
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -48,7 +37,13 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
+        o = torch.empty_like(q)
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
+
+        return o
 
     def forward_decode(
         self,
@@ -60,6 +55,8 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         save_kv_cache: bool = True,
     ):
         raise NotImplementedError("BlackwellPrefillAttentionBackend does not support forward_decode")
+
+    forward = forward_extend
 
     def support_triton(self):
         return False

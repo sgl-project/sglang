@@ -2097,7 +2097,7 @@ class ServerArgs:
                 "fa4",
                 "triton",
                 "trtllm_mha",
-            ], f"GptOssForCausalLM requires 'triton' or 'trtllm_mha' attention backend, but got {self.attention_backend}"
+            ], f"GptOssForCausalLM requires 'fa4', 'triton' or 'trtllm_mha' attention backend, but got {self.attention_backend}"
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
