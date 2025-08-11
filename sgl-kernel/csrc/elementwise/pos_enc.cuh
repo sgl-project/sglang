@@ -37,8 +37,8 @@ template <typename DType, typename IdType, uint32_t vec_size>
 __device__ __forceinline__ void save_kv_buffer_ptr(
     const vec_t<float, vec_size>& k_vec,
     const vec_t<float, vec_size>& v_vec,
-    const DType* k_buffer,
-    const DType* v_buffer,
+    DType* k_buffer,
+    DType* v_buffer,
     const IdType* kv_cache_loc,
     const uint32_t idx,
     const uint32_t tx,
