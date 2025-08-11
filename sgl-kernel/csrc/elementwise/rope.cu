@@ -36,16 +36,6 @@ void apply_rope_pos_ids_cos_sin_cache(
   CHECK_LAST_DIM_CONTIGUOUS(k);
 
   const bool save_kv_cache = v.has_value();
-  size_t k_buffer_stride_n = 0;
-  size_t k_buffer_stride_h = 0;
-  size_t v_buffer_stride_n = 0;
-  size_t v_buffer_stride_h = 0;
-  size_t v_stride_n = 0;
-  size_t v_stride_h = 0;
-  auto v_ptr = nullptr;
-  auto k_buffer_ptr = nullptr;
-  auto v_buffer_ptr = nullptr;
-  auto cache_loc_ptr = nullptr;
   if (save_kv_cache) {
     CHECK_LAST_DIM_CONTIGUOUS(v);
     CHECK_LAST_DIM_CONTIGUOUS(k_buffer);
@@ -55,17 +45,17 @@ void apply_rope_pos_ids_cos_sin_cache(
     CHECK_DIM(3, v);          // v: (nnz, H_V, D)
     CHECK_DIM(1, cache_loc);  // v: (n)
     CHECK_INPUT(cache_loc);
-    size_t k_buffer_stride_n = k_buffer.stride(0);
-    size_t k_buffer_stride_h = k_buffer.stride(1);
-    size_t v_buffer_stride_n = v_buffer.stride(0);
-    size_t v_buffer_stride_h = v_buffer.stride(1);
-    size_t v_stride_n = v.stride(0);
-    size_t v_stride_h = v.stride(1);
-    auto v_ptr = static_cast<c_type*>(v.data_ptr());
-    auto k_buffer_ptr = static_cast<c_type*>(k_buffer.data_ptr());
-    auto v_buffer_ptr = static_cast<c_type*>(v_buffer.data_ptr());
-    auto cache_loc_ptr = static_cast<int64_t*>(cache_loc.data_ptr());
   }
+  size_t k_buffer_stride_n = save_kv_cache ? k_buffer.stride(0) : 0;
+  size_t k_buffer_stride_h = save_kv_cache ? k_buffer.stride(1) : 0;
+  size_t v_buffer_stride_n = save_kv_cache ? v_buffer.stride(0) : 0;
+  size_t v_buffer_stride_h = save_kv_cache ? v_buffer.stride(1) : 0;
+  size_t v_stride_n = save_kv_cache ? v.stride(0) : 0;
+  size_t v_stride_h = save_kv_cache ? v.stride(1) : 0;
+  auto v_ptr = save_kv_cache ? static_cast<c_type*>(v.data_ptr()) : nullptr;
+  auto k_buffer_ptr = save_kv_cache ? static_cast<c_type*>(k_buffer.data_ptr()) : nullptr;
+  auto v_buffer_ptr = save_kv_cache ? static_cast<c_type*>(v_buffer.data_ptr()) : nullptr;
+  auto cache_loc_ptr = save_kv_cache ? static_cast<int64_t*>(cache_loc.data_ptr()) : nullptr;
 
   CHECK_INPUT(cos_sin_cache);
   CHECK_INPUT(pos_ids);
