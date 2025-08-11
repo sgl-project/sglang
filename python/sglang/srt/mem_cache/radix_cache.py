@@ -498,7 +498,7 @@ class RadixCache(BasePrefixCache):
         # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
             # First chunk links to the last page of the parent node (if any).
-            if node.parent is None or not node.parent.key:
+            if node.parent is None or node != self.root_node:
                 parent_block_hash = None
             else:
                 last_page_start = (
