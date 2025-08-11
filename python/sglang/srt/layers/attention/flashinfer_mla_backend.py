@@ -81,7 +81,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
-            global_workspace_buffer = torch.empty(
+            global_workspace_buffer = torch.zeros(
                 global_config.flashinfer_workspace_size,
                 dtype=torch.uint8,
                 device=model_runner.device,
