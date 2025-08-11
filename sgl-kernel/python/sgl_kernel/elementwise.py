@@ -305,30 +305,31 @@ def apply_rope_with_cos_sin_cache_inplace(
         and value is not None
         and cache_loc is not None
     ):
-        torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer.default(
-            query.view(query.shape[0], -1, head_size),
-            key.view(key.shape[0], -1, head_size),
-            query.view(query.shape[0], -1, head_size),
-            key.view(key.shape[0], -1, head_size),
-            cos_sin_cache,
-            positions.long(),
-            (not is_neox),
-            get_cuda_stream(),
-            k_buffer.view(k_buffer.shape[0], -1, head_size),
-            v_buffer.view(v_buffer.shape[0], -1, head_size),
-            1.0 if k_scale is None else k_scale,
-            1.0 if v_scale is None else v_scale,
-            value.view(value.shape[0], -1, head_size),
-            cache_loc.long(),
-        )
+        save_kv_cache = True
+        k_buffer = k_buffer.view(k_buffer.shape[0], -1, head_size)
+        v_buffer = v_buffer.view(v_buffer.shape[0], -1, head_size)
+        value = value.view(value.shape[0], -1, head_size)
+        cache_loc = cache_loc.long()
     else:
-        torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
-            query.view(query.shape[0], -1, head_size),
-            key.view(key.shape[0], -1, head_size),
-            query.view(query.shape[0], -1, head_size),
-            key.view(key.shape[0], -1, head_size),
-            cos_sin_cache,
-            positions.long(),
-            (not is_neox),
-            get_cuda_stream(),
-        )
+        save_kv_cache = False
+        k_buffer = None
+        v_buffer = None
+        value = None
+        cache_loc = None
+    torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer.default(
+        query.view(query.shape[0], -1, head_size),
+        key.view(key.shape[0], -1, head_size),
+        query.view(query.shape[0], -1, head_size),
+        key.view(key.shape[0], -1, head_size),
+        cos_sin_cache,
+        positions.long(),
+        (not is_neox),
+        get_cuda_stream(),
+        k_buffer,
+        v_buffer,
+        1.0 if k_scale is None else k_scale,
+        1.0 if v_scale is None else v_scale,
+        value,
+        cache_loc,
+        save_kv_cache,
+    )
