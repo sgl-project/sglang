@@ -50,8 +50,6 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 
-from triton_dist.utils import init_nvshmem_by_torch_process_group
-
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
@@ -1345,12 +1343,6 @@ def initialize_model_parallel(
         ),
         group_name="tp",
     )
-
-    
-    global _TP_OVERLAP_GROUP
-    _TP_OVERLAP_GROUP = torch.distributed.new_group(ranks=group_ranks[0], backend='gloo')
-    torch.distributed.barrier(_TP_OVERLAP_GROUP)
-    init_nvshmem_by_torch_process_group(_TP_OVERLAP_GROUP)
 
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP

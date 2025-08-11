@@ -135,6 +135,9 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
 
+from triton_dist.utils import init_nvshmem_by_torch_process_group
+import nvshmem.core.utils
+nvshmem.core.utils._configure_logging(level="DEBUG")
 
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
@@ -248,8 +251,10 @@ class ModelRunner:
         )
         self._model_update_group = {}
 
+        self.gemm_ar_overlap_group = None
         self.gemm_ar_attn_op = None
         self.gemm_ar_mlp_op = None
+        
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -288,6 +293,8 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
+        if self.device == 'cuda':
+            self.init_overlap_gemm_allreduce_operator()
         # Check if the model is using hybrid SWA
         if (
             not self.server_args.disable_hybrid_swa_memory
@@ -340,7 +347,6 @@ class ModelRunner:
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
-            self.init_overlap_gemm_allreduce_operator()
             self.init_cuda_graphs()
         else:
             self.cuda_graph_runner = None
@@ -1317,19 +1323,22 @@ class ModelRunner:
 
         from sglang.srt.distributed import parallel_state as ps
         from triton_dist.layers.nvidia import GemmARLayer
+        
+        _TP_OVERLAP_GROUP = torch.distributed.new_group(ranks=self.tp_group.ranks, backend='gloo')
+        torch.distributed.barrier(_TP_OVERLAP_GROUP)
+        init_nvshmem_by_torch_process_group(_TP_OVERLAP_GROUP)
 
         self.gemm_ar_attn_op = GemmARLayer(
-            tp_group=ps._TP_OVERLAP_GROUP,
+            tp_group=_TP_OVERLAP_GROUP,
             max_M=self.model_config.hf_config.max_position_embeddings, 
             N=self.model_config.hf_config.hidden_size, 
             K=(self.model_config.hf_config.hidden_size // self.tp_size),
             input_dtype=self.model_config.dtype,
             output_dtype=self.model_config.dtype,
             local_world_size=self.tp_size, persistent=True, copy_to_local=False,
-            use_ll_kernel=False, NUM_COMM_SMS=2)
-        torch.distributed.breakpoint()
+            use_ll_kernel=True, NUM_COMM_SMS=2)
         self.gemm_ar_mlp_op = GemmARLayer(
-            tp_group=ps._TP_OVERLAP_GROUP,
+            tp_group=_TP_OVERLAP_GROUP,
             max_M=self.model_config.hf_config.max_position_embeddings, 
             N=self.model_config.hf_config.hidden_size, 
             K=(self.model_config.hf_config.intermediate_size // self.tp_size),
