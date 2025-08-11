@@ -56,8 +56,6 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
     size_t k_buffer_stride_h,
     size_t v_buffer_stride_n,
     size_t v_buffer_stride_h,
-    float k_scale,
-    float v_scale,
     IdType* __restrict__ cache_loc) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   uint32_t by = blockIdx.y;
@@ -166,8 +164,6 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
     size_t k_buffer_stride_h,
     size_t v_buffer_stride_n,
     size_t v_buffer_stride_h,
-    float k_scale,
-    float v_scale,
     IdType* __restrict__ cache_loc) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bdy = blockDim.y;
@@ -329,8 +325,6 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
             (void*)&k_buffer_stride_h,
             (void*)&v_buffer_stride_n,
             (void*)&v_buffer_stride_h,
-            (void*)&k_scale,
-            (void*)&v_scale,
             (void*)&cache_loc};
         auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel<
             SAVE_KV_CACHE,
