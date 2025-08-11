@@ -2050,7 +2050,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Return logprob.",
     )
-    parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+    parser.add_argument("--seed", type=int, default=int(time.time()), help="The random seed.")
     parser.add_argument(
         "--disable-ignore-eos",
         action="store_true",
