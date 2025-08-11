@@ -48,6 +48,8 @@ impl TestContext {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1091,6 +1093,8 @@ mod error_tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1439,6 +1443,8 @@ mod pd_mode_tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         // Create app context
@@ -1594,6 +1600,8 @@ mod request_id_tests {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         let ctx = TestContext::new_with_config(

@@ -52,7 +52,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
@@ -76,7 +76,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -96,7 +96,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -120,7 +120,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -144,7 +144,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -164,7 +164,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark single latency
         timeout-minutes: 10
@@ -216,7 +216,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 10
@@ -260,7 +260,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark single latency (TP=2)
         timeout-minutes: 10
@@ -310,7 +310,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -333,7 +333,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -356,7 +356,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_deepep.sh
+          bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -376,7 +376,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_deepep.sh
+          bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -398,7 +398,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
