@@ -1786,6 +1786,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
+            seq_lens=self.seq_lens, # not sure if needed
         )
 
     def _evict_tree_cache_if_needed(
