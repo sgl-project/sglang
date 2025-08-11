@@ -637,9 +637,11 @@ class TokenizerManager:
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
         if isinstance(obj.sampling_params, SamplingParams):
-            sampling_kwargs = obj.sampling_params.__dict__
-        else: # sampling params is dict already
-            sampling_kwargs = obj.sampling_params
+            sampling_kwargs = obj.sampling_params.__dict__.copy()
+        elif isinstance(obj.sampling_params, dict):
+            sampling_kwargs = obj.sampling_params.copy()
+        else:
+            raise ValueError(f"Invalid sampling params: {obj.sampling_params}")
         if self.preferred_sampling_params:
             sampling_kwargs = {**self.preferred_sampling_params, **sampling_kwargs}
         sampling_params = SamplingParams(**sampling_kwargs)
