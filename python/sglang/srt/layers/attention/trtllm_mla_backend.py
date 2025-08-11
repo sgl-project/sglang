@@ -83,7 +83,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        self.workspace_buffer = torch.empty(
+        self.workspace_buffer = torch.zeros(
             self.workspace_size, dtype=torch.int8, device=self.device
         )
 
