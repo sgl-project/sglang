@@ -67,7 +67,6 @@ Please be aware that this setting will cause prefill instances to take a longer 
 | **`SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL`** | Interval (seconds) between health checks to prefill bootstrap servers | `5.0` |
 | **`SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE`** | Consecutive heartbeat failures before marking prefill server offline | `2` |
 | **`SGLANG_DISAGGREGATION_WAITING_TIMEOUT`** | Timeout (seconds) for receiving KV Cache after request initialization | `300` |
-| **`SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION`** | Clip request param "max_tokens" to pre_allocate | `4096` |
 
 If a greater mean TTFT is acceptable, you can `export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600` (10 minutes) to relax the timeout condition.
 
