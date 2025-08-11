@@ -12,7 +12,7 @@ RUN cd sglang && pip install -e "python[all]" -v -i https://mirrors.ivolces.com/
 
 
 RUN git clone https://github.com/ByteDance-Seed/Triton-distributed.git
-WORKDIR /root/Triton-distributed
+WORKDIR //sgl-workspace/Triton-distributed
 RUN git submodule deinit --all -f
 RUN rm -rf 3rdparty/triton
 RUN git submodule update --init --recursive
