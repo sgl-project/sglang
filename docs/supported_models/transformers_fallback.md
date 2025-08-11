@@ -18,7 +18,7 @@ python3 -m sglang.launch_server \
 
 ### Quantization
 
-Transformers fall back has supported most of available quantization in SGLang (except GGUF). See [Quantization page](https://docs.sglang.ai/backend/quantization.html) for more information about supported quantization in SGLang.
+Transformers fall back has supported most of available quantization in SGLang (except GGUF). See [Quantization page](../advanced_features/quantization.md) for more information about supported quantization in SGLang.
 
 ### Remote code
 

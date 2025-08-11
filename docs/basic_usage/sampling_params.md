@@ -1,11 +1,11 @@
 # Sampling Parameters
 
 This doc describes the sampling parameters of the SGLang Runtime. It is the low-level endpoint of the runtime.
-If you want a high-level endpoint that can automatically handle chat templates, consider using the [OpenAI Compatible API](./openai_api_completions.ipynb).
+If you want a high-level endpoint that can automatically handle chat templates, consider using the [OpenAI Compatible API](openai_api_completions.ipynb).
 
 ## `/generate` Endpoint
 
-The `/generate` endpoint accepts the following parameters in JSON format. For detailed usage, see the [native API doc](./native_api.ipynb). The object is defined at `io_struct.py::GenerateReqInput`. You can also read the source code to find more arguments and docs.
+The `/generate` endpoint accepts the following parameters in JSON format. For detailed usage, see the [native API doc](native_api.ipynb). The object is defined at `io_struct.py::GenerateReqInput`. You can also read the source code to find more arguments and docs.
 
 | Argument                   | Type/Default                                                                 | Description                                                                                                                                                     |
 |----------------------------|------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -135,7 +135,7 @@ for chunk in response.iter_lines(decode_unicode=False):
 print("")
 ```
 
-Detailed example in [openai compatible api](https://docs.sglang.ai/backend/openai_api_completions.html#id2).
+Detailed example in [openai compatible api](openai_api_completions.ipynb).
 
 ### Multimodal
 
@@ -176,7 +176,7 @@ The `image_data` can be a file name, a URL, or a base64 encoded string. See also
 
 Streaming is supported in a similar manner as [above](#streaming).
 
-Detailed example in [openai api vision](./openai_api_vision.ipynb).
+Detailed example in [OpenAI API Vision](openai_api_vision.ipynb).
 
 ### Structured Outputs (JSON, Regex, EBNF)
 

@@ -66,7 +66,7 @@ This enables TorchAO's int4 weight-only quantization with a 128-group size. The 
 * * * * *
 Structured output with XGrammar
 -------------------------------
-Please refer to [SGLang doc structured output](../backend/structured_outputs.ipynb).
+Please refer to [SGLang doc structured output](../advanced_features/structured_outputs.ipynb).
 * * * * *
 
 Thanks to the support from [shahizat](https://github.com/shahizat).
