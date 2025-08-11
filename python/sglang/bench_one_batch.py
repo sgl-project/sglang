@@ -607,7 +607,6 @@ def latency_test(
     if server_args.tp_size > 1:
         destroy_distributed_environment()
 
-    
 
 def main(server_args, bench_args):
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)

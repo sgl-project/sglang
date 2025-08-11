@@ -8,7 +8,7 @@ RUN apt install -y libnuma-dev
 RUN pip install --upgrade pip
 
 RUN git clone https://github.com/bytedance-iaas/sglang.git -b feat/overlap
-RUN cd sglang && pip install -e "python[all]" -v 
+RUN cd sglang && pip install -e "python[all]" -v
 
 
 RUN git clone https://github.com/ByteDance-Seed/Triton-distributed.git
@@ -16,12 +16,12 @@ WORKDIR //sgl-workspace/Triton-distributed
 RUN git submodule deinit --all -f
 RUN rm -rf 3rdparty/triton
 RUN git submodule update --init --recursive
-RUN pip3 install -v cuda-python ninja cmake wheel pybind11 numpy chardet pytest nvidia-ml-py>=12 
-RUN pip3 install -v 'nvidia-nvshmem-cu12' 'cuda.core==0.2.0' "Cython>=0.29.24" 
+RUN pip3 install -v cuda-python ninja cmake wheel pybind11 numpy chardet pytest nvidia-ml-py>=12
+RUN pip3 install -v 'nvidia-nvshmem-cu12' 'cuda.core==0.2.0' "Cython>=0.29.24"
 RUN CPPFLAGS="-I/usr/local/cuda/include" pip3 install https://developer.download.nvidia.com/compute/nvshmem/redist/nvshmem_python/source/nvshmem_python-source-0.1.0.36132199_cuda12-archive.tar.xz -v
 
 RUN pip3 install black "clang-format==19.1.2" pre-commit ruff yapf==0.43
-RUN apt update 
+RUN apt update
 RUN apt install -y wget
 RUN wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | gpg -o /etc/apt/keyrings/llvm-snapshot.gpg --dearmor
 RUN echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] https://mirrors.tuna.tsinghua.edu.cn/llvm-apt/jammy/ llvm-toolchain-jammy-19 main" >> /etc/apt/sources.list.d/llvm-apt.list

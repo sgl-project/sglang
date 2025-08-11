@@ -108,8 +108,8 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
-    get_int_env_var,
     get_cpu_ids_by_node,
+    get_int_env_var,
     init_custom_process_group,
     is_fa3_default_architecture,
     is_flashinfer_available,
@@ -135,9 +135,11 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
 
-from triton_dist.utils import init_nvshmem_by_torch_process_group
 import nvshmem.core.utils
+from triton_dist.utils import init_nvshmem_by_torch_process_group
+
 nvshmem.core.utils._configure_logging(level="DEBUG")
+
 
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
@@ -252,9 +254,6 @@ class ModelRunner:
         )
         self._model_update_group = {}
 
-        
-        
-
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
 
@@ -291,11 +290,9 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
-        
-        if self.device == 'cuda' and get_int_env_var('SGL_USE_TP_OVERLAP', 0) == 1:
-            logger.info(
-                f"Initialize Gemm-AllReduce Overlap Operator..."
-            )
+
+        if self.device == "cuda" and get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
+            logger.info(f"Initialize Gemm-AllReduce Overlap Operator...")
             self.init_overlap_gemm_allreduce_operator()
 
         # Check if the model is using hybrid SWA
@@ -340,7 +337,7 @@ class ModelRunner:
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
-        
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -378,7 +375,6 @@ class ModelRunner:
                 eagle_aux_hidden_state_layer_ids = None
 
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
-        
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -1320,42 +1316,50 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-
     def init_overlap_gemm_allreduce_operator(self):
-        if get_int_env_var('SGL_USE_TP_OVERLAP', 0) != 1:
+        if get_int_env_var("SGL_USE_TP_OVERLAP", 0) != 1:
             return
-        
+
         from triton_dist.layers.nvidia import GemmARLayer
-        
-        _TP_OVERLAP_GROUP = torch.distributed.new_group(ranks=self.tp_group.ranks, backend='gloo')
+
+        _TP_OVERLAP_GROUP = torch.distributed.new_group(
+            ranks=self.tp_group.ranks, backend="gloo"
+        )
         torch.distributed.barrier(_TP_OVERLAP_GROUP)
         init_nvshmem_by_torch_process_group(_TP_OVERLAP_GROUP)
 
         self.gemm_ar_attn_op = GemmARLayer(
             tp_group=_TP_OVERLAP_GROUP,
-            max_M=self.model_config.hf_config.max_position_embeddings, 
-            N=self.model_config.hf_config.hidden_size, 
+            max_M=self.model_config.hf_config.max_position_embeddings,
+            N=self.model_config.hf_config.hidden_size,
             K=(self.model_config.hf_config.hidden_size // self.tp_size),
             input_dtype=self.model_config.dtype,
             output_dtype=self.model_config.dtype,
-            local_world_size=self.tp_size, persistent=True, copy_to_local=False,
-            use_ll_kernel=True, NUM_COMM_SMS=2)
+            local_world_size=self.tp_size,
+            persistent=True,
+            copy_to_local=False,
+            use_ll_kernel=True,
+            NUM_COMM_SMS=2,
+        )
         self.gemm_ar_mlp_op = GemmARLayer(
             tp_group=_TP_OVERLAP_GROUP,
-            max_M=self.model_config.hf_config.max_position_embeddings, 
-            N=self.model_config.hf_config.hidden_size, 
+            max_M=self.model_config.hf_config.max_position_embeddings,
+            N=self.model_config.hf_config.hidden_size,
             K=(self.model_config.hf_config.intermediate_size // self.tp_size),
             input_dtype=self.model_config.dtype,
             output_dtype=self.model_config.dtype,
-            local_world_size=self.tp_size, persistent=True, copy_to_local=False,
-            use_ll_kernel=False, NUM_COMM_SMS=2)
-        
+            local_world_size=self.tp_size,
+            persistent=True,
+            copy_to_local=False,
+            use_ll_kernel=False,
+            NUM_COMM_SMS=2,
+        )
+
         for each in self.model.model.layers:
             if each.self_attn.o_proj:
                 each.self_attn.o_proj.gemm_ar_attn_op = self.gemm_ar_attn_op
             if each.mlp.down_proj:
                 each.mlp.down_proj.gemm_ar_mlp_op = self.gemm_ar_mlp_op
-        
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
