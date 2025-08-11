@@ -572,12 +572,12 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
             ).flatten(0, 1)
             wq, wk, wv = pad_func(wq), pad_func(wk), pad_func(wv)
             loaded_weight = torch.cat([wq, wk, wv], dim=0)
-        if "attn.proj.weight" in name:
+        elif "attn.proj.weight" in name:
             padded_weight = loaded_weight.new_zeros(
                 loaded_weight.shape[0], head_dim * num_dummy_heads
             )
             loaded_weight = torch.cat([loaded_weight, padded_weight], dim=-1)
-        if "attn.q_norm.weight" in name or "attn.k_norm.weight" in name:
+        elif "attn.q_norm.weight" in name or "attn.k_norm.weight" in name:
             padded_weight = loaded_weight.new_zeros(head_dim * num_dummy_heads)
             loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
         return loaded_weight
