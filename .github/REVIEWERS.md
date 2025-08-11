@@ -18,7 +18,7 @@ Here are some reviewers for common areas. You can ping them to review your code 
 ## Scheduler and memory pool
 - general @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 - constrained decoding @hnyls2002
-- hierarhical cache @xiezhq-hermann @DarkSharpness
+- hierarchical cache @xiezhq-hermann @DarkSharpness
 - lora @Fridge003 @Ying1123 @lifuhuang
 - speculative decoding @merrymercy @Ying1123 @kssteven418 @Qiaolin-Yu
 - sliding window attention @hanming-lu
