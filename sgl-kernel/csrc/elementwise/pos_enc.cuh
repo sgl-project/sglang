@@ -154,7 +154,18 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
 
       if constexpr (save_kv_cache) {
         save_kv_buffer_ptr<DType, IdType, vec_size>(
-            k_vec, v_vec, k_buffer, v_buffer, kv_cache_loc, idx, tx, kv_head_idx, k_buffer_stride_n, k_buffer_stride_h, v_buffer_stride_n, v_buffer_stride_h);
+            k_vec,
+            v_vec,
+            k_buffer,
+            v_buffer,
+            kv_cache_loc,
+            idx,
+            tx,
+            kv_head_idx,
+            k_buffer_stride_n,
+            k_buffer_stride_h,
+            v_buffer_stride_n,
+            v_buffer_stride_h);
       }
     }
   }
@@ -259,7 +270,18 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
 
       if constexpr (save_kv_cache) {
         save_kv_buffer_ptr<DType, IdType, vec_size>(
-            k_vec, v_vec, k_buffer, v_buffer, kv_cache_loc, idx, tx, kv_head_idx, k_buffer_stride_n, k_buffer_stride_h, v_buffer_stride_n, v_buffer_stride_h);
+            k_vec,
+            v_vec,
+            k_buffer,
+            v_buffer,
+            kv_cache_loc,
+            idx,
+            tx,
+            kv_head_idx,
+            k_buffer_stride_n,
+            k_buffer_stride_h,
+            v_buffer_stride_n,
+            v_buffer_stride_h);
       }
     }
   }

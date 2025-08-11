@@ -44,9 +44,9 @@ void apply_rope_pos_ids_cos_sin_cache(
     CHECK_LAST_DIM_CONTIGUOUS(v.value());
     CHECK_LAST_DIM_CONTIGUOUS(k_buffer.value());
     CHECK_LAST_DIM_CONTIGUOUS(v_buffer.value());
-    CHECK_DIM(3, k_buffer.value());   // k_buffer: (nnz, H_K, D)
-    CHECK_DIM(3, v_buffer.value());   // v_buffer: (nnz, H_V, D)
-    CHECK_DIM(3, v.value());          // v: (nnz, H_V, D)
+    CHECK_DIM(3, k_buffer.value());      // k_buffer: (nnz, H_K, D)
+    CHECK_DIM(3, v_buffer.value());      // v_buffer: (nnz, H_V, D)
+    CHECK_DIM(3, v.value());             // v: (nnz, H_V, D)
     CHECK_DIM(1, kv_cache_loc.value());  // v: (n)
     CHECK_INPUT(kv_cache_loc.value());
   }
