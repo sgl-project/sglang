@@ -108,6 +108,7 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
+    get_int_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
     is_fa3_default_architecture,
@@ -1318,7 +1319,7 @@ class ModelRunner:
         from triton_dist.layers.nvidia import GemmARLayer
 
         self.gemm_ar_attn_op = GemmARLayer(
-            tp_group=ps._TP_GLOO,
+            tp_group=ps._TP_OVERLAP_GROUP,
             max_M=self.model_config.hf_config.max_position_embeddings, 
             N=self.model_config.hf_config.hidden_size, 
             K=(self.model_config.hf_config.hidden_size // self.tp_size),
@@ -1328,7 +1329,7 @@ class ModelRunner:
             use_ll_kernel=False, NUM_COMM_SMS=2)
         
         self.gemm_ar_mlp_op = GemmARLayer(
-            tp_group=ps._TP_GLOO,
+            tp_group=ps._TP_OVERLAP_GROUP,
             max_M=self.model_config.hf_config.max_position_embeddings, 
             N=self.model_config.hf_config.hidden_size, 
             K=(self.model_config.hf_config.intermediate_size // self.tp_size),

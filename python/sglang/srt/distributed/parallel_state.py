@@ -1346,10 +1346,11 @@ def initialize_model_parallel(
         group_name="tp",
     )
 
-    global _TP_GLOO
-    _TP_GLOO = torch.distributed.new_group(ranks=group_ranks[0], backend='gloo')
-    torch.distributed.barrier(_TP_GLOO)
-    init_nvshmem_by_torch_process_group(_TP_GLOO)
+    
+    global _TP_OVERLAP_GROUP
+    _TP_OVERLAP_GROUP = torch.distributed.new_group(ranks=group_ranks[0], backend='gloo')
+    torch.distributed.barrier(_TP_OVERLAP_GROUP)
+    init_nvshmem_by_torch_process_group(_TP_OVERLAP_GROUP)
 
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
@@ -1527,10 +1528,7 @@ def destroy_model_parallel():
     if _TP:
         _TP.destroy()
     _TP = None
-    global _TP_GLOO
-    if _TP_GLOO:
-        _TP_GLOO.destroy()
-    _TP_GLOO = None
+
     
     global _PP
     if _PP:
@@ -1539,10 +1537,18 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
+    global _TP_GLOO
+    if _TP_GLOO:
+        _TP_GLOO.destroy()
+    _TP_GLOO = None
+
     global _WORLD
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
+
+
+
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
