@@ -32,15 +32,19 @@ from sglang.lang.choices import (
     token_length_normalized,
     unconditional_likelihood_normalized,
 )
-from sglang.srt.entrypoints.engine import Engine
+
+# Lazy import some libraries
 from sglang.utils import LazyImport
 from sglang.version import __version__
 
-ServerArgs = LazyImport("sglang.srt.server_args", "ServerArgs")
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
 OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
 VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
+
+# Runtime Engine APIs
+ServerArgs = LazyImport("sglang.srt.server_args", "ServerArgs")
+Engine = LazyImport("sglang.srt.entrypoints.engine", "Engine")
 
 __all__ = [
     "Engine",

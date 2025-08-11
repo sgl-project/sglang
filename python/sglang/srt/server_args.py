@@ -2175,10 +2175,6 @@ class ServerArgs:
         self.mem_fraction_static = (
             original_server_arg_mem_fraction * final_overall_factor
         )
-        logger.warning(
-            f"Multimodal model: Dynamically adjusted --mem-fraction-static "
-            f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
-        )
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
