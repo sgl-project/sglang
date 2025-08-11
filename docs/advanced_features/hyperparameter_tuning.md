@@ -44,9 +44,9 @@ Look for log entries like this:
 [2025-08-11 17:17:03] max_total_num_tokens=665690, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=4096, context_len=65536, available_gpu_mem=13.50 GB
 ```
 
-Check the `available_gpu_mem` value.  
-- If it is between 5–8 GB, the setting is good.  
-- If it is too high (e.g., 10 - 20 GB), increase `--mem-fraction-static` to allocate more memory to the KV cache.  
+Check the `available_gpu_mem` value.
+- If it is between 5–8 GB, the setting is good.
+- If it is too high (e.g., 10 - 20 GB), increase `--mem-fraction-static` to allocate more memory to the KV cache.
 - If it is too low, you risk out-of-memory (OOM) errors later, so decrease `--mem-fraction-static`.
 
 Another straightforward approach is to increase `--mem-fraction-static` in increments of 0.01 until you encounter OOM errors for your workloads.
