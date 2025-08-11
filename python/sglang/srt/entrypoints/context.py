@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copied from vLLM
+# Copied from vLLM: https://github.com/zyongye/vllm/blob/6a70830065701b163e36a86fd331b41b5feac401/vllm/entrypoints/context.py
 import json
 import logging
 from abc import ABC, abstractmethod
