@@ -145,8 +145,17 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
 class MHATokenToKVPool:
     def __init__(
         self,
-        # TODO args
+        head_num: int,
+        head_dim: int,
     ):
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.size = 200
+        self.page_size = 1
+        self.store_dtype = torch.bfloat16
+        self.device = "cuda"
+        self.layer_num = 1
+        self.start_layer = 0
         self._create_buffers()
 
     def _create_buffers(self):
@@ -232,6 +241,9 @@ def test_correctness(
     key = torch.randn(
         batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
     )
+
+    pool_ref = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
+    pool_flashinfer = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
 
     query_ref, key_ref = query.clone(), key.clone()
     query_flashinfer, key_flashinfer = query.clone(), key.clone()
