@@ -1010,7 +1010,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             or attention_backend == "flashmla"
         ):
             # Use MHA with chunked KV cache when prefilling on long sequences.
-            sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu or [])
+            sum_extend_prefix_lens = (
+                sum(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.extend_prefix_lens_cpu is not None
+                else 0
+            )
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             disable_ragged = (
                 attention_backend == "flashinfer" or attention_backend == "flashmla"
