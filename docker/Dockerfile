@@ -80,17 +80,17 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
     fi
 
 # Download source files
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
- && if [ "$BUILD_TYPE" = "blackwell" ] && [ "$(uname -m)" = "aarch64" ]; then \
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+    && if [ "$BUILD_TYPE" = "blackwell" ] && [ "$(uname -m)" = "aarch64" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git \
       && cd DeepEP && git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && cd .. ; \
     else \
       git clone https://github.com/deepseek-ai/DeepEP.git \
       && cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. ; \
     fi \
-    tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    mv nvshmem_src nvshmem && \
-    rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+    && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+    && mv nvshmem_src nvshmem \
+    && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
 
 
 
