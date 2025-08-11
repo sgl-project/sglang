@@ -891,6 +891,7 @@ void decode_attention_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens,
+    int64_t sliding_window_size,
     bool is_cross_attn,
     bool has_encoder_lens,
     bool has_sink) {
@@ -920,6 +921,10 @@ void decode_attention_kernel_impl(
       int64_t seq_len_kv = is_cross_attn ? encoder_lens[bs] : seq_lens[bs];
       int64_t req_pool_id = req_pool_indices[bs];
       int64_t kv_offset = (has_encoder_lens && (!is_cross_attn)) ? encoder_lens[bs] : 0;
+      if (sliding_window_size > 0 && seq_len_kv > sliding_window_size) {
+        kv_offset = seq_len_kv - sliding_window_size;
+        seq_len_kv = sliding_window_size;
+      }
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
 
@@ -1240,6 +1245,7 @@ void decode_attention_grouped_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens,
+    int64_t sliding_window_size,
     bool is_cross_attn,
     bool has_encoder_lens,
     bool has_sink) {
@@ -1288,7 +1294,10 @@ void decode_attention_grouped_kernel_impl(
       int64_t kv_offset = (has_encoder_lens && (!is_cross_attn)) ? encoder_lens[bs] : 0;
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
-
+      if (sliding_window_size > 0 && seq_len_kv > sliding_window_size) {
+        kv_offset = seq_len_kv - sliding_window_size;
+        seq_len_kv = sliding_window_size;
+      }
       const int64_t SPLIT_SIZE = div_up(seq_len_kv, num_kv_splits);
       const int64_t kv_start = kv_id * SPLIT_SIZE;
       const int64_t kv_end = std::min(kv_start + SPLIT_SIZE, seq_len_kv);
@@ -1417,6 +1426,7 @@ void decode_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
+    int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks) {
   RECORD_FUNCTION(
@@ -1562,6 +1572,7 @@ void decode_attention_cpu(
             max_num_reqs,
             max_context_len,
             max_total_num_tokens,
+            sliding_window_size,
             is_cross_attn,
             has_encoder_lens,
             has_sink);
@@ -1626,6 +1637,7 @@ void decode_attention_cpu(
             max_num_reqs,
             max_context_len,
             max_total_num_tokens,
+            sliding_window_size,
             is_cross_attn,
             has_encoder_lens,
             has_sink);

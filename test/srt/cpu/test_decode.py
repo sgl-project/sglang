@@ -157,7 +157,7 @@ class TestDecodeAttention(CustomTestCase):
         return output
 
     def _test_grouped_decode_attention_once(
-        self, B, H_Q, H_KV, D, D_V, sink, is_cross_attn, device
+        self, B, H_Q, H_KV, D, D_V, sliding_window, sink, is_cross_attn, device
     ):
         dtype = torch.bfloat16
         # This represents the number of tokens already in the sequence
@@ -225,6 +225,7 @@ class TestDecodeAttention(CustomTestCase):
             sm_scale,
             logit_cap,
             is_cross_attn,
+            sliding_window if sliding_window is not None else 0,
             encoder_lens,
             sinks if sink else None,
         )
@@ -240,7 +241,7 @@ class TestDecodeAttention(CustomTestCase):
                 num_kv_heads=H_KV,
                 q_mult=H_Q // H_KV if enable_gqa else 1,
                 scaling=sm_scale,
-                sliding_window=None,
+                sliding_window=sliding_window if sliding_window is not None else None,
                 attention_sinks=sinks,
                 enable_gqa=enable_gqa,
             )
@@ -283,12 +284,12 @@ class TestDecodeAttention(CustomTestCase):
             for sink in [True, False]:
                 if D != D_V and sink:
                     continue
-                self._test_grouped_decode_attention_once(
-                    B, H_Q, H_KV, D, D_V, sink, False, device=device
-                )
-            self._test_grouped_decode_attention_once(
-                B, H_Q, H_KV, D, D_V, False, True, device=device
-            )
+                for sliding_window in [None, 10]:
+                    if sliding_window is not None and not sink:
+                        continue
+                    self._test_grouped_decode_attention_once(
+                        B, H_Q, H_KV, D, D_V, sliding_window, sink, False, device=device
+                    )
 
     def test_grouped_decode_attention(self):
         self._test_grouped_decode_attention("cpu")

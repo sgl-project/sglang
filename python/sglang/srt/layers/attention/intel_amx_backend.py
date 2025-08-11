@@ -90,7 +90,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
+            layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
+            sk,
         )
         return o
 
@@ -132,7 +134,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.scaling,
             layer.logit_cap,
             layer.is_cross_attention,
+            layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
+            sk,
         )
         return o
 
