@@ -25,7 +25,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_rust.sh
+          bash scripts/ci/ci_install_rust.sh
 
       - name: Run fmt
         run: |
@@ -64,7 +64,7 @@ jobs:
 
       - name: Install rust dependencies
         run: |
-          bash scripts/ci_install_rust.sh
+          bash scripts/ci/ci_install_rust.sh
 
       - name: Build python binding
         run: |
