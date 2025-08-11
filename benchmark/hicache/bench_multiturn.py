@@ -322,6 +322,9 @@ class WorkloadGenerator:
             "prompt_len": [],
             "cached_tokens": [],
         }
+        self.num_rounds = args.num_rounds
+        self.max_parallel = args.max_parallel
+        self.output_length = args.output_length
 
     async def handle_request(self, item):
         try:
@@ -336,7 +339,7 @@ class WorkloadGenerator:
     def request_sender(self):
         async def request_loop():
             while True:
-                if self.sent_requests - self.completed_requests < args.max_parallel:
+                if self.sent_requests - self.completed_requests < self.max_parallel:
                     new_request = self.ready_queue.pop()
                     if new_request:
                         asyncio.create_task(self.handle_request(new_request))
@@ -382,7 +385,7 @@ class WorkloadGenerator:
                 self.performance_metrics["cached_tokens"].append(response.cached_tokens)
                 self.completed_requests += 1
 
-                if self.client_records[client_id]["round"] < args.num_rounds:
+                if self.client_records[client_id]["round"] < self.num_rounds:
                     # append new request to client's history
                     self.client_records[client_id][
                         "history"
@@ -392,7 +395,7 @@ class WorkloadGenerator:
                             client_id,
                             gen_payload(
                                 self.client_records[client_id]["history"],
-                                args.output_length,
+                                self.output_length,
                             ),
                         )
                     )
@@ -461,7 +464,7 @@ class WorkloadGenerator:
             f"  Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
         print(f"  Cache Hit Rate: {performance_data['summary']['cache_hit_rate']:.6f}")
-        log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)
+        return performance_data
 
 
 if __name__ == "__main__":
@@ -482,4 +485,5 @@ if __name__ == "__main__":
         args.request_rate = rate
         requests.post(flush_cache_url)
         time.sleep(1)
-        WorkloadGenerator(args).run()
+        performance_data = WorkloadGenerator(args).run()
+        log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)
