@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -237,6 +238,30 @@ if torch.version.hip is not None:
         return out
 
 
+@dataclass
+class FusedSetKVBufferArg:
+    """
+    k_buffer : Optional[torch.Tensor]
+        Buffer for keys, shape: ``(nnz, num_k_heads * head_size)``.
+        If provided, the function will set the buffer inplace.
+    v_buffer : Optional[torch.Tensor]
+        Buffer for values, shape: ``(nnz, num_v_heads * head_size)``.
+        If provided, the function will set the buffer inplace.
+    k_scale : Optional[float]
+        Scale factor for keys. If not provided, defaults to 1.0.
+    v_scale : Optional[float]
+        Scale factor for values. If not provided, defaults to 1.0.
+    cache_loc : Optional[torch.Tensor]
+        Cache location tensor, used for indexing kv cache.
+    """
+
+    k_buffer: torch.Tensor
+    v_buffer: torch.Tensor
+    k_scale: Optional[float]
+    v_scale: Optional[float]
+    cache_loc: torch.Tensor
+
+
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -245,11 +270,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
     value: Optional[torch.Tensor] = None,
-    k_buffer: Optional[torch.Tensor] = None,
-    v_buffer: Optional[torch.Tensor] = None,
-    k_scale: Optional[float] = None,
-    v_scale: Optional[float] = None,
-    cache_loc: Optional[torch.Tensor] = None,
+    fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
 ) -> None:
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
@@ -279,18 +300,9 @@ def apply_rope_with_cos_sin_cache_inplace(
     value : Optional[torch.Tensor]
         Value tensor, shape: ``(nnz, num_v_heads * head_size)``.
         If provided, the function will also apply RoPE to the value tensor.
-    k_buffer : Optional[torch.Tensor]
-        Buffer for keys, shape: ``(nnz, num_k_heads * head_size)``.
-        If provided, the function will set the buffer inplace.
-    v_buffer : Optional[torch.Tensor]
-        Buffer for values, shape: ``(nnz, num_v_heads * head_size)``.
-        If provided, the function will set the buffer inplace.
-    k_scale : Optional[float]
-        Scale factor for keys. If not provided, defaults to 1.0.
-    v_scale : Optional[float]
-        Scale factor for values. If not provided, defaults to 1.0.
-    cache_loc : Optional[torch.Tensor]
-        Cache location tensor, used for indexing kv cache.
+    fused_set_kv_buffer_arg : FusedSetKVBufferArg
+        Fuse the set-kv-buffer operation into this kernel
+
     Note
     ----
     The rotary dimension is determined by the cosine cache and sine cache.
