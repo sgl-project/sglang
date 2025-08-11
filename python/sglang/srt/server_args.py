@@ -1880,6 +1880,11 @@ class ServerArgs:
             action="store_true",
             help="(Deprecated) Enabling DeepEP MoE implementation for EP MoE.",
         )
+        parser.add_argument(
+            "--disable-weight-loading",
+            action="store_true",
+            help="(Deprecated) Disable weight loading, only used for testing.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
