@@ -40,6 +40,7 @@ def get_scalar_types():
 
         return MockScalarType, MockScalarTypes()
 
+ScalarType, scalar_types = get_scalar_types()
 
 def is_layer_skipped(
     prefix: str,
