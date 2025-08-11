@@ -425,6 +425,7 @@ class DefaultModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        disable_weight_loading: bool = False,
     ) -> nn.Module:
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
@@ -433,10 +434,11 @@ class DefaultModelLoader(BaseModelLoader):
                     model_config,
                     self.load_config,
                 )
-
-        self.load_weights_and_postprocess(
-            model, self._get_all_weights(model_config, model), target_device
-        )
+        
+        if not disable_weight_loading
+            self.load_weights_and_postprocess(
+                model, self._get_all_weights(model_config, model), target_device
+            )
 
         return model.eval()
 

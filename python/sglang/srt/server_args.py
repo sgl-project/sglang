@@ -276,6 +276,7 @@ class ServerArgs:
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    disable_weight_loading: bool = False
 
     def __post_init__(self):
 
