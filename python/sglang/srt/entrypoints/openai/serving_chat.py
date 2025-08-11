@@ -71,9 +71,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
-        if max_output_tokens is not None and max_output_tokens > server_context_length:
+        if (
+            max_output_tokens
+            and server_context_length
+            and max_output_tokens > server_context_length
+        ):
             return (
-                f"max_completion_tokens is too large: {max_output_tokens} ."
+                f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
             )
 
