@@ -468,9 +468,10 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         json_request: Value,
         route: &str,
+        prefill: Box<dyn Worker>,
+        decode: Box<dyn Worker>,
         is_stream: bool,
         return_logprob: bool,
-        request_text: Option<&str>,
     ) -> Response {
         let start_time = Instant::now();
 
@@ -479,18 +480,13 @@ impl PDRouter {
             // Operation per attempt
             {
                 let json_request = json_request.clone();
+                let prefill = prefill.clone_worker();
+                let decode = decode.clone_worker();
                 move |attempt: u32| {
                     let json_request = json_request.clone();
+                    let prefill = prefill.clone_worker();
+                    let decode = decode.clone_worker();
                     async move {
-                        // Select workers for this attempt (may change if some become unavailable)
-                        let (prefill, decode) = match self.select_pd_pair(request_text).await {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                RouterMetrics::record_pd_error("server_selection");
-                                return Self::handle_server_selection_error(e);
-                            }
-                        };
-
                         debug!(
                             "PD retry attempt {} using prefill={} decode={}",
                             attempt,
@@ -786,65 +782,58 @@ impl PDRouter {
             .read()
             .map_err(|e| format!("Failed to acquire decode workers lock: {}", e))?;
 
-        // Check we have workers
-        if prefill_workers.is_empty() {
-            return Err("No prefill workers available. Please check if prefill servers are configured and healthy.".to_string());
-        }
-        if decode_workers.is_empty() {
-            return Err("No decode workers available. Please check if decode servers are configured and healthy.".to_string());
+        // Select workers using helper function
+        let prefill = Self::pick_worker_by_policy(
+            &*prefill_workers,
+            &*self.prefill_policy,
+            request_text,
+            "prefill",
+        )?;
+
+        let decode = Self::pick_worker_by_policy(
+            &*decode_workers,
+            &*self.decode_policy,
+            request_text,
+            "decode",
+        )?;
+
+        Ok((prefill, decode))
+    }
+
+    // Helper function to select a worker using the policy
+    fn pick_worker_by_policy(
+        workers: &[Box<dyn Worker>],
+        policy: &dyn LoadBalancingPolicy,
+        request_text: Option<&str>,
+        worker_type: &str,
+    ) -> Result<Box<dyn Worker>, String> {
+        // Check if we have any workers
+        if workers.is_empty() {
+            return Err(format!(
+                "No {} workers available. Please check if {} servers are configured and healthy.",
+                worker_type, worker_type
+            ));
         }
 
         // Filter available workers (healthy + circuit breaker not open)
-        let available_prefill: Vec<&Box<dyn Worker>> = prefill_workers
+        let available_workers: Vec<Box<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
+            .map(|w| w.clone_worker())
             .collect();
-        let available_decode: Vec<&Box<dyn Worker>> =
-            decode_workers.iter().filter(|w| w.is_available()).collect();
 
-        if available_prefill.is_empty() {
-            return Err(
-                "No available prefill workers (all circuits open or unhealthy)".to_string(),
-            );
-        }
-        if available_decode.is_empty() {
-            return Err("No available decode workers (all circuits open or unhealthy)".to_string());
+        if available_workers.is_empty() {
+            return Err(format!(
+                "No available {} workers (all circuits open or unhealthy)",
+                worker_type
+            ));
         }
 
-        // Select prefill worker using prefill policy from available workers
-        let prefill_idx = self
-            .prefill_policy
-            .select_worker(&prefill_workers, request_text)
-            .ok_or("Failed to select prefill worker")?;
-
-        // Select decode worker using decode policy from available workers
-        let decode_idx = self
-            .decode_policy
-            .select_worker(&decode_workers, request_text)
-            .ok_or("Failed to select decode worker")?;
-
-        // Check if selected workers are available
-        let prefill = if prefill_workers[prefill_idx].is_available() {
-            prefill_workers[prefill_idx].clone_worker()
-        } else {
-            // Policy selected unavailable worker, try to find any available
-            available_prefill
-                .first()
-                .ok_or("No available prefill workers")?
-                .clone_worker()
-        };
-
-        let decode = if decode_workers[decode_idx].is_available() {
-            decode_workers[decode_idx].clone_worker()
-        } else {
-            // Policy selected unavailable worker, try to find any available
-            available_decode
-                .first()
-                .ok_or("No available decode workers")?
-                .clone_worker()
-        };
-
-        Ok((prefill, decode))
+        // Let policy select from available workers only
+        match policy.select_worker(&available_workers, request_text) {
+            Some(idx) => Ok(available_workers[idx].clone_worker()),
+            None => Err(format!("Policy could not select a {} worker", worker_type)),
+        }
     }
 
     // Background task to monitor worker loads with shared client
@@ -1578,8 +1567,8 @@ impl RouterTrait for PDRouter {
             None
         };
 
-        // For initial server selection to inject bootstrap fields
-        let (prefill, _) = match self.select_pd_pair(request_text).await {
+        // Select servers for this request
+        let (prefill, decode) = match self.select_pd_pair(request_text).await {
             Ok(pair) => pair,
             Err(e) => return Self::handle_server_selection_error(e),
         };
@@ -1594,14 +1583,15 @@ impl RouterTrait for PDRouter {
             Err(e) => return Self::handle_serialization_error(e),
         };
 
-        // Execute dual dispatch with retries
+        // Execute dual dispatch with retries using the same worker pair
         self.execute_dual_dispatch_with_retry(
             headers,
             json,
             "/generate",
+            prefill,
+            decode,
             is_stream,
             return_logprob,
-            request_text,
         )
         .await
     }
@@ -1635,8 +1625,8 @@ impl RouterTrait for PDRouter {
             None
         };
 
-        // For initial server selection to inject bootstrap fields
-        let (prefill, _) = match self.select_pd_pair(request_text).await {
+        // Select servers for this request
+        let (prefill, decode) = match self.select_pd_pair(request_text).await {
             Ok(pair) => pair,
             Err(e) => return Self::handle_server_selection_error(e),
         };
@@ -1651,14 +1641,15 @@ impl RouterTrait for PDRouter {
             Err(e) => return Self::handle_serialization_error(e),
         };
 
-        // Execute dual dispatch with retries
+        // Execute dual dispatch with retries using the same worker pair
         self.execute_dual_dispatch_with_retry(
             headers,
             json,
             "/v1/chat/completions",
+            prefill,
+            decode,
             is_stream,
             return_logprob,
-            request_text,
         )
         .await
     }
@@ -1682,8 +1673,8 @@ impl RouterTrait for PDRouter {
             None
         };
 
-        // For initial server selection to inject bootstrap fields
-        let (prefill, _) = match self.select_pd_pair(request_text).await {
+        // Select servers for this request
+        let (prefill, decode) = match self.select_pd_pair(request_text).await {
             Ok(pair) => pair,
             Err(e) => return Self::handle_server_selection_error(e),
         };
@@ -1698,14 +1689,15 @@ impl RouterTrait for PDRouter {
             Err(e) => return Self::handle_serialization_error(e),
         };
 
-        // Execute dual dispatch with retries
+        // Execute dual dispatch with retries using the same worker pair
         self.execute_dual_dispatch_with_retry(
             headers,
             json,
             "/v1/completions",
+            prefill,
+            decode,
             is_stream,
             return_logprob,
-            request_text,
         )
         .await
     }
