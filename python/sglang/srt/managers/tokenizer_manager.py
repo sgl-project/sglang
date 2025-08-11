@@ -636,14 +636,13 @@ class TokenizerManager:
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
-        if self.preferred_sampling_params:
-            sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
-        else:
+        if isinstance(obj.sampling_params, SamplingParams):
+            sampling_kwargs = obj.sampling_params.__dict__
+        else: # sampling params is dict already
             sampling_kwargs = obj.sampling_params
-        if isinstance(sampling_kwargs, SamplingParams):
-            sampling_params = sampling_kwargs
-        else:
-            sampling_params = SamplingParams(**sampling_kwargs)
+        if self.preferred_sampling_params:
+            sampling_kwargs = {**self.preferred_sampling_params, **sampling_kwargs}
+        sampling_params = SamplingParams(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
