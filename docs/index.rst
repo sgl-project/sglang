@@ -34,9 +34,7 @@ The core features include:
    :caption: Advanced Features
 
    advanced_features/server_arguments.md
-   advanced_features/attention_backend.md
    advanced_features/hyperparameter_tuning.md
-
    advanced_features/speculative_decoding.ipynb
    advanced_features/structured_outputs.ipynb
    advanced_features/structured_outputs_for_reasoning_models.ipynb
@@ -48,6 +46,7 @@ The core features include:
    advanced_features/vlm_query.ipynb
    advanced_features/router.md
    advanced_features/observability.md
+   advanced_features/attention_backend.md
 
 .. toctree::
    :maxdepth: 1
