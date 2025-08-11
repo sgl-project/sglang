@@ -59,9 +59,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
 
-DECODE_CLIP_MAX_NEW_TOKEN = get_int_env_var(
-    "SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096
-)
+CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
 
 
 class DecodeReqToTokenPool:
@@ -390,7 +388,7 @@ class DecodePreallocQueue:
                     origin_input_len
                     + min(
                         decode_req.req.sampling_params.max_new_tokens,
-                        DECODE_CLIP_MAX_NEW_TOKEN,
+                        CLIP_MAX_NEW_TOKEN,
                     )
                     - retractable_tokens,
                 )
@@ -440,7 +438,7 @@ class DecodePreallocQueue:
         need_space_for_single_req = (
             max(
                 [
-                    min(x.sampling_params.max_new_tokens, DECODE_CLIP_MAX_NEW_TOKEN)
+                    min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
                     + len(x.origin_input_ids)
                     - retractable_tokens
                     for x in self.scheduler.running_batch.reqs
