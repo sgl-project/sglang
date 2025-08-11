@@ -1,5 +1,8 @@
 # Attention Backend
 
+SGLang supports multiple attention backends. Each of them have different pros and cons.
+You can test them according to your needs.
+
 ## Supporting matrix for different attention backends
 
 | **Backend**              | **Page Size > 1** | **Spec Decoding** | **MLA** | **Sliding Window** | **MultiModal** |
