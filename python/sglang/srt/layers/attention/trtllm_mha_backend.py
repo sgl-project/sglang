@@ -23,7 +23,9 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 # Constants
-DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
+DEFAULT_WORKSPACE_SIZE_MB = (
+    512  # Memory workspace size in MB, todo(Yingyi): read from config
+)
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 global_workspace_buffer = None
