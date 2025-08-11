@@ -22,6 +22,7 @@ namespace flashinfer {
 
 template <typename DType, uint32_t vec_size>
 __device__ __forceinline__ void load_v_vec(
+    DType* v,
     vec_t<float, vec_size>& v_vec,
     const uint32_t idx,
     const uint32_t tx,
@@ -34,6 +35,11 @@ __device__ __forceinline__ void load_v_vec(
 
 template <typename DType, typename IdType, uint32_t vec_size>
 __device__ __forceinline__ void save_kv_buffer_ptr(
+    vec_t<float, vec_size>& k_vec,
+    vec_t<float, vec_size>& v_vec,
+    DType* k_buffer,
+    DType* v_buffer,
+    IdType* kv_cache_loc,
     const uint32_t idx,
     const uint32_t tx,
     const uint32_t kv_head_idx,
@@ -41,7 +47,7 @@ __device__ __forceinline__ void save_kv_buffer_ptr(
     size_t k_buffer_stride_h,
     size_t v_buffer_stride_n,
     size_t v_buffer_stride_h) {
-  const IdType cache_offset = cache_loc[idx];
+  const IdType cache_offset = kv_cache_loc[idx];
   DType* k_buffer_ptr =
       k_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
   DType* v_buffer_ptr =
@@ -86,7 +92,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
     size_t k_buffer_stride_h,
     size_t v_buffer_stride_n,
     size_t v_buffer_stride_h,
-    IdType* __restrict__ cache_loc) {
+    IdType* __restrict__ kv_cache_loc) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   uint32_t by = blockIdx.y;
   const uint32_t bdy = blockDim.y;
@@ -135,7 +141,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
 
       vec_t<float, vec_size> v_vec;
       if constexpr (save_kv_cache) {
-        load_v_vec<DType, vec_size>(v_vec, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
+        load_v_vec<DType, vec_size>(v, v_vec, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
       }
 
       vec_t<float, vec_size> k_vec;
@@ -148,7 +154,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
 
       if constexpr (save_kv_cache) {
         save_kv_buffer_ptr<DType, IdType, vec_size>(
-            idx, tx, kv_head_idx, k_buffer_stride_n, k_buffer_stride_h, v_buffer_stride_n, v_buffer_stride_h);
+            k_vec, v_vec, k_buffer, v_buffer, kv_cache_loc, idx, tx, kv_head_idx, k_buffer_stride_n, k_buffer_stride_h, v_buffer_stride_n, v_buffer_stride_h);
       }
     }
   }
@@ -190,7 +196,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
     size_t k_buffer_stride_h,
     size_t v_buffer_stride_n,
     size_t v_buffer_stride_h,
-    IdType* __restrict__ cache_loc) {
+    IdType* __restrict__ kv_cache_loc) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bdy = blockDim.y;
 
@@ -240,7 +246,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
 
       vec_t<float, vec_size> v_vec;
       if constexpr (save_kv_cache) {
-        load_v_vec<DType, vec_size>(v_vec, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
+        load_v_vec<DType, vec_size>(v, v_vec, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
       }
 
       vec_t<float, vec_size> k_vec;
@@ -253,7 +259,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
 
       if constexpr (save_kv_cache) {
         save_kv_buffer_ptr<DType, IdType, vec_size>(
-            idx, tx, kv_head_idx, k_buffer_stride_n, k_buffer_stride_h, v_buffer_stride_n, v_buffer_stride_h);
+            k_vec, v_vec, k_buffer, v_buffer, kv_cache_loc, idx, tx, kv_head_idx, k_buffer_stride_n, k_buffer_stride_h, v_buffer_stride_n, v_buffer_stride_h);
       }
     }
   }
@@ -298,7 +304,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     size_t k_buffer_stride_h,
     size_t v_buffer_stride_n,
     size_t v_buffer_stride_h,
-    IdType* cache_loc,
+    IdType* kv_cache_loc,
     bool interleave,
     bool save_kv_cache,
     cudaStream_t stream = nullptr) {
@@ -348,7 +354,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
             (void*)&k_buffer_stride_h,
             (void*)&v_buffer_stride_n,
             (void*)&v_buffer_stride_h,
-            (void*)&cache_loc};
+            (void*)&kv_cache_loc};
         auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel<
             SAVE_KV_CACHE,
             INTERLEAVE,

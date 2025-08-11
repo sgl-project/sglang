@@ -47,19 +47,19 @@ void apply_rope_pos_ids_cos_sin_cache(
     CHECK_DIM(3, k_buffer);   // k_buffer: (nnz, H_K, D)
     CHECK_DIM(3, v_buffer);   // v_buffer: (nnz, H_V, D)
     CHECK_DIM(3, v);          // v: (nnz, H_V, D)
-    CHECK_DIM(1, cache_loc);  // v: (n)
-    CHECK_INPUT(cache_loc);
+    CHECK_DIM(1, kv_cache_loc);  // v: (n)
+    CHECK_INPUT(kv_cache_loc);
   }
-  size_t k_buffer_stride_n = save_kv_cache ? k_buffer.stride(0) : 0;
-  size_t k_buffer_stride_h = save_kv_cache ? k_buffer.stride(1) : 0;
-  size_t v_buffer_stride_n = save_kv_cache ? v_buffer.stride(0) : 0;
-  size_t v_buffer_stride_h = save_kv_cache ? v_buffer.stride(1) : 0;
-  size_t v_stride_n = save_kv_cache ? v.stride(0) : 0;
-  size_t v_stride_h = save_kv_cache ? v.stride(1) : 0;
-  auto v_ptr = save_kv_cache ? static_cast<c_type*>(v.data_ptr()) : nullptr;
-  auto k_buffer_ptr = save_kv_cache ? static_cast<c_type*>(k_buffer.data_ptr()) : nullptr;
-  auto v_buffer_ptr = save_kv_cache ? static_cast<c_type*>(v_buffer.data_ptr()) : nullptr;
-  auto cache_loc_ptr = save_kv_cache ? static_cast<int64_t*>(cache_loc.data_ptr()) : nullptr;
+  size_t k_buffer_stride_n = save_kv_cache ? k_buffer->stride(0) : 0;
+  size_t k_buffer_stride_h = save_kv_cache ? k_buffer->stride(1) : 0;
+  size_t v_buffer_stride_n = save_kv_cache ? v_buffer->stride(0) : 0;
+  size_t v_buffer_stride_h = save_kv_cache ? v_buffer->stride(1) : 0;
+  size_t v_stride_n = save_kv_cache ? v->stride(0) : 0;
+  size_t v_stride_h = save_kv_cache ? v->stride(1) : 0;
+  auto v_ptr = save_kv_cache ? static_cast<c_type*>(v->data_ptr()) : nullptr;
+  auto k_buffer_ptr = save_kv_cache ? static_cast<c_type*>(k_buffer->data_ptr()) : nullptr;
+  auto v_buffer_ptr = save_kv_cache ? static_cast<c_type*>(v_buffer->data_ptr()) : nullptr;
+  auto kv_cache_loc_ptr = save_kv_cache ? static_cast<int64_t*>(kv_cache_loc->data_ptr()) : nullptr;
 
   CHECK_INPUT(cos_sin_cache);
   CHECK_INPUT(pos_ids);
@@ -124,7 +124,7 @@ void apply_rope_pos_ids_cos_sin_cache(
           k_buffer_stride_h,
           v_buffer_stride_n,
           v_buffer_stride_h,
-          cache_loc_ptr,
+          kv_cache_loc_ptr,
           interleave,
           save_kv_cache,
           stream);
