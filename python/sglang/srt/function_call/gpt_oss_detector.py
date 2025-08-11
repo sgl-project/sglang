@@ -80,16 +80,16 @@ class GptOssDetector(BaseFormatDetector):
 
         # Process the entire text to handle mixed commentary and tool calls
         normal_text_parts = []
-        
+
         # Find all commentary sections (both with and without to=)
         all_commentary_pattern = re.compile(
             r"<\|channel\|>commentary(?:\s+to=[^<]*)?<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)",
             re.DOTALL,
         )
-        
+
         # Track processed positions to avoid double-processing
         processed_ranges = []
-        
+
         # First, extract all tool calls
         for match in self.function_call_pattern.finditer(text):
             full_function_name = match.group(1)
@@ -125,7 +125,7 @@ class GptOssDetector(BaseFormatDetector):
                 start <= match_start < end or start < match_end <= end
                 for start, end in processed_ranges
             )
-            
+
             # If this commentary is not part of a tool call, include it in normal text
             if not is_tool_call:
                 content = match.group(1).strip()

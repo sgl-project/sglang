@@ -296,7 +296,9 @@ class GptOssDetector(BaseReasoningFormatDetector):
             # Check if this commentary is a tool call by looking at the text before <|message|>
             match_start = match.start()
             # Find the start of this commentary section
-            commentary_start = full_normal_text.rfind("<|channel|>commentary", 0, match_start)
+            commentary_start = full_normal_text.rfind(
+                "<|channel|>commentary", 0, match_start
+            )
             if commentary_start != -1:
                 # Extract text between "commentary" and "<|message|>"
                 message_pos = full_normal_text.find("<|message|>", commentary_start)
@@ -307,7 +309,9 @@ class GptOssDetector(BaseReasoningFormatDetector):
                         content = match.group(1).strip()
                         reasoning_parts.append(content)
                         # Remove this commentary section from normal text
-                        cleaned_text = cleaned_text[:match.start()] + cleaned_text[match.end():]
+                        cleaned_text = (
+                            cleaned_text[: match.start()] + cleaned_text[match.end() :]
+                        )
 
         full_normal_text = cleaned_text
 
