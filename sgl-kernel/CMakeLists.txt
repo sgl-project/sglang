@@ -87,6 +87,7 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
+
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
@@ -95,6 +96,7 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
+
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
@@ -232,6 +234,7 @@ set(SOURCES
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
+    "csrc/common_extension.cc"
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/dsv3_fused_a_gemm.cu"
@@ -251,24 +254,10 @@ set(SOURCES
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
-    "csrc/moe/moe_align_kernel.cu"
-    "csrc/moe/moe_fused_gate.cu"
-    "csrc/moe/moe_topk_softmax_kernels.cu"
-    "csrc/moe/nvfp4_blockwise_moe.cu"
-    "csrc/moe/fp8_blockwise_moe_kernel.cu"
-    "csrc/moe/prepare_moe_input.cu"
-    "csrc/moe/ep_moe_reorder_kernel.cu"
-    "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
-    "csrc/speculative/eagle_utils.cu"
-    "csrc/speculative/packbit.cu"
-    "csrc/spatial/greenctx_stream.cu"
-    "csrc/speculative/speculative_sampling.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
-    "csrc/kvcacheio/transfer.cu"
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
-    "csrc/common_extension.cc"
     "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/marlin_moe_wna16/gptq_marlin_repack.cu"
     "csrc/moe/marlin_moe_wna16/awq_marlin_repack.cu"
@@ -278,6 +267,19 @@ set(SOURCES
     "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
     "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
     "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
+    "csrc/moe/moe_align_kernel.cu"
+    "csrc/moe/moe_fused_gate.cu"
+    "csrc/moe/moe_topk_softmax_kernels.cu"
+    "csrc/moe/nvfp4_blockwise_moe.cu"
+    "csrc/moe/fp8_blockwise_moe_kernel.cu"
+    "csrc/moe/prepare_moe_input.cu"
+    "csrc/moe/ep_moe_reorder_kernel.cu"
+    "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
+    "csrc/kvcacheio/transfer.cu"
+    "csrc/speculative/eagle_utils.cu"
+    "csrc/speculative/packbit.cu"
+    "csrc/spatial/greenctx_stream.cu"
+    "csrc/speculative/speculative_sampling.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
@@ -312,12 +314,15 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
+
+# mscclpp
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
 add_subdirectory(${repo-mscclpp_SOURCE_DIR})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
+# flash attention
 target_compile_definitions(common_ops PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT

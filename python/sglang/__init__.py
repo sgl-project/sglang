@@ -1,7 +1,8 @@
 # SGLang public APIs
 
 # Frontend Language APIs
-from sglang.api import (
+from sglang.global_config import global_config
+from sglang.lang.api import (
     Engine,
     Runtime,
     assistant,
@@ -25,13 +26,13 @@ from sglang.api import (
     user_end,
     video,
 )
-from sglang.global_config import global_config
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.lang.choices import (
     greedy_token_selection,
     token_length_normalized,
     unconditional_likelihood_normalized,
 )
+from sglang.srt.entrypoints.engine import Engine
 from sglang.utils import LazyImport
 from sglang.version import __version__
 
