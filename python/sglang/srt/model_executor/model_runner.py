@@ -1443,6 +1443,16 @@ class ModelRunner:
             )
 
             return FlashAttentionBackend(self)
+        elif backend_str == "fa4":
+            assert torch.cuda.get_device_capability()[0] == 10, (
+                "FlashAttention v4 Backend requires SM>=100"
+                "With your setup, please use `--attention-backend flashinfer` instead."
+            )
+            from sglang.srt.layers.attention.blackwell_prefill_attention_backend import (
+                BlackwellAttentionBackend,
+            )
+
+            return BlackwellAttentionBackend(self)
         elif backend_str == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
