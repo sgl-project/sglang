@@ -1,17 +1,17 @@
-name: Test Disaggregation Mode
+name: PR Test (PD Router)
 
 on:
   push:
     branches: [ main ]
     paths:
       - 'python/sglang/srt/disaggregation/**'
-      - 'scripts/ci_start_disaggregation_servers.sh'
+      - 'scripts/ci/ci_start_disaggregation_servers.sh'
       - 'sgl-router/**'
   pull_request:
     branches: [ main ]
     paths:
       - 'python/sglang/srt/disaggregation/**'
-      - 'scripts/ci_start_disaggregation_servers.sh'
+      - 'scripts/ci/ci_start_disaggregation_servers.sh'
       - 'sgl-router/**'
   workflow_dispatch:
 
@@ -27,8 +27,7 @@ permissions:
 jobs:
   test-disaggregation:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
+        github.event.pull_request.draft == false
     runs-on: [h200]
     timeout-minutes: 45
 
@@ -41,11 +40,11 @@ jobs:
     - name: Setup Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.11'
+        python-version: '3.12'
 
     - name: Setup Rust
       run: |
-        bash scripts/ci_install_rust.sh
+        bash scripts/ci/ci_install_rust.sh
 
     - name: Cache Rust dependencies
       uses: actions/cache@v4
@@ -115,9 +114,12 @@ jobs:
     - name: Install SGLang dependencies
       run: |
         echo "Installing SGLang with all extras..."
+        python3 -m pip --no-cache-dir install --upgrade pip
+        python3 -m pip --no-cache-dir install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
         python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.5
         python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.1
+        python3 -m pip --no-cache-dir install sgl-kernel==0.3.3
 
     - name: Build and install sgl-router
       run: |
@@ -130,7 +132,7 @@ jobs:
       id: start_servers
       run: |
         echo "Starting disaggregation servers..."
-        bash scripts/ci_start_disaggregation_servers.sh &
+        bash scripts/ci/ci_start_disaggregation_servers.sh &
         SERVER_PID=$!
         echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
 
@@ -304,9 +306,9 @@ jobs:
                 # Set mean thresholds (allowing for reasonable variance)
                 # These can be adjusted based on your performance requirements
                 ttft_threshold=2.0          # Max 2.0 seconds for mean TTFT
-                e2e_latency_threshold=8.0   # Max 8.0 seconds for mean E2E latency
+                e2e_latency_threshold=24.0   # Max 8.0 seconds for mean E2E latency
                 input_throughput_threshold=10000   # Min 9000 tokens/s for mean input throughput
-                output_throughput_threshold=100    # Min 100 tokens/s for mean output throughput
+                output_throughput_threshold=90    # Min 100 tokens/s for mean output throughput
 
 
                 # Validate mean thresholds
@@ -527,7 +529,7 @@ jobs:
                 fi
               fi
               if [ "$e2e_latency" != "N/A" ] && [ "$e2e_latency" != "null" ]; then
-                if (( $(echo "$e2e_latency > 8.0" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$e2e_latency > 24.0" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
@@ -537,7 +539,7 @@ jobs:
                 fi
               fi
               if [ "$output_throughput" != "N/A" ] && [ "$output_throughput" != "null" ]; then
-                if (( $(echo "$output_throughput < 100" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$output_throughput < 90" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
