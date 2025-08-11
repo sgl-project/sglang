@@ -64,7 +64,7 @@ You can find additional accuracy eval examples in:
 Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md).
 
 ## Request a Review
-You can identify potential reviewers for your code by checking the [code owners](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and [reviewers](https://github.com/sgl-project/sglang/blob/main/.github/REVIEWERS) files.
+You can identify potential reviewers for your code by checking the [code owners](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and [reviewers](https://github.com/sgl-project/sglang/blob/main/.github/REVIEWERS.md) files.
 Another effective strategy is to review the file modification history and contact individuals who have frequently edited the files.
 If you modify files protected by code owners, their approval is required to merge the code.
 
