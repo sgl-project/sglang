@@ -29,13 +29,10 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor pos_ids,
     bool interleave,
     int64_t cuda_stream,
-    at::Tensor k_buffer,
-    at::Tensor v_buffer,
-    float k_scale,
-    float v_scale,
-    at::Tensor v,
-    at::Tensor cache_loc,
-    bool save_kv_cache) {
+    const std::optional<at::Tensor>& v,
+    const std::optional<at::Tensor>& k_buffer,
+    const std::optional<at::Tensor>& v_buffer,
+    const std::optional<at::Tensor>& kv_cache_loc) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   if (save_kv_cache) {
