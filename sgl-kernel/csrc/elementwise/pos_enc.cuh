@@ -33,10 +33,10 @@ __device__ __forceinline__ void prepare(
     uint32_t kv_head_idx,
     size_t v_stride_n,
     size_t v_stride_h) {
+  kv_cache_offset = kv_cache_loc[idx];
+
   DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
   v_vec.cast_load(v_ptr + tx * vec_size);
-
-  kv_cache_offset = kv_cache_loc[idx];
 }
 
 template <typename DType, typename IdType, uint32_t vec_size>
