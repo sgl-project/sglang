@@ -54,16 +54,6 @@ class OpenAIServingChat(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
 
-        # NOTE While OpenAI's chat completion API supports browsing
-        # for some models, currently vLLM doesn't support it. Please use the
-        # Responses API instead.
-        self.supports_browsing = False
-        self.browser_tool = None
-        # NOTE: Chat completion API does not support code interpreter.
-        # Please use the Responses API instead.
-        self.supports_code_interpreter = False
-        self.python_tool = None
-
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
