@@ -78,7 +78,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and not request.tools
         ):
             return "Tools cannot be empty if tool choice is set to required."
-        
+
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
         if max_output_tokens is not None and max_output_tokens > server_context_length:
