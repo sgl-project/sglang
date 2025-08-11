@@ -269,10 +269,9 @@ class TokenizerManager:
         self.asyncio_tasks = set()
 
         # Health check
-        self.health_check_failed = False
+        self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
-        self.server_status = ServerStatus.Starting
 
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
@@ -291,8 +290,8 @@ class TokenizerManager:
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
-        self._is_updating = False
-        self._is_updating_cond = asyncio.Condition()
+        self.is_pause = False
+        self.is_pause_cond = asyncio.Condition()
 
         # LoRA
         # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.
@@ -476,14 +475,14 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        async with self._is_updating_cond:
-            await self._is_updating_cond.wait_for(lambda: not self._is_updating)
-
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
+
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
             if obj.is_single:
@@ -750,7 +749,11 @@ class TokenizerManager:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
             except asyncio.TimeoutError:
-                if request is not None and await request.is_disconnected():
+                if (
+                    request is not None
+                    and not obj.background
+                    and await request.is_disconnected()
+                ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
@@ -805,7 +808,11 @@ class TokenizerManager:
             if obj.stream:
                 yield out
             else:
-                if request is not None and await request.is_disconnected():
+                if (
+                    request is not None
+                    and not obj.background
+                    and await request.is_disconnected()
+                ):
                     # Abort the request for disconnected requests (non-streaming, running)
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
@@ -974,14 +981,14 @@ class TokenizerManager:
         await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
 
     async def pause_generation(self):
-        async with self._is_updating_cond:
-            self._is_updating = True
+        async with self.is_pause_cond:
+            self.is_pause = True
             self.abort_request(abort_all=True)
 
     async def continue_generation(self):
-        async with self._is_updating_cond:
-            self._is_updating = False
-            self._is_updating_cond.notify_all()
+        async with self.is_pause_cond:
+            self.is_pause = False
+            self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
         self,
@@ -1121,6 +1128,7 @@ class TokenizerManager:
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path=obj.lora_path,
+                    pinned=obj.pinned,
                 )
 
                 # Trigger the actual loading operation at the backend processes.
@@ -1178,7 +1186,7 @@ class TokenizerManager:
 
                 return result
         except ValueError as e:
-            return UnloadLoRAAdapterReqOutput(success=False, rror_message=str(e))
+            return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
@@ -1465,7 +1473,7 @@ class TokenizerManager:
         while True:
             remain_num_req = len(self.rid_to_state)
 
-            if self.health_check_failed:
+            if self.server_status == ServerStatus.UnHealthy:
                 # if health check failed, we should exit immediately
                 logger.error(
                     "Signal SIGTERM received while health check failed. Exiting... remaining number of requests: %d",
@@ -1548,8 +1556,17 @@ class TokenizerManager:
 
             if isinstance(recv_obj, BatchStrOut):
                 state.text += recv_obj.output_strs[i]
+                if state.obj.stream:
+                    state.output_ids.extend(recv_obj.output_ids[i])
+                    output_token_ids = state.output_ids[state.last_output_offset :]
+                    state.last_output_offset = len(state.output_ids)
+                else:
+                    state.output_ids.extend(recv_obj.output_ids[i])
+                    output_token_ids = state.output_ids.copy()
+
                 out_dict = {
                     "text": state.text,
+                    "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchTokenIDOut):
@@ -1947,10 +1964,6 @@ class ServerStatus(Enum):
     Up = "Up"
     Starting = "Starting"
     UnHealthy = "UnHealthy"
-    Crashed = "Crashed"
-
-    def is_healthy(self) -> bool:
-        return self == ServerStatus.Up
 
 
 def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
