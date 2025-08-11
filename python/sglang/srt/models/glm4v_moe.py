@@ -48,6 +48,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
 
         config.moe_layer_freq = 1
         self.config = config
+        self._update_hf_config()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.dp_size = get_local_attention_dp_size()
         self.quant_config = quant_config
@@ -394,6 +395,10 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
+                        if "visual" in name:
+                            loaded_weight = self._pad_vit_attn_dummy_heads(
+                                name, loaded_weight
+                            )
                         weight_loader(param, loaded_weight)
 
 
