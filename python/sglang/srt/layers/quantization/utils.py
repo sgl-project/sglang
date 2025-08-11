@@ -16,10 +16,29 @@ from sglang.srt.utils import is_cuda
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
-_is_cuda = is_cuda()
 
-if _is_cuda:
-    from sgl_kernel.scalar_type import ScalarType, scalar_types
+def get_scalar_types():
+    """
+    Returns:
+        tuple: (ScalarType, scalar_types)
+    """
+    try:
+        from sgl_kernel.scalar_type import ScalarType, scalar_types
+
+        return ScalarType, scalar_types
+    except ImportError:
+
+        class MockScalarType:
+            pass
+
+        class MockScalarTypes:
+            uint4b8 = "uint4b8"
+            uint8b128 = "uint8b128"
+
+            def __getattr__(self, name):
+                return f"mock_{name}"
+
+        return MockScalarType, MockScalarTypes()
 
 
 def is_layer_skipped(

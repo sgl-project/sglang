@@ -19,18 +19,15 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.utils import pack_cols, unpack_cols
+from sglang.srt.layers.quantization.utils import (
+    get_scalar_types,
+    pack_cols,
+    unpack_cols,
+)
 from sglang.srt.utils import get_device_capability
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
-
-from sglang.srt.utils import is_cuda
-
-_is_cuda = is_cuda()
-
-if _is_cuda:
-    from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 try:
     from vllm import _custom_ops as ops
@@ -38,6 +35,8 @@ except ImportError:
     ops = None
 
 logger = logging.getLogger(__name__)
+
+ScalarType, scalar_types = get_scalar_types()
 
 GPTQ_MARLIN_TILE = 16
 GPTQ_MARLIN_MIN_THREAD_N = 64
