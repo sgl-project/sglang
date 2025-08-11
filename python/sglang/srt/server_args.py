@@ -452,9 +452,9 @@ class ServerArgs:
                     "trtllm_mla backend does not support speculative decoding yet."
                 )
 
-            if self.kv_cache_dtype not in ["fp8_e4m3", "fp16", "auto"]:
+            if self.kv_cache_dtype not in ["fp8_e4m3", "auto"]:
                 raise ValueError(
-                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or fp16/auto."
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
                 )
 
         if (
