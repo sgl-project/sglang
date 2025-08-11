@@ -1537,10 +1537,7 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
-    global _TP_GLOO
-    if _TP_GLOO:
-        _TP_GLOO.destroy()
-    _TP_GLOO = None
+    
 
     global _WORLD
     if _WORLD:
