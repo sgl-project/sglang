@@ -194,6 +194,25 @@ def _enable_fused_set_kv_buffer():
     return _is_cuda
 
 
+# TODO maybe move to a model-common utils
+def _create_fused_set_kv_buffer_arg(
+    value: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+):
+    layer_id = layer.layer_id
+    token_to_kv_pool = forward_batch.token_to_kv_pool
+
+    return FusedSetKVBufferArg(
+        value=value,
+        k_buffer=token_to_kv_pool.get_key_buffer(layer_id),
+        v_buffer=token_to_kv_pool.get_value_buffer(layer_id),
+        k_scale=layer.k_scale,
+        v_scale=layer.v_scale,
+        cache_loc=forward_batch.out_cache_loc,
+    )
+
+
 class GptOssAttention(nn.Module):
     def __init__(
         self,
@@ -306,13 +325,10 @@ class GptOssAttention(nn.Module):
             positions,
             q,
             k,
-            fused_set_kv_buffer_arg=FusedSetKVBufferArg(
-                value=TODO,
-                k_buffer=TODO,
-                v_buffer=TODO,
-                k_scale=TODO,
-                v_scale=TODO,
-                cache_loc=TODO,
+            fused_set_kv_buffer_arg=_create_fused_set_kv_buffer_arg(
+                value=v,
+                layer=self.attn,
+                forward_batch=forward_batch,
             ) if _enable_fused_set_kv_buffer() else None,
         )
         inner_state = q, k, v, forward_batch
