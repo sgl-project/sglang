@@ -1,3 +1,4 @@
+import re
 from typing import Dict, Optional, Tuple, Type
 
 
@@ -218,7 +219,27 @@ class GPTOSSDetector(BaseReasoningFormatDetector):
         """
         One-time parsing: Detects and parses both analysis and final channels.
         Tool call channels are preserved in normal_text for downstream processing.
+
+        HACK: Also handles simplified format where text starts with "analysis" and transitions
+        to "assistantfinal" without full channel markers.
         """
+        # HACK: Handle simplified format (analysis...assistantfinal) without channel markers
+        if (
+            text.startswith("analysis")
+            and "assistantfinal" in text
+            and "<|channel|>" not in text
+        ):
+            # Split on "assistantfinal"
+            parts = text.split("assistantfinal", 1)
+            if len(parts) == 2:
+                reasoning_text = parts[0][
+                    len("analysis") :
+                ].strip()  # Remove "analysis" prefix
+                normal_text = parts[1].strip()
+                return StreamingParseResult(
+                    normal_text=normal_text, reasoning_text=reasoning_text
+                )
+
         reasoning_parts = []
         normal_parts = []
         current_pos = 0
@@ -227,23 +248,25 @@ class GPTOSSDetector(BaseReasoningFormatDetector):
         while current_pos < len(text):
             # Look for next analysis channel
             analysis_start_idx = text.find(self.think_start_token, current_pos)
-            
+
             if analysis_start_idx == -1:
                 # No more analysis channels, rest goes to remaining
                 break
-            
+
             # Preserve any content before this analysis channel (could include tool calls)
             if analysis_start_idx > current_pos:
                 between_content = text[current_pos:analysis_start_idx]
                 # This content will be added to normal_parts later
                 normal_parts.append(between_content)
-            
+
             # Extract analysis content
             analysis_content_start = analysis_start_idx + len(self.think_start_token)
             analysis_end_idx = text.find(self.think_end_token, analysis_content_start)
-            
+
             if analysis_end_idx != -1:
-                reasoning_parts.append(text[analysis_content_start:analysis_end_idx].strip())
+                reasoning_parts.append(
+                    text[analysis_content_start:analysis_end_idx].strip()
+                )
                 current_pos = analysis_end_idx + len(self.think_end_token)
             else:
                 # Analysis not complete
@@ -255,24 +278,58 @@ class GPTOSSDetector(BaseReasoningFormatDetector):
         if current_pos < len(text):
             remaining = text[current_pos:]
             normal_parts.append(remaining)
-        
+
         # Now process the collected normal_parts for commentary channels
         full_normal_text = "".join(normal_parts)
-        
-        # Extract non-tool-call commentary content for reasoning
-        idx = 0
-        while idx < len(full_normal_text):
-            # Check for commentary channel without "to=" (not a tool call)
-            if full_normal_text[idx:].startswith("<|channel|>commentary<|message|>"):
-                msg_start = idx + len("<|channel|>commentary<|message|>")
-                msg_end = full_normal_text.find("<|end|>", msg_start)
-                if msg_end != -1:
-                    reasoning_parts.append(full_normal_text[msg_start:msg_end].strip())
-                    idx = msg_end + len("<|end|>")
-                else:
-                    idx += 1
-            else:
-                idx += 1
+
+        # Use regex to extract and remove non-tool-call commentary content
+        # Pattern to match commentary without "to=" (not a tool call)
+        commentary_pattern = re.compile(
+            r"<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)",
+            re.DOTALL,
+        )
+
+        # Find all matches and extract content for reasoning
+        for match in commentary_pattern.finditer(full_normal_text):
+            # Check if this is a tool call by looking backward for "to="
+            start_pos = match.start()
+            # Look backwards up to 100 characters to see if there's a "to=" before the match
+            lookback_start = max(0, start_pos - 100)
+            lookback_text = full_normal_text[lookback_start:start_pos]
+
+            # If no "to=" found in the lookback, this is regular commentary
+            if "to=" not in lookback_text:
+                reasoning_parts.append(match.group(1).strip())
+
+        # Remove non-tool-call commentary sections from normal text
+        # Match any commentary that is NOT a tool call (doesn't have "to=" directly after "commentary")
+        removal_pattern = re.compile(
+            r"<\|start\|>assistant<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)(?:<\|start\|>assistant)?",
+            re.DOTALL,
+        )
+
+        cleaned_text = full_normal_text
+
+        # Process matches from end to beginning to avoid index shifting
+        for match in reversed(list(removal_pattern.finditer(full_normal_text))):
+            # Get the full match including what comes before <|channel|>commentary
+            full_match_start = match.start()
+
+            # Look for "to=" between <|channel|>commentary and <|message|>
+            commentary_start = full_match_start + len(
+                "<|start|>assistant<|channel|>commentary"
+            )
+            message_start = full_normal_text.find("<|message|>", commentary_start)
+
+            if message_start != -1:
+                between_text = full_normal_text[commentary_start:message_start]
+                # If there's no "to=" in this section, it's not a tool call
+                if " to=" not in between_text:
+                    cleaned_text = (
+                        cleaned_text[: match.start()] + cleaned_text[match.end() :]
+                    )
+
+        full_normal_text = cleaned_text
 
         # Combine all reasoning parts
         reasoning_text = "".join(reasoning_parts)
@@ -282,17 +339,21 @@ class GPTOSSDetector(BaseReasoningFormatDetector):
         if self.final_channel_start in full_normal_text:
             final_start = full_normal_text.find(self.final_channel_start)
             final_content_start = final_start + len(self.final_channel_start)
-            final_end = full_normal_text.find(self.final_channel_end, final_content_start)
+            final_end = full_normal_text.find(
+                self.final_channel_end, final_content_start
+            )
 
             if final_end != -1:
                 # Extract content before final channel (includes tool calls)
                 before_final = full_normal_text[:final_start].strip()
-                # Extract final channel content
+                # Extract ONLY the final channel content (not the channel markers)
                 final_text = full_normal_text[final_content_start:final_end].strip()
-                # Extract content after final channel  
-                after_final = full_normal_text[final_end + len(self.final_channel_end):].strip()
-                
-                # Combine all parts
+                # Extract content after final channel
+                after_final = full_normal_text[
+                    final_end + len(self.final_channel_end) :
+                ].strip()
+
+                # For tool calls + final answer: concatenate tool calls with final text
                 parts = []
                 if before_final:
                     parts.append(before_final)
@@ -302,8 +363,23 @@ class GPTOSSDetector(BaseReasoningFormatDetector):
                     parts.append(after_final)
                 normal_text = " ".join(parts)
             else:
-                # Final channel not complete, include everything
-                normal_text = full_normal_text.strip()
+                # Final channel not complete - extract what we have
+                # Look for just <|channel|>final<|message|> without <|return|>
+                alt_final_start = full_normal_text.find("<|channel|>final<|message|>")
+                if alt_final_start != -1:
+                    before_alt_final = full_normal_text[:alt_final_start].strip()
+                    alt_final_content = full_normal_text[
+                        alt_final_start + len("<|channel|>final<|message|>") :
+                    ].strip()
+
+                    parts = []
+                    if before_alt_final:
+                        parts.append(before_alt_final)
+                    if alt_final_content:
+                        parts.append(alt_final_content)
+                    normal_text = " ".join(parts)
+                else:
+                    normal_text = full_normal_text.strip()
         else:
             # No final channel, treat all as normal text (includes tool calls)
             normal_text = full_normal_text.strip()

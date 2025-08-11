@@ -119,39 +119,30 @@ class GPTOSSDetector(BaseFormatDetector):
         # Include any remaining text after all function calls
         if last_match_end > 0 and last_match_end < len(text):
             remaining_text = text[last_match_end:]
-            # Remove analysis channel content since that's handled by reasoning parser
-            # But keep any text after the analysis ends
-            if (
-                "<|channel|>analysis" in remaining_text
-                or "analysis<|message|>" in remaining_text
-            ):
-                # Find the end of analysis section(s)
-                temp = remaining_text
-                while "<|channel|>analysis" in temp or "analysis<|message|>" in temp:
-                    # Find the start of analysis section (could be either format)
-                    start1 = temp.find("<|channel|>analysis")
-                    start2 = temp.find("analysis<|message|>")
 
-                    if start1 == -1 and start2 == -1:
-                        break
-                    elif start1 == -1:
-                        start = start2
-                    elif start2 == -1:
-                        start = start1
-                    else:
-                        start = min(start1, start2)
+            # Clean up <|start|>assistant prefixes and extract final content
+            # Remove standalone <|start|>assistant prefixes
+            remaining_text = re.sub(r"<\|start\|>assistant(?!\w)", "", remaining_text)
 
-                    end = temp.find("<|end|>", start)
-                    if end != -1:
-                        # Remove the analysis section but keep text after it
-                        temp = temp[:start] + temp[end + len("<|end|>") :]
-                    else:
-                        # Incomplete analysis, remove from start
-                        temp = temp[:start]
-                        break
-                remaining_text = temp.strip()
-            else:
-                remaining_text = remaining_text.strip()
+            # Extract content from final channel if present
+            final_pattern = re.compile(
+                r"<\|channel\|>final<\|message\|>(.*?)(?:<\|return\|>|$)", re.DOTALL
+            )
+            final_match = final_pattern.search(remaining_text)
+
+            if final_match:
+                # Get everything before final channel + final channel content
+                before_final = remaining_text[: final_match.start()].strip()
+                final_content = final_match.group(1).strip()
+
+                parts = []
+                if before_final:
+                    parts.append(before_final)
+                if final_content:
+                    parts.append(final_content)
+                remaining_text = " ".join(parts) if parts else ""
+
+            remaining_text = remaining_text.strip()
 
             if remaining_text:
                 normal_text = (
