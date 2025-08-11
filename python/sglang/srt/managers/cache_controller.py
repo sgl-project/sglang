@@ -169,12 +169,13 @@ class StorageOperation:
         host_indices: torch.Tensor,
         token_ids: List[int],
         last_hash: Optional[str] = None,
+        hash_value: Optional[List[str]] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
-        self.hash_value = []
+        self.hash_value = hash_value if hash_value is not None else []
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -702,12 +703,12 @@ class HiCacheController:
         self,
         host_indices: torch.Tensor,
         token_ids: List[int],
-        last_hash: Optional[str] = None,
+        hash_value: Optional[List[str]] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
-        operation = StorageOperation(host_indices, token_ids, last_hash)
+        operation = StorageOperation(host_indices, token_ids, hash_value=hash_value)
         self.backup_queue.put(operation)
         return operation.id
 
@@ -762,24 +763,6 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                last_hash = operation.last_hash
-                tokens_to_backup = operation.token_ids
-
-                backup_hit_count = 0
-                remaining_tokens = len(tokens_to_backup)
-                hash_value = []
-                while remaining_tokens >= self.page_size:
-                    last_hash = self.get_hash_str(
-                        tokens_to_backup[
-                            backup_hit_count : backup_hit_count + self.page_size
-                        ],
-                        last_hash,
-                    )
-                    backup_hit_count += self.page_size
-                    hash_value.append(last_hash)
-                    remaining_tokens -= self.page_size
-                operation.hash_value = hash_value
-
                 if self.is_mooncake_backend():
                     self.mooncake_page_backup(operation)
                 elif self.storage_backend_type == "hf3fs":
@@ -802,7 +785,6 @@ class HiCacheController:
                 self.ack_backup_queue.put(
                     (
                         operation.id,
-                        operation.hash_value[: min_completed_tokens // self.page_size],
                         min_completed_tokens,
                     )
                 )
