@@ -30,62 +30,76 @@
 
 [Pytorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html) is a convenient basic tool to inspect kernel execution time, call stack, and kernel overlap and occupancy.
 
-- To profile a server
+### Profile a server with `sglang.bench_serving`
+```bash
+# set trace path
+export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 
-  ```bash
-  # set trace path
-  export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+# start server
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
-  # start server
-  python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
+# send profiling request from client
+python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
+```
 
-  # send profiling request from client
-  python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
-  ```
+Please make sure that the `SGLANG_TORCH_PROFILER_DIR` should be set at both server and client side, otherwise the trace file cannot be generated correctly . A secure way will be setting `SGLANG_TORCH_PROFILER_DIR` in the `.*rc` file of shell (e.g. `~/.bashrc` for bash shells).
 
-  Please make sure that the `SGLANG_TORCH_PROFILER_DIR` should be set at both server and client side, otherwise the trace file cannot be generated correctly . A secure way will be setting `SGLANG_TORCH_PROFILER_DIR` in the `.*rc` file of shell (e.g. `~/.bashrc` for bash shells).
+### Profile a server with `sglang.bench_offline_throughput`
+```bash
+export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 
-- To profile offline
-  ```bash
-  export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+# profile one batch with bench_one_batch.py
+# batch size can be controlled with --batch argument
+python3 -m sglang.bench_one_batch --model-path meta-llama/Llama-3.1-8B-Instruct --batch 32 --input-len 1024 --output-len 10 --profile
 
-  # profile one batch with bench_one_batch.py
-  # batch size can be controlled with --batch argument
-  python3 -m sglang.bench_one_batch --model-path meta-llama/Llama-3.1-8B-Instruct --batch 32 --input-len 1024 --output-len 10 --profile
+# profile multiple batches with bench_offline_throughput.py
+python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
+```
 
-  # profile multiple batches with bench_offline_throughput.py
-  python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
-  ```
+### Profile a server with `sglang.profiler`
 
-- Possible PyTorch Bug
-  If in any cases you encounter the following error (for example, using qwen 2.5 VL):
-  ```bash
-  RuntimeError: !stack.empty() INTERNAL ASSERT FAILED at "/pytorch/torch/csrc/autograd/profiler_python.cpp":983, please report a bug to PyTorch. Python replay stack is empty.
-  ```
-  This is likely a PyTorch Bug reported in [Bug: vLLM Profiler](https://github.com/vllm-project/vllm/issues/18240) and [Bug: torch.profiler.profile](https://github.com/pytorch/pytorch/issues/101632). As a workaround, you may disable `with_stack` with an environment variable such as follows:
-  ```bash
-  export SGLANG_PROFILE_WITH_STACK=False
-  python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
-  ```
+When the server is running (e.g., processing a decoding request), you can start live profiling immediately by sending a profile request to the server.
 
-- View Traces
+You can do this by running `python3 -m sglang.profiler`. For example:
 
-  Trace files can be loaded and visualized from:
+```
+# Terminal 1: Send a generation request
+python3 -m sglang.test.send_one
 
-  1. https://ui.perfetto.dev/ (any browser)
-  2. chrome://tracing (Chrome browser only)
+# Terminal 2: Before the above request finishes, quickly launch the following command in a separate terminal.
+# It will generate a profile of the above request for several decoding batches.
+python3 -m sglang.profiler
+```
 
-  If browser cannot open trace file due to its large size,
-  client can generate a small trace file (<100MB) by controlling number of prompts and lengths of prompt outputs.
-  For example, when profiling a server,
+### Possible PyTorch bugs
+If in any cases you encounter the following error (for example, using qwen 2.5 VL):
+```bash
+RuntimeError: !stack.empty() INTERNAL ASSERT FAILED at "/pytorch/torch/csrc/autograd/profiler_python.cpp":983, please report a bug to PyTorch. Python replay stack is empty.
+```
+This is likely a PyTorch Bug reported in [Bug: vLLM Profiler](https://github.com/vllm-project/vllm/issues/18240) and [Bug: torch.profiler.profile](https://github.com/pytorch/pytorch/issues/101632). As a workaround, you may disable `with_stack` with an environment variable such as follows:
+```bash
+export SGLANG_PROFILE_WITH_STACK=False
+python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
+```
 
-  ```bash
-  python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 2 --sharegpt-output-len 100 --profile
-  ```
+### View traces
 
-  This command sets the number of prompts to 2 with `--num-prompts` argument and limits the length of output sequences to 100 with `--sharegpt-output-len` argument, which can generate a small trace file for browser to open smoothly.
+Trace files can be loaded and visualized from:
 
-  Additionally, if you want to locate the SGLang Python source code through the cuda kernel in Trace, you need to disable CUDA Graph when starting the service. This can be done by using the `--disable-cuda-graph` parameter in the command to start the service.
+1. https://ui.perfetto.dev/ (any browser)
+2. chrome://tracing (Chrome browser only)
+
+If browser cannot open trace file due to its large size,
+client can generate a small trace file (<100MB) by controlling number of prompts and lengths of prompt outputs.
+For example, when profiling a server,
+
+```bash
+python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 2 --sharegpt-output-len 100 --profile
+```
+
+This command sets the number of prompts to 2 with `--num-prompts` argument and limits the length of output sequences to 100 with `--sharegpt-output-len` argument, which can generate a small trace file for browser to open smoothly.
+
+Additionally, if you want to locate the SGLang Python source code through the cuda kernel in Trace, you need to disable CUDA Graph when starting the service. This can be done by using the `--disable-cuda-graph` parameter in the command to start the service.
 
 ## Profile with Nsight
 
