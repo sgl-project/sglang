@@ -143,7 +143,7 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
 
 
 class MHATokenToKVPool:
-    KV_POOL_SIZE = 2000
+    KV_POOL_SIZE = 8192
 
     def __init__(
         self,

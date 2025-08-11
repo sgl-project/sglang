@@ -34,7 +34,10 @@ from sgl_kernel.testing.rotary_embedding import (
             for batch_size, seq_len in (
                 (1, 1),
                 (32, 1),
+                (128, 1),
+                (512, 1),
                 (2, 512),
+                (1, 4096),
             )
         ],
         # Other cases
