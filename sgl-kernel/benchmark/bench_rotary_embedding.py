@@ -18,6 +18,7 @@ configs = [
     for batch_size, seq_len in (
         (1, 1),
         (32, 1),
+        (128, 1),
         (2, 512),
     )
 ]
@@ -85,7 +86,7 @@ def benchmark(batch_size, seq_len, save_kv_cache, provider):
         ),
     )
 
-    time_s = bench_kineto(bench_fn, kernel_names=["TODO"])
+    time_s = bench_kineto(bench_fn, kernel_names="BatchQKApplyRotaryPosIds")
     return time_s * 1e6
 
 
