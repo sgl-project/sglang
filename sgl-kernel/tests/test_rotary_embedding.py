@@ -30,7 +30,6 @@ from sgl_kernel.testing.rotary_embedding import (
                 8,
                 save_kv_cache,
             )
-            for save_kv_cache in (False, True)
             for batch_size, seq_len in (
                 (1, 1),
                 (32, 1),
@@ -39,6 +38,7 @@ from sgl_kernel.testing.rotary_embedding import (
                 (2, 512),
                 (4, 4096),
             )
+            for save_kv_cache in (False, True)
         ],
         # Other cases
         (64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1, False),

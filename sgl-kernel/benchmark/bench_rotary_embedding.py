@@ -14,7 +14,6 @@ from sglang.srt.bench_utils import bench_kineto
 
 configs = [
     (batch_size, seq_len, save_kv_cache)
-    for save_kv_cache in (False, True)
     for batch_size, seq_len in (
         (1, 1),
         (32, 1),
@@ -23,6 +22,7 @@ configs = [
         (2, 512),
         (4, 4096),
     )
+    for save_kv_cache in (False, True)
 ]
 
 
