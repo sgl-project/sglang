@@ -524,7 +524,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             logger.warning_once('using attn output gate!')
 
-        if hasattr(config, "partial_rotary_factor"):
+        if hasattr(config, "rotary_percent"):
+            rotary_dim = self.head_dim * config.rotary_percent
+        elif hasattr(config, "partial_rotary_factor"):
             rotary_dim = self.head_dim * config.partial_rotary_factor
         elif hasattr(config, "attn_rotary_emb"):
             rotary_dim = config.attn_rotary_emb  # for backward compatibility
@@ -611,7 +613,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
             orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_kv_heads, -1)
+            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
             gate = gate.reshape(*orig_shape, -1)
