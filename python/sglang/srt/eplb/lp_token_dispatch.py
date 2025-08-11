@@ -53,17 +53,17 @@ def run_lp_solver(
         tol = lp_metadata["ecos_opts"]["abstol"]
         t2_value = solution["x"][1:]
         t2_value[t2_value < tol] = 0
-        phy_prob = np.ones(
+        phy_prob = np.zeros(
             lp_metadata["single_expert_array"].shape[0]
             + lp_metadata["phy_replicated_expert_array"].shape[0]
+            + 1
         )
         phy_prob[lp_metadata["phy_replicated_expert_array"]] = t2_value
         phy_prob[lp_metadata["single_expert_array"]] = t1
 
         log2phy_prob = np.full_like(log2phy, fill_value=0, dtype=float)
-        mask = log2phy != -1
-        log2phy_prob[mask] = np.take(phy_prob, log2phy[mask])
-        return torch.from_numpy(log2phy_prob)
+        log2phy_prob = np.take(phy_prob, log2phy)
+        return torch.from_numpy(log2phy_prob).to(torch.float32)
     else:
         # Fall back to random dispatch
         # copy log2phy
@@ -71,7 +71,7 @@ def run_lp_solver(
         # replace -1 with 0, all other values to 1
         log2phy_prob[log2phy_prob == -1] = 0
         log2phy_prob[log2phy_prob != -1] = 1
-        return log2phy_prob
+        return log2phy_prob.to(torch.float32)
 
 
 def count_logical_expert_tokens(
@@ -174,7 +174,7 @@ def get_log2phy_prob(
         log2phy_prob = torch.empty_like(
             expert_location_dispatch_info.partial_logical_to_all_physical_map,
             device=device,
-        )
+        ).to(torch.float32)
 
     # Step 4: Broadcast to all ranks
     log2phy_prob = log2phy_prob.to(device=device)
