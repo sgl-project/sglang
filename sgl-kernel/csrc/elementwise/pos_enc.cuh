@@ -42,8 +42,8 @@ __device__ __forceinline__ void prepare(
 template <typename DType, typename IdType, uint32_t vec_size>
 __device__ __forceinline__ void save(
     const IdType& kv_cache_offset,
-    const vec_t<float, vec_size>& k_vec,
-    const vec_t<float, vec_size>& v_vec,
+    vec_t<float, vec_size>& k_vec,
+    vec_t<float, vec_size>& v_vec,
     const DType* k_buffer,
     const DType* v_buffer,
     const uint32_t idx,
