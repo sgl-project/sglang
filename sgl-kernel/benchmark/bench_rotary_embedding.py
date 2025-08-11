@@ -48,7 +48,7 @@ def benchmark(batch_size, seq_len, save_kv_cache, provider):
         rotary_dim=64,
         max_position_embeddings=4096,
         base=8000,
-        is_neox_style=False,
+        is_neox_style=True,
         dtype=dtype,
     )
     rope_flashinfer = FlashInferRotaryEmbedding(**config).to(device)

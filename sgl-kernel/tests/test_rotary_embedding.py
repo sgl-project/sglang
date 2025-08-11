@@ -21,7 +21,7 @@ from sgl_kernel.testing.rotary_embedding import (
                 64,
                 4096,
                 8000,
-                False,
+                True,
                 torch.bfloat16,
                 "cuda",
                 batch_size,
