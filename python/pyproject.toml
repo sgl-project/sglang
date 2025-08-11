@@ -63,7 +63,7 @@ srt = [
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "flashinfer_python==0.2.10",
+    "flashinfer_python==0.2.11.post1",
 ]
 
 blackwell = [
@@ -73,7 +73,7 @@ blackwell = [
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "flashinfer_python==0.2.10",
+    "flashinfer_python==0.2.11.post1",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
