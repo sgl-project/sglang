@@ -36,6 +36,16 @@ void apply_rope_pos_ids_cos_sin_cache(
   CHECK_LAST_DIM_CONTIGUOUS(k);
 
   const bool save_kv_cache = v.has_value();
+  size_t k_buffer_stride_n = 0;
+  size_t k_buffer_stride_h = 0;
+  size_t v_buffer_stride_n = 0;
+  size_t v_buffer_stride_h = 0;
+  size_t v_stride_n = 0;
+  size_t v_stride_h = 0;
+  auto v_ptr = nullptr;
+  auto k_buffer_ptr = nullptr;
+  auto v_buffer_ptr = nullptr;
+  auto cache_loc_ptr = nullptr;
   if (save_kv_cache) {
     CHECK_LAST_DIM_CONTIGUOUS(v);
     CHECK_LAST_DIM_CONTIGUOUS(k_buffer);
@@ -55,17 +65,6 @@ void apply_rope_pos_ids_cos_sin_cache(
     auto k_buffer_ptr = static_cast<c_type*>(k_buffer.data_ptr());
     auto v_buffer_ptr = static_cast<c_type*>(v_buffer.data_ptr());
     auto cache_loc_ptr = static_cast<int64_t*>(cache_loc.data_ptr());
-  } else {
-    size_t k_buffer_stride_n = 0;
-    size_t k_buffer_stride_h = 0;
-    size_t v_buffer_stride_n = 0;
-    size_t v_buffer_stride_h = 0;
-    size_t v_stride_n = 0;
-    size_t v_stride_h = 0;
-    auto v_ptr = nullptr;
-    auto k_buffer_ptr = nullptr;
-    auto v_buffer_ptr = nullptr;
-    auto cache_loc_ptr = nullptr;
   }
 
   CHECK_INPUT(cos_sin_cache);
