@@ -825,17 +825,18 @@ class UpdateWeightsFromDistributedReqOutput:
     success: bool
     message: str
 
+
 @dataclass
 class ConvertDisaggregationRoleReqInput:
     # the server url to convert
     server_url: str
 
     # convert decode to prefill
-    bootstrap_port:Optional[int] = None
-    disaggregation_decode_tp:Optional[int] = None
-    disaggregation_decode_dp:Optional[int] = None
-    disaggregation_prefill_pp:Optional[int] = 1
-    disable_radix_cache: bool = False # defalut open radix cache in prefill
+    bootstrap_port: Optional[int] = None
+    disaggregation_decode_tp: Optional[int] = None
+    disaggregation_decode_dp: Optional[int] = None
+    disaggregation_prefill_pp: Optional[int] = 1
+    disable_radix_cache: bool = False  # defalut open radix cache in prefill
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
@@ -851,7 +852,7 @@ class ConvertDisaggregationRoleReqInput:
     # convert prefill to decode
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
-    disable_cuda_graph: bool = False # defalut open cuda graph in decode
+    disable_cuda_graph: bool = False  # defalut open cuda graph in decode
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
     # environ for decode
@@ -859,13 +860,14 @@ class ConvertDisaggregationRoleReqInput:
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES: Optional[int] = None
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL: Optional[float] = None
 
-    
 
 @dataclass
 class ConvertDisaggregationRoleReqOutput:
     """Converse PD disaggregation identity"""
+
     success: bool
     message: str
+
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:

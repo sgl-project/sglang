@@ -68,6 +68,8 @@ from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
+    ConvertDisaggregationRoleReqInput,
+    ConvertDisaggregationRoleReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -97,8 +99,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
-    ConvertDisaggregationRoleReqInput,
-    ConvertDisaggregationRoleReqOutput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -2164,7 +2164,10 @@ class Scheduler(
             len(self.waiting_queue) == 0
             and self.running_batch.is_empty()
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
-            and (not hasattr(self,"disagg_prefill_inflight_queue") or len(self.disagg_prefill_inflight_queue) == 0)
+            and (
+                not hasattr(self, "disagg_prefill_inflight_queue")
+                or len(self.disagg_prefill_inflight_queue) == 0
+            )
         ):
             self.cur_batch = None
             self.last_batch = None
@@ -2467,34 +2470,48 @@ class Scheduler(
                 # ServerArgs init will set cuda_graph_max_bs to a num.
                 self.server_args.cuda_graph_max_bs = recv_req.cuda_graph_max_bs
             self.server_args.cuda_graph_bs = recv_req.cuda_graph_bs
-            self.server_args.disable_cuda_graph_padding = recv_req.disable_cuda_graph_padding
-            self.server_args.enable_profile_cuda_graph = recv_req.enable_profile_cuda_graph
-            #stop prefill event loop
+            self.server_args.disable_cuda_graph_padding = (
+                recv_req.disable_cuda_graph_padding
+            )
+            self.server_args.enable_profile_cuda_graph = (
+                recv_req.enable_profile_cuda_graph
+            )
+            # stop prefill event loop
             self.stop_prefill_event.set()
             return ConvertDisaggregationRoleReqOutput(
                 success=True,
                 message="The role of this server is now DECODE.",
-            )   
+            )
         else:
             # disaggregation
             self.server_args.disaggregation_bootstrap_port = recv_req.bootstrap_port
-            self.server_args.disaggregation_decode_dp = recv_req.disaggregation_decode_dp
-            self.server_args.disaggregation_decode_tp = recv_req.disaggregation_decode_tp
-            self.server_args.disaggregation_prefill_pp = recv_req.disaggregation_prefill_pp
+            self.server_args.disaggregation_decode_dp = (
+                recv_req.disaggregation_decode_dp
+            )
+            self.server_args.disaggregation_decode_tp = (
+                recv_req.disaggregation_decode_tp
+            )
+            self.server_args.disaggregation_prefill_pp = (
+                recv_req.disaggregation_prefill_pp
+            )
             # tree cache
             self.server_args.disable_radix_cache = recv_req.disable_radix_cache
             self.enable_hierarchical_cache = recv_req.enable_hierarchical_cache
-            self.server_args.enable_hierarchical_cache = recv_req.enable_hierarchical_cache
+            self.server_args.enable_hierarchical_cache = (
+                recv_req.enable_hierarchical_cache
+            )
             if self.enable_hierarchical_cache:
                 self.server_args.hicache_ratio = recv_req.hicache_ratio
                 self.server_args.hicache_size = recv_req.hicache_size
                 self.server_args.hicache_write_policy = recv_req.hicache_write_policy
                 self.server_args.hicache_io_backend = recv_req.hicache_io_backend
                 self.enable_hicache_storage = recv_req.hicache_storage_backend
-                self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
+                self.server_args.hicache_storage_backend = (
+                    recv_req.hicache_storage_backend
+                )
                 self.server_args.hicache_mem_layout = recv_req.hicache_mem_layout
             # cuda graph
-            self.server_args.disable_cuda_graph = True 
+            self.server_args.disable_cuda_graph = True
             # stop decode event loop
             self.stop_decode_event.set()
             return ConvertDisaggregationRoleReqOutput(
@@ -2556,7 +2573,8 @@ def is_health_check_generate_req(recv_req):
 def is_work_request(recv_req):
     return isinstance(recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
 
-def start_scheduler_event_loop(scheduler: Scheduler,server_args: ServerArgs):
+
+def start_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs):
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
 
     if disaggregation_mode == DisaggregationMode.NULL:
@@ -2577,6 +2595,7 @@ def start_scheduler_event_loop(scheduler: Scheduler,server_args: ServerArgs):
             scheduler.event_loop_overlap_disagg_decode()
         else:
             scheduler.event_loop_normal_disagg_decode()
+
 
 def run_scheduler_process(
     server_args: ServerArgs,
@@ -2638,11 +2657,10 @@ def run_scheduler_process(
             }
         )
         if server_args.enable_pd_convert:
-            start_scheduler_event_loop(scheduler,server_args)
+            start_scheduler_event_loop(scheduler, server_args)
         else:
             while True:
-                start_scheduler_event_loop(scheduler,server_args)
-            
+                start_scheduler_event_loop(scheduler, server_args)
 
     except Exception:
         traceback = get_exception_traceback()

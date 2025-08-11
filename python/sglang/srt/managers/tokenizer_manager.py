@@ -73,6 +73,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    ConvertDisaggregationRoleReqInput,
+    ConvertDisaggregationRoleReqOutput,
     EmbeddingReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -113,8 +115,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    ConvertDisaggregationRoleReqInput,
-    ConvertDisaggregationRoleReqOutput,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -1270,7 +1270,9 @@ class TokenizerManager:
         )
         return [res.internal_state for res in responses]
 
-    async def convert_pd_role(self, obj:ConvertDisaggregationRoleReqInput) -> Tuple[bool, str]:
+    async def convert_pd_role(
+        self, obj: ConvertDisaggregationRoleReqInput
+    ) -> Tuple[bool, str]:
         if not self.server_args.enable_pd_convert:
             return False, "PD role conversion is not enabled.", None
 
@@ -1290,36 +1292,48 @@ class TokenizerManager:
                 bootstrap_port,
             )
             self.server_args.disaggregation_bootstrap_port = bootstrap_port
-            obj.bootstrap_port=bootstrap_port
+            obj.bootstrap_port = bootstrap_port
             req = obj
             if obj.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE is not None:
-                os.environ["SGLANG_DISAGGREGATION_THREAD_POOL_SIZE"] = obj.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
+                os.environ["SGLANG_DISAGGREGATION_THREAD_POOL_SIZE"] = (
+                    obj.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
+                )
             else:
                 os.environ.pop("SGLANG_DISAGGREGATION_THREAD_POOL_SIZE", None)
-            
+
             if obj.SGLANG_DISAGGREGATION_QUEUE_SIZE is not None:
-                os.environ["SGLANG_DISAGGREGATION_QUEUE_SIZE"] = obj.SGLANG_DISAGGREGATION_QUEUE_SIZE
+                os.environ["SGLANG_DISAGGREGATION_QUEUE_SIZE"] = (
+                    obj.SGLANG_DISAGGREGATION_QUEUE_SIZE
+                )
             else:
                 os.environ.pop("SGLANG_DISAGGREGATION_QUEUE_SIZE", None)
-            
+
             if obj.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT is not None:
-                os.environ["SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT"] = obj.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
+                os.environ["SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT"] = (
+                    obj.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
+                )
             else:
                 os.environ.pop("SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", None)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             req = obj
             if obj.SGLANG_DISAGGREGATION_WAITING_TIMEOUT is not None:
-                os.environ["SGLANG_DISAGGREGATION_WAITING_TIMEOUT"] = obj.SGLANG_DISAGGREGATION_WAITING_TIMEOUT
+                os.environ["SGLANG_DISAGGREGATION_WAITING_TIMEOUT"] = (
+                    obj.SGLANG_DISAGGREGATION_WAITING_TIMEOUT
+                )
             else:
                 os.environ.pop("SGLANG_DISAGGREGATION_WAITING_TIMEOUT", None)
-            
+
             if obj.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES is not None:
-                os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES"] = obj.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES
+                os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES"] = (
+                    obj.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES
+                )
             else:
                 os.environ.pop("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES", None)
-            
+
             if obj.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL is not None:
-                os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL"] = obj.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL
+                os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL"] = (
+                    obj.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL
+                )
             else:
                 os.environ.pop("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", None)
         else:

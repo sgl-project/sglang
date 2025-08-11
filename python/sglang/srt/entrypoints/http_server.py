@@ -71,6 +71,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    ConvertDisaggregationRoleReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -89,7 +90,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
-    ConvertDisaggregationRoleReqInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
@@ -607,6 +607,7 @@ async def update_weights_from_distributed(
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
+
 @app.post("/convert_pd_role")
 async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
     """Convert the role of the current PD server."""
@@ -619,6 +620,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
 async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):

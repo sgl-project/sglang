@@ -2008,11 +2008,13 @@ class ServerArgs:
         assert (
             self.chunked_prefill_size % self.page_size == 0
         ), "chunked_prefill_size must be divisible by page_size"
-        
+
         # check pd disaggregation args
         assert (
-            (self.enable_pd_convert and self.disaggregation_mode != "null") or self.disaggregation_mode == "null"
-        ), "enable_pd_convert should be set only when disaggregation_mode is not null"
+            self.enable_pd_convert and self.disaggregation_mode != "null"
+        ) or self.disaggregation_mode == "null", (
+            "enable_pd_convert should be set only when disaggregation_mode is not null"
+        )
 
     def check_lora_server_args(self):
         assert (

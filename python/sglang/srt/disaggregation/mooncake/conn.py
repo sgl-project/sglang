@@ -761,6 +761,7 @@ class MooncakeKVManager(BaseKVManager):
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.update_status(room, KVPoll.WaitingForInput)
             self.server_socket.close()
+
         threading.Thread(target=bootstrap_thread).start()
 
     def start_decode_thread(self):
@@ -798,7 +799,7 @@ class MooncakeKVManager(BaseKVManager):
                     )
                     self.update_status(bootstrap_room, status)
             self.server_socket.close()
-        
+
         def heartbeat_checker():
             while True:
                 self.stop_event.wait(self.heartbeat_interval)
@@ -1004,14 +1005,16 @@ class MooncakeKVManager(BaseKVManager):
         )
 
     def stop_all_threads(self):
-        self._connect(f"tcp://{self.local_ip}:{self.rank_port}").send_multipart([b"__EXIT__"])
+        self._connect(f"tcp://{self.local_ip}:{self.rank_port}").send_multipart(
+            [b"__EXIT__"]
+        )
         if hasattr(self, "transfer_queues"):
             # quit all transfer threads, for prefill
             for queue in self.transfer_queues:
                 queue.put(None)
         else:
             self.stop_event.set()
-    
+
         self._connect.cache_clear()
 
     def __del__(self):
@@ -1029,7 +1032,7 @@ class MooncakeKVManager(BaseKVManager):
 
         for aux_data_ptr in self.kv_args.aux_data_ptrs:
             self.engine.deregister(aux_data_ptr)
-        
+
         del self.engine
 
 
