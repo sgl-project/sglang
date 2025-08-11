@@ -49,7 +49,6 @@ from sglang.srt.utils import (
     is_shm_available,
     supports_custom_op,
 )
-
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
@@ -1521,7 +1520,6 @@ def destroy_model_parallel():
         _TP.destroy()
     _TP = None
 
-    
     global _PP
     if _PP:
         _PP.destroy()
