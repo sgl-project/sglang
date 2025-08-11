@@ -4,6 +4,8 @@ import torch
 import triton
 
 from sglang.srt.bench_utils import bench_kineto
+from sgl_kernel import FusedSetKVBufferArg
+from sgl_kernel.testing.rotary_embedding import RotaryEmbedding, FlashInferRotaryEmbedding, MHATokenToKVPool, create_inputs
 
 configs = [
     (batch_size, seq_len, save_kv_cache)
@@ -31,18 +33,53 @@ configs = [
 def benchmark(batch_size, seq_len, save_kv_cache, provider):
     device = torch.device("cuda")
 
-    x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
+    num_q_heads = 32
+    num_kv_heads = 8
+    head_size = 64
+    dtype=torch.bfloat16
 
-    fn, kernel_names = {
-        "triton": (triton_per_token_group_quant_8bit, "_per_token_group_quant_fp8"),
-        "sglang": (
-            sglang_per_token_group_quant_8bit,
-            "per_token_group_quant_8bit_kernel",
+    config = dict(
+        head_size=head_size,
+        rotary_dim=64,
+        max_position_embeddings=4096,
+        base=8000,
+        is_neox_style=False,
+        dtype=dtype,
+    )
+    rope_flashinfer = FlashInferRotaryEmbedding(**config).to(device)
+    pool_flashinfer = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
+
+    inputs = create_inputs(
+        head_size=head_size,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        device=device,
+        dtype=dtype,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+    )
+
+    query_flashinfer, key_flashinfer = inputs['query'].clone(), inputs['key'].clone()
+
+    bench_fn = lambda: rope_flashinfer.forward_cuda(
+        inputs['pos_ids'],
+        query_flashinfer,
+        key_flashinfer,
+        fused_set_kv_buffer_arg=(
+            FusedSetKVBufferArg(
+                value=inputs['value'],
+                k_buffer=pool_flashinfer.k_buffer[0],
+                v_buffer=pool_flashinfer.v_buffer[0],
+                k_scale=None,
+                v_scale=None,
+                cache_loc=inputs['out_cache_loc'],
+            )
+            if save_kv_cache
+            else None
         ),
-    }[provider]
-    bench_fn = lambda: fn(x=x, group_size=group_size, dst_dtype=dst_dtype, **flags)
+    )
 
-    time_s = bench_kineto(bench_fn, kernel_names=kernel_names)
+    time_s = bench_kineto(bench_fn, kernel_names=["TODO"])
     return time_s * 1e6
 
 
