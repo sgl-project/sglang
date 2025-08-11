@@ -16,7 +16,7 @@ git clone https://github.com/<your_user_name>/sglang.git
 
 Refer to [Install SGLang from Source](../get_started/install.md#method-2-from-source).
 
-## Code formatting with pre-commit
+## Format code with pre-commit
 
 We use [pre-commit](https://pre-commit.com/) to maintain consistent code style checks. Before pushing your changes, please run:
 
@@ -29,18 +29,18 @@ pre-commit run --all-files
 - **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
 - **Do not commit** directly to the `main` branch. Always create a new branch (e.g., `feature/my-new-feature`), push your changes, and open a PR from that branch.
 
-## Running and adding unit tests
+## Run and add unit tests
 
 If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
 SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework.
 For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
-## Writing documentations
+## Write documentations
 
 We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
 For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
 
-## Testing the accuracy
+## Test the accuracy
 If your code changes the model output, please run the accuracy tests. A quick sanity check is the few-shot GSM8K.
 
 ```
@@ -60,8 +60,13 @@ You can find additional accuracy eval examples in:
 - [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_eval_accuracy_large.py)
 - [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_gpt_oss_1gpu.py)
 
-## Benchmarking the speed
+## Benchmark the speed
 Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md).
+
+## Request a Review
+You can identify potential reviewers for your code by checking the [code owners](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and [reviewers](https://github.com/sgl-project/sglang/blob/main/.github/REVIEWERS) files.
+Another effective strategy is to review the file modification history and contact individuals who have frequently edited the files.
+If you modify files protected by code owners, their approval is required to merge the code.
 
 ## General Code Style
 - Avoid code duplication. If the same code snippet (more than 5 lines) appears multiple times, extract it into a shared function.

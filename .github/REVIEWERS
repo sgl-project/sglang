@@ -1,0 +1,18 @@
+# Area Reviewer
+
+Here are some reviewers for common areas. You can ping them to review your code.
+
+- AMD @HaiShaw
+- Blackwell kernels @kushanam @trevor-m @zhyncs
+- constrained decoding @hnyls2002
+- dependency, build, and release pipeline @zhyncs @merrymercy
+- function calling and reasoning parsing @CatherineSue
+- hierarhical Cache @xiezhq-hermann @DarkSharpness
+- lora @Fridge003 @Ying1123 @lifuhuang
+- multimodal models @mickqian @JustinTong0323
+- OpenAI API @CatherineSue @slin1237
+- PD Disaggregation @ByronHsu @ShangmingCai @@ShangmingCai @hnyls2002
+- scheduler @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
+- sgl-Kernel @zhyncs @ispobock @HandH1998 @BBuf
+- sgl-router @slin1237 @ByronHsu
+- speculative decoding @merrymercy @Ying1123  @kssteven418
