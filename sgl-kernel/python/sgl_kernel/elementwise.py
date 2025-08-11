@@ -315,23 +315,26 @@ def apply_rope_with_cos_sin_cache_inplace(
         assert a.v_scale is None, "v_scale is not yet supported"
         assert a.cache_loc.dtype == torch.int64, f"{a.cache_loc.dtype=}"
 
+    def _view_3d(x):
+        return x.view(x.shape[0], -1, head_size)
+
     torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
-        query.view(query.shape[0], -1, head_size),
-        key.view(key.shape[0], -1, head_size),
-        query.view(query.shape[0], -1, head_size),
-        key.view(key.shape[0], -1, head_size),
+        _view_3d(query),
+        _view_3d(key),
+        _view_3d(query),
+        _view_3d(key),
         cos_sin_cache,
         positions.long(),
         (not is_neox),
         get_cuda_stream(),
         fused_set_kv_buffer_arg.value if fused_set_kv_buffer_arg is not None else None,
         (
-            fused_set_kv_buffer_arg.k_buffer
+            _view_3d(fused_set_kv_buffer_arg.k_buffer)
             if fused_set_kv_buffer_arg is not None
             else None
         ),
         (
-            fused_set_kv_buffer_arg.v_buffer
+            _view_3d(fused_set_kv_buffer_arg.v_buffer)
             if fused_set_kv_buffer_arg is not None
             else None
         ),
