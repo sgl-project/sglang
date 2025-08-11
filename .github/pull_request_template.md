@@ -18,7 +18,7 @@
 
 ## Checklist
 
-- [ ] Format your code according to the [Code formatting with pre-commit](https://docs.sglang.ai/references/contribution_guide.html#code-formatting-with-pre-commit).
-- [ ] Add unit tests according to the [Running and adding unit tests](https://docs.sglang.ai/references/contribution_guide.html#running-unit-tests-adding-to-ci).
-- [ ] Update documentation according to [Writing documentations](https://docs.sglang.ai/references/contribution_guide.html#writing-documentation-running-docs-ci).
-- [ ] Provide accuracy and speed benchmark results according to [Testing the accuracy](https://docs.sglang.ai/references/contribution_guide.html#testing-the-accuracy) and [Benchmark and profiling]()
+- [ ] Format your code according to the [Format code with pre-commit](https://docs.sglang.ai/developer_guide/contribution_guide.html#format-code-with-pre-commit).
+- [ ] Add unit tests according to the [Run and add unit tests](https://docs.sglang.ai/developer_guide/contribution_guide.html#run-and-add-unit-tests).
+- [ ] Update documentation according to [Write documentations](https://docs.sglang.ai/developer_guide/contribution_guide.html#write-documentations).
+- [ ] Provide accuracy and speed benchmark results according to [Test the accuracy](https://docs.sglang.ai/developer_guide/contribution_guide.html#test-the-accuracy) and [Benchmark the speed](https://docs.sglang.ai/developer_guide/contribution_guide.html#benchmark-the-speed).
