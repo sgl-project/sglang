@@ -55,9 +55,6 @@ Qwen2Config = None
 
 
 logger = logging.getLogger(__name__)
-import torch.nn.functional as F
-from sglang.srt.utils import get_int_env_var
-from sglang.srt.distributed import parallel_state as ps
 
 class Qwen2MLP(nn.Module):
     def __init__(
@@ -94,7 +91,6 @@ class Qwen2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
-
         return x
 
 
