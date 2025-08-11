@@ -100,9 +100,9 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
       git clone https://github.com/deepseek-ai/DeepEP.git \
       && cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     fi \
-    tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    mv nvshmem_src nvshmem && \
-    rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+    && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+    && mv nvshmem_src nvshmem \
+    && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
 
 
 # Build and install NVSHMEM
