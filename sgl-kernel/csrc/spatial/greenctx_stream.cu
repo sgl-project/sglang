@@ -55,13 +55,13 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
 
   CUDA_DRV(SAFE_cuDeviceGetDevResource((CUdevice)device, &input, CU_DEV_RESOURCE_TYPE_SM));
 
-  const int64_t minCount = smA + smB;
-  const int64_t minCountA = smA;
+  const unsigned minCount = static_cast<unsigned>(smA + smB);
+  const unsigned minCountA = static_cast<unsigned>(smA);
   TORCH_CHECK(minCount <= input.sm.smCount, "Not enough SMs available for the requested configuration");
 
-  int nbGroups = 1;
+  unsigned nbGroups = 1;
   CUDA_DRV(SAFE_cuDevSmResourceSplitByCount(&resources[2], &nbGroups, &input, &resources[3], 0, minCount));
-  CUDA_DRV(SAFE_cuDevResourceGenerateDesc(&desc[2], &resources[2], 1));
+  CUDA_DRV(SAFE_cuDevResourceGenerateDesc(&desc[2], &resources[2], static_cast<size_t>(1)));
   CUDA_DRV(SAFE_cuGreenCtxCreate(&gctx[2], desc[2], (CUdevice)device, CU_GREEN_CTX_DEFAULT_STREAM));
   CUDA_DRV(SAFE_cuGreenCtxGetDevResource(gctx[2], &input, CU_DEV_RESOURCE_TYPE_SM));
   nbGroups = 1;
