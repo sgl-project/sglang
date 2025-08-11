@@ -27,6 +27,7 @@ __device__ __forceinline__ void prepare(
     vec_t<float, vec_size>& v_vec,
     IdType& kv_cache_offset,
     const DType* v,
+    const IdType* kv_cache_loc,
     const uint32_t idx,
     const uint32_t tx,
     const uint32_t kv_head_idx,
@@ -45,7 +46,6 @@ __device__ __forceinline__ void save(
     const vec_t<float, vec_size>& v_vec,
     const DType* k_buffer,
     const DType* v_buffer,
-    const IdType* kv_cache_loc,
     const uint32_t idx,
     const uint32_t tx,
     const uint32_t kv_head_idx,
@@ -150,7 +150,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
       IdType kv_cache_offset;
       if constexpr (save_kv_cache) {
         kv_buffer_saver::prepare<DType, IdType, vec_size>(
-            v_vec, kv_cache_offset, v, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
+            v_vec, kv_cache_offset, v, kv_cache_loc, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
       }
 
       vec_t<float, vec_size> k_vec;
@@ -168,7 +168,6 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
             v_vec,
             k_buffer,
             v_buffer,
-            kv_cache_loc,
             idx,
             tx,
             kv_head_idx,
@@ -269,7 +268,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
       IdType kv_cache_offset;
       if constexpr (save_kv_cache) {
         kv_buffer_saver::prepare<DType, IdType, vec_size>(
-            v_vec, kv_cache_offset, v, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
+            v_vec, kv_cache_offset, v, kv_cache_loc, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
       }
 
       vec_t<float, vec_size> k_vec;
@@ -287,7 +286,6 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
             v_vec,
             k_buffer,
             v_buffer,
-            kv_cache_loc,
             idx,
             tx,
             kv_head_idx,
