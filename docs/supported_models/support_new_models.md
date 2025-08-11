@@ -27,7 +27,7 @@ standard LLM support:
 3. **Multimodal Data Processor**:
    Define a new `Processor` class that inherits from `BaseMultimodalProcessor` and register this processor as your
    model’s dedicated processor.
-   See [multimodal_processor.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/multimodal_processor.py)
+   See [multimodal_processor.py](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/multimodal/processors)
    for more details.
 
 4. **Handle Multimodal Tokens**:
