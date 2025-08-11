@@ -34,6 +34,8 @@ void apply_rope_pos_ids_cos_sin_cache(
     const std::optional<at::Tensor>& kv_cache_loc) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
+
+  const bool save_kv_cache = v.has_value();
   if (save_kv_cache) {
     CHECK_LAST_DIM_CONTIGUOUS(v);
     CHECK_LAST_DIM_CONTIGUOUS(k_buffer);
