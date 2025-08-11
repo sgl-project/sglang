@@ -94,7 +94,9 @@ def test_correctness(
     )
     if save_kv_cache:
         pool_ref.set_kv_buffer(
-            loc=inputs["out_cache_loc"], cache_k=key_ref_out, cache_v=inputs["value"]
+            loc=inputs["out_cache_loc"],
+            cache_k=key_ref_out.view(-1, num_kv_heads, head_size),
+            cache_v=inputs["value"].view(-1, num_kv_heads, head_size),
         )
 
     query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(
