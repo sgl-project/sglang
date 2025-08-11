@@ -37,6 +37,10 @@ void apply_rope_pos_ids_cos_sin_cache(
 
   const bool save_kv_cache = v.has_value();
   if (save_kv_cache) {
+    TORCH_CHECK(v.has_value());
+    TORCH_CHECK(k_buffer.has_value());
+    TORCH_CHECK(v_buffer.has_value());
+    TORCH_CHECK(kv_cache_loc.has_value());
     CHECK_LAST_DIM_CONTIGUOUS(v);
     CHECK_LAST_DIM_CONTIGUOUS(k_buffer);
     CHECK_LAST_DIM_CONTIGUOUS(v_buffer);
