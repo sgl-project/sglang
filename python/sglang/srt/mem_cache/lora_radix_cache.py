@@ -32,7 +32,10 @@ class LoRAKey:
 def get_child_key(key: LoRAKey):
     # Here the key of children dict is the hash of lora_id + str(token_ids[0])
     # So the child key can be matched only when lora_id and token_ids[0] are the same
-    return hash(key.lora_id + str(key.token_ids[0]))
+    if key.lora_id is None:
+        return hash(str(key.token_ids[0]))
+    else:
+        return hash(key.lora_id + str(key.token_ids[0]))
 
 
 class LoRATreeNode:
