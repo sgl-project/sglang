@@ -26,7 +26,7 @@ import os
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -277,7 +277,7 @@ async def health_generate(request: Request) -> Response:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
 
-    if not _global_state.tokenizer_manager.server_status.is_healthy():
+    if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
@@ -317,7 +317,7 @@ async def health_generate(request: Request) -> Response:
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.health_check_failed = False
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
             return Response(status_code=200)
 
     task.cancel()
@@ -331,7 +331,7 @@ async def health_generate(request: Request) -> Response:
         f"last_heartbeat time: {last_receive_time}"
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.health_check_failed = True
+    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
 
 

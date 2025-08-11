@@ -99,24 +99,23 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # Whether to return hidden states
+    return_hidden_states: Union[List[bool], bool] = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
+    # Session info for continual prompting
+    session_params: Optional[Union[List[Dict], Dict]] = None
+
     # The path to the LoRA adaptors
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    # Session info for continual prompting
-    session_params: Optional[Union[List[Dict], Dict]] = None
-
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
-
-    # Whether to return hidden states
-    return_hidden_states: Union[List[bool], bool] = False
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
