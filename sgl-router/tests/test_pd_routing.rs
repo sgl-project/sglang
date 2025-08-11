@@ -182,6 +182,8 @@ mod test_pd_routing {
                 cors_allowed_origins: vec![],
                 retry: RetryConfig::default(),
                 circuit_breaker: CircuitBreakerConfig::default(),
+                disable_retries: false,
+                disable_circuit_breaker: false,
             };
 
             // Router creation will fail due to health checks, but config should be valid

@@ -109,7 +109,7 @@ pub(crate) fn get_healthy_worker_indices(workers: &[Box<dyn Worker>]) -> Vec<usi
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.is_healthy())
+        .filter(|(_, w)| w.is_healthy() && w.circuit_breaker().can_execute())
         .map(|(idx, _)| idx)
         .collect()
 }

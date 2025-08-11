@@ -1845,7 +1845,7 @@ impl RouterTrait for PDRouter {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
-    use crate::policies::{CacheAwarePolicy, RandomPolicy};
+    use crate::policies::RandomPolicy;
 
     fn create_test_pd_router() -> PDRouter {
         let prefill_policy = Arc::new(RandomPolicy::new());

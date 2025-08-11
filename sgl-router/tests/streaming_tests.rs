@@ -40,6 +40,8 @@ impl TestContext {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
         };
 
         let mut workers = Vec::new();
