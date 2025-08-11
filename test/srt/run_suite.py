@@ -23,6 +23,7 @@ suites = {
         TestFile("lora/test_lora_cuda_graph.py", 250),
         TestFile("lora/test_lora_update.py", 400),
         TestFile("lora/test_lora_qwen3.py", 97),
+        TestFile("lora/test_lora_radix_cache.py", 100),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
