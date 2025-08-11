@@ -53,7 +53,6 @@ class BaseKVManager(ABC):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
-        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ): ...
 
 

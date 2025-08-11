@@ -39,7 +39,6 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
-    get_metrics_collector,
     is_mla_backend,
     kv_to_page_indices,
     poll_and_all_reduce,
@@ -223,7 +222,6 @@ class DecodePreallocQueue:
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
             self.is_mla_backend,
-            get_metrics_collector(self.scheduler),
         )
         return kv_manager
 
@@ -334,6 +332,8 @@ class DecodePreallocQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 

@@ -118,7 +118,6 @@ class NixlKVManager(CommonKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
-        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         try:

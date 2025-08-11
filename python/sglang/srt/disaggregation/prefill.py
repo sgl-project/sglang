@@ -36,7 +36,6 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
-    get_metrics_collector,
     is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
@@ -141,7 +140,6 @@ class PrefillBootstrapQueue:
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
-            get_metrics_collector(self.scheduler),
         )
         return kv_manager
 
@@ -234,6 +232,8 @@ class PrefillBootstrapQueue:
                 self.scheduler.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 continue
 
             # KV.WaitingForInput - init here
@@ -515,6 +515,8 @@ class SchedulerDisaggregationPrefillMixin:
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 done_reqs.append(req)
+                if self.enable_metrics:
+                    self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 assert False, f"Unexpected polling state {poll=}"
 
