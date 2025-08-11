@@ -10,9 +10,6 @@ else
     CU_VERSION="cu126"
 fi
 
-# Clear torch compilation cache
-rm -rf /tmp/torchinductor_root
-
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../killall_sglang.sh"
