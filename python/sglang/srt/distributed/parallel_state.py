@@ -1529,7 +1529,7 @@ def destroy_model_parallel():
     _TP = None
     global _TP_GLOO
     if _TP_GLOO:
-        _TP_GLOO.destory()
+        _TP_GLOO.destroy()
     _TP_GLOO = None
     
     global _PP
