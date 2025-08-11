@@ -31,7 +31,7 @@ pre-commit run --all-files
 
 ## Running and adding unit tests
 
-If you add a new feature or fix a bug, please include corresponding unit tests to ensure coverage and prevent regression.
+If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
 SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework.
 For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
@@ -53,9 +53,9 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 
 Please note that the above script is primarily a sanity check, not a rigorous accuracy or speed test.
 This test can have significant variance (1%–5%) in accuracy due to batching and the non-deterministic nature of the inference engine.
-Do not rely on the "Latency/Output throughput" from this script, as it is not a proper speed test.
+Also, do not rely on the "Latency/Output throughput" from this script, as it is not a proper speed test.
 
-Also, GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging test cases.
+GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
 You can find additional accuracy eval examples in:
 - [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_eval_accuracy_large.py)
 - [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_gpt_oss_1gpu.py)

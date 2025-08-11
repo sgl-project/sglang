@@ -1,4 +1,4 @@
-# Frequently Asked Questions and Troubleshooting
+# Troubleshooting and Frequently Asked Questions
 
 ## Troubleshooting
 

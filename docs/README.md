@@ -20,7 +20,7 @@ Update your Jupyter notebooks in the appropriate subdirectories under `docs/`. I
 
 ```bash
 # 1) Compile all Jupyter notebooks
-make compile
+make compile  # This step can take a long time (10+ mins). You can consider skipping this step if you can make sure your added files are correct.
 make html
 
 # 2) Compile and Preview documentation locally with auto-build
