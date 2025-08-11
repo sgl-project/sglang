@@ -10,10 +10,10 @@ You can test them according to your needs.
 | **FlashInfer**           | ❌                | ✅                 | ✅      | ✅                 | ✅              |
 | **FA3**                  | ✅                | ✅                 | ✅      | ✅                 | ✅              |
 | **Triton**               | ❌                | ✅                 | ✅      | ✅                 | ❌              |
-| **Torch Native**         | ❌                | ❌                 | ❌      | ❌                 | ❌              |
+| **Torch Native**         | ❌                | ❌                 | ✅      | ❌                 | ❌              |
 | **FlashMLA**             | ✅                | ✅                 | ✅      | ❌                 | ❌              |
 | **TRTLLM MLA**           | ✅                | ❌                 | ✅      | ✅                 | ❌              |
-| **Ascend**               | ✅                | ❌                 | ❌      | ❌                 | ❌              |
+| **Ascend**               | ✅                | ❌                 | ✅      | ❌                 | ❌              |
 
 **Notes:**
 - TRTLLM MLA only implements decode operations. For prefill operations (including multimodal inputs), it falls back to FlashInfer MLA backend.
