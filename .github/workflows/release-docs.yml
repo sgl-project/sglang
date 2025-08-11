@@ -41,6 +41,8 @@ jobs:
           make compile
 
       - name: Push HTML to sgl-project.github.io
+        env:
+          GITHUB_TOKEN: ${{ secrets.DOCUMENTATION_PAT_TOKEN }}
         run: |
           cd docs
           make html
