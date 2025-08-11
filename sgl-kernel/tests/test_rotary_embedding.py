@@ -242,7 +242,7 @@ def test_correctness(
     value = torch.randn(
         batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
     )
-    cache_loc = torch.randint(
+    out_cache_loc = torch.randint(
         0,
         _KV_POOL_SIZE,
         (batch_size * seq_len,),
@@ -258,12 +258,17 @@ def test_correctness(
 
     query_ref_out, key_ref_out = rope_ref.forward_native(pos_ids, query_ref, key_ref)
     if save_kv_cache:
-        pool_ref.set_kv_buffer(loc=cache_loc, cache_k=key_ref_out, cache_v=value)
+        pool_ref.set_kv_buffer(loc=out_cache_loc, cache_k=key_ref_out, cache_v=value)
 
     query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(
         pos_ids, query_flashinfer, key_flashinfer,
         fused_set_kv_buffer_arg=FusedSetKVBufferArg(
-
+            value=value,
+            k_buffer=pool_flashinfer.k_buffer[0],
+            v_buffer=pool_flashinfer.v_buffer[0],
+            k_scale=None,
+            v_scale=None,
+            cache_loc=out_cache_loc,
         ) if save_kv_cache else None,
     )
 
