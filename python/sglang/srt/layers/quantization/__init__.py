@@ -45,6 +45,7 @@ except ImportError as e:
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
+from sglang.srt.layers.quantization.quark.quark import (QuarkConfig,)
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -94,14 +95,14 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 if is_cuda():
     BASE_QUANTIZATION_METHODS.update(
         {
-            "quark": Mxfp4Config,
+            "quark": QuarkConfig,
             "mxfp4": Mxfp4Config,
         }
     )
 elif _is_mxfp_supported and is_hip():
     BASE_QUANTIZATION_METHODS.update(
         {
-            "quark": Mxfp4Config,
+            "quark": QuarkConfig,
             "mxfp4": Mxfp4Config,
         }
     )
