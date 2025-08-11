@@ -87,7 +87,9 @@ git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
 
 #### Triton on Ascend
 
-Please follow Triton-on-Ascend's [installation guide](https://gitee.com/ascend/triton-ascend) to install the latest `triton-ascend` package.
+_Notice:_ We recommend installing triton-ascend from source due to its rapid development, the version on PYPI can't keep up for know. This problem will be solved on Sep. 2025, afterwards `pip install` would be the one and only installing method. 
+
+Please follow Triton-on-Ascend's [installation guide from source](https://gitee.com/ascend/triton-ascend#2%E6%BA%90%E4%BB%A3%E7%A0%81%E5%AE%89%E8%A3%85-triton-ascend) to install the latest `triton-ascend` package.
 
 #### DeepEP-compatible Library
 
@@ -97,7 +99,7 @@ We are also providing a DeepEP-compatible Library as a drop-in replacement of de
 
 ```shell
 # Use the last release branch
-git clone -b v0.4.10.post2 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.0rc0 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -108,7 +110,7 @@ pip install -e python[srt_npu]
 
 __Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
-__Notice:__ The following docker command is based on Atlas A3 machines. If you are using A2, make sure only `davinci[0-7]` are mapped into container.
+__Notice:__ The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
 
 ```shell
 # Clone the SGLang repository
@@ -138,7 +140,7 @@ drun --env "HF_TOKEN=<secret>" \
 
 ### Running DeepSeek-V3
 
-Running DeepSeek with PD disaggregation on 2 x A3 SuperPods.
+Running DeepSeek with PD disaggregation on 2 x Atlas 800I A3.
 Model weights could be found [here](https://modelers.cn/models/State_Cloud/Deepseek-R1-bf16-hfd-w8a8).
 
 Prefill:
