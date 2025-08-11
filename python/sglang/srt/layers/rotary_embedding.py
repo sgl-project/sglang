@@ -222,34 +222,8 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
-        layer: Any = None,  # RadixAttention
-        forward_batch=None,
-        save_kv_cache: bool = False,
-        value: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
-            if save_kv_cache:
-                layer_id = layer.layer_id
-                token_to_kv_pool = forward_batch.token_to_kv_pool
-                start_layer = token_to_kv_pool.start_layer
-                k_buffer = token_to_kv_pool.k_buffer
-                v_buffer = token_to_kv_pool.v_buffer
-                cache_loc = forward_batch.out_cache_loc
-                k_buffer_ptr = k_buffer[layer_id - start_layer]
-                v_buffer_ptr = v_buffer[layer_id - start_layer]
-
-                k_scale, v_scale = layer.k_scale, layer.v_scale
-            else:
-                k_buffer_ptr = None
-                v_buffer_ptr = None
-                k_scale, v_scale = None, None
-                cache_loc = None
-                value = None
-            # import importlib.util
-            # spec = importlib.util.spec_from_file_location("apply_rope_with_cos_sin_cache_inplace", "/sgl-workspace/sglang/sgl-kernel/python/sgl_kernel/elementwise.py")
-            # elementwise = importlib.util.module_from_spec(spec)
-            # spec.loader.exec_module(elementwise)
-            # elementwise.apply_rope_with_cos_sin_cache_inplace(
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
