@@ -89,21 +89,17 @@ void apply_rope_pos_ids_cos_sin_cache(
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
-    auto v_ptr = save_kv_cache ? static_cast<c_type*>(v->data_ptr()) : nullptr;
-    auto k_buffer_ptr = save_kv_cache ? static_cast<c_type*>(k_buffer->data_ptr()) : nullptr;
-    auto v_buffer_ptr = save_kv_cache ? static_cast<c_type*>(v_buffer->data_ptr()) : nullptr;
-
     // TODO temporarily only use `BatchQKApplyRotaryPosIdsCosSinCacheEnhanced` when save_kv_cache
     // to avoid changing original code path; but this branch is feature-complete and should switch to this later
     if (save_kv_cache) {
       cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
           static_cast<c_type*>(q.data_ptr()),
           static_cast<c_type*>(k.data_ptr()),
-          v_ptr,
+          save_kv_cache ? static_cast<c_type*>(v->data_ptr()) : nullptr,
           static_cast<c_type*>(q_rope.data_ptr()),
           static_cast<c_type*>(k_rope.data_ptr()),
-          k_buffer_ptr,
-          v_buffer_ptr,
+          save_kv_cache ? static_cast<c_type*>(k_buffer->data_ptr()) : nullptr,
+          save_kv_cache ? static_cast<c_type*>(v_buffer->data_ptr()) : nullptr,
           static_cast<float*>(cos_sin_cache.data_ptr()),
           static_cast<int64_t*>(pos_ids.data_ptr()),
           nnz,
