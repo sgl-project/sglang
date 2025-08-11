@@ -56,7 +56,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id, is_sm100_supported
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -64,7 +64,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, is_flashinfer_available, make_layers
+
+_is_flashinfer_available = is_flashinfer_available()
+_is_sm100_supported = is_cuda() and is_sm100_supported()
 
 
 class GptOssConfig(PretrainedConfig):
@@ -151,10 +154,13 @@ class GptOssSparseMoeBlock(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         if not global_server_args_dict["moe_a2a_backend"].is_deepep():
-            return self.forward_normal(hidden_states)
+            return self.forward_normal(hidden_states, should_allreduce_fusion)
         else:
             raise Exception("forward_deepep branch not implemented yet")
 
@@ -165,7 +171,11 @@ class GptOssSparseMoeBlock(nn.Module):
             if name not in ["correction_bias"]
         ]
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal(
+        self,
+        hidden_states: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -179,7 +189,7 @@ class GptOssSparseMoeBlock(nn.Module):
             kwargs["topk_output"] = (self.top_k, router_logits)
         final_hidden_states = self.experts(**kwargs)
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
@@ -370,6 +380,7 @@ class GptOssDecoderLayer(nn.Module):
 
         # GptOss all layers are sparse and have no nextn now
         self.is_layer_sparse = True
+        self.is_nextn = False
         is_previous_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -402,6 +413,42 @@ class GptOssDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
+        self._fuse_allreduce_lookup_table = self._build_fuse_allreduce_lookup_table()
+
+    def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
+        """Check if MLP allreduce can be fused with next layer's residual_rmsnorm"""
+
+        batch_size = (
+            forward_batch.input_ids.shape[0]
+            if hasattr(forward_batch, "input_ids")
+            else 0
+        )
+
+        if batch_size > 128:
+            return False
+
+        return self._fuse_allreduce_lookup_table.get(batch_size, False)
+
+    def _build_fuse_allreduce_lookup_table(self):
+        static_conditions_met = (
+            self.layer_id != self.config.num_hidden_layers - 1
+            and get_tensor_model_parallel_world_size() > 1
+            and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
+            and _is_sm100_supported
+            and _is_flashinfer_available
+        )
+
+        if not static_conditions_met:
+            return {}
+
+        lookup_table = {}
+        for batch_size in range(129):  # 0 to 128
+            is_last_layer = self.layer_id == self.config.num_hidden_layers - 1
+            should_fuse = batch_size > 0 and batch_size <= 128 and not is_last_layer
+            lookup_table[batch_size] = should_fuse
+
+        return lookup_table
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -424,11 +471,20 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        should_allreduce_fusion = (
+            self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+            and not self.is_nextn
         )
+
+        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+
+        if not should_allreduce_fusion:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
         return hidden_states, residual
 
