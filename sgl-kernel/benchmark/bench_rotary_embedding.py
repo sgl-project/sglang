@@ -2,10 +2,15 @@ import itertools
 
 import torch
 import triton
+from sgl_kernel import FusedSetKVBufferArg
+from sgl_kernel.testing.rotary_embedding import (
+    FlashInferRotaryEmbedding,
+    MHATokenToKVPool,
+    RotaryEmbedding,
+    create_inputs,
+)
 
 from sglang.srt.bench_utils import bench_kineto
-from sgl_kernel import FusedSetKVBufferArg
-from sgl_kernel.testing.rotary_embedding import RotaryEmbedding, FlashInferRotaryEmbedding, MHATokenToKVPool, create_inputs
 
 configs = [
     (batch_size, seq_len, save_kv_cache)
@@ -36,7 +41,7 @@ def benchmark(batch_size, seq_len, save_kv_cache, provider):
     num_q_heads = 32
     num_kv_heads = 8
     head_size = 64
-    dtype=torch.bfloat16
+    dtype = torch.bfloat16
 
     config = dict(
         head_size=head_size,
@@ -59,20 +64,20 @@ def benchmark(batch_size, seq_len, save_kv_cache, provider):
         num_kv_heads=num_kv_heads,
     )
 
-    query_flashinfer, key_flashinfer = inputs['query'].clone(), inputs['key'].clone()
+    query_flashinfer, key_flashinfer = inputs["query"].clone(), inputs["key"].clone()
 
     bench_fn = lambda: rope_flashinfer.forward_cuda(
-        inputs['pos_ids'],
+        inputs["pos_ids"],
         query_flashinfer,
         key_flashinfer,
         fused_set_kv_buffer_arg=(
             FusedSetKVBufferArg(
-                value=inputs['value'],
+                value=inputs["value"],
                 k_buffer=pool_flashinfer.k_buffer[0],
                 v_buffer=pool_flashinfer.v_buffer[0],
                 k_scale=None,
                 v_scale=None,
-                cache_loc=inputs['out_cache_loc'],
+                cache_loc=inputs["out_cache_loc"],
             )
             if save_kv_cache
             else None

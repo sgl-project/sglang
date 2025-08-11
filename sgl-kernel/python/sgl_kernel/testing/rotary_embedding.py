@@ -142,7 +142,6 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         return query, key
 
 
-
 class MHATokenToKVPool:
     KV_POOL_SIZE = 2000
 
@@ -209,6 +208,10 @@ def create_inputs(
     value = torch.randn(
         batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
     )
-    out_cache_loc = torch.randperm(MHATokenToKVPool.KV_POOL_SIZE, dtype=torch.int64, device=device)[: batch_size * seq_len].clone()
+    out_cache_loc = torch.randperm(
+        MHATokenToKVPool.KV_POOL_SIZE, dtype=torch.int64, device=device
+    )[: batch_size * seq_len].clone()
 
-    return dict(pos_ids=pos_ids, query=query, key=key, value=value, out_cache_loc=out_cache_loc)
+    return dict(
+        pos_ids=pos_ids, query=query, key=key, value=value, out_cache_loc=out_cache_loc
+    )

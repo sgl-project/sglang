@@ -3,7 +3,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pytest
 import torch
 from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
-from sgl_kernel.testing.rotary_embedding import RotaryEmbedding, FlashInferRotaryEmbedding, MHATokenToKVPool, create_inputs
+from sgl_kernel.testing.rotary_embedding import (
+    FlashInferRotaryEmbedding,
+    MHATokenToKVPool,
+    RotaryEmbedding,
+    create_inputs,
+)
+
 
 @pytest.mark.parametrize(
     "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads, save_kv_cache",
@@ -80,25 +86,29 @@ def test_correctness(
         pool_ref = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
         pool_flashinfer = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
 
-    query_ref, key_ref = inputs['query'].clone(), inputs['key'].clone()
-    query_flashinfer, key_flashinfer = inputs['query'].clone(), inputs['key'].clone()
+    query_ref, key_ref = inputs["query"].clone(), inputs["key"].clone()
+    query_flashinfer, key_flashinfer = inputs["query"].clone(), inputs["key"].clone()
 
-    query_ref_out, key_ref_out = rope_ref.forward_native(inputs['pos_ids'], query_ref, key_ref)
+    query_ref_out, key_ref_out = rope_ref.forward_native(
+        inputs["pos_ids"], query_ref, key_ref
+    )
     if save_kv_cache:
-        pool_ref.set_kv_buffer(loc=inputs['out_cache_loc'], cache_k=key_ref_out, cache_v=inputs['value'])
+        pool_ref.set_kv_buffer(
+            loc=inputs["out_cache_loc"], cache_k=key_ref_out, cache_v=inputs["value"]
+        )
 
     query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(
-        inputs['pos_ids'],
+        inputs["pos_ids"],
         query_flashinfer,
         key_flashinfer,
         fused_set_kv_buffer_arg=(
             FusedSetKVBufferArg(
-                value=inputs['value'],
+                value=inputs["value"],
                 k_buffer=pool_flashinfer.k_buffer[0],
                 v_buffer=pool_flashinfer.v_buffer[0],
                 k_scale=None,
                 v_scale=None,
-                cache_loc=inputs['out_cache_loc'],
+                cache_loc=inputs["out_cache_loc"],
             )
             if save_kv_cache
             else None
