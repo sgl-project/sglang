@@ -149,9 +149,9 @@ def send_one_prompt(args):
         for r in rets:
             print(r["text"])
             print("-" * 100)
-
-    print(ret["text"])
-    print()
+    else:
+        print(ret["text"])
+        print()
     print(f"{acc_length=:.2f}")
     print(f"{speed=:.2f} token/s")
 
