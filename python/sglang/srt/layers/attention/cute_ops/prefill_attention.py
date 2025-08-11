@@ -41,6 +41,7 @@ np.set_printoptions(
     suppress=True, precision=3, linewidth=120, formatter={"float": "{:>8.3f}".format}
 )
 
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -161,12 +162,7 @@ def _flash_attn_fwd(
         if cu_seqlens_q is None
         else (num_head, total_q)
     )
-    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
-    lse = (
-        torch.empty(lse_shape, dtype=torch.float32, device=device)
-        if requires_grad
-        else None
-    )
+    lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -384,6 +380,10 @@ def test_ragged(
 
     qo_len = sum(qo_lens)
     kv_len = sum(kv_lens)
+    seqlens_q = torch.tensor(list(qo_lens), dtype=torch.int32, device="cuda")
+    seqlens_k = torch.tensor(list(qo_lens), dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.cumsum(seqlens_q, dim=0, dtype=torch.int32)
+    cu_seqlens_k = torch.cumsum(seqlens_k, dim=0, dtype=torch.int32)
 
     q = torch.empty(
         size=(qo_len, num_qo_heads, head_dim), dtype=dtype, device="cuda"
@@ -395,7 +395,22 @@ def test_ragged(
         size=(kv_len, num_kv_heads, head_dim), dtype=dtype, device="cuda"
     ).uniform_(-init_range, init_range)
 
-    ref = _ref_impl(q, k, v)
+    out = flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        softmax_scale=softmax_scale,
+    )
+    ref = _ref_impl(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        softmax_scale=softmax_scale,
+    )
 
     print(_green(f"--> {q.shape=} {k.shape=} {v.shape=}"), f"{ref.shape=}")
 
