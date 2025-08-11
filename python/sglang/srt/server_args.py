@@ -1999,9 +1999,11 @@ class ServerArgs:
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
-        assert (
-            self.chunked_prefill_size % self.page_size == 0
-        ), "chunked_prefill_size must be divisible by page_size"
+        # Skip validation if chunked prefill is disabled (i.e., size <= 0).
+        if self.chunked_prefill_size > 0:
+            assert (
+                self.chunked_prefill_size % self.page_size == 0
+            ), "chunked_prefill_size must be divisible by page_size"
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
