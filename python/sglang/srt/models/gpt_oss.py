@@ -66,6 +66,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
 
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import FusedSetKVBufferArg
 
 class GptOssConfig(PretrainedConfig):
     model_type = "gpt_oss"
@@ -186,6 +190,10 @@ class GptOssSparseMoeBlock(nn.Module):
         return ans
 
 
+def _enable_fused_set_kv_buffer():
+    return _is_cuda
+
+
 class GptOssAttention(nn.Module):
     def __init__(
         self,
@@ -298,7 +306,7 @@ class GptOssAttention(nn.Module):
             positions,
             q,
             k,
-            TODO=TODO,
+            fused_set_kv_buffer_arg=FusedSetKVBufferArg(TODO) if _enable_fused_set_kv_buffer() else None,
         )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -309,8 +317,7 @@ class GptOssAttention(nn.Module):
             return hidden_states
         attn_output = self.attn(
             *inner_state, sinks=self.sinks,
-            # Fused into rope
-            save_kv_cache=False
+            save_kv_cache=not _enable_fused_set_kv_buffer()
         )
         output, _ = self.o_proj(attn_output)
         return output
