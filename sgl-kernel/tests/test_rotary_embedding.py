@@ -141,7 +141,7 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
 
         return query, key
 
-_KV_POOL_SIZE = 200
+_KV_POOL_SIZE = 2000
 
 class MHATokenToKVPool:
     def __init__(
@@ -239,20 +239,22 @@ def test_correctness(
     key = torch.randn(
         batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
     )
-    value = torch.randn(
-        batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
-    )
-    out_cache_loc = torch.randint(
-        0,
-        _KV_POOL_SIZE,
-        (batch_size * seq_len,),
-        dtype=torch.int64,
-        device=device,
-    )
-    TODO_should_be_unique
+    if save_kv_cache:
+        value = torch.randn(
+            batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
+        )
+        out_cache_loc = torch.randint(
+            0,
+            _KV_POOL_SIZE,
+            (batch_size * seq_len,),
+            dtype=torch.int64,
+            device=device,
+        )
+        TODO_should_be_unique
 
-    pool_ref = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
-    pool_flashinfer = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
+    if save_kv_cache:
+        pool_ref = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
+        pool_flashinfer = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
 
     query_ref, key_ref = query.clone(), key.clone()
     query_flashinfer, key_flashinfer = query.clone(), key.clone()
@@ -277,8 +279,9 @@ def test_correctness(
         query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
-    assert torch.all(pool_ref.k_buffer[0] == pool_flashinfer.k_buffer[0])
-    assert torch.all(pool_ref.v_buffer[0] == pool_flashinfer.v_buffer[0])
+    if save_kv_cache:
+        assert torch.all(pool_ref.k_buffer[0] == pool_flashinfer.k_buffer[0])
+        assert torch.all(pool_ref.v_buffer[0] == pool_flashinfer.v_buffer[0])
 
 
 if __name__ == "__main__":
