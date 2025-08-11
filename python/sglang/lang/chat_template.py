@@ -505,6 +505,22 @@ register_chat_template(
     )
 )
 
+# Reference: https://huggingface.co/docs/transformers/main/model_doc/glm4_v#usage-example
+register_chat_template(
+    ChatTemplate(
+        name="glm-4v",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("<|system|>\n", "\n"),
+            "user": ("<|user|>\n", "\n"),
+            "assistant": ("<|assistant|>\n", "\n"),
+        },
+        style=ChatTemplateStyle.PLAIN,
+        stop_str=["<|user|>", "<|endoftext|>", "<|observation|>"],
+        image_token="<|image|>",
+    )
+)
+
 
 @register_chat_template_matching_function
 def match_deepseek(model_path: str):
@@ -562,6 +578,8 @@ def match_chat_ml(model_path: str):
         return "chatml"
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
+    if re.search(r"glm[-_]?4(\.\d+)?v", model_path, re.IGNORECASE):
+        return "glm-4v"
     if re.search(r"qwen.*(chat|instruct)", model_path, re.IGNORECASE) and not re.search(
         r"llava", model_path, re.IGNORECASE
     ):
