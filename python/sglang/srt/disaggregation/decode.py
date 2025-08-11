@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 DECODE_CLIP_MAX_NEW_TOKEN = get_int_env_var(
-    "SGLANG_DISAGGREGATION_DECODE_CLIP_MAX_NEW_TOKEN", 4096
+    "SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096
 )
 
 
@@ -378,6 +378,7 @@ class DecodePreallocQueue:
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
+            # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
             required_tokens_for_request = (
                 origin_input_len + self.num_reserved_decode_tokens
