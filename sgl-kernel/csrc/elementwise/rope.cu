@@ -20,7 +20,7 @@
 
 using namespace flashinfer;
 
-void apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer(
+void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,
     at::Tensor q_rope,
