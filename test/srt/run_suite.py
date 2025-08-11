@@ -123,6 +123,7 @@ suites = {
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_dp_attention.py", 277),
+        TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 127),
         TestFile("hicache/test_hicache_storage_file_backend.py", 400),
@@ -251,6 +252,7 @@ suite_amd = {
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
+        TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
     ],
     "per-commit-4-gpu-amd": [
