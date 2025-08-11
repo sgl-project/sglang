@@ -19,22 +19,15 @@ python3 run_suite.py --suite per-commit
 ## Test Frontend Language
 ```bash
 cd sglang/test/lang
-export OPENAI_API_KEY=sk-*****
 
 # Run a single file
-python3 test_openai_backend.py
-
-# Run a single test
-python3 -m unittest test_openai_backend.TestOpenAIServer.test_few_shot_qa
-
-# Run a suite with multiple files
-python3 run_suite.py --suite per-commit
+python3 test_srt_backend.py
 ```
 
 ## Adding or Updating Tests in CI
 
 - Create new test files under `test/srt` or `test/lang` depending on the type of test.
-- Ensure they are referenced in the respective `run_suite.py` (e.g., `test/srt/run_suite.py` or `test/lang/run_suite.py`) so they’re picked up in CI. For most small test cases, they can be added to the `per-commit` suite.
+- Ensure they are referenced in the respective `run_suite.py` (e.g., `test/srt/run_suite.py`) so they’re picked up in CI. For most small test cases, they can be added to the `per-commit` suite. Sort the test cases alphabetically.
 - The CI will run the `per-commit` and `nightly` automatically. If you need special setup or custom test groups, you may modify the workflows in [`.github/workflows/`](https://github.com/sgl-project/sglang/tree/main/.github/workflows).
 
 
@@ -45,3 +38,4 @@ python3 run_suite.py --suite per-commit
 - Give tests descriptive names reflecting their purpose.
 - Use robust assertions (e.g., assert, unittest methods) to validate outcomes.
 - Clean up resources to avoid side effects and preserve test independence.
+- Reduce the test time by using smaller models and reusing the server for multiple test cases.

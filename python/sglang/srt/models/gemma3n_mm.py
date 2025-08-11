@@ -501,27 +501,26 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
 
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim
-        if module_name in ["q_proj", "qkv_proj"]:
+        if module_name == "qkv_proj":
             return (
                 self.config.hidden_size,
-                self.config.head_dim * self.config.num_attention_heads,
+                self.config.head_dim
+                * (
+                    self.config.num_attention_heads
+                    + self.config.num_key_value_heads * 2
+                ),
             )
-        elif module_name in ["o_proj"]:
+        elif module_name == "o_proj":
             return (
                 self.config.head_dim * self.config.num_attention_heads,
                 self.config.hidden_size,
-            )
-        elif module_name in ["kv_proj"]:
-            return (
-                self.config.hidden_size,
-                self.config.head_dim * self.config.num_key_value_heads,
             )
         elif module_name == "gate_up_proj":
             assert len(set(self.config.intermediate_size)) == 1, (
                 "Currently SGLang requires uniform intermediate size for all layers. "
                 "Please file an issue if you need support for non-uniform intermediate sizes."
             )
-            return self.config.hidden_size, self.config.intermediate_size[0]
+            return self.config.hidden_size, self.config.intermediate_size[0] * 2
         elif module_name == "down_proj":
             assert len(set(self.config.intermediate_size)) == 1, (
                 "Currently SGLang requires uniform intermediate size for all layers. "
