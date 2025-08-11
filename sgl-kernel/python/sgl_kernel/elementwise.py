@@ -243,17 +243,14 @@ class FusedSetKVBufferArg:
     """
     value : Optional[torch.Tensor]
         Value tensor, shape: ``(nnz, num_v_heads * head_size)``.
-        If provided, the function will also apply RoPE to the value tensor.
     k_buffer : Optional[torch.Tensor]
         Buffer for keys, shape: ``(nnz, num_k_heads * head_size)``.
-        If provided, the function will set the buffer inplace.
     v_buffer : Optional[torch.Tensor]
         Buffer for values, shape: ``(nnz, num_v_heads * head_size)``.
-        If provided, the function will set the buffer inplace.
     k_scale : Optional[float]
-        Scale factor for keys. If not provided, defaults to 1.0.
+        Scale factor for keys.
     v_scale : Optional[float]
-        Scale factor for values. If not provided, defaults to 1.0.
+        Scale factor for values.
     cache_loc : Optional[torch.Tensor]
         Cache location tensor, used for indexing kv cache.
     """
