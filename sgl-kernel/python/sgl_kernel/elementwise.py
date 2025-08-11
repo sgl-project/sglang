@@ -321,13 +321,16 @@ def apply_rope_with_cos_sin_cache_inplace(
         k_buffer = k_buffer.view(k_buffer.shape[0], -1, head_size)
         v_buffer = v_buffer.view(v_buffer.shape[0], -1, head_size)
         value = value.view(value.shape[0], -1, head_size)
-        cache_loc = cache_loc.long()
+        # cache_loc = cache_loc.long()
     else:
         save_kv_cache = False
         k_buffer = None
         v_buffer = None
         value = None
         cache_loc = None
+
+    assert cache_loc.dtype == torch.int64
+
     torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache_with_set_kv_buffer.default(
         query.view(query.shape[0], -1, head_size),
         key.view(key.shape[0], -1, head_size),
