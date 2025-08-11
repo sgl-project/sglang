@@ -151,7 +151,7 @@ class HiRadixCache(RadixCache):
 
     def write_backup_storage(self, node: TreeNode):
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.parent.get_last_hash_value()
+            node.host_value, node.key, node.hash_value
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -414,9 +414,7 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
         for _ in range(queue_size.item()):
-            ack_id, hash_value, completed_tokens = (
-                self.cache_controller.ack_backup_queue.get()
-            )
+            ack_id, completed_tokens = self.cache_controller.ack_backup_queue.get()
             host_node = self.ongoing_backup[ack_id]
 
             if completed_tokens > 0:
