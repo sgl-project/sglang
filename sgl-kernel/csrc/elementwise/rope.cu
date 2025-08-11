@@ -99,7 +99,7 @@ void apply_rope_pos_ids_cos_sin_cache(
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
-    cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer(
+    cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
         static_cast<c_type*>(q.data_ptr()),
         static_cast<c_type*>(k.data_ptr()),
         v_ptr,
@@ -136,7 +136,7 @@ void apply_rope_pos_ids_cos_sin_cache(
         save_kv_cache);
     TORCH_CHECK(
         status == cudaSuccess,
-        "BatchQKApplyRotaryPosIdsCosSinCacheWithSetKVBuffer failed with error code " +
+        "BatchQKApplyRotaryPosIdsCosSinCacheEnhanced failed with error code " +
             std::string(cudaGetErrorString(status)));
     return true;
   });
