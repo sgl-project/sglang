@@ -34,7 +34,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -63,7 +63,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -92,7 +92,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -109,7 +109,7 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-4-ascend-npu --timeout-per-file 3600
 
-  finish:
+  pr-test-npu-finish:
     if: always()
     needs:
       - per-commit-1-ascend-npu
