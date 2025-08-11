@@ -162,7 +162,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
       k_vec.cast_store(k_rope_ptr + tx * vec_size);
 
       if constexpr (save_kv_cache) {
-        save_kv_buffer_ptr<DType, IdType, vec_size>(
+        kv_buffer_saver::save<DType, IdType, vec_size>(
             kv_cache_offset,
             k_vec,
             v_vec,
@@ -266,8 +266,10 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
       DType* k_rope_ptr = k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
 
       vec_t<float, vec_size> v_vec;
+      IdType kv_cache_offset;
       if constexpr (save_kv_cache) {
-        load_v_vec<DType, vec_size>(v_vec, v, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
+        kv_buffer_saver::prepare<DType, vec_size>(
+            v_vec, kv_cache_offset, v, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
       }
 
       vec_t<float, vec_size> k_vec;
@@ -279,7 +281,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
       k_vec.cast_store(k_rope_ptr + tx * vec_size);
 
       if constexpr (save_kv_cache) {
-        save_kv_buffer_ptr<DType, IdType, vec_size>(
+        kv_buffer_saver::save<DType, IdType, vec_size>(
+            kv_cache_offset,
             k_vec,
             v_vec,
             k_buffer,
