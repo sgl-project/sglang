@@ -435,7 +435,7 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                 )
         
-        if not disable_weight_loading
+        if not disable_weight_loading:
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
