@@ -26,14 +26,14 @@ template <typename DType, typename IdType, uint32_t vec_size>
 __device__ __forceinline__ void prepare(
     vec_t<float, vec_size>& v_vec,
     IdType& kv_cache_offset,
-    const DType* v,
-    const IdType* kv_cache_loc,
-    const uint32_t idx,
-    const uint32_t tx,
-    const uint32_t kv_head_idx,
-    const size_t v_stride_n,
-    const size_t v_stride_h) {
-  const DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
+    DType* v,
+    IdType* kv_cache_loc,
+    uint32_t idx,
+    uint32_t tx,
+    uint32_t kv_head_idx,
+    size_t v_stride_n,
+    size_t v_stride_h) {
+  DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
   v_vec.cast_load(v_ptr + tx * vec_size);
 
   kv_cache_offset = kv_cache_loc[idx];
@@ -41,21 +41,21 @@ __device__ __forceinline__ void prepare(
 
 template <typename DType, typename IdType, uint32_t vec_size>
 __device__ __forceinline__ void save(
-    const IdType& kv_cache_offset,
+    IdType& kv_cache_offset,
     vec_t<float, vec_size>& k_vec,
     vec_t<float, vec_size>& v_vec,
-    const DType* k_buffer,
-    const DType* v_buffer,
-    const uint32_t idx,
-    const uint32_t tx,
-    const uint32_t kv_head_idx,
-    const size_t k_buffer_stride_n,
-    const size_t k_buffer_stride_h,
-    const size_t v_buffer_stride_n,
-    const size_t v_buffer_stride_h) {
-  const DType* k_buffer_ptr =
+    DType* k_buffer,
+    DType* v_buffer,
+    uint32_t idx,
+    uint32_t tx,
+    uint32_t kv_head_idx,
+    size_t k_buffer_stride_n,
+    size_t k_buffer_stride_h,
+    size_t v_buffer_stride_n,
+    size_t v_buffer_stride_h) {
+  DType* k_buffer_ptr =
       k_buffer + get_elem_offset_impl(kv_cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
-  const DType* v_buffer_ptr =
+  DType* v_buffer_ptr =
       v_buffer + get_elem_offset_impl(kv_cache_offset, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
   k_vec.cast_store(k_buffer_ptr + tx * vec_size);
   v_vec.cast_store(v_buffer_ptr + tx * vec_size);
