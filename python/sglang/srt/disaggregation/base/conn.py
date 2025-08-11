@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
