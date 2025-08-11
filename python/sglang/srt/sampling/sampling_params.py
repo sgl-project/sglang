@@ -33,7 +33,7 @@ class SamplingParams:
         max_new_tokens: int = 128,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
-        temperature: float = 1.0,
+        temperature: float = 0.0, # temporary, for passing non-greedy sampling for gsm8k
         top_p: float = 1.0,
         top_k: int = -1,
         min_p: float = 0.0,

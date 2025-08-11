@@ -122,10 +122,13 @@ def send_one_prompt(args):
                     break
                 ret = json.loads(chunk[5:].strip("\n"))
     else:
-        ret = response.json()
+        if args.batch_size > 1:
+            rets = response.json()
+        else:
+            ret = response.json()
 
     if args.batch_size > 1:
-        ret = ret[0]
+        ret = rets[0]
 
     if response.status_code != 200:
         print(ret)
@@ -141,6 +144,11 @@ def send_one_prompt(args):
         acc_length = 1.0
 
     speed = ret["meta_info"]["completion_tokens"] / latency
+
+    if args.batch_size > 1:
+        for r in rets:
+            print(r["text"])
+            print("-" * 100)
 
     print(ret["text"])
     print()

@@ -302,6 +302,8 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
+            # TODO: understand why this fixes the race, why no cpu-gpu sync fixed it?
+            # max_extend_len = torch.max(forward_batch.extend_seq_lens)
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
             num_kv_splits = None
 

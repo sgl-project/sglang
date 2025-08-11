@@ -65,7 +65,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, next_power_of_2, support_triton
+from sglang.srt.utils import flatten_nested_list, next_power_of_2, support_triton, alloc_len_per_eagle_decode
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -885,6 +885,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: Optional[SpeculativeAlgorithm] = None
     spec_info: Optional[SpecInfo] = None
+    verify_done: Optional[torch.cuda.Event] = None
     draft_worker: Optional["EagleWorker"] = None
 
     @classmethod
@@ -1038,15 +1039,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         worker = self.draft_worker
         bs = self.batch_size()
 
-        # This overallocates a lot of tokens.
-        # FIXME: we should use self.spec_info.seq_lens instead of self.spec_info.allocate_lens
-        new_needed_lens = self.spec_info.allocate_lens + (
-            max(
-                bs * worker.num_steps * worker.topk,
-                bs * worker.num_draft_tokens,
-            )
-        )
-        new_allocate_lens = torch.max(self.spec_info.allocate_lens, new_needed_lens)
+        # We need this to get the correct self.seq_lens
+        # TODO: is this missing overlapping opportunities? maybe we can do old self.seq_lens + 2x needed tokens?
+        if self.verify_done is not None:
+            self.verify_done.synchronize()
+        
+        self.seq_lens_sum = self.seq_lens.sum().item()
+        new_allocate_lens = self.seq_lens + alloc_len_per_eagle_decode(worker)
+        assert torch.all(new_allocate_lens > self.spec_info.allocate_lens), f"new_allocate_lens={new_allocate_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
         num_needed_tokens = (
             (new_allocate_lens - self.spec_info.allocate_lens).sum().item()
         )
@@ -1062,11 +1062,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             next_power_of_2(bs),
         )
         self.spec_info.allocate_lens = new_allocate_lens
-
-        # We need this to get the correct self.seq_lens
-        if self.verify_done is not None:
-            self.verify_done.synchronize()
-        self.seq_lens_sum = self.seq_lens.sum().item()
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
@@ -1614,6 +1609,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        if self.verify_done is not None:
+            self.verify_done.wait()
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -1670,6 +1668,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
+        # if self.verify_done is not None:
+        #     self.verify_done.wait()
+        # if other.verify_done is not None:
+        #     other.verify_done.wait()
+
         self.sampling_info.merge_batch(other.sampling_info)
 
         # Encoder-decoder infos
