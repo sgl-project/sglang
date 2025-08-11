@@ -37,7 +37,7 @@ from sgl_kernel.testing.rotary_embedding import (
                 (128, 1),
                 (512, 1),
                 (2, 512),
-                (1, 4096),
+                (4, 4096),
             )
         ],
         # Other cases
