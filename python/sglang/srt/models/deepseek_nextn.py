@@ -20,7 +20,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -134,6 +134,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
+        self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
 
         self.model = DeepseekModelNextN(
