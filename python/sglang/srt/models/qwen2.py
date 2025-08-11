@@ -58,10 +58,6 @@ logger = logging.getLogger(__name__)
 import torch.nn.functional as F
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.distributed import parallel_state as ps
-from triton_dist.layers.nvidia import GemmARLayer
-from triton_dist.utils import (is_nvshmem_multimem_supported, assert_allclose, dist_print, generate_data, group_profile,
-                               initialize_distributed, nvshmem_barrier_all_on_stream, perf_func, finalize_distributed,
-                               sleep_async)
 
 class Qwen2MLP(nn.Module):
     def __init__(
@@ -94,24 +90,10 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-        self.gemm_ar = GemmARLayer(
-            tp_group=ps._TP_GLOO,
-            max_M=1000, N=8192, K=3696,
-            input_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
-            local_world_size=8, persistent=False, copy_to_local=True,
-            use_ll_kernel=False, NUM_COMM_SMS=2)
-
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        if get_int_env_var('TP_OVERLAP', 0) == 1:
-            output_parallel = F.linear(x, self.down_proj.weight, self.down_proj.bias)
-            x = ps.get_tp_group().all_reduce(output_parallel)
-        elif get_int_env_var('TP_OVERLAP', 0) == 2:
-            x = self.gemm_ar.forward(x, self.down_proj.weight, self.down_proj.bias)
-        else:
-            x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x)
 
         return x
 

@@ -247,6 +247,9 @@ class ModelRunner:
         )
         self._model_update_group = {}
 
+        self.gemm_ar_attn_op = None
+        self.gemm_ar_mlp_op = None
+
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
 
@@ -336,6 +339,7 @@ class ModelRunner:
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
+            self.init_overlap_gemm_allreduce_operator()
             self.init_cuda_graphs()
         else:
             self.cuda_graph_runner = None
@@ -1304,6 +1308,49 @@ class ModelRunner:
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+
+
+    def init_overlap_gemm_allreduce_operator(self):
+        from sglang.srt.distributed import parallel_state as ps
+        from triton_dist.layers.nvidia import GemmARLayer
+        from triton_dist.utils import (
+            is_nvshmem_multimem_supported, 
+            assert_allclose, 
+            dist_print, 
+            generate_data, 
+            group_profile,
+            initialize_distributed, 
+            nvshmem_barrier_all_on_stream, 
+            perf_func, 
+            finalize_distributed,
+            sleep_async
+        )
+
+        self.gemm_ar_attn_op = GemmARLayer(
+            tp_group=ps._TP_GLOO,
+            max_M=self.model_config.hf_config.max_position_embeddings, 
+            N=self.model_config.hf_config.hidden_size, 
+            K=(self.model_config.hf_config.hidden_size // self.tp_size),
+            input_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            local_world_size=self.tp_size, persistent=True, copy_to_local=False,
+            use_ll_kernel=False, NUM_COMM_SMS=2)
+        
+        self.gemm_ar_mlp_op = GemmARLayer(
+            tp_group=ps._TP_GLOO,
+            max_M=self.model_config.hf_config.max_position_embeddings, 
+            N=self.model_config.hf_config.hidden_size, 
+            K=(self.model_config.hf_config.intermediate_size // self.tp_size),
+            input_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            local_world_size=self.tp_size, persistent=True, copy_to_local=False,
+            use_ll_kernel=False, NUM_COMM_SMS=2)
+        
+        for each in self.model.model.layers:
+            if each.self_attn.o_proj:
+                each.self_attn.o_proj.gemm_ar_attn_op = self.gemm_ar_attn_op
+            if each.mlp.down_proj:
+                each.mlp.down_proj.gemm_ar_mlp_op = self.gemm_ar_mlp_op
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
