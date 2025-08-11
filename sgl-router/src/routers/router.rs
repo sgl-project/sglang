@@ -1,5 +1,5 @@
 use crate::config::types::{CircuitBreakerConfig as ConfigCircuitBreakerConfig, RetryConfig};
-use crate::core::{CircuitBreakerConfig, HealthChecker, Worker, WorkerFactory};
+use crate::core::{CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory};
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
@@ -382,6 +382,33 @@ impl Router {
     }
 
     // New method to route typed requests directly
+    /// Select worker considering circuit breaker state
+    fn select_worker_with_circuit_breaker(&self, text: Option<&str>) -> Option<Box<dyn Worker>> {
+        let workers = self.workers.read().ok()?;
+        let available: Vec<Box<dyn Worker>> = workers
+            .iter()
+            .filter(|w| w.is_available())
+            .map(|w| w.clone_worker())
+            .collect();
+        if available.is_empty() {
+            return None;
+        }
+        let idx = self.policy.select_worker(&available, text)?;
+        Some(available[idx].clone_worker())
+    }
+
+    fn is_retryable_status(status: StatusCode) -> bool {
+        matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT
+                | StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::INTERNAL_SERVER_ERROR
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        )
+    }
+
     pub async fn route_typed_request<
         T: crate::openai_api_types::GenerationRequest + serde::Serialize + Clone,
     >(
@@ -390,127 +417,70 @@ impl Router {
         typed_req: &T,
         route: &str,
     ) -> Response {
-        // Handle retries like the original implementation
         let start = Instant::now();
-        // Use retry config for per-worker retries
-        let max_request_retries = self.retry_config.max_retries;
-        // Total retries across all workers (2x to allow trying multiple workers)
-        let max_total_retries = self.retry_config.max_retries * 2;
-        let mut total_retries = 0;
+        let is_stream = typed_req.is_stream();
+        let text = typed_req.extract_text_for_routing();
 
-        while total_retries < max_total_retries {
-            // Extract routing text directly from typed request
-            let text = typed_req.extract_text_for_routing();
-            let is_stream = typed_req.is_stream();
-
-            // Select worker based on text
-            let worker_url = self.select_generate_worker_from_text(&text);
-            if worker_url.is_empty() {
-                RouterMetrics::record_request_error(route, "no_healthy_workers");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "No healthy workers available",
-                )
-                    .into_response();
-            }
-            let mut request_retries = 0;
-
-            // Try the same worker multiple times
-            while request_retries < max_request_retries {
-                if total_retries >= 1 {
-                    info!("Retrying request after {} failed attempts", total_retries);
-                    RouterMetrics::record_retry(route);
-                }
-
-                // Increment load before request if using RAII load tracking
-                let load_incremented = if self.policy.name() == "cache_aware" {
-                    let workers_guard = self.workers.read().unwrap();
-                    if let Some(worker) = workers_guard.iter().find(|w| w.url() == &worker_url) {
-                        worker.increment_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
-                        true
-                    } else {
-                        false
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            // operation per attempt
+            |_: u32| async {
+                let worker = match self.select_worker_with_circuit_breaker(Some(&text)) {
+                    Some(w) => w,
+                    None => {
+                        RouterMetrics::record_request_error(route, "no_available_workers");
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "No available workers (all circuits open or unhealthy)",
+                        )
+                            .into_response();
                     }
+                };
+
+                // Optional load tracking for cache-aware policy
+                let load_incremented = if self.policy.name() == "cache_aware" {
+                    worker.increment_load();
+                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                    true
                 } else {
                     false
                 };
 
-                // Send typed request directly
                 let response = self
                     .send_typed_request(
                         headers,
                         typed_req,
                         route,
-                        &worker_url,
+                        worker.url(),
                         is_stream,
                         load_incremented,
                     )
                     .await;
 
-                if response.status().is_success() {
-                    let duration = start.elapsed();
-                    RouterMetrics::record_request(route);
-                    RouterMetrics::record_generate_duration(duration);
-                    return response;
-                } else {
-                    let status = response.status();
-                    if status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS {
-                        RouterMetrics::record_request_error(route, "client_error");
-                        return response;
-                    }
-                    // if the worker is healthy, it means the request is bad, so return the error response
-                    let health_response = self.send_health_check(&worker_url).await;
-                    if health_response.status().is_success() {
-                        RouterMetrics::record_request_error(route, "request_failed");
-                        return response;
-                    }
-                }
-
-                warn!(
-                    "Generate request failed route={} worker_url={} attempt={} max_attempts={}",
-                    route,
-                    worker_url,
-                    request_retries + 1,
-                    max_request_retries
-                );
-
-                request_retries += 1;
-                total_retries += 1;
-
-                if request_retries == max_request_retries {
-                    warn!(
-                        "Removing failed worker after typed request failures worker_url={}",
-                        worker_url
-                    );
-                    self.remove_worker(&worker_url);
-                    break;
-                }
-
-                let backoff_ms = (100u64 * (request_retries as u64)).min(1000);
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            }
-        }
-
-        RouterMetrics::record_request_error(route, "request_failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "All retry attempts failed",
+                worker.record_outcome(response.status().is_success());
+                response
+            },
+            // should_retry predicate
+            |res, _attempt| Self::is_retryable_status(res.status()),
+            // on_backoff hook
+            |delay, attempt| {
+                RouterMetrics::record_retry(route);
+                RouterMetrics::record_retry_backoff_duration(delay, attempt);
+            },
+            // on_exhausted hook
+            || RouterMetrics::record_retries_exhausted(route),
         )
-            .into_response()
-    }
+        .await;
 
-    // Helper method to select worker from text using the policy
-    fn select_generate_worker_from_text(&self, text: &str) -> String {
-        let workers = self.workers.read().unwrap();
-
-        match self.policy.select_worker(&workers, Some(text)) {
-            Some(idx) => workers[idx].url().to_string(),
-            None => {
-                warn!("No healthy workers available");
-                String::new()
-            }
+        if response.status().is_success() {
+            let duration = start.elapsed();
+            RouterMetrics::record_request(route);
+            RouterMetrics::record_generate_duration(duration);
+        } else if !Self::is_retryable_status(response.status()) {
+            RouterMetrics::record_request_error(route, "non_retryable_error");
         }
+
+        response
     }
 
     // TODO (rui): Better accommodate to the Worker abstraction
