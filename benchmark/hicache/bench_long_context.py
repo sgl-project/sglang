@@ -93,4 +93,4 @@ if __name__ == "__main__":
         requests.post(flush_cache_url)
         time.sleep(1)
         performance_data = ContextWorkloadGenerator(args).run()
-        log_to_jsonl_file(performance_data, "long_context_benchmark.jsonl", args.tag)
+        log_to_jsonl_file(performance_data, args.log_file, args.tag)
