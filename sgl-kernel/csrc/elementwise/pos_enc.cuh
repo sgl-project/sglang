@@ -22,8 +22,8 @@ namespace flashinfer {
 
 template <typename DType, uint32_t vec_size>
 __device__ __forceinline__ void load_v_vec(
-    DType* v,
     vec_t<float, vec_size>& v_vec,
+    const DType* v,
     const uint32_t idx,
     const uint32_t tx,
     const uint32_t kv_head_idx,
@@ -35,18 +35,18 @@ __device__ __forceinline__ void load_v_vec(
 
 template <typename DType, typename IdType, uint32_t vec_size>
 __device__ __forceinline__ void save_kv_buffer_ptr(
-    vec_t<float, vec_size>& k_vec,
-    vec_t<float, vec_size>& v_vec,
-    DType* k_buffer,
-    DType* v_buffer,
-    IdType* kv_cache_loc,
+    const vec_t<float, vec_size>& k_vec,
+    const vec_t<float, vec_size>& v_vec,
+    const DType* k_buffer,
+    const DType* v_buffer,
+    const IdType* kv_cache_loc,
     const uint32_t idx,
     const uint32_t tx,
     const uint32_t kv_head_idx,
-    size_t k_buffer_stride_n,
-    size_t k_buffer_stride_h,
-    size_t v_buffer_stride_n,
-    size_t v_buffer_stride_h) {
+    const size_t k_buffer_stride_n,
+    const size_t k_buffer_stride_h,
+    const size_t v_buffer_stride_n,
+    const size_t v_buffer_stride_h) {
   const IdType cache_offset = kv_cache_loc[idx];
   DType* k_buffer_ptr =
       k_buffer + get_elem_offset_impl(cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
@@ -141,7 +141,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
 
       vec_t<float, vec_size> v_vec;
       if constexpr (save_kv_cache) {
-        load_v_vec<DType, vec_size>(v, v_vec, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
+        load_v_vec<DType, vec_size>(v_vec, v, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
       }
 
       vec_t<float, vec_size> k_vec;
@@ -257,7 +257,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
 
       vec_t<float, vec_size> v_vec;
       if constexpr (save_kv_cache) {
-        load_v_vec<DType, vec_size>(v, v_vec, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
+        load_v_vec<DType, vec_size>(v_vec, v, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
       }
 
       vec_t<float, vec_size> k_vec;
