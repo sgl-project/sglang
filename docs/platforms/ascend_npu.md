@@ -1,6 +1,6 @@
 # SGLang on Ascend NPUs
 
-You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encouter any issues or have any problems.
+You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
 ## System Settings
 
@@ -48,9 +48,9 @@ conda activate sglang_npu
 
 #### MemFabric Adaptor
 
-_TODO: MemFabric is still a working project yet open sourced til August/September, 2025. We will release it as prebuilt wheel packge for now._
+_TODO: MemFabric is still a working project yet open sourced til August/September, 2025. We will release it as prebuilt wheel package for now._
 
-_Notice: Prebuilt wheel packge is based on `aarch64`, please leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) to let us know the requests for `amd64` build._
+_Notice: Prebuilt wheel package is based on `aarch64`, please leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) to let us know the requests for `amd64` build._
 
 MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
