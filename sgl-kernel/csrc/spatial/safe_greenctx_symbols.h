@@ -6,44 +6,52 @@
 
 #include "cuda_utils.h"
 
-#define CUDA_SAFE_SYMBOL(symbol_name, fallback_return)                                                             \
-  [](auto... args) -> decltype(symbol_name(args...)) {                                                             \
-    static decltype(symbol_name)* pfn = nullptr;                                                                   \
-    static std::once_flag pfn_probed_flag;                                                                         \
-    std::call_once(                                                                                                \
-        pfn_probed_flag, []() { cuGetProcAddress(#symbol_name, reinterpret_cast<void**>(&pfn), 0, 0, nullptr); }); \
-    if (!pfn) {                                                                                                    \
-      return fallback_return;                                                                                      \
-    }                                                                                                              \
-    return pfn(args...);                                                                                           \
+#define CUDA_DEFINED_SAFE_CALL(symbol_name_str, ...)                                                                  \
+  [](auto... args) -> CUresult {                                                                                      \
+    using pfn_t = CUresult(CUDAAPI*)(__VA_ARGS__);                                                                    \
+    static pfn_t pfn = nullptr;                                                                                       \
+                                                                                                                      \
+    static std::once_flag pfn_probed_flag;                                                                            \
+    std::call_once(                                                                                                   \
+        pfn_probed_flag, []() { cuGetProcAddress(symbol_name_str, reinterpret_cast<void**>(&pfn), 0, 0, nullptr); }); \
+                                                                                                                      \
+    if (!pfn) {                                                                                                       \
+      return CUDA_ERROR_NOT_SUPPORTED;                                                                                \
+    }                                                                                                                 \
+    return pfn(args...);                                                                                              \
   }
 
-#define SAFE_cuDeviceGetDevResource(device, resource, type) \
-  CUDA_SAFE_SYMBOL(cuDeviceGetDevResource, CUDA_ERROR_NOT_SUPPORTED)(device, resource, type)
+auto SAFE_cuDeviceGetDevResource =
+    CUDA_DEFINED_SAFE_CALL("cuDeviceGetDevResource", CUdevice, CUdevResource*, CUdevResourceType);
 
-#define SAFE_cuGreenCtxStreamCreate(stream, gctx, flags, priority) \
-  CUDA_SAFE_SYMBOL(cuGreenCtxStreamCreate, CUDA_ERROR_NOT_SUPPORTED)(stream, gctx, flags, priority)
+auto SAFE_cuGreenCtxStreamCreate =
+    CUDA_DEFINED_SAFE_CALL("cuGreenCtxStreamCreate", CUstream*, CUgreenCtx, unsigned int, int);
 
-#define SAFE_cuGreenCtxCreate(gctx, desc, device, flags) \
-  CUDA_SAFE_SYMBOL(cuGreenCtxCreate, CUDA_ERROR_NOT_SUPPORTED)(gctx, desc, device, flags)
+auto SAFE_cuGreenCtxCreate =
+    CUDA_DEFINED_SAFE_CALL("cuGreenCtxCreate", CUgreenCtx*, CUdevResourceDesc, CUdevice, unsigned int);
 
-#define SAFE_cuGreenCtxDestroy(gctx) CUDA_SAFE_SYMBOL(cuGreenCtxDestroy, CUDA_ERROR_NOT_SUPPORTED)(gctx)
+auto SAFE_cuGreenCtxDestroy = CUDA_DEFINED_SAFE_CALL("cuGreenCtxDestroy", CUgreenCtx);
 
-#define SAFE_cuGreenCtxGetDevResource(gctx, resource, type) \
-  CUDA_SAFE_SYMBOL(cuGreenCtxGetDevResource, CUDA_ERROR_NOT_SUPPORTED)(gctx, resource, type)
+auto SAFE_cuGreenCtxGetDevResource =
+    CUDA_DEFINED_SAFE_CALL("cuGreenCtxGetDevResource", CUgreenCtx, CUdevResource*, CUdevResourceType);
 
-#define SAFE_cuDevSmResourceSplitByCount(resource1, nbGroups, input, resource2, flags, count) \
-  CUDA_SAFE_SYMBOL(cuDevSmResourceSplitByCount, CUDA_ERROR_NOT_SUPPORTED)                     \
-  (resource1, nbGroups, input, resource2, flags, count)
+auto SAFE_cuDevSmResourceSplitByCount = CUDA_DEFINED_SAFE_CALL(
+    "cuDevSmResourceSplitByCount",
+    CUdevResource*,
+    unsigned int*,
+    const CUdevResource*,
+    CUdevResource*,
+    unsigned int,
+    unsigned int);
 
-#define SAFE_cuDevResourceGenerateDesc(desc, resource, count) \
-  CUDA_SAFE_SYMBOL(cuDevResourceGenerateDesc, CUDA_ERROR_NOT_SUPPORTED)(desc, resource, count)
+auto SAFE_cuDevResourceGenerateDesc =
+    CUDA_DEFINED_SAFE_CALL("cuDevResourceGenerateDesc", CUdevResourceDesc*, CUdevResource*, unsigned int);
 
-#define SAFE_cuCtxFromGreenCtx(ctx, gctx) CUDA_SAFE_SYMBOL(cuCtxFromGreenCtx, CUDA_ERROR_NOT_SUPPORTED)(ctx, gctx)
+auto SAFE_cuCtxFromGreenCtx = CUDA_DEFINED_SAFE_CALL("cuCtxFromGreenCtx", CUcontext*, CUgreenCtx);
 
-#define SAFE_cuCtxPushCurrent(ctx) CUDA_SAFE_SYMBOL(cuCtxPushCurrent, CUDA_ERROR_NOT_SUPPORTED)(ctx)
+auto SAFE_cuCtxPushCurrent = CUDA_DEFINED_SAFE_CALL("cuCtxPushCurrent", CUcontext);
 
-#define SAFE_cuCtxPopCurrent(ctx) CUDA_SAFE_SYMBOL(cuCtxPopCurrent, CUDA_ERROR_NOT_SUPPORTED)(ctx)
+auto SAFE_cuCtxPopCurrent = CUDA_DEFINED_SAFE_CALL("cuCtxPopCurrent", CUcontext*);
 
 #define CHECK_CUDA_VERSION_GREEN_CTX_SUPPORT()                                           \
   do {                                                                                   \

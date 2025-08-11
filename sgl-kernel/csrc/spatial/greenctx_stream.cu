@@ -1,3 +1,4 @@
+// Documentation: https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html
 #include <torch/all.h>
 
 #include <cstdlib>
@@ -61,7 +62,7 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
 
   unsigned nbGroups = 1;
   CUDA_DRV(SAFE_cuDevSmResourceSplitByCount(&resources[2], &nbGroups, &input, &resources[3], 0, minCount));
-  CUDA_DRV(SAFE_cuDevResourceGenerateDesc(&desc[2], &resources[2], static_cast<size_t>(1)));
+  CUDA_DRV(SAFE_cuDevResourceGenerateDesc(&desc[2], &resources[2], 1));
   CUDA_DRV(SAFE_cuGreenCtxCreate(&gctx[2], desc[2], (CUdevice)device, CU_GREEN_CTX_DEFAULT_STREAM));
   CUDA_DRV(SAFE_cuGreenCtxGetDevResource(gctx[2], &input, CU_DEV_RESOURCE_TYPE_SM));
   nbGroups = 1;
