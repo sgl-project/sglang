@@ -1941,9 +1941,6 @@ class Scheduler(
                 can_run_cuda_graph=forward_output.can_run_cuda_graph,
                 copy_done=copy_done,
                 accept_length=forward_output.accept_length,
-                # this doesn't change overlap
-                # new_seq_lens=spec_info.new_seq_lens.clone(), # spec_info fields may be modified by next batch, so clone
-                # allocate_lens=spec_info.allocate_lens.clone(),
                 new_seq_lens=spec_info.new_seq_lens,
                 allocate_lens=spec_info.allocate_lens,
             )
