@@ -26,9 +26,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
-else:
-    FusedSetKVBufferArg = Any
+    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 
@@ -224,7 +222,7 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
-        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
