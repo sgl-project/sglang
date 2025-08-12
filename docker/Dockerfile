@@ -2,7 +2,7 @@ ARG CUDA_VERSION=12.6.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
 ARG BUILD_TYPE=all
-ARG DEEPEP_COMMIT=b6ce310bb0b75079682d09bc2ebc063a074fbd58
+ARG DEEPEP_COMMIT=b92d0d4860ce6866cd6d31bfbae937f9a7a3772b
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -14,7 +14,7 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 
 RUN apt update && apt install wget -y && apt install software-properties-common -y \
  && add-apt-repository ppa:deadsnakes/ppa -y \
- && apt install python3.12-full -y \
+  && apt install python3.12-full python3.12-dev python3.10-venv -y \
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
  && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
  && update-alternatives --set python3 /usr/bin/python3.12 \
@@ -28,7 +28,6 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     tzdata \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
-    python3 python3-pip python3-dev libpython3-dev python3-venv \
     build-essential cmake \
     libopenmpi-dev libnuma1 libnuma-dev \
     libibverbs-dev libibverbs1 libibumad3 \
@@ -44,7 +43,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     patchelf \
     nvidia-dkms-550 \
     devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
- && ln -sf /usr/bin/python3 /usr/bin/python \
+ && ln -sf /usr/bin/python3.12 /usr/bin/python \
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
 
@@ -67,22 +66,30 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
       12.8.1) CUINDEX=128 ;; \
+      12.9.1) CUINDEX=129 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
+ && python3 -m flashinfer --download-cubin \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.9/sgl_kernel-0.2.9+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.4/sgl_kernel-0.3.4+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+    fi \
+ && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.4/sgl_kernel-0.3.4-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi
 
-# Build and install NVSHMEM + DeepEP
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
- && git clone https://github.com/deepseek-ai/DeepEP.git \
- && cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. \
- && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && mv nvshmem_src nvshmem \
- && cd nvshmem \
- && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
- && NVSHMEM_SHMEM_SUPPORT=0 \
+# Download source files
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
+    git clone https://github.com/deepseek-ai/DeepEP.git && \
+    cd DeepEP && git checkout ${DEEPEP_COMMIT} && cd .. && \
+    tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
+    mv nvshmem_src nvshmem && \
+    rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+
+# Build and install NVSHMEM
+RUN cd /sgl-workspace/nvshmem && \
+    NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
     NVSHMEM_MPI_SUPPORT=0 \
@@ -90,10 +97,12 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=90 \
- && cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL} \
- && cd /sgl-workspace/DeepEP \
- && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="90" && \
+    cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
+
+# Install DeepEP
+RUN cd /sgl-workspace/DeepEP && \
+    NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
@@ -106,7 +115,8 @@ RUN python3 -m pip install --no-cache-dir \
     icdiff \
     uv \
     wheel \
-    scikit-build-core
+    scikit-build-core \
+    nixl
 
 # Install development tools and utilities
 RUN apt-get update && apt-get install -y \

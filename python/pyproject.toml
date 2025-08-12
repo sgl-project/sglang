@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.10.post2"
+version = "0.5.0rc0"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -21,6 +21,7 @@ runtime_common = [
     "build",
     "compressed-tensors",
     "datasets",
+    "einops",
     "fastapi",
     "hf_transfer",
     "huggingface_hub",
@@ -29,6 +30,8 @@ runtime_common = [
     "modelscope",
     "msgspec",
     "ninja",
+    "openai==1.99.1",
+    "openai-harmony==0.0.3",
     "orjson",
     "outlines==0.1.11",
     "packaging",
@@ -44,9 +47,10 @@ runtime_common = [
     "sentencepiece",
     "soundfile==0.13.1",
     "scipy",
+    "timm==1.0.16",
+    "tiktoken",
     "torchao==0.9.0",
     "transformers==4.55.0",
-    "timm==1.0.16",
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.22",
@@ -54,13 +58,12 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.2",
+    "sgl-kernel==0.3.3",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "einops",
-    "flashinfer_python==0.2.10",
+    "flashinfer_python==0.2.11.post1",
 ]
 
 blackwell = [
@@ -70,9 +73,7 @@ blackwell = [
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "einops",
-    "flashinfer_python==0.2.10",
-    "tiktoken",
+    "flashinfer_python==0.2.11.post1",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -83,6 +84,9 @@ srt_hip = [
     "petit_kernel==0.0.2",
 ]
 
+# CPU: torch wheel for CPU needs to be installed from https://download.pytorch.org/whl/cpu
+srt_cpu = ["sglang[runtime_common]", "einops"]
+
 # xpu is not enabled in public vllm and torch whl,
 # need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
 srt_xpu = ["sglang[runtime_common]"]
@@ -91,18 +95,17 @@ srt_xpu = ["sglang[runtime_common]"]
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
 srt_hpu = ["sglang[runtime_common]"]
 
-# CPU: torch wheel for CPU needs to be installed from https://download.pytorch.org/whl/cpu
-srt_cpu = ["sglang[runtime_common]", "einops"]
 # https://vllm-ascend.readthedocs.io/en/latest/installation.html
 srt_npu = ["sglang[runtime_common]"]
 
-openai = ["openai>=1.0", "tiktoken"]
+openai = ["openai==1.99.1", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
-torch_memory_saver = ["torch_memory_saver>=0.0.8"]
+torch_memory_saver = ["torch_memory_saver==0.0.8"]
 decord = ["decord"]
 test = [
     "accelerate",
+    "expecttest",
     "jsonlines",
     "matplotlib",
     "pandas",
@@ -110,12 +113,12 @@ test = [
     "sentence_transformers",
     "pytest",
 ]
-all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[torch_memory_saver]", "sglang[decord]"]
-all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
-all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
-all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
-all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
-all_npu = ["sglang[srt_npu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[decord]"]
+all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[torch_memory_saver]", "sglang[decord]"]
+all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[decord]"]
+all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[decord]"]
+all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[decord]"]
+all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[decord]"]
+all_npu = ["sglang[srt_npu]", "sglang[openai]", "sglang[anthropic]", "sglang[decord]"]
 
 dev = ["sglang[all]", "sglang[test]"]
 dev_hip = ["sglang[all_hip]", "sglang[test]"]

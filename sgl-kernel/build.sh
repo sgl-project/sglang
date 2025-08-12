@@ -23,13 +23,13 @@ fi
 
 if [ ${CUDA_VERSION} = "12.9" ]; then
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/test/cu129"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129"
 elif [ ${CUDA_VERSION} = "12.8" ]; then
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/test/cu128"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128"
 else
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/test/cu126"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126"
 fi
 
 docker run --rm \
@@ -39,6 +39,13 @@ docker run --rm \
    # Install CMake (version >= 3.26) - Robust Installation
    export CMAKE_VERSION_MAJOR=3.31
    export CMAKE_VERSION_MINOR=1
+   # Setting these flags to reduce OOM chance only on ARM
+   if [ \"${ARCH}\" = \"aarch64\" ]; then
+      export CUDA_NVCC_FLAGS=\"-Xcudafe --threads=2\"
+      export MAKEFLAGS='-j2'
+      export CMAKE_BUILD_PARALLEL_LEVEL=2
+      export NINJAFLAGS='-j2'
+   fi
    echo \"Downloading CMake from: https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz\"
    wget https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz
    tar -xzf cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz

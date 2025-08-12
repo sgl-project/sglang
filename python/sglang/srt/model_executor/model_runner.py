@@ -121,6 +121,10 @@ from sglang.srt.utils import (
     set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
+from sglang.srt.weight_sync.tensor_bucket import (
+    FlattenedTensorBucket,
+    FlattenedTensorMetadata,
+)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -378,6 +382,25 @@ class ModelRunner:
             )
             server_args.attention_backend = "torch_native"
 
+        if server_args.prefill_attention_backend is not None and (
+            server_args.prefill_attention_backend
+            == server_args.decode_attention_backend
+        ):  # override the default attention backend
+            server_args.attention_backend = server_args.prefill_attention_backend
+
+        if (
+            getattr(self.model_config.hf_config, "dual_chunk_attention_config", None)
+            is not None
+        ):
+            if server_args.attention_backend is None:
+                server_args.attention_backend = "dual_chunk_flash_attn"
+                logger.info("Dual chunk attention is turned on by default.")
+            elif server_args.attention_backend != "dual_chunk_flash_attn":
+                raise ValueError(
+                    "Dual chunk attention is enabled, but attention backend is set to "
+                    f"{server_args.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
+                )
+
         if server_args.attention_backend is None:
             """
             Auto select the fastest attention backend.
@@ -397,7 +420,6 @@ class ModelRunner:
                     is_hopper_with_cuda_12_3()
                     and is_no_spec_infer_or_topk_one(server_args)
                     and is_fa3_default_architecture(self.model_config.hf_config)
-                    and (not server_args.enable_hierarchical_cache)
                 ):
                     server_args.attention_backend = "fa3"
                 elif _is_hip:
@@ -410,9 +432,7 @@ class ModelRunner:
                     )
             else:
                 # MLA architecture
-                if is_hopper_with_cuda_12_3() and (
-                    not server_args.enable_hierarchical_cache
-                ):
+                if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
                 elif is_sm100_supported():
                     server_args.attention_backend = "flashinfer"
@@ -499,6 +519,27 @@ class ModelRunner:
         if server_args.attention_backend == "aiter":
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
+
+        if (
+            server_args.enable_hierarchical_cache
+            and server_args.hicache_io_backend == "kernel"
+        ):
+            # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
+            if server_args.decode_attention_backend is None:
+                if not self.use_mla_backend:
+                    server_args.decode_attention_backend = (
+                        "flashinfer" if is_flashinfer_available() else "triton"
+                    )
+                else:
+                    server_args.decode_attention_backend = (
+                        "flashinfer" if is_sm100_supported() else "triton"
+                    )
+            elif server_args.decode_attention_backend == "fa3":
+                server_args.hicache_io_backend = "direct"
+                logger.warning(
+                    "FlashAttention3 decode backend is not compatible with hierarchical cache. "
+                    f"Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
+                )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -871,8 +912,18 @@ class ModelRunner:
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         load_format: Optional[str] = None,
     ):
+        monkey_patch_torch_reductions()
+        if load_format == "flattened_bucket":
+            # Handle flattened bucket format
+            return self._update_weights_from_flattened_bucket(
+                flattened_tensor_bucket_dict=named_tensors
+            )
+
+        # We need to get device after patch otherwise the device would be wrong
+        infered_device = torch.cuda.current_device()
+
         named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
+            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
         if load_format == "direct":
@@ -884,6 +935,38 @@ class ModelRunner:
             self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        return True, "Success"
+
+    def _update_weights_from_flattened_bucket(
+        self,
+        flattened_tensor_bucket_dict,
+    ):
+        """Handle flattened bucket format for weight updates"""
+        flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
+        metadata = flattened_tensor_bucket_dict["metadata"]
+
+        # Convert metadata dict to our format
+        converted_metadata = []
+        for meta in metadata:
+            converted_meta = FlattenedTensorMetadata(
+                name=meta.name,
+                shape=meta.shape,
+                dtype=meta.dtype,
+                start_idx=meta.start_idx,
+                end_idx=meta.end_idx,
+                numel=meta.numel,
+            )
+            converted_metadata.append(converted_meta)
+
+        # Create bucket and reconstruct tensors
+        bucket = FlattenedTensorBucket(
+            flattened_tensor=flattened_tensor, metadata=converted_metadata
+        )
+        reconstructed_tensors = bucket.reconstruct_tensors()
+
+        # Load the reconstructed tensors using the standard method
+        self.model.load_weights(reconstructed_tensors)
+
         return True, "Success"
 
     def get_weights_by_name(
@@ -1181,30 +1264,33 @@ class ModelRunner:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
 
-        if self.server_args.attention_backend == "ascend" and not self.use_mla_backend:
-            self.token_to_kv_pool = AscendTokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.model_config.num_hidden_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-            )
-        elif self.server_args.attention_backend == "ascend" and self.use_mla_backend:
-            self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                kv_lora_rank=self.model_config.kv_lora_rank,
-                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-            )
+        if self.server_args.attention_backend == "ascend":
+            if self.use_mla_backend:
+                self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+            else:
+                self.token_to_kv_pool = AscendTokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.model_config.num_hidden_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                )
         elif self.use_mla_backend:
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
@@ -1263,6 +1349,7 @@ class ModelRunner:
                     end_layer=self.end_layer,
                 )
 
+        need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:
                 if self.is_hybrid:
@@ -1272,6 +1359,7 @@ class ModelRunner:
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
                     )
                 else:
                     self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
@@ -1279,23 +1367,26 @@ class ModelRunner:
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
                     )
             else:
-                if _is_npu:
-                    self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                    )
-                else:
+                if not _is_npu:
                     self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
                     )
         else:
             assert self.is_draft_worker
@@ -1443,13 +1534,13 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
-        elif self.server_args.attention_backend == "trtllm_mla":
+        elif backend_str == "trtllm_mla":
             if not self.use_mla_backend:
                 raise ValueError("trtllm_mla backend can only be used with MLA models.")
             from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
             return TRTLLMMLABackend(self)
-        elif self.server_args.attention_backend == "trtllm_mha":
+        elif backend_str == "trtllm_mha":
             if self.use_mla_backend:
                 raise ValueError(
                     "trtllm_mha backend can only be used with non-MLA models."
@@ -1460,13 +1551,19 @@ class ModelRunner:
 
             return TRTLLMHAAttnBackend(self)
 
-        elif self.server_args.attention_backend == "intel_amx":
+        elif backend_str == "intel_amx":
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,
             )
 
             logger.info(f"Intel AMX attention backend is enabled.")
             return IntelAMXAttnBackend(self)
+        elif self.server_args.attention_backend == "dual_chunk_flash_attn":
+            from sglang.srt.layers.attention.dual_chunk_flashattention_backend import (
+                DualChunkFlashAttentionBackend,
+            )
+
+            return DualChunkFlashAttentionBackend(self)
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
 
@@ -1779,11 +1876,10 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
         default_weight_loader(params_dict[name], tensor)
 
 
-def _unwrap_tensor(tensor, tp_rank):
+def _unwrap_tensor(tensor, tp_rank, device):
     if isinstance(tensor, LocalSerializedTensor):
-        monkey_patch_torch_reductions()
         tensor = tensor.get(tp_rank)
-    return tensor.to(torch.cuda.current_device())
+    return tensor.to(device)
 
 
 @dataclass
