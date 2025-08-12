@@ -21,7 +21,10 @@ import os
 import random
 import sys
 import tempfile
+import pathlib
 from typing import List, Literal, Optional, Union
+
+import yaml
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.layers.utils import is_sm100_supported
@@ -2190,15 +2193,36 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Prepare the server arguments from the command line arguments.
 
     Args:
-        args: The command line arguments. Typically, it should be `sys.argv[1:]`
+        argv: The command line arguments. Typically, it should be `sys.argv[1:]`
             to ensure compatibility with `parse_args` when no arguments are passed.
 
     Returns:
         The server arguments.
     """
     parser = argparse.ArgumentParser()
+    # Add the `config` argument here to show up in the full help message.
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help=("The path to the configuration file in YAML format. "
+            "Priority: command line arguments > config file > default value."),
+        required=False,
+    )
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
+
+    if raw_args.config:
+        config_path = pathlib.Path(raw_args.config)
+        if not (config_path.exists() and config_path.is_file()):
+            raise ValueError(f"Config file {config_path} does not exist or is not a file.")
+        config_args = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config_args, dict):
+            raise ValueError(f"Invalid config file {config_path}, expected a dictionary.")
+        parser.set_defaults(**config_args)
+        raw_args = parser.parse_args(argv)
+    delattr(raw_args, "config")
+
     server_args = ServerArgs.from_cli_args(raw_args)
     return server_args
 
