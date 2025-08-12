@@ -367,68 +367,6 @@ class DeciLMForCausalLM(nn.Module):
         else:
             return self.pooler(hidden_states, forward_batch)
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata,
-    ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(
-            input_ids=None,
-            hidden_states=hidden_states,
-            lm_head=self.lm_head,
-            logits_metadata=sampling_metadata,
-        )
-        return logits
-
-    def _preprocess_logits(
-        self,
-        logits_output: LogitsProcessorOutput,
-        sampling_info,
-    ):
-        # Apply logit bias
-        if sampling_info.sampling_info_done:
-            # Overlap mode: the function update_regex_vocab_mask was executed
-            # in process_batch_result of the last batch.
-            if sampling_info.grammars:
-                sampling_info.sampling_info_done.wait()
-        else:
-            # Normal mode: Put CPU-heavy tasks here. They will be overlapped with the forward pass.
-            sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
-
-    def sample(
-        self,
-        logits_output: LogitsProcessorOutput,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        """Sample and compute logprobs and update logits_output.
-
-        Args:
-            logits_output: The logits output from the model forward
-            forward_batch: The forward batch that generates logits_output
-
-        Returns:
-            A list of next_token_ids
-        """
-        # For duplex models with multiple output streams.
-        if isinstance(logits_output, tuple):
-            return torch.stack(
-                [self.sample(values, forward_batch) for values in logits_output],
-                axis=-1,
-            )
-
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
-
-        # Sample the next tokens
-        next_token_ids = self.sampler(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-        )
-        return next_token_ids
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
