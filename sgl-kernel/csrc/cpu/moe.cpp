@@ -163,10 +163,7 @@ inline void add_mul_stub(
 
 // out = input + input2 * scale
 template <typename scalar_t>
-inline void add_bias_stub(
-    float* __restrict__ input,
-    const scalar_t* __restrict__ input2,
-    int64_t size) {
+inline void add_bias_stub(float* __restrict__ input, const scalar_t* __restrict__ input2, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
@@ -323,18 +320,19 @@ inline void silu_and_mul(
 }
 
 template <typename scalar_t, int BLOCK_N>
-inline void clamp_sigmoid_and_mul(
+inline void clamp_sigmoid_and_mul_blockfree(
     scalar_t* __restrict__ output,
-    const float* __restrict__ input0,  // x: x0, x1
-    const float* __restrict__ input1,  // y: y0, y1
+    const float* __restrict__ input0,
     int64_t m_size,
     int64_t N,
     const float alpha,
-    const float limit) {
+    const float limit,
+    int64_t offset) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
   const fVec one = fVec(1.f);
+  const fVec zero = fVec(0.f);
   const fVec limit_v = fVec(limit);
   const fVec nlimit_v = fVec(-limit);
   const fVec alpha_v = fVec(alpha);
@@ -342,32 +340,101 @@ inline void clamp_sigmoid_and_mul(
   // no remainder
   for (int64_t m = 0; m < m_size; ++m) {
     scalar_t* __restrict__ out = output + m * N;
-    const float* __restrict__ x = input0 + m * BLOCK_N;
-    const float* __restrict__ y = input1 + m * BLOCK_N;
-
+    const float* __restrict__ cur_ptr = input0 + m * BLOCK_N;
     for (int64_t d = 0; d < BLOCK_N; d += bVec::size()) {
-      fVec x0 = fVec::loadu(x + d);
-      fVec x1 = fVec::loadu(x + d + fVec::size());
-      fVec y0 = fVec::loadu(y + d);
-      fVec y1 = fVec::loadu(y + d + fVec::size());
+      float tmp_glu0[fVec::size()];     // 16
+      float tmp_linear0[fVec::size()];  // 16
+
+      // interleaved: x[2i] = glu, x[2i+1] = linear
+      for (int j = 0; j < fVec::size(); ++j) {
+        // x0 [0,2,..30]
+        tmp_glu0[j] = cur_ptr[d + j * 2];
+        // y0 [1,3,...31]
+        tmp_linear0[j] = cur_ptr[d + j * 2 + 1];
+      }
+      fVec x0 = fVec::loadu(tmp_glu0);
+      fVec y0 = fVec::loadu(tmp_linear0);
+
       // clamp
-      x0 = at::vec::minimum(x0,limit_v);
-      x1 = at::vec::minimum(x1,limit_v);
+      x0 = at::vec::minimum(x0, limit_v);
       y0 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y0));
-      y1 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y1));
       // x * sigmoid(x * alpha)
-      x0 = x0 / (one + (x0*alpha).neg().exp_u20());
-      x1 = x1 / (one + (x1*alpha).neg().exp_u20());
+      x0 = x0 / (one + (x0 * alpha_v).neg().exp_u20());
       // (y + 1) * x
-      x0 = x0 * (y0+one);
-      x1 = x1 * (y1+one);
-      // convert
-      bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-      out_vec.store(out + d);
+      y0 = y0 + one;
+      x0 = x0 * y0;
+      // // convert
+      convert_from_float_and_store<scalar_t>(out + d / 2 + offset, x0);
     }
   }
 }
 
+template <typename scalar_t, int BLOCK_N>
+inline void clamp_sigmoid_and_mul(
+    scalar_t* __restrict__ output,
+    const float* __restrict__ input0,
+    int64_t m_size,
+    int64_t N,
+    const float alpha,
+    const float limit,
+    int64_t offset) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  const fVec one = fVec(1.f);
+  const fVec zero = fVec(0.f);
+  const fVec limit_v = fVec(limit);
+  const fVec nlimit_v = fVec(-limit);
+  const fVec alpha_v = fVec(alpha);
+
+  // no remainder
+  for (int64_t m = 0; m < m_size; ++m) {
+    scalar_t* __restrict__ out = output + m * N;
+    const float* __restrict__ cur_ptr = input0 + m * BLOCK_N;
+    // TODO:
+    // remove this assert and make block_n common to meet below interleaved x and y
+    static_assert(BLOCK_N == 64);
+    for (int64_t d = 0; d < BLOCK_N; d += 64) {
+      float tmp_glu0[fVec::size()];     // 16
+      float tmp_glu1[fVec::size()];     // 16
+      float tmp_linear0[fVec::size()];  // 16
+      float tmp_linear1[fVec::size()];  // 16
+
+      // interleaved: x[2i] = glu, x[2i+1] = linear
+      for (int j = 0; j < 16; ++j) {
+        // x0 [0,2,..30]
+        tmp_glu0[j] = cur_ptr[j * 2];
+        // x1 [32,34,..62]
+        tmp_glu1[j] = cur_ptr[32 + j * 2];
+        // y0 [1,3,...31]
+        tmp_linear0[j] = cur_ptr[j * 2 + 1];
+        // y1 [33,35,..63]
+        tmp_linear1[j] = cur_ptr[32 + j * 2 + 1];
+      }
+      fVec x0 = fVec::loadu(tmp_glu0);
+      fVec x1 = fVec::loadu(tmp_glu1);
+      fVec y0 = fVec::loadu(tmp_linear0);
+      fVec y1 = fVec::loadu(tmp_linear1);
+
+      // clamp
+      x0 = at::vec::minimum(x0, limit_v);
+      x1 = at::vec::minimum(x1, limit_v);
+      y0 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y0));
+      y1 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y1));
+      // x * sigmoid(x * alpha)
+      x0 = x0 / (one + (x0 * alpha_v).neg().exp_u20());
+      x1 = x1 / (one + (x1 * alpha_v).neg().exp_u20());
+      // (y + 1) * x
+      y0 = y0 + one;
+      y1 = y1 + one;
+      x0 = x0 * y0;
+      x1 = x1 * y1;
+      // convert
+      bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+      out_vec.store(out + offset);
+    }
+  }
+}
 
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn2 {
@@ -473,128 +540,233 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
 };
 #endif
 
-// template <typename scalar_t, int BLOCK_M, int BLOCK_N>
-// struct tinygemm_kernel_nn2 {
-//   static inline void apply(
-//       const scalar_t* __restrict__ A,
-//       const scalar_t* __restrict__ B0,
-//       const scalar_t* __restrict__ B1,
-//       scalar_t* __restrict__ C,
-//       int64_t K,
-//       int64_t lda,
-//       int64_t ldb,
-//       int64_t ldc) {
-//     TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
-//   }
-// };
+template <typename scalar_t, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn2_bias {
+  static inline void apply(
+      const scalar_t* __restrict__ A,
+      const scalar_t* __restrict__ B0,
+      const scalar_t* __restrict__ B1,
+      const scalar_t* __restrict__ B0_bias,
+      const scalar_t* __restrict__ B1_bias,
+      scalar_t* __restrict__ C,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc,
+      float alpha,
+      float limit) {
+    TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
+  }
+};
 
-// #if defined(CPU_CAPABILITY_AVX512)
-// template <int BLOCK_M, int BLOCK_N>
-// struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
-//   static inline void apply(
-//       const at::BFloat16* __restrict__ A,
-//       const at::BFloat16* __restrict__ B0,
-//       const at::BFloat16* __restrict__ B1,
-//       const at::BFloat16* __restrict__ B0_bias,
-//       const at::BFloat16* __restrict__ B1_bias,
-//       at::BFloat16* __restrict__ C,
-//       int64_t K,
-//       int64_t lda,
-//       int64_t ldb,
-//       int64_t ldc,
-//       float alpha,
-//       float limit) {
-//     constexpr int ROWS = BLOCK_M;
-//     constexpr int COLS = BLOCK_N / 16;
+#if defined(CPU_CAPABILITY_AVX512)
+template <int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn2_bias<at::BFloat16, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::BFloat16* __restrict__ B0,
+      const at::BFloat16* __restrict__ B1,
+      const at::BFloat16* __restrict__ B0_bias,
+      const at::BFloat16* __restrict__ B1_bias,
+      at::BFloat16* __restrict__ C,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc,
+      float alpha,
+      float limit) {
+    constexpr int ROWS = BLOCK_M;
+    constexpr int COLS = BLOCK_N / 16;
 
-//     static_assert(COLS % 2 == 0);
+    static_assert(COLS % 2 == 0);
 
-//     // prefetch distance
-//     constexpr int PREFETCH_SIZE_K = 0;
+    // prefetch distance
+    constexpr int PREFETCH_SIZE_K = 0;
 
-//     __m512bh va;
-//     __m512bh vb0[COLS];
-//     __m512bh vb1[COLS];
-//     __m512 vc0[ROWS * COLS];
-//     __m512 vc1[ROWS * COLS];
-//     __m512 vb0_b[COLS];
-//     __m512 vb1_b[COLS];
+    __m512bh va;
+    __m512bh vb0[COLS];
+    __m512bh vb1[COLS];
+    __m512 vc0[ROWS * COLS];
+    __m512 vc1[ROWS * COLS];
+    __m512 vb0_b[COLS];
+    __m512 vb1_b[COLS];
 
-//     auto loadc = [&](auto i) {
-//       vc0[i] = _mm512_set1_ps(0.f);
-//       vc1[i] = _mm512_set1_ps(0.f);
-//     };
-//     Unroll<ROWS * COLS>{}(loadc);
+    auto loadc = [&](auto i) {
+      vc0[i] = _mm512_set1_ps(0.f);
+      vc1[i] = _mm512_set1_ps(0.f);
+    };
+    Unroll<ROWS * COLS>{}(loadc);
 
-//     const int64_t K2 = K >> 1;
-//     const int64_t lda2 = lda >> 1;
-//     const int64_t ldb2 = ldb;  // ldb * 2 >> 1;
-//     const float* a_ptr = reinterpret_cast<const float*>(A);
-//     const float* b0_ptr = reinterpret_cast<const float*>(B0);
-//     const float* b1_ptr = reinterpret_cast<const float*>(B1);
-//     const float* b0_bias_ptr = reinterpret_cast<const float*>(B0_bias);
-//     const float* b1_bias_ptr = reinterpret_cast<const float*>(B1_bias);
-//     auto compute = [&](auto i, int64_t k) {
-//       constexpr int row = i / COLS;
-//       constexpr int col = i % COLS;
+    const int64_t K2 = K >> 1;
+    const int64_t lda2 = lda >> 1;
+    const int64_t ldb2 = ldb;  // ldb * 2 >> 1;
+    const float* a_ptr = reinterpret_cast<const float*>(A);
+    const float* b0_ptr = reinterpret_cast<const float*>(B0);
+    const float* b1_ptr = reinterpret_cast<const float*>(B1);
+    const float* b0_bias_ptr = reinterpret_cast<const float*>(B0_bias);
+    const float* b1_bias_ptr = reinterpret_cast<const float*>(B1_bias);
+    auto compute = [&](auto i, int64_t k) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
 
-//       if constexpr (col == 0) {
-//         va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
-//       }
-//       if constexpr (row == 0) {
-//         vb0[col] = (__m512bh)(_mm512_loadu_si512(b0_ptr + k * ldb2 + col * 16));
-//         vb1[col] = (__m512bh)(_mm512_loadu_si512(b1_ptr + k * ldb2 + col * 16));
-//         if constexpr (PREFETCH_SIZE_K > 0) {
-//           _mm_prefetch(b0_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
-//           _mm_prefetch(b1_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
-//         }
-//       }
-//       vc0[i] = _mm512_dpbf16_ps(vc0[i], va, vb0[col]);
-//       vc1[i] = _mm512_dpbf16_ps(vc1[i], va, vb1[col]);
-//     };
-//     for (int64_t k = 0; k < K2; ++k) {
-//       Unroll<ROWS * COLS>{}(compute, k);
-//     }
+      if constexpr (col == 0) {
+        va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
+      }
+      if constexpr (row == 0) {
+        vb0[col] = (__m512bh)(_mm512_loadu_si512(b0_ptr + k * ldb2 + col * 16));
+        vb0_b[col] = (__m512)(_mm512_loadu_ps(b0_bias_ptr + col * 16));
+        vb1[col] = (__m512bh)(_mm512_loadu_si512(b1_ptr + k * ldb2 + col * 16));
+        vb1_b[col] = (__m512)(_mm512_loadu_ps(b1_bias_ptr + col * 16));
+        if constexpr (PREFETCH_SIZE_K > 0) {
+          _mm_prefetch(b0_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
+          _mm_prefetch(b1_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
+        }
+      }
+      vc0[i] = _mm512_dpbf16_ps(vc0[i], va, vb0[col]);
+      vc1[i] = _mm512_dpbf16_ps(vc1[i], va, vb1[col]);
+    };
+    for (int64_t k = 0; k < K2; ++k) {
+      Unroll<ROWS * COLS>{}(compute, k);
+    }
 
-//     using Vec = at::vec::Vectorized<float>;
-//     const Vec one = Vec(1.f);
-//     const fVec limit_v = fVec(limit);
-//     const fVec nlimit_v = fVec(-limit);
-//     const fVec alpha_v = fVec(alpha);
-//     auto storec = [&](auto i) {
-//       constexpr int row = i / COLS;
-//       constexpr int col = i % COLS;
-//       // for COLS = 2, 4 use 512bit store
-//       if constexpr (col % 2 == 0) {
-//         Vec x0 = vc0[row * COLS + col + 0];
-//         Vec x1 = vc0[row * COLS + col + 1];
-//         Vec y0 = vc1[row * COLS + col + 0];
-//         Vec y1 = vc1[row * COLS + col + 1];
-//         // clamp
-//         x0 = at::vec::minimum(x0,limit_v);
-//         x1 = at::vec::minimum(x1,limit_v);
-//         y0 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y0));
-//         y1 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y1));
-//         // x * sigmoid(x * alpha)
-//         x0 = x0 / (one + (x0*alpha).neg().exp_u20());
-//         x1 = x1 / (one + (x1*alpha).neg().exp_u20());
-//         // (y + 1) * x
-//         x0 = x0 * (y0+one);
-//         x1 = x1 * (y1+one);
+    using Vec = at::vec::Vectorized<float>;
+    const Vec one = Vec(1.f);
+    const Vec limit_v = Vec(limit);
+    const Vec nlimit_v = Vec(-limit);
+    const Vec alpha_v = Vec(alpha);
+    auto storec = [&](auto i) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+      // for COLS = 2, 4 use 512bit store
+      if constexpr (col % 2 == 0) {
+        Vec vb0_vec = vb0_b[col];
+        Vec vb1_vec = vb1_b[col];
+        Vec x0 = vc0[row * COLS + col + 0];
+        x0 = x0 + vb0_vec;
+        Vec x1 = vc0[row * COLS + col + 1];
+        x1 = x1 + vb0_vec;
+        Vec y0 = vc1[row * COLS + col + 0];
+        y0 = y0 + vb1_vec;
+        Vec y1 = vc1[row * COLS + col + 1];
+        y1 = y1 + vb1_vec;
+        float tmp_x0[Vec::size()];
+        x0.store(tmp_x0);
+        float tmp_x1[Vec::size()];
+        x1.store(tmp_x1);
+        float tmp_y0[Vec::size()];
+        y0.store(tmp_y0);
+        float tmp_y1[Vec::size()];
+        y1.store(tmp_y1);
 
-//         _mm512_storeu_si512(
-//             reinterpret_cast<__m512i*>((C + row * ldc + col * 16)),
-//             (__m512i)(_mm512_cvtne2ps_pbh(__m512(x1), __m512(x0))));
-//       }
-//     };
-//     Unroll<ROWS * COLS>{}(storec);
-//   }
-// };
-// #endif
+        float tmp_glu0[Vec::size()];
+        float tmp_glu1[Vec::size()];
+        float tmp_linear0[Vec::size()];
+        float tmp_linear1[Vec::size()];
 
-// #define LAUNCH_TINYGEMM_KERNEL_NN_B(MB_SIZE, NB_SIZE)       \
-//   tinygemm_kernel_nn2_bias<scalar_t, MB_SIZE, NB_SIZE>::apply( \
-//       A + mb_start * lda, B0 + nb_start * 2, B1 + nb_start * 2, C + mb_start * ldc + nb_start, K, lda, ldb, ldc);
+        // interleaved: x[2i] = glu, x[2i+1] = linear
+        for (int j = 0; j < 8; ++j) {
+          tmp_glu0[j] = tmp_x0[j * 2];
+          tmp_glu0[j + 8] = tmp_x1[j * 2];
+          tmp_linear0[j] = tmp_x0[j * 2 + 1];
+          tmp_linear0[j + 8] = tmp_x1[j * 2 + 1];
+          tmp_glu1[j] = tmp_y0[j * 2];
+          tmp_glu1[j + 8] = tmp_y1[j * 2];
+          tmp_linear1[j] = tmp_y0[j * 2 + 1];
+          tmp_linear1[j + 8] = tmp_y1[j * 2 + 1];
+        }
+        Vec x0_ = Vec::loadu(tmp_glu0);
+        Vec x1_ = Vec::loadu(tmp_glu1);
+        Vec y0_ = Vec::loadu(tmp_linear0);
+        Vec y1_ = Vec::loadu(tmp_linear1);
+
+        // clamp
+        x0_ = at::vec::minimum(x0_, limit_v);
+        x1_ = at::vec::minimum(x1_, limit_v);
+        y0_ = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y0_));
+        y1_ = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y1_));
+        // x * sigmoid(x * alpha)
+        x0_ = x0_ / (one + (x0_ * alpha_v).neg().exp_u20());
+        x1_ = x1_ / (one + (x1_ * alpha_v).neg().exp_u20());
+        // (y + 1) * x
+        x0_ = x0_ * (y0_ + one);
+        x1_ = x1_ * (y1_ + one);
+
+        _mm512_storeu_si512(
+            reinterpret_cast<__m512i*>((C + row * ldc + col * 16)),
+            (__m512i)(_mm512_cvtne2ps_pbh(__m512(x1_), __m512(x0_))));
+      }
+    };
+    Unroll<ROWS * COLS>{}(storec);
+  }
+};
+#endif
+
+#define LAUNCH_TINYGEMM_KERNEL_NN_B(MB_SIZE, NB_SIZE)          \
+  tinygemm_kernel_nn2_bias<scalar_t, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda,                                      \
+      B0 + nb_start * 2,                                       \
+      B1 + nb_start * 2,                                       \
+      B0_bias + nb_start * 2,                                  \
+      B1_bias + nb_start * 2,                                  \
+      C + mb_start * ldc + nb_start,                           \
+      K,                                                       \
+      lda,                                                     \
+      ldb,                                                     \
+      ldc,                                                     \
+      alpha,                                                   \
+      limit);
+
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B0,
+    const scalar_t* __restrict__ B1,
+    const scalar_t* __restrict__ B0_bias,
+    const scalar_t* __restrict__ B1_bias,
+    scalar_t* __restrict__ C,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    float alpha,
+    float limit) {
+  // pattern: 1-(2+2)-(8+8)
+  constexpr int64_t BLOCK_M = 4;
+  constexpr int64_t BLOCK_N = 32;
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+  for (int mb = 0; mb < MB; ++mb) {
+    int64_t mb_start = mb * BLOCK_M;
+    int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
+
+      switch (mb_size << 4 | nb_size >> 4) {
+        // mb_size = 1
+        case 0x12:
+          LAUNCH_TINYGEMM_KERNEL_NN_B(1, 32);
+          break;
+        // mb_size = 2
+        case 0x22:
+          LAUNCH_TINYGEMM_KERNEL_NN_B(2, 32);
+          break;
+        // mb_size = 3
+        case 0x32:
+          LAUNCH_TINYGEMM_KERNEL_NN_B(3, 32);
+          break;
+        // mb_size = 4
+        case 0x42:
+          LAUNCH_TINYGEMM_KERNEL_NN_B(4, 32);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+      }
+    }
+  }
+}
 
 #define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)       \
   tinygemm_kernel_nn2<scalar_t, MB_SIZE, NB_SIZE>::apply( \
@@ -798,10 +970,13 @@ void fused_experts_kernel_impl(
     int64_t num_tokens_post_pad,
     float alpha,
     float limit,
-    int act_func) {
+    int act_func,
+    bool with_bias) {
   // handle 2 tiles per block
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
+  int num_threads = at::get_num_threads();
+  scalar_t* __restrict__ ic0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
 
   // stage 1: intermediate_cache1 = silu(hidden_states @ w1)
   const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
@@ -871,32 +1046,60 @@ void fused_experts_kernel_impl(
             /* A     */ A,
             /* B     */ B1,
             /* C     */ C1);
-        for (int64_t m = 0; m < m_size; ++m) {
-          add_bias_stub(C0 + m * BLOCK_N,  B0_bias, n_size);
-          add_bias_stub(C1 + m * BLOCK_N,  B1_bias, n_size);
-        }
-        // 1.d silu and mul
-        const int64_t offset = offsets[mb];
-        if (act_func == 2){
-          clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N, alpha, limit);
-        }else{
-          silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
-        }
 
       } else {
-        // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
         const int64_t offset = offsets[mb];
-        tinygemm_kernel(
-            /* A     */ A,
-            /* B0    */ B0,
-            /* B1    */ B1,
-            /* C     */ ic1 + offset * N + nb * BLOCK_N,
-            /* M     */ m_size,
-            /* N     */ n_size,
-            /* K     */ K,
-            /* lda   */ K,
-            /* ldb   */ n_size,
-            /* ldc   */ N);
+        if (act_func == 2) {
+          tinygemm_kernel(
+              /* A     */ A,
+              /* B     */ B0,
+              /* C     */ C0,
+              /* M     */ m_size,
+              /* N     */ n_size,
+              /* K     */ K,
+              /* lda   */ K,
+              /* ldb   */ n_size,
+              /* ldc   */ BLOCK_N);
+          tinygemm_kernel(
+              /* A     */ A,
+              /* B     */ B1,
+              /* C     */ C1,
+              /* M     */ m_size,
+              /* N     */ n_size,
+              /* K     */ K,
+              /* lda   */ K,
+              /* ldb   */ n_size,
+              /* ldc   */ BLOCK_N);
+        } else {
+          // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
+          tinygemm_kernel(
+              /* A     */ A,
+              /* B0    */ B0,
+              /* B1    */ B1,
+              /* C     */ ic1 + offset * N + nb * BLOCK_N,
+              /* M     */ m_size,
+              /* N     */ n_size,
+              /* K     */ K,
+              /* lda   */ K,
+              /* ldb   */ n_size,
+              /* ldc   */ N);
+        }
+      }
+      if (with_bias) {
+        for (int64_t m = 0; m < m_size; ++m) {
+          add_bias_stub(C0 + m * BLOCK_N, B0_bias, n_size);
+          add_bias_stub(C1 + m * BLOCK_N, B1_bias, n_size);
+        }
+      }
+      // 1.d silu and mul
+      const int64_t offset = offsets[mb];
+      if (act_func == 1 && is_brgemm_used) {
+        silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
+      } else {
+        clamp_sigmoid_and_mul_blockfree<scalar_t, BLOCK_N>(
+            ic1 + offset * N, C0, m_size, N, alpha, limit, 0 + nb * BLOCK_N / 2);
+        clamp_sigmoid_and_mul_blockfree<scalar_t, BLOCK_N>(
+            ic1 + offset * N, C1, m_size, N, alpha, limit, N / 2 + nb * BLOCK_N / 2);
       }
     });
 
@@ -933,7 +1136,7 @@ void fused_experts_kernel_impl(
       // B shape [IC, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
       const scalar_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
-      const scalar_t* __restrict__ B_bias = w1_bias + expert_id * OC + nb * BLOCK_N;
+      const scalar_t* __restrict__ B_bias = w2_bias + expert_id * OC + nb * BLOCK_N;
 
       // 2.a gemm: C = A @ B
       if (use_brgemm) {
@@ -960,8 +1163,10 @@ void fused_experts_kernel_impl(
             /* ldb   */ n_size,
             /* ldc   */ BLOCK_N);
       }
-      for (int64_t m = 0; m < m_size; ++m) {
-        add_bias_stub(C + m * BLOCK_N,  B_bias, n_size);
+      if (with_bias) {
+        for (int64_t m = 0; m < m_size; ++m) {
+          add_bias_stub(C + m * BLOCK_N, B_bias, n_size);
+        }
       }
       // 2.b copy from C to ic2 in original order
       //   and also mul topk_weights in float32
@@ -1396,6 +1601,9 @@ at::Tensor fused_experts_cpu(
     } else {
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
+      // TODO: This "with_bias" is only for gptoss models,
+      //       refine this check to support common cases.
+      bool with_bias = w1_bias.has_value();
 
       fused_experts_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
@@ -1406,8 +1614,8 @@ at::Tensor fused_experts_cpu(
           hidden_states.data_ptr<scalar_t>(),
           packed_w1.data_ptr<scalar_t>(),
           packed_w2.data_ptr<scalar_t>(),
-          w1_bias.value().data_ptr<scalar_t>(),
-          w2_bias.value().data_ptr<scalar_t>(),
+          with_bias ? w1_bias.value().data_ptr<scalar_t>() : nullptr,
+          with_bias ? w2_bias.value().data_ptr<scalar_t>() : nullptr,
           topk_weights_.data_ptr<float>(),
           sorted_ids,
           expert_ids,
@@ -1418,9 +1626,10 @@ at::Tensor fused_experts_cpu(
           E,
           topk,
           num_tokens_post_pad,
-          float(alpha.value()),
-          float(limit.value()),
-          2);
+          with_bias ? float(alpha.value()) : 0,
+          with_bias ? float(limit.value()) : 0,
+          with_bias ? 2 : 1,
+          with_bias);
     }
   });
   return out_hidden_states;

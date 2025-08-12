@@ -1007,6 +1007,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.quant_config.weight_block_size,  # block_size
                 None,  # a1_scale
                 None,  # a2_scale
+                None,  # w1 bias
+                None,  # w3 bias
+                None,  # alpha
+                None,  # limit
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
