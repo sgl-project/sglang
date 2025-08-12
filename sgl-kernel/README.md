@@ -5,6 +5,11 @@
 [![PyPI](https://img.shields.io/pypi/v/sgl-kernel)](https://pypi.org/project/sgl-kernel)
 
 ## Installation
+For CUDA 12.1 and above:
+
+```bash
+pip3 install sgl-kernel
+```
 
 For CUDA 11.8:
 
@@ -12,11 +17,6 @@ For CUDA 11.8:
 pip3 install sgl-kernel -i https://docs.sglang.ai/whl/cu118
 ```
 
-For CUDA 12.1 or CUDA 12.4:
-
-```bash
-pip3 install sgl-kernel
-```
 ## Build from source
 
 Development build:
