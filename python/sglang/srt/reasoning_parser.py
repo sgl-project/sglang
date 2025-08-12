@@ -295,15 +295,15 @@ class GptOssDetector(BaseReasoningFormatDetector):
         for match in reversed(list(commentary_pattern.finditer(full_normal_text))):
             # Check if this commentary is a tool call by looking at the text before <|message|>
             match_start = match.start()
-            # Find the start of this commentary section
-            commentary_start = full_normal_text.rfind(
-                "<|channel|>commentary", 0, match_start
-            )
-            if commentary_start != -1:
-                # Extract text between "commentary" and "<|message|>"
-                message_pos = full_normal_text.find("<|message|>", commentary_start)
-                if message_pos != -1:
-                    between_text = full_normal_text[commentary_start:message_pos]
+            # Find where "<|channel|>commentary" starts within the matched pattern
+            # The pattern starts with "<|start|>assistant<|channel|>commentary"
+            # So we look for the text between "commentary" and "<|message|>" in the match
+            match_text = full_normal_text[match_start : match.end()]
+            commentary_idx = match_text.find("<|channel|>commentary")
+            if commentary_idx != -1:
+                message_idx = match_text.find("<|message|>", commentary_idx)
+                if message_idx != -1:
+                    between_text = match_text[commentary_idx:message_idx]
                     # If no "to=" found, this is regular commentary (reasoning content)
                     if " to=" not in between_text:
                         content = match.group(1).strip()
