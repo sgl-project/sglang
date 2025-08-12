@@ -222,6 +222,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
+    disable_tp_allreduce_overlap: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
@@ -1662,6 +1663,11 @@ class ServerArgs:
             "--enable-symm-mem",
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
+        )
+        parser.add_argument(
+            "--disable-tp-allreduce-overlap",
+            action="store_true",
+            help="Disable overlapping TP all-reduce with compute using a dedicated comm stream.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",
