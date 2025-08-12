@@ -14,6 +14,7 @@ You can test them according to your needs.
 | **FlashMLA**             | ✅                | ✅                 | ✅      | ❌                 | ❌              |
 | **TRTLLM MLA**           | ✅                | ❌                 | ✅      | ✅                 | ❌              |
 | **Ascend**               | ✅                | ❌                 | ✅      | ❌                 | ❌              |
+| **Wave**                 | ✅                | ❌                 | ❌      | ❌                 | ❌              |
 
 **Notes:**
 - TRTLLM MLA only implements decode operations. For prefill operations (including multimodal inputs), it falls back to FlashInfer MLA backend.
@@ -70,6 +71,10 @@ python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attenti
 python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend ascend
 ```
 
+- Wave
+```bash
+python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend wave
+```
 
 ## Steps to add a new attention backend
 To add a new attention backend, you can learn from the existing backends
