@@ -1548,6 +1548,7 @@ def scaled_mm_kernel(
 
 # input  - [M, K]
 # weight - [K, N]
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
 def triton_scaled_mm(
     input: torch.Tensor,
     weight: torch.Tensor,
