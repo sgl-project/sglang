@@ -66,9 +66,18 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
+      - name: Debug runner info
+        run: |
+          echo "Current user: $(whoami)"
+          echo "User ID: $(id)"
+          echo "Home directory: $HOME"
+          # Test sudo access
+          sudo whoami
+          sudo apt update
+          
       - name: Install SGLang dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          sudo bash scripts/ci/ci_install_dependency.sh
 
       - name: Build python binding
         run: |
