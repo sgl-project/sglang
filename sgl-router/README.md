@@ -43,6 +43,7 @@ python -m build && pip install --force-reinstall dist/*.whl
 ```
 
 #### Option B: Development Mode
+
 ```bash
 pip install -e .
 ```
@@ -56,7 +57,21 @@ pip install -e .
 cargo build
 ```
 
-#### Launch Router with Worker URLs in regular mode
+#### Using the Rust Binary Directly (Alternative to Python)
+```bash
+# Build the Rust binary
+cargo build --release
+
+# Launch router with worker URLs in regular mode
+./target/release/sglang-router \
+    --worker-urls http://worker1:8000 http://worker2:8000
+
+# Or use cargo run
+cargo run --release -- \
+    --worker-urls http://worker1:8000 http://worker2:8000
+```
+
+#### Launch Router with Python (Original Method)
 ```bash
 # Launch router with worker URLs
 python -m sglang_router.launch_router \
@@ -68,7 +83,22 @@ python -m sglang_router.launch_router \
 # Note that the prefill and decode URLs must be provided in the following format:
 # http://<ip>:<port> for  decode nodes
 # http://<ip>:<port> bootstrap-port for  prefill nodes, where bootstrap-port is optional
-# Launch router with worker URLs
+
+# Using Rust binary directly
+./target/release/sglang-router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://127.0.0.1:30001 9001 \
+    --prefill http://127.0.0.2:30002 9002 \
+    --prefill http://127.0.0.3:30003 9003 \
+    --prefill http://127.0.0.4:30004 9004 \
+    --decode http://127.0.0.5:30005 \
+    --decode http://127.0.0.6:30006 \
+    --decode http://127.0.0.7:30007 \
+    --host 0.0.0.0 \
+    --port 8080
+
+# Or using Python launcher
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
