@@ -96,6 +96,8 @@ class Hf3fsClient:
         )
         self.iov_r = make_iovec(self.shm_r, self.hf3fs_mount_point)
         self.iov_w = make_iovec(self.shm_w, self.hf3fs_mount_point)
+        self.shm_r.unlink()
+        self.shm_w.unlink()
 
         self.rlock = threading.RLock()
         self.wlock = threading.RLock()
@@ -176,8 +178,6 @@ class Hf3fsClient:
         del self.iov_w
         self.shm_r.close()
         self.shm_w.close()
-        self.shm_r.unlink()
-        self.shm_w.unlink()
 
     def flush(self) -> None:
         os.fsync(self.file)

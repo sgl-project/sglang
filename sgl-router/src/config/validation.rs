@@ -23,6 +23,12 @@ impl ConfigValidator {
 
         Self::validate_compatibility(config)?;
 
+        // Validate effective retry/CB configs (respect disable flags)
+        let retry_cfg = config.effective_retry_config();
+        let cb_cfg = config.effective_circuit_breaker_config();
+        Self::validate_retry(&retry_cfg)?;
+        Self::validate_circuit_breaker(&cb_cfg)?;
+
         Ok(())
     }
 
@@ -260,6 +266,79 @@ impl ConfigValidator {
             });
         }
 
+        Ok(())
+    }
+
+    /// Validate retry configuration
+    fn validate_retry(retry: &RetryConfig) -> ConfigResult<()> {
+        if retry.max_retries < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.max_retries".to_string(),
+                value: retry.max_retries.to_string(),
+                reason: "Must be >= 1 (set to 1 to effectively disable retries)".to_string(),
+            });
+        }
+        if retry.initial_backoff_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.initial_backoff_ms".to_string(),
+                value: retry.initial_backoff_ms.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        if retry.max_backoff_ms < retry.initial_backoff_ms {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.max_backoff_ms".to_string(),
+                value: retry.max_backoff_ms.to_string(),
+                reason: "Must be >= initial_backoff_ms".to_string(),
+            });
+        }
+        if retry.backoff_multiplier < 1.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.backoff_multiplier".to_string(),
+                value: retry.backoff_multiplier.to_string(),
+                reason: "Must be >= 1.0".to_string(),
+            });
+        }
+        if !(0.0..=1.0).contains(&retry.jitter_factor) {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.jitter_factor".to_string(),
+                value: retry.jitter_factor.to_string(),
+                reason: "Must be between 0.0 and 1.0".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate circuit breaker configuration
+    fn validate_circuit_breaker(cb: &CircuitBreakerConfig) -> ConfigResult<()> {
+        if cb.failure_threshold < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "circuit_breaker.failure_threshold".to_string(),
+                value: cb.failure_threshold.to_string(),
+                reason: "Must be >= 1 (set to u32::MAX to effectively disable CB)".to_string(),
+            });
+        }
+        if cb.success_threshold < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "circuit_breaker.success_threshold".to_string(),
+                value: cb.success_threshold.to_string(),
+                reason: "Must be >= 1".to_string(),
+            });
+        }
+        if cb.timeout_duration_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "circuit_breaker.timeout_duration_secs".to_string(),
+                value: cb.timeout_duration_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        if cb.window_duration_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "circuit_breaker.window_duration_secs".to_string(),
+                value: cb.window_duration_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
         Ok(())
     }
 

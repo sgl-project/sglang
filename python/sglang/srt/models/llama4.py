@@ -204,7 +204,7 @@ class Llama4Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        self.use_rope = int((layer_id + 1) % 4 != 0)
+        self.use_rope = (layer_id + 1) % 4 != 0
         self.use_qk_norm = config.use_qk_norm and self.use_rope
 
         attn_tp_rank = get_attention_tp_rank()
