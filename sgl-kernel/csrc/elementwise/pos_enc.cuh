@@ -104,6 +104,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
   uint32_t by = blockIdx.y;
   const uint32_t bdy = blockDim.y;
 
+  asm volatile("griddepcontrol.wait;");
+
   vec_t<float, vec_size> cos, sin;
   if (bx * bdy + ty < nnz) {
     const uint32_t idx = bx * bdy + ty;
@@ -178,6 +180,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel
       }
     }
   }
+
+  asm volatile("griddepcontrol.launch_dependents;");
 }
 
 template <
@@ -219,6 +223,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
     IdType* __restrict__ kv_cache_loc) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bdy = blockDim.y;
+
+  asm volatile("griddepcontrol.wait;");
 
   vec_t<float, vec_size> cos, sin;
   if (bx * bdy + ty < nnz) {
@@ -296,6 +302,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
       }
     }
   }
+
+  asm volatile("griddepcontrol.launch_dependents;");
 }
 
 #define DISPATCH_SAVE_KV_CACHE(save_kv_cache, SAVE_KV_CACHE, ...) \
