@@ -105,13 +105,18 @@ class ModelOptFp8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> ModelOptFp8Config:
-        quant_method = cls.get_from_keys(config, ["quantization"]).get("quant_algo")
-        kv_cache_quant_method = cls.get_from_keys(config, ["quantization"]).get(
-            "kv_cache_quant_algo"
-        )
-        exclude_modules = cls.get_from_keys(config, ["quantization"]).get(
-            "exclude_modules"
-        )
+        try:
+            quant_method = cls.get_from_keys(config, ["quantization"]).get("quant_algo")
+            kv_cache_quant_method = cls.get_from_keys(config, ["quantization"]).get(
+                "kv_cache_quant_algo"
+            )
+            exclude_modules = cls.get_from_keys(config, ["quantization"]).get(
+                "exclude_modules"
+            )
+        except ValueError:
+            quant_method = cls.get_from_keys(config, ["quant_algo"])
+            kv_cache_quant_method = cls.get_from_keys(config, ["kv_cache_scheme"])
+            exclude_modules = cls.get_from_keys(config, ["ignore"])
 
         if "FP8" not in quant_method:
             raise ValueError(
