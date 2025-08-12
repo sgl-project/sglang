@@ -415,17 +415,17 @@ def grouped_topk_gpu(
             topk_ids.size(0), -1
         )
         # Set each shared expert's weight to sum(real_experts)/routed_scaling_factor
-        real_sum = topk_weights[:, : -num_fused_shared_experts].sum(dim=-1)
+        real_sum = topk_weights[:, :-num_fused_shared_experts].sum(dim=-1)
         shared_weight = real_sum / routed_scaling_factor
-        topk_weights[:, -num_fused_shared_experts:] = shared_weight.unsqueeze(-1).expand(
-            -1, num_fused_shared_experts
-        )
+        topk_weights[:, -num_fused_shared_experts:] = shared_weight.unsqueeze(
+            -1
+        ).expand(-1, num_fused_shared_experts)
 
     if renormalize:
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True)
             if num_fused_shared_experts == 0
-            else topk_weights[:, : -num_fused_shared_experts].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-num_fused_shared_experts].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
 
@@ -519,17 +519,17 @@ def biased_grouped_topk_impl(
             topk_ids.size(0), -1
         )
         # Set each shared expert's weight to sum(real_experts)/routed_scaling_factor
-        real_sum = topk_weights[:, : -num_fused_shared_experts].sum(dim=-1)
+        real_sum = topk_weights[:, :-num_fused_shared_experts].sum(dim=-1)
         shared_weight = real_sum / routed_scaling_factor
-        topk_weights[:, -num_fused_shared_experts:] = shared_weight.unsqueeze(-1).expand(
-            -1, num_fused_shared_experts
-        )
+        topk_weights[:, -num_fused_shared_experts:] = shared_weight.unsqueeze(
+            -1
+        ).expand(-1, num_fused_shared_experts)
 
     if renormalize:
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True)
             if num_fused_shared_experts == 0
-            else topk_weights[:, : -num_fused_shared_experts].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-num_fused_shared_experts].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
 
@@ -583,7 +583,9 @@ def biased_grouped_topk_gpu(
         _is_cuda
         and gating_output.shape[1] // num_expert_group
         <= 512  # moe_fused_gate kernel now supports MAX_VPT up to 512, including Kimi K2's 384 experts
-        and (is_power_of_two(correction_bias.shape[0]) or correction_bias.shape[0] == 384)  # Kimi K2 has 384 experts
+        and (
+            is_power_of_two(correction_bias.shape[0]) or correction_bias.shape[0] == 384
+        )  # Kimi K2 has 384 experts
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),

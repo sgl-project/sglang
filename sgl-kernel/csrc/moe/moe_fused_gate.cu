@@ -5,10 +5,12 @@
 #include <cutlass/numeric_types.h>
 #include <stdio.h>
 #include <torch/all.h>
-#include <vector>
-#include "moe_fused_gate_tiled.h"
+
 #include <cfloat>
 #include <type_traits>
+#include <vector>
+
+#include "moe_fused_gate_tiled.h"
 template <typename T, int N>
 using AlignedArray = cutlass::AlignedArray<T, N>;
 using bfloat16_t = cutlass::bfloat16_t;
@@ -405,9 +407,7 @@ std::vector<at::Tensor> moe_fused_gate(
 
   int computed_vpt = num_experts / num_expert_group;
   // Ensure subgroup width fits within a warp for shuffle operations
-  TORCH_CHECK(
-      num_expert_group <= WARP_SIZE,
-      "num_expert_group must be <= ", WARP_SIZE, ", but got ", num_expert_group);
+  TORCH_CHECK(num_expert_group <= WARP_SIZE, "num_expert_group must be <= ", WARP_SIZE, ", but got ", num_expert_group);
 
   // Dispatch to templated kernel for known compile-time configurations.
   // We currently only support for:
@@ -472,13 +472,7 @@ std::vector<at::Tensor> moe_fused_gate(
   // If VPT exceeds native path (32), dispatch to tiled kernel which supports larger VPT
   if (computed_vpt > MAX_VPT) {
     return moe_fused_gate_tiled(
-        input,
-        bias,
-        num_expert_group,
-        topk_group,
-        topk,
-        num_fused_shared_experts,
-        routed_scaling_factor);
+        input, bias, num_expert_group, topk_group, topk, num_fused_shared_experts, routed_scaling_factor);
   }
   if (!dispatched) {
     // Fallback to the dynamic kernel if none of the supported combinations match.

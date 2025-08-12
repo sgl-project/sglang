@@ -6,9 +6,9 @@
 #include <cutlass/numeric_types.h>
 #include <torch/all.h>
 
+#include <algorithm>
 #include <cfloat>
 #include <type_traits>
-#include <algorithm>
 
 // Reuse aliases compatible with moe_fused_gate.cu
 template <typename T, int N>
@@ -23,7 +23,7 @@ static constexpr int WARPS_PER_CTA = 6;
 // Maximum experts per thread (VPT) we target via tiling
 // You can raise this to 512 if needed; performance and register pressure should be reassessed.
 static constexpr int MAX_TILED_VPT = 512;
-static constexpr int TILE_VPT = 32; // tile size processed per thread per pass
+static constexpr int TILE_VPT = 32;  // tile size processed per thread per pass
 
 template <typename T>
 __device__ inline float to_float(T x) {
@@ -52,16 +52,16 @@ __device__ inline float sigmoidf_approx(float x) {
 }
 
 struct KernelParamsDynamicTiled {
-  int VPT;                // experts per thread (per group)
-  int NUM_EXPERTS;        // total experts
-  int THREADS_PER_ROW;    // num_expert_group
-  int ROWS_PER_WARP;      // max(1, 32 / num_expert_group)
-  int ROWS_PER_CTA;       // WARPS_PER_CTA * ROWS_PER_WARP
-  int WARPS_PER_CTA;      // fixed as 6
+  int VPT;              // experts per thread (per group)
+  int NUM_EXPERTS;      // total experts
+  int THREADS_PER_ROW;  // num_expert_group
+  int ROWS_PER_WARP;    // max(1, 32 / num_expert_group)
+  int ROWS_PER_CTA;     // WARPS_PER_CTA * ROWS_PER_WARP
+  int WARPS_PER_CTA;    // fixed as 6
 };
 
 // Argmin reduce across THREADS_PER_ROW lanes within a warp-subgroup
-__device__ inline void warp_argmin_pair(float &val, int &idx, int width) {
+__device__ inline void warp_argmin_pair(float& val, int& idx, int width) {
   // width must be power of two and <= 32
   unsigned mask = 0xFFFFFFFFu;
   for (int offset = width / 2; offset > 0; offset >>= 1) {
@@ -76,7 +76,7 @@ __device__ inline void warp_argmin_pair(float &val, int &idx, int width) {
 }
 
 // Argmax reduce across THREADS_PER_ROW lanes within a warp-subgroup
-__device__ inline void warp_argmax_pair(float &val, int &idx, int width) {
+__device__ inline void warp_argmax_pair(float& val, int& idx, int width) {
   unsigned mask = 0xFFFFFFFFu;
   for (int offset = width / 2; offset > 0; offset >>= 1) {
     float other_val = __shfl_xor_sync(mask, val, offset, width);
@@ -110,21 +110,20 @@ __global__ void moe_fused_gate_kernel_tiled(
   params.ROWS_PER_WARP = max(1, WARP_SIZE / params.THREADS_PER_ROW);
   params.ROWS_PER_CTA = params.WARPS_PER_CTA * params.ROWS_PER_WARP;
 
-  int lane = threadIdx.x;                // 0..31
-  int warp_id = threadIdx.y;             // 0..WARPS_PER_CTA-1
-  int thread_group_idx = lane % params.THREADS_PER_ROW;   // lane within group-subwarp
-  int row_in_warp = lane / params.THREADS_PER_ROW;        // which row this lane processes inside the warp
+  int lane = threadIdx.x;                                // 0..31
+  int warp_id = threadIdx.y;                             // 0..WARPS_PER_CTA-1
+  int thread_group_idx = lane % params.THREADS_PER_ROW;  // lane within group-subwarp
+  int row_in_warp = lane / params.THREADS_PER_ROW;       // which row this lane processes inside the warp
 
   int64_t thread_row = static_cast<int64_t>(blockIdx.x) * params.ROWS_PER_CTA +
-                       static_cast<int64_t>(warp_id) * params.ROWS_PER_WARP +
-                       static_cast<int64_t>(row_in_warp);
+                       static_cast<int64_t>(warp_id) * params.ROWS_PER_WARP + static_cast<int64_t>(row_in_warp);
   if (thread_row >= num_rows) return;
 
   const T* __restrict__ input_ptr = reinterpret_cast<const T*>(input);
   const T* __restrict__ bias_ptr = reinterpret_cast<const T*>(bias);
 
   int VPT = params.VPT;
-  int first_elt_read_by_thread = thread_group_idx * VPT; // base expert index within the row handled by this lane
+  int first_elt_read_by_thread = thread_group_idx * VPT;  // base expert index within the row handled by this lane
 
   // Phase 1: exclude worst groups iteratively until only topk_group groups remain
   bool group_active = true;
@@ -152,8 +151,8 @@ __global__ void moe_fused_gate_kernel_tiled(
       }
     }
 
-    float group_score = group_active ? (local_best + local_second) : FLT_MAX; // argmin
-    int marker = first_elt_read_by_thread; // used to recover the group index via marker / VPT
+    float group_score = group_active ? (local_best + local_second) : FLT_MAX;  // argmin
+    int marker = first_elt_read_by_thread;  // used to recover the group index via marker / VPT
 
     // argmin across lanes in this row-subwarp
     warp_argmin_pair(group_score, marker, params.THREADS_PER_ROW);
@@ -171,7 +170,7 @@ __global__ void moe_fused_gate_kernel_tiled(
 
   // Track per-thread selected local indices to avoid picking them again
   // Upper bound: one thread may win many times theoretically, but in practice topk is small.
-  const int MAX_LOCAL_SELECT = 64; // safe upper bound for routing top-k
+  const int MAX_LOCAL_SELECT = 64;  // safe upper bound for routing top-k
   int selected_count = 0;
   // Implement local selected indices container
   int selected_local_indices[MAX_LOCAL_SELECT];
@@ -190,7 +189,10 @@ __global__ void moe_fused_gate_kernel_tiled(
           int local_idx = base + ii;
           bool skip = false;
           for (int t = 0; t < selected_count; ++t) {
-            if (selected_local_indices[t] == local_idx) { skip = true; break; }
+            if (selected_local_indices[t] == local_idx) {
+              skip = true;
+              break;
+            }
           }
           if (skip) continue;
 
@@ -263,13 +265,14 @@ __global__ void moe_fused_gate_kernel_tiled(
 // Static tiled kernel template (compile-time params). Currently supports
 // THREADS_PER_ROW == 1 path (no warp reductions). Can be extended later.
 // ----------------------------------------------------------------------------
-template <typename T,
-          int NUM_EXPERTS,
-          int THREADS_PER_ROW,
-          int ROWS_PER_WARP,
-          int ROWS_PER_CTA,
-          int WARPS_PER_CTA_,
-          int TILE>
+template <
+    typename T,
+    int NUM_EXPERTS,
+    int THREADS_PER_ROW,
+    int ROWS_PER_WARP,
+    int ROWS_PER_CTA,
+    int WARPS_PER_CTA_,
+    int TILE>
 __global__ void moe_fused_gate_kernel_tiled_static(
     const void* __restrict__ input,
     const void* __restrict__ bias,
@@ -286,8 +289,7 @@ __global__ void moe_fused_gate_kernel_tiled_static(
   int warp_id = threadIdx.y;  // 0..WARPS_PER_CTA-1
   int row_in_warp = lane;     // THREADS_PER_ROW=1 => row_in_warp = lane
 
-  int64_t thread_row = static_cast<int64_t>(blockIdx.x) * ROWS_PER_CTA +
-                       static_cast<int64_t>(warp_id) * ROWS_PER_WARP +
+  int64_t thread_row = static_cast<int64_t>(blockIdx.x) * ROWS_PER_CTA + static_cast<int64_t>(warp_id) * ROWS_PER_WARP +
                        static_cast<int64_t>(row_in_warp);
   if (thread_row >= num_rows) return;
 
@@ -302,7 +304,7 @@ __global__ void moe_fused_gate_kernel_tiled_static(
 
   float best_choice[MAX_TOPK];
   float best_weight[MAX_TOPK];
-  int   best_index[MAX_TOPK];
+  int best_index[MAX_TOPK];
 #pragma unroll
   for (int i = 0; i < MAX_TOPK; ++i) {
     best_choice[i] = -FLT_MAX;
@@ -383,20 +385,56 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     int64_t num_blocks = (num_warps + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
 
     if (input.scalar_type() == at::kBFloat16) {
-      moe_fused_gate_kernel_tiled_static<bfloat16_t, 384, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
+      moe_fused_gate_kernel_tiled_static<
+          bfloat16_t,
+          384,
+          THREADS_PER_ROW,
+          ROWS_PER_WARP,
+          ROWS_PER_CTA,
+          WARPS_PER_CTA,
+          TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
+          input.data_ptr(),
+          bias.data_ptr(),
+          output.data_ptr<float>(),
+          indices.data_ptr<int32_t>(),
+          num_rows,
+          topk,
+          num_fused_shared_experts,
+          routed_scaling_factor);
     } else if (input.scalar_type() == at::kHalf) {
-      moe_fused_gate_kernel_tiled_static<float16_t, 384, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
+      moe_fused_gate_kernel_tiled_static<
+          float16_t,
+          384,
+          THREADS_PER_ROW,
+          ROWS_PER_WARP,
+          ROWS_PER_CTA,
+          WARPS_PER_CTA,
+          TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
+          input.data_ptr(),
+          bias.data_ptr(),
+          output.data_ptr<float>(),
+          indices.data_ptr<int32_t>(),
+          num_rows,
+          topk,
+          num_fused_shared_experts,
+          routed_scaling_factor);
     } else if (input.scalar_type() == at::kFloat) {
-      moe_fused_gate_kernel_tiled_static<float32_t, 384, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
+      moe_fused_gate_kernel_tiled_static<
+          float32_t,
+          384,
+          THREADS_PER_ROW,
+          ROWS_PER_WARP,
+          ROWS_PER_CTA,
+          WARPS_PER_CTA,
+          TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
+          input.data_ptr(),
+          bias.data_ptr(),
+          output.data_ptr<float>(),
+          indices.data_ptr<int32_t>(),
+          num_rows,
+          topk,
+          num_fused_shared_experts,
+          routed_scaling_factor);
     } else {
       TORCH_CHECK(false, "Unsupported dtype for moe_fused_gate_tiled_static");
     }
@@ -409,20 +447,56 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     int64_t num_blocks = (num_warps + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
 
     if (input.scalar_type() == at::kBFloat16) {
-      moe_fused_gate_kernel_tiled_static<bfloat16_t, 64, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
+      moe_fused_gate_kernel_tiled_static<
+          bfloat16_t,
+          64,
+          THREADS_PER_ROW,
+          ROWS_PER_WARP,
+          ROWS_PER_CTA,
+          WARPS_PER_CTA,
+          TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
+          input.data_ptr(),
+          bias.data_ptr(),
+          output.data_ptr<float>(),
+          indices.data_ptr<int32_t>(),
+          num_rows,
+          topk,
+          num_fused_shared_experts,
+          routed_scaling_factor);
     } else if (input.scalar_type() == at::kHalf) {
-      moe_fused_gate_kernel_tiled_static<float16_t, 64, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
+      moe_fused_gate_kernel_tiled_static<
+          float16_t,
+          64,
+          THREADS_PER_ROW,
+          ROWS_PER_WARP,
+          ROWS_PER_CTA,
+          WARPS_PER_CTA,
+          TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
+          input.data_ptr(),
+          bias.data_ptr(),
+          output.data_ptr<float>(),
+          indices.data_ptr<int32_t>(),
+          num_rows,
+          topk,
+          num_fused_shared_experts,
+          routed_scaling_factor);
     } else if (input.scalar_type() == at::kFloat) {
-      moe_fused_gate_kernel_tiled_static<float32_t, 64, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
-          <<<num_blocks, block_dim, 0, stream>>>(
-              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
-              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
+      moe_fused_gate_kernel_tiled_static<
+          float32_t,
+          64,
+          THREADS_PER_ROW,
+          ROWS_PER_WARP,
+          ROWS_PER_CTA,
+          WARPS_PER_CTA,
+          TILE_VPT><<<num_blocks, block_dim, 0, stream>>>(
+          input.data_ptr(),
+          bias.data_ptr(),
+          output.data_ptr<float>(),
+          indices.data_ptr<int32_t>(),
+          num_rows,
+          topk,
+          num_fused_shared_experts,
+          routed_scaling_factor);
     } else {
       TORCH_CHECK(false, "Unsupported dtype for moe_fused_gate_tiled_static");
     }
@@ -513,4 +587,3 @@ std::vector<at::Tensor> moe_fused_gate_tiled(
 
   return {output, indices};
 }
-

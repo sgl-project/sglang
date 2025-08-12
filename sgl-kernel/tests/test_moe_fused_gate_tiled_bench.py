@@ -2,7 +2,6 @@ from statistics import median
 
 import pytest
 import torch
-
 from sgl_kernel import moe_fused_gate
 
 
@@ -33,10 +32,10 @@ def _measure_time_ms(fn, warmup: int, repeat: int) -> list[float]:
     "params",
     [
         # Tiled path (VPT > 32)
-        (64, 1, 1, 6),      # kimi-vl: VPT=64
-        (384, 1, 1, 8),     # kimi-K2: VPT=384
-        (1024, 8, 4, 8),    # VPT=128
-        (2048, 8, 4, 8),    # VPT=256
+        (64, 1, 1, 6),  # kimi-vl: VPT=64
+        (384, 1, 1, 8),  # kimi-K2: VPT=384
+        (1024, 8, 4, 8),  # VPT=128
+        (2048, 8, 4, 8),  # VPT=256
     ],
 )
 def test_moe_fused_gate_tiled_perf(seq_length, params):
@@ -95,5 +94,3 @@ def test_moe_fused_gate_tiled_perf(seq_length, params):
 
 if __name__ == "__main__":
     pytest.main([__file__])
-
-

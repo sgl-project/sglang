@@ -1,7 +1,8 @@
 #pragma once
 
-#include <vector>
 #include <torch/all.h>
+
+#include <vector>
 
 // Tiled moe fused gate dynamic dispatcher (VPT>32 fallback)
 std::vector<at::Tensor> moe_fused_gate_tiled(
@@ -24,13 +25,11 @@ std::vector<at::Tensor> moe_fused_gate_tiled_static(
     double routed_scaling_factor);
 
 // Keep a consistent launch style with LAUNCH_MOE_GATE_CONFIG
-#define LAUNCH_MOE_GATE_TILED_CONFIG(EXPERTS, EXPERT_GROUP, TILE)                                        \
-  do {                                                                                                   \
-    (void)(EXPERTS);                                                                                     \
-    (void)(EXPERT_GROUP);                                                                                \
-    (void)(TILE);                                                                                        \
-    return moe_fused_gate_tiled_static(                                                                  \
+#define LAUNCH_MOE_GATE_TILED_CONFIG(EXPERTS, EXPERT_GROUP, TILE)                                          \
+  do {                                                                                                     \
+    (void)(EXPERTS);                                                                                       \
+    (void)(EXPERT_GROUP);                                                                                  \
+    (void)(TILE);                                                                                          \
+    return moe_fused_gate_tiled_static(                                                                    \
         input, bias, num_expert_group, topk_group, topk, num_fused_shared_experts, routed_scaling_factor); \
   } while (0)
-
-

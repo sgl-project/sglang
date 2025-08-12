@@ -2,11 +2,10 @@ import itertools
 import math
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from sgl_kernel import moe_fused_gate
-
-import torch.nn.functional as F
 
 
 def biased_grouped_topk_ref_impl(scores, bias, num_expert_group, topk_group, topk):
@@ -23,7 +22,9 @@ def biased_grouped_topk_ref_impl(scores, bias, num_expert_group, topk_group, top
     view = scores_for_choice.view(n, g, per_group)
     top2 = torch.topk(view, k=2, dim=-1).values
     group_scores = top2.sum(dim=-1)  # [n, g]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False).indices  # [n, topk_group]
+    group_idx = torch.topk(
+        group_scores, k=topk_group, dim=-1, sorted=False
+    ).indices  # [n, topk_group]
 
     # mask and topk within selected groups
     group_mask = torch.zeros_like(group_scores)
@@ -60,25 +61,43 @@ seq_length_range = [2048, 3072, 4096, 10240, 15360, 20480]
 
 # Focus on tiled-path configs (VPT > 32)
 configs = []
-configs += [(sq, 64, 1, 1, 6) for sq in seq_length_range]     # Kimi VL: VPT=64
-configs += [(sq, 384, 1, 1, 8) for sq in seq_length_range]    # Kimi K2: VPT=384
+configs += [(sq, 64, 1, 1, 6) for sq in seq_length_range]  # Kimi VL: VPT=64
+configs += [(sq, 384, 1, 1, 8) for sq in seq_length_range]  # Kimi K2: VPT=384
 
 
 def _bench_template(dtype: torch.dtype, plot_suffix: str):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
-            x_names=["seq_length", "num_experts", "num_expert_group", "topk_group", "topk"],
+            x_names=[
+                "seq_length",
+                "num_experts",
+                "num_expert_group",
+                "topk_group",
+                "topk",
+            ],
             x_vals=[list(_) for _ in configs],
             line_arg="provider",
-            line_vals=["orig-eager", "orig-compile-static", "orig-compile-dynamic", "kernel"],
-            line_names=["Original-Eager", "Original-Compile-Static", "Original-Compile-Dynamic", "SGL Kernel"],
+            line_vals=[
+                "orig-eager",
+                "orig-compile-static",
+                "orig-compile-dynamic",
+                "kernel",
+            ],
+            line_names=[
+                "Original-Eager",
+                "Original-Compile-Static",
+                "Original-Compile-Dynamic",
+                "SGL Kernel",
+            ],
             styles=[("blue", "-"), ("green", "-"), ("orange", "-"), ("red", "-")],
             ylabel="us",
             plot_name=f"moe-fused-gate-tiled-performance-{plot_suffix}",
             args={},
         )
     )
-    def benchmark(seq_length, num_experts, num_expert_group, topk_group, topk, provider):
+    def benchmark(
+        seq_length, num_experts, num_expert_group, topk_group, topk, provider
+    ):
         device = torch.device("cuda")
 
         scores = torch.randn((seq_length, num_experts), device=device, dtype=dtype)
@@ -90,7 +109,9 @@ def _bench_template(dtype: torch.dtype, plot_suffix: str):
             mode = provider.replace("orig-", "")
             ref = make_ref_fn(mode)
             ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: ref(scores.clone(), bias.clone(), num_expert_group, topk_group, topk),
+                lambda: ref(
+                    scores.clone(), bias.clone(), num_expert_group, topk_group, topk
+                ),
                 quantiles=quantiles,
             )
         elif provider == "kernel":
@@ -117,5 +138,3 @@ if __name__ == "__main__":
     benchmark_bf16.run(print_data=True)
     benchmark_fp16.run(print_data=True)
     benchmark_fp32.run(print_data=True)
-
-

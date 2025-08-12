@@ -33,6 +33,7 @@ configs = [(sq, 256, 8, 4, 8) for sq in seq_length_range]  # original config
 # configs = ([(sq, 64, 1, 1, 6) for sq in seq_length_range])  # kimi vl config
 # configs = ([(sq, 384, 1, 1, 8) for sq in seq_length_range])  # Kimi K2 config
 
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["seq_length", "num_experts", "num_expert_group", "topk_group", "topk"],
