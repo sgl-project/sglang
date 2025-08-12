@@ -460,8 +460,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
+        dual_chunk_attention_config = (
+            getattr(config, "dual_chunk_attention_config", None)
+            if global_server_args_dict["attention_backend"] == "dual_chunk_flash_attn"
+            else None
         )
         self.self_attn = Qwen3MoeAttention(
             hidden_size=self.hidden_size,
