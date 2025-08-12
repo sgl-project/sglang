@@ -598,6 +598,11 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+        if self.hicache_storage_backend == "mooncake":
+            # to use mooncake storage backend, the following conditions must be met:
+            self.hicache_io_backend = "kernel"
+            self.hicache_mem_layout = "page_first"
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
@@ -1213,7 +1218,7 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=[
+            choices=[  # TODO: use FunctionCallParser.DetectorMap.keys()
                 "qwen25",
                 "mistral",
                 "llama3",
@@ -1223,6 +1228,7 @@ class ServerArgs:
                 "qwen3_coder",
                 "glm45",
                 "step3",
+                "gpt-oss",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
@@ -1345,6 +1351,7 @@ class ServerArgs:
             "trtllm_mla",
             "trtllm_mha",
             "dual_chunk_flash_attn",
+            "wave",
         ]
         parser.add_argument(
             "--attention-backend",
