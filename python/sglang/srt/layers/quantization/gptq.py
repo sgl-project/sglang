@@ -1127,6 +1127,10 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 None,  # block_size
                 None,  # a1_scale
                 None,  # a2_scale
+                None,  # w1 bias
+                None,  # w3 bias
+                None,  # alpha
+                None,  # limit
                 True,  # is_vnni
             )
 

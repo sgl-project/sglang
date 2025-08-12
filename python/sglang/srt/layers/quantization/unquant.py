@@ -396,6 +396,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 swiglu_limit=swiglu_limit,
             )
 
+
     def forward_npu(
         self,
         layer: torch.nn.Module,

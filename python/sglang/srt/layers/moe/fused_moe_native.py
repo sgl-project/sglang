@@ -104,6 +104,7 @@ def moe_forward_native(
 
         gate_up = F.linear(tokens_for_this_expert, layer_w13_weight, bias=layer_w13_weight_bias.to(torch.bfloat16))
         gate_up = moe_gptoss_act(gate_up, activation_alpha, swiglu_limit)
+        # gate_up = act(gate_up)
         expert_out = F.linear(gate_up, layer_w2_weight, bias=layer_w2_weight_bias.to(torch.bfloat16))
         outputs.append(expert_out)
         start_idx = end_idx
