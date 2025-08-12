@@ -53,11 +53,11 @@ The core features include:
 - **Active Community**: SGLang is open-source and backed by an active community with wide industry adoption.
 
 ## Getting Started
-- [Install SGLang](https://docs.sglang.ai/start/install.html)
-- [Quick Start](https://docs.sglang.ai/backend/send_request.html)
-- [Backend Tutorial](https://docs.sglang.ai/backend/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.ai/frontend/frontend.html)
-- [Contribution Guide](https://docs.sglang.ai/references/contribution_guide.html)
+- [Install SGLang](https://docs.sglang.ai/get_started/install.html)
+- [Quick Start](https://docs.sglang.ai/basic_usage/send_request.html)
+- [Backend Tutorial](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
+- [Frontend Tutorial](https://docs.sglang.ai/references/frontend/frontend_tutorial.html)
+- [Contribution Guide](https://docs.sglang.ai/developer_guide/contribution_guide.html)
 
 ## Benchmark and Performance
 Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/).

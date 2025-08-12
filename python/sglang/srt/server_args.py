@@ -435,7 +435,10 @@ class ServerArgs:
             )
             self.page_size = 128
 
-        if self.attention_backend == "trtllm_mla":
+        if (
+            self.attention_backend == "trtllm_mla"
+            or self.decode_attention_backend == "trtllm_mla"
+        ):
             if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -446,9 +449,15 @@ class ServerArgs:
                     f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
+
             if self.speculative_algorithm is not None:
                 raise ValueError(
                     "trtllm_mla backend does not support speculative decoding yet."
+                )
+
+            if self.kv_cache_dtype not in ["fp8_e4m3", "auto"]:
+                raise ValueError(
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
                 )
 
         if (
@@ -1184,7 +1193,7 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=[
+            choices=[  # TODO: use FunctionCallParser.DetectorMap.keys()
                 "qwen25",
                 "mistral",
                 "llama3",
@@ -1194,6 +1203,7 @@ class ServerArgs:
                 "qwen3_coder",
                 "glm45",
                 "step3",
+                "gpt-oss",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
@@ -1316,6 +1326,7 @@ class ServerArgs:
             "trtllm_mla",
             "trtllm_mha",
             "dual_chunk_flash_attn",
+            "wave",
         ]
         parser.add_argument(
             "--attention-backend",
@@ -1438,7 +1449,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
+            help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
             "--deepep-mode",
