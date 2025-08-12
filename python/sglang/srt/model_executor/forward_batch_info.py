@@ -817,6 +817,10 @@ class ForwardBatch:
             self.token_to_kv_pool, MLATokenToKVPool
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
+        if not any(self.extend_prefix_lens_cpu):
+            self.num_prefix_chunks = 0
+            return
+
         if self.prefix_chunk_len is not None:
             # Chunked kv cache info already prepared by prior modules
             return
