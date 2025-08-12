@@ -578,7 +578,7 @@ class ServerArgs:
             self.ep_dispatch_algorithm = "static"
 
         if self.enable_eplb:
-            assert self.ep_size > 1 or self.moe_a2a_backend is not None
+            assert self.ep_size > 1
 
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
