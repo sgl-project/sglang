@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     next_power_of_2,
+    round_up,
 )
 
 if is_flashinfer_available():
@@ -134,6 +135,10 @@ class FusedMoE(torch.nn.Module):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
         enable_flashinfer_cutlass_moe: Optional[bool] = False,
+        activation_alpha: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
+        use_weight_loader_fused: bool = False,
+        with_bias=False,
     ):
         super().__init__()
 
@@ -147,6 +152,10 @@ class FusedMoE(torch.nn.Module):
         self.num_fused_shared_experts = num_fused_shared_experts
         self.expert_map_cpu = None
         self.expert_map_gpu = None
+
+        # For activation
+        self.activation_alpha = activation_alpha
+        self.swiglu_limit = swiglu_limit
 
         if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")
@@ -198,6 +207,16 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         self.quant_config = quant_config
+        self.use_enable_flashinfer_mxfp4_moe = global_server_args_dict.get(
+            "enable_flashinfer_mxfp4_moe", False
+        )
+        if (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "mxfp4"
+            and self.use_enable_flashinfer_mxfp4_moe
+        ):
+            hidden_size = round_up(hidden_size, 256)
+        self.hidden_size = hidden_size
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
@@ -206,7 +225,12 @@ class FusedMoE(torch.nn.Module):
             intermediate_size=self.intermediate_size_per_partition,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
-            weight_loader=self.weight_loader,
+            weight_loader=(
+                self.weight_loader
+                if not use_weight_loader_fused
+                else self.weight_loader_fused
+            ),
+            with_bias=with_bias,
         )
 
     def _load_per_tensor_weight_scale(
@@ -234,6 +258,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         tp_rank: int,
+        is_bias: bool = False,
     ):
         # Load grouped weight scales for group quantization
         # or model weights
@@ -244,14 +269,16 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                is_bias=is_bias,
             )
-        elif shard_id in ("w1", "w3"):
+        elif shard_id in ("w1", "w3", "w13"):
             self._load_w13(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                is_bias=is_bias,
             )
 
     def _load_per_channel_weight_scale(
@@ -281,17 +308,30 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         tp_rank: int,
+        is_bias: bool = False,
     ):
 
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
-        shard_size = expert_data.shape[shard_dim] // 2
+        assert shard_id in {"w1", "w3", "w13"}
+
+        if is_bias:
+            # if this weight is a bias, the last dimension must be the sharded dimension
+            shard_dim = -1
+
+        if shard_id in {"w1", "w3"}:
+            # non-fused version
+            shard_size = expert_data.shape[shard_dim] // 2
+        elif shard_id in {"w13"}:
+            # fused version
+            shard_size = expert_data.shape[shard_dim]
+        else:
+            raise NotImplementedError
 
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         # w3, up_proj: Load into second logical weight of w13.
         # trtllm cutlass kernel assumes differently
-        assert shard_id in ("w1", "w3")
         switch_w13 = getattr(self.quant_method, "load_up_proj_weight_first", False)
         if (switch_w13 and shard_id == "w1") or (not switch_w13 and shard_id == "w3"):
             start = shard_size
@@ -310,7 +350,8 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
-                if self.use_triton_kernels:
+                if not is_bias and self.use_triton_kernels:
+                    # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
@@ -326,6 +367,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         tp_rank: int,
+        is_bias: bool = False,
     ):
         """Load w2 weights for down projection.
 
@@ -356,7 +398,14 @@ class FusedMoE(torch.nn.Module):
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
-        shard_size = expert_data.shape[shard_dim]
+        if is_bias:
+            # this expert_data is a bias, not weight,
+            # for w2_weight_bias in TP, it does not need to be sharded
+            shard_size = expert_data.shape[-1]
+        else:
+            # this parameter is a weight matrix
+            # for w2 in TP, it shards the input_features, i.e., shard_dim=2
+            shard_size = expert_data.shape[shard_dim]
 
         if _is_cpu:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
@@ -369,13 +418,9 @@ class FusedMoE(torch.nn.Module):
                 not self.use_presharded_weights,
             )
         else:
-            if not self.use_presharded_weights:
+            if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                if shard_size * tp_rank + shard_size > loaded_weight.shape[shard_dim]:
-                    raise ValueError(
-                        f"Shard size {shard_size} at rank {tp_rank} exceeds loaded_weight dimension {loaded_weight.shape[shard_dim]}"
-                    )
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
@@ -423,8 +468,24 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         weight_name: str,
         shard_id: str,
-        expert_id: int,
+        expert_id: Optional[int],
     ) -> None:
+
+        # if expert_id is None, then
+        # all the experts are loaded at the same time
+        if (
+            not expert_id
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "mxfp4"
+        ):
+            if "bias" in weight_name:
+                dim1 = loaded_weight.shape[1]
+                param.data[:, :dim1].copy_(loaded_weight)
+            else:
+                dim1 = loaded_weight.shape[1]
+                dim2 = loaded_weight.shape[2]
+                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+            return
 
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
@@ -464,6 +525,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
             return
@@ -658,7 +720,89 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
+    def weight_loader_fused(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+    ) -> None:
+        tp_rank = self.moe_tp_rank
+
+        if self.quant_config is not None and self.quant_config.get_name() == "mxfp4":
+            if "bias" in weight_name:
+                dim1 = loaded_weight.shape[1]
+                param.data[:, :dim1].copy_(loaded_weight)
+            elif "scale" in weight_name:
+                param.data.copy_(loaded_weight)
+            else:
+                dim1 = loaded_weight.shape[1]
+                dim2 = loaded_weight.shape[2]
+                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+            return
+
+        # compressed-tensors checkpoints with packed weights are stored flipped
+        # TODO: check self.quant_method.quant_config.quant_format
+        # against known CompressionFormat enum values that have this quality
+        loaded_weight = (
+            loaded_weight.t().contiguous()
+            if (
+                self.quant_method.__class__.__name__
+                == "CompressedTensorsWNA16MoEMethod"
+            )
+            else loaded_weight
+        )
+
+        if shard_id not in ("w13", "w2"):
+            raise ValueError(f"shard_id must be ['w13','w2'] but " f"got {shard_id}.")
+
+        # Fetch the dim to shard the parameter/loaded weight
+        # based on the shard id. This will be whatever
+        # dimension intermediate_size is used.
+        SHARD_ID_TO_SHARDED_DIM = {"w13": 1, "w2": 2}
+        SHARD_ID_TO_SHARDED_DIM_TRANSPOSE = {"w13": 2, "w2": 1}
+
+        expert_data = param.data
+        is_bias = expert_data.dim() == 2
+
+        # is_transposed: if the dim to shard the weight
+        # should be flipped. Required by GPTQ, compressed-tensors
+        # should be whatever dimension intermediate_size is
+        is_transposed = getattr(param, "is_transposed", False)
+
+        if self.use_triton_kernels:
+            is_transposed = True
+        shard_dim = (
+            SHARD_ID_TO_SHARDED_DIM[shard_id]
+            if not is_transposed
+            else SHARD_ID_TO_SHARDED_DIM_TRANSPOSE[shard_id]
+        )
+
+        # Case model weights
+        if "weight" in weight_name:
+            self._load_model_weight_or_group_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+                is_bias=is_bias,
+            )
+            return
+        else:
+            logging.warning(
+                f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
+            )
+
     def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
+        origin_hidden_states_dim = hidden_states.shape[-1]
+        if self.hidden_size != origin_hidden_states_dim:
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, self.hidden_size - origin_hidden_states_dim),
+                mode="constant",
+                value=0.0,
+            )
         assert self.quant_method is not None
 
         if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
@@ -666,13 +810,21 @@ class FusedMoE(torch.nn.Module):
                 # If we are in EP mode, we need to move the expert map to GPU.
                 self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
 
-        if self.expert_map_gpu is not None:
+        if self.expert_map_gpu is not None and isinstance(
+            topk_output, StandardTopKOutput
+        ):
             topk_output = topk_output._replace(
                 topk_ids=self.expert_map_gpu[topk_output.topk_ids]
             )
 
         # Matrix multiply.
         with use_symmetric_memory(get_tp_group()) as sm:
+            kwargs = {}
+            if self.activation_alpha is not None:
+                kwargs["activation_alpha"] = self.activation_alpha
+            if self.swiglu_limit is not None:
+                kwargs["swiglu_limit"] = self.swiglu_limit
+
             final_hidden_states = self.quant_method.apply(
                 layer=self,
                 x=hidden_states,
@@ -691,8 +843,13 @@ class FusedMoE(torch.nn.Module):
                     == "ModelOptNvFp4FusedMoEMethod"
                     else {}
                 ),
+                **kwargs,
             )
             sm.tag(final_hidden_states)
+
+        final_hidden_states = final_hidden_states[
+            ..., :origin_hidden_states_dim
+        ].contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -726,6 +883,52 @@ class FusedMoE(torch.nn.Module):
                 ("w2", ckpt_down_proj_name),
                 ("w3", ckpt_up_proj_name),
             ]
+        ]
+
+    @classmethod
+    def make_expert_params_mapping_fused(
+        cls,
+        ckpt_gate_up_proj_name: str,
+        ckpt_down_proj_name: str,
+        ckpt_gate_up_proj_bias_name: str,
+        ckpt_down_proj_bias_name: str,
+    ):
+        return [
+            ("experts.w13_weight", f"experts.{ckpt_gate_up_proj_name}", "w13"),
+            (
+                "experts.w13_weight_bias",
+                f"experts.{ckpt_gate_up_proj_bias_name}",
+                "w13",
+            ),
+            ("experts.w2_weight", f"experts.{ckpt_down_proj_name}", "w2"),
+            ("experts.w2_weight_bias", f"experts.{ckpt_down_proj_bias_name}", "w2"),
+        ]
+
+    @classmethod
+    def make_expert_params_mapping_fused_mxfp4(
+        cls,
+        ckpt_gate_up_proj_name: str,
+        ckpt_down_proj_name: str,
+        ckpt_gate_up_proj_bias_name: str,
+        ckpt_down_proj_bias_name: str,
+        ckpt_gate_up_proj_scale_name: str,
+        ckpt_down_proj_scale_name: str,
+    ):
+        return [
+            ("experts.w13_weight", f"experts.{ckpt_gate_up_proj_name}", "w13"),
+            (
+                "experts.w13_weight_bias",
+                f"experts.{ckpt_gate_up_proj_bias_name}",
+                "w13",
+            ),
+            ("experts.w2_weight", f"experts.{ckpt_down_proj_name}", "w2"),
+            ("experts.w2_weight_bias", f"experts.{ckpt_down_proj_bias_name}", "w2"),
+            (
+                "experts.w13_weight_scale",
+                f"experts.{ckpt_gate_up_proj_scale_name}",
+                "w13",
+            ),
+            ("experts.w2_weight_scale", f"experts.{ckpt_down_proj_scale_name}", "w2"),
         ]
 
     @classmethod
@@ -885,10 +1088,15 @@ class FlashInferFP4MoE(FusedMoE):
             gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(
                 torch.float8_e4m3fn
             ),
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
             gemm2_weights=self.gemm2_weights_fp4_shuffled.data,
             gemm2_weights_scale=self.gemm2_scales_fp4_shuffled.data.view(
                 torch.float8_e4m3fn
             ),
+            gemm2_bias=None,
             output1_scale_scalar=self.g1_scale_c.data,
             output1_scale_gate_scalar=self.g1_alphas.data,
             output2_scale_scalar=self.g2_alphas.data,

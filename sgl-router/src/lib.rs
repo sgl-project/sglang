@@ -19,7 +19,7 @@ pub enum PolicyType {
     Random,
     RoundRobin,
     CacheAware,
-    PowerOfTwo, // Moved from PD-specific, now shared
+    PowerOfTwo,
 }
 
 #[pyclass]
@@ -45,7 +45,6 @@ struct Router {
     selector: HashMap<String, String>,
     service_discovery_port: u16,
     service_discovery_namespace: Option<String>,
-    // PD service discovery fields
     prefill_selector: HashMap<String, String>,
     decode_selector: HashMap<String, String>,
     bootstrap_port_annotation: String,
@@ -53,16 +52,26 @@ struct Router {
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
-    // PD mode flag
     pd_disaggregation: bool,
-    // PD-specific fields (only used when pd_disaggregation is true)
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
     decode_policy: Option<PolicyType>,
-    // Additional server config fields
     max_concurrent_requests: usize,
     cors_allowed_origins: Vec<String>,
+    // Retry configuration
+    retry_max_retries: u32,
+    retry_initial_backoff_ms: u64,
+    retry_max_backoff_ms: u64,
+    retry_backoff_multiplier: f32,
+    retry_jitter_factor: f32,
+    disable_retries: bool,
+    // Circuit breaker configuration
+    cb_failure_threshold: u32,
+    cb_success_threshold: u32,
+    cb_timeout_duration_secs: u64,
+    cb_window_duration_secs: u64,
+    disable_circuit_breaker: bool,
 }
 
 impl Router {
@@ -150,6 +159,21 @@ impl Router {
             request_id_headers: self.request_id_headers.clone(),
             max_concurrent_requests: self.max_concurrent_requests,
             cors_allowed_origins: self.cors_allowed_origins.clone(),
+            retry: config::RetryConfig {
+                max_retries: self.retry_max_retries,
+                initial_backoff_ms: self.retry_initial_backoff_ms,
+                max_backoff_ms: self.retry_max_backoff_ms,
+                backoff_multiplier: self.retry_backoff_multiplier,
+                jitter_factor: self.retry_jitter_factor,
+            },
+            circuit_breaker: config::CircuitBreakerConfig {
+                failure_threshold: self.cb_failure_threshold,
+                success_threshold: self.cb_success_threshold,
+                timeout_duration_secs: self.cb_timeout_duration_secs,
+                window_duration_secs: self.cb_window_duration_secs,
+            },
+            disable_retries: false,
+            disable_circuit_breaker: false,
         })
     }
 }
@@ -191,7 +215,20 @@ impl Router {
         prefill_policy = None,
         decode_policy = None,
         max_concurrent_requests = 64,
-        cors_allowed_origins = vec![]
+        cors_allowed_origins = vec![],
+        // Retry defaults
+        retry_max_retries = 3,
+        retry_initial_backoff_ms = 100,
+        retry_max_backoff_ms = 10_000,
+        retry_backoff_multiplier = 2.0,
+        retry_jitter_factor = 0.1,
+        disable_retries = false,
+        // Circuit breaker defaults
+        cb_failure_threshold = 5,
+        cb_success_threshold = 2,
+        cb_timeout_duration_secs = 30,
+        cb_window_duration_secs = 60,
+        disable_circuit_breaker = false,
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -228,6 +265,17 @@ impl Router {
         decode_policy: Option<PolicyType>,
         max_concurrent_requests: usize,
         cors_allowed_origins: Vec<String>,
+        retry_max_retries: u32,
+        retry_initial_backoff_ms: u64,
+        retry_max_backoff_ms: u64,
+        retry_backoff_multiplier: f32,
+        retry_jitter_factor: f32,
+        disable_retries: bool,
+        cb_failure_threshold: u32,
+        cb_success_threshold: u32,
+        cb_timeout_duration_secs: u64,
+        cb_window_duration_secs: u64,
+        disable_circuit_breaker: bool,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -264,6 +312,17 @@ impl Router {
             decode_policy,
             max_concurrent_requests,
             cors_allowed_origins,
+            retry_max_retries,
+            retry_initial_backoff_ms,
+            retry_max_backoff_ms,
+            retry_backoff_multiplier,
+            retry_jitter_factor,
+            disable_retries,
+            cb_failure_threshold,
+            cb_success_threshold,
+            cb_timeout_duration_secs,
+            cb_window_duration_secs,
+            disable_circuit_breaker,
         })
     }
 
@@ -289,7 +348,6 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                // PD mode configuration
                 pd_mode: self.pd_disaggregation,
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
