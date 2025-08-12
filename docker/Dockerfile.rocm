@@ -3,7 +3,7 @@
 #   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx950 -t v0.4.9.post1-rocm700-mi35x -f Dockerfile.rocm .
 
 # Default base images
-ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.8.5_mi35X_prealpha"
+ARG BASE_IMAGE_950="henryx/haisgl:rocm7.0_preview_ubuntu_22.04_vllm-os-mini_0.1.0_mi35X_prealpha"
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 
 # This is necessary for scope purpose
@@ -17,6 +17,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV AITER_COMMIT="v0.1.4"
+ENV NO_DEPS_FLAG=""
 
 # ===============================
 # Base image 950 and args
@@ -27,6 +28,7 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_LLVM="1"
 ENV AITER_COMMIT="v0.1.4"
 ENV HIP_CLANG_PATH="/sgl-workspace/llvm-project/build/bin/"
+ENV NO_DEPS_FLAG="--no-deps"
 
 # ===============================
 # Chosen arch and args
@@ -137,9 +139,9 @@ RUN git clone ${SGL_REPO} \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
     && cd .. \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip]"; \
+         python -m pip --no-cache-dir install -e "python[srt_hip]" ${NO_DEPS_FLAG}; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip]"; \
+         python -m pip --no-cache-dir install -e "python[all_hip]" ${NO_DEPS_FLAG}; \
        fi
 
 RUN python -m pip cache purge
