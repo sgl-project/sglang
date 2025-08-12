@@ -287,38 +287,135 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
 
+    def quantize_and_rope_for_fp8(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        forward_batch: ForwardBatch,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize and apply RoPE for FP8 attention path.
+
+        This function handles the FP8 quantization and RoPE application for MLA attention.
+        It takes separate query/key nope and rope components, applies RoPE to the rope parts,
+        quantizes all components to FP8, and merges the query components into a single tensor.
+
+        Args:
+            q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
+                - expected dtype: torch.bfloat16
+            q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]
+                - expected dtype: torch.bfloat16
+            k_nope: Key no-position-encoding component [seq_len, num_heads, kv_lora_rank]
+                - expected dtype: torch.bfloat16
+            k_rope: Key RoPE component [seq_len, num_heads, qk_rope_head_dim]
+                - expected dtype: torch.bfloat16
+            forward_batch: Forward batch containing position information
+            cos_sin_cache: Precomputed cosine/sine cache for RoPE
+                - expected dtype: matches q_/k_ input dtype (torch.bfloat16)
+            is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
+
+        Returns:
+            tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
+                - merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=torch.float8_e4m3fn
+                - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
+                - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
+        """
+        attn_dtype = torch.float8_e4m3fn
+        q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
+
+        # Allocate output tensors with FP8 dtype
+        # Query output will contain merged nope + rope components
+        q_out = q_rope.new_empty(
+            q_len,
+            num_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            dtype=attn_dtype,
+        )
+
+        # Key outputs maintain original shapes but with FP8 dtype
+        k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
+        k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
+
+        # Apply RoPE and quantize all components in a single fused kernel call
+        # This kernel handles:
+        # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
+        # 2. Quantization of all components to FP8 format
+        # 3. Output placement into pre-allocated tensors
+        flashinfer.rope.mla_rope_quantize_fp8(
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=forward_batch.positions,
+            is_neox=is_neox,
+            quantize_dtype=attn_dtype,
+            # Output tensor slicing: q_out contains [nope_part, rope_part]
+            q_rope_out=q_out[..., self.kv_lora_rank :],  # RoPE part goes to end
+            k_rope_out=k_rope_out,
+            q_nope_out=q_out[..., : self.kv_lora_rank],  # Nope part goes to beginning
+            k_nope_out=k_nope_out,
+            # Quantization scales (set to 1.0 for no additional scaling)
+            quant_scale_q=1.0,
+            quant_scale_kv=1.0,
+        )
+
+        return q_out, k_nope_out, k_rope_out
+
     def forward_decode(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        q: torch.Tensor,  # q_nope
+        k: torch.Tensor,  # k_nope
+        v: torch.Tensor,  # not used in this backend
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = False,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
+        merge_query = q_rope is not None
+        if self.data_type == torch.float8_e4m3fn:
+            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
+            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
+            assert all(
+                x is not None for x in [q_rope, k_rope, cos_sin_cache]
+            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
+            q, k, k_rope = self.quantize_and_rope_for_fp8(
+                q,
+                q_rope,
+                k.squeeze(1),
+                k_rope.squeeze(1),
+                forward_batch,
+                cos_sin_cache,
+                is_neox,
+            )
+            merge_query = False
+
         # Save KV cache if requested
-        if k is not None and save_kv_cache:
-            cache_loc = forward_batch.out_cache_loc
-            if k_rope is not None:
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, cache_loc, k, k_rope
-                )
-            elif v is not None:
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+        if save_kv_cache:
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, k_rope
+            )
 
         # Prepare query tensor inline
-        if q_rope is not None:
-            # q contains NOPE part (v_head_dim)
+        if merge_query:
+            # For FP16 path, we merge the query and rope parts into a single tensor
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
             query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
         else:
-            # q already has both parts
+            # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
         # Ensure query has shape [bs, acc_q_len, num_q_heads, head_dim] when seq_len 1
@@ -327,9 +424,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Prepare KV cache inline
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        pages = k_cache.view(-1, self.page_size, self.kv_cache_dim)
-        # TRT-LLM expects single KV data with extra dimension
-        kv_cache = pages.unsqueeze(1)
+        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
         # Get metadata
         metadata = (
@@ -337,11 +432,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             or self.forward_metadata
         )
 
-        # Scale computation for TRTLLM MLA kernel:
-        # - BMM1 scale = q_scale * k_scale * softmax_scale
-        # - For FP16 path we keep q_scale = 1.0, softmax_scale = 1/sqrt(head_dim) which is pre-computed as layer.scaling
-        # - k_scale is read from model checkpoint if available
-        # TODO: Change once fp8 path is supported
+        # Scale computation for TRTLLM MLA kernel BMM1 operation:
+        # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
+        # Scale components:
+        # - q_scale: Query scaling factor (set to 1.0 for both FP16/FP8 paths)
+        # - k_scale: Key scaling factor from model checkpoint (defaults to 1.0 if not available)
+        # - softmax_scale: Attention softmax scaling = 1/sqrt(head_dim), pre-computed as layer.scaling
+        # This unified approach works for both FP16 and FP8 quantized attention paths.
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
