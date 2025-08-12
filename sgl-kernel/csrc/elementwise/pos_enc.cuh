@@ -405,7 +405,19 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
         if ((nnz + bdy - 1) / bdy >= num_ctas_0) {
           dim3 nblks(nblks_x);
           dim3 nthrs(bdx, bdy);
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
+
+          cudaLaunchConfig_t config = {};
+          config.gridDim = nblks;
+          config.blockDim = nthrs;
+          config.dynamicSmemBytes = 0;
+          config.stream = stream;
+          cudaLaunchAttribute attrs[1] = {};
+          attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+          attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+          config.numAttrs = 1;
+          config.attrs = attrs;
+
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(config, (void*)kernel_0, args));
         } else {
           dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
           dim3 nthrs(bdx, bdy);
@@ -417,7 +429,19 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
               bdx,
               DType,
               IdType>;
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
+
+          cudaLaunchConfig_t config = {};
+          config.gridDim = nblks;
+          config.blockDim = nthrs;
+          config.dynamicSmemBytes = 0;
+          config.stream = stream;
+          cudaLaunchAttribute attrs[1] = {};
+          attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+          attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+          config.numAttrs = 1;
+          config.attrs = attrs;
+
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(config, (void*)kernel_1, args));
         }
       });
     });
