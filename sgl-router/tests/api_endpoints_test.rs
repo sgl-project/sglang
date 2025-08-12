@@ -92,12 +92,8 @@ impl TestContext {
         // Create app context
         let app_context = common::create_test_context(config.clone());
 
-        // Create router using sync factory in a blocking context
-        let router =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
-                .await
-                .unwrap()
-                .unwrap();
+        // Create router
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
 
         // Wait for router to discover workers
@@ -1451,10 +1447,7 @@ mod pd_mode_tests {
         let app_context = common::create_test_context(config);
 
         // Create router - this might fail due to health check issues
-        let router_result =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
-                .await
-                .unwrap();
+        let router_result = RouterFactory::create_router(&app_context).await;
 
         // Clean up workers
         prefill_worker.stop().await;
