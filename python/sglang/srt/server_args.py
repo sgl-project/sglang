@@ -1190,7 +1190,7 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=[
+            choices=[  # TODO: use FunctionCallParser.DetectorMap.keys()
                 "qwen25",
                 "mistral",
                 "llama3",
@@ -1200,6 +1200,7 @@ class ServerArgs:
                 "qwen3_coder",
                 "glm45",
                 "step3",
+                "gpt-oss",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",

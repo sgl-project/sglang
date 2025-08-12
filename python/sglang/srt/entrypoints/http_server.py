@@ -174,7 +174,6 @@ async def lifespan(fast_api_app: FastAPI):
             tool_server=tool_server,
         )
     except Exception as e:
-        # print stack trace
         import traceback
 
         traceback.print_exc()
