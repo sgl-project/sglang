@@ -253,7 +253,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
         return lora_output
 
-    def forward(self, input_: torch.Tensor):
+    def forward(self, input_: torch.Tensor, skip_allreduce=False):
         # duplicate the logic in RowParallelLinear
         if self.base_layer.input_is_parallel:
             input_parallel = input_
