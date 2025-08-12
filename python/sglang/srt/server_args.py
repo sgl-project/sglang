@@ -2280,7 +2280,7 @@ class ServerArgs:
                     self.attention_backend = "fa3"
                 else:
                     self.attention_backend = "triton"
-            supported_backends = ["triton", "trtllm_mha", "fa3"]
+            supported_backends = ["triton", "trtllm_mha", "fa3", "hip_attention"]
             logger.info(
                 f"Use {self.attention_backend} as attention backend for GptOssForCausalLM"
             )
