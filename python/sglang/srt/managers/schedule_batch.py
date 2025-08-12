@@ -767,6 +767,7 @@ class Req:
         self.is_chunked = 0
         self.req_pool_idx = None
         self.already_computed = 0
+        global_scheduler_batch_dict["retracted_requests_ids"].add(self.rid)
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2028,4 +2029,5 @@ def get_last_loc_triton(
 global_scheduler_batch_dict: Dict[str, Any] = {
     "request_ids_to_seq_ids": {},  # Maps request IDs to sequence IDs
     "finished_requests_ids": set(),
+    "retracted_requests_ids": set(),
 }

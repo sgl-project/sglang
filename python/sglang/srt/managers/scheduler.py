@@ -812,6 +812,7 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
+            global_scheduler_batch_dict["retracted_requests_ids"].clear()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -822,6 +823,7 @@ class Scheduler(
                  #(yizhang2077) hook manba here
                 global_scheduler_batch_dict["finished_requests_ids"].clear()
                 self.process_batch_result(batch, result)
+                global_scheduler_batch_dict["finished_requests_ids"].update(global_scheduler_batch_dict["retracted_requests_ids"])
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -837,6 +839,7 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
+            global_scheduler_batch_dict["retracted_requests_ids"].clear()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -858,6 +861,7 @@ class Scheduler(
                      #(yizhang2077) hook manba here
                     global_scheduler_batch_dict["finished_requests_ids"].clear()
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
+                    global_scheduler_batch_dict["finished_requests_ids"].update(global_scheduler_batch_dict["retracted_requests_ids"])
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -871,6 +875,7 @@ class Scheduler(
                 self.process_batch_result(
                     tmp_batch, tmp_result, batch.launch_done if batch else None
                 )
+                global_scheduler_batch_dict["finished_requests_ids"].update(global_scheduler_batch_dict["retracted_requests_ids"])
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
