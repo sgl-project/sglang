@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_cuda, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
@@ -67,7 +67,10 @@ class TestTorchCompileMoe(CustomTestCase):
         tok = time.perf_counter()
         print(f"{res=}")
         throughput = max_tokens / (tok - tic)
-        self.assertGreaterEqual(throughput, 285)
+        if is_cuda():
+            self.assertGreaterEqual(throughput, 285)
+        else:
+            self.assertGreaterEqual(throughput, 270)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 
 import unittest
 from io import BytesIO
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import requests
@@ -14,14 +14,15 @@ from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.conversation import generate_chat_conv
-from sglang.srt.managers.mm_utils import embed_mm_inputs
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.managers.mm_utils import embed_mm_inputs, init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.server_args import ServerArgs
 
 
@@ -100,7 +101,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
 
         np.testing.assert_allclose(hf_np, sg_np)
 
-    def get_processor_output(self):
+    def get_completion_request(self) -> ChatCompletionRequest:
         json_str = f"""
         {{
   "model": "{self.model_path}",
@@ -124,10 +125,12 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
 }}
         """
 
-        req = ChatCompletionRequest.model_validate_json(json_str)
+        return ChatCompletionRequest.model_validate_json(json_str)
 
+    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None):
+        if req is None:
+            req = self.get_completion_request()
         conv = generate_chat_conv(req, template_name=self.chat_template)
-
         text = conv.get_prompt()
 
         # Process inputs using processor
@@ -179,6 +182,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
             .eval()
             .to(cls.device)
         )
+        init_embedding_cache()
 
     async def test_vlm_embedding_output(self):
         """
@@ -217,27 +221,47 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 for pixel_n, tgt_n in zip(pixel_b, tgt_b):
                     pixel_values_flat += [pixel_n]
                     tgt_sizes_flat += [tgt_n]
+
+            im_start_id, im_end_id = (
+                self.tokenizer.im_start_id,
+                self.tokenizer.im_end_id,
+            )
+            slice_start_id, slice_end_id = (
+                self.tokenizer.slice_start_id,
+                self.tokenizer.slice_end_id,
+            )
+
+            image_offsets = BaseMultimodalProcessor.get_mm_items_offset_by_pair(
+                input_ids=input_ids, mm_start_id=im_start_id, mm_end_id=im_end_id
+            )
+            slice_offsets = BaseMultimodalProcessor.get_mm_items_offset_by_pair(
+                input_ids=input_ids, mm_start_id=slice_start_id, mm_end_id=slice_end_id
+            )
+            image_offsets.extend(slice_offsets)
+            image_offsets = sorted(image_offsets)
+
             sglang_output = embed_mm_inputs(
-                mm_inputs=MultimodalInputs(
-                    mm_items=[
-                        MultimodalDataItem(
-                            pixel_values=pixel_values_flat,
-                            tgt_size=tgt_sizes_flat,
-                            modality=Modality.IMAGE,
-                            pad_value=self.processor.tokenizer.unk_token_id,
-                        )
-                    ]
-                ),
+                mm_inputs_list=[
+                    MultimodalInputs(
+                        mm_items=[
+                            MultimodalDataItem(
+                                feature=pixel_values_flat,
+                                offsets=image_offsets,
+                                tgt_size=tgt_sizes_flat,
+                                modality=Modality.IMAGE,
+                                pad_value=self.processor.tokenizer.unk_token_id,
+                            )
+                        ]
+                    ),
+                ],
+                extend_prefix_lens=[0],
+                extend_seq_lens=[input_ids.shape[0]],
                 input_ids=input_ids,
                 input_embedding=model.get_input_embeddings(),
-                image_data_embedding_func=model.get_image_feature,
+                multimodal_model=model,
                 placeholder_tokens={
                     Modality.IMAGE: self.processor.tokenizer.unk_token_id,
                 },
             )
 
         self.compare_outputs(sglang_output, hf_output)
-
-
-if __name__ == "__main__":
-    unittest.main()

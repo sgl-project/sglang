@@ -168,7 +168,7 @@ class CLIPEncoderLayer(nn.Module):
             softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,
-            prefix=add_prefix("attn", prefix),
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = CLIPMLP(
             config,
@@ -395,6 +395,10 @@ class CLIPVisionModel(nn.Module):
             config, quant_config, prefix=add_prefix("vision_model", prefix)
         )
 
+    @property
+    def device(self) -> torch.device:
+        return self.vision_model.device
+
     def forward(self, pixel_values: torch.Tensor):
         return self.vision_model(pixel_values)
 
@@ -459,7 +463,7 @@ class CLIPModel(nn.Module):
         if forward_batch.mm_inputs is not None:
             mm_inputs = forward_batch.mm_inputs
         pixel_values_list = [
-            item.pixel_values
+            item.feature
             for item in flatten_nested_list(
                 [mm_input.mm_items for mm_input in mm_inputs if mm_input is not None]
             )

@@ -14,17 +14,19 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import json
 import os
 import warnings
 from pathlib import Path
-from typing import Dict, Optional, Type, Union
+from typing import Any, Dict, Optional, Type, Union
 
-import transformers
+import torch
 from huggingface_hub import snapshot_download
 from transformers import (
     AutoConfig,
     AutoProcessor,
     AutoTokenizer,
+    GenerationConfig,
     PretrainedConfig,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -39,10 +41,11 @@ from sglang.srt.configs import (
     ExaoneConfig,
     KimiVLConfig,
     MultiModalityConfig,
+    Step3VLConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url
+from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -52,6 +55,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     MultiModalityConfig.model_type: MultiModalityConfig,
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
+    Step3VLConfig.model_type: Step3VLConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -59,13 +63,57 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
-def download_from_hf(model_path: str):
+def download_from_hf(
+    model_path: str,
+    allow_patterns: Optional[Union[str, list]] = None,
+):
     if os.path.exists(model_path):
         return model_path
 
-    return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
+    if not allow_patterns:
+        allow_patterns = ["*.json", "*.bin", "*.model"]
+
+    return snapshot_download(model_path, allow_patterns=allow_patterns)
 
 
+def get_hf_text_config(config: PretrainedConfig):
+    """Get the "sub" config relevant to llm for multi modal models.
+    No op for pure text models.
+    """
+    if config.architectures is not None:
+        class_name = config.architectures[0]
+        if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
+            # We support non-hf version of llava models, so we do not want to
+            # read the wrong values from the unused default text_config.
+            # NOTE(HandH1998): We set `torch_dtype` of config to `torch.float16` for the weights, as
+            # `torch.float16` is default used for image features in `python/sglang/srt/models/llava.py`.
+            setattr(config, "torch_dtype", torch.float16)
+            return config
+
+    if hasattr(config, "text_config"):
+        # The code operates under the assumption that text_config should have
+        # `num_attention_heads` (among others). Assert here to fail early
+        # if transformers config doesn't align with this assumption.
+        assert hasattr(config.text_config, "num_attention_heads")
+        return config.text_config
+    if hasattr(config, "language_config"):
+        return config.language_config
+    if hasattr(config, "thinker_config"):
+        # qwen2.5 omni
+        thinker_config = config.thinker_config
+        if hasattr(thinker_config, "text_config"):
+            setattr(
+                thinker_config.text_config,
+                "torch_dtype",
+                getattr(thinker_config, "torch_dtype", None),
+            )
+            return thinker_config.text_config
+        return thinker_config
+    else:
+        return config
+
+
+@lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -81,13 +129,12 @@ def get_config(
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
+    text_config = get_hf_text_config(config=config)
 
-    # FIXME: Pour contents of janus-pro's langauge_config to first-level
-    if isinstance(model, str) and model.lower().startswith("deepseek-ai/janus-pro"):
-        assert hasattr(config, "language_config")
-        for key, val in config.language_config.__dict__.items():
-            setattr(config, key, val)
-        setattr(config, "architectures", ["MultiModalityCausalLM"])
+    if isinstance(model, str) and text_config is not None:
+        for key, val in text_config.__dict__.items():
+            if not hasattr(config, key) and getattr(text_config, key, None) is not None:
+                setattr(config, key, val)
 
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
@@ -100,6 +147,9 @@ def get_config(
             if not hasattr(config, key):
                 setattr(config, key, val)
 
+    if config.model_type == "multi_modality":
+        config.update({"architectures": ["MultiModalityCausalLM"]})
+
     if model_override_args:
         config.update(model_override_args)
 
@@ -110,6 +160,41 @@ def get_config(
         model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
         config.update({"architectures": [model_type]})
 
+    return config
+
+
+@lru_cache_frozenset(maxsize=32)
+def get_generation_config(
+    model: str,
+    trust_remote_code: bool,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    try:
+        return GenerationConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except OSError as e:
+        return None
+
+
+# Qwen-1M related
+def get_sparse_attention_config(
+    model: str,
+    sparse_attention_config_filename: str = "sparse_attention_config.json",
+) -> Dict[str, Any]:
+    is_local = os.path.isdir(model)
+    if not is_local:
+        # Download the config files.
+        model = download_from_hf(model, allow_patterns=["*.json"])
+
+    config_file = os.path.join(model, sparse_attention_config_filename)
+    if not os.path.exists(config_file):
+        return {}
+
+    # Load the sparse attention config.
+    with open(config_file) as f:
+        config = json.load(f)
     return config
 
 
@@ -163,6 +248,10 @@ def get_tokenizer(
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
+
+    # TODO(Xinyuan): Remove this once we have a proper tokenizer for Devstral
+    if tokenizer_name == "mistralai/Devstral-Small-2505":
+        tokenizer_name = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
 
     is_gguf = check_gguf_file(tokenizer_name)
     if is_gguf:
@@ -254,15 +343,31 @@ def get_processor(
 
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
+    try:
+        processor = AutoProcessor.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
 
-    processor = AutoProcessor.from_pretrained(
-        tokenizer_name,
-        *args,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        **kwargs,
-    )
-
+    except ValueError as e:
+        error_message = str(e)
+        if "does not have a slow version" in error_message:
+            logger.info(
+                f"Processor {tokenizer_name} does not have a slow version. Automatically use fast version"
+            )
+            kwargs["use_fast"] = True
+            processor = AutoProcessor.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        else:
+            raise e
     tokenizer = get_tokenizer_from_processor(processor)
 
     attach_additional_stop_token_ids(tokenizer)

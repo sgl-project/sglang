@@ -227,3 +227,11 @@ compile_commands.json
 .vscode
 
 1
+
+# Autoenv
+.env.leave
+
+# Rust lib
+Cargo.lock
+
+lmms-eval

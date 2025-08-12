@@ -140,7 +140,7 @@ void launch_sm90_fp8_blockwise_scaled_mm(
   LayoutSFB layout_sfb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
 
   typename GemmKernel::MainloopArguments mainloop_args{
-      a_ptr, stride_a, b_ptr, stride_b, 4, a_s_ptr, layout_sfa, b_s_ptr, layout_sfb};
+      a_ptr, stride_a, b_ptr, stride_b, a_s_ptr, layout_sfa, b_s_ptr, layout_sfb};
   typename GemmKernel::EpilogueArguments epilogue_args{{}, nullptr, stride_d, o_ptr, stride_d};
 
   typename Gemm::Arguments args = {
@@ -353,7 +353,7 @@ torch::Tensor fp8_blockwise_scaled_mm(
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
   TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
   TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
-  TORCH_CHECK(mat_b.stride(0) == 1, "mat_a must be a column major tensor");
+  TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
   TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
 
   TORCH_CHECK(

@@ -17,6 +17,7 @@ import time
 
 import requests
 
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -52,7 +53,9 @@ class CompileArgs:
 
 
 @warmup("compile-deep-gemm")
-async def warm_up_compile(tokenizer_manager: TokenizerManager):
+async def warm_up_compile(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
     print("\nGenerate warm up request for compiling DeepGEMM...\n")
     generate_req_input = GenerateReqInput(
         input_ids=[0, 1, 2, 3],
@@ -62,6 +65,10 @@ async def warm_up_compile(tokenizer_manager: TokenizerManager):
             "ignore_eos": True,
         },
     )
+    if disaggregation_mode != "null":
+        generate_req_input.bootstrap_room = 0
+        generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
     await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
@@ -82,8 +89,8 @@ def launch_server_process_and_send_one_request(
     base_url = f"http://{server_args.host}:{server_args.port}"
     timeout = compile_args.timeout
 
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+    start_time = time.perf_counter()
+    while time.perf_counter() - start_time < timeout:
         try:
             headers = {
                 "Content-Type": "application/json; charset=utf-8",
@@ -112,9 +119,9 @@ def launch_server_process_and_send_one_request(
                         raise RuntimeError(f"Sync request failed: {error}")
                 # Other nodes should wait for the exit signal from Rank-0 node.
                 else:
-                    start_time_waiting = time.time()
+                    start_time_waiting = time.perf_counter()
                     while proc.is_alive():
-                        if time.time() - start_time_waiting < timeout:
+                        if time.perf_counter() - start_time_waiting < timeout:
                             time.sleep(10)
                         else:
                             raise TimeoutError("Waiting for main node timeout!")

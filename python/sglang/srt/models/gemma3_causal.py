@@ -166,8 +166,7 @@ class Gemma3Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # Determine if layer uses sliding window based on pattern
-        self.is_sliding = bool((layer_id + 1) % config.sliding_window_pattern)
+        self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
 
         # Initialize the rotary embedding.
         if self.is_sliding:
@@ -277,6 +276,13 @@ class Gemma3Attention(nn.Module):
         k = k.permute(0, 2, 1, 3)
 
         attn_output = self.attn(q, k, v, forward_batch=forward_batch)
+
+        # Compatible with triton backend which returns [1, s, h, head_dim]
+        if attn_output.dim() == 4 and attn_output.shape[0] == 1:
+            attn_output = attn_output.squeeze(0)
+            attn_output = attn_output.flatten(-2, -1)
+        # [s, h * head_dim]
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -640,6 +646,69 @@ class Gemma3ForCausalLM(PreTrainedModel):
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ):
+        start, end = split_interval
+        # embed
+        if start == 0:
+            if input_embeds is None:
+                hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+
+            if positions.dim() == 1:
+                positions = einops.rearrange(positions, "s -> 1 s")
+            position_embeddings_global = self.model.rotary_emb(hidden_states, positions)
+            position_embeddings_local = self.model.rotary_emb_local(
+                hidden_states, positions
+            )
+
+            forward_batch.hidden_states = hidden_states
+            forward_batch.model_specific_states = {
+                "positions": positions,
+                "position_embeddings_global": position_embeddings_global,
+                "position_embeddings_local": position_embeddings_local,
+            }
+
+        # decoder layer
+        for i in range(start, end):
+            layer = self.model.layers[i]
+            layer_output = layer(
+                positions=forward_batch.model_specific_states["positions"],
+                position_embeddings_global=forward_batch.model_specific_states[
+                    "position_embeddings_global"
+                ],
+                position_embeddings_local=forward_batch.model_specific_states[
+                    "position_embeddings_local"
+                ],
+                hidden_states=forward_batch.hidden_states,
+                forward_batch=forward_batch,
+            )
+            forward_batch.hidden_states = layer_output[0]
+
+        if end == self.model.config.num_hidden_layers:
+            # norm
+            forward_batch.hidden_states = self.model.norm(forward_batch.hidden_states)
+
+            # logits process
+            result = self.logits_processor(
+                input_ids,
+                forward_batch.hidden_states,
+                self.model.embed_tokens,
+                forward_batch,
+            )
+        else:
+            result = None
+
+        return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

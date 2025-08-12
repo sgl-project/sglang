@@ -109,9 +109,9 @@ def batch(video_dir, save_dir, cur_chunk, num_chunks, num_frames=16, batch_size=
             for video_path in batch_video_files
         ]
 
-        start_time = time.time()
+        start_time = time.perf_counter()
         states = video_qa.run_batch(batch_input, max_new_tokens=512, temperature=0.2)
-        total_time = time.time() - start_time
+        total_time = time.perf_counter() - start_time
         average_time = total_time / len(batch_video_files)
         print(
             f"Number of videos in batch: {len(batch_video_files)}. Average processing time per video: {average_time:.2f} seconds. Total time for this batch: {total_time:.2f} seconds"
@@ -240,11 +240,11 @@ if __name__ == "__main__":
             for f in os.listdir(root)
             if f.endswith((".mp4", ".avi", ".mov"))
         ]  # Add more extensions if needed
-    start_time = time.time()  # Start time for processing a single video
+    start_time = time.perf_counter()  # Start time for processing a single video
     for cur_video in video_files[:1]:
         print(cur_video)
         single(cur_video, num_frames)
-    end_time = time.time()  # End time for processing a single video
+    end_time = time.perf_counter()  # End time for processing a single video
     total_time = end_time - start_time
     average_time = total_time / len(
         video_files

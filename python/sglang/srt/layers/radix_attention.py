@@ -12,15 +12,16 @@
 # limitations under the License.
 # ==============================================================================
 """Radix attention."""
+from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from torch import nn
 
-from sglang.srt.layers.linear import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class AttentionType(Enum):
@@ -52,9 +53,9 @@ class RadixAttention(nn.Module):
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
-        attn_type=AttentionType.DECODER,
-        prefix: str = "",
+        attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_q_head_num = num_heads

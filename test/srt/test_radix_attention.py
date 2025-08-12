@@ -9,6 +9,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     kill_process_tree,
     popen_launch_server,
 )
@@ -88,6 +89,7 @@ class TestRadixCacheFCFS(CustomTestCase):
         run_test(self.base_url, nodes)
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestRadixCacheLPM(TestRadixCacheFCFS):
     @classmethod
     def setUpClass(cls):

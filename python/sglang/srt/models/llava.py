@@ -41,16 +41,16 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.mm_utils import (
-    get_anyres_image_grid_shape,
-    unpad_image,
-    unpad_image_shape,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.multimodal.mm_utils import (
+    get_anyres_image_grid_shape,
+    unpad_image,
+    unpad_image_shape,
+)
 from sglang.srt.utils import add_prefix, flatten_nested_list, logger
 
 
@@ -135,7 +135,6 @@ class LlavaBaseForCausalLM(nn.Module):
         """
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
         # NOTE: This is not memory efficient. (output_hidden_states=True) will save all the hidden stated.
-
         selected_image_feature = image_outputs.hidden_states[self.vision_feature_layer]
         if self.vision_feature_select_strategy in ["default", "patch"]:
             selected_image_feature = selected_image_feature[:, 1:]
@@ -146,7 +145,6 @@ class LlavaBaseForCausalLM(nn.Module):
                 f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
             )
         image_features = self.multi_modal_projector(selected_image_feature)
-
         return image_features
 
     @torch.no_grad()
@@ -188,7 +186,7 @@ class LlavaBaseForCausalLM(nn.Module):
                 bs = forward_batch.batch_size
                 pixel_values = flatten_nested_list(
                     [
-                        [item.pixel_values for item in image_inputs[i].mm_items]
+                        [item.feature for item in image_inputs[i].mm_items]
                         for i in range(bs)
                         if need_vision[i]
                     ]
@@ -613,6 +611,10 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
 
     MULTIMODAL_PROJECTOR_TYPE = LlavaMultiModalProjector
 
+    @property
+    def dtype(self):
+        return self.torch_dtype
+
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         if hasattr(self.vision_tower, "pad_input_ids"):
             return self.vision_tower.pad_input_ids(input_ids, image_inputs)
@@ -654,11 +656,15 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         self, auto_model_type: Type[AutoModel]
     ) -> Dict[str, str]:
         mapping = {}
-        for config_cls, archs in auto_model_type._model_mapping.items():
-            if isinstance(archs, tuple):
-                mapping[config_cls.__name__] = tuple(arch.__name__ for arch in archs)
-            else:
-                mapping[config_cls.__name__] = archs.__name__
+        for config_cls in auto_model_type._model_mapping.keys():
+            archs = auto_model_type._model_mapping.get(config_cls, None)
+            if archs is not None:
+                if isinstance(archs, tuple):
+                    mapping[config_cls.__name__] = tuple(
+                        arch.__name__ for arch in archs
+                    )
+                else:
+                    mapping[config_cls.__name__] = archs.__name__
         return mapping
 
     def __init__(
@@ -672,11 +678,17 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         assert hasattr(config, "text_config")
         assert hasattr(config, "vision_config")
         self.config = config
-        self.text_config = config.text_config
-        self.vision_config = config.vision_config
+        self.text_config = self.config.text_config
+        self.vision_config = self.config.vision_config
+        self.torch_dtype = getattr(self.config, "torch_dtype")
+
+        if not getattr(self.text_config, "torch_dtype"):
+            self.text_config.torch_dtype = self.torch_dtype
+        if not getattr(self.vision_config, "torch_dtype"):
+            self.vision_config.torch_dtype = self.torch_dtype
 
         if not hasattr(self.config, "vocab_size"):
-            self.config.vocab_size = self.config.text_config.vocab_size
+            self.config.vocab_size = self.text_config.vocab_size
         if not hasattr(self.config, "image_aspect_ratio"):
             self.config.image_aspect_ratio = "anyres"
         if not hasattr(self.config, "image_grid_pinpoints"):
@@ -697,39 +709,39 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         if not hasattr(self.config, "projector_hidden_act"):
             self.config.projector_hidden_act = "gelu"
 
-        self.vision_feature_layer = getattr(config, "vision_feature_layer", -1)
+        self.vision_feature_layer = getattr(self.config, "vision_feature_layer", -1)
         self.vision_feature_select_strategy = getattr(
-            config, "vision_feature_select_strategy", "full"
+            self.config, "vision_feature_select_strategy", "full"
         )
-        self.image_size = self.config.vision_config.image_size
-        self.patch_size = self.config.vision_config.patch_size
+        self.image_size = self.vision_config.image_size
+        self.patch_size = self.vision_config.patch_size
 
-        self.mm_patch_merge_type = config.mm_patch_merge_type
-        self.image_aspect_ratio = config.image_aspect_ratio
-        self.image_grid_pinpoints = config.image_grid_pinpoints
+        self.mm_patch_merge_type = self.config.mm_patch_merge_type
+        self.image_aspect_ratio = self.config.image_aspect_ratio
+        self.image_grid_pinpoints = self.config.image_grid_pinpoints
 
         self.image_feature_len = int((self.image_size // self.patch_size) ** 2)
 
         self.multi_modal_projector = self.MULTIMODAL_PROJECTOR_TYPE(config)
 
         language_model_cls = self._get_sgl_model_cls(
-            config.text_config, AutoModelForCausalLM
+            self.text_config, AutoModelForCausalLM
         )
-        vision_model_cls = self._get_sgl_model_cls(config.vision_config, AutoModel)
+        vision_model_cls = self._get_sgl_model_cls(self.vision_config, AutoModel)
         self.language_model = language_model_cls(
-            config.text_config,
+            self.text_config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
         self.vision_tower = vision_model_cls(
-            config.vision_config,
+            self.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("vision_tower", prefix),
         )
 
-        if "unpad" in getattr(config, "mm_patch_merge_type", ""):
+        if "unpad" in getattr(self.config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
-                torch.empty(config.text_config.hidden_size, dtype=torch.float16)
+                torch.empty(self.text_config.hidden_size, dtype=self.torch_dtype)
             )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -745,7 +757,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched
-            pixel_values, image_sizes = item.pixel_values, item.image_sizes
+            pixel_values, image_sizes = item.feature, item.image_sizes
             image_outputs = self.vision_tower(
                 pixel_values, image_sizes, output_hidden_states=True
             )
@@ -779,7 +791,9 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             forward_batch=forward_batch,
             get_embedding=get_embedding,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
+            data_embedding_funcs={
+                Modality.IMAGE: self.get_image_feature,
+            },
             placeholder_tokens=None,  # using mm_item.pad_value
             positions=positions,
         )
