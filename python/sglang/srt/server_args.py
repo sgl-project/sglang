@@ -282,6 +282,9 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
 
+    # LMCache
+    enable_lmcache: bool = False
+
     def __post_init__(self):
         # Check deprecated arguments
         def print_deprecated_warning(message: str):
@@ -1840,6 +1843,7 @@ class ServerArgs:
         )
 
         # PD disaggregation
+        
         parser.add_argument(
             "--disaggregation-mode",
             type=str,
@@ -1936,6 +1940,14 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="(Deprecated) Enabling DeepEP MoE implementation for EP MoE.",
+        )
+
+        # LMCache
+        logger.info("Adding LMCache arguments")
+        parser.add_argument(
+            "--enable-lmcache",
+            action="store_true",
+            help="Enable LMCache for the model.",
         )
 
     @classmethod
