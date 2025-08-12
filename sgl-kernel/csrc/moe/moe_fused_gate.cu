@@ -6,27 +6,7 @@
 #include <stdio.h>
 #include <torch/all.h>
 #include <vector>
-
-// Forward declaration for tiled path (defined in moe_fused_gate_tile_more_experts.cu)
-std::vector<at::Tensor> moe_fused_gate_tiled(
-    at::Tensor& input,
-    at::Tensor& bias,
-    int64_t num_expert_group,
-    int64_t topk_group,
-    int64_t topk,
-    int64_t num_fused_shared_experts,
-    double routed_scaling_factor);
-
-// Static tiled specialization dispatcher (defined in moe_fused_gate_tile_more_experts.cu)
-std::vector<at::Tensor> moe_fused_gate_tiled_static(
-    at::Tensor& input,
-    at::Tensor& bias,
-    int64_t num_expert_group,
-    int64_t topk_group,
-    int64_t topk,
-    int64_t num_fused_shared_experts,
-    double routed_scaling_factor);
-
+#include "moe_fused_gate_tiled.h"
 #include <cfloat>
 #include <type_traits>
 template <typename T, int N>
@@ -439,15 +419,13 @@ std::vector<at::Tensor> moe_fused_gate(
     case 384:
       if (num_expert_group == 1) {
         // Static tiled specialization for THREADS_PER_ROW==1
-        return moe_fused_gate_tiled_static(
-            input, bias, num_expert_group, topk_group, topk, num_fused_shared_experts, routed_scaling_factor);
+        LAUNCH_MOE_GATE_TILED_CONFIG(384, 1, 32);
       }
       break;
     case 64:
       if (num_expert_group == 1) {
         // Static tiled specialization for THREADS_PER_ROW==1
-        return moe_fused_gate_tiled_static(
-            input, bias, num_expert_group, topk_group, topk, num_fused_shared_experts, routed_scaling_factor);
+        LAUNCH_MOE_GATE_TILED_CONFIG(64, 1, 32);
       }
       break;
     case 256:
