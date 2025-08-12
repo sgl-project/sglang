@@ -699,3 +699,8 @@ void qserve_w4a8_per_group_gemm(
  * From csrc/spatial
  */
 std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device);
+
+/*
+ * From csrc/memory
+ */
+void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
