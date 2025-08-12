@@ -44,7 +44,7 @@ if _is_npu:
     torch.cuda.graph_pool_handle = torch.npu.graph_pool_handle
 
 
-class NPUGraphRunner(CudaGraphRunner):
+class NPUGraphRunner(GraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
