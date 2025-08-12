@@ -56,14 +56,12 @@ def moe_fused_gate_kernel(scores, bias, num_expert_group, topk_group, topk):
 
 
 # Choose a sequence length sweep consistent with existing benchmark style
-seq_length_range = [5000, 10000, 15000, 20000]
+seq_length_range = [2048, 3072, 4096, 10240, 15360, 20480]
 
 # Focus on tiled-path configs (VPT > 32)
 configs = []
 configs += [(sq, 64, 1, 1, 6) for sq in seq_length_range]     # Kimi VL: VPT=64
 configs += [(sq, 384, 1, 1, 8) for sq in seq_length_range]    # Kimi K2: VPT=384
-configs += [(sq, 1024, 8, 4, 8) for sq in seq_length_range]   # VPT=128
-configs += [(sq, 2048, 8, 4, 8) for sq in seq_length_range]   # VPT=256
 
 
 def _bench_template(dtype: torch.dtype, plot_suffix: str):
