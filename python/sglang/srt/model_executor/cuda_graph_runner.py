@@ -758,11 +758,11 @@ class CudaGraphRunner:
         if enable_num_token_non_padded(self.model_runner.server_args):
             num_token_non_padded = forward_batch.num_token_non_padded
             if self.require_gathered_buffer:
-                bs_per_rank = bs // self.attn_tp_size
+                tokens_per_rank = bs // self.attn_tp_size * self.num_tokens_per_bs
                 num_local_token_non_padded = torch.clamp(
-                    num_token_non_padded - bs_per_rank * self.attn_tp_rank,
+                    num_token_non_padded - tokens_per_rank * self.attn_tp_rank,
                     min=0,
-                    max=bs_per_rank,
+                    max=tokens_per_rank,
                 )
                 self.num_token_non_padded.copy_(num_local_token_non_padded)
             else:
