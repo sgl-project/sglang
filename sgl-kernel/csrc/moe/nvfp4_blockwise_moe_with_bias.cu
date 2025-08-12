@@ -581,7 +581,7 @@ void run_fp4_blockwise_scaled_group_mm_with_bias(
   fusion_args.alpha_ptr_array = reinterpret_cast<float**>(alpha_ptrs.data_ptr());
   fusion_args.dAlpha = {_0{}, _0{}, 1};
 
-  fusion_args.bias_ptr = static_cast<const ElementC**>(bias_ptrs.data_ptr());  // Default is column bias
+  fusion_args.bias_ptr = static_cast<const ElementC**>(bias.data_ptr());  // Default is column bias
 
   // Gemm Arguments
   typename GemmKernel::Arguments args{
