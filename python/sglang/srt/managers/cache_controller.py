@@ -814,6 +814,6 @@ class HiCacheController:
                 continue
 
     def __del__(self):
-        print("CacheController is being deleted.")
         if hasattr(self.storage_backend, "unregister_buffer"):
             self.storage_backend.unregister_buffer(self.mem_pool_host.kv_buffer)
+        logger.info("HiCacheController is destroyed, all resources and thread released.")

@@ -1034,6 +1034,7 @@ class MooncakeKVManager(BaseKVManager):
             self.engine.deregister(aux_data_ptr)
 
         del self.engine
+        logger.info("MooncakeKVManager is destroyed, all resources and thread released.")
 
 
 class MooncakeKVSender(BaseKVSender):

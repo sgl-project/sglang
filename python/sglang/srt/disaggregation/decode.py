@@ -124,6 +124,11 @@ class DecodeReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
 
+    def set_prealloc_size(self, pre_alloc_size: int):
+        # if pre_alloc_size is 0, change the free_slots to right size
+        # can only be used in enable_pd_convert mode
+        self.free_slots = list(range(self.size + pre_alloc_size))
+        self.pre_alloc_size = pre_alloc_size
 
 @dataclass
 class DecodeRequest:
@@ -926,39 +931,12 @@ class SchedulerDisaggregationDecodeMixin:
         del self.disagg_decode_transfer_queue
         del self.disagg_decode_prealloc_queue
 
-        # update the DecodeReqToTokenPool to req-to-token-pool
-        pool_size = self.req_to_token_pool.size
-        pool_max_context_len = self.req_to_token_pool.max_context_len
-        pool_device = self.req_to_token_pool.device
-
-        # three place ref reqtotokenpool, all set None to release Cuda memory
-        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-        self.req_to_token_pool = None
-        self.tree_cache.req_to_token_pool = None
-        model_runner.attn_backend.model_runner = None
-        model_runner.attn_backend = None
-
-        if model_runner.cuda_graph_runner is not None:
-            model_runner.cuda_graph_runner.model_runner = None
-            set_global_graph_memory_pool(None)
-            del model_runner.cuda_graph_runner
-
-        del model_runner.req_to_token_pool
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # replace the DecodeReqToTokenPool with ReqToTokenPool
-        model_runner.req_to_token_pool = ReqToTokenPool(
-            size=pool_size,
-            max_context_len=pool_max_context_len,
-            device=pool_device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
-        )
-        model_runner.init_attention_backend()
+        # reuse the cuda graph runner for prefill to decode
         model_runner.server_args = self.server_args
+        model_runner.attn_backend.forward_metadata = None
+        self.decode_cuda_graph_runner = model_runner.cuda_graph_runner
         model_runner.init_cuda_graphs()
-        self.req_to_token_pool = model_runner.req_to_token_pool
-        self.tree_cache.req_to_token_pool = self.req_to_token_pool
+        self.req_to_token_pool.set_prealloc_size(0)
 
         # same code in ServerArgs
         if self.server_args.disaggregation_decode_dp is None:

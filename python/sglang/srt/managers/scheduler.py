@@ -2168,6 +2168,10 @@ class Scheduler(
                 not hasattr(self, "disagg_prefill_inflight_queue")
                 or len(self.disagg_prefill_inflight_queue) == 0
             )
+            and (
+                not hasattr(self, "disagg_decode_prealloc_queue")
+                or len(self.disagg_decode_prealloc_queue.queue) == 0
+            )
         ):
             self.cur_batch = None
             self.last_batch = None
@@ -2509,6 +2513,7 @@ class Scheduler(
                 self.server_args.hicache_storage_backend = (
                     recv_req.hicache_storage_backend
                 )
+                self.server_args.hicache_storage_prefetch_policy = recv_req.hicache_storage_prefetch_policy
                 self.server_args.hicache_mem_layout = recv_req.hicache_mem_layout
             # cuda graph
             self.server_args.disable_cuda_graph = True
@@ -2656,7 +2661,7 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-        if server_args.enable_pd_convert:
+        if not server_args.enable_pd_convert:
             start_scheduler_event_loop(scheduler, server_args)
         else:
             while True:

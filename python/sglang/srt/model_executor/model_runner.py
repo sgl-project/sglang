@@ -1240,6 +1240,18 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     pre_alloc_size=pre_alloc_size,
                 )
+            elif self.server_args.disaggregation_mode == "prefill" and self.server_args.enable_pd_convert:
+                from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+                
+                pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
+                self.req_to_token_pool = DecodeReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len + 4,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    pre_alloc_size=pre_alloc_size,
+                )
+                self.req_to_token_pool.set_prealloc_size(0)
             else:
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,

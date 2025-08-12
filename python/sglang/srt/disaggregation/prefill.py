@@ -644,36 +644,17 @@ class SchedulerDisaggregationPrefillMixin:
         del self.disagg_prefill_bootstrap_queue
         del self.disagg_prefill_inflight_queue
 
-        # update the req-to-token-pool to DecodeReqToTokenPool
-        pool_size = self.req_to_token_pool.size
-        pool_max_context_len = self.req_to_token_pool.max_context_len
-        pool_device = self.req_to_token_pool.device
-        pre_alloc_size = pool_size * 2 if pool_size <= 32 else 0
-
-        # set all ref to req-to-token-pool to None to release Cuda memory
-        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-        self.req_to_token_pool = None
-        self.tree_cache.req_to_token_pool = None
-        model_runner.attn_backend.model_runner = None
-        model_runner.attn_backend = None
-
-        del model_runner.req_to_token_pool
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # replace the ReqToTokenPool with DecodeReqToTokenPool
-        model_runner.req_to_token_pool = DecodeReqToTokenPool(
-            size=pool_size,
-            max_context_len=pool_max_context_len,
-            device=pool_device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
-            pre_alloc_size=pre_alloc_size,
-        )
-        model_runner.init_attention_backend()
+        # reuse the cuda graph runner
         model_runner.server_args = self.server_args
-        model_runner.init_cuda_graphs()
-        self.req_to_token_pool = model_runner.req_to_token_pool
-        self.tree_cache.req_to_token_pool = self.req_to_token_pool
+        if hasattr(self, "decode_cuda_graph_runner"):
+            model_runner.cuda_graph_runner = self.decode_cuda_graph_runner
+            del self.decode_cuda_graph_runner
+        else:
+            model_runner.init_cuda_graphs()
+        
+        max_num_reqs = self.req_to_token_pool.size
+        pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
+        self.req_to_token_pool.set_prealloc_size(pre_alloc_size)
 
         # reinitialize the disaggregation resources for decode
         self.disaggregation_mode = DisaggregationMode.DECODE
