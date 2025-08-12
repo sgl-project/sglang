@@ -1216,10 +1216,10 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 None,  # block_size
                 None,  # a1_scale
                 None,  # a2_scale
-                None,  # w1 bias
-                None,  # w3 bias
-                None,  # alpha
-                None,  # limit
+                layer.w13_bias,  # w1 bias
+                layer.w2_bias,  # w3 bias
+                1.702,  # alpha
+                7.0,  # limit
                 True,  # is_vnni
             )
 

@@ -1640,7 +1640,9 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       const int group_size = K / w1_zero.value().size(1);
-
+      // TODO: This "with_bias" is only for gptoss models,
+      //       refine this check to support common cases.
+      bool with_bias = w1_bias.has_value();
       // TODO: check scales and zeros
       fused_experts_int4_w4a16_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
@@ -1657,6 +1659,8 @@ at::Tensor fused_experts_cpu(
           w2_zero.value().data_ptr<uint8_t>(),
           w1_scale.value().data_ptr<scalar_t>(),
           w2_scale.value().data_ptr<scalar_t>(),
+          with_bias ? w1_bias.value().data_ptr<scalar_t>() : nullptr,
+          with_bias ? w2_bias.value().data_ptr<scalar_t>() : nullptr,
           group_size,
           topk_weights.data_ptr<float>(),
           sorted_ids,
@@ -1667,7 +1671,11 @@ at::Tensor fused_experts_cpu(
           K,
           E,
           topk,
-          num_tokens_post_pad);
+          num_tokens_post_pad,
+          with_bias ? float(alpha.value()) : 0,
+          with_bias ? float(limit.value()) : 0,
+          with_bias ? 2 : 1,
+          with_bias);
     } else {
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
