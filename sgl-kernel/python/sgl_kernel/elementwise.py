@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
-from sgl_kernel.utils import get_cuda_stream, is_hopper_arch, is_arch_support_pdl
+from sgl_kernel.utils import get_cuda_stream, is_arch_support_pdl, is_hopper_arch
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
