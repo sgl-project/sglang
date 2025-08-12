@@ -150,7 +150,11 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor cos_sin_cache,
     at::Tensor pos_ids,
     bool interleave,
-    int64_t cuda_stream);
+    int64_t cuda_stream,
+    const std::optional<at::Tensor>& v,
+    const std::optional<at::Tensor>& k_buffer,
+    const std::optional<at::Tensor>& v_buffer,
+    const std::optional<at::Tensor>& kv_cache_loc);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
@@ -243,8 +247,7 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
-    double routed_scaling_factor,
-    bool apply_routed_scaling_factor_on_output);
+    double routed_scaling_factor);
 
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
