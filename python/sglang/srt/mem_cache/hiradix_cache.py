@@ -71,8 +71,10 @@ class HiRadixCache(RadixCache):
         self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.enable_storage = hicache_storage_backend is not None
-        # todo: customizable storage prefetch threshold
+        # todo: customizable storage prefetch threshold and timeout
         self.prefetch_threshold = 256
+        self.prefetch_timeout = 3  # seconds
+        self.prefetch_stop_policy = hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -85,13 +87,6 @@ class HiRadixCache(RadixCache):
             io_backend=hicache_io_backend,
             storage_backend=hicache_storage_backend,
             prefetch_threshold=self.prefetch_threshold,
-        )
-
-        self.prefetch_stop_policy = hicache_storage_prefetch_policy
-        # todo: customizable storage prefetch timeout
-        self.prefetch_timeout = 3  # seconds
-        logger.info(
-            f"HiCache storage prefetch policy: {hicache_storage_prefetch_policy}"
         )
 
         # record the nodes with ongoing write through
