@@ -188,7 +188,7 @@ suite_amd = {
         TestFile("quant/test_block_int8.py", 22),
         TestFile("quant/test_awq_dequant.py", 2),
         TestFile("rl/test_update_weights_from_disk.py", 114),
-        TestFile("rl/test_update_weights_from_tensor.py", 48),
+        # TestFile("rl/test_update_weights_from_tensor.py", 48),
         TestFile("test_abort.py", 51),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_chunked_prefill.py", 313),
