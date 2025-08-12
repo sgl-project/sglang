@@ -56,7 +56,7 @@ converter = TokenToAction()
 
 def single():
     state = image_qa.run(
-        image_path="robot.jpg",
+        image_path="images/robot.jpg",
         question="In: What action should the robot take to {<INSTRUCTION>}?\nOut:",
         max_new_tokens=7,
         temperature=0,
@@ -76,7 +76,7 @@ def single():
 def batch(batch_size: int):
     arguments = [
         {
-            "image_path": "robot.jpg",
+            "image_path": "images/robot.jpg",
             "question": "In: What action should the robot take to {<INSTRUCTION>}?\nOut:",
         }
     ] * batch_size

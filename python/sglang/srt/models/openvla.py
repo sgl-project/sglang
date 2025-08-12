@@ -22,12 +22,6 @@ from sglang.srt.layers.openvla import PrismaticProjector, PrismaticVisionBackbon
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM
 
-# logger = logging.getLogger(__name__)
-
-# === PyTorch/HuggingFace Default IGNORE_INDEX (for CrossEntropyLoss labels)
-# IGNORE_INDEX = -100
-
-
 class OpenVLAConfig(PretrainedConfig):
     model_type: str = "openvla"
     is_composition: bool = False
