@@ -22,7 +22,7 @@ standard LLM support:
    to return `True` for your model.
 
 2. **Register a new chat-template**
-   See [conversation.py](https://github.com/sgl-project/sglang/blob/86a779dbe9e815c02f71ea82574608f6eae016b5/python/sglang/srt/conversation.py)
+   Check if any of the existing chat templates [conversation.py](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/conversation.py) is applicable to your model, and if not, register a new one. 
 
 3. **Multimodal Data Processor**:
    Define a new `Processor` class that inherits from `BaseMultimodalProcessor` and register this processor as your
