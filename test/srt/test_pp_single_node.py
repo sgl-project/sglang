@@ -9,6 +9,8 @@ import time
 import unittest
 from types import SimpleNamespace
 
+import requests
+
 from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
