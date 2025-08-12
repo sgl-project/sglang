@@ -2960,7 +2960,7 @@ class ConcurrentCounter:
         This suspends the calling coroutine without blocking the thread, allowing
         other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
         """
-        self.wait_for(lambda count: count == 0)
+        await self.wait_for(lambda count: count == 0)
 
 
 @lru_cache(maxsize=1)
