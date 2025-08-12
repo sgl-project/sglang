@@ -2210,6 +2210,7 @@ class ServerArgs:
             assert self.attention_backend in [
                 "triton",
                 "trtllm_mha",
+                "hip_attention",
             ], f"GptOssForCausalLM requires 'triton' or 'trtllm_mha' attention backend, but got {self.attention_backend}"
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
