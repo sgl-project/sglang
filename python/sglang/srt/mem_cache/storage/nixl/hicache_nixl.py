@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -44,6 +44,28 @@ class HiCacheNixl(HiCacheStorage):
 
         self.registration = NixlRegistration(self.agent)
 
+    def register_buffers(
+        self, buffers: Union[torch.Tensor, List[torch.Tensor]]
+    ) -> Optional[Any]:
+        """Register tensor(s) with NIXL. Can be extended to tuple mode of registration."""
+        return self.registration._register_memory(buffers)
+
+    def register_files(
+        self, file_paths: List[str], open_file: Optional[bool] = True
+    ) -> Optional[Any]:
+        """Register files with NIXL."""
+        tuples = self.file_manager.files_to_nixl_tuples(file_paths)
+        return self.registration._register_memory(tuples, "FILE")
+
+    def register_objects(
+        self, keys: List[str], sizes: Optional[List[int]] = None
+    ) -> Optional[Any]:
+        """Register objects with NIXL."""
+        if not keys:
+            return None
+        tuples = [(0, 0, key, "") for key in keys]
+        return self.registration._register_memory(tuples, "OBJ")
+
     def _execute_transfer(
         self, tensors: List[torch.Tensor], keys: List[str], direction: str
     ) -> bool:
@@ -51,52 +73,57 @@ class HiCacheNixl(HiCacheStorage):
             logger.error("Mismatch between number of tensors and files/objects")
             return False
 
-        if not self.registration.register_buffers(tensors):
-            logger.error("Failed to register tensors")
-            return False
-
-        # Get transfer tuples based on backend type
-        tensor_sizes = [tensor.element_size() * tensor.numel() for tensor in tensors]
+        # Registering file and object keys per transfer, to be updated when
+        # pre-registration for file and object is added to HiCache.
         if self.backend_selector.mem_type == "FILE":
-            file_tuples = self.file_manager.files_to_nixl_tuples(keys)
-            if not file_tuples or not self.registration.register_files(file_tuples):
+            tuples = self.file_manager.files_to_nixl_tuples(keys)
+            if not tuples or not self.registration._register_memory(tuples, "FILE"):
                 logger.error("Failed to prepare files for transfer")
                 return False
-            transfer_tuples = [
-                (x[0], s, x[2]) for x, s in zip(file_tuples, tensor_sizes)
-            ]
-        else:
-            if not self.registration.register_objects(keys, tensors):
+        else: # mem_type == "OBJ"
+            tuples = [(0, 0, key, "") for key in keys]
+            if not tuples or not self.registration._register_memory(tuples, "OBJ"):
                 logger.error("Failed to register objects")
                 return False
-            transfer_tuples = [(0, s, key) for s, key in zip(tensor_sizes, keys)]
 
+        # Prepare transfer tuples based on tensor sizes
+        tensor_sizes = [tensor.element_size() * tensor.numel() for tensor in tensors]
+        transfer_tuples = [(x[0], s, x[2]) for x, s in zip(tuples, tensor_sizes)]
+
+        # Get transfer descriptors
+        tensor_descs = self.agent.get_xfer_descs(tensors)
+        storage_descs = self.agent.get_xfer_descs(transfer_tuples, self.backend_selector.mem_type)
+
+        if (tensor_descs is None) or (storage_descs is None):
+            logger.error("Failed to get transfer descriptors")
+            return False
+
+        # Initialize transfer, default assumption that tensor was registered
         try:
-            # Get transfer descriptors
-            if (tensor_descs := self.agent.get_xfer_descs(tensors)) is None or (
-                file_descs := self.agent.get_xfer_descs(
-                    transfer_tuples, self.backend_selector.mem_type
-                )
-            ) is None:
-                logger.error("Failed to get transfer descriptors")
+            xfer_req = self.agent.initialize_xfer(direction, tensor_descs, storage_descs, self.agent_name)
+        except:
+            # Check if it was due to missing pre-registration
+            if not self.register_buffers(tensors):
+                logger.error("Failed to register tensors")
                 return False
 
-            # Initialize and execute transfer
-            if (
-                xfer_req := self.agent.initialize_xfer(
-                    direction, tensor_descs, file_descs, self.agent_name
-                )
-            ) is None:
-                logger.error("Failed to create transfer request")
+            try:
+                xfer_req = self.agent.initialize_xfer(direction, tensor_descs, storage_descs, self.agent_name)
+            except Exception as e:
+                logger.error(f"Failed to create transfer request: {e}")
                 return False
 
+        # Execute transfer and wait for its completion
+        try:
             state = self.agent.transfer(xfer_req)
             while state != "DONE":
                 state = self.agent.check_xfer_state(xfer_req)
                 if state == "ERR":
+                    self.agent.release_xfer_handle(xfer_req)
                     logger.error("Transfer failed")
                     return False
-            time.sleep(0.0001)  # Can be changed to os.sched_yield() or parametrized
+                time.sleep(0.0001)  # Can be changed to os.sched_yield() or parametrized
+            self.agent.release_xfer_handle(xfer_req)
             return True
 
         except Exception as e:
@@ -106,6 +133,9 @@ class HiCacheNixl(HiCacheStorage):
             logger.error(f"Traceback: {traceback.format_exc()}")
             return False
 
+    def set(self, key: str, value: torch.Tensor) -> bool:
+        return self.batch_set([key], [value])
+
     def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
         if not keys:
             return True
@@ -113,17 +143,15 @@ class HiCacheNixl(HiCacheStorage):
         if self.backend_selector.mem_type == "FILE":
             file_paths = []
             for key in keys:
-                tensor_path = self.file_manager.get_file_path(key)
-                if not self.file_manager.create_file(tensor_path):
-                    logger.error(f"Failed to create file {tensor_path}")
+                file_path = self.file_manager.get_file_path(key)
+                # New file per set, to be updated when partial writes is added to HiCache
+                if not self.file_manager.create_file(file_path):
+                    logger.error(f"Failed to create file {file_path}")
                     return False
-                file_paths.append(tensor_path)
+                file_paths.append(file_path)
             return self._execute_transfer(values, file_paths, "WRITE")
-        else:
+        else: # mem_type == "OBJ"
             return self._execute_transfer(values, keys, "WRITE")
-
-    def set(self, key: str, value: torch.Tensor) -> bool:
-        return self.batch_set([key], [value])
 
     def get(
         self, key: str, dst_tensor: Optional[torch.Tensor] = None
