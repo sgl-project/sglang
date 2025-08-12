@@ -392,6 +392,19 @@ class ModelRunner:
         ):  # override the default attention backend
             server_args.attention_backend = server_args.prefill_attention_backend
 
+        if (
+            getattr(self.model_config.hf_config, "dual_chunk_attention_config", None)
+            is not None
+        ):
+            if server_args.attention_backend is None:
+                server_args.attention_backend = "dual_chunk_flash_attn"
+                logger.info("Dual chunk attention is turned on by default.")
+            elif server_args.attention_backend != "dual_chunk_flash_attn":
+                raise ValueError(
+                    "Dual chunk attention is enabled, but attention backend is set to "
+                    f"{server_args.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
+                )
+
         if server_args.attention_backend is None:
             """
             Auto select the fastest attention backend.
