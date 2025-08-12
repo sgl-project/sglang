@@ -223,13 +223,11 @@ class MooncakeStore(HiCacheStorage):
 
     def exists(self, keys) -> bool | dict:
         _keys = []
-        local_rank = torch.cuda.current_device()
         for key in keys:
             if key is None:
                 return None
-            # Since mooncake store is stored in layer by layer,
-            # only the first layer is checked here.
-            _keys.append(f"{key}_{local_rank}_k")
+
+            _keys.append(f"{key}_k")
         result = {k: v for k, v in zip(keys, self.store.batch_is_exist(_keys))}
         return result
 
