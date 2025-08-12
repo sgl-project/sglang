@@ -46,8 +46,8 @@ static std::vector<int64_t> create_greenctx_stream_direct_dynamic(CUgreenCtx gct
   }
 
   CUstream streamA, streamB;
-  CUresult resultA = pfn(&streamA, gctx[0], CU_STREAM_NON_BLOCKING, 0);
-  CUresult resultB = pfn(&streamB, gctx[1], CU_STREAM_NON_BLOCKING, 0);
+  CUresult resultA = CUDA_DRV(pfn(&streamA, gctx[0], CU_STREAM_NON_BLOCKING, 0));
+  CUresult resultB = CUDA_DRV(pfn(&streamB, gctx[1], CU_STREAM_NON_BLOCKING, 0));
 
   return {(int64_t)streamA, (int64_t)streamB};
 }

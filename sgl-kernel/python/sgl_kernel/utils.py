@@ -24,25 +24,6 @@ def get_cuda_stream() -> int:
     return torch.cuda.current_stream().cuda_stream
 
 
-def get_cuda_driver_version():
-    if torch.version.cuda is not None:
-        try:
-            output = subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=driver_version",
-                    "--format=csv,noheader,nounits",
-                ]
-            )
-            print(f"{output.decode().strip()=}")
-            print(f"{output.decode().strip().split(' ')[0]=}")
-            return output.decode().strip().split(" ")[0]
-        except subprocess.SubprocessError:
-            return None
-    else:
-        return None
-
-
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 
