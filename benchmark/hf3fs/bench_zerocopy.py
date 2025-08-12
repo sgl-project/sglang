@@ -98,7 +98,7 @@ operations = [
         list(range(i, i + op_size)),
         hash_value=[f"{j}" for j in range(i, i + op_size, page_size)],
     )
-    for i in tqdm(range(0, op_num, op_size))
+    for i in tqdm(range(0, op_num * op_size, op_size))
 ]
 
 tik = time.monotonic()
@@ -118,7 +118,7 @@ operations = [
         list(range(i, i + op_size)),
         f"{i}",
     )
-    for i in tqdm(range(0, op_num, page_size))
+    for i in tqdm(range(0, op_num * op_size, op_size))
 ]
 
 for operation in operations:
