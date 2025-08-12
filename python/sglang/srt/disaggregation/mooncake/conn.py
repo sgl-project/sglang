@@ -1204,7 +1204,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             # or the KVPoll will never be set correctly
             self.target_tp_rank = self.target_tp_ranks[0]
             self.required_dst_info_num = 1
-            if self.is_mla_backend:
+            if self.kv_mgr.is_mla_backend:
                 self.required_prefill_response_num = (
                     self.prefill_pp_size // self.kv_mgr.pp_size
                 )
