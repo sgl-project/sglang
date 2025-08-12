@@ -68,14 +68,7 @@ jobs:
 
       - name: Install SGLang dependencies
         run: |
-          echo "Installing SGLang with all extras..."
-          python3 -m pip install --upgrade pip --break-system-packages
-          python3 -m pip install uv --break-system-packages
-          export UV_SYSTEM_PYTHON=true
-
-          # Use uv for faster installation with system packages
-          uv pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126 --index-strategy unsafe-best-match --break-system-packages
-          uv pip install -e "python[all]" --index-strategy unsafe-best-match --break-system-packages
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Build python binding
         run: |
