@@ -36,7 +36,7 @@ def sglang_per_token_quant_fp8(
 
 @pytest.mark.parametrize(
     "num_tokens,hidden_dim",
-    list(itertools.product([128, 256, 512], [512, 2048, 4096])),
+    list(itertools.product([128, 256, 512], [512, 1368, 2048, 4096])),
 )
 def test_per_token_quant_compare_implementations(
     num_tokens: int,

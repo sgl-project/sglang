@@ -73,6 +73,7 @@ class EAGLEWorker(TpModelWorker):
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        moe_ep_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -127,6 +128,7 @@ class EAGLEWorker(TpModelWorker):
                 tp_rank=tp_rank,
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
+                moe_ep_rank=moe_ep_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
@@ -224,6 +226,22 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner,
                 skip_prefill=False,
             )
+        elif self.server_args.attention_backend == "aiter":
+            from sglang.srt.layers.attention.aiter_backend import (
+                AiterAttnBackend,
+                AiterMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = AiterMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = AiterAttnBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
+            self.has_prefill_wrapper_verify = False
         elif self.server_args.attention_backend == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
