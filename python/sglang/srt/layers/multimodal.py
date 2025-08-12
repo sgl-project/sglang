@@ -40,11 +40,6 @@ def _fmix32(x, C1: tl.constexpr, C2: tl.constexpr):
     return x
 
 
-# @triton.jit
-# def _rotl64(x, r: tl.constexpr):
-#     return (x << r) | (x >> (64 - r))
-
-
 @triton.jit
 def hash_tiles32_kernel_blocked(
     in_ptr,
