@@ -15,7 +15,6 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/nemotron_nas.py
 
 """Inference-only deci model compatible with HuggingFace weights."""
-import logging
 from typing import Iterable, Optional, Tuple, Type, Union
 
 import torch
@@ -41,8 +40,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.llama import LlamaAttention, LlamaMLP
 from sglang.srt.utils import add_prefix, make_layers
-
-logger = logging.getLogger(__name__)
+from sglang.utils import logger
 
 
 def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:
