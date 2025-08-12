@@ -21,7 +21,6 @@ import signal
 import sys
 import threading
 import time
-from bisect import insort
 from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
@@ -1250,7 +1249,7 @@ class Scheduler(
         else:
             self._extend_to_waiting_queue(reqs)
 
-    def _extend_to_waiting_queue(self, reqs):
+    def _extend_to_waiting_queue(self, reqs: List[Req]):
         if self.use_priority_scheduling:
             heapq.heapify(self.waiting_queue)
         for req in reqs:
@@ -1261,12 +1260,13 @@ class Scheduler(
         self, recv_req: Req, heapify: bool = False
     ) -> bool:
         """Returns True if the given request can be added to the queue. If at capacity, abort incoming or existing request to free up the queue."""
-        # If no limit is configured, or the limit hasn't been reached, skip validation.
+        # If no limit is configured or the limit hasn't been reached, skip validation.
         if (
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
         ):
             return True
+        # Queued request size is at limit.
         # Reject incoming request by default.
         abort_req = AbortReq(
             recv_req.rid,
@@ -1289,7 +1289,7 @@ class Scheduler(
         self.send_to_tokenizer.send_pyobj(abort_req)
         return abort_req.rid != recv_req.rid
 
-    def _add_to_waiting_queue(self, req):
+    def _add_to_waiting_queue(self, req: Req):
         if self.use_priority_scheduling:
             heapq.heappush(self.waiting_queue, req)
         else:
