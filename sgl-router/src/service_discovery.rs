@@ -530,6 +530,7 @@ mod tests {
                     last_transition_time: None,
                     message: None,
                     reason: None,
+                    observed_generation: None,
                 };
                 pod_status.conditions = Some(vec![condition]);
             }
@@ -567,6 +568,7 @@ mod tests {
                     last_transition_time: None,
                     message: None,
                     reason: None,
+                    observed_generation: None,
                 }]),
                 ..Default::default()
             }),
@@ -580,8 +582,18 @@ mod tests {
         use crate::routers::router::Router;
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Random);
-        let router =
-            Router::new(vec![], policy, reqwest::Client::new(), 5, 1, false, None).unwrap();
+        let router = Router::new(
+            vec![],
+            policy,
+            reqwest::Client::new(),
+            5,
+            1,
+            false,
+            None,
+            crate::config::types::RetryConfig::default(),
+            crate::config::types::CircuitBreakerConfig::default(),
+        )
+        .unwrap();
         Arc::new(router) as Arc<dyn RouterTrait>
     }
 
