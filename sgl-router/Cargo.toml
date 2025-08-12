@@ -9,7 +9,12 @@ name = "sglang_router_rs"
 # Python/C binding + Rust library: Use ["cdylib", "rlib"]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "sglang-router"
+path = "src/main.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }

@@ -7,18 +7,8 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from openai_harmony import Message as OpenAIMessage
 
 from sglang.srt.conversation import generate_chat_conv
-from sglang.srt.entrypoints.harmony_utils import (
-    get_developer_message,
-    get_stop_tokens_for_assistant_actions,
-    get_streamable_parser_for_assistant,
-    get_system_message,
-    parse_chat_input,
-    parse_output_into_messages,
-    render_for_completion,
-)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -57,30 +47,12 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     def __init__(
-        self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager
+        self,
+        tokenizer_manager: TokenizerManager,
+        template_manager: TemplateManager,
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        self.use_harmony = (
-            self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
-        )
-
-        if self.use_harmony:
-            from sglang.srt.function_call.harmony_tool_parser import (
-                HarmonyToolCallParser,
-            )
-
-            self.harmony_tool_parser = HarmonyToolCallParser()
-
-        # NOTE While OpenAI's chat completion API supports browsing
-        # for some models, currently vLLM doesn't support it. Please use the
-        # Responses API instead.
-        self.supports_browsing = False
-        self.browser_tool = None
-        # NOTE: Chat completion API does not support code interpreter.
-        # Please use the Responses API instead.
-        self.supports_code_interpreter = False
-        self.python_tool = None
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -97,6 +69,18 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
+        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        server_context_length = self.tokenizer_manager.server_args.context_length
+        if (
+            max_output_tokens
+            and server_context_length
+            and max_output_tokens > server_context_length
+        ):
+            return (
+                f"max_completion_tokens is too large: {max_output_tokens}."
+                f"This model supports at most {server_context_length} completion tokens."
+            )
+
         return None
 
     def _convert_to_internal_request(
@@ -107,66 +91,43 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
-        if not self.use_harmony:
-            processed_messages = self._process_messages(request, is_multimodal)
+        processed_messages = self._process_messages(request, is_multimodal)
 
-            # Build sampling parameters
-            sampling_params = self._build_sampling_params(
-                request,
-                processed_messages.stop,
-                processed_messages.tool_call_constraint,
-            )
+        # Build sampling parameters
+        sampling_params = self._build_sampling_params(
+            request,
+            processed_messages.stop,
+            processed_messages.tool_call_constraint,
+        )
 
-            # Handle single vs multiple requests
-            if is_multimodal:
-                prompt_kwargs = {"text": processed_messages.prompt}
-            else:
-                if isinstance(processed_messages.prompt_ids, str):
-                    prompt_kwargs = {"text": processed_messages.prompt_ids}
-                else:
-                    prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-
-            adapted_request = GenerateReqInput(
-                **prompt_kwargs,
-                image_data=processed_messages.image_data,
-                video_data=processed_messages.video_data,
-                audio_data=processed_messages.audio_data,
-                sampling_params=sampling_params,
-                return_logprob=request.logprobs,
-                logprob_start_len=-1,
-                top_logprobs_num=request.top_logprobs or 0,
-                stream=request.stream,
-                return_text_in_logprobs=True,
-                modalities=processed_messages.modalities,
-                lora_path=request.lora_path,
-                bootstrap_host=request.bootstrap_host,
-                bootstrap_port=request.bootstrap_port,
-                bootstrap_room=request.bootstrap_room,
-                return_hidden_states=request.return_hidden_states,
-                rid=request.rid,
-            )
+        # Handle single vs multiple requests
+        if is_multimodal:
+            prompt_kwargs = {"text": processed_messages.prompt}
         else:
-            processed_messages, prompt_ids = self._make_request_with_harmony(request)
+            if isinstance(processed_messages.prompt_ids, str):
+                prompt_kwargs = {"text": processed_messages.prompt_ids}
+            else:
+                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
-            adapted_request = GenerateReqInput(
-                input_ids=prompt_ids,
-                sampling_params=self._build_sampling_params(
-                    request,
-                    request.stop,
-                    tool_call_constraint=None,
-                ),
-                stream=request.stream,
-                return_logprob=request.logprobs,
-                logprob_start_len=-1,
-                top_logprobs_num=request.top_logprobs or 0,
-                return_text_in_logprobs=True,
-                lora_path=request.lora_path,
-                bootstrap_host=request.bootstrap_host,
-                bootstrap_port=request.bootstrap_port,
-                bootstrap_room=request.bootstrap_room,
-                return_hidden_states=request.return_hidden_states,
-                rid=request.rid,
-            )
+        adapted_request = GenerateReqInput(
+            **prompt_kwargs,
+            image_data=processed_messages.image_data,
+            video_data=processed_messages.video_data,
+            audio_data=processed_messages.audio_data,
+            sampling_params=sampling_params,
+            return_logprob=request.logprobs,
+            logprob_start_len=-1,
+            top_logprobs_num=request.top_logprobs or 0,
+            stream=request.stream,
+            return_text_in_logprobs=True,
+            modalities=processed_messages.modalities,
+            lora_path=request.lora_path,
+            bootstrap_host=request.bootstrap_host,
+            bootstrap_port=request.bootstrap_port,
+            bootstrap_room=request.bootstrap_room,
+            return_hidden_states=request.return_hidden_states,
+            rid=request.rid,
+        )
 
         return adapted_request, request
 
@@ -251,14 +212,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 tokenize=True,
                 add_generation_prompt=True,
                 tools=tools,
+                reasoning_effort=request.reasoning_effort,
+                builtin_tools=[],
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
             )
         except Exception:
-            #  This except branch will be triggered when the chosen model
-            #  has a different tools input format that is not compatible
-            #  with openAI's apply_chat_template tool_call format, like Mistral.
+            # This except branch will be triggered when the chosen model
+            # has a different tools input format that is not compatible
+            # with openAI's apply_chat_template tool_call format, like Mistral.
             tools = (
                 [t if "function" in t else {"function": t} for t in tools]
                 if tools
@@ -269,6 +232,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 tokenize=True,
                 add_generation_prompt=True,
                 tools=tools,
+                reasoning_effort=request.reasoning_effort,
+                builtin_tools=[],
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
@@ -459,12 +424,6 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
 
-        # Harmony tracking
-        if self.use_harmony:
-            harmony_parsers = [
-                get_streamable_parser_for_assistant() for _ in range(request.n)
-            ]
-
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -511,58 +470,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
-                # Process content delta
-                if self.use_harmony:
-                    harmony_parser = harmony_parsers[index]
-
-                    new_token_ids = content["output_ids"]
-                    for token_id in new_token_ids:
-                        harmony_parser.process(token_id)
-
-                    is_final = harmony_parser.current_channel == "final"
-                    is_analysis = harmony_parser.current_channel == "analysis"
-                    delta = harmony_parser.last_content_delta or ""
-
-                    if is_analysis:
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(reasoning_content=delta),
-                            finish_reason=None,
-                        )
-                        chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            created=int(time.time()),
-                            choices=[choice_data],
-                            model=request.model,
-                        )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-                        continue
-
-                    choice_data = ChatCompletionResponseStreamChoice(
-                        index=index,
-                        delta=DeltaMessage(content=delta if delta else None),
-                        finish_reason=None,
-                        matched_stop=None,
-                        logprobs=choice_logprobs,
-                    )
-                    chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=int(time.time()),
-                        choices=[choice_data],
-                        model=request.model,
-                    )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
-                    continue
-                else:
-                    stream_buffer = stream_buffers.get(index, "")
-                    delta = content["text"][len(stream_buffer) :]
-                    stream_buffers[index] = stream_buffer + delta
+                stream_buffer = stream_buffers.get(index, "")
+                delta = content["text"][len(stream_buffer) :]
+                stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content
                 if (
                     self.tokenizer_manager.server_args.reasoning_parser
                     and request.separate_reasoning
-                    and not self.use_harmony
                 ):
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
@@ -581,27 +496,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-                if self.use_harmony and not is_final:
-                    choice_data = ChatCompletionResponseStreamChoice(
-                        index=index,
-                        delta=DeltaMessage(reasoning_content=delta),
-                        finish_reason=None,
-                    )
-                    chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=int(time.time()),
-                        choices=[choice_data],
-                        model=request.model,
-                    )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
-
                 # Handle tool calls
-                # TODO: support tool call parsing for harmony
-                if (
-                    request.tool_choice != "none"
-                    and request.tools
-                    and not self.use_harmony
-                ):
+                if request.tool_choice != "none" and request.tools:
                     async for chunk in self._process_tool_call_stream(
                         index,
                         delta,
@@ -765,76 +661,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
-            output_ids = ret_item["output_ids"]
-
-            if self.use_harmony:
-                parser = parse_output_into_messages(output_ids)
-                output_msgs = parser.messages
-                if len(output_msgs) == 0:
-                    # The generation has stopped during reasoning.
-                    is_tool_call = False
-                    reasoning_content = parser.current_content
-                    final_content = None
-                elif len(output_msgs) == 1:
-                    # The generation has stopped during final message.
-                    is_tool_call = False
-                    reasoning_content = output_msgs[0].content[0].text
-                    final_content = parser.current_content
-                else:
-                    if len(output_msgs) != 2:
-                        raise ValueError(
-                            "Expected 2 output messages (reasoning and final), "
-                            f"but got {len(output_msgs)}."
-                        )
-                    reasoning_msg, final_msg = output_msgs
-                    reasoning_content = reasoning_msg.content[0].text
-                    final_content = final_msg.content[0].text
-                    is_tool_call = final_msg.recipient is not None
-
-                if is_tool_call:
-                    # Extract tool call information from final message
-                    tool_call = (
-                        self.harmony_tool_parser.extract_tool_calls_from_message(
-                            final_msg
-                        )
-                    )
-                    tool_calls = [tool_call] if tool_call else []
-
-                    message = ChatMessage(
-                        role="assistant",
-                        reasoning_content=reasoning_content,
-                        content=None,  # Tool calls don't have regular content
-                        tool_calls=tool_calls,
-                    )
-                else:
-                    # Normal message
-                    message = ChatMessage(
-                        role="assistant",
-                        reasoning_content=reasoning_content,
-                        content=final_content,
-                    )
-
-                if is_tool_call:
-                    finish_reason_type = "tool_calls"
-                elif finish_reason:
-                    finish_reason_type = (
-                        finish_reason["type"] if finish_reason else "stop"
-                    )
-                else:
-                    finish_reason_type = "stop"
-                choice_data = ChatCompletionResponseChoice(
-                    index=idx,
-                    message=message,
-                    logprobs=choice_logprobs,
-                    finish_reason=finish_reason_type,
-                    matched_stop=(
-                        finish_reason["matched"]
-                        if finish_reason and "matched" in finish_reason
-                        else None
-                    ),
-                )
-                choices.append(choice_data)
-                continue
 
             # Handle reasoning content
             reasoning_text = None
@@ -1184,33 +1010,3 @@ class OpenAIServingChat(OpenAIServingBase):
             return f"data: {chunk.model_dump_json()}\n\n"
 
         return None
-
-    def _make_request_with_harmony(
-        self,
-        request: ChatCompletionRequest,
-    ):
-        messages: list[OpenAIMessage] = []
-
-        # Add system message.
-        # In Chat Completion API, browsing is enabled by default if the model
-        # supports it.
-        assert not self.supports_browsing
-        assert not self.supports_code_interpreter
-        sys_msg = get_system_message(
-            reasoning_effort=request.reasoning_effort,
-            browser_description=None,
-            python_description=None,
-        )
-        messages.append(sys_msg)
-
-        # Add developer message.
-        dev_msg = get_developer_message()
-        messages.append(dev_msg)
-
-        # Add user message.
-        for chat_msg in request.messages:
-            messages.append(parse_chat_input(chat_msg))
-
-        # Render prompt token ids.
-        prompt_token_ids = render_for_completion(messages)
-        return messages, prompt_token_ids
