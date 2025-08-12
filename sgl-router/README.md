@@ -116,6 +116,39 @@ python -m sglang_router.launch_router \
     --prometheus-port 9000
 ```
 
+### Retries and Circuit Breakers
+
+- Retries (regular router) are enabled by default with exponential backoff and jitter. You can tune them via CLI:
+
+```bash
+python -m sglang_router.launch_router \
+  --worker-urls http://localhost:8080 http://localhost:8081 \
+  --retry-max-retries 3 \
+  --retry-initial-backoff-ms 100 \
+  --retry-max-backoff-ms 10000 \
+  --retry-backoff-multiplier 2.0 \
+  --retry-jitter-factor 0.1
+```
+
+- Circuit Breaker defaults protect workers and auto-recover. Tune thresholds/timeouts:
+
+```bash
+python -m sglang_router.launch_router \
+  --worker-urls http://localhost:8080 http://localhost:8081 \
+  --cb-failure-threshold 5 \
+  --cb-success-threshold 2 \
+  --cb-timeout-duration-secs 30 \
+  --cb-window-duration-secs 60
+```
+
+Behavior summary:
+- Closed → Open after N consecutive failures (failure-threshold)
+- Open → HalfOpen after timeout (timeout-duration-secs)
+- HalfOpen → Closed after M consecutive successes (success-threshold)
+- Any failure in HalfOpen reopens immediately
+
+Retry predicate (regular router): retry on 408/429/500/502/503/504, otherwise return immediately. Backoff/jitter observed between attempts.
+
 ### Request ID Tracking
 
 Track requests across distributed systems with configurable headers:
