@@ -1,5 +1,3 @@
-import os
-import time
 from statistics import median
 
 import pytest
@@ -11,11 +9,11 @@ from sgl_kernel import moe_fused_gate
 def _measure_time_ms(fn, warmup: int, repeat: int) -> list[float]:
     times_ms: list[float] = []
     # Warmup
-    for _ in range(max(0, warmup)):
+    for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     # Timed runs
-    for _ in range(max(1, repeat)):
+    for _ in range(repeat):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -28,7 +26,11 @@ def _measure_time_ms(fn, warmup: int, repeat: int) -> list[float]:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
-    "num_experts,num_expert_group,topk_group,topk",
+    "seq_length",
+    [256, 1024, 4096],
+)
+@pytest.mark.parametrize(
+    "params",
     [
         # Tiled path (VPT > 32)
         (64, 1, 1, 6),      # kimi-vl: VPT=64
@@ -37,11 +39,11 @@ def _measure_time_ms(fn, warmup: int, repeat: int) -> list[float]:
         (2048, 8, 4, 8),    # VPT=256
     ],
 )
-def test_moe_fused_gate_tiled_perf(num_experts, num_expert_group, topk_group, topk):
-    # Keep the problem size moderate; allow override by env
-    seq_length = int(os.getenv("SGL_BENCH_SEQ", "2048"))
-    warmup = int(os.getenv("SGL_BENCH_WARMUP", "5"))
-    repeat = int(os.getenv("SGL_BENCH_REPEAT", "10"))
+def test_moe_fused_gate_tiled_perf(seq_length, params):
+    num_experts, num_expert_group, topk_group, topk = params
+
+    warmup = 5
+    repeat = 10
 
     dtype = torch.float32
     device = "cuda"
@@ -63,13 +65,13 @@ def test_moe_fused_gate_tiled_perf(num_experts, num_expert_group, topk_group, to
             routed_scaling_factor=1.0,
         )
 
-    # Measure
+    # Measure latency
     times_ms = _measure_time_ms(run_once, warmup=warmup, repeat=repeat)
     avg_ms = sum(times_ms) / len(times_ms)
     p50_ms = median(times_ms)
     p90_ms = sorted(times_ms)[int(0.9 * (len(times_ms) - 1))]
 
-    # Basic sanity: returns correct shapes and dtype
+    # Sanity check on outputs
     out, idx = moe_fused_gate(
         scores,
         bias,
@@ -84,10 +86,14 @@ def test_moe_fused_gate_tiled_perf(num_experts, num_expert_group, topk_group, to
     assert out.dtype == torch.float32
     assert idx.dtype in (torch.int32, torch.int64)
 
-    # Emit a concise perf line (useful in local runs; harmless in CI)
+    # Emit concise perf line to test logs
     print(
-        f"moe_fused_gate tiled perf | experts={num_experts} groups={num_expert_group} "
+        f"moe_fused_gate tiled perf | seq={seq_length} experts={num_experts} groups={num_expert_group} "
         f"topk_group={topk_group} topk={topk} | avg={avg_ms:.3f}ms p50={p50_ms:.3f}ms p90={p90_ms:.3f}ms"
     )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])
 
 
