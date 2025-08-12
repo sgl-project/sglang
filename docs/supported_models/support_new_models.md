@@ -21,8 +21,8 @@ standard LLM support:
    in [model_config.py](https://github.com/sgl-project/sglang/blob/0ab3f437aba729b348a683ab32b35b214456efc7/python/sglang/srt/configs/model_config.py#L561)
    to return `True` for your model.
 
-2. **Register a new chat-template**
-   Check if any of the existing chat templates [conversation.py](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/conversation.py) is applicable to your model, and if not, register a new one. 
+2. **Register a new chat-template**:
+   Only when your default chat-template is unable to accept images as input: Register a new chat template in [conversation.py](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/conversation.py) and the corresponding matching function.
 
 3. **Multimodal Data Processor**:
    Define a new `Processor` class that inherits from `BaseMultimodalProcessor` and register this processor as your
@@ -142,3 +142,4 @@ Add to table of supported models in [generative_models.md](https://github.com/sg
 
 By following these guidelines, you can add support for new language models and multimodal large language models in
 SGLang and ensure they are thoroughly tested and easily integrated into the system.
+
