@@ -232,7 +232,12 @@ class RotaryEmbedding(CustomOp):
                 head_size=self.head_size,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
-                fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+                # Compatible with old sgl-kernel
+                **(
+                    dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
+                    if fused_set_kv_buffer_arg is not None
+                    else None
+                ),
             )
         else:
             assert (
