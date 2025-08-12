@@ -333,6 +333,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
         if _is_cpu:
             assert (
                 _is_cpu_amx_available
@@ -341,7 +342,6 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             return
 
         layer.weight = Parameter(layer.weight.t(), requires_grad=False)
-        layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
     def create_weights(
         self,
@@ -466,6 +466,13 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight_scale = Parameter(
+            layer.w13_weight_scale.data, requires_grad=False
+        )
+        layer.w2_weight_scale = Parameter(
+            layer.w2_weight_scale.data, requires_grad=False
+        )
+
         if _is_cpu:
             assert (
                 _is_cpu_amx_available
@@ -475,12 +482,6 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
 
     def apply(
         self,

@@ -534,7 +534,6 @@ class CPUGraphRunner(GraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        assert forward_batch.seq_lens_cpu is None
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
