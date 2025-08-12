@@ -1,6 +1,6 @@
 # SGLang Router
 
-The SGLang Router is a high-performance request distribution system that intelligently routes inference requests across multiple SGLang runtime instances. It features cache-aware load balancing, fault tolerance, and support for advanced deployment patterns including data parallelism and prefill-decode disaggregation.
+The SGLang Router is a high-performance request distribution system that routes inference requests across multiple SGLang runtime instances. It features cache-aware load balancing, fault tolerance, and support for advanced deployment patterns including data parallelism and prefill-decode disaggregation.
 
 ## Key Features
 
@@ -148,11 +148,12 @@ Example with mixed policies:
 ```bash
 python -m sglang_router.launch_router \
     --pd-disaggregation \
-    --prefill http://prefill1:8000 http://prefill2:8000 \
-    --decode http://decode1:8001 http://decode2:8001 \
+    --prefill http://prefill1:8000
+    --prefill http://prefill2:8000 \
+    --decode http://decode1:8001
+    --decode http://decode2:8001 \
     --policy round_robin \
-    --prefill-policy cache_aware  # Prefill uses cache_aware
-    # Decode uses round_robin from --policy
+    --prefill-policy cache_aware  # Prefill uses cache_aware and decode uses round_robin from --policy
 ```
 
 #### PD Mode with Service Discovery
