@@ -453,7 +453,9 @@ class Llama4DecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states = self.feed_forward(hidden_states, forward_batch, use_reduce_scatter)
+        hidden_states = self.feed_forward(
+            hidden_states, forward_batch, use_reduce_scatter
+        )
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
