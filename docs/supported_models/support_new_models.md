@@ -79,9 +79,8 @@ ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerati
 
 ### Benchmark
 
-Test the new MLLM against Hugging Face models: run the [MMMU benchmark](https://github.com/sgl-project/sglang/blob/main/benchmark/mmmu/README.md) to get SGLang vs. HF Transformer accuracy comparison. \\ 
-TTFT and throughput must meet or exceed baselines (e.g., compared to vLLM or HF Transformer): https://docs.sglang.ai/developer_guide/benchmark_and_profiling.html.
-
+- **MMMU**: follow MMMU benchmark [README.md](https://github.com/sgl-project/sglang/blob/main/benchmark/mmmu/README.md) to get SGLang vs. HF Transformer accuracy comparison. The accuracy score from SGLang run should not be much lower than that from HF Transformer run. Similarly, follow https://docs.sglang.ai/developer_guide/benchmark_and_profiling.html to get performance comparison: TTFT and throughput must meet or exceed baselines (e.g., HF Transformer).
+- **Other evals**: If you ran other evals, please note the results in PR description.
 
 ## Port a Model from vLLM to SGLang
 
