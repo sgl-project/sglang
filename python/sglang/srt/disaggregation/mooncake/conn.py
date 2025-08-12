@@ -1204,9 +1204,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
             # or the KVPoll will never be set correctly
             self.target_tp_rank = self.target_tp_ranks[0]
             self.required_dst_info_num = 1
-            self.required_prefill_response_num = (
-                self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
-            ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
+            if self.is_mla_backend:
+                self.required_prefill_response_num = (
+                    self.prefill_pp_size // self.kv_mgr.pp_size
+                )
+            else:
+                self.required_prefill_response_num = (
+                    self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
+                ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
 
         if self.data_parallel_rank is not None:
             logger.debug(f"Targeting DP rank: {self.data_parallel_rank}")
