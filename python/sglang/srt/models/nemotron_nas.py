@@ -26,7 +26,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -85,7 +84,6 @@ class DeciLMDecoderLayer(nn.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False
         )
-        bias_o_proj = attention_bias
         # support internlm/internlm3-8b with qkv_bias
         if hasattr(config, "qkv_bias"):
             attention_bias = config.qkv_bias
@@ -178,13 +176,12 @@ class DeciModel(nn.Module):
             if lora_config
             else 0
         )
-        self.vocab_size = config.vocab_size + lora_vocab
-        self.org_vocab_size = config.vocab_size
+        vocab_size = config.vocab_size + lora_vocab
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
             self.embed_tokens = VocabParallelEmbedding(
-                self.vocab_size,
+                vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
                 quant_config=quant_config,
@@ -333,8 +330,6 @@ class DeciLMForCausalLM(nn.Module):
             self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         else:
             self.lm_head = PPMissingLayer()
-
-        self.sampler = Sampler()
 
     def _init_model(
         self,
