@@ -159,6 +159,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         """Test that when some batch items have images and others None, parallel expansion works correctly."""
         req = copy.deepcopy(self.base_req)
         req.text = ["Prompt 1", "Prompt 2", "Prompt 3"]
+        req.rid = ["id1", "id2", "id3"]
         req.image_data = [
             ["image1.jpg"],
             None,
@@ -311,6 +312,71 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertFalse(req.is_single)
         self.assertEqual(req.batch_size, 2)
 
+    def test_input_embeds_with_parallel_sampling(self):
+        """Test input_embeds normalization with parallel sampling (n > 1)."""
+        # Test single input_embeds with parallel sampling
+        req = GenerateReqInput(
+            input_embeds=[[0.1, 0.2]],  # single embedding vector
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+
+        # Should be converted from single to batch and then expanded
+        self.assertFalse(req.is_single)
+        self.assertEqual(len(req.input_embeds), 2)
+        # Both should be the same input_embeds
+        self.assertEqual(req.input_embeds[0], [[0.1, 0.2]])
+        self.assertEqual(req.input_embeds[1], [[0.1, 0.2]])
+
+        # Test batch input_embeds with parallel sampling
+        req = GenerateReqInput(
+            input_embeds=[[[0.1, 0.2]], [[0.3, 0.4]]], sampling_params={"n": 3}
+        )
+        req.normalize_batch_and_arguments()
+
+        # Should be expanded
+        self.assertFalse(req.is_single)
+        self.assertEqual(len(req.input_embeds), 6)
+
+        # Check that the expansion is correct
+        expected_embeds = [[[0.1, 0.2]], [[0.3, 0.4]]] * 3
+        self.assertEqual(req.input_embeds, expected_embeds)
+
+        # Test with different n values per sample (should raise error)
+        req = GenerateReqInput(
+            input_embeds=[[[0.1, 0.2]], [[0.3, 0.4]]],
+            sampling_params=[{"n": 2}, {"n": 3}],
+        )
+        with self.assertRaises(ValueError):
+            req.normalize_batch_and_arguments()
+
+    def test_input_embeds_single_to_batch_conversion(self):
+        """Test that single input_embeds are properly converted to batch when using parallel sampling."""
+        # Test the specific case that was fixed: single input_embeds with n > 1
+        req = GenerateReqInput(
+            input_embeds=[[0.1, 0.2, 0.3]], sampling_params={"n": 2}  # Single embedding
+        )
+        req.normalize_batch_and_arguments()
+
+        # Should convert single to batch and then expand
+        self.assertFalse(req.is_single)
+        self.assertEqual(len(req.input_embeds), 2)
+
+        # Both should be the same single embedding
+        self.assertEqual(req.input_embeds[0], [[0.1, 0.2, 0.3]])
+        self.assertEqual(req.input_embeds[1], [[0.1, 0.2, 0.3]])
+
+        # Test with higher n value
+        req = GenerateReqInput(input_embeds=[[0.1, 0.2, 0.3]], sampling_params={"n": 5})
+        req.normalize_batch_and_arguments()
+
+        self.assertFalse(req.is_single)
+        self.assertEqual(len(req.input_embeds), 5)
+
+        # All should be the same
+        for i in range(5):
+            self.assertEqual(req.input_embeds[i], [[0.1, 0.2, 0.3]])
+
     def test_lora_path_normalization(self):
         """Test normalization of lora_path."""
         # Test single lora_path with batch input
@@ -381,12 +447,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             logprob_start_len=[10, 5],
             top_logprobs_num=[5, 3],
             token_ids_logprob=[[7, 8, 9], [4, 5, 6]],
+            return_hidden_states=[False, False, True],
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req.return_logprob, [True, False])
         self.assertEqual(req.logprob_start_len, [10, 5])
         self.assertEqual(req.top_logprobs_num, [5, 3])
         self.assertEqual(req.token_ids_logprob, [[7, 8, 9], [4, 5, 6]])
+        self.assertEqual(req.return_hidden_states, [False, False, True])
 
     def test_custom_logit_processor_normalization(self):
         """Test normalization of custom_logit_processor."""

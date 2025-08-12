@@ -8,6 +8,8 @@ import torch
 
 kernel = torch.ops.sgl_kernel
 
+torch.manual_seed(1234)
+
 from utils import (
     BLOCK_K,
     BLOCK_N,
@@ -33,7 +35,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
     topk_weights = torch.empty(B, topk, dtype=torch.float32)
     topk_ids = torch.empty(B, topk, dtype=torch.int32)
     topk_weights, topk_ids = kernel.grouped_topk_cpu(
-        a, score, topk, renormalize, G, topk_group
+        a, score, topk, renormalize, G, topk_group, 0, None, None
     )
 
     packed_w1 = kernel.convert_weight_packed(w1) if prepack else w1
@@ -73,8 +75,8 @@ class TestFusedExperts(CustomTestCase):
     topk_int8 = [3]
 
     M_fp8 = [2, 121]
-    N_fp8 = [512]
-    K_fp8 = [256]
+    N_fp8 = [352, 512]
+    K_fp8 = [256, 320]
     E_fp8 = [8]
     topk_fp8 = [4]
 
@@ -91,9 +93,7 @@ class TestFusedExperts(CustomTestCase):
         fused_output = fused_moe(a, w1, w2, score, topk, renormalize, prepack)
 
         atol = rtol = precision[torch_output.dtype]
-        self.assertTrue(
-            torch.allclose(torch_output, fused_output, atol=atol, rtol=rtol)
-        )
+        torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
 
     def test_bf16_moe(self):
         for params in itertools.product(
@@ -171,7 +171,7 @@ class TestFusedExperts(CustomTestCase):
         # Increase the tolerance for large input shapes
         if M > 35:
             atol = rtol = 0.02
-        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
     def test_int8_moe(self):
         for params in itertools.product(
@@ -201,8 +201,14 @@ class TestFusedExperts(CustomTestCase):
         w2_fp32 = torch.randn(E, K, N)
         w2 = (w2_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
-        w1s = torch.randn(E, 2 * N // BLOCK_N, K // BLOCK_K) * factor_for_scale
-        w2s = torch.randn(E, K // BLOCK_N, N // BLOCK_K) * factor_for_scale
+        w1s = (
+            torch.randn(E, math.ceil(2 * N / BLOCK_N), math.ceil(K / BLOCK_K))
+            * factor_for_scale
+        )
+        w2s = (
+            torch.randn(E, math.ceil(K / BLOCK_N), math.ceil(N / BLOCK_K))
+            * factor_for_scale
+        )
 
         w1_scaled = scaled_weight(w1, w1s)
         w2_scaled = scaled_weight(w2, w2s)
@@ -235,7 +241,7 @@ class TestFusedExperts(CustomTestCase):
         )
 
         atol = rtol = precision[dtype]
-        self.assertTrue(torch.allclose(ref_out.bfloat16(), out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
     def test_fp8_moe(self):
         for params in itertools.product(

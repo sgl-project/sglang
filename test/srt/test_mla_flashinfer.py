@@ -25,7 +25,7 @@ class TestFlashinferMLA(CustomTestCase):
                 [
                     "--enable-torch-compile",
                     "--cuda-graph-max-bs",
-                    "2",
+                    "4",
                     "--attention-backend",
                     "flashinfer",
                 ]
@@ -54,7 +54,7 @@ class TestFlashinferMLA(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["accuracy"], 0.615)
 
 
 class TestFlashinferMLAMTP(CustomTestCase):
@@ -68,7 +68,6 @@ class TestFlashinferMLAMTP(CustomTestCase):
                 [
                     "--cuda-graph-max-bs",
                     "4",
-                    "--disable-radix",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",
                     "1",

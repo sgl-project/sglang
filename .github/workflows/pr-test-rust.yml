@@ -25,7 +25,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_rust.sh
+          bash scripts/ci/ci_install_rust.sh
 
       - name: Run fmt
         run: |
@@ -40,16 +40,31 @@ jobs:
           cd sgl-router/
           cargo test
 
+      - name: Check benchmark compilation
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          cargo check --benches
+
+      - name: Quick benchmark sanity check
+        timeout-minutes: 10
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          # Run quick benchmarks to ensure they work using Python script
+          python3 scripts/run_benchmarks.py --quick
+
   e2e-python:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install rust dependencies
         run: |
-          bash scripts/ci_install_rust.sh
+          bash scripts/ci/ci_install_rust.sh
 
       - name: Build python binding
         run: |

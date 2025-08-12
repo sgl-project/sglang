@@ -40,7 +40,7 @@ def ep_moe(
     block_shape: Optional[List[int]] = None,
 ):
     use_blockwise_fp8 = block_shape is not None
-    topk_weights, topk_ids = select_experts(
+    topk_weights, topk_ids, _ = select_experts(
         hidden_states=hidden_states,
         router_logits=router_logits,
         top_k=top_k,
@@ -84,6 +84,7 @@ def ep_moe(
         top_k,
         hidden_states.shape[1],
         BLOCK_SIZE=512,
+        use_per_token_if_dynamic=True,
     )
 
     seg_indptr_cur_rank = seg_indptr[start_expert_id : end_expert_id + 2]
@@ -181,6 +182,7 @@ def ep_moe(
         end_expert_id,
         top_k,
         hidden_states.size(1),
+        0,
         BLOCK_SIZE=512,
     )
     return output
