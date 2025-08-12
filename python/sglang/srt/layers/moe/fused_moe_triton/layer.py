@@ -847,10 +847,14 @@ class FusedMoE(torch.nn.Module):
             )
             sm.tag(final_hidden_states)
 
+        final_hidden_states = final_hidden_states[
+            ..., :origin_hidden_states_dim
+        ].contiguous()
+
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        return final_hidden_states[..., :origin_hidden_states_dim].contiguous()
+        return final_hidden_states
 
     @classmethod
     def make_expert_params_mapping(
