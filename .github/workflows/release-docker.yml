@@ -13,13 +13,13 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        cuda_version: ['12.6.1', '12.8.1']
-        build_type: ['all', 'blackwell']
-        exclude:
+        variant:
           - cuda_version: '12.6.1'
-            build_type: 'blackwell'
-          - cuda_version: '12.8.1'
             build_type: 'all'
+          - cuda_version: '12.8.1'
+            build_type: 'blackwell'
+          - cuda_version: '12.9.1'
+            build_type: 'blackwell'
     runs-on: ubuntu-latest
     steps:
       - name: Delete huge unnecessary tools folder
@@ -52,18 +52,12 @@ jobs:
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
 
-          if [ "${{ matrix.cuda_version }}" = "11.8.0" ]; then
-            cuda_tag="cu118"
-          elif [ "${{ matrix.cuda_version }}" = "12.1.1" ]; then
-            cuda_tag="cu121"
-          elif [ "${{ matrix.cuda_version }}" = "12.4.1" ]; then
-            cuda_tag="cu124"
-          elif [ "${{ matrix.cuda_version }}" = "12.5.1" ]; then
-            cuda_tag="cu125"
-          elif [ "${{ matrix.cuda_version }}" = "12.6.1" ]; then
+          if [ "${{ matrix.variant.cuda_version }}" = "12.6.1" ]; then
             cuda_tag="cu126"
-          elif [ "${{ matrix.cuda_version }}" = "12.8.1" ]; then
+          elif [ "${{ matrix.variant.cuda_version }}" = "12.8.1" ]; then
             cuda_tag="cu128"
+          elif [ "${{ matrix.variant.cuda_version }}" = "12.9.1" ]; then
+            cuda_tag="cu129"
           else
             echo "Unsupported CUDA version"
             exit 1
@@ -71,21 +65,19 @@ jobs:
 
           tag=v${version}-${cuda_tag}
 
-          if [ "${{ matrix.build_type }}" = "all" ]; then
+          if [ "${{ matrix.variant.build_type }}" = "all" ]; then
             tag_suffix=""
-          elif [ "${{ matrix.build_type }}" = "srt" ]; then
-            tag_suffix="-srt"
-          elif [ "${{ matrix.build_type }}" = "blackwell" ]; then
+          elif [ "${{ matrix.variant.build_type }}" = "blackwell" ]; then
             tag_suffix="-b200"
           else
             echo "Unsupported build type"
             exit 1
           fi
 
-          if [ "${{ matrix.cuda_version }}" = "12.6.1" ]; then
-            docker buildx build --platform linux/amd64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} -t lmsysorg/sglang:latest --no-cache .
+          if [ "${{ matrix.variant.cuda_version }}" = "12.6.1" ]; then
+            docker buildx build --platform linux/amd64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} -t lmsysorg/sglang:latest --no-cache .
           else
-            docker buildx build --platform linux/amd64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache .
+            docker buildx build --platform linux/amd64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache .
           fi
 
   publish-arm64:
@@ -93,8 +85,9 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        cuda_version: ['12.8.1']
-        build_type: ['blackwell']
+        variant:
+          - cuda_version: '12.9.1'
+            build_type: 'blackwell'
     runs-on: ubuntu-22.04-arm
     steps:
       - name: Delete huge unnecessary tools folder
@@ -115,8 +108,15 @@ jobs:
       - name: Build and Push ARM64
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
-          cuda_tag="cu128"
+
+          if [ "${{ matrix.variant.cuda_version }}" = "12.9.1" ]; then
+            cuda_tag="cu129"
+          else
+            echo "Unsupported CUDA version"
+            exit 1
+          fi
+
           tag=v${version}-${cuda_tag}
           tag_suffix="-gb200"
 
-          docker buildx build --platform linux/arm64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache .
+          docker buildx build --platform linux/arm64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache .
