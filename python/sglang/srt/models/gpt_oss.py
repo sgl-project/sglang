@@ -66,8 +66,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda, is_flashinfer_available, make_layers
 
+_is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
+
+
+if _is_cuda:
+    from sgl_kernel import FusedSetKVBufferArg
 
 
 class GptOssConfig(PretrainedConfig):
@@ -196,6 +201,32 @@ class GptOssSparseMoeBlock(nn.Module):
         return ans
 
 
+def _enable_fused_set_kv_buffer():
+    return _is_cuda
+
+
+# TODO maybe move to a model-common utils
+def _create_fused_set_kv_buffer_arg(
+    value: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+):
+    layer_id = layer.layer_id
+    token_to_kv_pool = forward_batch.token_to_kv_pool
+
+    k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+    v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+
+    return FusedSetKVBufferArg(
+        value=value,
+        k_buffer=k_buffer.view(k_buffer.shape[0], -1),
+        v_buffer=v_buffer.view(v_buffer.shape[0], -1),
+        k_scale=layer.k_scale,
+        v_scale=layer.v_scale,
+        cache_loc=forward_batch.out_cache_loc,
+    )
+
+
 class GptOssAttention(nn.Module):
     def __init__(
         self,
@@ -303,7 +334,21 @@ class GptOssAttention(nn.Module):
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            fused_set_kv_buffer_arg=(
+                _create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if _enable_fused_set_kv_buffer()
+                else None
+            ),
+        )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -311,7 +356,11 @@ class GptOssAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        attn_output = self.attn(*inner_state, sinks=self.sinks)
+        attn_output = self.attn(
+            *inner_state,
+            sinks=self.sinks,
+            save_kv_cache=not _enable_fused_set_kv_buffer(),
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
