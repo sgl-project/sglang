@@ -418,7 +418,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
           config.numAttrs = 1;
           config.attrs = attrs;
 
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(config, (void*)kernel_0, args));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, (void*)kernel_0, args));
         } else {
           dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
           dim3 nthrs(bdx, bdy);
@@ -442,7 +442,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
           config.numAttrs = 1;
           config.attrs = attrs;
 
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(config, (void*)kernel_1, args));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, (void*)kernel_1, args));
         }
       });
     });
