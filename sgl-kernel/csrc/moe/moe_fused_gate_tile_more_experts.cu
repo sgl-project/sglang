@@ -259,6 +259,154 @@ __global__ void moe_fused_gate_kernel_tiled(
   }
 }
 
+// ----------------------------------------------------------------------------
+// Static tiled kernel template (compile-time params). Currently supports
+// THREADS_PER_ROW == 1 path (no warp reductions). Can be extended later.
+// ----------------------------------------------------------------------------
+template <typename T,
+          int NUM_EXPERTS,
+          int THREADS_PER_ROW,
+          int ROWS_PER_WARP,
+          int ROWS_PER_CTA,
+          int WARPS_PER_CTA_,
+          int TILE>
+__global__ void moe_fused_gate_kernel_tiled_static(
+    const void* __restrict__ input,
+    const void* __restrict__ bias,
+    float* __restrict__ output_ptr,
+    int32_t* __restrict__ indices_ptr,
+    int64_t num_rows,
+    int64_t topk,
+    int64_t num_fused_shared_experts,
+    double routed_scaling_factor) {
+  static_assert(THREADS_PER_ROW == 1, "static tiled kernel currently supports THREADS_PER_ROW==1 only");
+  (void)WARPS_PER_CTA_;
+
+  int lane = threadIdx.x;     // 0..31
+  int warp_id = threadIdx.y;  // 0..WARPS_PER_CTA-1
+  int row_in_warp = lane;     // THREADS_PER_ROW=1 => row_in_warp = lane
+
+  int64_t thread_row = static_cast<int64_t>(blockIdx.x) * ROWS_PER_CTA +
+                       static_cast<int64_t>(warp_id) * ROWS_PER_WARP +
+                       static_cast<int64_t>(row_in_warp);
+  if (thread_row >= num_rows) return;
+
+  const T* __restrict__ input_ptr = reinterpret_cast<const T*>(input);
+  const T* __restrict__ bias_ptr = reinterpret_cast<const T*>(bias);
+
+  int64_t row_base = thread_row * NUM_EXPERTS;
+  int topk_excl_shared = static_cast<int>(topk - num_fused_shared_experts);
+  topk_excl_shared = max(0, topk_excl_shared);
+  const int MAX_TOPK = 32;
+  topk_excl_shared = min(topk_excl_shared, MAX_TOPK);
+
+  float best_choice[MAX_TOPK];
+  float best_weight[MAX_TOPK];
+  int   best_index[MAX_TOPK];
+#pragma unroll
+  for (int i = 0; i < MAX_TOPK; ++i) {
+    best_choice[i] = -FLT_MAX;
+    best_weight[i] = 0.0f;
+    best_index[i] = -1;
+  }
+
+  for (int e = 0; e < NUM_EXPERTS; ++e) {
+    float s = sigmoidf_approx(to_float(input_ptr[row_base + e]));
+    float choice = s + to_float(bias_ptr[e]);
+    if (choice > best_choice[topk_excl_shared - 1]) {
+      int j = topk_excl_shared - 1;
+      while (j > 0 && choice > best_choice[j - 1]) {
+        best_choice[j] = best_choice[j - 1];
+        best_weight[j] = best_weight[j - 1];
+        best_index[j] = best_index[j - 1];
+        --j;
+      }
+      best_choice[j] = choice;
+      best_weight[j] = s;
+      best_index[j] = e;
+    }
+  }
+
+  float real_sum = 0.0f;
+  for (int k = 0; k < topk_excl_shared; ++k) {
+    int64_t out_idx = topk * thread_row + k;
+    output_ptr[out_idx] = best_weight[k];
+    indices_ptr[out_idx] = static_cast<int32_t>(best_index[k]);
+    real_sum += best_weight[k];
+  }
+
+  if (num_fused_shared_experts > 0) {
+    float shared_w = (real_sum == 0.0f) ? 0.0f : (real_sum / static_cast<float>(routed_scaling_factor));
+    int64_t base = topk * thread_row + topk_excl_shared;
+    for (int i = 0; i < num_fused_shared_experts; ++i) {
+      indices_ptr[base + i] = static_cast<int32_t>(NUM_EXPERTS + i);
+      output_ptr[base + i] = shared_w;
+    }
+  }
+
+  if (real_sum > 0.0f) {
+    for (int i = 0; i < topk; ++i) {
+      int64_t out_idx = topk * thread_row + i;
+      output_ptr[out_idx] = output_ptr[out_idx] / real_sum;
+    }
+  }
+}
+
+// Public dispatcher for static tiled instantiations
+std::vector<at::Tensor> moe_fused_gate_tiled_static(
+    at::Tensor& input,
+    at::Tensor& bias,
+    int64_t num_expert_group,
+    int64_t topk_group,
+    int64_t topk,
+    int64_t num_fused_shared_experts,
+    double routed_scaling_factor) {
+  TORCH_CHECK(input.is_cuda(), "input must be CUDA tensor");
+  TORCH_CHECK(bias.is_cuda(), "bias must be CUDA tensor");
+  int64_t num_rows = input.size(0);
+  int64_t num_experts = input.size(1);
+
+  auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+  auto output = torch::empty({num_rows, topk}, options);
+  auto indices = torch::empty({num_rows, topk}, options.dtype(torch::kInt32));
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
+
+  // Currently: specialize (NUM_EXPERTS=384, THREADS_PER_ROW=1) with TILE=32
+  if (num_experts == 384 && num_expert_group == 1) {
+    constexpr int THREADS_PER_ROW = 1;
+    constexpr int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
+    constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;
+    int64_t rows_per_warp = ROWS_PER_WARP;
+    int64_t num_warps = (num_rows + rows_per_warp - 1) / rows_per_warp;
+    int64_t num_blocks = (num_warps + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
+
+    if (input.scalar_type() == at::kBFloat16) {
+      moe_fused_gate_kernel_tiled_static<bfloat16_t, 384, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
+          <<<num_blocks, block_dim, 0, stream>>>(
+              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
+              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
+    } else if (input.scalar_type() == at::kHalf) {
+      moe_fused_gate_kernel_tiled_static<float16_t, 384, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
+          <<<num_blocks, block_dim, 0, stream>>>(
+              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
+              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
+    } else if (input.scalar_type() == at::kFloat) {
+      moe_fused_gate_kernel_tiled_static<float32_t, 384, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA, TILE_VPT>
+          <<<num_blocks, block_dim, 0, stream>>>(
+              input.data_ptr(), bias.data_ptr(), output.data_ptr<float>(), indices.data_ptr<int32_t>(),
+              num_rows, topk, num_fused_shared_experts, routed_scaling_factor);
+    } else {
+      TORCH_CHECK(false, "Unsupported dtype for moe_fused_gate_tiled_static");
+    }
+  } else {
+    TORCH_CHECK(false, "moe_fused_gate_tiled_static: unsupported combination");
+  }
+
+  return {output, indices};
+}
+
 // Host launcher for tiled kernel. This does not auto-wire into the existing `moe_fused_gate` API.
 // Call this from the dispatcher when VPT > 32 and <= MAX_TILED_VPT.
 std::vector<at::Tensor> moe_fused_gate_tiled(

@@ -17,6 +17,16 @@ std::vector<at::Tensor> moe_fused_gate_tiled(
     int64_t num_fused_shared_experts,
     double routed_scaling_factor);
 
+// Static tiled specialization dispatcher (defined in moe_fused_gate_tile_more_experts.cu)
+std::vector<at::Tensor> moe_fused_gate_tiled_static(
+    at::Tensor& input,
+    at::Tensor& bias,
+    int64_t num_expert_group,
+    int64_t topk_group,
+    int64_t topk,
+    int64_t num_fused_shared_experts,
+    double routed_scaling_factor);
+
 #include <cfloat>
 #include <type_traits>
 template <typename T, int N>
@@ -419,18 +429,6 @@ std::vector<at::Tensor> moe_fused_gate(
       num_expert_group <= WARP_SIZE,
       "num_expert_group must be <= ", WARP_SIZE, ", but got ", num_expert_group);
 
-  // If VPT exceeds native path (32), dispatch to tiled kernel which supports larger VPT
-  if (computed_vpt > MAX_VPT) {
-    return moe_fused_gate_tiled(
-        input,
-        bias,
-        num_expert_group,
-        topk_group,
-        topk,
-        num_fused_shared_experts,
-        routed_scaling_factor);
-  }
-
   // Dispatch to templated kernel for known compile-time configurations.
   // We currently only support for:
   //   Case 1: 256 experts, with 8 or 16 groups.
@@ -438,6 +436,20 @@ std::vector<at::Tensor> moe_fused_gate(
   //   Case 3: other cases, require 8 <= num_experts / num_expert_group <= 32
   bool dispatched = false;
   switch (num_experts) {
+    case 384:
+      if (num_expert_group == 1) {
+        // Static tiled specialization for THREADS_PER_ROW==1
+        return moe_fused_gate_tiled_static(
+            input, bias, num_expert_group, topk_group, topk, num_fused_shared_experts, routed_scaling_factor);
+      }
+      break;
+    case 64:
+      if (num_expert_group == 1) {
+        // Static tiled specialization for THREADS_PER_ROW==1
+        return moe_fused_gate_tiled_static(
+            input, bias, num_expert_group, topk_group, topk, num_fused_shared_experts, routed_scaling_factor);
+      }
+      break;
     case 256:
       if (num_expert_group == 8)
         // This is deepseek v3 case. Here VPT = 256/8 = 32, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
@@ -478,6 +490,17 @@ std::vector<at::Tensor> moe_fused_gate(
       break;
     default:
       break;
+  }
+  // If VPT exceeds native path (32), dispatch to tiled kernel which supports larger VPT
+  if (computed_vpt > MAX_VPT) {
+    return moe_fused_gate_tiled(
+        input,
+        bias,
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts,
+        routed_scaling_factor);
   }
   if (!dispatched) {
     // Fallback to the dynamic kernel if none of the supported combinations match.
