@@ -76,7 +76,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.4/sgl_kernel-0.3.4+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
     fi \
  && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.4/sgl_kernel-0.3.4-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.4/sgl_kernel-0.3.4+cu129-cp310-abi3-manylinux2014_aarch64.whl --force-reinstall --no-deps ; \
     fi
 
 # Download source files
