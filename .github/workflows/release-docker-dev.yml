@@ -54,7 +54,7 @@ jobs:
             tag: blackwell
           - version: 12.9.1
             type: blackwell
-            tag: b200-cu129
+            tag: blackwell-cu129
 
     steps:
       - name: Checkout repository
@@ -90,9 +90,9 @@ jobs:
     strategy:
       matrix:
         variant:
-          - version: 12.8.1
+          - version: 12.9.1
             type: blackwell
-            tag: blackwell
+            tag: blackwell-cu129
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -121,9 +121,17 @@ jobs:
         run: |
           docker buildx build --platform linux/arm64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }}-arm64 --no-cache .
 
-  create-manifest:
+
+  create-manifests:
     runs-on: ubuntu-22.04
     needs: [build-blackwell-x86, build-blackwell-arm]
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    strategy:
+      matrix:
+        variant:
+          - tag: blackwell-cu129
+            amd64_tag: blackwell-cu129-amd64
+            arm64_tag: blackwell-cu129-arm64
     steps:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v2
@@ -132,6 +140,6 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - run: |
           docker buildx imagetools create \
-            -t lmsysorg/sglang:blackwell \
-            lmsysorg/sglang:blackwell-amd64 \
-            lmsysorg/sglang:blackwell-arm64
+            -t lmsysorg/sglang:${{ matrix.variant.tag }} \
+            lmsysorg/sglang:${{ matrix.variant.amd64_tag }} \
+            lmsysorg/sglang:${{ matrix.variant.arm64_tag }}
