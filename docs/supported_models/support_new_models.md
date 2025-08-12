@@ -142,4 +142,3 @@ Add to table of supported models in [generative_models.md](https://github.com/sg
 
 By following these guidelines, you can add support for new language models and multimodal large language models in
 SGLang and ensure they are thoroughly tested and easily integrated into the system.
-
