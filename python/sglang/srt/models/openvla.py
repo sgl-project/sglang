@@ -245,19 +245,13 @@ class OpenVLAForActionPrediction(PreTrainedModel):
         
         pt = 0
         bs = forward_batch.batch_size
-        extend_start_loc_cpu = forward_batch.extend_start_loc
-        extend_seq_lens = forward_batch.extend_seq_lens
+        extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+        extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
         prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-        # print("\nNew batch")
-        # print(f"{extend_start_loc_cpu=}")
-        # print(f"{extend_seq_lens=}")
-        # print(f"{prefix_lens_cpu=}")
 
         assert bs == len(forward_batch.mm_inputs), "Batch size doesn't match the number of image inputs, each request can have only one image."
         for i, image_input in enumerate(forward_batch.mm_inputs):
             assert len(image_input.mm_items) == 1, "OpenVLA only supports single image inputs"
-            if prefix_lens_cpu[i] > 256 + 1: # No need to patch if already computed
-                continue
             mm_item = image_input.mm_items[0]
             image_data = Image.fromarray(mm_item.feature)
             pixel_value = self.processor.process_image(image_data).to(torch.bfloat16).to(0)
@@ -270,6 +264,7 @@ class OpenVLAForActionPrediction(PreTrainedModel):
             # Supports chunked prefill
             id_start = max(pt + relative_id_image_start, extend_start_loc_cpu[i])
             id_end = min(pt + relative_id_image_end, extend_start_loc_cpu[i] + extend_seq_lens[i])
+            if id_end < 0: id_end = 0
             length = id_end - id_start
             id_image_start = 0 if prefix_lens_cpu[i] == 0 else prefix_lens_cpu[i] - 1 
             # print(f"{id_start=} {id_end=} {length=} {id_image_start=} {id_image_start + length=}")

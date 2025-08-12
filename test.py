@@ -65,7 +65,7 @@ def single():
     output_logprobs = state.get_meta_info("action")["output_token_logprobs"]
     output_ids = [logprob[1] for logprob in output_logprobs]
     latency = state.get_meta_info("action")["e2e_latency"]
-    print(f"[bs = 001] latency: {latency}, throughput: {1 / latency} actions/s")
+    print(f"[bs ={1: 03}] latency: {latency}, throughput: {1 / latency} actions/s")
 
     assert output_ids == [31888,31869,31900,31912,31823,31882,31744]
     action = converter.convert(output_ids)
@@ -87,15 +87,16 @@ def batch(batch_size: int):
         return_logprob=True
     )
     max_latency = 0
+    i = 0
     for state in states:
         output_logprobs = state.get_meta_info("action")["output_token_logprobs"]
         output_ids = [logprob[1] for logprob in output_logprobs]
-        # assert output_ids == [31888,31869,31900,31912,31823,31882,31744], f"Wrong output_ids: {output_ids}"
-        print(output_ids)
+        i+=1
+        # print(i, output_ids)
         latency = state.get_meta_info("action")["e2e_latency"]
         max_latency = max(latency, max_latency)
 
-    print(f"[bs = {batch_size: 03}] latency: {max_latency}, throughput: {batch_size / max_latency} actions/s")
+    print(f"[bs ={batch_size: 03}] latency: {max_latency}, throughput: {batch_size / max_latency} actions/s")
     return max_latency
 
 
@@ -104,7 +105,7 @@ if __name__ == "__main__":
         model_path="openvla/openvla-7b",
         tokenizer_path="openvla/openvla-7b",
         # disable_cuda_graph=True,
-        disable_radix_cache=True,
+        # disable_radix_cache=True,
         # chunked_prefill_size=-1,
         trust_remote_code=True,
     )
@@ -118,12 +119,18 @@ if __name__ == "__main__":
     sgl.flush_cache(runtime)
     single()
     sgl.flush_cache(runtime)
+    batch(2)
+    sgl.flush_cache(runtime)
+    batch(4)
+    sgl.flush_cache(runtime)
+    batch(8)
+    sgl.flush_cache(runtime)
     batch(16)
     sgl.flush_cache(runtime)
     batch(32)
     sgl.flush_cache(runtime)
     batch(64)
     sgl.flush_cache(runtime)
-    batch(100)
+    batch(128)
 
     runtime.shutdown()
