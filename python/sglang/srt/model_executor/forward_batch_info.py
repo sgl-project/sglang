@@ -247,6 +247,7 @@ class ForwardBatch:
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether lse needs to be returned
     mha_return_lse: Optional[bool] = None
+    attn_forward_method: Optional["AttnForwardMethod"] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -872,6 +873,10 @@ class ForwardBatch:
         assert isinstance(
             self.token_to_kv_pool, MLATokenToKVPool
         ), "Currently chunked prefix cache can only be used by Deepseek models"
+
+        if not any(self.extend_prefix_lens_cpu):
+            self.num_prefix_chunks = 0
+            return
 
         if self.prefix_chunk_len is not None:
             # Chunked kv cache info already prepared by prior modules
