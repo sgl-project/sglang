@@ -487,7 +487,7 @@ class EAGLEWorker(TpModelWorker):
             new_seq_lens=new_seq_lens,
             allocate_lens=old_spec_info.allocate_lens,
             verify_done=verify_done,
-            seq_lens_backup_debug=seq_lens_backup,
+            seq_lens_backup=seq_lens_backup, # This is needed. See EagleDraftInput for more details.
         )
 
         return ForwardBatchOutput(

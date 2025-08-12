@@ -1040,12 +1040,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         bs = self.batch_size()
 
         # We need this to get the correct self.seq_lens
-        # TODO: is this missing overlapping opportunities? maybe we can do old self.seq_lens + 2x needed tokens?
         if self.verify_done is not None:
             self.verify_done.synchronize()
         
         self.seq_lens_sum = self.seq_lens.sum().item()
         new_allocate_lens = self.seq_lens + alloc_len_per_eagle_decode(worker)
+        # TODO: remove assert
         assert torch.all(new_allocate_lens > self.spec_info.allocate_lens), f"new_allocate_lens={new_allocate_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
         assert torch.all(self.seq_lens <= self.spec_info.allocate_lens), f"self.seq_lens={self.seq_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
         num_needed_tokens = (
@@ -1669,10 +1669,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
-        # if self.verify_done is not None:
-        #     self.verify_done.wait()
-        # if other.verify_done is not None:
-        #     other.verify_done.wait()
 
         self.sampling_info.merge_batch(other.sampling_info)
 
@@ -1786,7 +1782,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
-            seq_lens=self.seq_lens, # not sure if needed
         )
 
     def _evict_tree_cache_if_needed(
