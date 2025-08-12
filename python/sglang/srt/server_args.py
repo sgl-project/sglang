@@ -395,7 +395,7 @@ class ServerArgs:
         # Adjust memory fraction and set kernel backends
         if self.device == "cpu":
             # On CPU the memory is shared by the numa nodes
-            n_numa_node: int = len(get_cpu_ids_by_node)
+            n_numa_node: int = len(get_cpu_ids_by_node())
             self.mem_fraction_static = round(
                 self.mem_fraction_static / max(n_numa_node, self.tp_size), 3
             )
