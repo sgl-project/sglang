@@ -399,8 +399,11 @@ std::vector<at::Tensor> moe_fused_gate(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
 
-  // Check 1: Ensure that num_experts is a power of 2.
-  TORCH_CHECK((num_experts & (num_experts - 1)) == 0, "num_experts must be a power of 2, but got ", num_experts);
+  // Check 1: Ensure that num_experts is a power of 2, except allow 384 (Kimi K2) as a special case.
+  TORCH_CHECK(
+      ((num_experts & (num_experts - 1)) == 0) || (num_experts == 384),
+      "num_experts must be a power of 2 or 384 (Kimi K2), but got ",
+      num_experts);
 
   // Check 2: Ensure that num_experts is divisible by num_expert_group. (this also means num_expert_group is power of 2)
   TORCH_CHECK(

@@ -19,6 +19,9 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
         # VPT > 32 cases to exercise tiled kernel path
         (1024, 8, 4, 8),  # VPT = 128
         (2048, 8, 4, 8),  # VPT = 256
+        # Kimi series
+        (64, 1, 1, 6),    # kimi-vl: VPT = 64
+        (384, 1, 1, 8),   # kimi-K2: VPT = 384 (special-case allowed)
     ],
 )
 @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])

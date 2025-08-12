@@ -274,7 +274,9 @@ std::vector<at::Tensor> moe_fused_gate_tiled(
   int64_t num_rows = input.size(0);
   int64_t num_experts = input.size(1);
 
-  TORCH_CHECK((num_experts & (num_experts - 1)) == 0, "num_experts must be power of 2");
+  TORCH_CHECK(
+      ((num_experts & (num_experts - 1)) == 0) || (num_experts == 384),
+      "num_experts must be power of 2 or 384 (Kimi K2)");
   TORCH_CHECK(num_experts % num_expert_group == 0, "num_experts must be divisible by num_expert_group");
   int64_t VPT = num_experts / num_expert_group;
   TORCH_CHECK(VPT <= MAX_TILED_VPT, "VPT exceeds MAX_TILED_VPT=", MAX_TILED_VPT);
