@@ -637,7 +637,7 @@ class ModelRunner:
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
         )
-        if self.device == "cpu":
+        if self.device == "cpu" and self.tp_size > 1:
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
             )

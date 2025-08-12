@@ -912,6 +912,38 @@ class FusedMoE(torch.nn.Module):
         ]
 
     @classmethod
+    def make_expert_params_mapping_fused_gptoss_gptq(
+        cls,
+        num_experts: int,
+        ckpt_gate_up_proj_name: str,
+        ckpt_down_proj_name: str,
+    ):
+        return [
+            # (param_name, weight_name, expert_id, shard_id)
+            (
+                (
+                    f"experts.w13_{param_name}"
+                    if weight_name in [ckpt_gate_up_proj_name]
+                    else f"experts.w2_{param_name}"
+                ),
+                f"experts.{weight_name}.{expert_id}.{param_name}",
+                expert_id,
+                shard_id,
+            )
+            for expert_id in range(num_experts)
+            for shard_id, weight_name, param_name in [
+                ("w13", ckpt_gate_up_proj_name, "qweight"),
+                ("w2", ckpt_down_proj_name, "qweight"),
+                ("w13", ckpt_gate_up_proj_name, "bias"),
+                ("w2", ckpt_down_proj_name, "bias"),
+                ("w13", ckpt_gate_up_proj_name, "qzeros"),
+                ("w2", ckpt_down_proj_name, "qzeros"),
+                ("w13", ckpt_gate_up_proj_name, "scales"),
+                ("w2", ckpt_down_proj_name, "scales"),
+            ]
+        ]
+
+    @classmethod
     def make_expert_input_scale_params_mapping(
         cls,
         num_experts: int,

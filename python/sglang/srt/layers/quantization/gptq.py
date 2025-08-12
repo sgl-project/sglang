@@ -878,13 +878,13 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         )
 
         if self.quant_config.group_size != -1:
-            scales_size13 = hidden_size // self.quant_config.group_size
+            scales_size13 = (hidden_size+self.quant_config.group_size-1) // self.quant_config.group_size
             w2_scales_size = (
                 intermediate_size
                 if self.quant_config.desc_act
                 else intermediate_size_per_partition
             )
-            scales_size2 = w2_scales_size // self.quant_config.group_size
+            scales_size2 = (w2_scales_size+self.quant_config.group_size-1) // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
             scales_size13 = 1
@@ -937,6 +937,30 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_scales, extra_weight_attrs)
         # dont shard the w2 scales when running act order
         set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
+        # up_proj bias
+        w13_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_bias", w13_bias)
+        set_weight_attrs(w13_bias, extra_weight_attrs)
+        # down_proj scales
+        w2_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_bias", w2_bias)
+        set_weight_attrs(w2_bias, extra_weight_attrs)
+        # dont shard the w2 scales when running act order
+        set_weight_attrs(w2_bias, {"load_full_w2": self.quant_config.desc_act})
         # up_proj scales
         w13_qzeros = torch.nn.Parameter(
             torch.empty(
