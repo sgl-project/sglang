@@ -487,7 +487,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             key_list.append(f"{key_}_k")
             key_list.append(f"{key_}_v")
         element_size = (
-            self.layer_num * self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
+            self.layer_num
+            * self.dtype.itemsize
+            * self.page_size
+            * self.head_num
+            * self.head_dim
         )
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
