@@ -377,34 +377,34 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                          \
         &config,                                                      \
         kernel_name,                                                  \
-        &q,                                                           \
-        &k,                                                           \
-        &v,                                                           \
-        &q_rope,                                                      \
-        &k_rope,                                                      \
-        &k_buffer,                                                    \
-        &v_buffer,                                                    \
-        &cos_sin_cache,                                               \
-        &pos_ids,                                                     \
-        &nnz,                                                         \
-        &num_qo_heads,                                                \
-        &num_kv_heads,                                                \
-        &rotary_dim,                                                  \
-        &q_stride_n,                                                  \
-        &q_stride_h,                                                  \
-        &k_stride_n,                                                  \
-        &k_stride_h,                                                  \
-        &v_stride_n,                                                  \
-        &v_stride_h,                                                  \
-        &q_rope_stride_n,                                             \
-        &q_rope_stride_h,                                             \
-        &k_rope_stride_n,                                             \
-        &k_rope_stride_h,                                             \
-        &k_buffer_stride_n,                                           \
-        &k_buffer_stride_h,                                           \
-        &v_buffer_stride_n,                                           \
-        &v_buffer_stride_h,                                           \
-        &kv_cache_loc));                                              \
+        q,                                                            \
+        k,                                                            \
+        v,                                                            \
+        q_rope,                                                       \
+        k_rope,                                                       \
+        k_buffer,                                                     \
+        v_buffer,                                                     \
+        cos_sin_cache,                                                \
+        pos_ids,                                                      \
+        nnz,                                                          \
+        num_qo_heads,                                                 \
+        num_kv_heads,                                                 \
+        rotary_dim,                                                   \
+        q_stride_n,                                                   \
+        q_stride_h,                                                   \
+        k_stride_n,                                                   \
+        k_stride_h,                                                   \
+        v_stride_n,                                                   \
+        v_stride_h,                                                   \
+        q_rope_stride_n,                                              \
+        q_rope_stride_h,                                              \
+        k_rope_stride_n,                                              \
+        k_rope_stride_h,                                              \
+        k_buffer_stride_n,                                            \
+        k_buffer_stride_h,                                            \
+        v_buffer_stride_n,                                            \
+        v_buffer_stride_h,                                            \
+        kv_cache_loc));                                               \
   } while (0)
 
         auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel<
