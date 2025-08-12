@@ -186,6 +186,25 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class GptOssSimpleDetector(BaseReasoningFormatDetector):
+    """
+    Detector for GPT-OSS model.
+    Assumes reasoning format:
+      (<|channel|>analysis<|message|>)*(.*)<|channel|>final<|message|>
+    Returns all the text before the <|channel|>final<|message|> tag as `reasoning_text`
+    and the rest of the text as `normal_text`.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+        # GPT-OSS is assumed to be reasoning until `</think>` token
+        super().__init__(
+            "<|channel|>analysis<|message|>",
+            "<|channel|>final<|message|>",
+            force_reasoning=True,
+            stream_reasoning=stream_reasoning,
+        )
+
+
 class GptOssDetector(BaseReasoningFormatDetector):
     """
     Detector for T4-style reasoning format.
@@ -519,6 +538,7 @@ class ReasoningParser:
         "kimi": KimiDetector,
         "step3": DeepSeekR1Detector,
         "gpt-oss": GptOssDetector,
+        "gpt-oss-simple": GptOssSimpleDetector,
     }
 
     def __init__(
