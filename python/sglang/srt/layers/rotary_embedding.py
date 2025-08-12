@@ -27,6 +27,8 @@ _is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
+else:
+    FusedSetKVBufferArg = Any
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 
