@@ -330,6 +330,13 @@ class FusedMoE(torch.nn.Module):
         if _is_cpu:
             if loaded_weight.dim() == 2:
                 shard_dim = 1
+                if not is_bias:
+                    if shard_id in {"w1", "w3"}:
+                        # non-fused version
+                        shard_size = expert_data.shape[shard_dim] // 2
+                    elif shard_id in {"w13"}:
+                        # fused version
+                        shard_size = expert_data.shape[shard_dim]
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -402,6 +409,8 @@ class FusedMoE(torch.nn.Module):
 
             if loaded_weight.dim() == 2:
                 shard_dim = 1
+                if not is_bias:
+                    shard_size = expert_data.shape[shard_dim]
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -480,7 +489,6 @@ class FusedMoE(torch.nn.Module):
                 dim2 = loaded_weight.shape[2]
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
-
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
             self._weight_loader_impl(
@@ -711,6 +719,16 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+            )
+            return
+        if "bias" in weight_name:
+            self._load_model_weight_or_group_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+                is_bias=True,
             )
             return
 

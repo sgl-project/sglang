@@ -228,6 +228,8 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        activation_alpha: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
     ):
         assert activation == "silu"
         assert inplace and not no_combine

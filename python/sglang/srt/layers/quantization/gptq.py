@@ -51,11 +51,12 @@ try:
 except ImportError:
     ops = None
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, get_bool_env_var
 
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_moe_torch_native = get_bool_env_var("SGLANG_USE_MOE_TORCH_NATIVE")
 if _is_cuda:
     from sgl_kernel import fused_marlin_moe
 elif _is_cpu and _is_cpu_amx_available:
@@ -852,6 +853,48 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         )
 
 
+def unpack_4bit_to_32bit_signed(qweight, qzeros):
+    # Unpack 4-bit values and interpret them as signed integers
+    unpacked_weights = torch.zeros(
+        (qweight.shape[0], qweight.shape[1] * 8, qweight.shape[2]),
+        dtype=torch.int8,
+        device=qweight.device,
+        requires_grad=False,
+    )
+
+    unpacked_zeros = torch.zeros(
+        (qzeros.shape[0], qzeros.shape[1], qzeros.shape[2] * 8),
+        dtype=torch.int8,
+        device=qzeros.device,
+        requires_grad=False,
+    )
+
+    for row in range(unpacked_weights.shape[1]):
+        i = row % 8
+        unpacked_weights[:, row, :] = (qweight[:, row // 8, :] >> (4 * i)) & 0xF
+
+    for col in range(unpacked_zeros.shape[2]):
+        i = col % 8
+        unpacked_zeros[:, :, col] = (qzeros[:, :, col // 8] >> (4 * i)) & 0xF
+
+    return unpacked_weights, unpacked_zeros + 1
+
+
+def dequantize_weight(qweight, qzeros, scales):
+    unpacked_qweight, unpacked_qzeros = unpack_4bit_to_32bit_signed(qweight, qzeros)
+    origin_dim = unpacked_qweight.shape[1]
+    if origin_dim % scales.shape[1] != 0:
+        new_dim1 = 128 * scales.shape[1]
+        new_unpacked_qweight = torch.zeros(unpacked_qweight.shape[0], new_dim1, unpacked_qweight.shape[2])
+        new_unpacked_qweight[:, :origin_dim, :] = unpacked_qweight
+        unpacked_qweight = new_unpacked_qweight
+    group_size = unpacked_qweight.shape[1] // scales.shape[1]
+    scales = scales.repeat_interleave(group_size, dim=1)
+    unpacked_qzeros = unpacked_qzeros.repeat_interleave(group_size, dim=1)
+    unpacked_qweight = (unpacked_qweight - unpacked_qzeros) * scales
+    unpacked_qweight = unpacked_qweight[:, :origin_dim, :]
+    return unpacked_qweight.transpose(1,2), unpacked_qzeros
+
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
     """MoE Marlin method with quantization."""
 
@@ -1029,6 +1072,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _moe_torch_native:
+            return
         if _is_cpu:
             assert (
                 _is_cpu_amx_available
@@ -1129,6 +1174,26 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         **kwargs,
     ) -> torch.Tensor:
         # Delay the import to avoid circular dependency
+        if _moe_torch_native:
+            layer.w13_weight, _ = dequantize_weight(layer.w13_qweight, layer.w13_qzeros, layer.w13_scales)
+            layer.w2_weight, _ = dequantize_weight(layer.w2_qweight, layer.w2_qzeros, layer.w2_scales)
+            layer.w13_weight = layer.w13_weight.to(x.dtype)
+            layer.w2_weight = layer.w2_weight.to(x.dtype)
+            layer.w13_weight_bias = layer.w13_bias
+            layer.w2_weight_bias = layer.w2_bias
+            from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+            return moe_forward_native(
+                layer,
+                x,
+                topk_output,
+                activation=layer.activation,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                inplace=True,
+                no_combine=False,
+                routed_scaling_factor=layer.routed_scaling_factor,
+                activation_alpha=layer.activation_alpha,
+                swiglu_limit=layer.swiglu_limit,
+            )
 
         assert activation == "silu", "Only SiLU activation is supported."
 
