@@ -363,20 +363,6 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
-  DISPATCH_SAVE_KV_CACHE(save_kv_cache, SAVE_KV_CACHE, {
-    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-      DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-        // operate on 16 Bytes at a time
-        constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
-        // how many threads needed per head_dim
-        constexpr uint32_t bdx = HEAD_DIM / vec_size;
-        // how many threads needed per block
-        uint32_t num_threads = std::max(128U, bdx);
-        // how many tokens can we process in a block
-        uint32_t bdy = num_threads / bdx;
-        // how many blocks needed to process all tokens
-        uint32_t nblks_x = (nnz + bdy - 1) / bdy;
-
 #define LAUNCH_KERNEL_RAW(kernel_name)                                \
   do {                                                                \
     cudaLaunchConfig_t config = {};                                   \
@@ -423,6 +409,20 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
         kv_cache_loc));                                               \
   } while (0)
 
+  DISPATCH_SAVE_KV_CACHE(save_kv_cache, SAVE_KV_CACHE, {
+    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+      DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+        // operate on 16 Bytes at a time
+        constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+        // how many threads needed per head_dim
+        constexpr uint32_t bdx = HEAD_DIM / vec_size;
+        // how many threads needed per block
+        uint32_t num_threads = std::max(128U, bdx);
+        // how many tokens can we process in a block
+        uint32_t bdy = num_threads / bdx;
+        // how many blocks needed to process all tokens
+        uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+
         auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel<
             SAVE_KV_CACHE,
             INTERLEAVE,
@@ -455,10 +455,9 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
           LAUNCH_KERNEL_RAW(kernel_1);
         }
       });
-
-#undef LAUNCH_KERNEL_RAW
     });
   });
+#undef LAUNCH_KERNEL_RAW
 
   return cudaSuccess;
 }
