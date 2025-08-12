@@ -74,7 +74,7 @@ class NPUGraphRunner(GraphRunner):
             cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
         )
 
-    def _zero_tensor_with_dtype(tshape):
+    def _zero_tensor_with_dtype(self, tshape):
         return torch.zeros(tshape, dtype=torch.int32)
 
     def replay(

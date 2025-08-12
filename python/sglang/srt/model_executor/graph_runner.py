@@ -390,7 +390,7 @@ class GraphRunner:
                 f"Capture cuda graph failed: {e}\n{GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-    def _zero_tensor_with_dtype(tshape):
+    def _zero_tensor_with_dtype(self, tshape):
         return torch.zeros(tshape, dtype=torch.int64)
 
     def can_run(self, forward_batch: ForwardBatch):
