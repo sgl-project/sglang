@@ -130,6 +130,7 @@ class DecodeReqToTokenPool:
         self.free_slots = list(range(self.size + pre_alloc_size))
         self.pre_alloc_size = pre_alloc_size
 
+
 @dataclass
 class DecodeRequest:
     req: Req

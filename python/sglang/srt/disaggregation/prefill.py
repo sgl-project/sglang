@@ -651,7 +651,7 @@ class SchedulerDisaggregationPrefillMixin:
             del self.decode_cuda_graph_runner
         else:
             model_runner.init_cuda_graphs()
-        
+
         max_num_reqs = self.req_to_token_pool.size
         pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
         self.req_to_token_pool.set_prealloc_size(pre_alloc_size)

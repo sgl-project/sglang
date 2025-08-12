@@ -2513,7 +2513,9 @@ class Scheduler(
                 self.server_args.hicache_storage_backend = (
                     recv_req.hicache_storage_backend
                 )
-                self.server_args.hicache_storage_prefetch_policy = recv_req.hicache_storage_prefetch_policy
+                self.server_args.hicache_storage_prefetch_policy = (
+                    recv_req.hicache_storage_prefetch_policy
+                )
                 self.server_args.hicache_mem_layout = recv_req.hicache_mem_layout
             # cuda graph
             self.server_args.disable_cuda_graph = True
