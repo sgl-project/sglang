@@ -65,7 +65,7 @@ jobs:
       - name: Install rust dependencies
         run: |
           bash scripts/ci/ci_install_rust.sh
-          
+
       - name: Install SGLang dependencies
         run: |
           sudo bash scripts/ci/ci_install_dependency.sh
