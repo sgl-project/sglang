@@ -340,6 +340,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     IdType* kv_cache_loc,
     bool interleave,
     bool save_kv_cache,
+    bool enable_pdl,
     cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
-from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
+from sgl_kernel.utils import get_cuda_stream, is_hopper_arch, is_arch_support_pdl
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -271,6 +271,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
     fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
@@ -307,6 +308,10 @@ def apply_rope_with_cos_sin_cache_inplace(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
+    if enable_pdl is None:
+        # the non-fused branch does not yet support PDL, but after we switch to our impl for that branch it will
+        enable_pdl = is_arch_support_pdl() and (fused_set_kv_buffer_arg is not None)
+
     if (a := fused_set_kv_buffer_arg) is not None:
         assert a.k_scale is None, "k_scale is not yet supported"
         assert a.v_scale is None, "v_scale is not yet supported"
@@ -323,6 +328,7 @@ def apply_rope_with_cos_sin_cache_inplace(
         cos_sin_cache,
         positions.long(),
         (not is_neox),
+        enable_pdl,
         get_cuda_stream(),
         (
             _view_3d(fused_set_kv_buffer_arg.value)
