@@ -236,7 +236,7 @@ class RotaryEmbedding(CustomOp):
                 **(
                     dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
                     if fused_set_kv_buffer_arg is not None
-                    else None
+                    else {}
                 ),
             )
         else:
