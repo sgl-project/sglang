@@ -82,6 +82,7 @@ srt_hip = [
     "sglang[runtime_common]",
     "torch",
     "petit_kernel==0.0.2",
+    "wave-lang==1.0.1",
 ]
 
 # CPU: torch wheel for CPU needs to be installed from https://download.pytorch.org/whl/cpu
