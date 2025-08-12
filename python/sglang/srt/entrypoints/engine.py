@@ -67,6 +67,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
+    get_bool_env_var,
     get_zmq_socket,
     is_cuda,
     kill_process_tree,
@@ -259,7 +260,7 @@ class Engine(EngineBase):
                     f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
                 )
 
-        logger.info(f"data_parallel_rank: {data_parallel_rank}")
+        logger.debug(f"data_parallel_rank: {data_parallel_rank}")
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -450,15 +451,20 @@ class Engine(EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[
+        if load_format == "flattened_bucket":
+            serialized_named_tensors = named_tensors
+        else:
+            serialized_named_tensors = [
                 MultiprocessingSerializer.serialize(named_tensors)
                 for _ in range(self.server_args.tp_size)
-            ],
+            ]
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
             flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
+
         return loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
@@ -492,12 +498,13 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str):
+    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
         """Load a new LoRA adapter without re-launching the engine."""
 
         obj = LoadLoRAAdapterReqInput(
             lora_name=lora_name,
             lora_path=lora_path,
+            pinned=pinned,
         )
 
         loop = asyncio.get_event_loop()
@@ -626,7 +633,6 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if not server_args.enable_symm_mem:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
-    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
@@ -641,15 +647,15 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.10",
+            "0.2.11.post1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
-    if _is_cuda:
+    if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.2",
+            "0.3.3",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

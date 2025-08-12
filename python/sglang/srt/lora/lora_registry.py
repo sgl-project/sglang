@@ -14,7 +14,6 @@
 
 
 import asyncio
-from collections import defaultdict
 from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Union
 from uuid import uuid4
@@ -28,14 +27,15 @@ class LoRARef:
     """
     Reference record for a LoRA model.
 
-    This object guarantees a unique ``lora_id`` and may include ``lora_name`` and ``lora_path``. The ID
-    eliminates conflicts from reused LoRA names or paths and can be used to generate deterministic cache
+    This object guarantees a unique ``lora_id`` and may include ``lora_name``, ``lora_path``, and ``pinned``.
+    The ID eliminates conflicts from reused LoRA names or paths and can be used to generate deterministic cache
     keys (e.g., radix cache).
     """
 
     lora_id: str = field(default_factory=lambda: uuid4().hex)
     lora_name: Optional[str] = None
     lora_path: Optional[str] = None
+    pinned: Optional[bool] = None
 
     def __post_init__(self):
         if self.lora_id is None:
@@ -105,7 +105,6 @@ class LoRARegistry:
                     f"LoRA with name {lora_name} does not exist. Loaded LoRAs: {self._registry.keys()}"
                 )
             del self._registry[lora_name]
-            del self._counters[lora_ref.lora_id]
 
         return lora_ref.lora_id
 
@@ -116,6 +115,9 @@ class LoRARegistry:
         """
 
         def _lookup(name: str) -> str:
+            if name is None:
+                return None
+
             lora_ref = self._registry.get(name, None)
             if lora_ref is None:
                 raise ValueError(
@@ -134,7 +136,11 @@ class LoRARegistry:
 
                 # Increment the counters only after all IDs are looked up.
                 await asyncio.gather(
-                    *[self._counters[id].increment(notify_all=False) for id in lora_ids]
+                    *[
+                        self._counters[id].increment(notify_all=False)
+                        for id in lora_ids
+                        if id is not None
+                    ]
                 )
                 return lora_ids
             else:
@@ -152,7 +158,11 @@ class LoRARegistry:
                 await self._counters[lora_id].decrement()
             elif isinstance(lora_id, list):
                 await asyncio.gather(
-                    *[self._counters[id].decrement() for id in lora_id]
+                    *[
+                        self._counters[id].decrement()
+                        for id in lora_id
+                        if id is not None
+                    ]
                 )
             else:
                 raise TypeError("lora_id must be either a string or a list of strings.")
@@ -168,11 +178,13 @@ class LoRARegistry:
         assert (
             lora_id not in self._registry
         ), "wait_for_unload should only be called after the LoRA adapter has been unregistered. "
-        counter = self._counters.get(lora_id)
-        if counter:
-            # Wait until no requests are using this LoRA adapter.
-            await counter.wait_for_zero()
-            del self._counters[lora_id]
+        assert (
+            lora_id in self._counters
+        ), "The LoRA ID should still have a counter if it has been registered before."
+
+        # Wait until no requests are using this LoRA adapter.
+        await self._counters[lora_id].wait_for_zero()
+        del self._counters[lora_id]
 
     def _register_adapter(self, lora_ref: LoRARef):
         """

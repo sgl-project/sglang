@@ -47,7 +47,9 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     def __init__(
-        self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager
+        self,
+        tokenizer_manager: TokenizerManager,
+        template_manager: TemplateManager,
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
@@ -67,6 +69,18 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
+        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        server_context_length = self.tokenizer_manager.server_args.context_length
+        if (
+            max_output_tokens
+            and server_context_length
+            and max_output_tokens > server_context_length
+        ):
+            return (
+                f"max_completion_tokens is too large: {max_output_tokens}."
+                f"This model supports at most {server_context_length} completion tokens."
+            )
+
         return None
 
     def _convert_to_internal_request(
@@ -81,7 +95,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Build sampling parameters
         sampling_params = self._build_sampling_params(
-            request, processed_messages.stop, processed_messages.tool_call_constraint
+            request,
+            processed_messages.stop,
+            processed_messages.tool_call_constraint,
         )
 
         # Handle single vs multiple requests
@@ -196,14 +212,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 tokenize=True,
                 add_generation_prompt=True,
                 tools=tools,
+                reasoning_effort=request.reasoning_effort,
+                builtin_tools=[],
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
             )
         except Exception:
-            #  This except branch will be triggered when the chosen model
-            #  has a different tools input format that is not compatible
-            #  with openAI's apply_chat_template tool_call format, like Mistral.
+            # This except branch will be triggered when the chosen model
+            # has a different tools input format that is not compatible
+            # with openAI's apply_chat_template tool_call format, like Mistral.
             tools = (
                 [t if "function" in t else {"function": t} for t in tools]
                 if tools
@@ -214,6 +232,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 tokenize=True,
                 add_generation_prompt=True,
                 tools=tools,
+                reasoning_effort=request.reasoning_effort,
+                builtin_tools=[],
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
@@ -277,6 +297,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
+            if self._get_enable_thinking_from_request(request):
+                prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 
         image_data = conv.image_data if conv.image_data else None
         video_data = conv.video_data if conv.video_data else None
@@ -448,7 +470,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
-                # Process content delta
                 stream_buffer = stream_buffers.get(index, "")
                 delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
@@ -502,7 +523,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(content=delta if delta else None),
+                            delta=DeltaMessage(content=delta),
                             finish_reason=None,
                             matched_stop=None,
                             logprobs=choice_logprobs,
@@ -645,9 +666,15 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_text = None
             reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
+                is_force_reasoning = (
+                    self.template_manager.force_reasoning
+                    or self._get_enable_thinking_from_request(request)
+                )
                 try:
                     parser = ReasoningParser(
-                        model_type=reasoning_parser, stream_reasoning=False
+                        model_type=reasoning_parser,
+                        stream_reasoning=False,
+                        force_reasoning=is_force_reasoning,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -810,14 +837,19 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> tuple[Optional[str], str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
+            is_force_reasoning = (
+                self.template_manager.force_reasoning
+                or self._get_enable_thinking_from_request(request)
+            )
             reasoning_parser_dict[index] = ReasoningParser(
                 self.tokenizer_manager.server_args.reasoning_parser,
                 request.stream_reasoning,
+                is_force_reasoning,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
-    def _get_enable_thinking_from_request(request: ChatCompletionRequest) -> bool:
+    def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
         """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
 
         NOTE: This parameter is only useful for models that support enable_thinking
@@ -826,7 +858,7 @@ class OpenAIServingChat(OpenAIServingBase):
         Args:
             request_obj: The request object (or an item from a list of requests).
         Returns:
-            The boolean value of 'enable_thinking' if found and not True, otherwise True.
+            The boolean value of 'enable_thinking' if found, otherwise False.
         """
         if (
             hasattr(request, "chat_template_kwargs")
@@ -834,7 +866,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.chat_template_kwargs.get("enable_thinking") is not None
         ):
             return request.chat_template_kwargs.get("enable_thinking")
-        return True
+        return False
 
     async def _process_tool_call_stream(
         self,

@@ -180,6 +180,9 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # The original sequence length without being chunked. Qwen-1M related.
+    orig_seq_lens: Optional[torch.Tensor] = None
+
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -321,6 +324,7 @@ class ForwardBatch:
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
+            orig_seq_lens=batch.orig_seq_lens,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -628,8 +632,10 @@ class ForwardBatch:
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
-            # when DP gather mode is all gather, we will use all_gather_into_tensor to gather hidden states,
-            # where transferred tokens should be padded to the same length.
+            # when DP gather mode is all gather, we will use
+            # all_gather_into_tensor to gather hidden states, where transferred
+            # tokens should be padded to the same length. We will also use
+            # reduce-scatter instead of all-reduce after MLP.
             max_num_tokens = max(global_num_tokens)
             global_num_tokens = [max_num_tokens] * sync_group_size
             buffer_len = max_num_tokens * sync_group_size
@@ -647,11 +653,29 @@ class ForwardBatch:
         else:
             num_tokens = global_num_tokens[0]
 
-        if self.forward_mode.is_decode():
-            setattr(self, "raw_bs", self.batch_size)
-            self.batch_size = num_tokens
-
         bs = self.batch_size
+
+        if self.forward_mode.is_decode():
+            if self.is_extend_in_batch and dp_padding_mode.is_max_len():
+                setattr(self, "_original_forward_mode", self.forward_mode)
+                self.forward_mode = ForwardMode.EXTEND
+                self.extend_num_tokens = bs
+                self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
+                self.extend_prefix_lens = self.seq_lens - 1
+                self.extend_start_loc = torch.arange(
+                    bs, dtype=torch.int32, device=self.seq_lens.device
+                )
+                self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
+                self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+                self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
+            else:
+                setattr(self, "_original_batch_size", self.batch_size)
+                if self.spec_info is not None:
+                    bs = self.batch_size = (
+                        num_tokens // self.spec_info.num_tokens_per_batch
+                    )
+                else:
+                    bs = self.batch_size = num_tokens
 
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
@@ -683,6 +707,7 @@ class ForwardBatch:
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
 
+        # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
@@ -706,7 +731,9 @@ class ForwardBatch:
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
 
-        bs = getattr(self, "raw_bs", self.batch_size)
+        self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
+        self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
+        bs = self.batch_size
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
