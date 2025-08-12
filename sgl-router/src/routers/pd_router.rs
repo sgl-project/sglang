@@ -1,13 +1,16 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
-
-use super::pd_types::{api_path, Bootstrap, ChatReqInput, GenerateReqInput, PDRouterError};
-use super::request_adapter::ToPdRequest;
-use crate::core::{HealthChecker, Worker, WorkerFactory, WorkerLoadGuard};
+use super::pd_types::{api_path, PDRouterError};
+use crate::config::types::{CircuitBreakerConfig as ConfigCircuitBreakerConfig, RetryConfig};
+use crate::core::{
+    is_retryable_status, CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory,
+    WorkerLoadGuard,
+};
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
-use crate::tree::Tree;
+use crate::routers::{RouterTrait, WorkerManagement};
+use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
@@ -16,9 +19,11 @@ use axum::{
     Json,
 };
 use futures_util::StreamExt;
+use reqwest::Client;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -29,34 +34,191 @@ pub struct PDRouter {
     pub decode_workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
     pub prefill_policy: Arc<dyn LoadBalancingPolicy>,
     pub decode_policy: Arc<dyn LoadBalancingPolicy>,
-    pub prefill_tree: Option<Arc<Mutex<Tree>>>,
-    pub decode_tree: Option<Arc<Mutex<Tree>>>,
     pub timeout_secs: u64,
     pub interval_secs: u64,
     pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
+    // Dedicated client for prefill fire-and-forget (non-logprob) requests
+    pub prefill_client: Client,
+    pub retry_config: RetryConfig,
+    pub circuit_breaker_config: CircuitBreakerConfig,
     _prefill_health_checker: Option<HealthChecker>,
     _decode_health_checker: Option<HealthChecker>,
 }
 
+// Request context for PD router operations
+#[derive(Clone)]
+struct PDRequestContext {
+    route: &'static str,
+    batch_size: Option<usize>,
+    is_stream: bool,
+    return_logprob: bool,
+    request_text: Option<String>,
+}
+
 impl PDRouter {
     // Dynamic worker management methods for service discovery
+
+    // Private helper method to perform health check on a new server
+    async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
+        crate::routers::router::Router::wait_for_healthy_workers(
+            &[url.to_string()],
+            self.timeout_secs,
+            self.interval_secs,
+        )
+        .await
+        .map_err(|_| PDRouterError::HealthCheckFailed {
+            url: url.to_string(),
+        })
+    }
+
+    // Generic helper for processing all workers with an endpoint
+    async fn process_workers(
+        &self,
+        workers: &RwLock<Vec<Box<dyn Worker>>>,
+        worker_type: &str,
+        endpoint: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut results = Vec::new();
+        let mut errors = Vec::new();
+
+        // Get worker URLs first to avoid holding lock across await
+        let urls = match workers.read() {
+            Ok(workers) => workers
+                .iter()
+                .map(|w| w.url().to_string())
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                errors.push(format!("Failed to access {} workers", worker_type));
+                Vec::new()
+            }
+        };
+
+        // Process each worker
+        for worker_url in urls {
+            let url = format!("{}/{}", worker_url, endpoint);
+            match self.client.post(&url).send().await {
+                Ok(res) if res.status().is_success() => {
+                    results.push(format!("{} {}: OK", worker_type, worker_url));
+                }
+                Ok(res) => {
+                    errors.push(format!(
+                        "{} {} returned status: {}",
+                        worker_type,
+                        worker_url,
+                        res.status()
+                    ));
+                }
+                Err(e) => {
+                    errors.push(format!("{} {} error: {}", worker_type, worker_url, e));
+                }
+            }
+        }
+
+        (results, errors)
+    }
+
+    // Helper to get worker URLs from a worker collection
+    fn get_worker_urls(
+        workers: &RwLock<Vec<Box<dyn Worker>>>,
+        worker_type: &str,
+    ) -> Result<Vec<String>, String> {
+        workers
+            .read()
+            .map(|workers| {
+                workers
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|_| format!("Failed to access {} workers", worker_type))
+    }
+
+    // Generic helper for proxying requests to the first worker
+    async fn proxy_to_first_worker(
+        &self,
+        workers: &RwLock<Vec<Box<dyn Worker>>>,
+        endpoint: &str,
+        worker_type: &str,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Response {
+        // Get first worker URL to avoid holding lock across await
+        let first_worker_url = match workers.read() {
+            Ok(workers) => workers.first().map(|w| w.url().to_string()),
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to access {} workers", worker_type),
+                )
+                    .into_response();
+            }
+        };
+
+        if let Some(worker_url) = first_worker_url {
+            let url = format!("{}/{}", worker_url, endpoint);
+            let mut request_builder = self.client.get(&url);
+
+            // Add headers if provided
+            if let Some(headers) = headers {
+                for (name, value) in headers {
+                    request_builder = request_builder.header(name, value);
+                }
+            }
+
+            match request_builder.send().await {
+                Ok(res) if res.status().is_success() => match res.bytes().await {
+                    Ok(body) => (StatusCode::OK, body).into_response(),
+                    Err(e) => {
+                        error!("Failed to read response body: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to read response body: {}", e),
+                        )
+                            .into_response()
+                    }
+                },
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    (
+                        status,
+                        format!("{} server returned status: {}", worker_type, res.status()),
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    error!("Failed to proxy request to {} server: {}", worker_type, e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to proxy request: {}", e),
+                    )
+                        .into_response()
+                }
+            }
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("No {} servers available", worker_type),
+            )
+                .into_response()
+        }
+    }
+
     pub async fn add_prefill_server(
         &self,
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
-        crate::routers::router::Router::wait_for_healthy_workers(
-            &[url.clone()],
-            self.timeout_secs,
-            self.interval_secs,
-        )
-        .map_err(|_| PDRouterError::HealthCheckFailed { url: url.clone() })?;
+        self.wait_for_server_health(&url).await?;
 
-        // Create Worker for the new prefill server
-        let worker = WorkerFactory::create_prefill(url.clone(), bootstrap_port);
+        // Create Worker for the new prefill server with circuit breaker configuration
+        let worker = WorkerFactory::create_prefill_with_config(
+            url.clone(),
+            bootstrap_port,
+            self.circuit_breaker_config.clone(),
+        );
 
         // Add to prefill workers list
         let mut workers = self
@@ -73,9 +235,14 @@ impl PDRouter {
 
         workers.push(worker);
 
-        // Add to cache tree if using cache-aware policy for prefill
-        if let Some(ref tree) = self.prefill_tree {
-            tree.lock().unwrap().insert("", &url);
+        // Update cache-aware policy if applicable
+        drop(workers); // Release write lock
+        if let Some(cache_policy) = self
+            .prefill_policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache_policy.add_worker(&url);
         }
 
         info!("Added prefill server: {}", url);
@@ -84,15 +251,13 @@ impl PDRouter {
 
     pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
-        crate::routers::router::Router::wait_for_healthy_workers(
-            &[url.clone()],
-            self.timeout_secs,
-            self.interval_secs,
-        )
-        .map_err(|_| PDRouterError::HealthCheckFailed { url: url.clone() })?;
+        self.wait_for_server_health(&url).await?;
 
-        // Create Worker for the new decode server
-        let worker = WorkerFactory::create_decode(url.clone());
+        // Create Worker for the new decode server with circuit breaker configuration
+        let worker = WorkerFactory::create_decode_with_config(
+            url.clone(),
+            self.circuit_breaker_config.clone(),
+        );
 
         // Add to decode workers list
         let mut workers = self
@@ -109,9 +274,14 @@ impl PDRouter {
 
         workers.push(worker);
 
-        // Add to cache tree if using cache-aware policy for decode
-        if let Some(ref tree) = self.decode_tree {
-            tree.lock().unwrap().insert("", &url);
+        // Update cache-aware policy if applicable
+        drop(workers); // Release write lock
+        if let Some(cache_policy) = self
+            .decode_policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache_policy.add_worker(&url);
         }
 
         info!("Added decode server: {}", url);
@@ -136,9 +306,13 @@ impl PDRouter {
             });
         }
 
-        // Remove from cache tree if using cache-aware policy
-        if let Some(ref tree) = self.prefill_tree {
-            tree.lock().unwrap().remove_tenant(url);
+        // Remove from cache-aware policy if applicable
+        if let Some(cache_policy) = self
+            .prefill_policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache_policy.remove_worker(url);
         }
 
         info!("Removed prefill server: {}", url);
@@ -163,16 +337,20 @@ impl PDRouter {
             });
         }
 
-        // Remove from the cache tree if using cache-aware policy for decode
-        if let Some(ref tree) = self.decode_tree {
-            tree.lock().unwrap().remove_tenant(url);
+        // Remove from cache-aware policy if applicable
+        if let Some(cache_policy) = self
+            .decode_policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache_policy.remove_worker(url);
         }
 
         info!("Removed decode server: {}", url);
         Ok(format!("Successfully removed decode server: {}", url))
     }
 
-    pub fn new(
+    pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
         prefill_policy: Arc<dyn LoadBalancingPolicy>,
@@ -180,16 +358,28 @@ impl PDRouter {
         client: Client,
         timeout_secs: u64,
         interval_secs: u64,
+        retry_config: RetryConfig,
+        circuit_breaker_config: ConfigCircuitBreakerConfig,
     ) -> Result<Self, String> {
+        // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
+        let core_cb_config = CircuitBreakerConfig {
+            failure_threshold: circuit_breaker_config.failure_threshold,
+            success_threshold: circuit_breaker_config.success_threshold,
+            timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
+            window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
+        };
+
         // Convert URLs to Worker trait objects
         let prefill_workers: Vec<Box<dyn Worker>> = prefill_urls
             .into_iter()
-            .map(|(url, port)| WorkerFactory::create_prefill(url, port))
+            .map(|(url, port)| {
+                WorkerFactory::create_prefill_with_config(url, port, core_cb_config.clone())
+            })
             .collect();
 
         let decode_workers: Vec<Box<dyn Worker>> = decode_urls
             .into_iter()
-            .map(WorkerFactory::create_decode)
+            .map(|url| WorkerFactory::create_decode_with_config(url, core_cb_config.clone()))
             .collect();
 
         // Wait for PD workers to be healthy (skip if empty - for service discovery mode)
@@ -203,14 +393,24 @@ impl PDRouter {
                 &all_urls,
                 timeout_secs,
                 interval_secs,
-            )?;
+            )
+            .await?;
         }
 
-        // Initialize cache-aware components if needed for prefill policy
-        let prefill_tree = Self::initialize_radix_tree(&prefill_policy, &prefill_workers)?;
+        // Initialize cache-aware policies with workers
+        if let Some(cache_policy) = prefill_policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache_policy.init_workers(&prefill_workers);
+        }
 
-        // Initialize cache-aware components if needed for decode policy
-        let decode_tree = Self::initialize_radix_tree(&decode_policy, &decode_workers)?;
+        if let Some(cache_policy) = decode_policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache_policy.init_workers(&decode_workers);
+        }
 
         // Set up background load monitoring for power-of-two selection
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
@@ -248,302 +448,251 @@ impl PDRouter {
         let decode_health_checker =
             crate::core::start_health_checker(Arc::clone(&decode_workers), interval_secs);
 
+        // Build a dedicated prefill client for fire-and-forget semantics
+        let prefill_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .http1_only()
+            .connect_timeout(Duration::from_millis(300))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|e| format!("Failed to build prefill client: {}", e))?;
+
         Ok(PDRouter {
             prefill_workers,
             decode_workers,
             prefill_policy,
             decode_policy,
-            prefill_tree,
-            decode_tree,
             timeout_secs,
             interval_secs,
             worker_loads,
             load_monitor_handle,
             client,
+            prefill_client,
+            retry_config,
+            circuit_breaker_config: core_cb_config,
             _prefill_health_checker: Some(prefill_health_checker),
             _decode_health_checker: Some(decode_health_checker),
         })
     }
 
-    // Helper function to initialize radix tree for cache-aware policies
-    fn initialize_radix_tree(
-        policy: &Arc<dyn LoadBalancingPolicy>,
-        workers: &[Box<dyn Worker>],
-    ) -> Result<Option<Arc<Mutex<Tree>>>, String> {
-        if let Some(cache_policy) = policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            // Initialize the policy's internal tree with workers
-            cache_policy.init_workers(workers);
+    // Helper to handle server selection errors
+    fn handle_server_selection_error(error: String) -> Response {
+        error!("Failed to select PD pair error={}", error);
+        RouterMetrics::record_pd_error("server_selection");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("No available servers: {}", error),
+        )
+            .into_response()
+    }
 
-            let tree = Arc::new(Mutex::new(Tree::new()));
+    // Helper to handle serialization errors
+    fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
+        error!("Failed to serialize request error={}", error);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to serialize request",
+        )
+            .into_response()
+    }
 
-            {
-                let tree_guard = tree
-                    .lock()
-                    .map_err(|e| format!("Failed to lock tree: {}", e))?;
-                for worker in workers {
-                    tree_guard.insert("", worker.url());
+    // Helper to determine batch size from a GenerateRequest
+    fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
+        // Check prompt array
+        if let Some(prompt) = &req.prompt {
+            if let crate::openai_api_types::StringOrArray::Array(arr) = prompt {
+                if !arr.is_empty() {
+                    return Some(arr.len());
                 }
             }
+        }
+        // Check text array
+        if let Some(text) = &req.text {
+            if text.contains("[") && text.contains("]") {
+                // This is a simplified check - in reality we'd need to parse JSON
+                return None; // For now, fall back to non-batch
+            }
+        }
+        None
+    }
 
-            Ok(Some(tree))
+    // Helper to determine batch size from a ChatCompletionRequest
+    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
+        // Check 'n' parameter for multiple responses
+        if let Some(n) = req.n {
+            if n > 1 {
+                return Some(n as usize);
+            }
+        }
+        None
+    }
+
+    // Helper to determine batch size from a CompletionRequest
+    fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
+        // Check prompt array
+        if let crate::openai_api_types::StringOrArray::Array(arr) = &req.prompt {
+            if !arr.is_empty() {
+                return Some(arr.len());
+            }
+        }
+        None
+    }
+
+    // Helper to inject bootstrap fields into an existing JSON request value
+    fn inject_bootstrap_into_value(
+        mut original: Value,
+        prefill_worker: &dyn Worker,
+        batch_size: Option<usize>,
+    ) -> Result<Value, String> {
+        let bootstrap_port = match prefill_worker.worker_type() {
+            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+        let hostname = super::pd_types::get_hostname(prefill_worker.url());
+
+        let obj = original
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+
+        if let Some(n) = batch_size {
+            let mut hosts = Vec::with_capacity(n);
+            let mut ports = Vec::with_capacity(n);
+            let mut rooms = Vec::with_capacity(n);
+            for _ in 0..n {
+                hosts.push(hostname.clone());
+                ports.push(bootstrap_port);
+                rooms.push(super::pd_types::generate_room_id());
+            }
+            obj.insert(
+                "bootstrap_host".to_string(),
+                Value::Array(hosts.into_iter().map(serde_json::Value::from).collect()),
+            );
+            obj.insert(
+                "bootstrap_port".to_string(),
+                Value::Array(
+                    ports
+                        .into_iter()
+                        .map(|p| match p {
+                            Some(v) => serde_json::Value::from(v),
+                            None => Value::Null,
+                        })
+                        .collect(),
+                ),
+            );
+            obj.insert(
+                "bootstrap_room".to_string(),
+                Value::Array(rooms.into_iter().map(serde_json::Value::from).collect()),
+            );
         } else {
-            Ok(None)
+            obj.insert(
+                "bootstrap_host".to_string(),
+                serde_json::Value::from(hostname),
+            );
+            obj.insert(
+                "bootstrap_port".to_string(),
+                match bootstrap_port {
+                    Some(v) => serde_json::Value::from(v),
+                    None => Value::Null,
+                },
+            );
+            obj.insert(
+                "bootstrap_room".to_string(),
+                serde_json::Value::from(super::pd_types::generate_room_id()),
+            );
         }
+        Ok(original)
     }
 
-    // Route a typed generate request
-    pub async fn route_generate(
+    // Execute the dual dispatch to prefill and decode servers with retries and bootstrap injection
+    async fn execute_dual_dispatch<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
-        mut typed_req: GenerateReqInput,
-        route: &str,
+        original_request: &T,
+        context: PDRequestContext,
     ) -> Response {
-        let start = Instant::now();
+        let start_time = Instant::now();
 
-        // Get stream flag and return_logprob flag before moving the request
-        let is_stream = typed_req.stream;
-        let return_logprob = typed_req
-            .other
-            .get("return_logprob")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let route = context.route;
+        RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            // Operation per attempt
+            {
+                let original_request = original_request.clone();
+                move |attempt: u32| {
+                    let original_request = original_request.clone();
+                    let context = context.clone();
+                    async move {
+                        // Select workers fresh for each attempt
+                        let (prefill, decode) =
+                            match self.select_pd_pair(context.request_text.as_deref()).await {
+                                Ok(pair) => pair,
+                                Err(e) => {
+                                    RouterMetrics::record_pd_error("server_selection");
+                                    return Self::handle_server_selection_error(e);
+                                }
+                            };
 
-        // Extract text for cache-aware routing from the typed request
-        let request_text = typed_req.text.as_ref().and_then(|t| match t {
-            super::pd_types::InputText::Single(s) => Some(s.as_str()),
-            super::pd_types::InputText::Batch(v) => v.first().map(|s| s.as_str()),
-        });
+                        debug!(
+                            "PD retry attempt {} using prefill={} decode={}",
+                            attempt,
+                            prefill.url(),
+                            decode.url()
+                        );
 
-        // Select servers
-        let (prefill, decode) = match self.select_pd_pair(request_text).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                error!("Failed to select PD pair error={}", e);
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("No available servers: {}", e),
-                )
-                    .into_response();
-            }
-        };
+                        // Serialize the original request
+                        let mut json_request = match serde_json::to_value(&original_request) {
+                            Ok(v) => v,
+                            Err(e) => return Self::handle_serialization_error(e),
+                        };
 
-        // Log routing decision
-        info!(
-            "PD routing decision route={} prefill_url={} decode_url={}",
-            route,
-            prefill.url(),
-            decode.url()
-        );
+                        // Inject bootstrap based on current prefill worker
+                        json_request = match Self::inject_bootstrap_into_value(
+                            json_request,
+                            prefill.as_ref(),
+                            context.batch_size,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => return Self::handle_serialization_error(e),
+                        };
 
-        // Add bootstrap info using the trait method
-        if let Err(e) = typed_req.add_bootstrap_info(prefill.as_ref()) {
-            error!("Failed to add bootstrap info error={}", e);
-            RouterMetrics::record_pd_error("bootstrap_injection");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Bootstrap injection failed: {}", e),
-            )
-                .into_response();
-        }
+                        // Execute the actual dual dispatch
+                        let response = self
+                            .execute_dual_dispatch_internal(
+                                headers,
+                                json_request,
+                                context.route,
+                                prefill.as_ref(),
+                                decode.as_ref(),
+                                context.is_stream,
+                                context.return_logprob,
+                                start_time,
+                            )
+                            .await;
 
-        // Convert to JSON after bootstrap injection
-        let json_with_bootstrap = match serde_json::to_value(&typed_req) {
-            Ok(json) => json,
-            Err(e) => {
-                error!("Failed to serialize request error={}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to serialize request",
-                )
-                    .into_response();
-            }
-        };
+                        // Record outcomes for circuit breakers
+                        let is_success = response.status().is_success();
+                        prefill.record_outcome(is_success);
+                        decode.record_outcome(is_success);
 
-        // Execute dual dispatch
-        self.execute_dual_dispatch(
-            headers,
-            json_with_bootstrap,
-            route,
-            prefill.as_ref(),
-            decode.as_ref(),
-            is_stream,
-            return_logprob,
-            start,
+                        response
+                    }
+                }
+            },
+            // Should retry predicate
+            |res, _attempt| is_retryable_status(res.status()),
+            // On backoff hook
+            |delay, attempt| {
+                RouterMetrics::record_retry(route);
+                RouterMetrics::record_retry_backoff_duration(delay, attempt);
+            },
+            // On exhausted hook
+            || RouterMetrics::record_retries_exhausted(route),
         )
         .await
     }
 
-    // Route a typed chat request
-    pub async fn route_chat(
-        &self,
-        headers: Option<&HeaderMap>,
-        mut typed_req: ChatReqInput,
-        route: &str,
-    ) -> Response {
-        let start = Instant::now();
-
-        // Get stream flag and return_logprob flag before moving the request
-        let is_stream = typed_req.stream;
-        let return_logprob = typed_req
-            .other
-            .get("return_logprob")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        // Extract text for cache-aware routing from chat messages
-        let request_text = typed_req
-            .other
-            .get("messages")
-            .and_then(|messages| messages.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|msg| msg.get("content"))
-            .and_then(|content| content.as_str());
-
-        // Select servers
-        let (prefill, decode) = match self.select_pd_pair(request_text).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                error!("Failed to select PD pair error={}", e);
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("No available servers: {}", e),
-                )
-                    .into_response();
-            }
-        };
-
-        // Log routing decision
-        info!(
-            "PD routing decision route={} prefill_url={} decode_url={}",
-            route,
-            prefill.url(),
-            decode.url()
-        );
-
-        // Add bootstrap info using the trait method
-        if let Err(e) = typed_req.add_bootstrap_info(prefill.as_ref()) {
-            error!("Failed to add bootstrap info error={}", e);
-            RouterMetrics::record_pd_error("bootstrap_injection");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Bootstrap injection failed: {}", e),
-            )
-                .into_response();
-        }
-
-        // Convert to JSON after bootstrap injection
-        let json_with_bootstrap = match serde_json::to_value(&typed_req) {
-            Ok(json) => json,
-            Err(e) => {
-                error!("Failed to serialize request error={}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to serialize request",
-                )
-                    .into_response();
-            }
-        };
-
-        // Execute dual dispatch
-        self.execute_dual_dispatch(
-            headers,
-            json_with_bootstrap,
-            route,
-            prefill.as_ref(),
-            decode.as_ref(),
-            is_stream,
-            return_logprob,
-            start,
-        )
-        .await
-    }
-
-    // Route a completion request while preserving OpenAI format
-    pub async fn route_completion(
-        &self,
-        headers: Option<&HeaderMap>,
-        mut typed_req: CompletionRequest,
-        route: &str,
-    ) -> Response {
-        let start = Instant::now();
-
-        // Get stream flag and return_logprob flag before moving the request
-        let is_stream = typed_req.stream;
-        let return_logprob = typed_req.logprobs.is_some();
-
-        // Extract text for cache-aware routing from the typed request
-        let request_text = match &typed_req.prompt {
-            crate::openai_api_types::StringOrArray::String(s) => Some(s.as_str()),
-            crate::openai_api_types::StringOrArray::Array(arr) => arr.first().map(|s| s.as_str()),
-        };
-
-        // Select servers
-        let (prefill, decode) = match self.select_pd_pair(request_text).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                error!("Failed to select PD pair error={}", e);
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("No available servers: {}", e),
-                )
-                    .into_response();
-            }
-        };
-
-        // Log routing decision
-        info!(
-            "PD routing decision route={} prefill_url={} decode_url={}",
-            route,
-            prefill.url(),
-            decode.url()
-        );
-
-        // Add bootstrap info using the trait method
-        if let Err(e) = typed_req.add_bootstrap_info(prefill.as_ref()) {
-            error!("Failed to add bootstrap info error={}", e);
-            RouterMetrics::record_pd_error("bootstrap_injection");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Bootstrap injection failed: {}", e),
-            )
-                .into_response();
-        }
-
-        // Convert to JSON after bootstrap injection
-        let json_with_bootstrap = match serde_json::to_value(&typed_req) {
-            Ok(json) => json,
-            Err(e) => {
-                error!("Failed to serialize request error={}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to serialize request",
-                )
-                    .into_response();
-            }
-        };
-
-        // Execute dual dispatch
-        self.execute_dual_dispatch(
-            headers,
-            json_with_bootstrap,
-            route,
-            prefill.as_ref(),
-            decode.as_ref(),
-            is_stream,
-            return_logprob,
-            start,
-        )
-        .await
-    }
-
-    // Execute the dual dispatch to prefill and decode servers
-    async fn execute_dual_dispatch(
+    // Internal method that performs the actual dual dispatch (without retry logic)
+    async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
         json_request: Value,
@@ -557,264 +706,229 @@ impl PDRouter {
         // Update load tracking for both workers
         let _guard = WorkerLoadGuard::new_multi(vec![prefill, decode]);
 
-        // Build requests using .json() method
-        let mut prefill_request = self
-            .client
-            .post(api_path(prefill.url(), route))
-            .json(&json_request);
-
-        let mut decode_request = self
-            .client
-            .post(api_path(decode.url(), route))
-            .json(&json_request);
-
-        // Copy headers from original request (excluding content-type and content-length which are set by .json())
-        if let Some(headers) = headers {
-            for (name, value) in headers.iter() {
-                let name_str = name.as_str();
-                if name_str != "content-type" && name_str != "content-length" {
-                    // Skip headers with non-ASCII values
-                    if value.to_str().is_ok() {
-                        prefill_request = prefill_request.header(name, value);
-                        decode_request = decode_request.header(name, value);
-                    }
-                }
-            }
-        }
+        // Build decode request with shared client
+        let decode_request = self.build_post_with_headers(
+            &self.client,
+            decode.url(),
+            route,
+            &json_request,
+            headers,
+            false,
+        );
 
         // Send both requests concurrently
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        debug!(
+            "Sending concurrent requests to prefill={} decode={}",
+            prefill.url(),
+            decode.url()
+        );
 
-        // Update metrics
-        let duration = start_time.elapsed();
-        RouterMetrics::record_pd_request_duration(route, duration);
-        RouterMetrics::record_pd_request(route);
-        RouterMetrics::record_pd_prefill_request(prefill.url());
-        RouterMetrics::record_pd_decode_request(decode.url());
+        if return_logprob {
+            // Build prefill request with shared client when we need response body
+            let prefill_request = self.build_post_with_headers(
+                &self.client,
+                prefill.url(),
+                route,
+                &json_request,
+                headers,
+                false,
+            );
+            // When we need logprobs, wait for both responses
+            let (prefill_result, decode_result) =
+                tokio::join!(prefill_request.send(), decode_request.send());
+            debug!("Received responses from both servers");
 
-        // Process decode response
-        match decode_result {
-            Ok(res) => {
-                let status = StatusCode::from_u16(res.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            // Update metrics
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_request_duration(route, duration);
+            RouterMetrics::record_pd_request(route);
+            RouterMetrics::record_pd_prefill_request(prefill.url());
+            RouterMetrics::record_pd_decode_request(decode.url());
 
-                if !status.is_success() {
-                    RouterMetrics::record_pd_decode_error(decode.url());
-                    error!(
-                        "Decode server returned error status decode_url={} status={}",
-                        decode.url(),
-                        status
-                    );
+            // Process decode response with prefill for logprobs
+            debug!("Processing decode response with logprobs");
+            match decode_result {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    debug!("Decode response status: {}", status);
 
-                    // Return the error response from decode server
-                    match res.bytes().await {
-                        Ok(error_body) => {
-                            return (status, error_body).into_response();
-                        }
-                        Err(e) => {
-                            return (status, format!("Decode server error: {}", e)).into_response();
+                    if !status.is_success() {
+                        RouterMetrics::record_pd_decode_error(decode.url());
+                        error!(
+                            "Decode server returned error status decode_url={} status={}",
+                            decode.url(),
+                            status
+                        );
+
+                        // Return the error response from decode server
+                        match res.bytes().await {
+                            Ok(error_body) => {
+                                return (status, error_body).into_response();
+                            }
+                            Err(e) => {
+                                return (status, format!("Decode server error: {}", e))
+                                    .into_response();
+                            }
                         }
                     }
-                }
 
-                // Log prefill errors for debugging
-                if let Err(e) = &prefill_result {
-                    error!(
-                        "Prefill server failed (non-critical) prefill_url={} error={}",
-                        prefill.url(),
-                        e
-                    );
-                    RouterMetrics::record_pd_prefill_error(prefill.url());
-                }
+                    // Process prefill response for logprobs
+                    let prefill_body = match self
+                        .process_prefill_response(prefill_result, prefill.url(), return_logprob)
+                        .await
+                    {
+                        Ok((_, body)) => body,
+                        Err(error_response) => return error_response,
+                    };
 
-                if is_stream {
-                    // Streaming response
-                    if return_logprob {
-                        // Get prefill logprobs for merging
-                        let prefill_logprobs =
-                            match prefill_result {
-                                Ok(prefill_res) => match prefill_res.bytes().await {
-                                    Ok(body) => serde_json::from_slice::<Value>(&body)
-                                        .ok()
-                                        .and_then(|json| {
-                                            json.pointer("/meta_info/input_token_logprobs").cloned()
-                                        }),
-                                    Err(_) => None,
-                                },
-                                Err(_) => None,
-                            };
+                    if is_stream {
+                        // Streaming response with logprobs
+                        let prefill_logprobs = prefill_body
+                            .as_ref()
+                            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+                            .and_then(|json| {
+                                json.pointer("/meta_info/input_token_logprobs").cloned()
+                            });
 
-                        // Stream with logprob merging
-                        let stream = res.bytes_stream();
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-                        tokio::spawn(async move {
-                            let mut stream = stream;
-                            while let Some(chunk_result) = stream.next().await {
-                                match chunk_result {
-                                    Ok(chunk) => {
-                                        // Try to merge logprobs
-                                        if let Ok(merged) = Self::merge_streaming_logprobs(
-                                            prefill_logprobs.clone(),
-                                            &chunk,
-                                        ) {
-                                            if tx.send(Ok(merged)).is_err() {
-                                                break;
-                                            }
-                                        } else {
-                                            if tx.send(Ok(chunk)).is_err() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(Err(format!("Stream error: {}", e)));
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-
-                        let stream = UnboundedReceiverStream::new(rx);
-                        let body = Body::from_stream(stream);
-
-                        let mut response = Response::new(body);
-                        *response.status_mut() = status;
-                        response
-                            .headers_mut()
-                            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-                        response
+                        Self::create_streaming_response(
+                            res.bytes_stream(),
+                            status,
+                            prefill_logprobs,
+                            return_logprob,
+                            None,
+                        )
                     } else {
-                        // No logprob merging needed
-                        let stream = res.bytes_stream();
-                        let decode_url = decode.url().to_string();
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-                        tokio::spawn(async move {
-                            let mut stream = stream;
-                            while let Some(chunk) = stream.next().await {
-                                match chunk {
-                                    Ok(bytes) => {
-                                        if tx.send(Ok(bytes)).is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "Stream error from decode server {}: {}",
-                                            decode_url, e
-                                        );
-                                        RouterMetrics::record_pd_stream_error(&decode_url);
-                                        let _ = tx.send(Err(format!("Stream error: {}", e)));
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-
-                        let stream = UnboundedReceiverStream::new(rx);
-                        let body = Body::from_stream(stream);
-
-                        let mut response = Response::new(body);
-                        *response.status_mut() = status;
-                        response
-                            .headers_mut()
-                            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-                        response
-                    }
-                } else {
-                    // Non-streaming response
-                    match res.bytes().await {
-                        Ok(decode_body) => {
-                            if return_logprob {
-                                self.merge_logprobs(prefill_result, decode_body, status)
-                                    .await
-                            } else {
-                                (status, decode_body).into_response()
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to read decode response: {}", e);
-                            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
-                                .into_response()
-                        }
+                        // Non-streaming response with logprobs
+                        self.process_non_streaming_response(
+                            res,
+                            status,
+                            return_logprob,
+                            prefill_body,
+                        )
+                        .await
                     }
                 }
+                Err(e) => {
+                    error!(
+                        decode_url = %decode.url(),
+                        error = %e,
+                        "Decode request failed"
+                    );
+                    RouterMetrics::record_pd_decode_error(decode.url());
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Decode server error: {}", e),
+                    )
+                        .into_response()
+                }
             }
-            Err(e) => {
-                error!(
-                    decode_url = %decode.url(),
-                    error = %e,
-                    "Decode request failed"
-                );
-                RouterMetrics::record_pd_decode_error(decode.url());
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Decode server error: {}", e),
+        } else {
+            // When we don't need logprobs, only wait for decode response
+            // Send both requests concurrently but don't wait for prefill
+            // Use dedicated prefill client with Connection: close
+            let prefill_future = self
+                .build_post_with_headers(
+                    &self.prefill_client,
+                    prefill.url(),
+                    route,
+                    &json_request,
+                    headers,
+                    true,
                 )
-                    .into_response()
-            }
-        }
-    }
+                .send();
+            let decode_future = decode_request.send();
 
-    // Merge logprobs from prefill and decode responses
-    async fn merge_logprobs(
-        &self,
-        prefill_result: Result<reqwest::Response, reqwest::Error>,
-        decode_body: bytes::Bytes,
-        status: StatusCode,
-    ) -> Response {
-        match prefill_result {
-            Ok(prefill_res) => {
-                match prefill_res.bytes().await {
-                    Ok(prefill_body) => {
-                        match (
-                            serde_json::from_slice::<Value>(&prefill_body),
-                            serde_json::from_slice::<Value>(&decode_body),
-                        ) {
-                            (Ok(prefill_json), Ok(mut decode_json)) => {
-                                // Merge input_token_logprobs
-                                if let (Some(prefill_meta), Some(decode_meta)) = (
-                                    prefill_json.get("meta_info"),
-                                    decode_json.get_mut("meta_info"),
-                                ) {
-                                    if let (Some(prefill_logprobs), Some(decode_logprobs)) = (
-                                        prefill_meta.get("input_token_logprobs"),
-                                        decode_meta.get_mut("input_token_logprobs"),
-                                    ) {
-                                        if let (Some(p_arr), Some(d_arr)) = (
-                                            prefill_logprobs.as_array(),
-                                            decode_logprobs.as_array(),
-                                        ) {
-                                            let mut merged = p_arr.clone();
-                                            merged.extend(d_arr.clone());
-                                            decode_meta["input_token_logprobs"] =
-                                                Value::Array(merged);
-                                        }
-                                    }
-                                }
-                                let mut response = Json(decode_json).into_response();
-                                *response.status_mut() = status;
-                                response
+            tokio::spawn(async move {
+                if let Ok(response) = prefill_future.await {
+                    // Consume at most one small chunk with a very short timeout to advance flow control
+                    let _ = tokio::time::timeout(Duration::from_millis(20), async {
+                        let mut s = response.bytes_stream();
+                        let _ = s.next().await;
+                    })
+                    .await;
+                }
+            });
+
+            // Wait only for decode response
+            let decode_result = decode_future.await;
+            debug!("Received decode response");
+
+            // Update metrics
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_request_duration(route, duration);
+            RouterMetrics::record_pd_request(route);
+            RouterMetrics::record_pd_prefill_request(prefill.url());
+            RouterMetrics::record_pd_decode_request(decode.url());
+
+            // Process decode response immediately
+            debug!("Processing decode response (no logprobs)");
+            match decode_result {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    debug!("Decode response status: {}", status);
+
+                    if !status.is_success() {
+                        RouterMetrics::record_pd_decode_error(decode.url());
+                        error!(
+                            "Decode server returned error status decode_url={} status={}",
+                            decode.url(),
+                            status
+                        );
+
+                        // Return the error response from decode server
+                        match res.bytes().await {
+                            Ok(error_body) => (status, error_body).into_response(),
+                            Err(e) => {
+                                (status, format!("Decode server error: {}", e)).into_response()
                             }
-                            _ => {
-                                warn!("Failed to parse responses for logprob merging");
-                                (status, decode_body).into_response()
+                        }
+                    } else if is_stream {
+                        // Streaming response without logprobs - direct passthrough
+                        let decode_url = decode.url().to_string();
+                        Self::create_streaming_response(
+                            res.bytes_stream(),
+                            status,
+                            None,
+                            false,
+                            Some(decode_url),
+                        )
+                    } else {
+                        // Non-streaming response without logprobs - direct passthrough like fast version
+                        match res.bytes().await {
+                            Ok(decode_body) => (status, decode_body).into_response(),
+                            Err(e) => {
+                                error!("Failed to read decode response: {}", e);
+                                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
+                                    .into_response()
                             }
                         }
                     }
-                    Err(e) => {
-                        warn!("Failed to read prefill response: {}", e);
-                        (status, decode_body).into_response()
-                    }
+                }
+                Err(e) => {
+                    error!(
+                        decode_url = %decode.url(),
+                        error = %e,
+                        "Decode request failed"
+                    );
+                    RouterMetrics::record_pd_decode_error(decode.url());
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Decode server error: {}", e),
+                    )
+                        .into_response()
                 }
             }
-            Err(_) => (status, decode_body).into_response(),
         }
     }
 
-    // Select a pair of prefill and decode servers
+    // Check if either prefill or decode policy needs request text
+    fn policies_need_request_text(&self) -> bool {
+        self.prefill_policy.needs_request_text() || self.decode_policy.needs_request_text()
+    }
+
+    // Select a pair of prefill and decode servers considering circuit breaker state
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
@@ -829,29 +943,58 @@ impl PDRouter {
             .read()
             .map_err(|e| format!("Failed to acquire decode workers lock: {}", e))?;
 
-        // Check we have workers
-        if prefill_workers.is_empty() {
-            return Err("No prefill workers available. Please check if prefill servers are configured and healthy.".to_string());
-        }
-        if decode_workers.is_empty() {
-            return Err("No decode workers available. Please check if decode servers are configured and healthy.".to_string());
-        }
+        // Select workers using helper function
+        let prefill = Self::pick_worker_by_policy(
+            &*prefill_workers,
+            &*self.prefill_policy,
+            request_text,
+            "prefill",
+        )?;
 
-        // Select prefill worker using prefill policy
-        let prefill_idx = self
-            .prefill_policy
-            .select_worker(&prefill_workers, request_text)
-            .ok_or("Failed to select prefill worker")?;
+        let decode = Self::pick_worker_by_policy(
+            &*decode_workers,
+            &*self.decode_policy,
+            request_text,
+            "decode",
+        )?;
 
-        // Select decode worker using decode policy
-        let decode_idx = self
-            .decode_policy
-            .select_worker(&decode_workers, request_text)
-            .ok_or("Failed to select decode worker")?;
-
-        let prefill = prefill_workers[prefill_idx].clone_worker();
-        let decode = decode_workers[decode_idx].clone_worker();
         Ok((prefill, decode))
+    }
+
+    // Helper function to select a worker using the policy
+    fn pick_worker_by_policy(
+        workers: &[Box<dyn Worker>],
+        policy: &dyn LoadBalancingPolicy,
+        request_text: Option<&str>,
+        worker_type: &str,
+    ) -> Result<Box<dyn Worker>, String> {
+        // Check if we have any workers
+        if workers.is_empty() {
+            return Err(format!(
+                "No {} workers available. Please check if {} servers are configured and healthy.",
+                worker_type, worker_type
+            ));
+        }
+
+        // Filter available workers (healthy + circuit breaker not open)
+        let available_workers: Vec<Box<dyn Worker>> = workers
+            .iter()
+            .filter(|w| w.is_available())
+            .map(|w| w.clone_worker())
+            .collect();
+
+        if available_workers.is_empty() {
+            return Err(format!(
+                "No available {} workers (all circuits open or unhealthy)",
+                worker_type
+            ));
+        }
+
+        // Let policy select from available workers only
+        match policy.select_worker(&available_workers, request_text) {
+            Some(idx) => Ok(available_workers[idx].clone_worker()),
+            None => Err(format!("Policy could not select a {} worker", worker_type)),
+        }
     }
 
     // Background task to monitor worker loads with shared client
@@ -900,6 +1043,234 @@ impl PDRouter {
         }
     }
 
+    // Helper to create a streaming response
+    fn create_streaming_response(
+        stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+        status: StatusCode,
+        prefill_logprobs: Option<Value>,
+        return_logprob: bool,
+        decode_url: Option<String>,
+    ) -> Response {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            futures_util::pin_mut!(stream);
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        let result = if return_logprob && prefill_logprobs.is_some() {
+                            // Try to merge logprobs
+                            Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
+                                .unwrap_or(chunk)
+                        } else {
+                            chunk
+                        };
+
+                        if tx.send(Ok(result)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(ref url) = decode_url {
+                            error!("Stream error from decode server {}: {}", url, e);
+                            RouterMetrics::record_pd_stream_error(url);
+                        }
+                        let _ = tx.send(Err(format!("Stream error: {}", e)));
+                        break;
+                    }
+                }
+            }
+        });
+
+        let stream = UnboundedReceiverStream::new(rx);
+        let body = Body::from_stream(stream);
+
+        let mut response = Response::new(body);
+        *response.status_mut() = status;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+    }
+
+    // Helper to process non-streaming decode response with logprob merging
+    async fn process_non_streaming_response(
+        &self,
+        res: reqwest::Response,
+        status: StatusCode,
+        return_logprob: bool,
+        prefill_body: Option<bytes::Bytes>,
+    ) -> Response {
+        match res.bytes().await {
+            Ok(decode_body) => {
+                if return_logprob && prefill_body.is_some() {
+                    // Merge logprobs from prefill and decode
+                    let prefill_body = prefill_body.as_ref().unwrap();
+                    match (
+                        serde_json::from_slice::<Value>(prefill_body),
+                        serde_json::from_slice::<Value>(&decode_body),
+                    ) {
+                        (Ok(prefill_json), Ok(mut decode_json)) => {
+                            // Use helper to merge logprobs
+                            Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+
+                            // Return merged response
+                            match serde_json::to_vec(&decode_json) {
+                                Ok(body) => (status, body).into_response(),
+                                Err(e) => {
+                                    error!("Failed to serialize merged response: {}", e);
+                                    (status, decode_body).into_response()
+                                }
+                            }
+                        }
+                        _ => {
+                            // If parsing fails, just return decode response
+                            warn!("Failed to parse responses for logprob merging");
+                            (status, decode_body).into_response()
+                        }
+                    }
+                } else {
+                    (status, decode_body).into_response()
+                }
+            }
+            Err(e) => {
+                error!("Failed to read decode response: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response").into_response()
+            }
+        }
+    }
+
+    // Helper to process prefill response and extract body if needed for logprobs
+    async fn process_prefill_response(
+        &self,
+        prefill_result: Result<reqwest::Response, reqwest::Error>,
+        prefill_url: &str,
+        return_logprob: bool,
+    ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
+        // Check prefill result first - it's critical for disaggregated mode
+        let prefill_response = match prefill_result {
+            Ok(response) => response,
+            Err(e) => {
+                RouterMetrics::record_pd_prefill_error(prefill_url);
+                error!(
+                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
+                    prefill_url,
+                    e
+                );
+
+                // Return error immediately - don't wait for decode to timeout
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "Prefill server error: {}. This will cause decode timeout.",
+                        e
+                    ),
+                )
+                    .into_response());
+            }
+        };
+
+        let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Check if prefill succeeded
+        if !prefill_status.is_success() {
+            RouterMetrics::record_pd_prefill_error(prefill_url);
+
+            // Get error body from prefill
+            let error_msg = prefill_response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown prefill error".to_string());
+
+            error!(
+                "Prefill server returned error status prefill_url={} status={} body={}",
+                prefill_url, prefill_status, error_msg
+            );
+
+            return Err((
+                prefill_status,
+                format!("Prefill server error ({}): {}", prefill_status, error_msg),
+            )
+                .into_response());
+        }
+
+        // Read prefill body if needed for logprob merging
+        let prefill_body = if return_logprob {
+            match prefill_response.bytes().await {
+                Ok(body) => Some(body),
+                Err(e) => {
+                    warn!("Failed to read prefill response body for logprobs: {}", e);
+                    None
+                }
+            }
+        } else {
+            // For non-logprob requests, just consume the response without storing
+            debug!("Consuming prefill response body (non-logprob request)");
+            match prefill_response.bytes().await {
+                Ok(_) => debug!("Prefill response consumed successfully"),
+                Err(e) => warn!("Error consuming prefill response: {}", e),
+            }
+            None
+        };
+
+        Ok((prefill_status, prefill_body))
+    }
+
+    fn build_post_with_headers(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        route: &str,
+        json_request: &serde_json::Value,
+        headers: Option<&HeaderMap>,
+        connection_close: bool,
+    ) -> reqwest::RequestBuilder {
+        let mut request = client.post(api_path(url, route)).json(json_request);
+        if connection_close {
+            request = request.header("Connection", "close");
+        }
+        if let Some(headers) = headers {
+            for (name, value) in headers.iter() {
+                let name_lc = name.as_str().to_ascii_lowercase();
+                // Whitelist important end-to-end headers, skip hop-by-hop
+                let forward = matches!(
+                    name_lc.as_str(),
+                    "authorization" | "x-request-id" | "x-correlation-id"
+                ) || name_lc.starts_with("x-request-id-");
+                if forward {
+                    if let Ok(val) = value.to_str() {
+                        request = request.header(name, val);
+                    }
+                }
+            }
+        }
+        request
+    }
+
+    // Helper to merge logprobs from prefill and decode responses
+    fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
+        if let (Some(prefill_meta), Some(decode_meta)) = (
+            prefill_json.get("meta_info"),
+            decode_json.get_mut("meta_info"),
+        ) {
+            if let (Some(prefill_logprobs), Some(decode_logprobs)) = (
+                prefill_meta.get("input_token_logprobs"),
+                decode_meta.get_mut("input_token_logprobs"),
+            ) {
+                if let (Some(prefill_arr), Some(decode_arr)) =
+                    (prefill_logprobs.as_array(), decode_logprobs.as_array_mut())
+                {
+                    let mut merged = prefill_arr.clone();
+                    merged.extend(decode_arr.clone());
+                    decode_meta["input_token_logprobs"] = Value::Array(merged);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     // Simple helper to merge logprobs in streaming responses
     fn merge_streaming_logprobs(
         prefill_logprobs: Option<Value>,
@@ -941,7 +1312,7 @@ impl PDRouter {
 
 // Helper functions
 
-async fn get_worker_load(client: &reqwest::Client, worker_url: &str) -> Option<isize> {
+async fn get_worker_load(client: &Client, worker_url: &str) -> Option<isize> {
     match client.get(format!("{}/get_load", worker_url)).send().await {
         Ok(res) if res.status().is_success() => match res.bytes().await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
@@ -973,350 +1344,6 @@ async fn get_worker_load(client: &reqwest::Client, worker_url: &str) -> Option<i
         }
     }
 }
-
-// PD-specific endpoints
-impl PDRouter {
-    pub async fn health_generate(&self) -> Response {
-        // Test model generation capability by selecting a random pair and testing them
-        // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
-
-        // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("No healthy worker pair available: {}", e),
-                )
-                    .into_response();
-            }
-        };
-
-        // Test prefill server's health_generate
-        let prefill_url = format!("{}/health_generate", prefill.url());
-        let prefill_result = self.client.get(&prefill_url).send().await;
-
-        // Test decode server's health_generate
-        let decode_url = format!("{}/health_generate", decode.url());
-        let decode_result = self.client.get(&decode_url).send().await;
-
-        // Check results
-        let mut errors = Vec::new();
-
-        match prefill_result {
-            Ok(res) if res.status().is_success() => {
-                debug!(
-                    "Health generate passed for prefill server: {}",
-                    prefill.url()
-                );
-            }
-            Ok(res) => {
-                errors.push(format!(
-                    "Prefill {} returned status {}",
-                    prefill.url(),
-                    res.status()
-                ));
-            }
-            Err(e) => {
-                errors.push(format!("Prefill {} error: {}", prefill.url(), e));
-            }
-        }
-
-        match decode_result {
-            Ok(res) if res.status().is_success() => {
-                debug!("Health generate passed for decode server: {}", decode.url());
-            }
-            Ok(res) => {
-                errors.push(format!(
-                    "Decode {} returned status {}",
-                    decode.url(),
-                    res.status()
-                ));
-            }
-            Err(e) => {
-                errors.push(format!("Decode {} error: {}", decode.url(), e));
-            }
-        }
-
-        if errors.is_empty() {
-            (
-                StatusCode::OK,
-                format!(
-                    "Health generate passed on selected pair: prefill={}, decode={}",
-                    prefill.url(),
-                    decode.url()
-                ),
-            )
-                .into_response()
-        } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Health generate failed: {:?}", errors),
-            )
-                .into_response()
-        }
-    }
-
-    pub async fn get_server_info(&self) -> Response {
-        // Get info from the first decode server to match sglang's server info format
-        let first_decode_url = if let Ok(workers) = self.decode_workers.read() {
-            workers.first().map(|w| w.url().to_string())
-        } else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to access decode workers",
-            )
-                .into_response();
-        };
-
-        if let Some(worker_url) = first_decode_url {
-            match self
-                .client
-                .get(format!("{}/get_server_info", worker_url))
-                .send()
-                .await
-            {
-                Ok(res) if res.status().is_success() => {
-                    match res.json::<Value>().await {
-                        Ok(info) => {
-                            // The decode server should already return the proper format
-                            // with tokenizer_path and other fields that bench_one_batch_server.py expects
-                            Json(info).into_response()
-                        }
-                        Err(e) => {
-                            error!("Failed to parse server info: {}", e);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to parse server info: {}", e),
-                            )
-                                .into_response()
-                        }
-                    }
-                }
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        status,
-                        format!("Decode server returned status: {}", res.status()),
-                    )
-                        .into_response()
-                }
-                Err(e) => {
-                    error!("Failed to get server info: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to get server info: {}", e),
-                    )
-                        .into_response()
-                }
-            }
-        } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No decode servers available",
-            )
-                .into_response()
-        }
-    }
-
-    pub async fn get_models(&self, req: Request<Body>) -> Response {
-        // Extract headers first to avoid Send issues
-        let headers = crate::routers::router::copy_request_headers(&req);
-
-        // Get first prefill worker URL to avoid holding lock across await
-        let first_worker_url = if let Ok(workers) = self.prefill_workers.read() {
-            workers.first().map(|w| w.url().to_string())
-        } else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to access prefill workers",
-            )
-                .into_response();
-        };
-
-        if let Some(worker_url) = first_worker_url {
-            // Send request directly without going through Router
-            let mut request_builder = self.client.get(format!("{}/v1/models", worker_url));
-            for (name, value) in headers {
-                if name.to_lowercase() != "content-type" && name.to_lowercase() != "content-length"
-                {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
-            match request_builder.send().await {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match res.bytes().await {
-                        Ok(body) => (status, body).into_response(),
-                        Err(e) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to read response body: {}", e),
-                        )
-                            .into_response(),
-                    }
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to send request: {}", e),
-                )
-                    .into_response(),
-            }
-        } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No prefill servers available",
-            )
-                .into_response()
-        }
-    }
-
-    pub async fn get_loads(&self, client: &reqwest::Client) -> Response {
-        let p_urls: Vec<_> = self
-            .prefill_workers
-            .read()
-            .unwrap()
-            .iter()
-            .map(|w| w.url().to_string())
-            .collect();
-        let d_urls: Vec<_> = self
-            .decode_workers
-            .read()
-            .unwrap()
-            .iter()
-            .map(|w| w.url().to_string())
-            .collect();
-
-        let mut prefill_loads = Vec::new();
-        let mut decode_loads = Vec::new();
-
-        for url in &p_urls {
-            let load = get_worker_load(client, url).await.unwrap_or(-1);
-            prefill_loads.push(serde_json::json!({
-                "engine": format!("(Prefill@{})", url),
-                "load": load as i64
-            }));
-        }
-
-        for url in &d_urls {
-            let load = get_worker_load(client, url).await.unwrap_or(-1);
-            decode_loads.push(serde_json::json!({
-                "engine": format!("(Decode@{})", url),
-                "load": load as i64
-            }));
-        }
-
-        Json(serde_json::json!({
-            "prefill": prefill_loads,
-            "decode": decode_loads
-        }))
-        .into_response()
-    }
-
-    pub async fn get_model_info(&self, req: Request<Body>) -> Response {
-        // Extract headers first to avoid Send issues
-        let headers = crate::routers::router::copy_request_headers(&req);
-
-        // Get model info from the first prefill server (matches original Rust PDLB behavior)
-        // Get first prefill worker URL to avoid holding lock across await
-        let first_worker_url = if let Ok(workers) = self.prefill_workers.read() {
-            workers.first().map(|w| w.url().to_string())
-        } else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to access prefill workers",
-            )
-                .into_response();
-        };
-
-        if let Some(worker_url) = first_worker_url {
-            let mut request_builder = self.client.get(format!("{}/get_model_info", worker_url));
-            for (name, value) in headers {
-                if name.to_lowercase() != "content-type" && name.to_lowercase() != "content-length"
-                {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
-            match request_builder.send().await {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match res.bytes().await {
-                        Ok(body) => (status, body).into_response(),
-                        Err(e) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to read response body: {}", e),
-                        )
-                            .into_response(),
-                    }
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to send request: {}", e),
-                )
-                    .into_response(),
-            }
-        } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No prefill servers available",
-            )
-                .into_response()
-        }
-    }
-
-    pub async fn flush_cache(&self, client: &reqwest::Client) -> Response {
-        let mut tasks = Vec::new();
-
-        // Flush cache on all prefill servers
-        for worker in self.prefill_workers.read().unwrap().iter() {
-            let url = format!("{}/flush_cache", worker.url());
-            tasks.push(client.post(&url).send());
-        }
-
-        // Flush cache on all decode servers
-        for worker in self.decode_workers.read().unwrap().iter() {
-            let url = format!("{}/flush_cache", worker.url());
-            tasks.push(client.post(&url).send());
-        }
-
-        let results = futures_util::future::join_all(tasks).await;
-
-        let mut all_success = true;
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(res) if res.status().is_success() => {}
-                Ok(res) => {
-                    all_success = false;
-                    warn!(
-                        "Server {} returned status {} for flush_cache",
-                        i,
-                        res.status()
-                    );
-                }
-                Err(e) => {
-                    all_success = false;
-                    error!("Server {} error during flush_cache: {}", i, e);
-                }
-            }
-        }
-
-        if all_success {
-            (StatusCode::OK, "Cache flushed on all servers").into_response()
-        } else {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Cache flush failed on one or more servers",
-            )
-                .into_response()
-        }
-    }
-}
-
-use crate::routers::{RouterTrait, WorkerManagement};
-use async_trait::async_trait;
-use reqwest::Client;
 
 #[async_trait]
 impl WorkerManagement for PDRouter {
@@ -1408,23 +1435,115 @@ impl RouterTrait for PDRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // Use the existing PDRouter health_generate method
-        PDRouter::health_generate(self).await
+        // Test model generation capability by selecting a random pair and testing them
+        // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
+
+        // Select a random worker pair using the policy
+        let (prefill, decode) = match self.select_pd_pair(None).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("No healthy worker pair available: {}", e),
+                )
+                    .into_response();
+            }
+        };
+
+        // Test prefill server's health_generate
+        let prefill_url = format!("{}/health_generate", prefill.url());
+        let (prefill_result, decode_result) = tokio::join!(
+            self.client.get(&prefill_url).send(),
+            self.client
+                .get(&format!("{}/health_generate", decode.url()))
+                .send()
+        );
+
+        // Check results
+        let mut errors = Vec::new();
+
+        match prefill_result {
+            Ok(res) if res.status().is_success() => {
+                debug!(
+                    "Health generate passed for prefill server: {}",
+                    prefill.url()
+                );
+            }
+            Ok(res) => {
+                errors.push(format!(
+                    "Prefill {} returned status {}",
+                    prefill.url(),
+                    res.status()
+                ));
+            }
+            Err(e) => {
+                errors.push(format!("Prefill {} error: {}", prefill.url(), e));
+            }
+        }
+
+        match decode_result {
+            Ok(res) if res.status().is_success() => {
+                debug!("Health generate passed for decode server: {}", decode.url());
+            }
+            Ok(res) => {
+                errors.push(format!(
+                    "Decode {} returned status {}",
+                    decode.url(),
+                    res.status()
+                ));
+            }
+            Err(e) => {
+                errors.push(format!("Decode {} error: {}", decode.url(), e));
+            }
+        }
+
+        if errors.is_empty() {
+            (
+                StatusCode::OK,
+                format!(
+                    "Health generate passed on selected pair: prefill={}, decode={}",
+                    prefill.url(),
+                    decode.url()
+                ),
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Health generate failed: {:?}", errors),
+            )
+                .into_response()
+        }
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        // Use the existing PDRouter get_server_info method
-        PDRouter::get_server_info(self).await
+        // Get info from the first decode server to match sglang's server info format
+        // Note: We use decode workers for server info to match expected format
+        self.proxy_to_first_worker(&self.decode_workers, "get_server_info", "decode", None)
+            .await
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
-        // Use the existing PDRouter get_models method
-        PDRouter::get_models(self, req).await
+        // Extract headers first to avoid Send issues
+        let headers = crate::routers::router::copy_request_headers(&req);
+
+        // Proxy to first prefill worker
+        self.proxy_to_first_worker(&self.prefill_workers, "v1/models", "prefill", Some(headers))
+            .await
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
-        // Use the existing PDRouter get_model_info method
-        PDRouter::get_model_info(self, req).await
+        // Extract headers first to avoid Send issues
+        let headers = crate::routers::router::copy_request_headers(&req);
+
+        // Proxy to first prefill worker
+        self.proxy_to_first_worker(
+            &self.prefill_workers,
+            "get_model_info",
+            "prefill",
+            Some(headers),
+        )
+        .await
     }
 
     async fn route_generate(
@@ -1432,10 +1551,41 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
     ) -> Response {
-        // Convert OpenAI format to PD format
-        let pd_req = body.clone().to_pd_request();
+        // Extract parameters
+        let is_stream = body.stream;
+        let return_logprob = body.return_logprob;
 
-        PDRouter::route_generate(self, headers, pd_req, "/generate").await
+        // Extract text for cache-aware routing
+        let request_text = if self.policies_need_request_text() {
+            body.text
+                .as_deref()
+                .or_else(|| {
+                    body.prompt.as_ref().and_then(|p| match p {
+                        crate::openai_api_types::StringOrArray::String(s) => Some(s.as_str()),
+                        crate::openai_api_types::StringOrArray::Array(v) => {
+                            v.first().map(|s| s.as_str())
+                        }
+                    })
+                })
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        // Calculate batch size
+        let batch_size = Self::get_generate_batch_size(body);
+
+        // Create context
+        let context = PDRequestContext {
+            route: "/generate",
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+        };
+
+        // Execute with retry and bootstrap injection
+        self.execute_dual_dispatch(headers, body, context).await
     }
 
     async fn route_chat(
@@ -1443,10 +1593,40 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
     ) -> Response {
-        // Convert OpenAI format to PD format
-        let pd_req = body.clone().to_pd_request();
+        // Extract parameters
+        let is_stream = body.stream;
+        let return_logprob = body.logprobs;
 
-        PDRouter::route_chat(self, headers, pd_req, "/v1/chat/completions").await
+        // Extract text for cache-aware routing
+        let request_text = if self.policies_need_request_text() {
+            body.messages.first().and_then(|msg| match msg {
+                crate::openai_api_types::ChatMessage::User { content, .. } => match content {
+                    crate::openai_api_types::UserMessageContent::Text(text) => Some(text.clone()),
+                    crate::openai_api_types::UserMessageContent::Parts(_) => None,
+                },
+                crate::openai_api_types::ChatMessage::System { content, .. } => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+
+        // Calculate batch size
+        let batch_size = Self::get_chat_batch_size(body);
+
+        // Create context
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+        };
+
+        // Execute with retry and bootstrap injection
+        self.execute_dual_dispatch(headers, body, context).await
     }
 
     async fn route_completion(
@@ -1454,18 +1634,115 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
     ) -> Response {
-        // Use the new method that preserves OpenAI format
-        PDRouter::route_completion(self, headers, body.clone(), "/v1/completions").await
+        // Extract parameters
+        let is_stream = body.stream;
+        let return_logprob = body.logprobs.is_some();
+
+        // Extract text for cache-aware routing
+        let request_text = if self.policies_need_request_text() {
+            match &body.prompt {
+                crate::openai_api_types::StringOrArray::String(s) => Some(s.clone()),
+                crate::openai_api_types::StringOrArray::Array(v) => {
+                    v.first().map(|s| s.to_string())
+                }
+            }
+        } else {
+            None
+        };
+
+        // Calculate batch size
+        let batch_size = Self::get_completion_batch_size(body);
+
+        // Create context
+        let context = PDRequestContext {
+            route: "/v1/completions",
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+        };
+
+        // Execute with retry and bootstrap injection
+        self.execute_dual_dispatch(headers, body, context).await
     }
 
     async fn flush_cache(&self) -> Response {
-        // Use the existing PDRouter flush_cache method
-        PDRouter::flush_cache(self, &self.client).await
+        // Process both prefill and decode workers
+        let (prefill_results, prefill_errors) = self
+            .process_workers(&self.prefill_workers, "Prefill", "flush_cache")
+            .await;
+        let (decode_results, decode_errors) = self
+            .process_workers(&self.decode_workers, "Decode", "flush_cache")
+            .await;
+
+        // Combine results and errors
+        let mut results = prefill_results;
+        results.extend(decode_results);
+        let mut errors = prefill_errors;
+        errors.extend(decode_errors);
+
+        if errors.is_empty() {
+            (
+                StatusCode::OK,
+                format!("Cache flushed successfully: {:?}", results),
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::PARTIAL_CONTENT,
+                format!(
+                    "Partial success. Results: {:?}, Errors: {:?}",
+                    results, errors
+                ),
+            )
+                .into_response()
+        }
     }
 
     async fn get_worker_loads(&self) -> Response {
-        // Use the existing PDRouter get_loads method
-        PDRouter::get_loads(self, &self.client).await
+        let mut loads = HashMap::new();
+        let mut errors = Vec::new();
+
+        // Process prefill workers
+        match Self::get_worker_urls(&self.prefill_workers, "prefill") {
+            Ok(urls) => {
+                for worker_url in urls {
+                    match get_worker_load(&self.client, &worker_url).await {
+                        Some(load) => {
+                            loads.insert(format!("prefill_{}", worker_url), load);
+                        }
+                        None => {
+                            errors.push(format!("Failed to get load from prefill {}", worker_url));
+                        }
+                    }
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+
+        // Process decode workers
+        match Self::get_worker_urls(&self.decode_workers, "decode") {
+            Ok(urls) => {
+                for worker_url in urls {
+                    match get_worker_load(&self.client, &worker_url).await {
+                        Some(load) => {
+                            loads.insert(format!("decode_{}", worker_url), load);
+                        }
+                        None => {
+                            errors.push(format!("Failed to get load from decode {}", worker_url));
+                        }
+                    }
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+
+        let response_data = serde_json::json!({
+            "loads": loads,
+            "errors": errors
+        });
+
+        (StatusCode::OK, Json(response_data)).into_response()
     }
 
     fn router_type(&self) -> &'static str {
@@ -1539,8 +1816,7 @@ impl RouterTrait for PDRouter {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
-    use crate::policies::{CacheAwarePolicy, RandomPolicy};
-    use crate::routers::pd_types::SingleOrBatch;
+    use crate::policies::RandomPolicy;
 
     fn create_test_pd_router() -> PDRouter {
         let prefill_policy = Arc::new(RandomPolicy::new());
@@ -1551,13 +1827,14 @@ mod tests {
             decode_workers: Arc::new(RwLock::new(vec![])),
             prefill_policy,
             decode_policy,
-            prefill_tree: None,
-            decode_tree: None,
             timeout_secs: 5,
             interval_secs: 1,
             worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
             load_monitor_handle: None,
             client: Client::new(),
+            prefill_client: Client::new(),
+            retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
             _prefill_health_checker: None,
             _decode_health_checker: None,
         }
@@ -1687,188 +1964,12 @@ mod tests {
         }
     }
 
-    // ============= Cache Tree Integration Tests =============
-
-    #[tokio::test]
-    async fn test_cache_tree_operations() {
-        let cache_policy = Arc::new(CacheAwarePolicy::new());
-        let mut router = create_test_pd_router();
-        router.prefill_policy = cache_policy;
-
-        // Initialize cache tree
-        let tree = Arc::new(Mutex::new(Tree::new()));
-        router.prefill_tree = Some(Arc::clone(&tree));
-
-        // Manually add worker and update tree
-        let worker = create_test_worker(
-            "http://worker1".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-        router.prefill_workers.write().unwrap().push(worker);
-
-        // Update tree
-        tree.lock().unwrap().insert("", "http://worker1");
-
-        // Verify tree contains the worker
-        let tree_guard = tree.lock().unwrap();
-        let (_matched_text, tenant) = tree_guard.prefix_match("");
-        // Since we inserted with empty prefix, we should get a match
-        assert_eq!(tenant, "http://worker1");
-    }
-
-    #[tokio::test]
-    async fn test_cache_tree_rebuild_on_remove() {
-        let cache_policy = Arc::new(CacheAwarePolicy::new());
-        let mut router = create_test_pd_router();
-        router.prefill_policy = cache_policy;
-
-        // Initialize cache tree
-        let tree = Arc::new(Mutex::new(Tree::new()));
-        router.prefill_tree = Some(Arc::clone(&tree));
-
-        // Add multiple workers
-        let worker1 = create_test_worker(
-            "http://worker1".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-        let worker2 = create_test_worker(
-            "http://worker2".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-
-        router.prefill_workers.write().unwrap().push(worker1);
-        router.prefill_workers.write().unwrap().push(worker2);
-
-        // Initialize tree with both workers
-        {
-            let tree_guard = tree.lock().unwrap();
-            tree_guard.insert("", "http://worker1");
-            tree_guard.insert("", "http://worker2");
-        }
-
-        // Remove one worker
-        let result = router.remove_prefill_server("http://worker1").await;
-        assert!(result.is_ok());
-
-        // Verify tree only contains remaining worker
-        let tree_guard = tree.lock().unwrap();
-        let (_matched_text, tenant) = tree_guard.prefix_match("");
-        // After rebuild, tree should only have worker2
-        assert_eq!(tenant, "http://worker2");
-    }
-
-    #[tokio::test]
-    async fn test_no_cache_tree_operations() {
-        let router = create_test_pd_router();
-        assert!(router.prefill_tree.is_none());
-
-        // Add a worker without cache tree
-        let worker = create_test_worker(
-            "http://worker1".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-        router.prefill_workers.write().unwrap().push(worker);
-
-        // Remove should work without tree
-        let result = router.remove_prefill_server("http://worker1").await;
-        assert!(result.is_ok());
-    }
-
     // ============= Bootstrap Injection Tests =============
+    // Note: These tests are commented out as we've moved to the optimized bootstrap injection
+    // approach that doesn't use the Bootstrap trait on GenerateReqInput anymore.
 
-    #[test]
-    fn test_bootstrap_injection_with_existing_fields() {
-        let mut req = GenerateReqInput {
-            text: Some(SingleOrBatch::Single("Test".to_string())),
-            input_ids: None,
-            stream: false,
-            bootstrap_host: Some(SingleOrBatch::Single("existing-host".to_string())),
-            bootstrap_port: Some(SingleOrBatch::Single(Some(9999))),
-            bootstrap_room: Some(SingleOrBatch::Single(12345)),
-            other: Value::Object(serde_json::Map::new()),
-        };
-
-        let prefill_worker = create_test_worker(
-            "http://new-host:8000".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: Some(8080),
-            },
-            true,
-        );
-
-        // Bootstrap info is added regardless of existing fields
-        let result = req.add_bootstrap_info(prefill_worker.as_ref());
-        assert!(result.is_ok());
-
-        // Bootstrap info should be updated with new values
-        assert_eq!(
-            req.bootstrap_host,
-            Some(SingleOrBatch::Single("new-host".to_string()))
-        );
-        assert_eq!(req.bootstrap_port, Some(SingleOrBatch::Single(Some(8080))));
-        // Room should be regenerated (different from original)
-        if let Some(SingleOrBatch::Single(room)) = req.bootstrap_room {
-            assert_ne!(room, 12345);
-        } else {
-            panic!("Expected single room ID");
-        }
-    }
-
-    #[test]
-    fn test_bootstrap_room_generation() {
-        let mut req1 = GenerateReqInput {
-            text: Some(SingleOrBatch::Single("Test".to_string())),
-            input_ids: None,
-            stream: false,
-            bootstrap_host: None,
-            bootstrap_port: None,
-            bootstrap_room: None,
-            other: Value::Object(serde_json::Map::new()),
-        };
-
-        let mut req2 = GenerateReqInput {
-            text: Some(SingleOrBatch::Single("Test".to_string())),
-            input_ids: None,
-            stream: false,
-            bootstrap_host: None,
-            bootstrap_port: None,
-            bootstrap_room: None,
-            other: Value::Object(serde_json::Map::new()),
-        };
-
-        let prefill_worker = create_test_worker(
-            "http://host:8000".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: Some(8080),
-            },
-            true,
-        );
-
-        // Add bootstrap info to both requests
-        let _ = req1.add_bootstrap_info(prefill_worker.as_ref());
-        let _ = req2.add_bootstrap_info(prefill_worker.as_ref());
-
-        // Room IDs should be different
-        if let (Some(SingleOrBatch::Single(room1)), Some(SingleOrBatch::Single(room2))) =
-            (req1.bootstrap_room, req2.bootstrap_room)
-        {
-            assert_ne!(room1, room2, "Room IDs should be unique");
-        } else {
-            panic!("Expected single room IDs");
-        }
-    }
+    // TODO: Add new tests for the optimized bootstrap injection approach using
+    // RequestWithBootstrap and BatchRequestWithBootstrap wrappers
 
     // ============= Worker Selection Tests =============
 
