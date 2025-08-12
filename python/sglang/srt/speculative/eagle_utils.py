@@ -411,7 +411,7 @@ class EagleVerifyInput:
             )
 
         # Sample tokens. Force greedy sampling on AMD
-        if batch.sampling_info.is_all_greedy or is_hip():
+        if batch.sampling_info.is_all_greedy or "tree_speculative_sampling_target_only" not in globals():
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
 
