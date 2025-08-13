@@ -7,6 +7,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -97,7 +98,7 @@ class W4AFp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if global_server_args_dict["enable_ep_moe"]:
+            if get_moe_expert_parallel_world_size() > 1:
                 return W4AFp8EPMoEMethod(self)
             else:
                 return W4AFp8TPMoEMethod(self)
@@ -513,38 +514,18 @@ class W4AFp8TPMoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
+        topk_output: TopKOutput,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        **kwargs,
     ) -> torch.Tensor:
-        # avoid circular import
+
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-        from sglang.srt.layers.moe.topk import select_experts
 
         assert activation == "silu", "Only SiLU activation is supported."
 
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        topk_weights, topk_ids, _ = topk_output
 
         output = cutlass_w4a8_moe(
             start_expert_id=0,
