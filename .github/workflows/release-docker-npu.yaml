@@ -33,20 +33,18 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ github.repository_owner }}/sglang
+            lmsysorg/sglang
           tags: |
             type=ref,event=pr
             type=ref,event=tag,suffix=-cann${{ matrix.cann_version }}-${{ matrix.device_type }}
           flavor: |
             latest=false
-      - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@v3
 
       # Login against a Docker registry except on PR
       # https://github.com/docker/login-action
       - name: Login to Docker Hub
         uses: docker/login-action@v2
-        if: ${{ github.repository_owner == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+        if: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -55,7 +53,7 @@ jobs:
         id: get_version
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
-          echo "TAG=${{ github.repository_owner }}/sglang:v$version-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
+          echo "TAG=lmsysorg/sglang:v$version-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
           kernel_tag=$(curl -s https://api.github.com/repos/sgl-project/sgl-kernel-npu/tags | jq -r '.[0].name')
           echo "KERNEL_NPU_TAG=${kernel_tag}" >> $GITHUB_OUTPUT
 
@@ -69,7 +67,7 @@ jobs:
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags || steps.get_version.outputs.TAG }}
-          push: ${{ github.repository_owner == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+          push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
             SGLANG_KERNEL_NPU_TAG=${{ steps.get_version.outputs.KERNEL_NPU_TAG }}
