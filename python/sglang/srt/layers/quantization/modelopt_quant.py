@@ -904,6 +904,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             reorder_rows_for_gated_act_gemm,
             shuffle_matrix_a,
             shuffle_matrix_sf_a,
+            nvfp4_block_scale_interleave,
         )
         from flashinfer.fused_moe.core import (
             _maybe_get_cached_w2_permute_indices,
