@@ -3,8 +3,9 @@ from __future__ import annotations
 import functools
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import triton
@@ -12,11 +13,16 @@ import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +36,10 @@ _ATTN_DP_RANK = None
 _ATTN_DP_SIZE = None
 _LOCAL_ATTN_DP_SIZE = None
 _LOCAL_ATTN_DP_RANK = None
+_ENABLE_DP_ATTENTION_FLAG = None
 
 
-class DPPaddingMode(IntEnum):
+class DpPaddingMode(IntEnum):
 
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
     MAX_LEN = auto()
@@ -40,13 +47,13 @@ class DPPaddingMode(IntEnum):
     SUM_LEN = auto()
 
     def is_max_len(self):
-        return self == DPPaddingMode.MAX_LEN
+        return self == DpPaddingMode.MAX_LEN
 
     def is_sum_len(self):
-        return self == DPPaddingMode.SUM_LEN
+        return self == DpPaddingMode.SUM_LEN
 
     @classmethod
-    def get_dp_padding_mode(cls, global_num_tokens: List[int]) -> DPPaddingMode:
+    def get_dp_padding_mode(cls, global_num_tokens: List[int]) -> DpPaddingMode:
         # we choose the mode that minimizes the communication cost
         max_len = max(global_num_tokens)
         sum_len = sum(global_num_tokens)
@@ -56,8 +63,33 @@ class DPPaddingMode(IntEnum):
             return cls.SUM_LEN
 
     @classmethod
-    def get_default_mode_in_cuda_graph(cls) -> DPPaddingMode:
+    def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
         return cls.MAX_LEN
+
+
+class _DpGatheredBufferWrapper:
+
+    _hidden_size: int
+    _dtype: torch.dtype
+    _device: torch.device
+
+    @classmethod
+    def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
+        cls._hidden_size = hidden_size
+        cls._dtype = dtype
+        cls._device = device
+
+    @classmethod
+    def get_buffer(cls, num_tokens: int) -> torch.Tensor:
+        return torch.empty(
+            (num_tokens, cls._hidden_size),
+            dtype=cls._dtype,
+            device=cls._device,
+        )
+
+
+def get_dp_gathered_buffer(num_tokens: int) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_buffer(num_tokens)
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
@@ -88,18 +120,32 @@ def compute_dp_attention_local_info(
     return local_attn_tp_rank, local_attn_tp_size, local_attn_dp_rank
 
 
+# def initialize_dp_attention(
+#     enable_dp_attention: bool,
+#     tp_rank: int,
+#     tp_size: int,
+#     dp_size: int,
+#     moe_dense_tp_size: int,
+#     pp_size: int,
+# ):
 def initialize_dp_attention(
-    enable_dp_attention: bool,
-    tp_rank: int,
-    tp_size: int,
-    dp_size: int,
-    moe_dense_tp_size: int,
-    pp_size: int,
+    server_args: ServerArgs,
+    model_config: ModelConfig,
 ):
     global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE
-    global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK
+    global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
+
+    enable_dp_attention = server_args.enable_dp_attention
+    tp_size = server_args.tp_size
+    dp_size = server_args.dp_size
+    moe_dense_tp_size = server_args.moe_dense_tp_size
+    pp_size = server_args.pp_size
+
+    tp_rank = get_tensor_model_parallel_rank()
+
+    _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
     _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size
@@ -134,6 +180,17 @@ def initialize_dp_attention(
         use_npu_communicator=False,
         group_name="attention_tp",
     )
+
+    _DpGatheredBufferWrapper.set_metadata(
+        hidden_size=model_config.hidden_size,
+        dtype=model_config.dtype,
+        device=torch.device("cuda"),
+    )
+
+
+def is_dp_attention_enabled():
+    assert _ENABLE_DP_ATTENTION_FLAG is not None, "dp attention not initialized!"
+    return _ENABLE_DP_ATTENTION_FLAG
 
 
 def get_attention_tp_group():

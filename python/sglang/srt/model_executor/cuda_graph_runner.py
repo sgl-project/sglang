@@ -34,7 +34,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.dp_attention import (
-    DPPaddingMode,
+    DpPaddingMode,
     get_attention_tp_rank,
     get_attention_tp_size,
 )
@@ -349,30 +349,15 @@ class CudaGraphRunner:
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
-                    self.gathered_buffer = torch.zeros(
-                        (
-                            self.max_num_token * self.dp_size,
-                            self.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.model_runner.dtype,
-                    )
                 else:
                     assert self.require_attn_tp_gather
                     self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )
-                    self.gathered_buffer = torch.zeros(
-                        (
-                            self.max_num_token,
-                            self.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.model_runner.dtype,
-                    )
             else:
                 self.global_num_tokens_gpu = None
                 self.global_num_tokens_for_logprob_gpu = None
-                self.gathered_buffer = None
 
             self.custom_mask = torch.ones(
                 (
@@ -556,7 +541,7 @@ class CudaGraphRunner:
                     device=input_ids.device,
                 )
             )
-            gathered_buffer = self.gathered_buffer[: num_tokens * self.dp_size]
+            gathered_buffer_size = num_tokens * self.dp_size
         elif self.require_attn_tp_gather:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -572,9 +557,9 @@ class CudaGraphRunner:
                     device=input_ids.device,
                 )
             )
-            gathered_buffer = self.gathered_buffer[:num_tokens]
+            gathered_buffer_size = num_tokens
         else:
-            gathered_buffer = None
+            gathered_buffer_size = None
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -607,8 +592,8 @@ class CudaGraphRunner:
             positions=positions,
             global_num_tokens_gpu=self.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DPPaddingMode.get_default_mode_in_cuda_graph(),
-            gathered_buffer=gathered_buffer,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            gathered_buffer_size=gathered_buffer_size,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
