@@ -13,9 +13,9 @@ from sglang.srt.lora.utils import (
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     get_hidden_dim,
+    get_normalized_target_modules,
     get_stacked_multiply,
-    get_target_module,
-    normalize_target_modules,
+    get_target_module_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ class LoRAMemoryPool:
             """
             if config.r > self.max_lora_rank:
                 return False
-            target_module_names = normalize_target_modules(config.target_modules)
+            target_module_names = get_normalized_target_modules(config.target_modules)
             return target_module_names.issubset(self.target_modules)
 
         if isinstance(config, LoRAConfig):
@@ -248,7 +248,7 @@ class LoRAMemoryPool:
                 target_module: None for target_module in self.B_buffer
             }
             for name, weights in layer_weights.items():
-                target_module = get_target_module(name, self.target_modules)
+                target_module = get_target_module_name(name, self.target_modules)
                 if "lora_A" in name:
                     temp_A_buffer[target_module] = weights
                 else:
@@ -257,7 +257,9 @@ class LoRAMemoryPool:
             if self.tp_size > 1:
                 cur_layer_modules = lora_modules[layer_id]
                 for module_name, module in cur_layer_modules.items():
-                    target_module = get_target_module(module_name, self.target_modules)
+                    target_module = get_target_module_name(
+                        module_name, self.target_modules
+                    )
 
                     if temp_A_buffer[target_module] is None:
                         # Skip weight slicing if the weight is not present in the adapter

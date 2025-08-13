@@ -32,8 +32,8 @@ from sglang.srt.lora.utils import (
     LoRABatchInfo,
     LoRAType,
     get_layer_id,
-    get_target_module,
-    normalize_target_modules,
+    get_normalized_target_modules,
+    get_target_module_name,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -350,15 +350,19 @@ class LoRAManager:
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
-                target_module = get_target_module(
+                target_module = get_target_module_name(
                     module_name, self.memory_pool.target_modules
                 )
                 module.set_lora_info(
                     self.memory_pool.get_tensor(
-                        target_module, layer_id, LoRAType.LORA_A
+                        target_module=target_module,
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_A,
                     ),
                     self.memory_pool.get_tensor(
-                        target_module, layer_id, LoRAType.LORA_B
+                        target_module=target_module,
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_B,
                     ),
                 )
 
@@ -429,7 +433,7 @@ class LoRAManager:
                         "enable all support modules types. "
                     )
                 self.target_modules.update(config.target_modules)
-        self.target_modules = normalize_target_modules(self.target_modules)
+        self.target_modules = get_normalized_target_modules(self.target_modules)
 
         if max_lora_rank is not None:
             self.max_lora_rank = max_lora_rank
