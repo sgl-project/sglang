@@ -568,8 +568,8 @@ class SRTRunner:
         else:
             self.tokenizer = None
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str):
-        return self.engine.load_lora_adapter(lora_name, lora_path)
+    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
+        return self.engine.load_lora_adapter(lora_name, lora_path, pinned)
 
     def unload_lora_adapter(self, lora_name: str):
         return self.engine.unload_lora_adapter(lora_name)

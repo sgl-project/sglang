@@ -1,9 +1,8 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 from __future__ import annotations
 
-import importlib.util
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -42,11 +41,7 @@ if is_cuda():
 
 try:
     from flashinfer import mm_fp4 as fp4_gemm
-    from flashinfer import (
-        reorder_rows_for_gated_act_gemm,
-        shuffle_matrix_a,
-        shuffle_matrix_sf_a,
-    )
+    from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
     enable_flashinfer_fp4_gemm = True
 except ImportError:
@@ -682,9 +677,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
-            padded_scales.reshape(M, K)
+            padded_scales.reshape(M_padded, K_padded)
             if scale_ndim == 2
-            else padded_scales.reshape(B, M, K)
+            else padded_scales.reshape(B, M_padded, K_padded)
         )
         layer.weight_scale_interleaved = Parameter(padded_scales, requires_grad=False)
 
@@ -764,8 +759,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         # TODO(ch-wan): check if this is needed
-        layer.num_experts = num_experts
-        layer.num_local_experts = num_experts
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
@@ -885,9 +878,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
         swizzled_scale = swizzled_scale.contiguous().cuda()
         return (
-            swizzled_scale.reshape(M, K)
+            swizzled_scale.reshape(M_padded, K_padded)
             if scale_ndim == 2
-            else swizzled_scale.reshape(B, M, K)
+            else swizzled_scale.reshape(B, M_padded, K_padded)
         )
 
     def prepare_static_weights_for_kernel(
@@ -1106,7 +1099,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale,
             )
 
-            print("Applied flashinfer weight processing for both w13 and w2")
+            logger.info_once("Applied flashinfer weight processing for both w13 and w2")
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -1126,7 +1119,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
             # Both flashinfer cutlass and regular cutlass use same processing for w2
-            print("Applied weight processing for both w13 and w2")
+            logger.info_once("Applied weight processing for both w13 and w2")
 
             # Set up CUTLASS MoE parameters
             device = layer.w13_weight.device
