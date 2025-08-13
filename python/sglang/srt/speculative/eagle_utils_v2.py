@@ -64,10 +64,6 @@ class EagleDraftInput:
     allocate_lens: torch.Tensor = None
     new_seq_lens: torch.Tensor = None
     verify_done: torch.cuda.Event = None
-    
-    # seq_lens_backup is not used. But we need to keep a pointer to it to avoid 
-    # pytorch cleanup the gpu memory while overlap is still running.
-    seq_lens_backup: torch.Tensor = None
 
     def filter_batch(self, new_indices: torch.Tensor):
         self.topk_p = self.topk_p[new_indices]

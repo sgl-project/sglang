@@ -478,6 +478,11 @@ class EAGLEWorker(TpModelWorker):
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
 
+        # Since seq_lens_backup's tensor is allocated in another stream, we
+        # need record_stream() to prevent pytorch gc and reuse the gpu memory
+        # while forward_stream is still running.
+        seq_lens_backup.record_stream(torch.cuda.current_stream())
+        
         # Construct the return values
         draft_input = EagleDraftInput(
             topk_p=ret_topk_p,
@@ -487,7 +492,6 @@ class EAGLEWorker(TpModelWorker):
             new_seq_lens=new_seq_lens,
             allocate_lens=old_spec_info.allocate_lens,
             verify_done=verify_done,
-            seq_lens_backup=seq_lens_backup, # This is needed. See EagleDraftInput for more details.
         )
 
         return ForwardBatchOutput(
