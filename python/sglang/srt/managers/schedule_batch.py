@@ -913,6 +913,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
 
@@ -953,6 +956,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            is_prefill_only=all(
+                req.sampling_params.max_new_tokens == 0 for req in reqs
+            ),
             chunked_req=chunked_req,
         )
 
@@ -1796,6 +1802,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
+            is_prefill_only=self.is_prefill_only,
         )
 
     def _evict_tree_cache_if_needed(self, num_tokens: int):
