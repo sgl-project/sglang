@@ -509,40 +509,12 @@ class ForwardBatch:
             or self.contains_image_inputs()
         )
 
-    # def _compute_spec_mrope_positions(
-    #     self, model_runner: ModelRunner, batch: ModelWorkerBatch
-    # ):
-    #     # TODO support batched deltas
-    #     batch_size = self.seq_lens.shape[0]
-    #     mrope_positions_list = []
-    #     if batch.forward_mode.is_draft_extend(): # draft_extend_after_decode
-    #         start_idx = 0
-    #         for batch_idx in range(batch_size):
-    #             extend_seq_len = batch.extend_seq_lens[batch_idx]
-    #             mrope_position_delta = batch.multimodal_inputs[batch_idx].mrope_position_delta.to(device=model_runner.device).squeeze(0)
-    #             current_batch_seq_positions = batch.spec_info.positions[start_idx : start_idx + extend_seq_len]
-    #             current_batch_seq_positions = current_batch_seq_positions + mrope_position_delta
-    #             mrope_positions_list.append(current_batch_seq_positions)
-    #             start_idx += extend_seq_len
-    #         next_input_positions = torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
-    #     else: # target_verify or draft_decode
-    #         seq_positions = batch.spec_info.positions.view(batch_size, -1)
-    #         mrope_delta_tensor = torch.stack([
-    #             batch.multimodal_inputs[i].mrope_position_delta.squeeze(0)
-    #             for i in range(batch_size)
-    #         ], dim=0).to(device=model_runner.device)
-    #         seq_positions = seq_positions + mrope_delta_tensor
-    #         # [3, batch_size * spec_topk/draft_token_num]
-    #         next_input_positions = seq_positions.flatten().unsqueeze(0).repeat(3, 1)
-
-    #     self.mrope_positions = next_input_positions
-
     def _compute_spec_mrope_positions(self, model_runner: ModelRunner, batch: ModelWorkerBatch):
         # TODO support batched deltas
         batch_size = self.seq_lens.shape[0]
         device = model_runner.device
         
-        if batch.forward_mode.is_draft_extend():
+        if batch.forward_mode.is_draft_extend(): # draft_extend_after_decode
             mrope_deltas = []
             extend_lens = []
             for batch_idx in range(batch_size):
