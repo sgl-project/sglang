@@ -48,6 +48,14 @@ class EngineBase(ABC):
         """Update model weights with in-memory tensor data."""
         pass
 
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        """Load a new LoRA adapter without re-launching the engine."""
+        pass
+
+    def unload_lora_adapter(self, lora_name: str):
+        """Unload a LoRA adapter without re-launching the engine."""
+        pass
+
     @abstractmethod
     def release_memory_occupation(self):
         """Release GPU memory occupation temporarily."""

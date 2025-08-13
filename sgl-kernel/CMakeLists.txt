@@ -39,25 +39,29 @@ find_package(Torch REQUIRED)
 # clean Torch Flag
 clear_cuda_arches(CMAKE_FLAG)
 
-if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
-  set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
-  set(DeepGEMM_TAG "blackwell")
-else()
-  set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
-  set(DeepGEMM_TAG "8dfa3298274bfe6b242f6f8a3e6f3eff2707dd9f")
-endif()
-
 include(FetchContent)
 
 # cutlass
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        f115c3f85467d5d9619119d1dbeb9c03c3d73864
+    GIT_TAG        664c4f7b3ed1959414905025728eef5568209479
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
+
 # DeepGEMM
+if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
+  set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
+  set(DeepGEMM_TAG "blackwell")
+elseif("${CUDA_VERSION}" VERSION_EQUAL "12.9")
+  set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
+  set(DeepGEMM_TAG "blackwell")
+else()
+  set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
+  set(DeepGEMM_TAG "391755ada0ffefa9a6a52b6f14dcaf22d1a463e0")
+endif()
+
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY ${DeepGEMM_REPO}
@@ -65,6 +69,16 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
+
+# Triton
+FetchContent_Declare(
+    repo-triton
+    GIT_REPOSITORY "https://github.com/triton-lang/triton"
+    GIT_TAG        8f9f695ea8fde23a0c7c88e4ab256634ca27789f
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-triton)
+
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
@@ -73,6 +87,7 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
+
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
@@ -81,6 +96,7 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
+
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
@@ -106,7 +122,6 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(ENABLE_BELOW_SM90 OFF)
     message(STATUS "For aarch64, disable gencode below SM90 by default")
 endif()
-
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -161,18 +176,14 @@ if (ENABLE_BELOW_SM90)
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0" OR SGL_KERNEL_ENABLE_SM100A)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100,code=sm_110"
-        "-gencode=arch=compute_100a,code=sm_110a"
-    )
-elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
-        "-gencode=arch=compute_100,code=sm_101"
-        "-gencode=arch=compute_100,code=sm_101a"
         "-gencode=arch=compute_100a,code=sm_100a"
+        "-gencode=arch=compute_101,code=sm_101"
+        "-gencode=arch=compute_101a,code=sm_101a"
         "-gencode=arch=compute_120,code=sm_120"
+        "-gencode=arch=compute_120a,code=sm_120a"
     )
 else()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -223,8 +234,13 @@ set(SOURCES
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
+    "csrc/common_extension.cc"
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
+    "csrc/gemm/dsv3_fused_a_gemm.cu"
+    "csrc/gemm/dsv3_router_gemm_bf16_out.cu"
+    "csrc/gemm/dsv3_router_gemm_entry.cu"
+    "csrc/gemm/dsv3_router_gemm_float_out.cu"
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
@@ -238,6 +254,19 @@ set(SOURCES
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
+    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
+    "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
+    "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
+    "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
+    "csrc/moe/marlin_moe_wna16/ops.cu"
+    "csrc/moe/marlin_moe_wna16/gptq_marlin_repack.cu"
+    "csrc/moe/marlin_moe_wna16/awq_marlin_repack.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
@@ -246,11 +275,12 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
     "csrc/moe/ep_moe_reorder_kernel.cu"
     "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
+    "csrc/kvcacheio/transfer.cu"
     "csrc/speculative/eagle_utils.cu"
-    "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"
-    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
-    "csrc/common_extension.cc"
+    "csrc/spatial/greenctx_stream.cu"
+    "csrc/speculative/speculative_sampling.cu"
+    "csrc/memory/store.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
@@ -285,12 +315,15 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
+
+# mscclpp
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
 add_subdirectory(${repo-mscclpp_SOURCE_DIR})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
+# flash attention
 target_compile_definitions(common_ops PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
@@ -399,3 +432,9 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
 
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
+
+# triton_kernels
+install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
+        DESTINATION "triton_kernels"
+        PATTERN ".git*" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE)

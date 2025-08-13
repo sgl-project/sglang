@@ -1,16 +1,17 @@
 use pyo3::prelude::*;
+pub mod config;
 pub mod logging;
 use std::collections::HashMap;
+pub mod core;
+pub mod metrics;
+pub mod middleware;
 pub mod openai_api_types;
-pub mod pd_router;
-pub mod pd_types;
-pub mod prometheus;
-pub mod request_adapter;
-pub mod router;
+pub mod policies;
+pub mod routers;
 pub mod server;
 pub mod service_discovery;
 pub mod tree;
-use crate::prometheus::PrometheusConfig;
+use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
 #[derive(Clone, PartialEq, Debug)]
@@ -18,7 +19,7 @@ pub enum PolicyType {
     Random,
     RoundRobin,
     CacheAware,
-    PowerOfTwo, // Moved from PD-specific, now shared
+    PowerOfTwo,
 }
 
 #[pyclass]
@@ -36,20 +37,145 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_payload_size: usize,
-    verbose: bool,
+    dp_aware: bool,
+    api_key: Option<String>,
     log_dir: Option<String>,
+    log_level: Option<String>,
     service_discovery: bool,
     selector: HashMap<String, String>,
     service_discovery_port: u16,
     service_discovery_namespace: Option<String>,
+    prefill_selector: HashMap<String, String>,
+    decode_selector: HashMap<String, String>,
+    bootstrap_port_annotation: String,
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
-    // PD mode flag
-    pd_disaggregated: bool,
-    // PD-specific fields (only used when pd_disaggregated is true)
+    request_id_headers: Option<Vec<String>>,
+    pd_disaggregation: bool,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
+    prefill_policy: Option<PolicyType>,
+    decode_policy: Option<PolicyType>,
+    max_concurrent_requests: usize,
+    cors_allowed_origins: Vec<String>,
+    // Retry configuration
+    retry_max_retries: u32,
+    retry_initial_backoff_ms: u64,
+    retry_max_backoff_ms: u64,
+    retry_backoff_multiplier: f32,
+    retry_jitter_factor: f32,
+    disable_retries: bool,
+    // Circuit breaker configuration
+    cb_failure_threshold: u32,
+    cb_success_threshold: u32,
+    cb_timeout_duration_secs: u64,
+    cb_window_duration_secs: u64,
+    disable_circuit_breaker: bool,
+}
+
+impl Router {
+    /// Convert PyO3 Router to RouterConfig
+    pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
+        use config::{
+            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
+        };
+
+        // Convert policy helper function
+        let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
+            match policy {
+                PolicyType::Random => ConfigPolicyConfig::Random,
+                PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
+                PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
+                    cache_threshold: self.cache_threshold,
+                    balance_abs_threshold: self.balance_abs_threshold,
+                    balance_rel_threshold: self.balance_rel_threshold,
+                    eviction_interval_secs: self.eviction_interval_secs,
+                    max_tree_size: self.max_tree_size,
+                },
+                PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 5, // Default value
+                },
+            }
+        };
+
+        // Determine routing mode
+        let mode = if self.pd_disaggregation {
+            RoutingMode::PrefillDecode {
+                prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
+                decode_urls: self.decode_urls.clone().unwrap_or_default(),
+                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
+                decode_policy: self.decode_policy.as_ref().map(convert_policy),
+            }
+        } else {
+            RoutingMode::Regular {
+                worker_urls: self.worker_urls.clone(),
+            }
+        };
+
+        // Convert main policy
+        let policy = convert_policy(&self.policy);
+
+        // Service discovery configuration
+        let discovery = if self.service_discovery {
+            Some(DiscoveryConfig {
+                enabled: true,
+                namespace: self.service_discovery_namespace.clone(),
+                port: self.service_discovery_port,
+                check_interval_secs: 60,
+                selector: self.selector.clone(),
+                prefill_selector: self.prefill_selector.clone(),
+                decode_selector: self.decode_selector.clone(),
+                bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
+            })
+        } else {
+            None
+        };
+
+        // Metrics configuration
+        let metrics = match (self.prometheus_port, self.prometheus_host.as_ref()) {
+            (Some(port), Some(host)) => Some(MetricsConfig {
+                port,
+                host: host.clone(),
+            }),
+            _ => None,
+        };
+
+        Ok(config::RouterConfig {
+            mode,
+            policy,
+            host: self.host.clone(),
+            port: self.port,
+            max_payload_size: self.max_payload_size,
+            request_timeout_secs: self.request_timeout_secs,
+            worker_startup_timeout_secs: self.worker_startup_timeout_secs,
+            worker_startup_check_interval_secs: self.worker_startup_check_interval,
+            dp_aware: self.dp_aware,
+            api_key: self.api_key.clone(),
+            discovery,
+            metrics,
+            log_dir: self.log_dir.clone(),
+            log_level: self.log_level.clone(),
+            request_id_headers: self.request_id_headers.clone(),
+            max_concurrent_requests: self.max_concurrent_requests,
+            cors_allowed_origins: self.cors_allowed_origins.clone(),
+            retry: config::RetryConfig {
+                max_retries: self.retry_max_retries,
+                initial_backoff_ms: self.retry_initial_backoff_ms,
+                max_backoff_ms: self.retry_max_backoff_ms,
+                backoff_multiplier: self.retry_backoff_multiplier,
+                jitter_factor: self.retry_jitter_factor,
+            },
+            circuit_breaker: config::CircuitBreakerConfig {
+                failure_threshold: self.cb_failure_threshold,
+                success_threshold: self.cb_success_threshold,
+                timeout_duration_secs: self.cb_timeout_duration_secs,
+                window_duration_secs: self.cb_window_duration_secs,
+            },
+            disable_retries: false,
+            disable_circuit_breaker: false,
+        })
+    }
 }
 
 #[pymethods]
@@ -68,18 +194,41 @@ impl Router {
         eviction_interval_secs = 60,
         max_tree_size = 2usize.pow(24),
         max_payload_size = 256 * 1024 * 1024,  // 256MB default for large batches
-        verbose = false,
+        dp_aware = false,
+        api_key = None,
         log_dir = None,
+        log_level = None,
         service_discovery = false,
         selector = HashMap::new(),
         service_discovery_port = 80,
         service_discovery_namespace = None,
+        prefill_selector = HashMap::new(),
+        decode_selector = HashMap::new(),
+        bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
         request_timeout_secs = 600,  // Add configurable request timeout
-        pd_disaggregated = false,  // New flag for PD mode
+        request_id_headers = None,  // Custom request ID headers
+        pd_disaggregation = false,  // New flag for PD mode
         prefill_urls = None,
-        decode_urls = None
+        decode_urls = None,
+        prefill_policy = None,
+        decode_policy = None,
+        max_concurrent_requests = 64,
+        cors_allowed_origins = vec![],
+        // Retry defaults
+        retry_max_retries = 3,
+        retry_initial_backoff_ms = 100,
+        retry_max_backoff_ms = 10_000,
+        retry_backoff_multiplier = 2.0,
+        retry_jitter_factor = 0.1,
+        disable_retries = false,
+        // Circuit breaker defaults
+        cb_failure_threshold = 5,
+        cb_success_threshold = 2,
+        cb_timeout_duration_secs = 30,
+        cb_window_duration_secs = 60,
+        disable_circuit_breaker = false,
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -94,18 +243,39 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         max_payload_size: usize,
-        verbose: bool,
+        dp_aware: bool,
+        api_key: Option<String>,
         log_dir: Option<String>,
+        log_level: Option<String>,
         service_discovery: bool,
         selector: HashMap<String, String>,
         service_discovery_port: u16,
         service_discovery_namespace: Option<String>,
+        prefill_selector: HashMap<String, String>,
+        decode_selector: HashMap<String, String>,
+        bootstrap_port_annotation: String,
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
         request_timeout_secs: u64,
-        pd_disaggregated: bool,
+        request_id_headers: Option<Vec<String>>,
+        pd_disaggregation: bool,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
+        prefill_policy: Option<PolicyType>,
+        decode_policy: Option<PolicyType>,
+        max_concurrent_requests: usize,
+        cors_allowed_origins: Vec<String>,
+        retry_max_retries: u32,
+        retry_initial_backoff_ms: u64,
+        retry_max_backoff_ms: u64,
+        retry_backoff_multiplier: f32,
+        retry_jitter_factor: f32,
+        disable_retries: bool,
+        cb_failure_threshold: u32,
+        cb_success_threshold: u32,
+        cb_timeout_duration_secs: u64,
+        cb_window_duration_secs: u64,
+        disable_circuit_breaker: bool,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -120,84 +290,55 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             max_payload_size,
-            verbose,
+            dp_aware,
+            api_key,
             log_dir,
+            log_level,
             service_discovery,
             selector,
             service_discovery_port,
             service_discovery_namespace,
+            prefill_selector,
+            decode_selector,
+            bootstrap_port_annotation,
             prometheus_port,
             prometheus_host,
             request_timeout_secs,
-            pd_disaggregated,
+            request_id_headers,
+            pd_disaggregation,
             prefill_urls,
             decode_urls,
+            prefill_policy,
+            decode_policy,
+            max_concurrent_requests,
+            cors_allowed_origins,
+            retry_max_retries,
+            retry_initial_backoff_ms,
+            retry_max_backoff_ms,
+            retry_backoff_multiplier,
+            retry_jitter_factor,
+            disable_retries,
+            cb_failure_threshold,
+            cb_success_threshold,
+            cb_timeout_duration_secs,
+            cb_window_duration_secs,
+            disable_circuit_breaker,
         })
     }
 
     fn start(&self) -> PyResult<()> {
-        let policy_config = if self.pd_disaggregated {
-            // PD mode - map PolicyType to PDSelectionPolicy
-            let pd_selection_policy = match &self.policy {
-                PolicyType::Random => pd_types::PDSelectionPolicy::Random,
-                PolicyType::PowerOfTwo => pd_types::PDSelectionPolicy::PowerOfTwo,
-                PolicyType::CacheAware => pd_types::PDSelectionPolicy::CacheAware {
-                    cache_threshold: self.cache_threshold,
-                    balance_abs_threshold: self.balance_abs_threshold,
-                    balance_rel_threshold: self.balance_rel_threshold,
-                },
-                PolicyType::RoundRobin => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "RoundRobin policy is not supported in PD disaggregated mode",
-                    ));
-                }
-            };
+        // Convert to RouterConfig and validate
+        let router_config = self.to_router_config().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {}", e))
+        })?;
 
-            let prefill_urls = self.prefill_urls.as_ref().ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "PD disaggregated mode requires prefill_urls",
-                )
-            })?;
-            let decode_urls = self.decode_urls.as_ref().ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "PD disaggregated mode requires decode_urls",
-                )
-            })?;
-
-            router::PolicyConfig::PrefillDecodeConfig {
-                selection_policy: pd_selection_policy,
-                prefill_urls: prefill_urls.clone(),
-                decode_urls: decode_urls.clone(),
-                timeout_secs: self.worker_startup_timeout_secs,
-                interval_secs: self.worker_startup_check_interval,
-            }
-        } else {
-            // Regular mode
-            match &self.policy {
-                PolicyType::Random => router::PolicyConfig::RandomConfig {
-                    timeout_secs: self.worker_startup_timeout_secs,
-                    interval_secs: self.worker_startup_check_interval,
-                },
-                PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig {
-                    timeout_secs: self.worker_startup_timeout_secs,
-                    interval_secs: self.worker_startup_check_interval,
-                },
-                PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
-                    timeout_secs: self.worker_startup_timeout_secs,
-                    interval_secs: self.worker_startup_check_interval,
-                    cache_threshold: self.cache_threshold,
-                    balance_abs_threshold: self.balance_abs_threshold,
-                    balance_rel_threshold: self.balance_rel_threshold,
-                    eviction_interval_secs: self.eviction_interval_secs,
-                    max_tree_size: self.max_tree_size,
-                },
-                PolicyType::PowerOfTwo => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "PowerOfTwo policy is only supported in PD disaggregated mode",
-                    ));
-                }
-            }
-        };
+        // Validate the configuration
+        router_config.validate().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Configuration validation failed: {}",
+                e
+            ))
+        })?;
 
         // Create service discovery config if enabled
         let service_discovery_config = if self.service_discovery {
@@ -207,6 +348,10 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
+                pd_mode: self.pd_disaggregation,
+                prefill_selector: self.prefill_selector.clone(),
+                decode_selector: self.decode_selector.clone(),
+                bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
             })
         } else {
             None
@@ -221,22 +366,26 @@ impl Router {
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
         });
 
-        actix_web::rt::System::new().block_on(async move {
+        // Use tokio runtime instead of actix-web System for better compatibility
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Block on the async startup function
+        runtime.block_on(async move {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),
                 port: self.port,
-                worker_urls: self.worker_urls.clone(),
-                policy_config,
-                verbose: self.verbose,
+                router_config,
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
+                log_level: self.log_level.clone(),
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
+                request_id_headers: self.request_id_headers.clone(),
             })
             .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            Ok(())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     }
 }

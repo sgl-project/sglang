@@ -22,7 +22,9 @@ class TestPixtralServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.73",
+                "0.70",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -44,7 +46,9 @@ class TestMistral3_1Server(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.8",
+                "0.75",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -67,6 +71,8 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--context-length",
                 "4096",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
@@ -88,12 +94,14 @@ class TestJanusProServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
+    def test_video_images_chat_completion(self):
         pass
 
     def test_single_image_chat_completion(self):
@@ -119,6 +127,10 @@ class TestJanusProServer(TestOpenAIVisionServer):
 #                 "0.8",
 #                 "--tp-size=8",
 #                 "--context-length=8192",
+#                 "--mm-attention-backend",
+#                 "fa3",
+#                 "--cuda-graph-max-bs",
+#                 "4",
 #             ],
 #         )
 #         cls.base_url += "/v1"
@@ -140,13 +152,88 @@ class TestGemma3itServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
                 "--enable-multimodal",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
     def test_video_chat_completion(self):
+        pass
+
+
+class TestGemma3nServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "google/gemma-3n-E4B-it"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.70",
+                "--cuda-graph-max-bs",
+                "4",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
+        # self._test_audio_ambient_completion()
+
+
+class TestQwen2AudioServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen2-Audio-7B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.70",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        self._test_audio_ambient_completion()
+
+    # Qwen2Audio does not support image
+    def test_single_image_chat_completion(self):
+        pass
+
+    # Qwen2Audio does not support image
+    def test_multi_turn_chat_completion(self):
+        pass
+
+    # Qwen2Audio does not support image
+    def test_multi_images_chat_completion(self):
+        pass
+
+    # Qwen2Audio does not support image
+    def test_video_images_chat_completion(self):
+        pass
+
+    # Qwen2Audio does not support image
+    def test_regex(self):
+        pass
+
+    # Qwen2Audio does not support image
+    def test_mixed_batch(self):
         pass
 
 
@@ -166,11 +253,13 @@ class TestKimiVLServer(TestOpenAIVisionServer):
                 "4096",
                 "--dtype",
                 "bfloat16",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
+    def test_video_images_chat_completion(self):
         pass
 
 
@@ -197,19 +286,22 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
                 "--disable-radix-cache",
                 "--max-loras-per-batch",
-                "1",
+                "2",
                 "--revision",
                 revision,
                 "--lora-paths",
                 f"vision={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/vision-lora",
+                f"speech={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/speech-lora",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
-    def get_request_kwargs(self):
+    def get_vision_request_kwargs(self):
         return {
             "extra_body": {
                 "lora_path": "vision",
@@ -218,16 +310,28 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             }
         }
 
-    def test_video_chat_completion(self):
-        pass
+    def get_audio_request_kwargs(self):
+        return {
+            "extra_body": {
+                "lora_path": "speech",
+                "top_k": 1,
+                "top_p": 1.0,
+            }
+        }
+
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
+        # self._test_audio_ambient_completion()
 
 
 class TestVILAServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "AndyZijianZhang/NVILA-Lite-2B"
+        cls.model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
+        cls.revision = "6bde1de5964b40e61c802b375fff419edc867506"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -236,10 +340,41 @@ class TestVILAServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--context-length=65536",
+                f"--revision={cls.revision}",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
 
+# Skip for ci test
+# class TestGLM41VServer(TestOpenAIVisionServer):
+#     @classmethod
+#     def setUpClass(cls):
+#         cls.model = "zai-org/GLM-4.1V-9B-Thinking"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-123456"
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             other_args=[
+#                 "--trust-remote-code",
+#                 "--mem-fraction-static",
+#                 "0.68",
+#                 "--cuda-graph-max-bs",
+#                 "4",
+#                 "--reasoning-parser",
+#                 "glm45",
+#             ],
+#         )
+#         cls.base_url += "/v1"
+
+#     def test_video_chat_completion(self):
+#         self._test_video_chat_completion()
+
+
 if __name__ == "__main__":
+    del TestOpenAIVisionServer
     unittest.main()
