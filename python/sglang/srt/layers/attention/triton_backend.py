@@ -330,7 +330,7 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
-            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            max_extend_len = torch.max(forward_batch.extend_seq_lens_cpu).item()
             num_kv_splits = None
 
         self.forward_metadata = ForwardMetadata(

@@ -1724,6 +1724,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 self.sampling_info.grammars = None
 
+        seq_lens_cpu = (
+            seq_lens_cpu_cache
+            if seq_lens_cpu_cache is not None
+            else self.seq_lens.cpu()
+        )
+
         global bid
         bid += 1
         return ModelWorkerBatch(
@@ -1734,7 +1740,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens=self.seq_lens,
             orig_seq_lens=self.orig_seq_lens,
             out_cache_loc=self.out_cache_loc,
-            seq_lens_cpu=seq_lens_cpu_cache or self.seq_lens.cpu(),
+            seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
