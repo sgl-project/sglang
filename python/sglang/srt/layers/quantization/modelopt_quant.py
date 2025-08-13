@@ -901,10 +901,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             e2m1_and_ufp8sf_scale_to_float,
             fp4_quantize,
             next_positive_power_of_2,
+            nvfp4_block_scale_interleave,
             reorder_rows_for_gated_act_gemm,
             shuffle_matrix_a,
             shuffle_matrix_sf_a,
-            nvfp4_block_scale_interleave,
         )
         from flashinfer.fused_moe.core import (
             _maybe_get_cached_w2_permute_indices,
