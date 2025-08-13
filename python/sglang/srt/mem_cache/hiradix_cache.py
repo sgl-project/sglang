@@ -71,8 +71,10 @@ class HiRadixCache(RadixCache):
         self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.enable_storage = hicache_storage_backend is not None
-        # todo: customizable storage prefetch threshold
+        # todo: customizable storage prefetch threshold and timeout
         self.prefetch_threshold = 256
+        self.prefetch_timeout = 3  # seconds
+        self.prefetch_stop_policy = hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -85,13 +87,6 @@ class HiRadixCache(RadixCache):
             io_backend=hicache_io_backend,
             storage_backend=hicache_storage_backend,
             prefetch_threshold=self.prefetch_threshold,
-        )
-
-        self.prefetch_stop_policy = hicache_storage_prefetch_policy
-        # todo: customizable storage prefetch timeout
-        self.prefetch_timeout = 3  # seconds
-        logger.info(
-            f"HiCache storage prefetch policy: {hicache_storage_prefetch_policy}"
         )
 
         # record the nodes with ongoing write through
@@ -151,7 +146,7 @@ class HiRadixCache(RadixCache):
 
     def write_backup_storage(self, node: TreeNode):
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.parent.get_last_hash_value()
+            node.host_value, node.key, node.hash_value
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -414,18 +409,18 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
         for _ in range(queue_size.item()):
-            ack_id, hash_value, completed_tokens = (
-                self.cache_controller.ack_backup_queue.get()
-            )
+            ack_id, completed_tokens = self.cache_controller.ack_backup_queue.get()
             host_node = self.ongoing_backup[ack_id]
-            if completed_tokens == 0:
-                host_node.hash_value = None
-            elif completed_tokens < len(host_node.key):
-                # backup is only partially successful, split the node
-                new_node = self._split_node(host_node.key, host_node, completed_tokens)
-                new_node.hash_value = hash_value
-            else:
-                host_node.hash_value = hash_value
+
+            if completed_tokens > 0:
+                if completed_tokens < len(host_node.key):
+                    # backup is only partially successful, split the node
+                    new_node = self._split_node(
+                        host_node.key, host_node, completed_tokens
+                    )
+                    new_node.backuped_storage = True
+                else:
+                    host_node.backuped_storage = True
             host_node.release_host()
             del self.ongoing_backup[ack_id]
 
@@ -470,6 +465,10 @@ class HiRadixCache(RadixCache):
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
             req_id
         ]
+
+        if operation.host_indices is None:
+            # prefetch has not been issued due to insufficient host memory
+            return True
 
         if not self.can_terminate_prefetch(operation):
             return False
@@ -565,10 +564,6 @@ class HiRadixCache(RadixCache):
         if host_indices is None:
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            last_host_node.release_host()
-            # no sufficient host memory to prefetch
-            return
         operation = self.cache_controller.prefetch(
             req_id, host_indices, new_input_tokens, last_hash
         )
@@ -716,6 +711,21 @@ class HiRadixCache(RadixCache):
             new_node.value = value
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
+
+            if self.enable_storage:
+                last_hash = node.get_last_hash_value()
+                assert (node == self.root_node) or (
+                    last_hash is not None
+                ), "Parent node must have a hash value with storage enabled"
+                new_node.hash_value = []
+                for idx in range(0, len(key), self.page_size):
+                    new_node.hash_value.append(
+                        self.cache_controller.get_hash_str(
+                            key[idx : idx + self.page_size],
+                            prior_hash=last_hash,
+                        )
+                    )
+                    last_hash = new_node.hash_value[-1]
 
             if self.cache_controller.write_policy != "write_back":
                 self.inc_hit_count(new_node)

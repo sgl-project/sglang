@@ -64,13 +64,12 @@ class ModelConfig:
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
-
+        # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.model_impl = model_impl
 
-        # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
@@ -139,6 +138,7 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "Ernie4_5_MoeForCausalLM"
         ):
             self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
+
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
@@ -282,12 +282,10 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
 
-        config = self.hf_config
-
         # multimodal
-        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
-            config, "image_token_index", None
-        )
+        self.image_token_id = getattr(
+            self.hf_config, "image_token_id", None
+        ) or getattr(self.hf_config, "image_token_index", None)
 
     @staticmethod
     def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
@@ -644,6 +642,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
+        or "Qwen3ForSequenceClassification" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
         or "Contriever" in model_architectures
@@ -661,6 +660,8 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
+    "Glm4vForConditionalGeneration",
+    "Glm4vMoeForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",

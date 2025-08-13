@@ -130,6 +130,7 @@ from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+from sglang.srt.mem_cache.lora_radix_cache import LoRARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -611,12 +612,7 @@ class Scheduler(
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
-                    hicache_io_backend=(
-                        "direct"
-                        if server_args.attention_backend
-                        == "fa3"  # hot fix for incompatibility
-                        else server_args.hicache_io_backend
-                    ),
+                    hicache_io_backend=server_args.hicache_io_backend,
                     hicache_mem_layout=server_args.hicache_mem_layout,
                     hicache_storage_backend=server_args.hicache_storage_backend,
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
@@ -635,7 +631,19 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                 )
-
+            elif self.enable_lora:
+                assert (
+                    not self.enable_hierarchical_cache
+                ), "LoRA radix cache doesn't support hierarchical cache"
+                assert (
+                    self.schedule_policy == "fcfs"
+                ), "LoRA radix cache only supports FCFS policy"
+                self.tree_cache = LoRARadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                    disable=server_args.disable_radix_cache,
+                )
             else:
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
