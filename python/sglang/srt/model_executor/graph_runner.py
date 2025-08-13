@@ -530,7 +530,7 @@ class GraphRunner:
         return out
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
-        graph = create_device_graph(self.device)
+        graph = create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
