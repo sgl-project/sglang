@@ -109,8 +109,8 @@ mod test_pd_routing {
         }
     }
 
-    #[test]
-    fn test_pd_router_configuration() {
+    #[tokio::test]
+    async fn test_pd_router_configuration() {
         // Test PD router configuration with various policies
         // In the new structure, RoutingMode and PolicyConfig are separate
         let test_cases = vec![
@@ -190,7 +190,7 @@ mod test_pd_routing {
             let app_context =
                 sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64);
             let app_context = std::sync::Arc::new(app_context);
-            let result = RouterFactory::create_router(&app_context);
+            let result = RouterFactory::create_router(&app_context).await;
             assert!(result.is_err());
             let error_msg = result.unwrap_err();
             // Error should be about health/timeout, not configuration
