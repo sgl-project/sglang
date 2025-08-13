@@ -4,7 +4,7 @@ SGLang router is a standalone Rust module that enables data parallelism across S
 
 ## Documentation
 
-- **User Guide**: [docs.sglang.ai/router/router.html](https://docs.sglang.ai/router/router.html)
+- **User Guide**: [docs.sglang.ai/advanced_features/router.html](https://docs.sglang.ai/advanced_features/router.html)
 
 ## Quick Start
 
@@ -43,6 +43,7 @@ python -m build && pip install --force-reinstall dist/*.whl
 ```
 
 #### Option B: Development Mode
+
 ```bash
 pip install -e .
 ```
