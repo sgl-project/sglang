@@ -116,7 +116,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
     def __init__(
         self,
         tokenizer,
-        whitespace_pattern: bool,
+        whitespace_pattern: str | None,
     ):
         super().__init__()
 
