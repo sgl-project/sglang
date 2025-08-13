@@ -197,6 +197,8 @@ suite_amd = {
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_triton_attention_backend.py", 150),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
+        TestFile("test_wave_attention_kernels.py", 2),
+        TestFile("test_wave_attention_backend.py", 150),
     ],
     "per-commit-2-gpu-amd": [
         TestFile("lora/test_lora_tp.py", 116),
