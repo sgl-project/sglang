@@ -29,10 +29,20 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather,
+    attn_tp_reduce_scatter,
+    dp_gather_partial,
+    dp_scatter,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    get_local_attention_dp_size,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.layers.communicator import (
     LayerCommunicator, 
     LayerScatterModes,
@@ -77,8 +87,8 @@ class Qwen3GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_attention_tp_size()
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
@@ -105,6 +115,8 @@ class Qwen3GatedDeltaNet(nn.Module):
             output_size=self.conv_dim,
             bias=False,
             quant_config=None,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
         # projection of the input hidden states
@@ -112,7 +124,10 @@ class Qwen3GatedDeltaNet(nn.Module):
         
         self.in_proj = ColumnParallelLinear(input_size=self.hidden_size,
                                             output_size=projection_size,
-                                            bias=False)
+                                            bias=False,
+                                            tp_rank=self.attn_tp_rank,
+                                            tp_size=self.attn_tp_size,
+                                            )
         
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -125,22 +140,18 @@ class Qwen3GatedDeltaNet(nn.Module):
                     query_key_settings,
                     query_key_settings,
                     value_settings,
-                ], self.tp_size, self.tp_rank)
+                ], self.attn_tp_size, self.attn_tp_rank)
             })
         
         # selective projection used to make dt, B and C input dependant
 
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
-        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads // self.tp_size))
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads // self.attn_tp_size))
 
-        A = torch.empty(divide(self.num_v_heads, self.tp_size), dtype=torch.float32).uniform_(0, 16)
+        A = torch.empty(divide(self.num_v_heads, self.attn_tp_size), dtype=torch.float32).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
-
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias,
-                         {"weight_loader": sharded_weight_loader(0)})
 
         self.share_norm = config.share_norm
         self.norm_before_gate = config.norm_before_gate
@@ -174,14 +185,17 @@ class Qwen3GatedDeltaNet(nn.Module):
                                           self.hidden_size,
                                           bias=False,
                                           input_is_parallel=True,
-                                          reduce_results=False)
+                                          reduce_results=False,
+                                          tp_rank=self.attn_tp_rank,
+                                          tp_size=self.attn_tp_size,
+                                          )
 
     def fix_query_key_value_ordering(self, mixed_qkvzba, ):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
         """
         new_tensor_shape = mixed_qkvzba.size()[:-1] + (
-            self.num_k_heads // self.tp_size,
+            self.num_k_heads // self.attn_tp_size,
             (
                 self.head_k_dim + self.head_k_dim +
                 (self.head_v_dim + self.head_v_dim + 2) * \
@@ -209,8 +223,8 @@ class Qwen3GatedDeltaNet(nn.Module):
         # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
         value = value.reshape(value.size(0), -1, self.head_v_dim)
         z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b = b.reshape(b.size(0), self.num_v_heads // self.tp_size)
-        a = a.reshape(a.size(0), self.num_v_heads // self.tp_size)
+        b = b.reshape(b.size(0), self.num_v_heads // self.attn_tp_size)
+        a = a.reshape(a.size(0), self.num_v_heads // self.attn_tp_size)
 
         return query, key, value, z, b, a
 
@@ -275,7 +289,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         query, key, value = torch.split(
             mixed_qkv,
             [
-                self.key_dim // self.tp_size, self.key_dim // self.tp_size, self.value_dim // self.tp_size,
+                self.key_dim // self.attn_tp_size, self.key_dim // self.attn_tp_size, self.value_dim // self.attn_tp_size,
             ],
             dim=-1,
         )
@@ -532,20 +546,21 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.config = config
         self.position_embedding_type = getattr(config, "position_embedding_type", "none")
         self.hidden_size = config.hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_attention_tp_size()
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % self.tp_size == 0
-        self.num_heads = self.total_num_heads // self.tp_size
+        assert self.total_num_heads % self.attn_tp_size == 0
+        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= self.tp_size:
+        if self.total_num_kv_heads >= self.attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % self.tp_size == 0
+            assert self.total_num_kv_heads % self.attn_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
+            assert self.attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
         self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -583,13 +598,18 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
         )
 
         self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
                                         config.hidden_size,
                                         bias=False,
                                         quant_config=quant_config,
-                                        reduce_results=False)
+                                        reduce_results=False,
+                                        tp_rank=self.attn_tp_rank,
+                                        tp_size=self.attn_tp_size,
+                                        )
         
         self.attn = RadixAttention(
             self.num_heads,
@@ -737,6 +757,7 @@ class Qwen3HybridMoeModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
+            enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
 
         def get_layer(idx: int, prefix: str):
@@ -815,7 +836,11 @@ class Qwen3HybridMoeModel(nn.Module):
                 forward_batch=forward_batch,
             )
             
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if hidden_states.shape[0] != 0:
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
         
         if hidden_states.shape[0] <= 3:
             self.infer_count += 1
@@ -850,6 +875,7 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
             quant_config=quant_config,
             org_num_embeddings=config.vocab_size,
             prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -867,7 +893,7 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
 
     def _get_linear_cache_shape(self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
         config = self.config
-        world_size = get_tensor_model_parallel_world_size()
+        world_size = get_attention_tp_size()
         conv_dim = (config.linear_key_head_dim * config.linear_num_key_heads * 2 + config.linear_value_head_dim * config.linear_num_value_heads)
         conv_state_shape = (
             divide(conv_dim, world_size),
@@ -883,7 +909,7 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
 
     def _get_mamba_cache_shape(
             self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-        world_size = get_tensor_model_parallel_world_size()
+        world_size = get_attention_tp_size()
         hidden_size = self.config.hidden_size
 
         conv_state_shape, temporal_state_shape = None, None
@@ -926,7 +952,6 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         self.mamba_cache = MambaCacheManager(
             self.lm_head.weight.dtype, num_mamba_layers,
             conv_state_shape, temporal_state_shape)
-        logger.info(f"{self.lm_head.weight.dtype=}")
 
     def prepare_extend_start_loc(self, forward_batch: ForwardBatch):
         # extend_start_loc shape is batch_size, while hybrid attention need batch_size + 1
