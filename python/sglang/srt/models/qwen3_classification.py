@@ -75,4 +75,4 @@ class Qwen3ForSequenceClassification(nn.Module):
 
 EntryClass = [
     Qwen3ForSequenceClassification,
-] 
+]
