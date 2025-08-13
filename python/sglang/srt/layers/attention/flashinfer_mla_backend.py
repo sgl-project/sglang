@@ -146,7 +146,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        curr_rank = forward_batch.req_pool_indices.device.index
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -245,7 +244,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
     ):
-        curr_rank = req_pool_indices.device.index
 
         if forward_mode.is_decode_or_idle():
             decode_wrapper = BatchMLAPagedAttentionWrapper(
@@ -327,7 +325,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInfo],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        curr_rank = req_pool_indices.device.index
 
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
@@ -591,7 +588,6 @@ class FlashInferMLAIndicesUpdaterDecode:
             )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-        curr_rank = kv_indptr.device.index
 
         if not init_metadata_replay:
             wrapper.plan(
@@ -829,8 +825,6 @@ class FlashInferMLAMultiStepDraftBackend:
         kv_indices_buffer: torch.Tensor,
         call_fn: Callable,
     ):
-        curr_rank = forward_batch.req_pool_indices.device.index
-
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
@@ -864,7 +858,6 @@ class FlashInferMLAMultiStepDraftBackend:
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        curr_rank = forward_batch.req_pool_indices.device.index
 
         kv_indices = torch.zeros(
             (
@@ -901,7 +894,6 @@ class FlashInferMLAMultiStepDraftBackend:
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        curr_rank = forward_batch.req_pool_indices.device.index
 
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
@@ -919,7 +911,6 @@ class FlashInferMLAMultiStepDraftBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        curr_rank = forward_batch.req_pool_indices.device.index
 
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
