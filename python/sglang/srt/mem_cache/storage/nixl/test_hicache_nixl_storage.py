@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
-from sglang.srt.mem_cache.nixl.nixl_utils import NixlFileManager, NixlRegistration
+from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
+from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager, NixlRegistration
 
 
 class TestNixlUnified(unittest.TestCase):
@@ -170,7 +170,7 @@ class TestNixlUnified(unittest.TestCase):
         self.file_manager.create_file(test_file)
 
         # Test tuple creation
-        tuples = self.file_manager.files_to_nixl_tuples([test_file], False)
+        tuples = self.file_manager.files_to_nixl_tuples([test_file])
         self.assertIsNotNone(tuples)
         self.assertTrue(len(tuples) > 0)
 
@@ -190,11 +190,11 @@ class TestNixlUnified(unittest.TestCase):
         tensor = torch.randn(10, 10)
 
         # Test buffer registration
-        self.assertIsNotNone(self.registration.register_buffers(tensor))
+        self.assertIsNotNone(self.hicache.register_buffers(tensor))
 
         # Test batch registration
         tensors = [torch.randn(5, 5) for _ in range(3)]
-        self.assertIsNotNone(self.registration.register_buffers(tensors))
+        self.assertIsNotNone(self.hicache.register_buffers(tensors))
 
     def test_register_files_with_tuples(self):
         """Test registration of files using NIXL tuples."""
@@ -203,8 +203,8 @@ class TestNixlUnified(unittest.TestCase):
             self.file_manager.create_file(file)
 
         # Create tuples and register
-        tuples = self.file_manager.files_to_nixl_tuples(files, False)
-        self.registration.register_files(tuples)
+        tuples = self.file_manager.files_to_nixl_tuples(files)
+        self.hicache.register_files(tuples)
 
         # Verify tuples
         self.assertEqual(len(tuples), len(files))

@@ -43,33 +43,26 @@ Consolidated utility classes:
 - PyTorch installed
 - Python 3.8+
 
-### Unit tests from Project root
-Navigate to the project root directory (`/path/to/sglang`) and run:
+### Unit tests from current directory
+From the current directory run:
 
 #### Run all NIXL tests:
 ```bash
-PYTHONPATH=. python -m pytest test/srt/test_hicache_nixl_storage.py -o asyncio_mode=strict
+PYTHONPATH=. python -m pytest test_hicache_nixl_storage.py -o asyncio_mode=strict
 ```
 
 #### Run with verbose output:
 ```bash
-PYTHONPATH=. python -m pytest test/srt/test_hicache_nixl_storage.py -v -o asyncio_mode=strict
+PYTHONPATH=. python -m pytest test_hicache_nixl_storage.py -v -o asyncio_mode=strict
 ```
 
 Note: The `-v` flag provides more detailed output, showing each test case name and its result.
 
 #### Run a specific test:
 ```bash
-PYTHONPATH=. python -m pytest test/srt/test_hicache_nixl_storage.py -v -k test_single_set_get -o asyncio_mode=strict
+PYTHONPATH=. python -m pytest test_hicache_nixl_storage.py -v -k test_single_set_get -o asyncio_mode=strict
 ```
 
-### From Tests Directory
-Navigate to the tests directory and run:
-
-```bash
-cd test/srt
-PYTHONPATH=../.. python -m pytest test_hicache_nixl_storage.py -o asyncio_mode=strict
-```
 Note: The `-o asyncio_mode=strict` flag is added to suppress warnings about asyncio configuration. This is not required for test functionality but provides cleaner output.
 
 ## Test Coverage
