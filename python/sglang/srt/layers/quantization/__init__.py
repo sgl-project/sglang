@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import builtins
 import inspect
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Type, Union
+from typing import TYPE_CHECKING, Dict, Optional, Type
 
 import torch
 
@@ -26,8 +26,9 @@ try:
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
     VLLM_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     VLLM_AVAILABLE = False
+    VLLM_IMPORT_ERROR = e
 
     # Define empty classes as placeholders when vllm is not available
     class DummyConfig:
@@ -47,7 +48,7 @@ from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from sglang.srt.utils import mxfp_supported
+from sglang.srt.utils import is_cuda, is_hip, mxfp_supported
 
 is_mxfp_supported = mxfp_supported()
 if is_mxfp_supported:
@@ -66,6 +67,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.utils import get_linear_quant_method
@@ -90,7 +92,16 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
 }
-if is_mxfp_supported:
+
+
+if is_cuda():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "quark": Mxfp4Config,
+            "mxfp4": Mxfp4Config,
+        }
+    )
+elif is_mxfp_supported and is_hip():
     BASE_QUANTIZATION_METHODS.update(
         {
             "quark": MxFp4Config,
@@ -127,7 +138,8 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
-            "Please install vllm by `pip install vllm==0.9.0.1`"
+            f"Please install vllm by `pip install vllm==0.9.0.1`\n"
+            f"Import error: {VLLM_IMPORT_ERROR}"
         )
 
     return QUANTIZATION_METHODS[quantization]

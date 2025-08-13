@@ -2,7 +2,9 @@
 mod test_pd_routing {
     use rand::Rng;
     use serde_json::json;
-    use sglang_router_rs::config::{PolicyConfig, RetryConfig, RouterConfig, RoutingMode};
+    use sglang_router_rs::config::{
+        CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    };
     use sglang_router_rs::core::{WorkerFactory, WorkerType};
     use sglang_router_rs::routers::pd_types::get_hostname;
     use sglang_router_rs::routers::pd_types::PDSelectionPolicy;
@@ -107,8 +109,8 @@ mod test_pd_routing {
         }
     }
 
-    #[test]
-    fn test_pd_router_configuration() {
+    #[tokio::test]
+    async fn test_pd_router_configuration() {
         // Test PD router configuration with various policies
         // In the new structure, RoutingMode and PolicyConfig are separate
         let test_cases = vec![
@@ -179,13 +181,16 @@ mod test_pd_routing {
                 max_concurrent_requests: 64,
                 cors_allowed_origins: vec![],
                 retry: RetryConfig::default(),
+                circuit_breaker: CircuitBreakerConfig::default(),
+                disable_retries: false,
+                disable_circuit_breaker: false,
             };
 
             // Router creation will fail due to health checks, but config should be valid
             let app_context =
                 sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64);
             let app_context = std::sync::Arc::new(app_context);
-            let result = RouterFactory::create_router(&app_context);
+            let result = RouterFactory::create_router(&app_context).await;
             assert!(result.is_err());
             let error_msg = result.unwrap_err();
             // Error should be about health/timeout, not configuration
