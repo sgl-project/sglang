@@ -4,7 +4,7 @@ import functools
 import logging
 from contextlib import contextmanager
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import triton
@@ -27,14 +27,14 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_ATTN_TP_GROUP = None
-_ATTN_TP_RANK = None
-_ATTN_TP_SIZE = None
-_ATTN_DP_RANK = None
-_ATTN_DP_SIZE = None
-_LOCAL_ATTN_DP_SIZE = None
-_LOCAL_ATTN_DP_RANK = None
-_ENABLE_DP_ATTENTION_FLAG = None
+_ATTN_TP_GROUP: Optional[GroupCoordinator] = None
+_ATTN_TP_RANK: Optional[int] = None
+_ATTN_TP_SIZE: Optional[int] = None
+_ATTN_DP_RANK: Optional[int] = None
+_ATTN_DP_SIZE: Optional[int] = None
+_LOCAL_ATTN_DP_SIZE: Optional[int] = None
+_LOCAL_ATTN_DP_RANK: Optional[int] = None
+_ENABLE_DP_ATTENTION_FLAG: bool = False
 
 
 class DpPaddingMode(IntEnum):
@@ -178,42 +178,41 @@ def initialize_dp_attention(
     )
 
 
-def is_dp_attention_enabled():
-    assert _ENABLE_DP_ATTENTION_FLAG is not None, "dp attention not initialized!"
+def is_dp_attention_enabled() -> bool:
     return _ENABLE_DP_ATTENTION_FLAG
 
 
-def get_attention_tp_group():
+def get_attention_tp_group() -> GroupCoordinator:
     assert _ATTN_TP_GROUP is not None, "dp attention not initialized!"
     return _ATTN_TP_GROUP
 
 
-def get_attention_tp_rank():
+def get_attention_tp_rank() -> int:
     assert _ATTN_TP_RANK is not None, "dp attention not initialized!"
     return _ATTN_TP_RANK
 
 
-def get_attention_tp_size():
+def get_attention_tp_size() -> int:
     assert _ATTN_TP_SIZE is not None, "dp attention not initialized!"
     return _ATTN_TP_SIZE
 
 
-def get_attention_dp_rank():
+def get_attention_dp_rank() -> int:
     assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
     return _ATTN_DP_RANK
 
 
-def get_attention_dp_size():
+def get_attention_dp_size() -> int:
     assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
     return _ATTN_DP_SIZE
 
 
-def get_local_attention_dp_rank():
+def get_local_attention_dp_rank() -> int:
     assert _LOCAL_ATTN_DP_RANK is not None, "dp attention not initialized!"
     return _LOCAL_ATTN_DP_RANK
 
 
-def get_local_attention_dp_size():
+def get_local_attention_dp_size() -> int:
     assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
     return _LOCAL_ATTN_DP_SIZE
 
