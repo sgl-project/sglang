@@ -110,6 +110,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_cpu_ids_by_node,
+    get_current_device,
     init_custom_process_group,
     is_fa3_default_architecture,
     is_flashinfer_available,
@@ -924,7 +925,7 @@ class ModelRunner:
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        infered_device = torch.cuda.current_device()
+        infered_device = get_current_device(self.device)
 
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))

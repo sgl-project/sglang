@@ -22,11 +22,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.model_executor.graph_runner import GraphRunner
-from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
-
-_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -34,30 +31,12 @@ if TYPE_CHECKING:
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
-if _is_npu:
-    torch.cuda.CUDAGraph = torch.npu.NPUGraph
-    torch.cuda.synchronize = torch.npu.synchronize
-    torch.cuda.graph = torch.npu.graph
-    torch.cuda.stream = torch.npu.stream
-    torch.cuda.Stream = torch.npu.Stream
-    torch.cuda.current_stream = torch.npu.current_stream
-    torch.cuda.graph_pool_handle = torch.npu.graph_pool_handle
-
 
 class NPUGraphRunner(GraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-
-    def _create_graph(self):
-        return torch.npu.NPUGraph()
-
-    def _capture_init(self, run_once_fn):
-        for _ in range(2):
-            torch.npu.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once_fn()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         with torch.npu.graph(
