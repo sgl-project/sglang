@@ -554,66 +554,63 @@ class HiCacheController:
     # Get batch by batch
     def generic_page_transfer(self, operation, batch_size=8):
         for i in range(0, len(operation.hash_value), batch_size):
-            page_hashes = operation.hash_value[i : i + batch_size]
-            # todo: zero copy
-            dummy_page_dst = [self.mem_pool_host.get_dummy_flat_data_page()] * len(
-                page_hashes
-            )
-            page_data = self.storage_backend.batch_get(page_hashes, dummy_page_dst)
-            if page_data is None:
-                logger.warning(
-                    f"Prefetch operation {operation.request_id} failed to retrieve page {page_hashes}."
-                )
-                break
-            completed_tokens = operation.completed_tokens
-            for i in range(len(page_hashes)):
-                if page_data[i] is None:
-                    logger.warning(
-                        f"Prefetch operation {operation.request_id} failed to retrieve page {page_hashes[i]}."
+            batch_hashes = operation.hash_value[i : i + batch_size]
+            # Get one batch token, and record the completed_tokens
+            if self.is_mooncake_backend():
+                # zero copy
+                key_strs, buffer_ptrs, buffer_sizes = (
+                    self.mem_pool_host.get_buffer_meta(
+                        batch_hashes,
+                        operation.host_indices[
+                            i
+                            * self.page_size : (i + len(batch_hashes))
+                            * self.page_size
+                        ],
                     )
-                    break
-                self.mem_pool_host.set_from_flat_data_page(
-                    operation.host_indices[completed_tokens],
-                    page_data[i],
                 )
-                completed_tokens += self.page_size
+                success = self.storage_backend.batch_get(
+                    key_strs,
+                    target_location=buffer_ptrs,
+                    target_sizes=buffer_sizes,
+                )
+                if not success:
+                    logger.warning(
+                        f"Prefetch operation {operation.request_id} failed to retrieve page {batch_hashes}."
+                    )
+                    break  # early return
+                completed_tokens = (
+                    operation.completed_tokens + len(batch_hashes) * self.page_size
+                )
+            else:
+                # non-zero copy
+                # todo: zero copy
+                dummy_page_dst = [self.mem_pool_host.get_dummy_flat_data_page()] * len(
+                    batch_hashes
+                )
+                page_data = self.storage_backend.batch_get(batch_hashes, dummy_page_dst)
+                if page_data is None:
+                    logger.warning(
+                        f"Prefetch operation {operation.request_id} failed to retrieve page {batch_hashes}."
+                    )
+                    break  # early return
+                completed_tokens = operation.completed_tokens
+                for i in range(len(batch_hashes)):
+                    if page_data[i] is None:
+                        logger.warning(
+                            f"Prefetch operation {operation.request_id} failed to retrieve page {batch_hashes[i]}."
+                        )
+                        break
+                    self.mem_pool_host.set_from_flat_data_page(
+                        operation.host_indices[completed_tokens],
+                        page_data[i],
+                    )
+                    completed_tokens += self.page_size
+            # Try to increment the completed_tokens
             if not operation.increment(completed_tokens - operation.completed_tokens):
                 # operation terminated by controller
                 break
-            if any(p is None for p in page_data):
-                break
         # release pre-allocated memory
         self.mem_pool_host.free(operation.host_indices[operation.completed_tokens :])
-
-    # Get in one batch
-    def mooncake_page_transfer(self, operation):
-        completed_tokens = 0
-        # If operation is done, early return
-        if not operation.is_done():
-            key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-                operation.hash_value, operation.host_indices
-            )
-            get_result = self.storage_backend.batch_get(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
-            if get_result is None:
-                logger.warning(
-                    f"Prefetch operation {operation.request_id} failed to call "
-                    f"MooncakeStore.batch_get: invalid parameters."
-                )
-            elif len(get_result) == sum(1 for v in get_result if v > 0):
-                # If all keys are retrieved successfully, mark them as success,
-                # otherwise mark all of them as failed.
-                # TODO: After the Page First PR, we can just mark successful pages to success.
-                completed_tokens = len(operation.hash_value) * self.page_size
-            if completed_tokens > 0:
-                operation.increment(completed_tokens)
-        if operation.completed_tokens < len(operation.hash_value) * self.page_size:
-            # Operation terminated by controller, or retrieve data failed or
-            # partially failed. Release pre-allocated memory.
-            self.mem_pool_host.free(
-                operation.host_indices[operation.completed_tokens :]
-            )
 
     def is_mooncake_backend(self):
         return self.storage_backend_type == "mooncake"
@@ -625,9 +622,7 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                if self.is_mooncake_backend():
-                    self.mooncake_page_transfer(operation)
-                elif self.storage_backend_type == "hf3fs":
+                if self.is_mooncake_backend() or self.storage_backend_type == "hf3fs":
                     self.generic_page_transfer(operation, batch_size=128)
                 else:
                     self.generic_page_transfer(operation)
@@ -779,13 +774,16 @@ class HiCacheController:
     def generic_page_backup(self, operation, batch_size=8):
         for i in range(0, len(operation.hash_value), batch_size):
             batch_hashes = operation.hash_value[i : i + batch_size]
+            # Set one batch token, and record if success
             if self.is_mooncake_backend():
                 # zero copy
                 key_strs, buffer_ptrs, buffer_sizes = (
                     self.mem_pool_host.get_buffer_meta(
                         batch_hashes,
                         operation.host_indices[
-                            i * self.page_size : (i + batch_size) * self.page_size
+                            i
+                            * self.page_size : (i + len(batch_hashes))
+                            * self.page_size
                         ],
                     )
                 )
@@ -808,7 +806,7 @@ class HiCacheController:
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
-            operation.completed_tokens += self.page_size * success
+            operation.completed_tokens += self.page_size * len(batch_hashes)
 
     def backup_thread_func(self):
         """
