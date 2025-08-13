@@ -575,6 +575,7 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+        # Hicache
         if self.hicache_storage_backend == "mooncake":
             # to use mooncake storage backend, the following conditions must be met:
             self.hicache_io_backend = "kernel"
@@ -1316,19 +1317,23 @@ class ServerArgs:
 
         # Kernel backend
         ATTN_BACKENDS = [
-            "aiter",
+            # Common
+            "triton",
+            "torch_native",
+            # NVIDIA specific
             "cutlass_mla",
             "fa3",
             "flashinfer",
             "flashmla",
-            "intel_amx",
-            "torch_native",
-            "ascend",
-            "triton",
             "trtllm_mla",
             "trtllm_mha",
             "dual_chunk_flash_attn",
+            # AMD specific
+            "aiter",
             "wave",
+            # Other platforms
+            "intel_amx",
+            "ascend",
         ]
         parser.add_argument(
             "--attention-backend",
