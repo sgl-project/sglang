@@ -77,7 +77,7 @@ get_latest_image_from_dockerhub() {
   local api_url="https://hub.docker.com/v2/repositories/rocm/sgl-dev/tags/?page_size=1000"
   local response
   
-  if ! response=$(curl -s "$api_url"); then
+  if ! response=$(curl -sf "$api_url"); then
     echo "Error: Failed to fetch tags from Docker Hub API" >&2
     return 1
   fi
