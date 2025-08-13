@@ -356,7 +356,7 @@ class MooncakeKVManager(BaseKVManager):
             ]
         assert layers_params is not None
 
-        def set_transfer_blocks(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+        def set_transfer_blocks(src_ptr: int, dst_ptr: int, item_len: int) -> List[Tuple[int, int, int]]:
             transfer_blocks = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
@@ -371,7 +371,7 @@ class MooncakeKVManager(BaseKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
         
         # Worker function for processing all layers in a batch
-        def process_layers(layers_params):
+        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
