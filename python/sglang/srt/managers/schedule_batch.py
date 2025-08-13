@@ -740,7 +740,7 @@ class Req:
                 self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
             if self.eos_token_ids:
                 self.output_ids[-1] = next(iter(self.eos_token_ids))
-            self.finished_reason = FINISH_MATCHED_TOKEN(matched="NaN happened")
+            self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
             return
 
         # Check stop strings
