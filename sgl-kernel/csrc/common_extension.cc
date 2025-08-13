@@ -78,18 +78,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
 
-  m.def("silu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
+  m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
-  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
+  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
 
-  m.def("gelu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
+  m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
   m.def(
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
-      "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
+      "Tensor pos_ids, bool interleave, int cuda_stream, "
+      "Tensor? v, Tensor!? k_buffer, Tensor!? v_buffer, Tensor? kv_cache_loc) -> ()");
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
   /*
@@ -165,7 +166,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
-      "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer, bool "
+      "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
       "pad_sorted_token_ids) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
@@ -249,34 +250,39 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "dst_indices, int item_size, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_per_layer", torch::kCUDA, &transfer_kv_per_layer);
   m.def(
-      "transfer_kv_per_layer_direct(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
-      "dst_indices, int page_size) -> ()");
-  m.impl("transfer_kv_per_layer_direct", torch::kCUDA, &transfer_kv_per_layer_direct);
+      "transfer_kv_per_layer_pf_lf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
+      "dst_indices, int layer_id, int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_per_layer_pf_lf", torch::kCUDA, &transfer_kv_per_layer_pf_lf);
   m.def(
-      "transfer_kv_all_layer(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
-      "dst_indices, int item_size, int num_layers, int src_layer_offset, int dst_layer_offset, int block_quota, int "
+      "transfer_kv_all_layer(Tensor src_k_layers, Tensor dst_k_layers, Tensor src_v_layers, Tensor dst_v_layers, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, int block_quota, int "
       "num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer", torch::kCUDA, &transfer_kv_all_layer);
   m.def(
-      "transfer_kv_all_layer_direct(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
-      "dst_indices, int page_size, int num_layers) -> ()");
-  m.impl("transfer_kv_all_layer_direct", torch::kCUDA, &transfer_kv_all_layer_direct);
+      "transfer_kv_all_layer_lf_pf(Tensor src_k_layers, Tensor dst_k, Tensor src_v_layers, Tensor dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers, int block_quota, int "
+      "num_warps_per_block) -> ()");
+  m.impl("transfer_kv_all_layer_lf_pf", torch::kCUDA, &transfer_kv_all_layer_lf_pf);
   m.def(
       "transfer_kv_per_layer_mla(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int item_size, int "
       "block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_per_layer_mla", torch::kCUDA, &transfer_kv_per_layer_mla);
   m.def(
-      "transfer_kv_per_layer_mla_direct(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int page_size) "
-      "-> ()");
-  m.impl("transfer_kv_per_layer_mla_direct", torch::kCUDA, &transfer_kv_per_layer_mla_direct);
+      "transfer_kv_per_layer_mla_pf_lf(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int layer_id, "
+      "int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_per_layer_mla_pf_lf", torch::kCUDA, &transfer_kv_per_layer_mla_pf_lf);
   m.def(
-      "transfer_kv_all_layer_mla(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int item_size, int "
-      "num_layers, int src_layer_offset, int dst_layer_offset, int block_quota, int num_warps_per_block) -> ()");
+      "transfer_kv_all_layer_mla(Tensor src_layers, Tensor dst_layers, Tensor src_indices, Tensor dst_indices, int "
+      "item_size, int num_layers, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer_mla", torch::kCUDA, &transfer_kv_all_layer_mla);
   m.def(
-      "transfer_kv_all_layer_mla_direct(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int page_size, "
-      "int num_layers) -> ()");
-  m.impl("transfer_kv_all_layer_mla_direct", torch::kCUDA, &transfer_kv_all_layer_mla_direct);
+      "transfer_kv_all_layer_mla_lf_pf(Tensor src_layers, Tensor dst, Tensor src_indices, Tensor dst_indices, "
+      "int item_size, int dst_layout_dim, int num_layers, int block_quota, int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kCUDA, &transfer_kv_all_layer_mla_lf_pf);
+  m.def(
+      "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
+      "page_size) -> ()");
+  m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);
 
   /*
    * From csrc/moe/cutlass_moe/w4a8
@@ -407,6 +413,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("create_greenctx_stream_by_value(int smA, int smB, int device) -> int[]");
   m.impl("create_greenctx_stream_by_value", &create_greenctx_stream_by_value);
+
+  /*
+   * From csrc/memory
+   */
+  m.def("store_kv_cache(Tensor k_cache, Tensor v_cache, Tensor out_loc, Tensor k, Tensor v) -> ()");
+  m.impl("store_kv_cache", &store_kv_cache);
 }
 
 REGISTER_EXTENSION(common_ops)

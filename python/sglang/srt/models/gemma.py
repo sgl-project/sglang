@@ -318,6 +318,54 @@ class GemmaForCausalLM(nn.Module):
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
 
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ):
+        start, end = split_interval
+        # embed
+        if start == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds
+
+            # Normalize the embedding by sqrt(hidden_size)
+            forward_batch.hidden_states *= self.model.config.hidden_size**0.5
+
+        # decoder layer
+        for i in range(start, end):
+            layer = self.model.layers[i]
+            forward_batch.hidden_states, forward_batch.residual = layer(
+                positions,
+                forward_batch.hidden_states,
+                forward_batch,
+                forward_batch.residual,
+            )
+
+        if end == self.model.config.num_hidden_layers:
+            # norm
+            forward_batch.hidden_states, _ = self.model.norm(
+                forward_batch.hidden_states, forward_batch.residual
+            )
+
+            # logits process
+            result = self.logits_processor(
+                input_ids,
+                forward_batch.hidden_states,
+                self.model.embed_tokens,
+                forward_batch,
+            )
+        else:
+            result = None
+
+        return result
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

@@ -21,6 +21,7 @@ from sgl_kernel.attention import (
 )
 from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
 from sgl_kernel.elementwise import (
+    FusedSetKVBufferArg,
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
     gelu_and_mul,
@@ -31,6 +32,10 @@ from sgl_kernel.elementwise import (
     silu_and_mul,
 )
 from sgl_kernel.fused_moe import fused_marlin_moe
+
+if torch.version.hip is not None:
+    from sgl_kernel.elementwise import gelu_quick
+
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -62,6 +67,7 @@ from sgl_kernel.marlin import (
     awq_marlin_repack,
     gptq_marlin_repack,
 )
+from sgl_kernel.memory import set_kv_buffer_kernel
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
