@@ -1487,6 +1487,10 @@ class ModelRunner:
             from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
             return AiterAttnBackend(self)
+        elif self.server_args.attention_backend == "wave":
+            from sglang.srt.layers.attention.wave_backend import WaveAttnBackend
+
+            return WaveAttnBackend(self)
         elif backend_str == "ascend":
             from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
 
