@@ -224,7 +224,7 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
-                return Mxfp4MoEMethod(prefix) 
+                return Mxfp4MoEMethod(prefix=prefix) 
             else:
                 return Mxfp4DynamicQuantMoEMethod()
         else:

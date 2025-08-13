@@ -148,13 +148,14 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         s0, s1, _ = layer.w13_weight_scale.shape
         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
         w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale, requires_grad=False)
-        #layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+        #layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale, requires_grad=False)
+        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
 
         s0, s1, _ = layer.w2_weight_scale.shape
         w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
         w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-        layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
+        #layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
+        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
     def apply(
         self,
