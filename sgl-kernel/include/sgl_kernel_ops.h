@@ -150,7 +150,11 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor cos_sin_cache,
     at::Tensor pos_ids,
     bool interleave,
-    int64_t cuda_stream);
+    int64_t cuda_stream,
+    const std::optional<at::Tensor>& v,
+    const std::optional<at::Tensor>& k_buffer,
+    const std::optional<at::Tensor>& v_buffer,
+    const std::optional<at::Tensor>& kv_cache_loc);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
@@ -695,3 +699,8 @@ void qserve_w4a8_per_group_gemm(
  * From csrc/spatial
  */
 std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device);
+
+/*
+ * From csrc/memory
+ */
+void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
