@@ -294,7 +294,7 @@ class GptOssAttention(nn.Module):
         )
 
         self.sinks = nn.Parameter(
-            torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
+            torch.empty(self.num_heads, dtype=torch.bfloat16), requires_grad=False
         )
 
         self.o_proj = RowParallelLinear(
