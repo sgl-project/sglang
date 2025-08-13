@@ -62,13 +62,13 @@ WORKDIR /sgl-workspace
 # -----------------------
 # llvm
 RUN if [ "$BUILD_LLVM" = "1" ]; then \
-     git clone ${LLVM_REPO} -b ${LLVM_BRANCH} \
+     git clone --single-branch ${LLVM_REPO} -b ${LLVM_BRANCH} \
      && cd llvm-project \
      && git checkout ${LLVM_COMMIT} \
      && mkdir build \
      && cd build \
      && cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=1 -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" -DLLVM_ENABLE_PROJECTS="clang;lld;" -DLLVM_ENABLE_RUNTIMES="compiler-rt" ../llvm \
-     && make -j32; \
+     && make -j$(nproc); \
     fi
 
 # -----------------------
