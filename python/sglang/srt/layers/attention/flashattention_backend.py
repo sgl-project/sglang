@@ -688,6 +688,11 @@ class FlashAttentionBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify() and self.topk > 1
         )
 
+        # For fa3 interface version compatibility, we put new fields into conditional keyword args
+        kwargs = {}
+        if sinks is not None:
+            kwargs["sinks"] = sinks
+
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -738,7 +743,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
-                sinks=sinks,
+                **kwargs,
             )
 
             if use_cascade_attn:
@@ -759,7 +764,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
-                    sinks=sinks,
+                    **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
@@ -947,6 +952,11 @@ class FlashAttentionBackend(AttentionBackend):
         )
         causal = not layer.is_cross_attention
 
+        # For fa3 interface version compatibility, we put new fields into conditional keyword args
+        kwargs = {}
+        if sinks is not None:
+            kwargs["sinks"] = sinks
+
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -989,7 +999,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    sinks=sinks,
+                    **kwargs,
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
@@ -1008,7 +1018,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    sinks=sinks,
+                    **kwargs,
                 )
             else:
                 page_table = metadata.page_table
@@ -1036,7 +1046,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
-                    sinks=sinks,
+                    **kwargs,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -1057,7 +1067,7 @@ class FlashAttentionBackend(AttentionBackend):
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
-                            sinks=sinks,
+                            **kwargs,
                         )
                     )
                     o, _ = merge_state_v2(
