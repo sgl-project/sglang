@@ -1275,8 +1275,10 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         if not self.server_args.enable_pd_convert:
             return False, "PD role conversion is not enabled.", None
-
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
+        
+        if obj.check_idle:
+            req = obj
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # start a bootstarp server first
             kv_bootstrap_server_class = get_kv_class(
                 self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
@@ -1342,9 +1344,10 @@ class TokenizerManager:
         responses: List[ConvertDisaggregationRoleReqOutput] = (
             await self.convert_pd_role_communicator(req)
         )
-
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # stop the bootstrap server then
+        if obj.check_idle:
+            return responses[0].success, responses[0].message, None
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # stop the bootstrap server
             self.bootstrap_server.close()
             del self.bootstrap_server
             self.disaggregation_mode = DisaggregationMode.DECODE

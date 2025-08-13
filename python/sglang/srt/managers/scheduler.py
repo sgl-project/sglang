@@ -2177,14 +2177,6 @@ class Scheduler(
             len(self.waiting_queue) == 0
             and self.running_batch.is_empty()
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
-            and (
-                not hasattr(self, "disagg_prefill_inflight_queue")
-                or len(self.disagg_prefill_inflight_queue) == 0
-            )
-            and (
-                not hasattr(self, "disagg_decode_prealloc_queue")
-                or len(self.disagg_decode_prealloc_queue.queue) == 0
-            )
         ):
             self.cur_batch = None
             self.last_batch = None
@@ -2472,6 +2464,18 @@ class Scheduler(
 
     def convert_disaggregation_role(self, recv_req: ConvertDisaggregationRoleReqInput):
         """Convert the disaggregation role of the scheduler."""
+        if recv_req.check_idle:
+            if not self.check_disaggregation_idle():
+                return ConvertDisaggregationRoleReqOutput(
+                    success=False,
+                    message="Cannot convert disaggregation role while the server is busy.",
+                )
+            else:
+                return ConvertDisaggregationRoleReqOutput(
+                success=True,
+                message="this server is idle and can convert disaggregation role.",
+                )
+        
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # disaggregation
             self.server_args.disaggregation_bootstrap_port = None
@@ -2538,6 +2542,30 @@ class Scheduler(
                 success=True,
                 message="The role of this server is now PREFILL.",
             )
+
+    def check_disaggregation_idle(self):
+        """Check if the disaggregation server is idle."""
+        # only for enable_pd_convert mode
+        if (
+            len(self.waiting_queue) == 0
+            and self.running_batch.is_empty()
+            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+        ):
+            pass
+        else:
+            return False
+        
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return (
+                len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                and len(self.disagg_prefill_inflight_queue) == 0
+            )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            return (
+                len(self.disagg_decode_prealloc_queue.queue) == 0
+                and len(self.disagg_decode_transfer_queue.queue) == 0
+            )
+        return False
 
     def get_print_prefix(self):
         prefix = ""
@@ -2609,14 +2637,14 @@ def start_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs):
             scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
-        scheduler.flush_decode_resources()
+        scheduler.flush_prefill_resources()
 
     elif disaggregation_mode == DisaggregationMode.DECODE:
         if scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_decode()
         else:
             scheduler.event_loop_normal_disagg_decode()
-        scheduler.flush_prefill_resources()
+        scheduler.flush_decode_resources()
 
 
 def run_scheduler_process(

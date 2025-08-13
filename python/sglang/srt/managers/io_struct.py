@@ -831,13 +831,14 @@ class UpdateWeightsFromDistributedReqOutput:
 class ConvertDisaggregationRoleReqInput:
     # the server url to convert
     server_url: str
+    check_idle: bool = True
 
     # convert decode to prefill
     bootstrap_port: Optional[int] = None
     disaggregation_decode_tp: Optional[int] = None
     disaggregation_decode_dp: Optional[int] = None
     disaggregation_prefill_pp: Optional[int] = 1
-    disable_radix_cache: bool = False  # default open radix cache in prefill
+    disable_radix_cache: bool = True  # default open radix cache in prefill
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
@@ -854,7 +855,7 @@ class ConvertDisaggregationRoleReqInput:
     # convert prefill to decode
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
-    disable_cuda_graph: bool = False  # default open cuda graph in decode
+    disable_cuda_graph: bool = True  # default open cuda graph in decode
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
     # environ for decode

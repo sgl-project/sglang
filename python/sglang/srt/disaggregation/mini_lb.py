@@ -426,7 +426,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
         current_role = "prefill"
         load_balancer.remove_prefill_server(server_url)
         logger.info(
-            f"Stop sending req to {server_url}.Waiting for prefill to finish all reqs."
+            f"Stop sending req to {server_url}. Waiting for prefill to finish all reqs."
         )
     elif server_url in load_balancer.decode_servers:
         if len(load_balancer.decode_servers) <= 1:
@@ -437,7 +437,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
         current_role = "decode"
         load_balancer.remove_decode_server(server_url)
         logger.info(
-            f"Stop sending req to {server_url}.Waiting for decode to finish all reqs."
+            f"Stop sending req to {server_url}. Waiting for decode to finish all reqs."
         )
     else:
         raise HTTPException(
@@ -445,14 +445,14 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
             detail=f"Invalid URL:{server_url}. The server may be not registered.",
         )
 
-    # flush the cache first, when flush cache is success, then we can try to convert pd role
-    # wait 10s for server to finish all requests
-    max_tries = 100
+    # wait 60s for server to finish all requests
+    max_tries = 60
     async with aiohttp.ClientSession() as session:
         try:
             while max_tries > 0:
-                response = await session.post(f"{server_url}/flush_cache")
-                if response.status == 200:
+                response = await session.post(f"{server_url}/convert_pd_role",json=dataclasses.asdict(obj))
+                content = await response.json()
+                if content["success"]:
                     break
                 else:
                     logger.warning(
@@ -464,21 +464,15 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
             raise HTTPException(
                 status_code=500,
                 detail=f"Wait 100s for server: {server_url} to finish all reqs. "
-                f"May be caused by: 1. Server is stuck or shut down, 2. 100s is not enough for server to finish all reqs.",
+                f"May be caused by: 1. Server is stuck or shut down, 2. 60s is not enough for server to finish all reqs.",
             )
-
-    wating_time = time.perf_counter()
-    logger.info(
-        f"Waited {(wating_time-start_time):.2f}s for server {server_url} to finish all requests."
-    )
-    logger.info(f"All requests to {server_url} have been done, now converting role...")
-
-    # post convert request to server
+    
     async with aiohttp.ClientSession() as session:
-        # response = await session.post(f"{server_url}/convert_pd_role")
-        response = await session.post(
-            f"{server_url}/convert_pd_role", json=dataclasses.asdict(obj)
-        )
+        response = await session.post(f"{server_url}/flush_cache")
+    
+    obj.check_idle = False
+    async with aiohttp.ClientSession() as session:
+        response = await session.post(f"{server_url}/convert_pd_role",json=dataclasses.asdict(obj))
         content = await response.json()
 
     # wait scheduler event loop ready
@@ -493,7 +487,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
 
     finished_time = time.perf_counter()
     logger.info(
-        f"Convert role finished in {(finished_time-wating_time):.2f}s, response: {content}"
+        f"Convert role finished in {(finished_time-start_time):.2f}s, response: {content}"
     )
 
     if content["success"]:
@@ -506,6 +500,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
             )
             logger.info(f"Converted decode server to prefill: {server_url}")
             logger.info(f"prefill server bootstrap port: {content['bootstrap_port']}")
+        await asyncio.sleep(5)
         return Response(status_code=200)
     else:
         raise HTTPException(

@@ -928,7 +928,6 @@ class SchedulerDisaggregationDecodeMixin:
 
         # reuse the cuda graph runner for prefill to decode
         model_runner.server_args = self.server_args
-        model_runner.attn_backend.forward_metadata = None
         self.decode_cuda_graph_runner = model_runner.cuda_graph_runner
         model_runner.init_cuda_graphs()
         self.req_to_token_pool.set_prealloc_size(0)
