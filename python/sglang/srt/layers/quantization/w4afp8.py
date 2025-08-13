@@ -106,30 +106,23 @@ class W4AFp8Config(QuantizationConfig):
         return []
 
 
-def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
+def interleave_scales(scales: torch.Tensor, alignment: int = 4) -> torch.Tensor:
     """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
-    pad_len = (-scales.size(2)) % 4  # 0–3
-    if pad_len:
-        pad = torch.ones(
-            (*scales.shape[:2], pad_len),
-            dtype=scales.dtype,
-            device=scales.device,
-        )
-        scales = torch.cat([scales, pad], dim=2)
-
     s_shape = scales.shape
     # Reshape to separate groups of 4
-    scales_interleaved = scales.reshape(s_shape[0], s_shape[1], (s_shape[2] // 4), 4)
+    scales_interleaved = scales.reshape(
+        s_shape[0], s_shape[1], (s_shape[2] // alignment), alignment
+    )
     # Permute dimensions to interleave
     scales_interleaved = scales_interleaved.permute(0, 2, 1, 3)
     # Reshape back to original dimensions but with interleaved values
     scales_interleaved = scales_interleaved.reshape(
-        s_shape[0], s_shape[2] // 4, s_shape[1] * 4
+        s_shape[0], s_shape[2] // alignment, s_shape[1] * alignment
     )
     return scales_interleaved.contiguous()
 
 
-class W4AFp8EPMoEMethod(FusedMoEMethodBase):
+class W4AFp8EPMoEMethod:
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
 
@@ -495,7 +488,7 @@ class W4AFp8TPMoEMethod(FusedMoEMethodBase):
 
         # Interleave w2_weight_scale (down_proj)
         w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
-        w2_weight_scale = interleave_scales(w2_weight_scale)
+        w2_weight_scale = interleave_scales(w2_weight_scale, 1)
         layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
 
         # Process input scales
@@ -553,7 +546,7 @@ class W4AFp8TPMoEMethod(FusedMoEMethodBase):
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        return cutlass_w4a8_moe(
+        output = cutlass_w4a8_moe(
             start_expert_id=0,
             end_expert_id=self.num_experts - 1,
             total_num_experts=self.num_experts,
@@ -580,3 +573,6 @@ class W4AFp8TPMoEMethod(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
+        if routed_scaling_factor is not None:
+            output = output * routed_scaling_factor
+        return output
