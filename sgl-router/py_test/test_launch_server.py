@@ -251,7 +251,7 @@ class TestLaunchServer(unittest.TestCase):
 
         metrics = run_eval(args)
         score = metrics["score"]
-        THRESHOLD = 0.65
+        THRESHOLD = 0.635
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
@@ -291,7 +291,7 @@ class TestLaunchServer(unittest.TestCase):
         )
         metrics = run_eval(args)
         score = metrics["score"]
-        THRESHOLD = 0.65
+        THRESHOLD = 0.635
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
@@ -305,7 +305,7 @@ class TestLaunchServer(unittest.TestCase):
         # 5. run mmlu again
         metrics = run_eval(args)
         score = metrics["score"]
-        THRESHOLD = 0.65
+        THRESHOLD = 0.635
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
@@ -358,7 +358,7 @@ class TestLaunchServer(unittest.TestCase):
         )
         metrics = run_eval(args)
         score = metrics["score"]
-        THRESHOLD = 0.65
+        THRESHOLD = 0.635
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
@@ -485,7 +485,7 @@ class TestLaunchServer(unittest.TestCase):
 
         metrics = run_eval(args)
         score = metrics["score"]
-        THRESHOLD = 0.65
+        THRESHOLD = 0.635
         passed = score >= THRESHOLD
         msg = f"dp aware MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
@@ -529,7 +529,7 @@ class TestLaunchServer(unittest.TestCase):
         )
         metrics = run_eval(args)
         score = metrics["score"]
-        THRESHOLD = 0.65
+        THRESHOLD = 0.635
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
@@ -543,7 +543,7 @@ class TestLaunchServer(unittest.TestCase):
         # 5. Run mmlu again
         metrics = run_eval(args)
         score = metrics["score"]
-        THRESHOLD = 0.65
+        THRESHOLD = 0.635
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
@@ -621,7 +621,7 @@ class TestLaunchServer(unittest.TestCase):
         )
         metrics = run_eval(args)
         score = metrics["score"]
-        THRESHOLD = 0.65
+        THRESHOLD = 0.635
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)

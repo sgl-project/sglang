@@ -1,5 +1,7 @@
 use crate::config::types::{CircuitBreakerConfig as ConfigCircuitBreakerConfig, RetryConfig};
-use crate::core::{CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory};
+use crate::core::{
+    is_retryable_status, CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory,
+};
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
@@ -15,7 +17,6 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::thread;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -50,7 +51,7 @@ pub struct Router {
 
 impl Router {
     /// Create a new router with injected policy and client
-    pub fn new(
+    pub async fn new(
         worker_urls: Vec<String>,
         policy: Arc<dyn LoadBalancingPolicy>,
         client: Client,
@@ -66,7 +67,7 @@ impl Router {
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
-            Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)?;
+            Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs).await?;
         }
 
         let worker_urls = if dp_aware {
@@ -81,12 +82,8 @@ impl Router {
         let core_cb_config = CircuitBreakerConfig {
             failure_threshold: circuit_breaker_config.failure_threshold,
             success_threshold: circuit_breaker_config.success_threshold,
-            timeout_duration: std::time::Duration::from_secs(
-                circuit_breaker_config.timeout_duration_secs,
-            ),
-            window_duration: std::time::Duration::from_secs(
-                circuit_breaker_config.window_duration_secs,
-            ),
+            timeout_duration: Duration::from_secs(circuit_breaker_config.timeout_duration_secs),
+            window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
         // Create Worker trait objects from URLs
@@ -158,7 +155,7 @@ impl Router {
             .collect()
     }
 
-    pub fn wait_for_healthy_workers(
+    pub async fn wait_for_healthy_workers(
         worker_urls: &[String],
         timeout_secs: u64,
         interval_secs: u64,
@@ -169,9 +166,24 @@ impl Router {
             );
         }
 
+        // Perform health check asynchronously
+        Self::wait_for_healthy_workers_async(worker_urls, timeout_secs, interval_secs).await
+    }
+
+    async fn wait_for_healthy_workers_async(
+        worker_urls: &[String],
+        timeout_secs: u64,
+        interval_secs: u64,
+    ) -> Result<(), String> {
+        info!(
+            "Waiting for {} workers to become healthy (timeout: {}s)",
+            worker_urls.len(),
+            timeout_secs
+        );
+
         let start_time = std::time::Instant::now();
-        let sync_client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
@@ -187,20 +199,48 @@ impl Router {
                 ));
             }
 
+            // Perform all health checks concurrently
+            let mut health_checks = Vec::new();
+            for url in worker_urls {
+                let client_clone = client.clone();
+                let url_clone = url.clone();
+
+                let check_health = tokio::spawn(async move {
+                    let health_url = format!("{}/health", url_clone);
+                    match client_clone.get(&health_url).send().await {
+                        Ok(res) => {
+                            if res.status().is_success() {
+                                None
+                            } else {
+                                Some((url_clone, format!("status: {}", res.status())))
+                            }
+                        }
+                        Err(_) => Some((url_clone, "not ready".to_string())),
+                    }
+                });
+
+                health_checks.push(check_health);
+            }
+
+            // Wait for all health checks to complete
+            let results = futures::future::join_all(health_checks).await;
+
             let mut all_healthy = true;
             let mut unhealthy_workers = Vec::new();
 
-            for url in worker_urls {
-                match sync_client.get(&format!("{}/health", url)).send() {
-                    Ok(res) => {
-                        if !res.status().is_success() {
-                            all_healthy = false;
-                            unhealthy_workers.push((url, format!("status: {}", res.status())));
-                        }
+            for result in results {
+                match result {
+                    Ok(None) => {
+                        // Worker is healthy
                     }
-                    Err(_) => {
+                    Ok(Some((url, reason))) => {
                         all_healthy = false;
-                        unhealthy_workers.push((url, "not ready".to_string()));
+                        unhealthy_workers.push((url, reason));
+                    }
+                    Err(e) => {
+                        all_healthy = false;
+                        unhealthy_workers
+                            .push(("unknown".to_string(), format!("task error: {}", e)));
                     }
                 }
             }
@@ -210,11 +250,12 @@ impl Router {
                 return Ok(());
             } else {
                 debug!(
-                    "Waiting for {} workers to become healthy ({} unhealthy)",
+                    "Waiting for {} workers to become healthy ({} unhealthy: {:?})",
                     worker_urls.len(),
-                    unhealthy_workers.len()
+                    unhealthy_workers.len(),
+                    unhealthy_workers
                 );
-                thread::sleep(Duration::from_secs(interval_secs));
+                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
             }
         }
     }
@@ -397,18 +438,6 @@ impl Router {
         Some(available[idx].clone_worker())
     }
 
-    fn is_retryable_status(status: StatusCode) -> bool {
-        matches!(
-            status,
-            StatusCode::REQUEST_TIMEOUT
-                | StatusCode::TOO_MANY_REQUESTS
-                | StatusCode::INTERNAL_SERVER_ERROR
-                | StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-        )
-    }
-
     pub async fn route_typed_request<
         T: crate::openai_api_types::GenerationRequest + serde::Serialize + Clone,
     >(
@@ -461,7 +490,7 @@ impl Router {
                 response
             },
             // should_retry predicate
-            |res, _attempt| Self::is_retryable_status(res.status()),
+            |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
             |delay, attempt| {
                 RouterMetrics::record_retry(route);
@@ -476,7 +505,7 @@ impl Router {
             let duration = start.elapsed();
             RouterMetrics::record_request(route);
             RouterMetrics::record_generate_duration(duration);
-        } else if !Self::is_retryable_status(response.status()) {
+        } else if !is_retryable_status(response.status()) {
             RouterMetrics::record_request_error(route, "non_retryable_error");
         }
 
@@ -1260,19 +1289,19 @@ mod tests {
         assert_eq!(result.unwrap(), "http://worker1:8080");
     }
 
-    #[test]
-    fn test_wait_for_healthy_workers_empty_list() {
-        // Empty list will timeout as there are no workers to check
-        let result = Router::wait_for_healthy_workers(&[], 1, 1);
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_empty_list() {
+        // Empty list will return error immediately
+        let result = Router::wait_for_healthy_workers(&[], 1, 1).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Timeout"));
+        assert!(result.unwrap_err().contains("no workers provided"));
     }
 
-    #[test]
-    fn test_wait_for_healthy_workers_invalid_urls() {
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_invalid_urls() {
         // This test will timeout quickly since the URLs are invalid
         let result =
-            Router::wait_for_healthy_workers(&["http://nonexistent:8080".to_string()], 1, 1);
+            Router::wait_for_healthy_workers(&["http://nonexistent:8080".to_string()], 1, 1).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Timeout"));
     }

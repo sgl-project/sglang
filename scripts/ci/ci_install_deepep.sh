@@ -58,7 +58,7 @@ cd build
 make -j$(nproc) install
 
 # Install DeepEP
-rm -rf /root/.cache/deepep && git clone https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep && cd /root/.cache/deepep && git checkout b6ce310bb0b75079682d09bc2ebc063a074fbd58
+rm -rf /root/.cache/deepep && git clone https://github.com/deepseek-ai/DeepEP.git /root/.cache/deepep && cd /root/.cache/deepep && git checkout b92d0d4860ce6866cd6d31bfbae937f9a7a3772b
 cd /root/.cache/deepep && python3 setup.py install
 
 # Verify configuration

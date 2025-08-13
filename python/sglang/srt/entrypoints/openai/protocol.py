@@ -859,15 +859,6 @@ class ResponseReasoningTextContent(BaseModel):
     type: Literal["reasoning_text"] = "reasoning_text"
 
 
-class ResponseReasoningItem(BaseModel):
-    id: str
-    content: list[ResponseReasoningTextContent] = Field(default_factory=list)
-    summary: list = Field(default_factory=list)
-    type: Literal["reasoning"] = "reasoning"
-    encrypted_content: Optional[str] = None
-    status: Optional[Literal["in_progress", "completed", "incomplete"]]
-
-
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
 ]
