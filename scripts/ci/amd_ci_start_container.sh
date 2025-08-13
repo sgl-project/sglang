@@ -2,30 +2,28 @@
 set -euo pipefail
 
 # Get version from SGLang version.py file
-FALLBACK_SGLANG_VERSION="v0.4.10.post2"
 SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
+SGLANG_VERSION="v0.5.0rc0"  # Default version, will be overridden if version.py is found
 
 if [ -f "$SGLANG_VERSION_FILE" ]; then
-  SGLANG_VERSION=$(python3 -c '
+  VERSION_FROM_FILE=$(python3 -c '
 import re, sys
 with open(sys.argv[1], "r") as f:
     content = f.read()
     match = re.search(r"__version__\s*=\s*[\"'"'"'](.*?)[\"'"'"']", content)
     if match:
         print("v" + match.group(1))
-' "$SGLANG_VERSION_FILE")
+' "$SGLANG_VERSION_FILE" 2>/dev/null || echo "")
 
-  if [ -z "$SGLANG_VERSION" ]; then
-      SGLANG_VERSION="$FALLBACK_SGLANG_VERSION"
-      echo "Warning: Could not parse version from $SGLANG_VERSION_FILE, using fallback version: $SGLANG_VERSION" >&2
+  if [ -n "$VERSION_FROM_FILE" ]; then
+      SGLANG_VERSION="$VERSION_FROM_FILE"
+      echo "Using SGLang version from version.py: $SGLANG_VERSION"
+  else
+      echo "Warning: Could not parse version from $SGLANG_VERSION_FILE, using default: $SGLANG_VERSION" >&2
   fi
 else
-  # Fallback version if file is not found
-  SGLANG_VERSION="$FALLBACK_SGLANG_VERSION"
-  echo "Warning: version.py not found, using fallback version: $SGLANG_VERSION" >&2
+  echo "Warning: version.py not found, using default version: $SGLANG_VERSION" >&2
 fi
-
-echo "Using SGLang version: $SGLANG_VERSION"
 
 # Default base tags (can be overridden by command line arguments)
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm630-mi30x"
@@ -66,70 +64,7 @@ else
   DEVICE_FLAG="--device /dev/dri"
 fi
 
-# Function to get latest image from Docker Hub API
-get_latest_image_from_dockerhub() {
-  local gpu_arch=$1
-  local strict=${2:-true}  # Default to strict filtering
-  
-  echo "Fetching available tags from Docker Hub API for GPU architecture: $gpu_arch (strict=$strict)" >&2
-  
-  # Get all tags from Docker Hub API
-  local api_url="https://hub.docker.com/v2/repositories/rocm/sgl-dev/tags/?page_size=1000"
-  local response
-  
-  if ! response=$(curl -sf "$api_url"); then
-    echo "Error: Failed to fetch tags from Docker Hub API" >&2
-    return 1
-  fi
-  
-  # Parse JSON response to get tags matching the GPU architecture
-  # Filter for tags containing the GPU architecture and exclude SRT images
-  local filtered_tags
-  filtered_tags=$(echo "$response" | python3 -c "
-import json
-import sys
-import re
-from datetime import datetime
 
-data = json.load(sys.stdin)
-gpu_arch = sys.argv[1]
-strict = sys.argv[2].lower() == 'true'
-tags = []
-
-for tag_info in data.get('results', []):
-    tag_name = tag_info.get('name', '')
-    
-    # Filter for tags containing GPU architecture (mi30x or mi35x)
-    if gpu_arch in tag_name:
-        if strict:
-            # Strict mode: Exclude SRT, nightly, dev, test images
-            if not any(exclude in tag_name.lower() for exclude in ['srt', 'nightly', 'dev', 'test']):
-                last_updated = tag_info.get('last_updated', '')
-                tags.append((tag_name, last_updated))
-        else:
-            # Non-strict mode: Allow any image with the GPU architecture
-            last_updated = tag_info.get('last_updated', '')
-            tags.append((tag_name, last_updated))
-
-# Sort by last_updated timestamp (most recent first)
-tags.sort(key=lambda x: x[1], reverse=True)
-
-# Print the most recent tag
-if tags:
-    print(tags[0][0])
-else:
-    sys.exit(1)
-" "$gpu_arch" "$strict")
-  
-  if [ $? -eq 0 ] && [ -n "$filtered_tags" ]; then
-    echo "Found latest Docker Hub image for $gpu_arch: rocm/sgl-dev:$filtered_tags" >&2
-    echo "rocm/sgl-dev:$filtered_tags"
-    return 0
-  else
-    echo "No suitable $gpu_arch images found on Docker Hub" >&2
-    return 1
-  fi
-}
 
 # Function to find latest available image for a given GPU architecture
 find_latest_image() {
@@ -165,19 +100,8 @@ find_latest_image() {
 
   echo "Error: No ${gpu_arch} image found in the last 7 days for version ${base_tag}" >&2
   
-  # Step 2: Try Docker Hub API to get latest available image
-  echo "Attempting to find latest image using Docker Hub API..." >&2
-  if get_latest_image_from_dockerhub "$gpu_arch" true; then
-    return 0
-  fi
-  
-  echo "Strict API search failed, trying non-strict search..." >&2
-  if get_latest_image_from_dockerhub "$gpu_arch" false; then
-    return 0
-  fi
-  
-  # Step 3: Final fallback to specific hardcoded images
-  echo "Docker Hub API search failed, using final fallback images..." >&2
+  # Final fallback to specific hardcoded images
+  echo "Using final fallback images..." >&2
   if [ "$gpu_arch" == "mi30x" ]; then
     echo "rocm/sgl-dev:v0.5.0rc0-rocm630-mi30x-20250812"
   elif [ "$gpu_arch" == "mi35x" ]; then
@@ -204,15 +128,11 @@ fi
 
 echo "The runner is: ${RUNNER_NAME}"
 GPU_ARCH="mi30x"
-FALLBACK_IMAGE="rocm/sgl-dev:${MI30X_BASE_TAG}-20250715"
-FALLBACK_MSG="No mi30x image found in last 30 days, using fallback image"
 
 # Check for mi350/mi355 runners
 if [[ "${RUNNER_NAME}" =~ ^linux-mi350-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi355-gpu-[0-9]+$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi35x image."
   GPU_ARCH="mi35x"
-  FALLBACK_IMAGE="rocm/sgl-dev:${MI35X_BASE_TAG}-20250715"
-  FALLBACK_MSG="No mi35x image found in last 30 days, using fallback image"
 # Check for mi300/mi325 runners
 elif [[ "${RUNNER_NAME}" =~ ^linux-mi300-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi325-gpu-[0-9]+$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi30x image."
@@ -222,13 +142,8 @@ else
 fi
 
 # Find and pull the latest image
-if IMAGE=$(find_latest_image "${GPU_ARCH}"); then
-  echo "Pulling Docker image: $IMAGE"
-else
-  echo "$FALLBACK_MSG" >&2
-  IMAGE="$FALLBACK_IMAGE"
-  echo "Pulling fallback Docker image: $IMAGE"
-fi
+IMAGE=$(find_latest_image "${GPU_ARCH}")
+echo "Pulling Docker image: $IMAGE"
 docker pull "$IMAGE"
 
 # Run the container
