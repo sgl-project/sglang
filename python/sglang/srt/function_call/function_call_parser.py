@@ -11,12 +11,14 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.srt.function_call.step3_detector import Step3Detector
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,8 @@ class FunctionCallParser:
         "kimi_k2": KimiK2Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "glm45": Glm4MoeDetector,
+        "step3": Step3Detector,
+        "gpt-oss": GptOssDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):

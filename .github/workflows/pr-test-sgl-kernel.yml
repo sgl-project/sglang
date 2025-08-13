@@ -2,11 +2,11 @@ name: PR Test (sgl-kernel)
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
       - "sgl-kernel/**"
   pull_request:
-    branches: [ main ]
+    branches: [main]
     paths:
       - "sgl-kernel/**"
   workflow_dispatch:
@@ -36,10 +36,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - python-version: '3.9'
-            cuda-version: '12.4'
-          - python-version: '3.9'
-            cuda-version: '12.8'
+          - python-version: "3.10"
+            cuda-version: "12.4"
+          - python-version: "3.10"
+            cuda-version: "12.9"
     name: Build Wheel (CUDA ${{ matrix.cuda-version }})
     steps:
       - name: Cleanup
@@ -48,7 +48,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -56,7 +56,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
-        if: github.event_name != 'push' || (matrix.cuda-version != '11.8' && matrix.cuda-version != '12.8')
+        if: github.event_name != 'push' || (matrix.cuda-version != '11.8' && matrix.cuda-version != '12.9')
         run: |
           cd sgl-kernel
           chmod +x ./build.sh
@@ -80,12 +80,12 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.9-cuda12.4
+          pattern: wheel-python3.10-cuda12.4
 
       - name: Install
         run: |
-          bash scripts/ci_install_dependency.sh
-          pip3 install torch==2.7.1 torchvision && pip3 install pytest
+          bash scripts/ci/ci_install_dependency.sh
+          pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126 && pip3 install pytest
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
@@ -112,12 +112,12 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.9-cuda12.4
+          pattern: wheel-python3.10-cuda12.4
 
       - name: Install
         run: |
-          bash scripts/ci_install_dependency.sh
-          pip3 install torch==2.7.1 torchvision
+          bash scripts/ci/ci_install_dependency.sh
+          pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel

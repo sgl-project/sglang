@@ -36,6 +36,7 @@ class ExpertLocationDispatchInfo:
     def init_new(cls, layer_id: int):
         ep_dispatch_algorithm = global_server_args_dict["ep_dispatch_algorithm"]
         expert_location_metadata = get_global_expert_location_metadata()
+        assert expert_location_metadata is not None
 
         if ep_dispatch_algorithm is None:
             return None
