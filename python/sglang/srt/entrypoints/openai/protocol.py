@@ -94,6 +94,8 @@ class UsageInfo(BaseModel):
     # only used to return cached tokens when --enable-cache-report is set
     prompt_tokens_details: Optional[Dict[str, int]] = None
     reasoning_tokens: Optional[int] = 0
+    # only used to return spec_verify_ct when --enable-spec-report is set
+    spec_verify_ct: Optional[int] = None
 
 
 class StreamOptions(BaseModel):

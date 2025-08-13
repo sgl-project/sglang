@@ -130,6 +130,7 @@ class ServerArgs:
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
+    enable_spec_report: bool = False
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
@@ -1223,6 +1224,11 @@ class ServerArgs:
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
         )
         parser.add_argument(
+            "--enable-spec-report",
+            action="store_true",
+            help="Return number of tokens accepted by the target model during speculative decoding verification in usage.spec_verify_ct for each openai request.",
+        )
+        parser.add_argument(
             "--reasoning-parser",
             type=str,
             choices=list(ReasoningParser.DetectorMap.keys()),
@@ -2067,6 +2073,11 @@ class ServerArgs:
             assert (
                 not self.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
+
+        if self.enable_spec_report:
+            assert (
+                self.speculative_algorithm is not None
+            ), "speculative_algorithm is required for --enable-spec-report"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
