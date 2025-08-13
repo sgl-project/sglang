@@ -104,7 +104,6 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
     && mv nvshmem_src nvshmem \
     && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
 
-
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
     if [ "$BUILD_TYPE" = "blackwell" ]; then CUDA_ARCH="100;120"; else CUDA_ARCH=90; fi && \
