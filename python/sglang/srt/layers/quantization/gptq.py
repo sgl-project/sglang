@@ -884,7 +884,7 @@ def dequantize_weight(qweight, qzeros, scales):
     unpacked_qweight, unpacked_qzeros = unpack_4bit_to_32bit_signed(qweight, qzeros)
     origin_dim = unpacked_qweight.shape[1]
     if origin_dim % scales.shape[1] != 0:
-        new_dim1 = 128 * scales.shape[1]
+        new_dim1 = 64 * scales.shape[1]
         new_unpacked_qweight = torch.zeros(unpacked_qweight.shape[0], new_dim1, unpacked_qweight.shape[2])
         new_unpacked_qweight[:, :origin_dim, :] = unpacked_qweight
         unpacked_qweight = new_unpacked_qweight
@@ -1073,6 +1073,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _moe_torch_native:
+            layer.w13_weight, _ = dequantize_weight(layer.w13_qweight, layer.w13_qzeros, layer.w13_scales)
+            layer.w2_weight, _ = dequantize_weight(layer.w2_qweight, layer.w2_qzeros, layer.w2_scales)
             return
         if _is_cpu:
             assert (
@@ -1175,8 +1177,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         # Delay the import to avoid circular dependency
         if _moe_torch_native:
-            layer.w13_weight, _ = dequantize_weight(layer.w13_qweight, layer.w13_qzeros, layer.w13_scales)
-            layer.w2_weight, _ = dequantize_weight(layer.w2_qweight, layer.w2_qzeros, layer.w2_scales)
             layer.w13_weight = layer.w13_weight.to(x.dtype)
             layer.w2_weight = layer.w2_weight.to(x.dtype)
             layer.w13_weight_bias = layer.w13_bias

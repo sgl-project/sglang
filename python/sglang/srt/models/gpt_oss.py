@@ -1010,30 +1010,13 @@ class GptOssForCausalLM(nn.Module):
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
-                        if "gate_up_projs" in weight_name:
-                            loaded_weight1, loaded_weight3 = loaded_weight.chunk(2, dim=-1)
-                            weight_loader(
-                                param,
-                                loaded_weight1,
-                                name,
-                                shard_id="w1",
-                                expert_id=expert_id,
-                            )
-                            weight_loader(
-                                param,
-                                loaded_weight3,
-                                name,
-                                shard_id="w3",
-                                expert_id=expert_id,
-                            )
-                        else:
-                            weight_loader(
-                                param,
-                                loaded_weight,
-                                name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
                         params_checker[name] = True
                         break
                 else:

@@ -328,15 +328,9 @@ class FusedMoE(torch.nn.Module):
             start = 0
 
         if _is_cpu:
-            if loaded_weight.dim() == 2:
+            if loaded_weight.dim() == 2 and is_bias:
                 shard_dim = 1
-                if not is_bias:
-                    if shard_id in {"w1", "w3"}:
-                        # non-fused version
-                        shard_size = expert_data.shape[shard_dim] // 2
-                    elif shard_id in {"w13"}:
-                        # fused version
-                        shard_size = expert_data.shape[shard_dim]
+
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -407,10 +401,8 @@ class FusedMoE(torch.nn.Module):
 
         if _is_cpu:
 
-            if loaded_weight.dim() == 2:
+            if loaded_weight.dim() == 2 and is_bias:
                 shard_dim = 1
-                if not is_bias:
-                    shard_size = expert_data.shape[shard_dim]
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -562,9 +554,9 @@ class FusedMoE(torch.nn.Module):
             else loaded_weight
         )
 
-        if shard_id not in ("w1", "w2", "w3"):
+        if shard_id not in ("w1", "w2", "w3", "w13"):
             raise ValueError(
-                f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
+                f"shard_id must be ['w1','w2','w3', 'w13'] but " f"got {shard_id}."
             )
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
@@ -575,7 +567,7 @@ class FusedMoE(torch.nn.Module):
         # Fetch the dim to shard the parameter/loaded weight
         # based on the shard id. This will be whatever
         # dimension intermediate_size is used.
-        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0, "w13": 0}
 
         expert_data = param.data[expert_id]
 
