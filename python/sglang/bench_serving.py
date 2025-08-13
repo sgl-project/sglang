@@ -12,6 +12,7 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
+import base64
 import io
 import json
 import os
@@ -1148,12 +1149,10 @@ def sample_random_image_requests(
     """
     try:
         from PIL import Image
-    except Exception as e:
+    except ImportError as e:
         raise ImportError(
             "Please install Pillow to generate random images: pip install pillow"
         ) from e
-
-    import base64
 
     # Parse resolution
     resolution_to_size = {
@@ -1189,7 +1188,7 @@ def sample_random_image_requests(
         text_prompt = gen_prompt(tokenizer, int(input_lens[i]))
 
         # Generate image list
-        images = [_gen_random_image_data_uri() for _ in range(max(1, num_images))]
+        images = [_gen_random_image_data_uri() for _ in range(num_images)]
 
         prompt_str = text_prompt
         if apply_chat_template:
