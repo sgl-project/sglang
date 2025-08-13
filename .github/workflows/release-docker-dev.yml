@@ -45,7 +45,7 @@ jobs:
 
   build-blackwell-x86:
     if: ${{ github.repository == 'sgl-project/sglang' }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         variant:
