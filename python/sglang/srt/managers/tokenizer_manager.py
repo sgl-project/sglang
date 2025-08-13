@@ -127,6 +127,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+QWEN3_RERANK_TYPE = "qwen3-rerank"
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -1869,6 +1870,20 @@ class TokenizerManager:
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
 
+    def _qwen3_rerank_customize_instruction(self, instruction: Optional[str], query: str, documents: List[str]) -> List[str]:
+        if instruction is None:
+            instruction = "Given a web search query, retrieve relevant passages that answer the query"
+
+        prefix = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
+        suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+        def format_instruction(instruction, query, doc):
+            output = f"{prefix} <Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc} {suffix}"
+            return output
+
+        pairs = [format_instruction(instruction, query, doc) for doc in documents]
+        return pairs
+
     async def score_request(
         self,
         query: Optional[Union[str, List[int]]] = None,
@@ -1876,6 +1891,8 @@ class TokenizerManager:
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
+        instruction: str = None,
+        rerank_type: str = None,
         request: Optional[Any] = None,
     ) -> List[List[float]]:
         """
@@ -1901,8 +1918,13 @@ class TokenizerManager:
             items_list = [items] if isinstance(items, str) else items
             if item_first:
                 prompts = [f"{item}{query}" for item in items_list]
+            elif rerank_type == QWEN3_RERANK_TYPE:
+                prompts = self._qwen3_rerank_customize_instruction(
+                    instruction, query, items_list
+                )
             else:
                 prompts = [f"{query}{item}" for item in items_list]
+
             batch_request = GenerateReqInput(
                 text=prompts,
                 return_logprob=True,
