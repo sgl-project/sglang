@@ -38,7 +38,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ github.repository_owner }}/sglang
+            lmsysorg/sglang
           # push with schedule event
           # push with workflow_dispatch event
           tags: |
@@ -52,7 +52,7 @@ jobs:
       # https://github.com/docker/login-action
       - name: Log into docker hub
         uses: docker/login-action@v3
-        if: ${{ github.repository_owner == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+        if: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -69,7 +69,7 @@ jobs:
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
-          push: ${{ github.repository_owner == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+          push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
             CANN_VERSION=${{ matrix.cann_version }}
