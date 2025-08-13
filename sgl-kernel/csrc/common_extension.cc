@@ -175,7 +175,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
-      "num_fused_shared_experts, float routed_scaling_factor) -> "
+      "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
   m.def(
@@ -413,6 +413,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("create_greenctx_stream_by_value(int smA, int smB, int device) -> int[]");
   m.impl("create_greenctx_stream_by_value", &create_greenctx_stream_by_value);
+
+  /*
+   * From csrc/memory
+   */
+  m.def("store_kv_cache(Tensor k_cache, Tensor v_cache, Tensor out_loc, Tensor k, Tensor v) -> ()");
+  m.impl("store_kv_cache", &store_kv_cache);
 }
 
 REGISTER_EXTENSION(common_ops)
