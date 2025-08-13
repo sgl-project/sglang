@@ -40,8 +40,11 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.utils import (
+    create_device_stream,
+    device_stream_func,
     direct_register_custom_op,
     get_bool_env_var,
+    get_device_current_stream,
     get_int_env_var,
     is_cuda_alike,
     is_hip,
@@ -55,7 +58,7 @@ _is_npu = is_npu()
 
 @dataclass
 class GraphCaptureContext:
-    stream: torch.cuda.Stream
+    stream: torch.cuda.Stream if not _is_npu else torch.npu.Stream
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -404,7 +407,7 @@ class GroupCoordinator:
         self, graph_capture_context: Optional[GraphCaptureContext] = None
     ):
         if graph_capture_context is None:
-            stream = torch.cuda.Stream()
+            stream = create_device_stream(self.device)
             graph_capture_context = GraphCaptureContext(stream)
         else:
             stream = graph_capture_context.stream
@@ -415,11 +418,11 @@ class GroupCoordinator:
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
-        curr_stream = torch.cuda.current_stream()
+        curr_stream = get_device_current_stream(self.device)
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context:
+        with device_stream_func(self.device)(stream), maybe_ca_context:
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
