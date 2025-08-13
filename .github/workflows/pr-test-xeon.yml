@@ -27,7 +27,7 @@ jobs:
   build-test:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: xeon-pvc
+    runs-on: xeon-gnr
     strategy:
       matrix:
         build_type: ['all']
