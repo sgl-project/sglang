@@ -33,6 +33,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.communicator import (
+    LayerCommunicator, 
+    LayerScatterModes,
+)
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.layernorm import RMSNorm, GemmaRMSNorm
@@ -169,7 +173,8 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.out_proj = RowParallelLinear(self.value_dim,
                                           self.hidden_size,
                                           bias=False,
-                                          input_is_parallel=True)
+                                          input_is_parallel=True,
+                                          reduce_results=False)
 
     def fix_query_key_value_ordering(self, mixed_qkvzba, ):
         """
@@ -352,14 +357,19 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.linear_attn = Qwen3GatedDeltaNet(config, layer_id)
+        
+        # Qwen3HybridMoE all layers are sparse and have no nextn now
+        self.is_layer_sparse = True
+        is_previous_layer_sparse = True
 
-        # Note: Qwen/Qwen2-57B-A14B-Instruct does not have
-        # `mlp_only_layers` in the config.
-        mlp_only_layers = ([] if not hasattr(config, "mlp_only_layers") else
-                           config.mlp_only_layers)
-        if (layer_id not in mlp_only_layers) and (
-                config.num_experts > 0 and
-            (layer_id + 1) % config.decoder_sparse_step == 0):
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+        )
+
+        if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -378,6 +388,12 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         else:
             self.input_layernorm = RMSNorm(config.hidden_size,  eps=config.rms_norm_eps)
             self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+        )
     
     def forward(
         self,
@@ -389,18 +405,25 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        hidden_states = self.linear_attn(hidden_states, forward_batch, mamba_cache_params,
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.linear_attn(hidden_states, forward_batch, mamba_cache_params,
                                    sequence_idx)
         
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+
+        hidden_states = self.mlp(hidden_states, forward_batch)
+
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
         return hidden_states, residual
 
 
@@ -431,13 +454,18 @@ class Qwen3HybridMixerDecoderLayer(nn.Module):
             chunk_size=config.mamba2_chunk_size,
             quant_config=quant_config)
 
-        # Note: Qwen/Qwen2-57B-A14B-Instruct does not have
-        # `mlp_only_layers` in the config.
-        mlp_only_layers = ([] if not hasattr(config, "mlp_only_layers") else
-                           config.mlp_only_layers)
-        if (layer_id not in mlp_only_layers) and (
-                config.num_experts > 0 and
-            (layer_id + 1) % config.decoder_sparse_step == 0):
+        # Qwen3HybridMoE all layers are sparse and have no nextn now
+        self.is_layer_sparse = True
+        is_previous_layer_sparse = True
+
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+        )
+
+        if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -459,6 +487,12 @@ class Qwen3HybridMixerDecoderLayer(nn.Module):
         
         self.layer_id = layer_id
 
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -468,19 +502,25 @@ class Qwen3HybridMixerDecoderLayer(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         **kwargs,
     ):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
 
-
-        hidden_states = self.mamba2(hidden_states, mamba_cache_params,
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.mamba2(hidden_states, mamba_cache_params,
                                    sequence_idx, forward_batch=forward_batch)
         
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+
+        hidden_states = self.mlp(hidden_states, forward_batch)
+
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
         return hidden_states, residual
 
 
@@ -552,7 +592,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
                                         config.hidden_size,
                                         bias=False,
-                                        quant_config=quant_config)
+                                        quant_config=quant_config,
+                                        reduce_results=False)
         
         self.attn = RadixAttention(
             self.num_heads,
@@ -563,14 +604,18 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # Note: Qwen/Qwen2-57B-A14B-Instruct does not have
-        # `mlp_only_layers` in the config.
+        # Qwen3HybridMoE all layers are sparse and have no nextn now
+        self.is_layer_sparse = True
+        is_previous_layer_sparse = True
 
-        mlp_only_layers = ([] if not hasattr(config, "mlp_only_layers") else
-                           config.mlp_only_layers)
-        if (layer_id not in mlp_only_layers) and (
-                config.num_experts > 0 and
-            (layer_id + 1) % config.decoder_sparse_step == 0):
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+        )
+
+        if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -598,6 +643,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             else:
                 self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
                 self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+        )
 
 
     def self_attention(
@@ -646,21 +697,28 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
 
-        hidden_states = self.self_attention(
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attention(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+
+        hidden_states = self.mlp(hidden_states, forward_batch)
+
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
         return hidden_states, residual
 
 ALL_DECODER_LAYER_TYPES = {
@@ -888,6 +946,7 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
                 input_ids.shape[0] + 1, dtype=torch.int32, device=input_ids.device)
         return extend_start_loc
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
