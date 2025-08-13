@@ -99,7 +99,7 @@ find_latest_image() {
   done
 
   echo "Error: No ${gpu_arch} image found in the last 7 days for version ${base_tag}" >&2
-  
+
   # Final fallback to specific hardcoded images
   echo "Using final fallback images..." >&2
   if [ "$gpu_arch" == "mi30x" ]; then
@@ -109,7 +109,7 @@ find_latest_image() {
   else
     echo "rocm/sgl-dev:v0.5.0rc0-rocm630-mi30x-20250812"  # Default to mi30x
   fi
-  
+
   return 0
 }
 
