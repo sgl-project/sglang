@@ -21,8 +21,8 @@ standard LLM support:
    in [model_config.py](https://github.com/sgl-project/sglang/blob/0ab3f437aba729b348a683ab32b35b214456efc7/python/sglang/srt/configs/model_config.py#L561)
    to return `True` for your model.
 
-2. **Register a new chat-template**
-   See [conversation.py](https://github.com/sgl-project/sglang/blob/86a779dbe9e815c02f71ea82574608f6eae016b5/python/sglang/srt/conversation.py)
+2. **Register a new chat-template**:
+   Only when your default chat-template is unable to accept images as input: Register a new chat template in [conversation.py](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/conversation.py) and the corresponding matching function.
 
 3. **Multimodal Data Processor**:
    Define a new `Processor` class that inherits from `BaseMultimodalProcessor` and register this processor as your
@@ -35,16 +35,18 @@ standard LLM support:
    expanded (if necessary) and padded with multimodal-data-hashes so that SGLang can recognize different multimodal data
    with `RadixAttention`.
 
-5. **Adapt to Vision Attention**:
+5. **Handle Image Feature Extraction**:
+   Implement a `get_image_feature` function for your new model, which extracts image features from raw image data and converts them into the embeddings used by the language model.
+
+6. **Adapt to Vision Attention**:
    Adapt the multi-headed `Attention` of ViT with SGLang’s `VisionAttention`.
 
 You can refer to [Qwen2VL](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/qwen2_vl.py) or
 other mllm implementations. These models demonstrate how to correctly handle both multimodal and textual inputs.
 
-You should test the new MLLM locally against Hugging Face models. See the [
-`mmmu`](https://github.com/sgl-project/sglang/tree/main/benchmark/mmmu) benchmark for an example.
+## Testing and Debugging
 
-## Test the Correctness
+Please note all your testing and benchmarking results in PR description.
 
 ### Interactive Debugging
 
@@ -65,13 +67,20 @@ should give the same text output and very similar prefill logits:
 To ensure the new model is well maintained, add it to the test suite by including it in the `ALL_OTHER_MODELS` list in
 the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/srt/models/test_generation_models.py)
 file, test the new model on your local machine and report the results on demonstrative benchmarks (GSM8K, MMLU, MMMU,
-MMMU-Pro, etc.) in your PR.
+MMMU-Pro, etc.) in your PR. \\
+For VLMs, also include a test in `test_vision_openai_server_{x}.py` (e.g. [test_vision_openai_server_a.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server_a.py), [test_vision_openai_server_b.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server_b.py)).
 
-This is the command to test a new model on your local machine:
+
+This is an example command to run to test a new model on your local machine:
 
 ```bash
 ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others
 ```
+
+### Benchmark
+
+- **(Required) MMMU**: follow MMMU benchmark [README.md](https://github.com/sgl-project/sglang/blob/main/benchmark/mmmu/README.md) to get SGLang vs. HF Transformer accuracy comparison. The accuracy score from SGLang run should not be much lower than that from HF Transformer run. Similarly, follow https://docs.sglang.ai/developer_guide/benchmark_and_profiling.html to get performance comparison: TTFT and throughput must meet or exceed baselines (e.g., HF Transformer).
+- **(Optional) Other evals**: If you ran other evals, please note the results in PR description.
 
 ## Port a Model from vLLM to SGLang
 
@@ -125,6 +134,9 @@ ModelRegistry.models.update(import_new_model_classes())
 # Launch the server with your server arguments:
 launch_server(server_args)
 ```
+
+## Documentation
+Add to table of supported models in [generative_models.md](https://github.com/sgl-project/sglang/blob/main/docs/supported_models/generative_models.md) or [multimodal_language_models.md](https://github.com/sgl-project/sglang/blob/main/docs/supported_models/multimodal_language_models.md)
 
 ---
 
