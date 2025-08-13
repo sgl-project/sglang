@@ -3,9 +3,8 @@ from __future__ import annotations
 import functools
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 import triton
@@ -13,7 +12,6 @@ import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -120,14 +118,6 @@ def compute_dp_attention_local_info(
     return local_attn_tp_rank, local_attn_tp_size, local_attn_dp_rank
 
 
-# def initialize_dp_attention(
-#     enable_dp_attention: bool,
-#     tp_rank: int,
-#     tp_size: int,
-#     dp_size: int,
-#     moe_dense_tp_size: int,
-#     pp_size: int,
-# ):
 def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
