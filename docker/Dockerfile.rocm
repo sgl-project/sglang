@@ -3,7 +3,7 @@
 #   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx950 -t v0.4.9.post1-rocm700-mi35x -f Dockerfile.rocm .
 
 # Default base images
-ARG BASE_IMAGE_950="henryx/haisgl:rocm7.0_preview_ubuntu_22.04_vllm-os-mini_0.1.0_mi35X_prealpha"
+ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7.0_preview_ubuntu_22.04_vllm_0.9.2_mi35X_prealpha"
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 
 # This is necessary for scope purpose
