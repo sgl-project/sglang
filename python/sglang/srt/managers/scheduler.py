@@ -493,6 +493,18 @@ class Scheduler(
         ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
+        # init future map for overlap schedule
+        if self.enable_overlap:
+            if self.spec_algorithm.is_eagle():
+                from sglang.srt.speculative.eagle_utils_v2 import FutureSpecInfoMap
+                self.future_spec_info_map = FutureSpecInfoMap(
+                    max_running_requests=self.max_running_requests,
+                    device=self.device,
+                )
+            else:
+                # TODO: implement non-eagle
+                pass
+
         # Init watchdog thread
         self.watchdog_timeout = server_args.watchdog_timeout
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
@@ -1875,6 +1887,7 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -1889,35 +1902,53 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            model_worker_batch = batch.get_model_worker_batch()
 
             if self.enable_overlap:
+                # 1. resolve spec_info reference with future_spec_info
+                # TODO: think about either resolve batch.spec_info or model_worker_batch.spec_info
+                self.future_spec_info_map.resolve_future_spec_info(batch.spec_info, batch.allocate_lens)
+                # 2. construct a new future_spec_info
+                future_spec_info, future_spec_info_ct = self.future_spec_info_map.construct_future_spec_info(len(batch.reqs))
+                model_worker_batch = batch.get_model_worker_batch()
                 # Make a copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
                 self.cur_sampling_info = model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
+                # assign the future_spec_info to the batch.spec_info
+                batch.spec_info = future_spec_info
 
                 # Run forward in a separate stream to avoid blocking the main stream.
                 with self.forward_stream_ctx:
                     forward_output = self.forward_worker.forward_batch_generation(
                         model_worker_batch
                     )
+                    if forward_output.spec_info is not None:
+                        self.future_spec_info_map.store_future_spec_info(future_spec_info_ct, len(batch.reqs), forward_output.spec_info)
                     copy_done = torch.cuda.Event()
                     copy_done.record()
             else:
+                model_worker_batch = batch.get_model_worker_batch()
                 forward_output = self.forward_worker.forward_batch_generation(
                     model_worker_batch
                 )
+                future_spec_info = forward_output.spec_info
                 copy_done = None
             batch.output_ids = forward_output.next_token_ids
 
             # Handle speculative decoding output
             if forward_output.spec_info is not None:
-                spec_info = batch.spec_info = forward_output.spec_info
-                batch.seq_lens = spec_info.new_seq_lens
-                batch.verify_done = spec_info.verify_done
+                new_seq_lens = forward_output.spec_info.new_seq_lens # val is ready after verify_done
+                allocate_lens = forward_output.spec_info.allocate_lens # val is always ready, at batch schedule time
+                batch.seq_lens = new_seq_lens
+                batch.allocate_lens = allocate_lens
+                batch.verify_done = forward_output.spec_info.verify_done
+                # spec_info = batch.spec_info = forward_output.spec_info
+                # batch.seq_lens = spec_info.new_seq_lens
+                # batch.verify_done = spec_info.verify_done
             else:
-                spec_info = None
+                new_seq_lens = None
+                allocate_lens = None
+                # spec_info = None
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -1941,8 +1972,8 @@ class Scheduler(
                 can_run_cuda_graph=forward_output.can_run_cuda_graph,
                 copy_done=copy_done,
                 accept_length=forward_output.accept_length,
-                new_seq_lens=spec_info.new_seq_lens,
-                allocate_lens=spec_info.allocate_lens,
+                new_seq_lens=new_seq_lens,
+                allocate_lens=allocate_lens,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
