@@ -252,6 +252,8 @@ class GroupCoordinator:
 
         if is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
+        elif _is_npu:
+            self.device = torch.device(f"npu:{local_rank}")
         else:
             self.device = torch.device("cpu")
 
@@ -1558,6 +1560,8 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
                 logger.warning(
                     "torch._C._host_emptyCache() only available in Pytorch >=2.5"
                 )
+        elif hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.empty_cache()
         elif hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.empty_cache()
 
