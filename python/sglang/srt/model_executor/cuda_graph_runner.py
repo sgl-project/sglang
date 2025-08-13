@@ -341,17 +341,17 @@ class CudaGraphRunner:
                     is_draft_model=True,
                 )
 
-                try:
-                    # get the aux layer from draft model config
-                    eagle_config = getattr(
-                        draft_model_config.hf_config, "eagle_config", None
-                    )
-                    eagle_aux_hidden_state_layer_ids = eagle_config[
-                        "eagle_aux_hidden_state_layer_ids"
-                    ]
-                except:
-                    # if there is no aux layer, set to None
+                # get the aux layer from draft model config
+                eagle_config = getattr(
+                    draft_model_config.hf_config, "eagle_config", None
+                )
+                if eagle_config is None:
                     eagle_aux_hidden_state_layer_ids = None
+                else:
+                    eagle_aux_hidden_state_layer_ids = eagle_config.get(
+                        "eagle_aux_hidden_state_layer_ids", None
+                    )
+                print(eagle_aux_hidden_state_layer_ids)
                 self.model_runner.model.set_eagle3_layers_to_capture(
                     eagle_aux_hidden_state_layer_ids
                 )
