@@ -23,6 +23,7 @@ suites = {
         TestFile("lora/test_lora_cuda_graph.py", 250),
         TestFile("lora/test_lora_update.py", 400),
         TestFile("lora/test_lora_qwen3.py", 97),
+        TestFile("lora/test_lora_radix_cache.py", 100),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -56,6 +57,7 @@ suites = {
         TestFile("quant/test_block_int8.py", 22),
         TestFile("quant/test_fp8_kernel.py", 8),
         TestFile("quant/test_int8_kernel.py", 8),
+        TestFile("quant/test_triton_scaled_mm.py", 8),
         TestFile("quant/test_w8a8_quantization.py", 46),
         TestFile("rl/test_update_weights_from_disk.py", 114),
         TestFile("rl/test_update_weights_from_tensor.py", 48),
@@ -195,6 +197,8 @@ suite_amd = {
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_triton_attention_backend.py", 150),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
+        TestFile("test_wave_attention_kernels.py", 2),
+        TestFile("test_wave_attention_backend.py", 150),
     ],
     "per-commit-2-gpu-amd": [
         TestFile("lora/test_lora_tp.py", 116),
