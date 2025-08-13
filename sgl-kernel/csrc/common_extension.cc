@@ -413,6 +413,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("create_greenctx_stream_by_value(int smA, int smB, int device) -> int[]");
   m.impl("create_greenctx_stream_by_value", &create_greenctx_stream_by_value);
+
+  /*
+   * From csrc/memory
+   */
+  m.def("store_kv_cache(Tensor k_cache, Tensor v_cache, Tensor out_loc, Tensor k, Tensor v) -> ()");
+  m.impl("store_kv_cache", &store_kv_cache);
 }
 
 REGISTER_EXTENSION(common_ops)
