@@ -27,7 +27,6 @@ from sglang.srt.hf_transformers_utils import (
     get_context_length,
     get_generation_config,
     get_hf_text_config,
-    get_sparse_attention_config,
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -54,7 +53,7 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_override_args: str = "{}",
+        model_override_args: Optional[str] = None,
         is_embedding: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
@@ -62,14 +61,15 @@ class ModelConfig:
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
-        model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
-        # Parse args
+
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
-        self.model_impl = model_impl
+        self.impl = impl
 
+        # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
@@ -112,7 +112,6 @@ class ModelConfig:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
-                "Step3VLForConditionalGeneration",
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
@@ -128,17 +127,8 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
-        if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
-            self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
-
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "Ernie4_5_MoeForCausalLM"
-        ):
-            self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
-
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
@@ -268,24 +258,20 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
-        self.num_nextn_predict_layers = getattr(
-            self.hf_text_config, "num_nextn_predict_layers", None
-        )
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization
         self._verify_quantization()
 
-        # Verify dual-chunk attention config
-        self._verify_dual_chunk_attention_config()
-
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
 
+        config = self.hf_config
+
         # multimodal
-        self.image_token_id = getattr(
-            self.hf_config, "image_token_id", None
-        ) or getattr(self.hf_config, "image_token_index", None)
+        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
+            config, "image_token_index", None
+        )
 
     @staticmethod
     def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
@@ -300,16 +286,9 @@ class ModelConfig:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
-            model_impl=server_args.model_impl,
+            impl=server_args.impl,
             **kwargs,
         )
-
-    def get_total_num_attention_heads(self) -> int:
-        return self.num_attention_heads
-
-    def get_num_attention_heads(self, tensor_parallel_size) -> int:
-        total_num_attention_heads = self.num_attention_heads
-        return max(1, total_num_attention_heads // tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
@@ -350,8 +329,6 @@ class ModelConfig:
             "num_key_value_heads",
             # For ChatGLM:
             "multi_query_group_num",
-            # For Step3
-            "num_attention_groups",
         ]
         for attr in attributes:
             num_kv_heads = getattr(self.hf_text_config, attr, None)
@@ -378,9 +355,10 @@ class ModelConfig:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
         if quant_cfg is None:
-            # check if is modelopt model -- modelopt doesn't have corresponding field
+            # check if is modelopt or mixed-precision model -- Both of them don't have corresponding field
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
+            # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
@@ -414,9 +392,6 @@ class ModelConfig:
             "compressed-tensors",
             "fbgemm_fp8",
             "w8a8_fp8",
-            "petit_nvfp4",
-            "quark",
-            "mxfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -434,11 +409,9 @@ class ModelConfig:
             "moe_wna16",
             "qoq",
             "w4afp8",
-            "petit_nvfp4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
-            "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -498,26 +471,9 @@ class ModelConfig:
                     self.quantization,
                 )
 
-    def _verify_dual_chunk_attention_config(self) -> None:
-        if hasattr(self.hf_config, "dual_chunk_attention_config"):
-            # Try loading the sparse attention config
-            sparse_attn_config = get_sparse_attention_config(self.model_path)
-            if not sparse_attn_config:
-                return
-            self.hf_config.dual_chunk_attention_config["sparse_attention_config"] = (
-                sparse_attn_config
-            )
-            if (
-                "sparse_attention_enabled"
-                not in self.hf_config.dual_chunk_attention_config
-            ):
-                self.hf_config.dual_chunk_attention_config[
-                    "sparse_attention_enabled"
-                ] = True
-
     def get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
-        if eos_ids is not None:
+        if eos_ids:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
         if eos_ids is None:
@@ -659,8 +615,6 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
-    "Glm4vForConditionalGeneration",
-    "Glm4vMoeForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
@@ -679,10 +633,8 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
-    "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
-    "Step3VLForConditionalGeneration",
 ]
 
 

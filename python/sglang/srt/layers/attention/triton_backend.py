@@ -88,7 +88,6 @@ class TritonAttnBackend(AttentionBackend):
                 self.window_kv_indptr = torch.zeros_like(kv_indptr_buf)
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
 
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
@@ -198,7 +197,6 @@ class TritonAttnBackend(AttentionBackend):
                             forward_batch.req_pool_indices,
                             bs,
                             self.device,
-                            self.token_to_kv_pool_allocator,
                         )
                     )
                     window_num_kv_splits = torch.empty(
@@ -227,6 +225,7 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
+            # TODO: Support sliding window in spec inference
             bs = len(forward_batch.req_pool_indices)
             qo_indptr = torch.arange(
                 0,
@@ -250,20 +249,6 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
-
-            if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                window_kv_indptr, window_kv_indices, window_kv_lens = (
-                    update_sliding_window_buffer(
-                        self.window_kv_indptr,
-                        self.req_to_token,
-                        self.sliding_window_size,
-                        forward_batch.seq_lens,
-                        forward_batch.req_pool_indices,
-                        bs,
-                        self.device,
-                        self.token_to_kv_pool_allocator,
-                    )
-                )
 
             custom_mask = spec_info.custom_mask
             seq_mask_len = self.num_draft_tokens * (
@@ -323,7 +308,6 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices,
                     bs,
                     self.device,
-                    self.token_to_kv_pool_allocator,
                 )
 
             qo_indptr = self.qo_indptr
@@ -439,17 +423,14 @@ class TritonAttnBackend(AttentionBackend):
                 ):
                     window_kv_indices = self.cuda_graph_window_kv_indices
                     window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-                    window_kv_indptr, window_kv_indices, _ = (
-                        update_sliding_window_buffer_cuda_graph(
-                            self.window_kv_indptr,
-                            window_kv_indices,
-                            self.req_to_token,
-                            self.sliding_window_size,
-                            seq_lens[:bs],
-                            req_pool_indices,
-                            bs,
-                            self.token_to_kv_pool_allocator,
-                        )
+                    window_kv_indptr, _ = update_sliding_window_buffer_cuda_graph(
+                        self.window_kv_indptr,
+                        window_kv_indices,
+                        self.req_to_token,
+                        self.sliding_window_size,
+                        seq_lens[:bs],
+                        req_pool_indices,
+                        bs,
                     )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
@@ -482,22 +463,6 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
-
-            if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                window_kv_indices = self.cuda_graph_window_kv_indices
-                window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-                window_kv_indptr, window_kv_indices, _ = (
-                    update_sliding_window_buffer_cuda_graph(
-                        self.window_kv_indptr,
-                        window_kv_indices,
-                        self.req_to_token,
-                        self.sliding_window_size,
-                        seq_lens,
-                        req_pool_indices,
-                        bs,
-                        self.token_to_kv_pool_allocator,
-                    )
-                )
 
             custom_mask = self.cuda_graph_custom_mask
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
@@ -592,7 +557,7 @@ class TritonAttnBackend(AttentionBackend):
                 ):
                     window_num_kv_splits = self.cuda_graph_window_num_kv_splits
                     window_kv_indices = self.cuda_graph_window_kv_indices
-                    _, _, window_kv_lens = update_sliding_window_buffer_cuda_graph(
+                    _, window_kv_lens = update_sliding_window_buffer_cuda_graph(
                         self.window_kv_indptr,
                         window_kv_indices,
                         self.req_to_token,
@@ -600,7 +565,6 @@ class TritonAttnBackend(AttentionBackend):
                         seq_lens[:bs],
                         req_pool_indices[:bs],
                         bs,
-                        self.token_to_kv_pool_allocator,
                     )
                     self.get_num_kv_splits(
                         window_num_kv_splits[:num_token], window_kv_lens[:bs]
@@ -635,19 +599,6 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
-            if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-                window_kv_indices = self.cuda_graph_window_kv_indices
-                _, _, window_kv_lens = update_sliding_window_buffer_cuda_graph(
-                    self.window_kv_indptr,
-                    window_kv_indices,
-                    self.req_to_token,
-                    self.sliding_window_size,
-                    seq_lens,
-                    req_pool_indices,
-                    bs,
-                    self.token_to_kv_pool_allocator,
-                )
             custom_mask = self.cuda_graph_custom_mask
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
             seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
@@ -686,7 +637,6 @@ class TritonAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-        sinks=None,
     ):
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
@@ -730,8 +680,7 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.max_extend_len,
             layer.scaling,
             layer.logit_cap,
-            sliding_window_size=sliding_window_size,
-            sinks=sinks,
+            sliding_window_size,
         )
         return o
 
@@ -743,7 +692,6 @@ class TritonAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-        sinks=None,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -780,7 +728,6 @@ class TritonAttnBackend(AttentionBackend):
             self.max_kv_splits,
             layer.scaling,
             layer.logit_cap,
-            sinks=sinks,
         )
         return o
 
@@ -985,11 +932,10 @@ def update_sliding_window_buffer(
     req_pool_indices,
     bs,
     device,
-    token_to_kv_pool_allocator=None,
 ):
     window_kv_lens = torch.minimum(
         seq_lens,
-        torch.tensor(sliding_window_size),
+        torch.tensor(sliding_window_size + 1),
     )
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
@@ -1006,14 +952,6 @@ def update_sliding_window_buffer(
         window_kv_indices,
         req_to_token.stride(0),
     )
-    # full to swa index mapping
-    if hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
-        kv_last_index = window_kv_indptr[-1]
-        window_kv_indices[:kv_last_index] = (
-            token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                window_kv_indices[:kv_last_index]
-            )
-        )
     return window_kv_indptr, window_kv_indices, window_kv_lens
 
 
@@ -1025,11 +963,10 @@ def update_sliding_window_buffer_cuda_graph(
     seq_lens,
     req_pool_indices,
     bs,
-    token_to_kv_pool_allocator=None,
 ):
     window_kv_lens = torch.minimum(
         seq_lens,
-        torch.tensor(sliding_window_size),
+        torch.tensor(sliding_window_size + 1),
     )
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
@@ -1043,12 +980,4 @@ def update_sliding_window_buffer_cuda_graph(
         window_kv_indices,
         req_to_token.stride(0),
     )
-    # full to swa index mapping
-    if hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
-        kv_last_index = window_kv_indptr[-1]
-        window_kv_indices[:kv_last_index] = (
-            token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                window_kv_indices[:kv_last_index]
-            )
-        )
-    return window_kv_indptr, window_kv_indices, window_kv_lens
+    return window_kv_indptr, window_kv_lens

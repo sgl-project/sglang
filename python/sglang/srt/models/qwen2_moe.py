@@ -43,6 +43,10 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather,
+    attn_tp_reduce_scatter,
+    dp_gather_partial,
+    dp_scatter,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
@@ -57,7 +61,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.ep_moe.layer import EPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -131,25 +134,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
-        )
-
         self.experts = get_moe_impl_class()(
             layer_id=self.layer_id,
-            top_k=config.num_experts_per_tok,
             num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             # Additional args for FusedMoE
             **(
                 dict(
-                    enable_flashinfer_cutlass_moe=True,
+                    enable_flashinfer_moe=True,
+                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
                 )
-                if global_server_args_dict["enable_flashinfer_cutlass_moe"]
+                if global_server_args_dict["enable_flashinfer_moe"]
                 else {}
             ),
         )
@@ -189,8 +189,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -210,7 +211,6 @@ class Qwen2MoeAttention(nn.Module):
         max_position_embeddings: int = 8192,
         qkv_bias: int = True,
         quant_config: Optional[QuantizationConfig] = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -268,7 +268,6 @@ class Qwen2MoeAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -310,9 +309,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         qkv_bias = getattr(config, "qkv_bias", True)
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -322,7 +318,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            dual_chunk_attention_config=dual_chunk_attention_config,
             qkv_bias=qkv_bias,
             prefix=add_prefix("self_attn", prefix),
         )
@@ -621,7 +616,9 @@ class Qwen2MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+
+        expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

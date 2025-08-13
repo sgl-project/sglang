@@ -485,8 +485,7 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
   torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
   torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
 
-  if (at::cuda::getCurrentDeviceProperties()->multiProcessorCount == 78 && a.size(1) > 128) {
-    // For H20 with K > 128, use Pingpong Schedule
+  if (a.size(1) > 128) {
     run_get_group_gemm_starts<MmaConfig0::LayoutSFA, MmaConfig0::LayoutSFB, MmaConfig0::ScaleConfig>(
         expert_offsets,
         a_ptrs,
@@ -518,7 +517,7 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
         expert_offsets,
         workspace);
   } else {
-    // For H20 with K <= 128, and H100 & H200 & H800, use Cooperative Schedule
+    // Small K
     run_get_group_gemm_starts<MmaConfig1::LayoutSFA, MmaConfig1::LayoutSFB, MmaConfig1::ScaleConfig>(
         expert_offsets,
         a_ptrs,

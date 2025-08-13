@@ -211,12 +211,15 @@ class TransformersForCausalLM(nn.Module):
         Apply the model's tensor parallelization plan.
         Currently only supports linear layers.
         """
-        tp_plan = getattr(self.model.config, "base_model_tp_plan", None) or {}
+        if not self.model.supports_tp_plan:
+            if tp_size <= 1:
+                return
 
-        if not tp_plan and self.tp_size > 1:
             raise ValueError(
                 f"{type(self.model)} does not support tensor parallel yet!"
             )
+
+        tp_plan = self.model._tp_plan
 
         def _tensor_parallel(module: nn.Module, prefix: str = ""):
             for child_name, child_module in module.named_children():

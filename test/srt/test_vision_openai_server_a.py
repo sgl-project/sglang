@@ -30,9 +30,7 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
-                "0.35",
-                "--cuda-graph-max-bs",
-                "4",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
@@ -54,9 +52,7 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
-                "0.35",
-                "--cuda-graph-max-bs",
-                "4",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
@@ -79,9 +75,7 @@ class TestVLMContextLengthIssue(CustomTestCase):
             other_args=[
                 "--context-length",
                 "300",
-                "--mem-fraction-static=0.75",
-                "--cuda-graph-max-bs",
-                "4",
+                "--mem-fraction-static=0.80",
             ],
         )
         cls.base_url += "/v1"
@@ -122,23 +116,22 @@ class TestVLMContextLengthIssue(CustomTestCase):
         )
 
 
-# Note(Xinyuan): mllama is not stable for now, skip for CI
-# class TestMllamaServer(TestOpenAIVisionServer):
-#     @classmethod
-#     def setUpClass(cls):
-#         cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-#         cls.base_url = DEFAULT_URL_FOR_TEST
-#         cls.api_key = "sk-123456"
-#         cls.process = popen_launch_server(
-#             cls.model,
-#             cls.base_url,
-#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-#             api_key=cls.api_key,
-#         )
-#         cls.base_url += "/v1"
+class TestMllamaServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.base_url += "/v1"
 
-#     def test_video_chat_completion(self):
-#         pass
+    def test_video_chat_completion(self):
+        pass
 
 
 class TestMinicpmvServer(TestOpenAIVisionServer):
@@ -154,9 +147,7 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.35",
-                "--cuda-graph-max-bs",
-                "4",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
@@ -172,11 +163,7 @@ class TestInternVL2_5Server(TestOpenAIVisionServer):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
+            other_args=["--trust-remote-code"],
         )
         cls.base_url += "/v1"
 
@@ -194,9 +181,7 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.65",
-                "--cuda-graph-max-bs",
-                "4",
+                "0.7",
             ],
         )
         cls.base_url += "/v1"
@@ -221,13 +206,10 @@ class TestMimoVLServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.6",
-                "--cuda-graph-max-bs",
-                "4",
             ],
         )
         cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
-    del TestOpenAIVisionServer
     unittest.main()

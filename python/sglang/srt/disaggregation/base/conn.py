@@ -25,13 +25,10 @@ class KVArgs:
     gpu_id: int
     # for different tp
     decode_tp_size: int
-    kv_head_num: int
-    page_size: int
     # for pp prefill
     prefill_pp_size: int
-    pp_rank: int
-    # for system dp
-    system_dp_rank: int
+    kv_head_num: int
+    page_size: int
 
 
 class KVPoll:

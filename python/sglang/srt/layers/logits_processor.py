@@ -27,9 +27,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.dp_attention import (
-    DPPaddingMode,
     attn_tp_all_gather,
-    attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
     dp_scatter,
     get_attention_dp_rank,
@@ -83,7 +81,6 @@ class LogitsProcessorOutput:
 class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
-    next_token_logits_buffer: Optional[torch.Tensor] = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -114,8 +111,7 @@ class LogitsMetadata:
     # Number of tokens to sample per DP rank
     global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-    # The gather mode for DP attention
-    dp_padding_mode: Optional[DPPaddingMode] = None
+
     # for padding
     padded_static_len: int = -1
 
@@ -149,7 +145,6 @@ class LogitsMetadata:
         return cls(
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
-            next_token_logits_buffer=forward_batch.next_token_logits_buffer,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -168,10 +163,12 @@ class LogitsMetadata:
             forward_batch_gathered_buffer=forward_batch.gathered_buffer,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DPPaddingMode.SUM_LEN,
         )
 
-    def compute_dp_attention_metadata(self):
+    def compute_dp_attention_metadata(self, hidden_states: torch.Tensor):
+        if self.global_num_tokens_for_logprob_cpu is None:
+            # we are capturing cuda graph
+            return
 
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
@@ -182,22 +179,18 @@ class LogitsMetadata:
         else:
             dp_local_start_pos = cumtokens[dp_rank - 1]
         dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+        gathered_buffer = torch.zeros(
+            (
+                sum(self.global_num_tokens_for_logprob_cpu),
+                hidden_states.shape[1],
+            ),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
         self.dp_local_start_pos = dp_local_start_pos
         self.dp_local_num_tokens = dp_local_num_tokens
-
-        if self.global_num_tokens_for_logprob_cpu is not None:
-            # create a smaller buffer to reduce peak memory usage
-            self.gathered_buffer = torch.empty(
-                (
-                    sum(self.global_num_tokens_for_logprob_cpu),
-                    self.gathered_buffer.shape[1],
-                ),
-                dtype=self.gathered_buffer.dtype,
-                device=self.gathered_buffer.device,
-            )
-        else:
-            self.gathered_buffer = torch.empty_like(self.gathered_buffer)
+        self.gathered_buffer = gathered_buffer
 
 
 class LogitsProcessor(nn.Module):
@@ -441,9 +434,9 @@ class LogitsProcessor(nn.Module):
         guarantee the given hidden_states follow this constraint.
         """
         if self.do_tensor_parallel_all_gather_dp_attn:
-            logits_metadata.compute_dp_attention_metadata()
+            logits_metadata.compute_dp_attention_metadata(hidden_states)
             hidden_states, local_hidden_states = (
-                logits_metadata.gathered_buffer,
+                torch.empty_like(logits_metadata.gathered_buffer),
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
@@ -470,31 +463,15 @@ class LogitsProcessor(nn.Module):
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
-                if self.config.vocab_size % self.attn_tp_size == 0:
-                    global_logits = torch.empty(
-                        (
-                            self.attn_tp_size,
-                            logits.shape[0],
-                            self.config.vocab_size // self.attn_tp_size,
-                        ),
-                        device=logits.device,
-                        dtype=logits.dtype,
-                    )
-                    attn_tp_all_gather_into_tensor(global_logits, logits)
-                    global_logits = global_logits.permute(1, 0, 2).reshape(
-                        logits.shape[0], self.config.vocab_size
-                    )
-                else:
-                    global_logits = torch.empty(
-                        (self.config.vocab_size, logits.shape[0]),
-                        device=logits.device,
-                        dtype=logits.dtype,
-                    )
-                    global_logits = global_logits.T
-                    attn_tp_all_gather(
-                        list(global_logits.tensor_split(self.attn_tp_size, dim=-1)),
-                        logits,
-                    )
+                global_logits = torch.empty(
+                    (self.config.vocab_size, logits.shape[0]),
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
+                global_logits = global_logits.T
+                attn_tp_all_gather(
+                    list(global_logits.tensor_split(self.attn_tp_size, dim=-1)), logits
+                )
                 logits = global_logits
             else:
                 logits = tensor_model_parallel_all_gather(logits)
@@ -510,13 +487,7 @@ class LogitsProcessor(nn.Module):
             )
             dp_scatter(logits, global_logits, logits_metadata)
 
-        if logits_metadata.next_token_logits_buffer is not None:
-            logits_buffer = logits_metadata.next_token_logits_buffer
-            assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.config.vocab_size])
-            logits = logits_buffer
-        else:
-            logits = logits[:, : self.config.vocab_size].float()
+        logits = logits[:, : self.config.vocab_size].float()
 
         if self.final_logit_softcapping:
             fused_softcap(logits, self.final_logit_softcapping)

@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.distributed as dist

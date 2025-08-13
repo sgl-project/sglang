@@ -15,23 +15,11 @@ from sglang.srt.multimodal.processors.base_processor import (
 class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
     models = [MiniCPMV, MiniCPMO]
 
-    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        # Collect special token ids
-        tokenizer = self._processor.tokenizer
-        self.slice_start_id = getattr(tokenizer, "slice_start_id", None)
-        self.slice_end_id = getattr(tokenizer, "slice_end_id", None)
-        self.audio_start_id = getattr(tokenizer, "audio_start_id", None)
-        self.audio_end_id = getattr(tokenizer, "audio_end_id", None)
-        self.im_start_id = getattr(tokenizer, "im_start_id", None)
-        self.im_end_id = getattr(tokenizer, "im_end_id", None)
-        self.im_token_id = getattr(tokenizer, "unk_id", None)
-        self.mm_tokens = MultimodalSpecialTokens(
-            image_token="(<image>./</image>)",
-            audio_token="(<audio>./</audio>)",
-            video_token="(<video>./</video>)",
-            image_token_id=self.im_token_id,
-        ).build(_processor)
+    def __init__(self, hf_config, server_args, _processor):
+        super().__init__(hf_config, server_args, _processor)
+        self.image_token = "(<image>./</image>)"
+        self.audio_token = "(<audio>./</audio>)"
+        self.video_token = "(<video>./</video>)"
 
     async def process_mm_data_async(
         self,
@@ -39,13 +27,19 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         audio_data: List[Union[str, bytes]],
         input_text,
         request_obj,
+        max_req_input_len,
         **kwargs,
     ):
         base_output = self.load_mm_data(
             prompt=input_text,
+            max_req_input_len=max_req_input_len,
             audio_data=audio_data,
             image_data=image_data,
-            multimodal_tokens=self.mm_tokens,
+            multimodal_tokens=MultimodalSpecialTokens(
+                image_token=self.image_token,
+                video_token=self.video_token,
+                audio_token=self.audio_token,
+            ),
         )
         if base_output is None:
             return None
@@ -56,6 +50,24 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             audios=base_output.audios,
         )
 
+        # Collect special token ids
+        tokenizer = self._processor.tokenizer
+        slice_start_id, slice_end_id, audio_start_id, audio_end_id = (
+            None,
+            None,
+            None,
+            None,
+        )
+        if tokenizer.slice_start_id:
+            slice_start_id = tokenizer.slice_start_id
+            slice_end_id = tokenizer.slice_end_id
+        if hasattr(tokenizer, "audio_start_id"):
+            audio_start_id = tokenizer.audio_start_id
+            audio_end_id = tokenizer.audio_end_id
+
+        im_start_id = tokenizer.im_start_id
+        im_end_id = tokenizer.im_end_id
+        im_token_id = tokenizer.unk_id
         pixel_values = res["pixel_values"]
         tgt_sizes = res["tgt_sizes"]
 
@@ -92,12 +104,10 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         items = []
         input_ids = res["input_ids"].flatten()
         image_offsets = self.get_mm_items_offset_by_pair(
-            input_ids=input_ids, mm_start_id=self.im_start_id, mm_end_id=self.im_end_id
+            input_ids=input_ids, mm_start_id=im_start_id, mm_end_id=im_end_id
         )
         slice_offsets = self.get_mm_items_offset_by_pair(
-            input_ids=input_ids,
-            mm_start_id=self.slice_start_id,
-            mm_end_id=self.slice_end_id,
+            input_ids=input_ids, mm_start_id=slice_start_id, mm_end_id=slice_end_id
         )
         image_offsets.extend(slice_offsets)
         image_offsets = sorted(image_offsets)
@@ -106,7 +116,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             item = MultimodalDataItem(
                 feature=pixel_values,
                 offsets=image_offsets,
-                model_specific_data={"tgt_size": tgt_sizes_flat},
+                tgt_size=tgt_sizes_flat,
                 modality=Modality.IMAGE,
             )
             items += [item]
@@ -116,17 +126,17 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             and res["audio_features"] is not None
             and len(res["audio_features"]) != 0
         ):
-            if self.audio_start_id is not None and self.audio_end_id is not None:
+            if audio_start_id is not None and audio_end_id is not None:
                 audio_offsets = self.get_mm_items_offset_by_pair(
                     input_ids=input_ids,
-                    mm_start_id=self.audio_start_id,
-                    mm_end_id=self.audio_end_id,
+                    mm_start_id=audio_start_id,
+                    mm_end_id=audio_end_id,
                 )
             else:
                 audio_offsets = None
             item = MultimodalDataItem(
                 feature=[res["audio_features"]],
-                model_specific_data={"audio_feature_lens": res["audio_feature_lens"]},
+                audio_feature_lens=res["audio_feature_lens"],
                 offsets=audio_offsets,
                 modality=Modality.AUDIO,
             )
@@ -134,11 +144,11 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         return {
             "mm_items": items,
             "input_ids": input_ids.tolist(),
-            "audio_start_id": self.audio_start_id,
-            "audio_end_id": self.audio_end_id,
-            "im_token_id": self.im_token_id,
-            "im_start_id": self.im_start_id,
-            "im_end_id": self.im_end_id,
-            "slice_start_id": self.slice_start_id,
-            "slice_end_id": self.slice_end_id,
+            "audio_start_id": audio_start_id,
+            "audio_end_id": audio_end_id,
+            "im_token_id": im_token_id,
+            "im_start_id": im_start_id,
+            "im_end_id": im_end_id,
+            "slice_start_id": slice_start_id,
+            "slice_end_id": slice_end_id,
         }

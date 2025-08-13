@@ -12,16 +12,14 @@
 # limitations under the License.
 # ==============================================================================
 """Radix attention."""
-from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from torch import nn
 
-if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.base_config import QuantizationConfig
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class AttentionType(Enum):

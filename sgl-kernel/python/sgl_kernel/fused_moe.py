@@ -5,7 +5,7 @@ import torch
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
-    from sgl_kernel.scalar_type import scalar_types
+    from sglang.srt.layers.quantization.scalar_type import scalar_types
 
     if has_zp:
         assert num_bits == 4

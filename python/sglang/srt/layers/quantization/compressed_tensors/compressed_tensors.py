@@ -40,10 +40,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 try:
-    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
-        WNA16_SUPPORTED_BITS,
-        CompressedTensorsWNA16,
-    )
+    import vllm
 
     VLLM_AVAILABLE = True
 except ImportError:
