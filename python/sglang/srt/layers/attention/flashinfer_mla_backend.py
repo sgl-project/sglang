@@ -114,7 +114,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
-        self.prefill_chunk_wrapper: list[BatchMLAPagedAttentionWrapper] = []
+        self.prefill_chunk_wrapper: list[BatchPrefillWithRaggedKVCacheWrapper] = []
 
         if not self.skip_prefill:
             self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
@@ -754,6 +754,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
                 head_dim_vo=self.v_head_dim,
                 q_data_type=self.q_data_type,
+                causal=True,
                 sm_scale=sm_scale,
             )
         else:
