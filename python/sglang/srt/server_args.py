@@ -576,6 +576,11 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+        if self.hicache_storage_backend == "mooncake":
+            # to use mooncake storage backend, the following conditions must be met:
+            self.hicache_io_backend = "kernel"
+            self.hicache_mem_layout = "page_first"
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
@@ -1324,6 +1329,7 @@ class ServerArgs:
             "trtllm_mla",
             "trtllm_mha",
             "dual_chunk_flash_attn",
+            "wave",
         ]
         parser.add_argument(
             "--attention-backend",
