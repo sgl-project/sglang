@@ -241,7 +241,8 @@ void fused_experts_int4_w4a16_kernel_impl(
     float alpha,
     float limit,
     int act_func,
-    bool with_bias) {
+    bool with_bias,
+    int k_gs) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
 
@@ -270,8 +271,8 @@ void fused_experts_int4_w4a16_kernel_impl(
       int32_t expert_id = expert_ids[mb];
       const at::quint4x2* __restrict__ B = packed_w1 + (expert_id * stride_e + nb * BLOCK_N * stride_n) / 2;
       // Bz and Bs: [E, K/gs, 2N]
-      const uint8_t* __restrict__ Bz = w1z + expert_id * (K / group_size) * (2 * N) + nb * BLOCK_N;
-      const scalar_t* __restrict__ Bs = w1s + expert_id * (K / group_size) * (2 * N) + nb * BLOCK_N;
+      const uint8_t* __restrict__ Bz = w1z + expert_id * (k_gs) * (2 * N) + nb * BLOCK_N;
+      const scalar_t* __restrict__ Bs = w1s + expert_id * (k_gs) * (2 * N) + nb * BLOCK_N;
       const scalar_t* __restrict__ B_bias0 = w1_bias + expert_id * 2 * N + nb * BLOCK_N;
       const scalar_t* __restrict__ B_bias1 = w1_bias + expert_id * 2 * N + (nb + NB) * BLOCK_N;
       // 1.a load A
@@ -367,8 +368,8 @@ void fused_experts_int4_w4a16_kernel_impl(
       int32_t expert_id = expert_ids[mb];
       const at::quint4x2* __restrict__ B = packed_w2 + (expert_id * stride_e2 + nb * BLOCK_N * stride_oc) / 2;
       // Bz and Bs: [E, IC/gs, OC]
-      const uint8_t* __restrict__ Bz = w2z + expert_id * (IC / group_size) * OC + nb * BLOCK_N;
-      const scalar_t* __restrict__ Bs = w2s + expert_id * (IC / group_size) * OC + nb * BLOCK_N;
+      const uint8_t* __restrict__ Bz = w2z + expert_id * (k_gs) * OC + nb * BLOCK_N;
+      const scalar_t* __restrict__ Bs = w2s + expert_id * (k_gs) * OC + nb * BLOCK_N;
       const scalar_t* __restrict__ B_bias = w2_bias + expert_id * OC + nb * BLOCK_N;
 
       tinygemm_kernel<scalar_t>(
@@ -449,7 +450,8 @@ void fused_experts_int4_w4a16_kernel_impl(
       float alpha,                                          \
       float limit,                                          \
       int act_func,                                         \
-      bool with_bias)
+      bool with_bias, \
+      int k_gs)
 
 INSTANTIATE_MOE_INT4_W4A16_TEMPLATE(at::BFloat16);
 INSTANTIATE_MOE_INT4_W4A16_TEMPLATE(at::Half);

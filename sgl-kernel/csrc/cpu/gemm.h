@@ -170,7 +170,8 @@ void fused_experts_int4_w4a16_kernel_impl(
     float alpha,
     float limit,
     int act_func,
-    bool with_bias);
+    bool with_bias,
+    int k_gs);
 
 template <typename scalar_t>
 void shared_expert_fp8_kernel_impl(
