@@ -15,8 +15,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from flash_fwd_sm100 import FlashAttentionForwardSm100
-
+# from flash_fwd_sm100 import FlashAttentionForwardSm100
+# from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 def _green(x: str) -> str:
     return f"\033[1;32m{x}\033[0m"
@@ -316,41 +316,41 @@ def _ref_impl(
 _flash_attn_fwd.compile_cache = {}
 
 
-def flash_attn_varlen_func(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    causal: bool = True,
-    window_size: tuple[Optional[int], Optional[int]] = (None, None),
-    learnable_sink: Optional[torch.Tensor] = None,
-    softcap: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    assert causal, "Only support causal."
-    assert (
-        window_size[0] is None and window_size[1] is None
-    ), "window_size is not supported."
-
-    out, lse = _flash_attn_fwd(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size_left=window_size[0],
-        window_size_right=window_size[1],
-        learnable_sink=learnable_sink,
-        softcap=softcap,
-    )
-    return out, lse
+# def flash_attn_varlen_func(
+#     q: torch.Tensor,
+#     k: torch.Tensor,
+#     v: torch.Tensor,
+#     cu_seqlens_q: Optional[torch.Tensor] = None,
+#     cu_seqlens_k: Optional[torch.Tensor] = None,
+#     seqused_q: Optional[torch.Tensor] = None,
+#     seqused_k: Optional[torch.Tensor] = None,
+#     softmax_scale: Optional[float] = None,
+#     causal: bool = True,
+#     window_size: tuple[Optional[int], Optional[int]] = (None, None),
+#     learnable_sink: Optional[torch.Tensor] = None,
+#     softcap: float = 0.0,
+# ) -> tuple[torch.Tensor, torch.Tensor]:
+#     assert causal, "Only support causal."
+#     assert (
+#         window_size[0] is None and window_size[1] is None
+#     ), "window_size is not supported."
+# 
+#     out, lse = _flash_attn_fwd(
+#         q,
+#         k,
+#         v,
+#         cu_seqlens_q,
+#         cu_seqlens_k,
+#         seqused_q,
+#         seqused_k,
+#         softmax_scale=softmax_scale,
+#         causal=causal,
+#         window_size_left=window_size[0],
+#         window_size_right=window_size[1],
+#         learnable_sink=learnable_sink,
+#         softcap=softcap,
+#     )
+#     return out, lse
 
 
 def test_ragged(
@@ -368,12 +368,16 @@ def test_ragged(
     torch.manual_seed(seed)
     np.random.seed(seed)
 
+    from flash_attn.cute.interface import flash_attn_varlen_func
+
     qo_len = sum(qo_lens)
     kv_len = sum(kv_lens)
     seqlens_q = torch.tensor(list(qo_lens), dtype=torch.int32, device="cuda")
     seqlens_k = torch.tensor(list(qo_lens), dtype=torch.int32, device="cuda")
-    cu_seqlens_q = torch.cumsum(seqlens_q, dim=0, dtype=torch.int32)
-    cu_seqlens_k = torch.cumsum(seqlens_k, dim=0, dtype=torch.int32)
+    cu_seqlens_q = F.pad(
+        torch.cumsum(seqlens_q, dim=0, dtype=torch.int32), pad=(1, 0), mode="constant", value=0)
+    cu_seqlens_k = F.pad(
+        torch.cumsum(seqlens_k, dim=0, dtype=torch.int32), pad=(1, 0), mode="constant", value=0)
 
     q = torch.empty(
         size=(qo_len, num_qo_heads, head_dim), dtype=dtype, device="cuda"
@@ -385,14 +389,22 @@ def test_ragged(
         size=(kv_len, num_kv_heads, head_dim), dtype=dtype, device="cuda"
     ).uniform_(-init_range, init_range)
 
-    out = flash_attn_varlen_func(
-        q=q,
-        k=k,
-        v=v,
+    out, lse, *rest = flash_attn_varlen_func(
+        q,
+        k,
+        v,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
-        softmax_scale=softmax_scale,
+        causal=causal,
     )
+    # out = flash_attn_varlen_func(
+    #     q=q,
+    #     k=k,
+    #     v=v,
+    #     cu_seqlens_q=cu_seqlens_q,
+    #     cu_seqlens_k=cu_seqlens_k,
+    #     softmax_scale=softmax_scale,
+    # )
     ref = _ref_impl(
         q=q,
         k=k,
