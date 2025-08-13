@@ -1,4 +1,5 @@
 use axum::{extract::Request, http::HeaderValue, response::Response};
+use rand::Rng;
 use std::sync::Arc;
 use std::time::Instant;
 use tower::{Layer, Service};
@@ -18,13 +19,12 @@ fn generate_request_id(path: &str) -> String {
     };
 
     // Generate a random string similar to OpenAI's format
+    let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
     let random_part: String = (0..24)
         .map(|_| {
-            let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-            chars
-                .chars()
-                .nth(rand::random::<usize>() % chars.len())
-                .unwrap()
+            let idx = rng.random_range(0..chars.len());
+            chars.chars().nth(idx).unwrap()
         })
         .collect();
 
