@@ -1257,9 +1257,11 @@ class TokenizerManager:
 
         if obj.grammar_id is None:
             obj.grammar_id = uuid.uuid4().hex
-        elif obj.json_schema is None and obj.regex is None and obj.ebnf is None and obj.structural_tag is None:
+
+        if obj.json_schema is None and obj.regex is None and obj.ebnf is None and obj.structural_tag is None:
             return None
-        elif obj.grammar_id in self.grammar_futures:
+
+        if obj.grammar_id in self.grammar_futures:
             return None
 
         self.send_to_scheduler.send_pyobj(obj)
