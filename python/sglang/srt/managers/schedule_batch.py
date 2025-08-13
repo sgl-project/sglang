@@ -887,6 +887,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: Optional[SpeculativeAlgorithm] = None
     spec_info: Optional[SpecInfo] = None
     verify_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[torch.cuda.Event] = None
     draft_worker: Optional["EagleWorker"] = None
 
     @classmethod

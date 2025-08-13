@@ -1904,11 +1904,14 @@ class Scheduler(
         if self.is_generation:
 
             if self.enable_overlap:
+                # need to wait for previous batch to finish storing to spec_info map
+                if batch.copy_done is not None:
+                    batch.copy_done.wait()
                 # 1. resolve spec_info reference with future_spec_info
                 # TODO: think about either resolve batch.spec_info or model_worker_batch.spec_info
-                self.future_spec_info_map.resolve_future_spec_info(batch.spec_info, batch.allocate_lens)
+                self.future_spec_info_map.resolve_future(batch.spec_info, batch.allocate_lens)
                 # 2. construct a new future_spec_info
-                future_spec_info, future_spec_info_ct = self.future_spec_info_map.construct_future_spec_info(len(batch.reqs))
+                future_spec_info, future_spec_info_ct = self.future_spec_info_map.get_next_future(len(batch.reqs))
                 model_worker_batch = batch.get_model_worker_batch()
                 # Make a copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
                 self.cur_sampling_info = model_worker_batch.sampling_info = (
@@ -1923,7 +1926,7 @@ class Scheduler(
                         model_worker_batch
                     )
                     if forward_output.spec_info is not None:
-                        self.future_spec_info_map.store_future_spec_info(future_spec_info_ct, len(batch.reqs), forward_output.spec_info)
+                        self.future_spec_info_map.store_to_map(future_spec_info_ct, len(batch.reqs), forward_output.spec_info)
                     copy_done = torch.cuda.Event()
                     copy_done.record()
             else:
@@ -1942,6 +1945,7 @@ class Scheduler(
                 batch.seq_lens = new_seq_lens
                 batch.allocate_lens = allocate_lens
                 batch.verify_done = forward_output.spec_info.verify_done
+                batch.copy_done = copy_done
                 # spec_info = batch.spec_info = forward_output.spec_info
                 # batch.seq_lens = spec_info.new_seq_lens
                 # batch.verify_done = spec_info.verify_done

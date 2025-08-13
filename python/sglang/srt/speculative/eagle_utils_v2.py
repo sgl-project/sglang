@@ -369,7 +369,7 @@ class FutureSpecInfoMap:
         self.future_allocate_lens_map = [None] * (self.future_spec_info_buffer_len)
         self.future_new_seq_lens_map = [None] * (self.future_spec_info_buffer_len)
     
-    def resolve_future_spec_info(self, spec_info: EagleDraftInput, allocate_lens):
+    def resolve_future(self, spec_info: EagleDraftInput, allocate_lens):
         if spec_info is None:
             return
 
@@ -403,7 +403,7 @@ class FutureSpecInfoMap:
         else:
             spec_info.allocate_lens = _resolve_field(self.future_allocate_lens_map, spec_info.allocate_lens)
 
-    def construct_future_spec_info(self, bs: int) -> EagleDraftInput:
+    def get_next_future(self, bs: int) -> EagleDraftInput:
         # future_spec_info_indices is a reference to the next spec_info fields, val is a reference id stored as a negative index.
         cur_future_spec_info_ct = self.future_spec_info_ct
         future_spec_info_indices = torch.arange(
@@ -425,7 +425,7 @@ class FutureSpecInfoMap:
             new_seq_lens=future_spec_info_indices,
         ), cur_future_spec_info_ct
 
-    def store_future_spec_info(self, future_spec_info_ct: int, bs: int, spec_info: EagleDraftInput):
+    def store_to_map(self, future_spec_info_ct: int, bs: int, spec_info: EagleDraftInput):
         # Store references (no clone) for each request into circular buffers
         for i in range(bs):
             slot = future_spec_info_ct + i + 1
