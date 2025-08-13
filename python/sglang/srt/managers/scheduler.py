@@ -418,11 +418,13 @@ class Scheduler(
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
         self.sessions: Dict[str, Session] = {}
-        self.grammars: Dict[str, Tuple[Tuple[str, str], Optional[BaseGrammarObject], bool]] = {}
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
+
+        # Grammar sessions: grammar_id -> (cache_key, grammar_object, cache_hit, owner_req)
+        self.grammars: Dict[str, Tuple[Tuple[str, str], Optional[BaseGrammarObject], bool, Optional[Req]]] = {}
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -1225,7 +1227,15 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
             else:
-                key, value, cache_hit = self.grammars[gramamr_id]
+                key, value, cache_hit, owner_req = self.grammars[gramamr_id]
+
+                if owner_req is not None and not owner_req.finished():
+                    error_msg = f"Grammar id {gramamr_id} is already used. Please use a different grammar id."
+                    req.set_finish_with_abort(error_msg)
+                    self._add_request_to_queue(req)
+                    return
+
+                self.grammars[gramamr_id] = (key, value, cache_hit, req)
                 req.grammar = value
 
                 if not cache_hit:
@@ -2502,7 +2512,7 @@ class Scheduler(
                 key = ("structural_tag", recv_req.structural_tag)
 
             value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
-            self.grammars[grammar_id] = (key, value, cache_hit)
+            self.grammars[grammar_id] = (key, value, cache_hit, None)
 
             return CreateGrammarReqOutput(grammar_id, True)
 
