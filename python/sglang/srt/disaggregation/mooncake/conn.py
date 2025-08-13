@@ -394,8 +394,8 @@ class MooncakeKVManager(BaseKVManager):
                         f.cancel()
                     return status
         else:
-            # use batch transfer, so we pass all layers params to one thread
-            # compared to use multiple executors, this is more efficient
+            # Combining all layers' params in one batch transfer is more efficient 
+            # compared to using multiple threads
             return process_layers(layers_params)
 
         return 0
