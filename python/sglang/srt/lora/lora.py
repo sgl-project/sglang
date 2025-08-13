@@ -86,13 +86,17 @@ class LoRAAdapter(nn.Module):
             if match is not None:
                 layer_id = int(match.group(1))
                 self.layers[layer_id].weights[name] = loaded_weight.cpu()
-            elif "input_embeddings" in name:
+            elif "input_embeddings" in name or "output_embeddings" in name:
                 self.new_embeddings[name] = loaded_weight.cpu()
                 assert loaded_weight.shape[0] == self.config.extra_vocab_size, (
                     f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
-                    f"but the loaded weight has {loaded_weight.shape[0]} embeddings"
+                    f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
                 )
             else:
+                # TODO: remove below after we support lm_head.
+                # Uncomment below to test embedding LoRA
+                # if "lm_head" in name:
+                #     continue
                 self.weights[name] = loaded_weight.cpu()
 
         # normalize kv_proj and gate_up_proj

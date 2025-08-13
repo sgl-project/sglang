@@ -104,17 +104,12 @@ class VocabParallelEmbeddingWithLoRA(EmbeddingLayerWithLoRA):
 
         lora_a_output = self._run_lora_a_embedding(input_, token_weight_indices)
 
-        lora_b_output = self.lora_backend.run_lora_b_sgemm(
-            lora_a_output,
-            self.embedding_B_buffer,
-            base_output=base_output if self.lora_backend.fuse_output_add else None,
+        lora_output = self.lora_backend.run_lora_b_sgemm(
+            x=lora_a_output,
+            weights=self.embedding_B_buffer,
+            base_output=base_output,
         )
-
-        return (
-            lora_b_output
-            if self.lora_backend.fuse_output_add
-            else base_output + lora_b_output
-        )
+        return lora_output
 
     def _get_token_weight_indices(
         self, input_: torch.Tensor, batch_info: LoRABatchInfo

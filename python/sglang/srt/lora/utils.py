@@ -96,7 +96,7 @@ def get_normalized_lora_weight_names(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
-        "embed_tokens": (["embed_tokens"], ["embed_tokens"]),
+        "embed_tokens": "embed_tokens",
     }
 
     result = set()

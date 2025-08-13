@@ -212,13 +212,13 @@ class LoRAMemoryPool:
 
         init_embedding_buffer(
             self.embedding_A_buffer,
-            self.lora_weight_names[0],
+            self.lora_weight_names,
             self.get_embedding_lora_A_shape,
         )
 
         init_embedding_buffer(
             self.embedding_B_buffer,
-            self.lora_weight_names[1],
+            self.lora_weight_names,
             self.get_embedding_lora_B_shape,
         )
 
@@ -365,18 +365,13 @@ class LoRAMemoryPool:
 
         if lora_adapter.weights:
             for name, weights in lora_adapter.weights.items():
+                lora_weight_name = get_weight_name(name, self.lora_weight_names)
                 if "lora_embedding_A" in name:
-                    lora_weight_name = get_weight_name(
-                        name, self.lora_weight_names, LoRAType.LORA_A
-                    )
                     buffer_view = self.embedding_A_buffer[lora_weight_name][
                         buffer_id, :lora_rank, : org_vocab_size + extra_vocab_size
                     ]
                     load_lora_weight_tensor(buffer_view, weights)
                 elif "lora_embedding_B" in name:
-                    lora_weight_name = get_weight_name(
-                        name, self.lora_weight_names, LoRAType.LORA_B
-                    )
                     lora_b_weights = weights
                     if self.tp_size > 1:
                         cur_module = lora_embeddings_modules[lora_weight_name]

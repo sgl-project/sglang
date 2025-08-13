@@ -32,6 +32,7 @@ class LoRAConfig:
         # TODO: Support lm_head modules
         if any(module in self.target_modules for module in ["lm_head"]):
             raise ValueError("Not supported yet")
+        # TODO: remove below after we support lm_head
         # Uncomment below for testing adapter: yard1/llama-2-7b-sql-lora-test (since it has lm_head which is not supported yet)
         # if "lm_head" in self.target_modules:
         #     self.target_modules.remove("lm_head")
