@@ -1219,23 +1219,23 @@ class Scheduler(
         # Init grammar cache for this request
         add_to_grammar_queue = False
         if req.sampling_params.grammar_id is not None:
-            gramamr_id = req.sampling_params.grammar_id
+            grammar_id = req.sampling_params.grammar_id
 
-            if gramamr_id not in self.grammars:
-                error_msg = f"Invalid grammar id: {gramamr_id=}"
+            if grammar_id not in self.grammars:
+                error_msg = f"Invalid grammar id: {grammar_id=}"
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
                 return
             else:
-                key, value, cache_hit, owner_req = self.grammars[gramamr_id]
+                key, value, cache_hit, owner_req = self.grammars[grammar_id]
 
                 if owner_req is not None and not owner_req.finished():
-                    error_msg = f"Grammar id {gramamr_id} is already used. Please use a different grammar id."
+                    error_msg = f"Grammar id {grammar_id} is already used. Please use a different grammar id."
                     req.set_finish_with_abort(error_msg)
                     self._add_request_to_queue(req)
                     return
 
-                self.grammars[gramamr_id] = (key, value, cache_hit, req)
+                self.grammars[grammar_id] = (key, value, cache_hit, req)
                 req.grammar = value
 
                 if not cache_hit:
