@@ -778,70 +778,37 @@ class HiCacheController:
     # Backup batch by batch
     def generic_page_backup(self, operation, batch_size=8):
         for i in range(0, len(operation.hash_value), batch_size):
-            page_hashes = operation.hash_value[i : i + batch_size]
-            page_data = [
-                self.mem_pool_host.get_flat_data_page(
-                    operation.host_indices[j * self.page_size]
+            batch_hashes = operation.hash_value[i : i + batch_size]
+            if self.is_mooncake_backend():
+                # zero copy
+                key_strs, buffer_ptrs, buffer_sizes = (
+                    self.mem_pool_host.get_buffer_meta(
+                        batch_hashes,
+                        operation.host_indices[
+                            i * self.page_size : (i + batch_size) * self.page_size
+                        ],
+                    )
                 )
-                for j in range(i, i + len(page_hashes))
-            ]
-            success = self.storage_backend.batch_set(page_hashes, page_data)
-            if not success:
-                logger.warning(f"Failed to write page {page_hashes} to storage.")
-                break
-            operation.completed_tokens += self.page_size * len(page_hashes)
-
-    # Backup non-existing pages in one batch
-    def mooncake_page_backup(self, operation):
-        completed_count = 0
-        if len(operation.hash_value):
-            success = self.storage_backend.exists(operation.hash_value)
-            if success is None:
-                # The input hash_value is invalid, skip backup
-                logger.warning(
-                    f"Failed to call MooncakeStore.exists: invalid parameters."
+                success = self.storage_backend.batch_set(
+                    key_strs,
+                    target_location=buffer_ptrs,
+                    target_sizes=buffer_sizes,
                 )
-                pass
             else:
-                set_op_indices = []
-                set_keys = []
-                set_data_indices = []
-                indices = operation.host_indices.tolist()
-                for i in range(len(operation.hash_value)):
-                    # Only set non-existing pages to storage
-                    if not success[i]:
-                        set_op_indices.append(i)
-                        set_keys.append(operation.hash_value[i])
-                        set_data_indices.extend(
-                            indices[i * self.page_size : (i + 1) * self.page_size]
-                        )
-                set_result = None
-                if len(set_keys) > 0:
-                    key_strs, buffer_ptrs, buffer_sizes = (
-                        self.mem_pool_host.get_buffer_meta(set_keys, set_data_indices)
+                # non-zero copy
+                batch_data = [
+                    self.mem_pool_host.get_flat_data_page(
+                        operation.host_indices[j * self.page_size]
                     )
-                    set_result = self.storage_backend.batch_set(
-                        key_strs,
-                        target_location=buffer_ptrs,
-                        target_sizes=buffer_sizes,
-                    )
-                # If all keys are set successfully, mark them as success,
-                # otherwise mark all of them as failed.
-                # TODO: After the Page First PR, we can just mark successful
-                # pages to success.
-                if set_result is not None and len(set_result) == sum(
-                    1 for v in set_result if v == 0
-                ):
-                    for i in range(len(set_op_indices)):
-                        success[set_op_indices[i]] = 1
-                # Count consecutive prefix of 1s (successful set)
-                for i in range(len(success)):
-                    if success[i]:
-                        completed_count += 1
-                    else:
-                        break
-
-        operation.completed_tokens += completed_count * self.page_size
+                    for j in range(i, i + len(batch_hashes))
+                ]
+                success = self.storage_backend.batch_set(batch_hashes, batch_data)
+            if not success:
+                logger.warning(
+                    f"Write page to storage: {len(batch_hashes)} pages failed."
+                )
+                break
+            operation.completed_tokens += self.page_size * success
 
     def backup_thread_func(self):
         """
@@ -853,9 +820,7 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if self.is_mooncake_backend():
-                    self.mooncake_page_backup(operation)
-                elif self.storage_backend_type == "hf3fs":
+                if self.is_mooncake_backend() or self.storage_backend_type == "hf3fs":
                     self.generic_page_backup(operation, batch_size=128)
                 else:
                     self.generic_page_backup(operation)

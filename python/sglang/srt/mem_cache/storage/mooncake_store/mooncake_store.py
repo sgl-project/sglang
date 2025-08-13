@@ -171,19 +171,43 @@ class MooncakeStore(HiCacheStorage):
     def batch_set(
         self,
         keys: List[str],
-        value: Optional[Any] = None,
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
-    ) -> List[int] | None:
+    ) -> bool:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
-            return
+            return 0
 
         for i in range(len(keys)):
             if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
-                return
+                return 0
 
-        return self._put_batch_zero_copy_impl(keys, target_location, target_sizes)
+        exist_result = self._batch_exist(keys)
+        set_keys = []
+        set_target_locations = []
+        set_target_sizes = []
+        set_indices = []
+        for i in range(len(keys)):
+            if exist_result[i] != 1:
+                set_keys.append(keys[i])
+                set_target_locations.append(target_location[i])
+                set_target_sizes.append(target_sizes[i])
+                set_indices.append(i)
+        # Only set non-existing keys to storage
+        put_result = self._put_batch_zero_copy_impl(
+            set_keys, set_target_locations, set_target_sizes
+        )
+        for i in range(len(set_indices)):
+            if put_result[i] == 0:
+                exist_result[set_indices[i]] = 1
+
+        success_count = 0
+        for i in range(len(keys)):
+            if exist_result[i] == 0:
+                break
+            success_count += 1
+        # TODO: return the number of consecutive successful operations from the start.
+        return success_count == len(keys)
 
     def get(
         self,
@@ -226,7 +250,7 @@ class MooncakeStore(HiCacheStorage):
             # Since mooncake store is stored in layer by layer,
             # only the first layer is checked here.
             _keys.append(f"{key}_{local_rank}_k")
-        return self.store.batch_is_exist(_keys)
+        return self._batch_exist(_keys)
 
     def delete(self, key) -> None:
         raise (NotImplementedError)
@@ -248,3 +272,6 @@ class MooncakeStore(HiCacheStorage):
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+
+    def _batch_exist(self, key_strs: List[str]) -> List[int]:
+        return self.store.batch_is_exist(key_strs)
