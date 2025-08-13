@@ -98,10 +98,7 @@ class W4AFp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if get_moe_expert_parallel_world_size() > 1:
-                return W4AFp8EPMoEMethod(self)
-            else:
-                return W4AFp8TPMoEMethod(self)
+            return W4AFp8MoEMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -125,7 +122,7 @@ def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
     return scales_interleaved.contiguous()
 
 
-class W4AFp8EPMoEMethod(FusedMoEMethodBase):
+class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
 
@@ -299,11 +296,12 @@ class W4AFp8EPMoEMethod(FusedMoEMethodBase):
 
         topk_weights, topk_ids, _ = topk_output
         local_topk_ids = topk_ids
-        local_topk_ids = torch.where(
-            topk_ids == -1,
-            layer.num_experts,
-            topk_ids,
-        )
+        if get_moe_expert_parallel_world_size() > 1:
+            local_topk_ids = torch.where(
+                topk_ids == -1,
+                layer.num_experts,
+                topk_ids,
+            )
 
         output = cutlass_w4a8_moe(
             layer.start_expert_id,
@@ -333,227 +331,4 @@ class W4AFp8EPMoEMethod(FusedMoEMethodBase):
         )
         if routed_scaling_factor is not None:
             output *= routed_scaling_factor
-        return output
-
-
-class W4AFp8TPMoEMethod(FusedMoEMethodBase):
-    """Tp method for MOE W4A8 FP8 quantization.
-
-    Args:
-        quant_config: The MOE W4A8 FP8 quantization config.
-    """
-
-    def __init__(self, quant_config: W4AFp8Config):
-        self.quant_config = quant_config
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
-        self.num_experts = num_experts
-        layer.quant_config = self.quant_config
-        group_size = self.quant_config.group_size
-
-        strategy = FusedMoeWeightScaleSupported.GROUP.value
-        extra_weight_attrs.update({"quant_method": strategy, "is_transposed": False})
-
-        assert "weight_loader" in extra_weight_attrs
-
-        # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_size // 2,
-                dtype=torch.int8,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
-
-        # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition // 2,
-                dtype=torch.int8,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
-
-        w13_scales = torch.nn.Parameter(
-            torch.ones(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_size // group_size,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_scale_inv", w13_scales)
-        set_weight_attrs(w13_scales, extra_weight_attrs)
-
-        w2_scales = torch.nn.Parameter(
-            torch.ones(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition // group_size,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_scale_inv", w2_scales)
-        set_weight_attrs(w2_scales, extra_weight_attrs)
-
-        # The input scale for w1 and w3 should be the same
-        w13_input_scale = torch.nn.Parameter(
-            torch.ones(
-                num_experts,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_input_scale", w13_input_scale)
-        set_weight_attrs(w13_input_scale, extra_weight_attrs)
-
-        w2_input_scale = torch.nn.Parameter(
-            torch.ones(
-                num_experts,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_input_scale", w2_input_scale)
-        set_weight_attrs(w2_input_scale, extra_weight_attrs)
-
-        # Pre-populate the strides
-        device = layer.w13_weight.device
-
-        self.a_strides1 = torch.full(
-            (num_experts, 3),
-            hidden_size,
-            device=device,
-            dtype=torch.int64,
-        )
-        self.c_strides1 = torch.full(
-            (num_experts, 3),
-            2 * intermediate_size_per_partition,
-            device=device,
-            dtype=torch.int64,
-        )
-        self.a_strides2 = torch.full(
-            (num_experts, 3),
-            intermediate_size_per_partition,
-            device=device,
-            dtype=torch.int64,
-        )
-        self.c_strides2 = torch.full(
-            (num_experts, 3),
-            hidden_size,
-            device=device,
-            dtype=torch.int64,
-        )
-        self.b_strides1 = self.a_strides1
-        self.s_strides13 = self.c_strides1
-        self.b_strides2 = self.a_strides2
-        self.s_strides2 = self.c_strides2
-
-        self.expert_offsets = torch.empty(
-            (num_experts + 1), dtype=torch.int32, device=device
-        )
-        self.problem_sizes1 = torch.empty(
-            (num_experts, 3), dtype=torch.int32, device=device
-        )
-        self.problem_sizes2 = torch.empty(
-            (num_experts, 3), dtype=torch.int32, device=device
-        )
-
-        return
-
-    def process_weights_after_loading(self, layer: Module) -> None:
-        dtype = torch.bfloat16
-        device = layer.w2_weight.device
-
-        # Interleave w13_weight_scale (gate_up_proj)
-        w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
-        w13_weight_scale = interleave_scales(w13_weight_scale)
-        layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
-
-        # Interleave w2_weight_scale (down_proj)
-        w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
-        w2_weight_scale = interleave_scales(w2_weight_scale)
-        layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
-
-        # Process input scales
-        w13_input_scale_max = layer.w13_input_scale.max().to(dtype).item()
-        new_w13_input_scale = torch.tensor(
-            [w13_input_scale_max],
-            dtype=dtype,
-            device=device,
-        )
-        layer.w13_input_scale = Parameter(new_w13_input_scale, requires_grad=False)
-
-        w2_input_scale_max = layer.w2_input_scale.max().to(dtype).item()
-        new_w2_input_scale = torch.tensor(
-            [w2_input_scale_max], dtype=dtype, device=device
-        )
-        layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-
-        assert activation == "silu", "Only SiLU activation is supported."
-
-        topk_weights, topk_ids, _ = topk_output
-
-        output = cutlass_w4a8_moe(
-            start_expert_id=0,
-            end_expert_id=self.num_experts - 1,
-            total_num_experts=self.num_experts,
-            a=x,
-            w1_q=layer.w13_weight,
-            w2_q=layer.w2_weight,
-            w1_scale=layer.w13_weight_scale_inv,
-            w2_scale=layer.w2_weight_scale_inv,
-            topk_weights=topk_weights,
-            topk_ids_=topk_ids,
-            local_topk_ids=topk_ids,
-            a_strides1=self.a_strides1,
-            b_strides1=self.b_strides1,
-            c_strides1=self.c_strides1,
-            a_strides2=self.a_strides2,
-            b_strides2=self.b_strides2,
-            c_strides2=self.c_strides2,
-            s_strides13=self.s_strides13,
-            s_strides2=self.s_strides2,
-            expert_offsets=self.expert_offsets,
-            problem_sizes1=self.problem_sizes1,
-            problem_sizes2=self.problem_sizes2,
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
-        if routed_scaling_factor is not None:
-            output = output * routed_scaling_factor
         return output
