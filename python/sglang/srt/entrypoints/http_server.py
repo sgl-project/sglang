@@ -71,6 +71,8 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    CreateGrammarReqInput,
+    DeleteGrammarReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -89,8 +91,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
-    CreateGrammarReqInput,
-    DeleteGrammarReqInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
@@ -712,7 +712,7 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
-    
+
 
 @app.api_route("/create_grammar", methods=["GET", "POST"])
 async def create_grammar(obj: CreateGrammarReqInput, request: Request):
@@ -724,7 +724,7 @@ async def create_grammar(obj: CreateGrammarReqInput, request: Request):
         return grammar_id
     except Exception as e:
         return _create_error_response(e)
-    
+
 
 @app.api_route("/delete_grammar", methods=["GET", "POST"])
 async def delete_grammar(obj: DeleteGrammarReqInput, request: Request):

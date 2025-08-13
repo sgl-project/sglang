@@ -37,8 +37,8 @@ from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
-    create_grammar_backend,
     BaseGrammarObject,
+    create_grammar_backend,
 )
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -69,6 +69,9 @@ from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
+    CreateGrammarReqInput,
+    CreateGrammarReqOutput,
+    DeleteGrammarReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -98,9 +101,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
-    CreateGrammarReqInput,
-    CreateGrammarReqOutput,
-    DeleteGrammarReqInput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -1231,7 +1231,7 @@ class Scheduler(
                 if not cache_hit:
                     req.grammar_key = key
                     add_to_grammar_queue = True
-            
+
         elif (
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None

@@ -73,6 +73,9 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    CreateGrammarReqInput,
+    CreateGrammarReqOutput,
+    DeleteGrammarReqInput,
     EmbeddingReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -113,9 +116,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    CreateGrammarReqInput,
-    CreateGrammarReqOutput,
-    DeleteGrammarReqInput,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -1261,7 +1261,7 @@ class TokenizerManager:
             return None
         elif obj.grammar_id in self.grammar_futures:
             return None
-        
+
         self.send_to_scheduler.send_pyobj(obj)
 
         self.grammar_futures[obj.grammar_id] = asyncio.Future()
