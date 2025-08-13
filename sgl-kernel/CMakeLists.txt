@@ -150,7 +150,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
-    "--threads=32"
+    "--threads=4"
 
     # Suppress warnings
     "-Xcompiler=-Wconversion"
