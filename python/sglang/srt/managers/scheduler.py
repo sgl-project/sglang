@@ -38,6 +38,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
+    BaseGrammarObject,
 )
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -97,6 +98,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    CreateGrammarReqInput,
+    CreateGrammarReqOutput,
+    DeleteGrammarReqInput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -414,6 +418,7 @@ class Scheduler(
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
         self.sessions: Dict[str, Session] = {}
+        self.grammars: Dict[str, Tuple[Tuple[str, str], Optional[BaseGrammarObject], bool]] = {}
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
@@ -506,6 +511,8 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (CreateGrammarReqInput, self.create_grammar),
+                (DeleteGrammarReqInput, self.delete_grammar),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
                 (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
                 (
@@ -1209,7 +1216,23 @@ class Scheduler(
 
         # Init grammar cache for this request
         add_to_grammar_queue = False
-        if (
+        if req.sampling_params.grammar_id is not None:
+            gramamr_id = req.sampling_params.grammar_id
+
+            if gramamr_id not in self.grammars:
+                error_msg = f"Invalid grammar id: {gramamr_id=}"
+                req.set_finish_with_abort(error_msg)
+                self._add_request_to_queue(req)
+                return
+            else:
+                key, value, cache_hit = self.grammars[gramamr_id]
+                req.grammar = value
+
+                if not cache_hit:
+                    req.grammar_key = key
+                    add_to_grammar_queue = True
+            
+        elif (
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
             or req.sampling_params.ebnf is not None
@@ -2455,6 +2478,40 @@ class Scheduler(
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
         else:
             del self.sessions[session_id]
+
+    def create_grammar(self, recv_req: CreateGrammarReqInput):
+        grammar_id = recv_req.grammar_id
+
+        if grammar_id in self.grammars:
+            logger.warning(f"grammar id {grammar_id} already exist, cannot create.")
+            return CreateGrammarReqOutput(grammar_id, False)
+        elif grammar_id is None:
+            logger.warning("grammar id is None, cannot create.")
+            return CreateGrammarReqOutput(grammar_id, False)
+        elif self.grammar_backend is None:
+            logger.warning("grammar backend is not initialized, cannot create.")
+            return CreateGrammarReqOutput(grammar_id, False)
+        else:
+            if recv_req.json_schema is not None:
+                key = ("json", recv_req.json_schema)
+            elif recv_req.regex is not None:
+                key = ("regex", recv_req.regex)
+            elif recv_req.ebnf is not None:
+                key = ("ebnf", recv_req.ebnf)
+            elif recv_req.structural_tag:
+                key = ("structural_tag", recv_req.structural_tag)
+
+            value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+            self.grammars[grammar_id] = (key, value, cache_hit)
+
+            return CreateGrammarReqOutput(grammar_id, True)
+
+    def delete_grammar(self, recv_req: DeleteGrammarReqInput):
+        grammar_id = recv_req.grammar_id
+        if grammar_id not in self.grammars:
+            logger.warning(f"grammar id {grammar_id} does not exist, cannot delete.")
+        else:
+            del self.grammars[grammar_id]
 
     def get_print_prefix(self):
         prefix = ""
