@@ -79,13 +79,13 @@ def create_flashinfer_kv_indices_triton(
                         20, 21, -1, -1, -1, -1, -1, -1, -1, -1]
 
         If PAGE_SIZE = 2
-        If max_pages is constant(Eg: 4),
+        packed:
+        - kv_indptr (passed in as input arg): [0,3,4]
+        - kv_indices = [5,6,10]
+        padded: max_pages is 4
         - kv_indptr (passed in as input arg): [0,4,8,..] (note that 4 is the max_pages)
         - kv_indices = [5, 6, -1, -1,
                         10, -1, -1, -1]
-        If there is no max_pages, it's going to be compressed -
-        - kv_indptr (passed in as input arg): [0,3,4]
-        - kv_indices = [5,6,10]
         This allows attention kernels to directly access the correct KV cache
         entries for each request's tokens.
     """
@@ -104,20 +104,24 @@ def create_flashinfer_kv_indices_triton(
 
     kv_range = kv_end - kv_start
     num_pages = tl.cdiv(kv_range, PAGE_SIZE)
-    num_pages_loop = tl.cdiv(kv_range, BLOCK_SIZE)
-    base_ptr = req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + kv_start
-    for i in range(num_pages_loop):
-        page_offsets_int64 = (
+    num_loops = tl.cdiv(kv_range, BLOCK_SIZE)
+    req_to_token_block_start = (
+        req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + kv_start
+    )
+    for i in range(num_loops):
+        token_offsets_in_block = (
             tl.arange(0, NUM_PAGES_PER_BLOCK).to(tl.int64) + i * NUM_PAGES_PER_BLOCK
         ) * PAGE_SIZE
-        out_page_offsets = tl.arange(0, NUM_PAGES_PER_BLOCK) + i * NUM_PAGES_PER_BLOCK
-        mask_page_range = page_offsets_int64 < (kv_range)
-        mask_out = out_page_offsets < num_pages
-        data = tl.load(base_ptr + page_offsets_int64, mask=mask_page_range)
+        page_offsets_in_block = token_offsets_in_block // PAGE_SIZE
+        valid_tokens = token_offsets_in_block < kv_range
+        valid_pages = page_offsets_in_block < num_pages
+        token_numbers = tl.load(
+            req_to_token_block_start + token_offsets_in_block, mask=valid_tokens
+        )
         tl.store(
-            kv_indices_ptr + kv_indices_offset + out_page_offsets,
-            data // PAGE_SIZE,
-            mask=mask_out,
+            kv_indices_ptr + kv_indices_offset + page_offsets_in_block,
+            token_numbers // PAGE_SIZE,  # write the page numbers to kv_indices_ptr
+            mask=valid_pages,
         )
 
 

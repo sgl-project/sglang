@@ -158,12 +158,10 @@ class EagleDraftInput:
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
-        num_pages_per_req = (
-                paged_kernel_lens + page_size - 1
-            ) // page_size
+        num_pages_per_req = (paged_kernel_lens + page_size - 1) // page_size
         kv_indptr = torch.zeros(
-                (bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device
-            )
+            (bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device
+        )
         kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)
 
         if paged_kernel_lens_sum is None:

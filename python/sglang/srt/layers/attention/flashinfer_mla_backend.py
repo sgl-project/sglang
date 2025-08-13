@@ -58,10 +58,6 @@ class PrefillMetadata:
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
-# Threshold for page size to enable new logic
-PAGE_SIZE_THRESHOLD = 1
-EDIT_PAGE_SIZE_THRESHOLD = 0
-
 
 class FlashInferMLAAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
@@ -755,7 +751,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             if spec_info is not None:
                 assert (
                     self.page_size == 1
-                ), "Only page_size=1 is supported for speculative decoding"
+                ), "Only page_size=1 is supported for flashinfer backend with speculative decoding"
                 kv_lens = kv_indptr[1:] - kv_indptr[:-1]
             else:
                 kv_lens = paged_kernel_lens.to(torch.int32)
