@@ -89,6 +89,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
+    CreateGrammarReqInput,
+    DeleteGrammarReqInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
@@ -707,6 +709,28 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
     """Close the session."""
     try:
         await _global_state.tokenizer_manager.close_session(obj, request)
+        return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+    
+
+@app.api_route("/create_grammar", methods=["GET", "POST"])
+async def create_grammar(obj: CreateGrammarReqInput, request: Request):
+    """Create a new grammar."""
+    try:
+        grammar_id = await _global_state.tokenizer_manager.create_grammar(obj, request)
+        if grammar_id is None:
+            raise Exception("Failed to create the grammar. Check if a grammar with the same id is already created.")
+        return grammar_id
+    except Exception as e:
+        return _create_error_response(e)
+    
+
+@app.api_route("/delete_grammar", methods=["GET", "POST"])
+async def delete_grammar(obj: DeleteGrammarReqInput, request: Request):
+    """Delete a grammar."""
+    try:
+        await _global_state.tokenizer_manager.delete_grammar(obj, request)
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
