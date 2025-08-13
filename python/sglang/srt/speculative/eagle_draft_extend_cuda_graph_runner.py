@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -207,7 +207,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                     device=self.input_ids.device,
                 )
             )
-            gathered_buffer_size = num_tokens * self.dp_size
+            global_dp_buffer_len = num_tokens * self.dp_size
         elif self.require_attn_tp_gather:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -223,9 +223,9 @@ class EAGLEDraftExtendCudaGraphRunner:
                     device=self.input_ids.device,
                 )
             )
-            gathered_buffer_size = num_tokens
+            global_dp_buffer_len = num_tokens
         else:
-            gathered_buffer_size = None
+            global_dp_buffer_len = None
 
         spec_info = EagleDraftInput(
             hidden_states=hidden_states,
@@ -250,7 +250,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             global_num_tokens_gpu=self.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-            gathered_buffer_size=gathered_buffer_size,
+            global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -273,6 +273,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
 
             # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc

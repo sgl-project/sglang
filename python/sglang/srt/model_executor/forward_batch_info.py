@@ -280,7 +280,7 @@ class ForwardBatch:
     # this will be recomputed in LogitsMetadata.from_forward_batch
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
-    gathered_buffer_size: Optional[int] = None
+    global_dp_buffer_len: Optional[int] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -642,7 +642,7 @@ class ForwardBatch:
         else:
             buffer_len = sum(global_num_tokens)
 
-        self.gathered_buffer_size = buffer_len
+        self.global_dp_buffer_len = buffer_len
 
         if len(global_num_tokens) > 1:
             num_tokens = global_num_tokens[get_attention_dp_rank()]

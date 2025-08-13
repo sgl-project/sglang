@@ -37,6 +37,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
     get_attention_tp_size,
+    set_dp_buffer_len,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
@@ -541,7 +542,7 @@ class CudaGraphRunner:
                     device=input_ids.device,
                 )
             )
-            gathered_buffer_size = num_tokens * self.dp_size
+            global_dp_buffer_len = num_tokens * self.dp_size
         elif self.require_attn_tp_gather:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -557,9 +558,9 @@ class CudaGraphRunner:
                     device=input_ids.device,
                 )
             )
-            gathered_buffer_size = num_tokens
+            global_dp_buffer_len = num_tokens
         else:
-            gathered_buffer_size = None
+            global_dp_buffer_len = None
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -593,7 +594,7 @@ class CudaGraphRunner:
             global_num_tokens_gpu=self.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-            gathered_buffer_size=gathered_buffer_size,
+            global_dp_buffer_len=global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
@@ -622,6 +623,7 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
 
             kwargs = {}
             if (

@@ -70,6 +70,8 @@ class _DpGatheredBufferWrapper:
     _hidden_size: int
     _dtype: torch.dtype
     _device: torch.device
+    _global_dp_buffer_len: int
+    _local_dp_buffer_len: int
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -78,16 +80,39 @@ class _DpGatheredBufferWrapper:
         cls._device = device
 
     @classmethod
-    def get_buffer(cls, num_tokens: int) -> torch.Tensor:
+    def set_dp_buffer_len(cls, global_dp_buffer_len: int, local_dp_buffer_len: int):
+        cls._global_dp_buffer_len = global_dp_buffer_len
+        cls._local_dp_buffer_len = local_dp_buffer_len
+
+    @classmethod
+    def get_global_buffer(cls) -> torch.Tensor:
         return torch.empty(
-            (num_tokens, cls._hidden_size),
+            (cls._global_dp_buffer_len, cls._hidden_size),
+            dtype=cls._dtype,
+            device=cls._device,
+        )
+
+    @classmethod
+    def get_local_buffer(cls) -> torch.Tensor:
+        return torch.empty(
+            (cls._local_dp_buffer_len, cls._hidden_size),
             dtype=cls._dtype,
             device=cls._device,
         )
 
 
-def get_dp_gathered_buffer(num_tokens: int) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_buffer(num_tokens)
+def set_dp_buffer_len(global_dp_buffer_len: int, local_dp_buffer_len: int):
+    _DpGatheredBufferWrapper.set_dp_buffer_len(
+        global_dp_buffer_len, local_dp_buffer_len
+    )
+
+
+def get_global_dp_buffer() -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_buffer()
+
+
+def get_local_dp_buffer() -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_buffer()
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -178,7 +178,7 @@ class EAGLEDraftCudaGraphRunner:
                 )
             )
             global_num_tokens = self.global_num_tokens_gpu
-            gathered_buffer_size = num_tokens * self.dp_size
+            global_dp_buffer_len = num_tokens * self.dp_size
             global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
         elif self.require_attn_tp_gather:
             self.global_num_tokens_gpu.copy_(
@@ -196,11 +196,11 @@ class EAGLEDraftCudaGraphRunner:
                 )
             )
             global_num_tokens = self.global_num_tokens_gpu
-            gathered_buffer_size = num_tokens
+            global_dp_buffer_len = num_tokens
             global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
         else:
             global_num_tokens = None
-            gathered_buffer_size = None
+            global_dp_buffer_len = None
             global_num_tokens_for_logprob = None
 
         spec_info = EagleDraftInput(
@@ -225,7 +225,7 @@ class EAGLEDraftCudaGraphRunner:
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-            gathered_buffer_size=gathered_buffer_size,
+            global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=(
@@ -243,6 +243,7 @@ class EAGLEDraftCudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
 
             # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
