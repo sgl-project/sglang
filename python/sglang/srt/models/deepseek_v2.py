@@ -1013,9 +1013,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                and sum(forward_batch.extend_prefix_lens_cpu) == 0
             ):
-                return AttnForwardMethod.MHA
+                return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return _dispatch_mla_subtype()
         elif attention_backend == "fa3":
@@ -1696,7 +1695,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             k[..., self.qk_nope_head_dim :] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-            lse = torch.transpose(lse, 0, 1).contiguous()
+            if output.shape[0] != lse.shape[0] and output.shape[0] == lse.shape[1]:
+                lse = torch.transpose(lse, 0, 1).contiguous()
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
@@ -1759,7 +1759,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
         attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        lse = torch.transpose(lse, 0, 1).contiguous()
+        if (
+            attn_output.shape[0] != lse.shape[0]
+            and attn_output.shape[0] == lse.shape[1]
+        ):
+            lse = torch.transpose(lse, 0, 1).contiguous()
 
         # Do mha attention with chunked prefix cache if there are any sequence with prefix
         if any(forward_batch.extend_prefix_lens_cpu):

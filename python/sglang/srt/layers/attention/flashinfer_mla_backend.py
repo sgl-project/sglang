@@ -108,12 +108,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        fmha_backend = "auto"
+        self.fmha_backend = "auto"
         if is_sm100_supported():
-            fmha_backend = "cutlass"
+            self.fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
+            self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
+        self.prefill_chunk_wrapper: list[BatchMLAPagedAttentionWrapper] = []
 
         if not self.skip_prefill:
             self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
@@ -185,7 +186,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 not global_server_args_dict["flashinfer_mla_disable_ragged"]
                 and extend_no_prefix
             )
-
+            if not use_ragged:
+                if forward_batch.num_prefix_chunks is None:
+                    forward_batch.prepare_chunked_prefix_cache_info(
+                        forward_batch.seq_lens.device
+                    )
+                self.indices_updater_prefill.update_chunked_kv(
+                    self.workspace_buffer,
+                    forward_batch,
+                    prefill_chunk_wrapper=self.prefill_chunk_wrapper,
+                    fmha_backend=self.fmha_backend,
+                )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -401,42 +412,29 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
 
+        qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         if self.forward_metadata.use_ragged:
             # ragged prefill
             if q_rope is not None:
                 q = torch.cat([q, q_rope], dim=-1)
-            qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             if k_rope is not None:
                 k = torch.cat([k, k_rope], dim=-1)
-            o = self.prefill_wrapper_ragged.forward(
+            o, lse = self.prefill_wrapper_ragged.run(
                 qall,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim),
                 v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
+                return_lse=True,
             )
+            return o, lse
         else:
-            # mla paged prefill
-            k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
+            chunk_idx = forward_batch.prefix_chunk_idx
+            o, lse = self.prefill_chunk_wrapper[chunk_idx].run(
+                qall,
+                k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                return_lse=True,
             )
-            if q_rope is None:
-                qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-                q, q_rope = (
-                    qall[:, :, : layer.v_head_dim],
-                    qall[:, :, layer.v_head_dim :],
-                )
-            o = q.new_empty(q.shape)
-            o = prefill_wrapper_paged.run(
-                q,
-                q_rope,
-                k_buf[:, :, : layer.v_head_dim],
-                k_buf[:, :, layer.v_head_dim :],
-                out=o,
-            )
-
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return o, lse
 
     def forward_decode(
         self,
@@ -660,6 +658,40 @@ class FlashInferMLAIndicesUpdaterPrefill:
             spec_info,
         )
 
+    def update_chunked_kv(
+        self,
+        workspace_buffer: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prefill_chunk_wrapper: list[BatchPrefillWithRaggedKVCacheWrapper],
+        fmha_backend: str,
+    ):
+        num_chunks = forward_batch.num_prefix_chunks
+        # Allocate more prefill chunk wrappers if needed
+        if len(prefill_chunk_wrapper) < num_chunks:
+            for _ in range(len(prefill_chunk_wrapper), num_chunks):
+                prefill_chunk_wrapper.append(
+                    BatchPrefillWithRaggedKVCacheWrapper(
+                        workspace_buffer, "NHD", backend=fmha_backend
+                    )
+                )
+        bs = len(forward_batch.seq_lens)
+        self.qo_indptr[1 : bs + 1] = torch.cumsum(
+            forward_batch.seq_lens - forward_batch.extend_prefix_lens, dim=0
+        )
+        qo_indptr = self.qo_indptr[: bs + 1]
+        for i in range(num_chunks):
+            prefill_chunk_wrapper[i].plan(
+                qo_indptr=qo_indptr,
+                kv_indptr=forward_batch.prefix_chunk_cu_seq_lens[i],
+                num_qo_heads=self.num_local_heads,
+                num_kv_heads=self.num_local_heads,
+                head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                head_dim_vo=self.v_head_dim,
+                q_data_type=self.q_data_type,
+                sm_scale=self.scaling,
+                causal=False,
+            )
+
     def call_begin_forward(
         self,
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
@@ -714,7 +746,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
 
         if use_ragged:
             # ragged prefill
-            wrapper_ragged.begin_forward(
+            wrapper_ragged.plan(
                 qo_indptr=qo_indptr,
                 kv_indptr=qo_indptr,
                 num_qo_heads=self.num_local_heads,
@@ -722,6 +754,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
                 head_dim_vo=self.v_head_dim,
                 q_data_type=self.q_data_type,
+                sm_scale=sm_scale,
             )
         else:
             # mla paged prefill
