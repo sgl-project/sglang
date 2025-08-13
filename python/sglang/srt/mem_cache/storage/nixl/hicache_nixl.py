@@ -28,6 +28,8 @@ class HiCacheNixl(HiCacheStorage):
 
     def __init__(self, file_path: str = "/tmp/hicache_storage", plugin: str = "auto"):
         """Initialize NIXL storage connector."""
+        # Might be better to be unified across HiCache backends and moved to HiCacheController
+        file_path = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR", file_path)
         self.file_manager = (
             NixlFileManager(file_path)
             if plugin not in NixlBackendSelection.OBJ_PLUGINS

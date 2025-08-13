@@ -36,6 +36,21 @@ Consolidated utility classes:
 - **NixlRegistration** - Manages memory registration for tensors, files and objects
 - **NixlFileManager** - Handles file system operations and NIXL tuple creation
 
+## Using NIXL for HiCache backend
+When running the SGLang server, indicate `nixl` for `hicache-storage-backend` parameter, for instance:
+
+```bash
+python3 -m sglang.launch_server --model-path <model> --host <ip> --port <port> --page-size 64 --enable-hierarchical-cache --hicache-ratio 2 --hicache-size 64 --hicache-write-policy write_through --hicache-storage-backend nixl
+```
+
+To customize the base directory for files, you can set the following environment variable:
+
+```bash
+export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/desired/dir
+```
+
+Selection of any storage backend like 3FS requires availability of that library on the system, and the bakcend is selected based on the priority mentioned above.
+
 ## Running Unit Tests
 
 ### Prerequisites
