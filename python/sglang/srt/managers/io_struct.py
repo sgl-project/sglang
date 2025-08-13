@@ -455,6 +455,7 @@ class GenerateReqInput:
             log_metrics=self.log_metrics,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            lora_id=self.lora_id[i] if self.lora_id is not None else None,
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
