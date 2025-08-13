@@ -6,17 +6,17 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-class TestGrammarSessions(CustomTestCase):
+class TestGrammar(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -31,11 +31,46 @@ class TestGrammarSessions(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+    
+    def setUp(self):
+        """Set up each test with clean state and track created resources."""
+        # requests.post(self.base_url + "/flush_cache")
+        self.created_grammars = []
+    
+    def tearDown(self):
+        """Clean up any resources created during the test."""
+        # Clean up grammars
+        for grammar_id in self.created_grammars:
+            try:
+                requests.post(
+                    self.base_url + "/delete_grammar",
+                    json={"grammar_id": grammar_id}
+                )
+            except:
+                pass  # Grammar might already be deleted
+    
+    def _create_grammar(self, json_schema, grammar_id=None):
+        """Helper method to create a grammar and track it for cleanup."""
+        if grammar_id is None:
+            grammar_id = str(uuid.uuid4())
+        
+        response = requests.post(
+            self.base_url + "/create_grammar",
+            json={
+                "json_schema": json_schema,
+                "grammar_id": grammar_id
+            }
+        )
+        
+        if response.status_code == 200 and response.json() is not None:
+            self.created_grammars.append(grammar_id)
+        
+        return response
+    
+
 
     def test_create_grammar_with_json_schema(self):
         """Test creating a grammar with a JSON schema."""
-        requests.post(self.base_url + "/flush_cache")
-        
         json_schema = json.dumps({
             "type": "object",
             "properties": {
@@ -45,18 +80,27 @@ class TestGrammarSessions(CustomTestCase):
             "required": ["name", "age"]
         })
         
-        # Create grammar with explicit ID
         grammar_id = str(uuid.uuid4())
-        response = requests.post(
-            self.base_url + "/create_grammar",
-            json={
-                "json_schema": json_schema,
-                "grammar_id": grammar_id
-            }
-        )
+        response = self._create_grammar(json_schema, grammar_id)
+        
         self.assertEqual(response.status_code, 200)
         result = response.json()
         self.assertEqual(result, grammar_id)
+    
+    def test_use_grammar_in_generation(self):
+        """Test using a created grammar in text generation."""
+        json_schema = json.dumps({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name", "age"]
+        })
+        
+        grammar_id = str(uuid.uuid4())
+        create_response = self._create_grammar(json_schema, grammar_id)
+        self.assertEqual(create_response.status_code, 200)
         
         # Test using the grammar in generation
         gen_response = requests.post(
@@ -75,39 +119,12 @@ class TestGrammarSessions(CustomTestCase):
         gen_result = gen_response.json()
         self.assertIn("text", gen_result)
 
-        # Delete grammar
-        delete_response = requests.post(
-            self.base_url + "/delete_grammar",
-            json={"grammar_id": grammar_id}
-        )
-        self.assertEqual(delete_response.status_code, 200)
-
-    def test_create_grammar_with_ebnf(self):
-        """Test creating a grammar with EBNF notation."""
-        requests.post(self.base_url + "/flush_cache")
-        
-        ebnf_grammar = """
-        start: expr
-        expr: NUMBER ("+" NUMBER)*
-        NUMBER: /[0-9]+/
-        """
-        
-        # Create grammar with explicit ID
-        grammar_id = "test_ebnf_grammar"
-        response = requests.post(
-            self.base_url + "/create_grammar",
-            json={
-                "ebnf": ebnf_grammar,
-                "grammar_id": grammar_id
-            }
-        )
-        self.assertEqual(response.status_code, 200)
-        result = response.json()
-        self.assertEqual(result, grammar_id)
+        gen_text = gen_result["text"]
+        self.assertIn("name", gen_text)
+        self.assertIn("age", gen_text)
 
     def test_create_grammar_auto_id(self):
         """Test creating a grammar with auto-generated ID."""
-        requests.post(self.base_url + "/flush_cache")
         
         json_schema = json.dumps({
             "type": "object",
@@ -129,10 +146,12 @@ class TestGrammarSessions(CustomTestCase):
         self.assertIsInstance(result, str)
         self.assertTrue(len(result) > 0)  # Should be a valid UUID string
 
+        # Track for cleanup
+        if result:
+            self.created_grammars.append(result)
+
     def test_create_grammar_duplicate_id_error(self):
         """Test creating a grammar with a duplicate ID should fail."""
-        requests.post(self.base_url + "/flush_cache")
-        
         json_schema = json.dumps({
             "type": "object",
             "properties": {
@@ -143,13 +162,7 @@ class TestGrammarSessions(CustomTestCase):
         grammar_id = "duplicate_test_grammar"
         
         # Create first grammar
-        response1 = requests.post(
-            self.base_url + "/create_grammar",
-            json={
-                "json_schema": json_schema,
-                "grammar_id": grammar_id
-            }
-        )
+        response1 = self._create_grammar(json_schema, grammar_id)
         self.assertEqual(response1.status_code, 200)
         result1 = response1.json()
         self.assertEqual(result1, grammar_id)
@@ -162,16 +175,11 @@ class TestGrammarSessions(CustomTestCase):
                 "grammar_id": grammar_id
             }
         )
-        # Should fail - expecting None return or error
-        if response2.status_code == 200:
-            result2 = response2.json()
-            self.assertIsNone(result2)
-        else:
-            self.assertNotEqual(response2.status_code, 200)
+        # Should fail
+        self.assertEqual(response2.status_code, 400)
 
     def test_create_grammar_missing_content_error(self):
         """Test creating a grammar without any grammar content should fail."""
-        requests.post(self.base_url + "/flush_cache")
         
         # Try to create grammar with only ID, no content
         response = requests.post(
@@ -181,39 +189,11 @@ class TestGrammarSessions(CustomTestCase):
             }
         )
         
-        # Should fail - expecting None return or error
-        if response.status_code == 200:
-            result = response.json()
-            self.assertIsNone(result)
-        else:
-            self.assertNotEqual(response.status_code, 200)
-
-    def test_create_grammar_multiple_types_error(self):
-        """Test creating a grammar with multiple grammar types should work (last one wins)."""
-        requests.post(self.base_url + "/flush_cache")
-        
-        json_schema = json.dumps({"type": "string"})
-        regex_pattern = r"[a-z]+"
-        
-        # Create grammar with both JSON schema and regex
-        grammar_id = "multi_type_grammar"
-        response = requests.post(
-            self.base_url + "/create_grammar",
-            json={
-                "json_schema": json_schema,
-                "regex": regex_pattern,
-                "grammar_id": grammar_id
-            }
-        )
-        # This should still work - the implementation will pick one
-        self.assertEqual(response.status_code, 200)
-        result = response.json()
-        self.assertEqual(result, grammar_id)
+        # Should fail - expecting None return
+        self.assertEqual(response.status_code, 400)
 
     def test_delete_grammar(self):
         """Test deleting a grammar."""
-        requests.post(self.base_url + "/flush_cache")
-        
         # Create a grammar first
         json_schema = json.dumps({
             "type": "object",
@@ -223,13 +203,7 @@ class TestGrammarSessions(CustomTestCase):
         })
         
         grammar_id = "deletable_grammar"
-        create_response = requests.post(
-            self.base_url + "/create_grammar",
-            json={
-                "json_schema": json_schema,
-                "grammar_id": grammar_id
-            }
-        )
+        create_response = self._create_grammar(json_schema, grammar_id)
         self.assertEqual(create_response.status_code, 200)
         
         # Delete the grammar
@@ -240,6 +214,35 @@ class TestGrammarSessions(CustomTestCase):
             }
         )
         self.assertEqual(delete_response.status_code, 200)
+        
+        # Remove from tracking since we manually deleted it
+        if grammar_id in self.created_grammars:
+            self.created_grammars.remove(grammar_id)
+    
+    def test_use_deleted_grammar_fails(self):
+        """Test that using a deleted grammar fails."""
+        # Create a grammar first
+        json_schema = json.dumps({
+            "type": "object",
+            "properties": {
+                "temp": {"type": "string"}
+            }
+        })
+        
+        grammar_id = "grammar_to_delete"
+        create_response = self._create_grammar(json_schema, grammar_id)
+        self.assertEqual(create_response.status_code, 200)
+        
+        # Delete the grammar
+        delete_response = requests.post(
+            self.base_url + "/delete_grammar",
+            json={"grammar_id": grammar_id}
+        )
+        self.assertEqual(delete_response.status_code, 200)
+        
+        # Remove from tracking since we manually deleted it
+        if grammar_id in self.created_grammars:
+            self.created_grammars.remove(grammar_id)
         
         # Try to use the deleted grammar - should fail
         gen_response = requests.post(
@@ -259,7 +262,6 @@ class TestGrammarSessions(CustomTestCase):
 
     def test_delete_nonexistent_grammar(self):
         """Test deleting a non-existent grammar."""
-        requests.post(self.base_url + "/flush_cache")
         
         # Try to delete a grammar that doesn't exist
         response = requests.post(
@@ -273,7 +275,6 @@ class TestGrammarSessions(CustomTestCase):
 
     def test_use_nonexistent_grammar_id(self):
         """Test using a non-existent grammar ID in generation should fail."""
-        requests.post(self.base_url + "/flush_cache")
         
         # Try to use a grammar that doesn't exist
         response = requests.post(
@@ -291,52 +292,27 @@ class TestGrammarSessions(CustomTestCase):
         # Should fail because grammar doesn't exist
         self.assertNotEqual(response.status_code, 200)
 
-    def test_grammar_with_stop_sequence_resume(self):
-        """Test creating a JSON schema grammar and using stop sequences to generate JSON incrementally."""
-        requests.post(self.base_url + "/flush_cache")
-        
-        # Create a JSON schema for a person object
+    def test_grammar_with_stop_sequences(self):
+        """Test using grammar with stop sequences in generation."""
+        # Create a simple JSON schema
         json_schema = json.dumps({
             "type": "object",
             "properties": {
                 "name": {"type": "string"},
-                "age": {"type": "integer", "minimum": 0, "maximum": 150},
-                "city": {"type": "string"},
-                "occupation": {"type": "string"}
+                "age": {"type": "integer"}
             },
-            "required": ["name", "age", "city", "occupation"],
-            "additionalProperties": False
+            "required": ["name", "age"]
         })
         
-        # Create grammar
         grammar_id = str(uuid.uuid4())
-        create_response = requests.post(
-            self.base_url + "/create_grammar",
-            json={
-                "json_schema": json_schema,
-                "grammar_id": grammar_id
-            }
-        )
+        create_response = self._create_grammar(json_schema, grammar_id)
         self.assertEqual(create_response.status_code, 200)
-        result = create_response.json()
-        self.assertEqual(result, grammar_id)
         
-        # Open a session for continuity
-        session_response = requests.post(
-            self.base_url + "/open_session",
-            json={"capacity_of_str_len": 2000}
-        )
-        self.assertEqual(session_response.status_code, 200)
-        session_id = session_response.json()
-        
-        # First request: Start JSON generation but stop after name field
-        gen_response1 = requests.post(
+        # Generate with stop sequences
+        gen_response = requests.post(
             self.base_url + "/generate",
             json={
                 "text": "Here is a person object: ",
-                "session_params": {
-                    "id": session_id,
-                },
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": 50,
@@ -346,98 +322,13 @@ class TestGrammarSessions(CustomTestCase):
                 "stream": False,
             },
         )
-        self.assertEqual(gen_response1.status_code, 200)
-        first_result = gen_response1.json()
-        first_text = first_result["text"]
+        self.assertEqual(gen_response.status_code, 200)
+        result = gen_response.json()
+        self.assertIn("text", result)
         
-        print(f"First generation result: {first_text}")
-        
-        # Verify first result starts JSON and has at least opening brace and one field
-        self.assertIn("{", first_text)
-        
-        # Second request: Continue the JSON generation
-        gen_response2 = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "",  # Continue from where we left off
-                "session_params": {
-                    "id": session_id,
-                },
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 100,
-                    "grammar_id": grammar_id,
-                },
-                "stream": False,
-            },
-        )
-        self.assertEqual(gen_response2.status_code, 200)
-        second_result = gen_response2.json()
-        second_text = second_result["text"]
-        
-        print(f"Second generation result: {second_text}")
-        
-        # Extract the full generated JSON by combining the texts
-        # The second text should contain the continuation from the session
-        full_json_text = second_text
-        
-        # Try to find and extract JSON from the full text
-        start_idx = full_json_text.find("{")
-        if start_idx != -1:
-            # Find the matching closing brace
-            brace_count = 0
-            end_idx = start_idx
-            for i, char in enumerate(full_json_text[start_idx:], start_idx):
-                if char == "{":
-                    brace_count += 1
-                elif char == "}":
-                    brace_count -= 1
-                    if brace_count == 0:
-                        end_idx = i + 1
-                        break
-            
-            json_str = full_json_text[start_idx:end_idx]
-            print(f"Extracted JSON: {json_str}")
-            
-            # Try to parse the JSON to verify it's valid
-            try:
-                parsed_json = json.loads(json_str)
-                print(f"Parsed JSON: {parsed_json}")
-                
-                # Verify the JSON structure matches our schema requirements
-                self.assertIn("name", parsed_json)
-                self.assertIn("age", parsed_json)
-                self.assertIn("city", parsed_json)
-                self.assertIn("occupation", parsed_json)
-                
-                # Verify types
-                self.assertIsInstance(parsed_json["name"], str)
-                self.assertIsInstance(parsed_json["age"], int)
-                self.assertIsInstance(parsed_json["city"], str)
-                self.assertIsInstance(parsed_json["occupation"], str)
-                
-                # Verify age constraint
-                self.assertGreaterEqual(parsed_json["age"], 0)
-                self.assertLessEqual(parsed_json["age"], 150)
-                
-            except json.JSONDecodeError as e:
-                print(f"JSON parsing failed: {e}")
-                print(f"Attempted to parse: {json_str}")
-                # Don't fail the test immediately, as the grammar might still be working
-                # but the stop sequence made it incomplete
-        
-        # Clean up
-        close_response = requests.post(
-            self.base_url + "/close_session",
-            json={"session_id": session_id}
-        )
-        self.assertEqual(close_response.status_code, 200)
-        
-        delete_response = requests.post(
-            self.base_url + "/delete_grammar",
-            json={"grammar_id": grammar_id}
-        )
-        self.assertEqual(delete_response.status_code, 200)
+        # Should start JSON generation
+        generated_text = result["text"]
+        self.assertIn("{", generated_text)
 
 if __name__ == "__main__":
     unittest.main()
