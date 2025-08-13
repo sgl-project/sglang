@@ -116,9 +116,7 @@ def get_stacked_multiply(module_name: str) -> int:
     return stacked_rank[module_name] if module_name in stacked_rank else 1
 
 
-def get_target_module_name(
-    full_module_name: str, target_modules: Set[str]
-) -> str:
+def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> str:
     """
     Get the target module name in target_modules that can match full_module_name.
 
