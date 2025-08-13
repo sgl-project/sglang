@@ -305,11 +305,6 @@ class SchedulerDisaggregationPrefillMixin:
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
 
-        if self.server_args.enable_pd_convert:
-            # Flush the disaggregation resources
-            self.flush_prefill_resources()
-            del self.stop_prefill_event
-
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
@@ -357,15 +352,6 @@ class SchedulerDisaggregationPrefillMixin:
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
-
-        if self.server_args.enable_pd_convert:
-            # Flush the disaggregation resources
-            if "tmp_batch" in locals():
-                del tmp_batch
-            if "tmp_result" in locals():
-                del tmp_result
-            self.flush_prefill_resources()
-            del self.stop_prefill_event
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -628,7 +614,10 @@ class SchedulerDisaggregationPrefillMixin:
         req.disagg_kv_sender.send(page_indices)
 
     def flush_prefill_resources(self: Scheduler) -> None:
-        """Flush prefill resources."""
+        """Flush prefill resources"""
+        if not self.server_args.enable_pd_convert:
+            return
+        del self.stop_prefill_event
         logger.info("Flushing prefill resources...")
 
         del self.req_to_metadata_buffer_idx_allocator

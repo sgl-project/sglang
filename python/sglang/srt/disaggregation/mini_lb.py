@@ -488,7 +488,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
         except asyncio.TimeoutError:
             raise HTTPException(
                 status_code=500,
-                detail=f"Can not recieve server info from {server_url} in 10s, maybe role conversion failed.",
+                detail=f"Can not receive server info from {server_url} in 10s, maybe role conversion failed.",
             )
 
     finished_time = time.perf_counter()

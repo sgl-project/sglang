@@ -52,7 +52,6 @@ from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-from sglang.srt.model_executor.cuda_graph_runner import set_global_graph_memory_pool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import require_mlp_sync
@@ -721,11 +720,6 @@ class SchedulerDisaggregationDecodeMixin:
 
             self.last_batch = batch
 
-        if self.server_args.enable_pd_convert:
-            # Flush the disaggregation resources
-            self.flush_decode_resources()
-            del self.stop_decode_event
-
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         result_queue = deque()
@@ -800,15 +794,6 @@ class SchedulerDisaggregationDecodeMixin:
 
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
-
-        # Flush the disaggregation resources
-        if self.server_args.enable_pd_convert:
-            if "tmp_batch" in locals():
-                del tmp_batch
-            if "tmp_result" in locals():
-                del tmp_result
-            self.flush_decode_resources()
-            del self.stop_decode_event
 
     def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
         batch = self.prepare_mlp_sync_batch(batch)
@@ -916,7 +901,11 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue.extend(alloc_reqs)
 
     def flush_decode_resources(self: Scheduler):
-        """Flush decode resources."""
+        """Flush decode resources"""
+        if not self.server_args.enable_pd_convert:
+            return
+        del self.stop_decode_event
+
         logger.info("Flushing decode resources...")
 
         del self.req_to_metadata_buffer_idx_allocator
