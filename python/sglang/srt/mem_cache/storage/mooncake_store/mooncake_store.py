@@ -18,17 +18,6 @@ DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 logger = logging.getLogger(__name__)
 
 
-def get_hash_str_mooncake(token_ids: List[int], prior_hash: str = None):
-    local_rank = get_tensor_model_parallel_rank()
-    prefix_str = ""
-    if prior_hash:
-        prefix_str = hashlib.sha256(prior_hash.encode()).hexdigest()
-    current_token_ids_bytes = np.array(token_ids).tobytes()
-    current_hash_object = hashlib.sha256(current_token_ids_bytes)
-    current_hash_hex = current_hash_object.hexdigest()
-    return f"{prefix_str}_{int(current_hash_hex[:16], 16)}_{local_rank}"
-
-
 @dataclass
 class MooncakeStoreConfig:
     local_hostname: str
@@ -132,6 +121,8 @@ class MooncakeStore(HiCacheStorage):
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
+
+        self.local_rank = get_tensor_model_parallel_rank()
 
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
@@ -246,7 +237,7 @@ class MooncakeStore(HiCacheStorage):
         for key in keys:
             if key is None:
                 return None
-            _keys.append(f"{key}__k")
+            _keys.append(f"{key}_{self.local_rank}_k")
         return self._batch_exist(_keys)
 
     def delete(self, key) -> None:

@@ -7,6 +7,7 @@ from functools import wraps
 import psutil
 import torch
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.utils import is_npu
 
@@ -461,6 +462,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_buffer_meta(self, keys, indices):
+        local_rank = get_tensor_model_parallel_rank()
         ptr_list = []
         key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
@@ -484,8 +486,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             ptr_list.append(k_ptr)
             ptr_list.append(v_ptr)
             key_ = keys[index // self.page_size]
-            key_list.append(f"{key_}_k")
-            key_list.append(f"{key_}_v")
+            key_list.append(f"{key_}_{local_rank}_k")
+            key_list.append(f"{key_}_{local_rank}_v")
         element_size = (
             self.layer_num
             * self.dtype.itemsize
@@ -682,6 +684,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_buffer_meta(self, keys, indices):
+        local_rank = get_tensor_model_parallel_rank()
         ptr_list = []
         key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
@@ -695,7 +698,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             )
             ptr_list.append(k_ptr)
             key_ = keys[index // self.page_size]
-            key_list.append(f"{key_}_k")
+            key_list.append(f"{key_}_{local_rank}_k")
         element_size = (
             self.layer_num
             * self.dtype.itemsize

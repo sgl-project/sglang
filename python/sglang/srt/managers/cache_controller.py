@@ -241,24 +241,24 @@ class HiCacheController:
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
-            from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
+            from sglang.srt.mem_cache.hicache_storage import get_hash_str
+
+            self.get_hash_str = get_hash_str
 
             if storage_backend == "file":
+                from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+
                 self.storage_backend = HiCacheFile()
-                self.get_hash_str = get_hash_str
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 
                 self.storage_backend = HiCacheNixl()
-                self.get_hash_str = get_hash_str
             elif storage_backend == "mooncake":
                 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                     MooncakeStore,
-                    get_hash_str_mooncake,
                 )
 
                 self.storage_backend = MooncakeStore()
-                self.get_hash_str = get_hash_str_mooncake
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":
@@ -275,7 +275,6 @@ class HiCacheController:
                 self.storage_backend = HiCacheHF3FS.from_env_config(
                     rank, bytes_per_page, dtype
                 )
-                self.get_hash_str = get_hash_str
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
