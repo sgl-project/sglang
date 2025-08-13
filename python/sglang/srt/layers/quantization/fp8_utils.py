@@ -1,4 +1,4 @@
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -214,7 +214,7 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
 
 
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
-    input: Union[torch.Tensor, tuple],
+    input: torch.Tensor,
     weight: torch.Tensor,
     block_size: List[int],
     weight_scale: torch.Tensor,
@@ -223,7 +223,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 ) -> torch.Tensor:
     assert input_scale is None
 
-    output_dtype = input[2] if isinstance(input, tuple) else input.dtype
+    output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
@@ -235,20 +235,16 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             input, weight, block_size, weight_scale, input_scale, bias
         )
 
-    if isinstance(input, tuple):
-        q_input, x_scale, _ = input
-        output_shape = [*q_input.shape[:-1], weight.shape[0]]
-    else:
-        input_2d = input.view(-1, input.shape[-1])
-        output_shape = [*input.shape[:-1], weight.shape[0]]
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
 
-        q_input, x_scale = sglang_per_token_group_quant_fp8(
-            input_2d,
-            block_size[1],
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        )
+    q_input, x_scale = sglang_per_token_group_quant_fp8(
+        input_2d,
+        block_size[1],
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
 
     # NOTE(alcanderian): Useless when scale is packed to int32
     # if get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK_UE8M0"):

@@ -800,15 +800,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
-            self.q_a_layernorm = RMSNorm(
-                self.q_lora_rank,
-                eps=config.rms_norm_eps,
-                output_quant=True,
-                group_size=128,
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            )
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -1102,12 +1094,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
-        if isinstance(hidden_states, tuple):
-            shape_0 = hidden_states[0].shape[0]
-        else:
-            shape_0 = hidden_states.shape[0]
-
-        if shape_0 == 0:
+        if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
@@ -1229,11 +1216,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
-            if isinstance(hidden_states, tuple):
-                shape_0 = hidden_states[0].shape[0]
-            else:
-                shape_0 = hidden_states.shape[0]
-            if shape_0 <= 16 and self.use_min_latency_fused_a_gemm:
+            if hidden_states.shape[0] <= 16 and self.use_min_latency_fused_a_gemm:
                 fused_qkv_a_proj_out = dsv3_fused_a_gemm(
                     hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
                 )
@@ -1873,15 +1856,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_size=mlp_tp_size,
             )
 
-        self.input_layernorm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            output_quant=True,
-            group_size=128,
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
