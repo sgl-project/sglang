@@ -598,6 +598,7 @@ class FusedMoE(torch.nn.Module):
 
             if (
                 "compressed" in self.quant_method.__class__.__name__.lower()
+                or "w4afp8" in self.quant_config.get_name()
                 and param.data[expert_id] != 1
                 and (param.data[expert_id] - loaded_weight).abs() > 1e-5
             ):

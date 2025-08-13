@@ -2683,25 +2683,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        # print(
-        #     f"params_dict: first moe w13 weights: {params_dict['model.layers.3.mlp.experts.w13_weight']}, shape {params_dict['model.layers.3.mlp.experts.w13_weight'].shape}"
-        # )
-        # print(
-        #     f"w2 weights: {params_dict['model.layers.3.mlp.experts.w2_weight']}, shape {params_dict['model.layers.3.mlp.experts.w2_weight'].shape}"
-        # )
-        # print(
-        #     f"params_dict: first moe w13 weights scale: {params_dict['model.layers.3.mlp.experts.w13_weight_scale_inv']}, shape {params_dict['model.layers.3.mlp.experts.w13_weight_scale_inv'].shape}"
-        # )
-        # print(
-        #     f"w2 weights scale: {params_dict['model.layers.3.mlp.experts.w2_weight_scale_inv']}, shape {params_dict['model.layers.3.mlp.experts.w2_weight_scale_inv'].shape}"
-        # )
-        # print(
-        #     f"params_dict: first moe w13 input scale: {params_dict['model.layers.3.mlp.experts.w13_input_scale']}, shape {params_dict['model.layers.3.mlp.experts.w13_input_scale'].shape}"
-        # )
-        # print(
-        #     f"w2 input scale: {params_dict['model.layers.3.mlp.experts.w2_input_scale']}, shape {params_dict['model.layers.3.mlp.experts.w2_input_scale'].shape}"
-        # )
-
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def get_embed_and_head(self):

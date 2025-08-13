@@ -7,6 +7,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -106,10 +107,11 @@ class W4AFp8Config(QuantizationConfig):
         return []
 
 
-def interleave_scales(scales: torch.Tensor, alignment: int = 4) -> torch.Tensor:
+def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
     """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
     s_shape = scales.shape
     # Reshape to separate groups of 4
+    alignment = 4 if s_shape[2] % 4 == 0 else 1
     scales_interleaved = scales.reshape(
         s_shape[0], s_shape[1], (s_shape[2] // alignment), alignment
     )
@@ -122,7 +124,7 @@ def interleave_scales(scales: torch.Tensor, alignment: int = 4) -> torch.Tensor:
     return scales_interleaved.contiguous()
 
 
-class W4AFp8EPMoEMethod:
+class W4AFp8EPMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
 
@@ -332,6 +334,7 @@ class W4AFp8EPMoEMethod:
             output *= routed_scaling_factor
         return output
 
+
 class W4AFp8TPMoEMethod(FusedMoEMethodBase):
     """Tp method for MOE W4A8 FP8 quantization.
 
@@ -488,7 +491,7 @@ class W4AFp8TPMoEMethod(FusedMoEMethodBase):
 
         # Interleave w2_weight_scale (down_proj)
         w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
-        w2_weight_scale = interleave_scales(w2_weight_scale, 1)
+        w2_weight_scale = interleave_scales(w2_weight_scale)
         layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
 
         # Process input scales
@@ -528,9 +531,6 @@ class W4AFp8TPMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.topk import select_experts
 
         assert activation == "silu", "Only SiLU activation is supported."
-        assert (
-            num_fused_shared_experts == 0
-        ), "Shared experts fusing not supported for W4A8 TP MoE mode, consider add --disable-shared-experts-fusion to avoid it"
 
         topk_weights, topk_ids = select_experts(
             hidden_states=x,

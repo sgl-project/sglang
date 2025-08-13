@@ -28,13 +28,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     sglang_per_token_group_quant_fp8,
 )
-<<<<<<< HEAD
-=======
-
-from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
-from sglang.srt.layers.quantization.unquant import UnquantizedEPMoEMethod
-from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8EPMoEMethod
->>>>>>> bb58425 (Support tp mode for DeepSeek-R1-W4AFP8)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
