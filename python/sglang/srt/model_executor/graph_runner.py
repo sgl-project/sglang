@@ -674,7 +674,7 @@ class GraphRunner:
             run_once()
 
         if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(get_device_graph_pool_handle())
+            set_global_graph_memory_pool(get_device_graph_pool_handle(self.device))
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
         out = self._capture_graph(
