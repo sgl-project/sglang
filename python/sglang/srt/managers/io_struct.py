@@ -612,6 +612,8 @@ class EmbeddingReqInput:
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
+            elif isinstance(self.sampling_params, dict):
+                self.sampling_params = [self.sampling_params] * self.batch_size
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
