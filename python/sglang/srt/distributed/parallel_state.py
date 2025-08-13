@@ -50,6 +50,8 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 
+_is_npu = is_npu()
+
 
 @dataclass
 class GraphCaptureContext:
@@ -591,7 +593,7 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if not supports_custom_op():
+        if _is_npu or not supports_custom_op():
             self._all_gather_into_tensor(output, input)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(
@@ -650,17 +652,19 @@ class GroupCoordinator:
             output_size, dtype=input_.dtype, device=input_.device
         )
 
-        if input_.is_cpu:
-            if is_shm_available(input_.dtype, self.world_size, self.local_size):
-                return torch.ops.sgl_kernel.shm_allgather(input_, dim)
-            else:
-                torch.distributed.all_gather_into_tensor(
-                    output_tensor, input_, group=self.device_group
-                )
-                return output_tensor
-
         # All-gather.
-        self.all_gather_into_tensor(output_tensor, input_)
+        if input_.is_cpu and is_shm_available(
+            input_.dtype, self.world_size, self.local_size
+        ):
+            return torch.ops.sgl_kernel.shm_allgather(input_, dim)
+
+        if input_.is_cpu:
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
+        else:
+            self.all_gather_into_tensor(output_tensor, input_)
+
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -1125,7 +1129,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=not is_npu(),
+        use_pynccl=not _is_npu,
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_hpu_communicator=True,
