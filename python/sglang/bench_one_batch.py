@@ -526,7 +526,6 @@ def latency_test(
 
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
-
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
         bench_args.batch_size[0], bench_args.input_len[0]
@@ -603,6 +602,13 @@ def latency_test(
         with open(bench_args.result_filename, "a") as fout:
             for result in result_list:
                 fout.write(json.dumps(result) + "\n")
+
+    if model_runner.gemm_ar_attn_op:
+        model_runner.gemm_ar_attn_op.finalize()
+        model_runner.gemm_ar_attn_op = None
+    if model_runner.gemm_ar_mlp_op:
+        model_runner.gemm_ar_mlp_op.finalize()
+        model_runner.gemm_ar_mlp_op = None
 
     if server_args.tp_size > 1:
         destroy_distributed_environment()
