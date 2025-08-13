@@ -2106,10 +2106,10 @@ class ServerArgs:
         if model_arch in ["GptOssForCausalLM"]:
             if self.attention_backend is None:
                 self.attention_backend = "triton"
-            assert self.attention_backend in [
-                "triton",
-                "trtllm_mha",
-            ], f"GptOssForCausalLM requires 'triton' or 'trtllm_mha' attention backend, but got {self.attention_backend}"
+            supported_backends = ["triton", "trtllm_mha", "fa3"]
+            assert (
+                self.attention_backend in supported_backends
+            ), f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got '{self.attention_backend}'"
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None

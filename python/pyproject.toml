@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.0rc0"
+version = "0.5.0rc1"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -58,7 +58,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.4",
+    "sgl-kernel==0.3.4.post1",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
