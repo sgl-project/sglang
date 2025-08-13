@@ -388,20 +388,20 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.linear_attn(hidden_states, forward_batch, mamba_cache_params,
                                    sequence_idx)
         
         # Fully Connected
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(
-            hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
 
 
 class Qwen3HybridMixerDecoderLayer(nn.Module):
@@ -468,22 +468,20 @@ class Qwen3HybridMixerDecoderLayer(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         **kwargs,
     ):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
 
         hidden_states = self.mamba2(hidden_states, mamba_cache_params,
                                    sequence_idx, forward_batch=forward_batch)
         
         # Fully Connected
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(
-            hidden_states)
-        
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
 
 
 class Qwen3HybridAttentionDecoderLayer(nn.Module):
@@ -644,11 +642,15 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.self_attention(
             positions=positions,
@@ -656,14 +658,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(
-            hidden_states)
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states
+        return hidden_states, residual
 
 ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen3HybridAttentionDecoderLayer,
@@ -753,7 +751,7 @@ class Qwen3HybridMoeModel(nn.Module):
                 layer_mamba_cache_params = mamba_cache_params.at_layer_id(
                     i - num_attn)
             
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 layer_id=i,
                 positions=positions,
                 hidden_states=hidden_states,
@@ -763,7 +761,7 @@ class Qwen3HybridMoeModel(nn.Module):
                 forward_batch=forward_batch,
             )
             
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         
         if hidden_states.shape[0] <= 3:
             self.infer_count += 1
