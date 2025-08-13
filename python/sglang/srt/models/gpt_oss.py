@@ -64,10 +64,21 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_cuda, is_flashinfer_available, make_layers
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    is_cuda,
+    is_flashinfer_available,
+    make_layers,
+)
 
+_is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
+
+
+if _is_cuda:
+    from sgl_kernel import FusedSetKVBufferArg
 
 
 class GptOssConfig(PretrainedConfig):
@@ -196,6 +207,32 @@ class GptOssSparseMoeBlock(nn.Module):
         return ans
 
 
+def _enable_fused_set_kv_buffer():
+    return _is_cuda
+
+
+# TODO maybe move to a model-common utils
+def _create_fused_set_kv_buffer_arg(
+    value: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+):
+    layer_id = layer.layer_id
+    token_to_kv_pool = forward_batch.token_to_kv_pool
+
+    k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+    v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+
+    return FusedSetKVBufferArg(
+        value=value,
+        k_buffer=k_buffer.view(k_buffer.shape[0], -1),
+        v_buffer=v_buffer.view(v_buffer.shape[0], -1),
+        k_scale=layer.k_scale,
+        v_scale=layer.v_scale,
+        cache_loc=forward_batch.out_cache_loc,
+    )
+
+
 class GptOssAttention(nn.Module):
     def __init__(
         self,
@@ -303,7 +340,21 @@ class GptOssAttention(nn.Module):
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            fused_set_kv_buffer_arg=(
+                _create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if _enable_fused_set_kv_buffer()
+                else None
+            ),
+        )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -311,7 +362,11 @@ class GptOssAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        attn_output = self.attn(*inner_state, sinks=self.sinks)
+        attn_output = self.attn(
+            *inner_state,
+            sinks=self.sinks,
+            save_kv_cache=not _enable_fused_set_kv_buffer(),
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -605,6 +660,18 @@ class GptOssForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, GptOssSparseMoeBlock)
+            }
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     @torch.no_grad()
     def forward(
@@ -1088,12 +1155,6 @@ class GptOssForCausalLM(nn.Module):
                 raise Exception(f"Not all parameters loaded: {not_loaded_params}")
             else:
                 logging.info("All parameters loaded successfully.")
-
-        self.routed_experts_weights_of_layer = {
-            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-            for layer_id in range(self.start_layer, self.end_layer)
-            if isinstance(self.model.layers[layer_id].mlp, GptOssSparseMoeBlock)
-        }
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
