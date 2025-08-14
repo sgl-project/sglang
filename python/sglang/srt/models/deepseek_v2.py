@@ -923,6 +923,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
+        # TODO: Design a finer way to determine the threshold for prefix MHA
+        self.mha_prefix_threshold = get_int_env_var(
+            "MHA_PREFIX_THRESHOLD", 1 * 512 * 512
+        )
+
         # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
         # which requires self.w_kc and self.w_vc to be packed.
         # If not, we will use torch.bmm and weight shouldn't be packed in this case
@@ -1019,6 +1024,19 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return _dispatch_mla_subtype()
         elif attention_backend == "fa3":
+            # When the sequence length exceeds the threshold and the GPU is in compute-bound state, 
+            # MHA performs better than MQA. Attention complexity: O(bs·seq_len^2)
+            # Where: 
+            # - average_seq_len approximately represents sequence length (average_seq_len ≈ sum_seq_len / batch_size)
+            # - Current computational workload estimation: current_workload ≈ batch_size * average_seq_len^2
+            current_workload = 0
+            if(
+                forward_batch.forward_mode.is_extend() 
+                and forward_batch.extend_seq_lens_cpu is not None
+            ):
+                sum_seq_lens = sum(forward_batch.extend_seq_lens_cpu) 
+                assert forward_batch.batch_size != 0, "Invalid batch size: zero"
+                current_workload = sum_seq_lens // forward_batch.batch_size * sum_seq_lens
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
             if forward_batch.extend_prefix_lens_cpu is not None:
                 sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
@@ -1030,6 +1048,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and (
                     sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
                     or sum_extend_prefix_lens == 0
+                    or current_workload >= self.mha_prefix_threshold
                 )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
