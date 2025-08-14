@@ -38,6 +38,7 @@ from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
+    DotsVLMConfig,
     ExaoneConfig,
     KimiVLConfig,
     MultiModalityConfig,
@@ -50,6 +51,7 @@ from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
     DbrxConfig.model_type: DbrxConfig,
+    DotsVLMConfig.model_type: DotsVLMConfig,
     ExaoneConfig.model_type: ExaoneConfig,
     DeepseekVL2Config.model_type: DeepseekVL2Config,
     MultiModalityConfig.model_type: MultiModalityConfig,

@@ -64,6 +64,7 @@ class SeparatorStyle(IntEnum):
     QWEN2_AUDIO = auto()
     GEMMA3 = auto()
     MPT = auto()
+    DOTS_VLM = auto()
 
 
 @dataclasses.dataclass
@@ -371,6 +372,16 @@ class Conversation:
                 else:
                     ret += role + "\n"
 
+            return ret
+        elif self.sep_style == SeparatorStyle.DOTS_VLM:
+            seps = [self.sep, self.sep2]
+            ret = system_prompt
+            for i, (role, message) in enumerate(self.messages):
+                ret += role
+                if message:
+                    ret += message
+                if i < len(self.messages) - 1:
+                    ret += seps[i % 2]
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
@@ -968,6 +979,19 @@ register_conv_template(
         sep_style=SeparatorStyle.QWEN2_AUDIO,
         stop_str=["<|im_end|>"],
         audio_token="Audio {idx}: <|audio_bos|><|AUDIO|><|audio_eos|>\n",
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="llama_4_vision",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_template="<|header_start|>system<|header_end|>\n\n{system_message}<|eot|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA4,
+        sep="",
+        stop_str="<|eot|>",
+        image_token="<|image|>",
     )
 )
 
