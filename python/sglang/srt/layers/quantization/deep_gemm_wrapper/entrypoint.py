@@ -43,20 +43,13 @@ def grouped_gemm_nt_f8f8bf16_masked(
     masked_m: torch.Tensor,
     expected_m: int,
 ):
-    num_groups, _, k = lhs[0].shape
-    _, n, _ = rhs[0].shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
-
-    with compile_utils.deep_gemm_execution_hook(
-        expected_m, n, k, num_groups, kernel_type
-    ):
-        _grouped_gemm_nt_f8f8bf16_masked_raw(
-            lhs,
-            rhs,
-            out,
-            masked_m,
-            expected_m,
-        )
+    _grouped_gemm_nt_f8f8bf16_masked_raw(
+        lhs,
+        rhs,
+        out,
+        masked_m,
+        expected_m,
+    )
 
 
 def grouped_gemm_nt_f8f8bf16_contig(
@@ -65,12 +58,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
     out: torch.Tensor,
     m_indices: torch.Tensor,
 ):
-    m, k = lhs[0].shape
-    num_groups, n, _ = rhs[0].shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
-
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        _grouped_gemm_nt_f8f8bf16_contig_raw(lhs, rhs, out, m_indices)
+    _grouped_gemm_nt_f8f8bf16_contig_raw(lhs, rhs, out, m_indices)
 
 
 def gemm_nt_f8f8bf16(
@@ -78,17 +66,11 @@ def gemm_nt_f8f8bf16(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
 ):
-    m, k = lhs[0].shape
-    n, _ = rhs[0].shape
-    num_groups = 1
-    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
-
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        _gemm_nt_f8f8bf16_raw(
-            lhs,
-            rhs,
-            out,
-        )
+    _gemm_nt_f8f8bf16_raw(
+        lhs,
+        rhs,
+        out,
+    )
 
 
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
