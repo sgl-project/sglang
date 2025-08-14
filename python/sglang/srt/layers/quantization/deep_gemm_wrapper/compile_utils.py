@@ -134,6 +134,19 @@ def _compile_deep_gemm_one_type_all(
         _compile_one_deepgemm()
 
 
+class _BaseWarmupExecutor:
+    @staticmethod
+    def create(kernel_type: DeepGemmKernelType, **kwargs):
+        return {
+            DeepGemmKernelType.GEMM_NT_F8F8BF16: TODO,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: TODO,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: TODO,
+        }[kernel_type](**kwargs)
+
+    def execute(self, m):
+        raise NotImplementedError
+
+
 @contextmanager
 def deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
