@@ -1,6 +1,6 @@
 import pytest
 import torch
-from sgl_kernel import scaled_fp4_quant, scaled_fp4_grouped_quant
+from sgl_kernel import scaled_fp4_grouped_quant, scaled_fp4_quant
 
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
 
@@ -190,8 +190,7 @@ def test_quantize_to_fp4_grouped():
         a_fp4, a_scale_interleaved = scaled_fp4_quant(x[i], x_sf_global[i])
         torch.testing.assert_close(a_fp4, output[i])
         torch.testing.assert_close(
-            a_scale_interleaved.to(torch.float),
-            output_scales[i].to(torch.float)
+            a_scale_interleaved.to(torch.float), output_scales[i].to(torch.float)
         )
 
 
