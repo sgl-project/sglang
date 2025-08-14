@@ -177,6 +177,7 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
         self.lhs_s = TODO
         self.rhs_q = _empty_on_device((num_groups, n, k))
         self.rhs_s = TODO
+        self.m_indices = torch.zeros((max_m,), device="cuda")
         self.out = _empty_on_device((max_m, n))
 
     def execute(self, m):
@@ -184,7 +185,7 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
-            m_indices=m_indices,
+            m_indices=self.m_indices[:m],
         )
 
 
