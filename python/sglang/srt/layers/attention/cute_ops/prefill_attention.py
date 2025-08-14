@@ -273,6 +273,9 @@ def _flash_attn_fwd(
     return out, lse
 
 
+_flash_attn_fwd.compile_cache = {}
+
+
 def _ref_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -312,10 +315,7 @@ def _ref_impl(
     return out
 
 
-_flash_attn_fwd.compile_cache = {}
-
-
-def flash_attn_varlen_func(
+def _flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -386,7 +386,7 @@ def test_ragged(
         size=(kv_len, num_kv_heads, head_dim), dtype=dtype, device="cuda"
     ).uniform_(-init_range, init_range)
 
-    out, lse, *rest = flash_attn_varlen_func(
+    out, lse, *rest = _flash_attn_varlen_func(
         q,
         k,
         v,
@@ -394,6 +394,7 @@ def test_ragged(
         cu_seqlens_k=cu_seqlens_k,
         causal=causal,
     )
+
     # out = flash_attn_varlen_func(
     #     q=q,
     #     k=k,
@@ -410,7 +411,6 @@ def test_ragged(
         cu_seqlens_k=cu_seqlens_k,
         softmax_scale=softmax_scale,
     )
-
     diff = (out - ref).abs_().max().item()
 
     print(_green(f"--> {q.shape=} {k.shape=} {v.shape=}"), f"{ref.shape=}", f"{out.shape=}")
