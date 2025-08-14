@@ -72,6 +72,12 @@ struct Router {
     cb_timeout_duration_secs: u64,
     cb_window_duration_secs: u64,
     disable_circuit_breaker: bool,
+    // Health check configuration
+    health_failure_threshold: u32,
+    health_success_threshold: u32,
+    health_check_timeout_secs: u64,
+    health_check_interval_secs: u64,
+    health_check_endpoint: String,
 }
 
 impl Router {
@@ -174,6 +180,13 @@ impl Router {
             },
             disable_retries: false,
             disable_circuit_breaker: false,
+            health_check: config::HealthCheckConfig {
+                failure_threshold: self.health_failure_threshold,
+                success_threshold: self.health_success_threshold,
+                timeout_secs: self.health_check_timeout_secs,
+                check_interval_secs: self.health_check_interval_secs,
+                endpoint: self.health_check_endpoint.clone(),
+            },
         })
     }
 }
@@ -229,6 +242,12 @@ impl Router {
         cb_timeout_duration_secs = 30,
         cb_window_duration_secs = 60,
         disable_circuit_breaker = false,
+        // Health check defaults
+        health_failure_threshold = 3,
+        health_success_threshold = 2,
+        health_check_timeout_secs = 5,
+        health_check_interval_secs = 60,
+        health_check_endpoint = String::from("/health"),
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -276,6 +295,11 @@ impl Router {
         cb_timeout_duration_secs: u64,
         cb_window_duration_secs: u64,
         disable_circuit_breaker: bool,
+        health_failure_threshold: u32,
+        health_success_threshold: u32,
+        health_check_timeout_secs: u64,
+        health_check_interval_secs: u64,
+        health_check_endpoint: String,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -323,6 +347,11 @@ impl Router {
             cb_timeout_duration_secs,
             cb_window_duration_secs,
             disable_circuit_breaker,
+            health_failure_threshold,
+            health_success_threshold,
+            health_check_timeout_secs,
+            health_check_interval_secs,
+            health_check_endpoint,
         })
     }
 

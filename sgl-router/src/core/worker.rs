@@ -182,6 +182,10 @@ pub struct HealthConfig {
     pub check_interval_secs: u64,
     /// Health check endpoint path
     pub endpoint: String,
+    /// Number of consecutive failures before marking unhealthy
+    pub failure_threshold: u32,
+    /// Number of consecutive successes before marking healthy
+    pub success_threshold: u32,
 }
 
 impl Default for HealthConfig {
@@ -190,6 +194,8 @@ impl Default for HealthConfig {
             timeout_secs: 5,
             check_interval_secs: 30,
             endpoint: "/health".to_string(),
+            failure_threshold: 3,
+            success_threshold: 2,
         }
     }
 }
@@ -214,6 +220,8 @@ pub struct BasicWorker {
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
+    consecutive_failures: Arc<AtomicUsize>,
+    consecutive_successes: Arc<AtomicUsize>,
     circuit_breaker: CircuitBreaker,
 }
 
@@ -231,6 +239,8 @@ impl BasicWorker {
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
+            consecutive_failures: Arc::new(AtomicUsize::new(0)),
+            consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::new(),
         }
     }
@@ -300,26 +310,47 @@ impl Worker for BasicWorker {
         let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
         // Use the shared client with a custom timeout for this request
-        match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
+        let health_result = match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
             Ok(response) => {
                 if response.status().is_success() {
-                    self.set_healthy(true);
-                    Ok(())
+                    true
                 } else {
-                    self.set_healthy(false);
-                    Err(WorkerError::HealthCheckFailed {
-                        url: url.to_string(),
-                        reason: format!("Health check returned status: {}", response.status()),
-                    })
+                    false
                 }
             }
-            Err(e) => {
-                self.set_healthy(false);
-                Err(WorkerError::HealthCheckFailed {
-                    url: url.to_string(),
-                    reason: format!("Health check request failed: {}", e),
-                })
+            Err(_) => false,
+        };
+
+        if health_result {
+            // Health check succeeded
+            self.consecutive_failures.store(0, Ordering::Release);
+            let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Mark healthy if we've reached the success threshold
+            if !self.is_healthy()
+                && successes >= self.metadata.health_config.success_threshold as usize
+            {
+                self.set_healthy(true);
+                self.consecutive_successes.store(0, Ordering::Release);
             }
+            Ok(())
+        } else {
+            // Health check failed
+            self.consecutive_successes.store(0, Ordering::Release);
+            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Mark unhealthy if we've reached the failure threshold
+            if self.is_healthy()
+                && failures >= self.metadata.health_config.failure_threshold as usize
+            {
+                self.set_healthy(false);
+                self.consecutive_failures.store(0, Ordering::Release);
+            }
+
+            Err(WorkerError::HealthCheckFailed {
+                url: url.to_string(),
+                reason: format!("Health check failed (consecutive failures: {})", failures),
+            })
         }
     }
 
@@ -408,43 +439,8 @@ impl Worker for DPAwareWorker {
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
-        // Use base URL for health checks
-        let health_url = format!("{}/health", self.base_url);
-        let timeout =
-            std::time::Duration::from_secs(self.base_worker.metadata.health_config.timeout_secs);
-
-        let health_result = async {
-            let response = WORKER_CLIENT
-                .get(&health_url)
-                .timeout(timeout)
-                .send()
-                .await
-                .map_err(|e| format!("Health check request failed: {}", e))?;
-
-            if response.status().is_success() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Health check returned status: {}",
-                    response.status()
-                ))
-            }
-        }
-        .await;
-
-        match health_result {
-            Ok(()) => {
-                self.set_healthy(true);
-                Ok(())
-            }
-            Err(reason) => {
-                self.set_healthy(false);
-                Err(WorkerError::HealthCheckFailed {
-                    url: self.base_url.clone(),
-                    reason,
-                })
-            }
-        }
+        // Delegate to the base worker's health check logic
+        self.base_worker.check_health_async().await
     }
 
     fn load(&self) -> usize {
@@ -951,6 +947,8 @@ mod tests {
         assert_eq!(config.timeout_secs, 5);
         assert_eq!(config.check_interval_secs, 30);
         assert_eq!(config.endpoint, "/health");
+        assert_eq!(config.failure_threshold, 3);
+        assert_eq!(config.success_threshold, 2);
     }
 
     #[test]
@@ -959,10 +957,14 @@ mod tests {
             timeout_secs: 10,
             check_interval_secs: 60,
             endpoint: "/healthz".to_string(),
+            failure_threshold: 5,
+            success_threshold: 3,
         };
         assert_eq!(config.timeout_secs, 10);
         assert_eq!(config.check_interval_secs, 60);
         assert_eq!(config.endpoint, "/healthz");
+        assert_eq!(config.failure_threshold, 5);
+        assert_eq!(config.success_threshold, 3);
     }
 
     // Test BasicWorker
@@ -994,6 +996,8 @@ mod tests {
             timeout_secs: 15,
             check_interval_secs: 45,
             endpoint: "/custom-health".to_string(),
+            failure_threshold: 4,
+            success_threshold: 2,
         };
 
         let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
