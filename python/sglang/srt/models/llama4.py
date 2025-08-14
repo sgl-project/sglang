@@ -131,14 +131,19 @@ class Llama4MoE(nn.Module):
             reduce_results=False,  # We need to do scatter before reduce
         )
 
-    def forward(self, hidden_states, forward_batch: ForwardBatch):
+    def forward(
+        self,
+        hidden_states,
+        forward_batch: ForwardBatch,
+        use_reduce_scatter: bool = False,
+    ):
         shared_out, routed_out = self._forward_core(
             hidden_states, forward_batch.forward_mode
         )
 
         out_aD = routed_out + shared_out
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not use_reduce_scatter:
             out_aD = tensor_model_parallel_all_reduce(out_aD)
 
         return out_aD
@@ -412,6 +417,7 @@ class Llama4DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
         )
 
     def _is_moe_layer(self, layer_id: int) -> bool:
@@ -441,8 +447,15 @@ class Llama4DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
         # Fully Connected
-        hidden_states = self.feed_forward(hidden_states, forward_batch)
+        hidden_states = self.feed_forward(
+            hidden_states, forward_batch, use_reduce_scatter
+        )
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
