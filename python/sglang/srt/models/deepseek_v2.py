@@ -1580,7 +1580,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
                 )
             )
-        ):
+        ) and (not self._fuse_rope_for_trtllm_mla(forward_batch)):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator, positions
