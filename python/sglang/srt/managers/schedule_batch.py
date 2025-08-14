@@ -1613,9 +1613,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
-        # not needed because spec_info is future_spec_info, ready before forward_batch_generation
-        # if self.verify_done is not None:
-        #     self.verify_done.synchronize()
+        # needed to ensure self.seq_lens is ready
+        if self.verify_done is not None:
+            self.verify_done.synchronize()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):

@@ -62,7 +62,7 @@ class TestEagleBS1(CustomTestCase):
 class TestEagleLargeBS(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        max_running_requests = 4
+        max_running_requests = 64
         cls.model = "meta-llama/Llama-2-7b-chat-hf"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
@@ -100,7 +100,7 @@ class TestEagleLargeBS(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=60,
+            num_questions=10000,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
