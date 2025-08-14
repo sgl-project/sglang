@@ -91,12 +91,23 @@ class HiCacheStorage(ABC):
         pass
 
     @abstractmethod
-    def exists(self, key: str) -> bool | dict:
+    def exists(self, key: str) -> bool:
         """
         Check if the key exists in the storage.
         Returns True if the key exists, False otherwise.
         """
         pass
+
+    def batch_exists(self, keys: List[str]) -> int:
+        """
+        Check if the keys exist in the storage.
+        return the number of consecutive existing keys from the start.
+        Can be overridden by subclasses for more efficient implementation.
+        """
+        for i in range(len(keys)):
+            if not self.exists(keys[i]):
+                return i
+        return len(keys)
 
 
 class HiCacheFile(HiCacheStorage):

@@ -651,25 +651,6 @@ class HiCacheController:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
 
-        storage_hit_count = 0
-        remaining_tokens = len(tokens_to_fetch)
-        hash_value = []
-        while remaining_tokens >= self.page_size:
-            last_hash = self.get_hash_str(
-                tokens_to_fetch[storage_hit_count : storage_hit_count + self.page_size],
-                last_hash,
-            )
-            if not self.storage_backend.exists(last_hash):
-                break
-            hash_value.append(last_hash)
-            storage_hit_count += self.page_size
-            remaining_tokens -= self.page_size
-        return hash_value, storage_hit_count
-
-    def _mooncake_storage_hit_query(self, operation) -> tuple[list[str], int]:
-        last_hash = operation.last_hash
-        tokens_to_fetch = operation.token_ids
-
         storage_query_count = 0
         remaining_tokens = len(tokens_to_fetch)
         hash_value = []
@@ -684,19 +665,8 @@ class HiCacheController:
             storage_query_count += self.page_size
             remaining_tokens -= self.page_size
         # deferring to batch exists
-        exist_result = self.storage_backend.exists(hash_value)
-        if exist_result is None:
-            storage_hit_count = 0
-        else:
-            # Count consecutive prefix of 1s (existing pages)
-            consecutive_hits = 0
-            for v in exist_result:
-                if v == 1:
-                    consecutive_hits += 1
-                else:
-                    break
-            storage_hit_count = consecutive_hits * self.page_size
-        return hash_value[: storage_hit_count // self.page_size], storage_hit_count
+        hit_page_num = self.storage_backend.batch_exists(hash_value)
+        return hash_value[:hit_page_num], hit_page_num * self.page_size
 
     def prefetch_thread_func(self):
         """
@@ -714,14 +684,9 @@ class HiCacheController:
                 if (
                     operation.host_indices is not None
                 ) and self.prefetch_rate_limit_check():
-                    if self.is_mooncake_backend():
-                        hash_value, storage_hit_count = (
-                            self._mooncake_storage_hit_query(operation)
-                        )
-                    else:
-                        hash_value, storage_hit_count = self._generic_storage_hit_query(
-                            operation
-                        )
+                    hash_value, storage_hit_count = self._generic_storage_hit_query(
+                        operation
+                    )
 
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(

@@ -149,15 +149,7 @@ class MooncakeStore(HiCacheStorage):
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
-        assert len(key) == len(target_location) == len(target_sizes)
-        if len(key) == 0:
-            return
-
-        for i in range(len(key)):
-            if key[i] is None or target_location[i] is None or target_sizes[i] is None:
-                return
-
-        self._put_batch_zero_copy_impl(key, target_location, target_sizes)
+        return self.batch_set([key], [value], [target_location], [target_sizes])
 
     def batch_set(
         self,
@@ -167,11 +159,11 @@ class MooncakeStore(HiCacheStorage):
     ) -> bool:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
-            return 0
+            return False
 
         for i in range(len(keys)):
             if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
-                return 0
+                return False
 
         exist_result = self._batch_exist(keys)
         set_keys = []
@@ -206,15 +198,7 @@ class MooncakeStore(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
-        assert len(key) == len(target_location) == len(target_sizes)
-        if len(key) == 0:
-            return
-
-        for i in range(len(key)):
-            if key[i] is None or target_location[i] is None or target_sizes[i] is None:
-                return
-
-        return self._get_batch_zero_copy_impl(key, target_location, target_sizes)
+        return self.batch_get([key], [target_location], [target_sizes])
 
     def batch_get(
         self,
@@ -224,22 +208,30 @@ class MooncakeStore(HiCacheStorage):
     ) -> bool:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
-            return
+            return False
 
         for i in range(len(keys)):
             if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
-                return
+                return False
 
         get_result = self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
         return all(v >= 0 for v in get_result)
 
-    def exists(self, keys) -> list[int] | None:
-        _keys = []
+    def exists(self, key) -> bool:
+        return self.batch_exists([key]) > 0
+
+    def batch_exists(self, keys) -> int:
+        query_keys = []
         for key in keys:
             if key is None:
-                return None
-            _keys.append(f"{key}_{self.local_rank}_k")
-        return self._batch_exist(_keys)
+                return 0
+            query_keys.append(f"{key}_{self.local_rank}_k")
+            query_keys.append(f"{key}_{self.local_rank}_v")
+        exist_result = self._batch_exist(query_keys)
+        for i in range(len(query_keys)):
+            if exist_result[i] != 1:
+                return i // 2
+        return len(query_keys) // 2
 
     def delete(self, key) -> None:
         raise (NotImplementedError)
