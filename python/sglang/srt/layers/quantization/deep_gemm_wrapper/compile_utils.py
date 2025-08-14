@@ -107,20 +107,6 @@ def _compile_warning_1():
         )
 
 
-# TODO improve naming
-def _compile_warning_2():
-    logger.warning(
-        "Entering DeepGEMM JIT Single Kernel Compile session. "
-        "And it will makes inference throughput becomes flaky. "
-        "Please run `sglang.compile_deep_gemm` with same args as `sglang.launch_server`"
-        " for pre-compilation to solve this issue. "
-        "For example: "
-        "`python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code`"
-    )
-
-
-
-
 def _maybe_compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
     n: int,
@@ -148,14 +134,8 @@ def _maybe_compile_deep_gemm_one_type_all(
 
         # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
         for m in m_list if m_list is not None else _BUILTIN_M_LIST:
-            # Put config into set to get unique configs and reduce cases to be compiled
-            collected_configs.add(
-                kernel_helper.configure_func(m, n, k, num_groups, num_sms)
-            )
-        compile_func = lambda config: kernel_helper.compile_func(
-            n, k, num_groups, config
-        )
-        thread_map(compile_func, collected_configs, max_workers=_COMPILE_WORKERS)
+            # TODO can use multi thread
+            _compile_one_deepgemm()
 
 
 @contextmanager
