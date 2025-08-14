@@ -655,6 +655,9 @@ class Scheduler(
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
                 )
+                self.tp_worker.register_hicache_layer_transfer_counter(
+                    self.tree_cache.cache_controller.layer_done_counter
+                )
             else:
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
@@ -1651,6 +1654,10 @@ class Scheduler(
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            new_batch.hicache_consumer_index = (
+                self.tree_cache.ready_to_load_host_cache()
+            )
+        elif self.enable_lmcache:
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )

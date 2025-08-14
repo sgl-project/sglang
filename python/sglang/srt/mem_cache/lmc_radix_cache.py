@@ -24,7 +24,7 @@ import time
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional
-from queue import Queue
+from queue import Queue, Empty
 import threading
 from dataclasses import dataclass
 
@@ -38,7 +38,7 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from lmcache.integration.sglang.sglang_adapter import LMCacheLayerwiseConnector
+from lmcache.integration.sglang.sglang_adapter import LMCacheLayerwiseConnector, StoreMetadata, LoadMetadata
 from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 if TYPE_CHECKING:
@@ -103,14 +103,6 @@ class TreeNode:
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
-
-@dataclass
-class StoreMetadata:
-    last_node: TreeNode
-    token_ids: List[int]
-    kv_indices: torch.Tensor
-    offset: int
-
 
 def _key_match_page_size1(key0: List, key1: List):
     i = 0
@@ -178,19 +170,20 @@ class LMCRadixCache(BasePrefixCache):
         self.load_queue = Queue()
         self.store_queue = Queue()
 
+        self.stop_event = threading.Event()
+        self.load_cache_event = threading.Event()
+
         self.load_thread = threading.Thread(
             target=self._load_thread_func, daemon=True
         )
         self.store_thread = threading.Thread(
             target=self._store_thread_func, daemon=True
         )
+        self.load_thread.start()
+        self.store_thread.start()
 
-        self.stop_event = threading.Event()
-        self.load_cache_event = threading.Event()
-
-        self.layer_done_counter = LayerDoneCounter(model_config.num_hidden_layers)
-        self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_counter(self.layer_done_counter)
-
+        # self.layer_done_counter = LayerDoneCounter(model_config.num_hidden_layers)
+        # self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_counter(self.layer_done_counter)
         self.reset()
     
     ##### Public API #####
@@ -206,7 +199,7 @@ class LMCRadixCache(BasePrefixCache):
 
         # For LMCache
         self.stop_event.set()
-        self.load_thread.join()
+        # self.load_thread.join()
         self.store_thread.join()
         self.load_queue.queue.clear()
         self.store_queue.queue.clear()
@@ -263,12 +256,7 @@ class LMCRadixCache(BasePrefixCache):
                 last_host_node=last_node,
             )
 
-        if len(value) % chunk_size != 0:
-                prefix_padding_len = len(value) % chunk_size
-        else:
-            prefix_padding_len = 0
-
-        key_tokens = torch.tensor(key, device=self.device)
+        prefix_padding_len = len(value) % chunk_size
             
         if self.token_to_kv_pool_allocator.available_size() < uncached_paged_aligned_len:
             self.evict(uncached_paged_aligned_len)
@@ -285,10 +273,12 @@ class LMCRadixCache(BasePrefixCache):
         slop_mapping = torch.cat([torch.tensor([-1] * prefix_padding_len, dtype=torch.int64, device=self.device), 
             token_prealloc_indices.detach().clone().to(torch.int64).to(self.device)])
         
-        num_retrieved_tokens = self.lmcache_connector.load_kv(
-            key_tokens,
-            slop_mapping,
-            offset=len(value) - prefix_padding_len,
+        num_retrieved_tokens = self.lmcache_connector.begin_load_kv(
+            LoadMetadata(
+                token_ids=key,
+                slot_mapping=slop_mapping,
+                offset=len(value) - prefix_padding_len,
+            )
         )
         
         if num_retrieved_tokens > 0:
@@ -679,21 +669,36 @@ class LMCRadixCache(BasePrefixCache):
         while not self.stop_event.is_set():
             try:
                 store_metadata = self.store_queue.get(block=True, timeout=1)
-                self.lmcache_connector.store(store_metadata)
+                self.lmcache_connector.store_kv(store_metadata)
                 self.store_stream.synchronize()
                 last_node = store_metadata.last_node
                 self.dec_lock_ref(last_node)
             except Empty:
                 continue
             except Exception as e:
-                logger.error(e)
+                print(e)
 
     def _load_thread_func(self):
         torch.cuda.set_stream(self.load_stream)
-        while True:
-            # self.load_queue.get()
-            # self.lmcache_connector.load()
-            pass
+        while not self.stop_event.is_set():
+            try:
+                self.load_cache_event.wait(timeout=1)
+                if not self.load_cache_event.is_set():
+                    continue
+                self.load_cache_event.clear()
+                self.layer_done_counter.update_producer()
+
+                self.layer_done_counter.reset()
+
+                for _ in range(self.lmcache_connector.num_layers):
+                    self.lmcache_connector.load_kv_layerwise()
+                    self.load_stream.synchronize()
+                    self.layer_done_counter.increment()
+
+            except Empty:
+                continue
+            except Exception as e:
+                print(e)
 
     def take_events(self):
         """Atomically takes all events and clears the queue.
@@ -709,7 +714,7 @@ class LMCRadixCache(BasePrefixCache):
 
 
 if __name__ == "__main__":
-    tree = RadixCache(None, None, page_size=1, disable=False)
+    tree = LMCRadixCache(None, None, page_size=1, disable=False)
 
     tree.insert("Hello")
     tree.insert("Hello")
