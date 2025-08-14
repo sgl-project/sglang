@@ -217,9 +217,9 @@ class EAGLEWorker(TpModelWorker):
             batch_output: The results in a tuple
         """
         if batch.forward_mode.is_decode():
-            old_spec_info = batch.spec_info
+            pre_draft_allocate_lens = batch.spec_info.allocate_lens
             spec_info = self.draft(batch)
-            batch_output = self.verify(batch, spec_info, old_spec_info)
+            batch_output = self.verify(batch, spec_info, pre_draft_allocate_lens)
             return batch_output
         else:
             # Target prefill
@@ -376,7 +376,7 @@ class EAGLEWorker(TpModelWorker):
         self,
         batch: ModelWorkerBatch,
         spec_info: EagleVerifyInput,
-        old_spec_info: EagleDraftInput,
+        pre_draft_allocate_lens: torch.Tensor,
     ):
         # Parse args
         seq_lens_backup = batch.seq_lens
@@ -490,7 +490,7 @@ class EAGLEWorker(TpModelWorker):
             hidden_states=ret_hidden_states,
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
-            allocate_lens=old_spec_info.allocate_lens,
+            allocate_lens=pre_draft_allocate_lens,
             verify_done=verify_done,
         )
 

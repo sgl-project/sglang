@@ -1906,10 +1906,7 @@ class Scheduler(
 
             if self.enable_overlap:
                 bs = len(batch.reqs)
-                # construct a new future_spec_info for the next batch
-                future_spec_info, future_spec_info_ct = self.future_spec_info_map.get_next_future(bs)
-                # assign the future_spec_info for scheduler processing (e.g. merge, filter) in the next batch
-                batch.spec_info = future_spec_info
+                future_spec_info_ct = self.future_spec_info_map.get_next_future_spec_info_ct(bs)
                 
                 # Make a copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
                 self.cur_sampling_info = model_worker_batch.sampling_info = (
@@ -1920,8 +1917,7 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     # model_worker_batch.spec_info is a future from the previous batch
                     # resolve it with the future_spec_info_map
-                    # batch.allocate_lens could be modified by allocate_for_eagle, so we need to pass it here
-                    self.future_spec_info_map.resolve_future(model_worker_batch.spec_info, batch.allocate_lens)
+                    self.future_spec_info_map.resolve_future(model_worker_batch.spec_info)
 
                     forward_output = self.forward_worker.forward_batch_generation(
                         model_worker_batch
@@ -1931,11 +1927,15 @@ class Scheduler(
                         self.future_spec_info_map.store_to_map(future_spec_info_ct, bs, forward_output.spec_info)
                     copy_done = torch.cuda.Event()
                     copy_done.record()
+
+                # construct a new future_spec_info for scheduler processing (e.g. merge, filter) in the next batch
+                future_spec_info = self.future_spec_info_map.get_next_future(future_spec_info_ct, bs, forward_output.spec_info.allocate_lens)
+                batch.spec_info = future_spec_info
             else:
                 forward_output = self.forward_worker.forward_batch_generation(
                     model_worker_batch
                 )
-                future_spec_info = forward_output.spec_info
+                batch.spec_info = forward_output.spec_info
                 copy_done = None
             batch.output_ids = forward_output.next_token_ids
 
@@ -1944,7 +1944,6 @@ class Scheduler(
                 new_seq_lens = forward_output.spec_info.new_seq_lens # val is ready after verify_done
                 allocate_lens = forward_output.spec_info.allocate_lens # val is always ready, at batch schedule time
                 batch.seq_lens = new_seq_lens
-                batch.allocate_lens = allocate_lens
                 batch.verify_done = forward_output.spec_info.verify_done
             else:
                 new_seq_lens = None

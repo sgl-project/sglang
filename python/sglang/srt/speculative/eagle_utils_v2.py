@@ -51,19 +51,19 @@ SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
 class EagleDraftInput:
     # The inputs for decode
     # shape: (b, topk)
-    topk_p: torch.Tensor = None
-    topk_index: torch.Tensor = None
+    topk_p: torch.Tensor = None # future when overlap
+    topk_index: torch.Tensor = None # future when overlap
     # shape: (b, hidden_size)
-    hidden_states: torch.Tensor = None
+    hidden_states: torch.Tensor = None # future when overlap
 
     # Inputs for extend
     # shape: (b,)
-    verified_id: torch.Tensor = None
+    verified_id: torch.Tensor = None # future when overlap
 
     # Metadata for seq_lens
-    allocate_lens: torch.Tensor = None
-    new_seq_lens: torch.Tensor = None
-    verify_done: torch.cuda.Event = None
+    new_seq_lens: torch.Tensor = None # future when overlap
+    allocate_lens: torch.Tensor = None # never a future
+    verify_done: torch.cuda.Event = None # never a future
 
     # for overlap schedule, these are references, so can be indexed without race condition
     def filter_batch(self, new_indices: torch.Tensor):
@@ -366,10 +366,15 @@ class FutureSpecInfoMap:
         self.future_topk_index_map = [None] * (self.future_spec_info_buffer_len)
         self.future_hidden_states_map = [None] * (self.future_spec_info_buffer_len)
         self.future_verified_id_map = [None] * (self.future_spec_info_buffer_len)
-        self.future_allocate_lens_map = [None] * (self.future_spec_info_buffer_len)
         self.future_new_seq_lens_map = [None] * (self.future_spec_info_buffer_len)
+
+    def get_next_future_spec_info_ct(self, bs: int) -> int:
+        cur_future_spec_info_ct = self.future_spec_info_ct
+        # increment the future_spec_info_ct, circular buffer pointer
+        self.future_spec_info_ct = (cur_future_spec_info_ct + bs) % self.future_spec_info_limit
+        return cur_future_spec_info_ct
     
-    def resolve_future(self, spec_info: EagleDraftInput, allocate_lens):
+    def resolve_future(self, spec_info: EagleDraftInput):
         if spec_info is None:
             return
 
@@ -388,33 +393,29 @@ class FutureSpecInfoMap:
         spec_info.hidden_states = torch.stack(hidden_states_stacked, dim=0)
         spec_info.verified_id = torch.stack(verified_id_stacked, dim=0)
         spec_info.new_seq_lens = torch.stack(new_seq_lens_stacked, dim=0)
-        spec_info.allocate_lens = allocate_lens
 
-    def get_next_future(self, bs: int) -> EagleDraftInput:
+    def get_next_future(self, future_spec_info_ct: int, bs: int, allocate_lens: torch.Tensor) -> EagleDraftInput:
         # future_spec_info_indices is a reference to the next spec_info fields, val is a reference id stored as a negative index.
-        cur_future_spec_info_ct = self.future_spec_info_ct
         future_spec_info_indices = torch.arange(
-            -(cur_future_spec_info_ct + 1),
-            -(cur_future_spec_info_ct + 1 + bs),
+            -(future_spec_info_ct + 1),
+            -(future_spec_info_ct + 1 + bs),
             -1,
             dtype=torch.int64,
             device=self.device,
         )
-        # increment the future_spec_info_ct, circular buffer pointer
-        self.future_spec_info_ct = (cur_future_spec_info_ct + bs) % self.future_spec_info_limit
 
         return EagleDraftInput(
             topk_p=future_spec_info_indices,
             topk_index=future_spec_info_indices,
             hidden_states=future_spec_info_indices,
             verified_id=future_spec_info_indices,
-            allocate_lens=future_spec_info_indices,
             new_seq_lens=future_spec_info_indices,
-        ), cur_future_spec_info_ct
+            allocate_lens=allocate_lens, # allocate_lens is never a future
+        )
 
     def store_to_map(self, future_spec_info_ct: int, bs: int, spec_info: EagleDraftInput):
         # Store references (no clone) for each request into circular buffers
-        # NOTE: self.future_allocate_lens_map is not needed here because it's assigned to batch.allocate_lens without future
+        # NOTE: self.future_allocate_lens_map is not needed here because it's assigned to batch.spec_info.allocate_lens, not a future
         for i in range(bs):
             slot = future_spec_info_ct + i + 1
             self.future_topk_p_map[slot] = spec_info.topk_p[i]

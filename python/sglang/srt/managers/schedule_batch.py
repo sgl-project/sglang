@@ -822,7 +822,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
-    allocate_lens: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
@@ -1047,23 +1046,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = self.seq_lens.sum().item()
         new_allocate_lens = self.seq_lens + alloc_len_per_eagle_decode(worker)
         # TODO: remove assert
-        assert torch.all(new_allocate_lens > self.allocate_lens), f"new_allocate_lens={new_allocate_lens}, self.allocate_lens={self.allocate_lens}"
-        assert torch.all(self.seq_lens <= self.allocate_lens), f"self.seq_lens={self.seq_lens}, self.allocate_lens={self.allocate_lens}"
+        assert torch.all(new_allocate_lens > self.spec_info.allocate_lens), f"{new_allocate_lens=}, {self.spec_info.allocate_lens=}"
+        assert torch.all(self.seq_lens <= self.spec_info.allocate_lens), f"{self.seq_lens=}, {self.spec_info.allocate_lens=}"
         num_needed_tokens = (
-            (new_allocate_lens - self.allocate_lens).sum().item()
+            (new_allocate_lens - self.spec_info.allocate_lens).sum().item()
         )
         out_cache_loc = self.alloc_token_slots(num_needed_tokens)
 
         assign_req_to_token_pool[(bs,)](
             self.req_pool_indices,
             self.req_to_token_pool.req_to_token,
-            self.allocate_lens,
+            self.spec_info.allocate_lens,
             new_allocate_lens,
             out_cache_loc,
             self.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
-        self.allocate_lens = new_allocate_lens
+        self.spec_info.allocate_lens = new_allocate_lens
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
@@ -1526,7 +1525,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.allocate_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
@@ -1650,7 +1648,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
-        self.allocate_lens = self.allocate_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         self.output_ids = self.output_ids[keep_indices_device]
@@ -1684,7 +1681,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.allocate_lens = torch.cat([self.allocate_lens, other.allocate_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
