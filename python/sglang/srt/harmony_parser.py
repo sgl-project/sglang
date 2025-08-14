@@ -1,0 +1,346 @@
+import re
+from dataclasses import dataclass
+from typing import Iterator, List, Optional, Tuple
+
+
+@dataclass
+class Event:
+    """Represents a parsed event from the Harmony stream."""
+
+    event_type: str
+    content: str
+
+
+@dataclass
+class Token:
+    """A structural token in the Harmony format."""
+
+    type: str
+    start: int
+    end: int
+
+
+def prefix_hold(text: str, tokens: List[str]) -> Tuple[str, str]:
+    """
+    Holds back the longest suffix of `text` that could be a prefix of any token.
+    Returns (emit_now, keep_for_later).
+    """
+    if not text:
+        return "", ""
+    max_hold = 0
+    for tok in tokens:
+        if not tok:
+            continue
+        # Check for prefixes of tok in the suffix of text
+        L = min(len(tok) - 1, len(text))
+        for k in range(L, 0, -1):
+            if tok.startswith(text[-k:]):
+                max_hold = max(max_hold, k)
+                break
+    if max_hold == 0:
+        return text, ""
+    return text[:-max_hold], text[-max_hold:]
+
+
+def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
+    """Iterate over structural tokens in left-to-right order."""
+    TOKENS = {
+        "<|start|>": "START",
+        "<|channel|>": "CHANNEL",
+        "<|message|>": "MESSAGE",
+        "<|constrain|>": "CONSTRAIN",
+        "<|end|>": "END",
+        "<|call|>": "CALL",
+        "<|return|>": "RETURN",
+    }
+
+    pos = start_pos
+    while pos < len(text):
+        # Find next "<|"
+        marker_pos = text.find("<|", pos)
+        if marker_pos == -1:
+            break
+
+        # Emit any text before the marker
+        if marker_pos > pos:
+            yield Token("TEXT", pos, marker_pos)
+
+        # Check which token it is
+        found_token = False
+        for literal, token_type in TOKENS.items():
+            if text.startswith(literal, marker_pos):
+                yield Token(token_type, marker_pos, marker_pos + len(literal))
+                pos = marker_pos + len(literal)
+                found_token = True
+                break
+
+        if not found_token:
+            tail = text[marker_pos:]
+            is_partial = any(lit.startswith(tail) for lit in TOKENS)
+            if is_partial:
+                # Hold whole tail (partial token)
+                yield Token("TEXT", marker_pos, len(text))
+                pos = len(text)
+                break
+            else:
+                # Truly unknown token in the middle; keep scanning
+                yield Token("TEXT", marker_pos, marker_pos + 2)  # "<|"
+                pos = marker_pos + 2
+
+    # Emit any remaining text
+    if pos < len(text):
+        yield Token("TEXT", pos, len(text))
+
+
+class CanonicalStrategy:
+    """Parses the canonical Harmony format with channel markers."""
+
+    def __init__(self, stream_reasoning: bool):
+        self.stream_reasoning = stream_reasoning
+        self.guard_tokens = [
+            "<|start|>",
+            "<|channel|>",
+            "<|message|>",
+            "<|constrain|>",
+            "<|end|>",
+            "<|call|>",
+            "<|return|>",
+        ]
+
+    def parse(self, text: str) -> Tuple[List[Event], str]:
+        events = []
+        tokens = list(iter_tokens(text))
+
+        if not tokens:
+            return events, ""
+
+        pos = 0
+        while pos < len(tokens):
+            token = tokens[pos]
+
+            if token.type == "TEXT":
+                # Check if this might be incomplete
+                if pos == len(tokens) - 1:  # Last token
+                    emit, hold = prefix_hold(
+                        text[token.start : token.end], self.guard_tokens
+                    )
+                    if emit:
+                        events.append(Event("normal", emit))
+                    return events, hold
+                else:
+                    events.append(Event("normal", text[token.start : token.end]))
+                pos += 1
+
+            elif token.type in ("START", "CHANNEL"):
+                # Parse a channel block starting here
+                block_result = self._parse_block(text, tokens, pos)
+                if block_result is None:
+                    # Incomplete block
+                    remaining_start = tokens[pos].start
+                    return events, text[remaining_start:]
+
+                event, new_pos = block_result
+                if event:
+                    events.append(event)
+                pos = new_pos
+
+            else:
+                # Unexpected token - treat as text
+                events.append(Event("normal", text[token.start : token.end]))
+                pos += 1
+
+        return events, ""
+
+    def _extract_channel_type(self, header_text: str) -> Optional[str]:
+        """Extract channel type from header, ignoring other attributes like to=... or <|constrain|>..."""
+        # Look for channel type at the start of the header (case insensitive)
+        header_clean = header_text.strip()
+
+        if header_clean.lower().startswith("analysis"):
+            return "analysis"
+        elif header_clean.lower().startswith("commentary"):
+            return "commentary"
+        elif header_clean.lower().startswith("final"):
+            return "final"
+        else:
+            return None  # Unknown channel type
+
+    def _parse_block(
+        self, text: str, tokens: List[Token], start_pos: int
+    ) -> Optional[Tuple[Optional[Event], int]]:
+        """Parse a channel block. Returns (event, next_pos) or None if incomplete."""
+        pos = start_pos
+
+        # Skip <|start|> if present
+        if pos < len(tokens) and tokens[pos].type == "START":
+            pos += 1
+
+        # Look for <|channel|> or <|message|> (tool responses go direct to message)
+        channel_pos = None
+        message_pos = None
+
+        for i in range(pos, len(tokens)):
+            if tokens[i].type == "CHANNEL" and channel_pos is None:
+                channel_pos = i
+            elif tokens[i].type == "MESSAGE":
+                message_pos = i
+                break
+
+        if message_pos is None:
+            return None  # No message token found
+
+        # If no channel found, this is a tool response - treat as normal text
+        if channel_pos is None:
+            content_start = tokens[message_pos].end
+            # Find end token after message
+            end_token_pos = None
+            for i in range(message_pos + 1, len(tokens)):
+                if tokens[i].type in ("END", "CALL", "RETURN"):
+                    end_token_pos = i
+                    break
+            if end_token_pos is None:
+                return None  # Incomplete
+            content = text[content_start : tokens[end_token_pos].start]
+            return Event("normal", content), end_token_pos + 1
+
+        # Standard channel block processing - message_pos is already found above
+        pos = channel_pos + 1  # Skip CHANNEL token
+
+        # Extract channel type from header (ignoring other attributes like to=... or <|constrain|>...)
+        channel_start = tokens[pos].start if pos < len(tokens) else tokens[pos - 1].end
+        channel_end = tokens[message_pos].start
+        channel_header = text[channel_start:channel_end]
+
+        channel_type = self._extract_channel_type(channel_header)
+        if not channel_type:
+            return None  # Unknown or malformed channel
+
+        pos = message_pos + 1  # Skip MESSAGE token
+
+        # Find content and end token
+        content_start = tokens[message_pos].end
+        end_pos = pos
+
+        # Each channel type has specific valid end tokens
+        if channel_type == "final":
+            while end_pos < len(tokens) and tokens[end_pos].type != "RETURN":
+                end_pos += 1
+        elif channel_type == "analysis":
+            while end_pos < len(tokens) and tokens[end_pos].type not in ("END", "CALL"):
+                end_pos += 1
+        else:  # commentary
+            while end_pos < len(tokens) and tokens[end_pos].type not in ("END", "CALL"):
+                end_pos += 1
+
+        if end_pos >= len(tokens):
+            return None  # No end token
+
+        end_token = tokens[end_pos]
+        content = text[content_start : end_token.start]
+
+        # Create event based on channel and end token
+        if channel_type == "analysis":
+            if end_token.type == "CALL":
+                # Built-in tools (browser, python) use analysis channel with <|call|>
+                return Event("tool_call", content.strip()), end_pos + 1
+            elif self.stream_reasoning:
+                return Event("reasoning", content), end_pos + 1
+            else:
+                return None, end_pos + 1  # Skip if not streaming reasoning
+        elif channel_type == "commentary":
+            if end_token.type == "CALL":
+                return Event("tool_call", content.strip()), end_pos + 1
+            else:
+                return Event("normal", content), end_pos + 1
+        elif channel_type == "final":
+            return Event("normal", content), end_pos + 1
+
+        return None, end_pos + 1
+
+
+class TextStrategy:
+    """Parses the text-based Harmony fallback format."""
+
+    def __init__(self, stream_reasoning: bool):
+        self.stream_reasoning = stream_reasoning
+        self.patterns = {
+            "analysis_then_final": re.compile(
+                r"^\s*(?:assistant)?\s*(analysis|commentary)(.*?)\s*assistantfinal\s*(.*)\s*$",
+                re.IGNORECASE | re.DOTALL,
+            ),
+            "final_only": re.compile(
+                r"^\s*assistantfinal\s*(.*)\s*$", re.IGNORECASE | re.DOTALL
+            ),
+            "analysis_only": re.compile(
+                r"^\s*(?:assistant)?\s*(analysis|commentary)(.*)\s*$",
+                re.IGNORECASE | re.DOTALL,
+            ),
+        }
+
+    def parse(self, text: str) -> Tuple[List[Event], str]:
+        events = []
+
+        m = self.patterns["analysis_then_final"].match(text)
+        if m:
+            channel, reasoning, final = m.groups()
+            if channel.lower() == "analysis" and reasoning.strip():
+                events.append(Event("reasoning", reasoning.strip()))
+            elif channel.lower() == "commentary" and reasoning.strip():
+                events.append(Event("normal", reasoning.strip()))
+            if final.strip():
+                events.append(Event("normal", final.strip()))
+            return events, ""
+
+        m = self.patterns["final_only"].match(text)
+        if m:
+            final = m.group(1)
+            if final.strip():
+                events.append(Event("normal", final.strip()))
+            return events, ""
+
+        if "assistantfinal" in text.lower():
+            return events, text  # Hold until complete
+
+        m = self.patterns["analysis_only"].match(text)
+        if m:
+            channel, content = m.groups()
+            emit, hold = prefix_hold(content, ["assistantfinal"])
+            if channel.lower() == "analysis" and emit:
+                events.append(Event("reasoning", emit))
+            elif channel.lower() == "commentary" and emit:
+                events.append(Event("normal", emit))
+            return events, text[: m.start(2)] + hold
+
+        emit, hold = prefix_hold(text, ["analysis", "commentary", "assistantfinal"])
+        if emit:
+            events.append(Event("normal", emit))
+        return events, hold
+
+
+class HarmonyParser:
+    """Facade for parsing Harmony format, switching between strategies."""
+
+    def __init__(self, stream_reasoning: bool = True):
+        self.stream_reasoning = stream_reasoning
+        self.strategy = None
+        self._buffer = ""
+
+    def parse(self, chunk: str) -> List[Event]:
+        self._buffer += chunk
+
+        if self.strategy is None:
+            if "<|channel|>" in self._buffer or "<|start|>" in self._buffer:
+                self.strategy = CanonicalStrategy(self.stream_reasoning)
+            elif re.search(
+                r"^\s*(?:assistant)?\s*(analysis|commentary|assistantfinal)",
+                self._buffer,
+                re.IGNORECASE,
+            ):
+                self.strategy = TextStrategy(self.stream_reasoning)
+            else:
+                # Not yet determined, hold
+                return []
+
+        events, remaining = self.strategy.parse(self._buffer)
+        self._buffer = remaining
+        return events
