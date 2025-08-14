@@ -26,10 +26,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import BumpAllocator, get_bool_env_var
+from sglang.srt.utils import BumpAllocator, get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
+
+_is_hip = is_hip()
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
@@ -661,6 +663,7 @@ class TboForwardBatchPreparer:
             "padded_static_len",
             "mrope_positions",  # only used by qwen2-vl, thus not care
             "split_index",  # for split prefill
+            "orig_seq_lens",  # only used by qwen-1m, thus not care
         ]:
             output_dict[key] = getattr(batch, key)
         if not batch.forward_mode.is_target_verify():
@@ -675,16 +678,12 @@ class TboForwardBatchPreparer:
         # TODO improve, e.g. unify w/ `init_raw`
         if (
             global_server_args_dict["moe_dense_tp_size"] == 1
-            and batch.gathered_buffer is not None
+            and batch.global_dp_buffer_len is not None
         ):
             sum_len = end_token_index - start_token_index
-            gathered_buffer = torch.zeros(
-                (sum_len, batch.gathered_buffer.shape[1]),
-                dtype=batch.gathered_buffer.dtype,
-                device=batch.gathered_buffer.device,
-            )
+            global_dp_buffer_len = sum_len
         else:
-            gathered_buffer = None
+            global_dp_buffer_len = None
 
         output_dict.update(
             dict(
@@ -703,7 +702,7 @@ class TboForwardBatchPreparer:
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 dp_padding_mode=None,
-                gathered_buffer=gathered_buffer,
+                global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
@@ -821,9 +820,15 @@ def _model_forward_tbo(
     )
     del inputs
 
-    with deep_gemm_wrapper.configure_deep_gemm_num_sms(
-        operations_strategy.deep_gemm_num_sms
-    ):
+    context = (
+        empty_context()
+        if _is_hip
+        else deep_gemm_wrapper.configure_deep_gemm_num_sms(
+            operations_strategy.deep_gemm_num_sms
+        )
+    )
+
+    with context:
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,
             operations_arr=[operations_strategy.operations] * 2,

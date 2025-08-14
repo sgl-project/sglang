@@ -21,6 +21,7 @@ from sgl_kernel.attention import (
 )
 from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
 from sgl_kernel.elementwise import (
+    FusedSetKVBufferArg,
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
     gelu_and_mul,
@@ -43,6 +44,9 @@ from sgl_kernel.gemm import (
     dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
+    gptq_gemm,
+    gptq_marlin_gemm,
+    gptq_shuffle,
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
@@ -66,6 +70,7 @@ from sgl_kernel.marlin import (
     awq_marlin_repack,
     gptq_marlin_repack,
 )
+from sgl_kernel.memory import set_kv_buffer_kernel
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,

@@ -1,9 +1,8 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 from __future__ import annotations
 
-import importlib.util
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -42,11 +41,7 @@ if is_cuda():
 
 try:
     from flashinfer import mm_fp4 as fp4_gemm
-    from flashinfer import (
-        reorder_rows_for_gated_act_gemm,
-        shuffle_matrix_a,
-        shuffle_matrix_sf_a,
-    )
+    from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
     enable_flashinfer_fp4_gemm = True
 except ImportError:
@@ -682,9 +677,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
-            padded_scales.reshape(M, K)
+            padded_scales.reshape(M_padded, K_padded)
             if scale_ndim == 2
-            else padded_scales.reshape(B, M, K)
+            else padded_scales.reshape(B, M_padded, K_padded)
         )
         layer.weight_scale_interleaved = Parameter(padded_scales, requires_grad=False)
 
@@ -742,6 +737,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " above."
             )
         self.enable_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
+        self._cache_permute_indices = {}
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
@@ -764,8 +760,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         # TODO(ch-wan): check if this is needed
-        layer.num_experts = num_experts
-        layer.num_local_experts = num_experts
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
@@ -885,9 +879,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
         swizzled_scale = swizzled_scale.contiguous().cuda()
         return (
-            swizzled_scale.reshape(M, K)
+            swizzled_scale.reshape(M_padded, K_padded)
             if scale_ndim == 2
-            else swizzled_scale.reshape(B, M, K)
+            else swizzled_scale.reshape(B, M_padded, K_padded)
         )
 
     def prepare_static_weights_for_kernel(
@@ -907,9 +901,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             e2m1_and_ufp8sf_scale_to_float,
             fp4_quantize,
             next_positive_power_of_2,
+            nvfp4_block_scale_interleave,
             reorder_rows_for_gated_act_gemm,
             shuffle_matrix_a,
             shuffle_matrix_sf_a,
+        )
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w2_permute_indices,
+            _maybe_get_cached_w3_w1_permute_indices,
         )
 
         """Prepare quantized weights for kernel (done offline with weights)."""
@@ -934,50 +933,66 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             num_experts, hidden_size, intermediate_size // 16
         )  # fp8 scaling factors
 
-        # Reorder rows of W1 and scales for fused gated activation
-        gemm1_weights_fp4_interleaved = []
-        gemm1_scales_fp4_interleaved = []
-        for i in range(num_experts):
-            gemm1_weights_fp4_interleaved.append(
-                reorder_rows_for_gated_act_gemm(gemm1_weights_fp4[i].clone())
-            )
-            gemm1_scales_fp4_interleaved.append(
-                reorder_rows_for_gated_act_gemm(gemm1_scales_linear_fp4[i].clone())
-            )
-
-        # Stack weights and scales for all experts
-        gemm1_weights_fp4_interleaved = torch.stack(
-            gemm1_weights_fp4_interleaved
-        ).reshape(num_experts, 2 * intermediate_size, hidden_size // 2)
-        gemm1_scales_fp4_interleaved = torch.stack(
-            gemm1_scales_fp4_interleaved
-        ).reshape(num_experts, 2 * intermediate_size, hidden_size // 16)
-
-        # Shuffle weights and scaling factors for transposed mma output
         gemm1_weights_fp4_shuffled = []
         gemm1_scales_fp4_shuffled = []
         gemm2_weights_fp4_shuffled = []
         gemm2_scales_fp4_shuffled = []
         for i in range(num_experts):
+            # Calculate the permute indices for the following:
+            # 1. Reorder rows of W1 and scales for fused gated activation
+            # 2. Shuffle weights and scaling factors for transposed mma output
+            # for both w3_w1 and w2 weights and scale factors
+            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                self._cache_permute_indices,
+                gemm1_weights_fp4[i].view(torch.uint8),
+                epilogue_tile_m,
+            )
             gemm1_weights_fp4_shuffled.append(
-                shuffle_matrix_a(
-                    gemm1_weights_fp4_interleaved[i].view(torch.uint8), epilogue_tile_m
-                )
+                gemm1_weights_fp4[i]
+                .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
+                .contiguous()
+            )
+
+            permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+                self._cache_permute_indices,
+                gemm1_scales_linear_fp4[i].view(torch.uint8),
+                epilogue_tile_m,
+                num_elts_per_sf=16,
             )
             gemm1_scales_fp4_shuffled.append(
-                shuffle_matrix_sf_a(
-                    gemm1_scales_fp4_interleaved[i].view(torch.uint8), epilogue_tile_m
+                nvfp4_block_scale_interleave(
+                    gemm1_scales_linear_fp4[i]
+                    .view(torch.uint8)[
+                        permute_sf_indices.to(gemm1_scales_linear_fp4.device)
+                    ]
+                    .contiguous()
                 )
             )
 
+            permute_indices = _maybe_get_cached_w2_permute_indices(
+                self._cache_permute_indices,
+                gemm2_weights_fp4[i].view(torch.uint8),
+                epilogue_tile_m,
+            )
             gemm2_weights_fp4_shuffled.append(
-                shuffle_matrix_a(
-                    gemm2_weights_fp4[i].view(torch.uint8), epilogue_tile_m
-                )
+                gemm2_weights_fp4[i]
+                .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
+                .contiguous()
+            )
+
+            permute_sf_indices = _maybe_get_cached_w2_permute_indices(
+                self._cache_permute_indices,
+                gemm2_scales_linear_fp4[i].view(torch.uint8),
+                epilogue_tile_m,
+                num_elts_per_sf=16,
             )
             gemm2_scales_fp4_shuffled.append(
-                shuffle_matrix_sf_a(
-                    gemm2_scales_linear_fp4[i].view(torch.uint8), epilogue_tile_m
+                nvfp4_block_scale_interleave(
+                    gemm2_scales_linear_fp4[i]
+                    .view(torch.uint8)[
+                        permute_sf_indices.to(gemm2_scales_linear_fp4.device)
+                    ]
+                    .contiguous()
                 )
             )
 
@@ -1106,7 +1121,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale,
             )
 
-            print("Applied flashinfer weight processing for both w13 and w2")
+            logger.info_once("Applied flashinfer weight processing for both w13 and w2")
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -1126,7 +1141,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
             # Both flashinfer cutlass and regular cutlass use same processing for w2
-            print("Applied weight processing for both w13 and w2")
+            logger.info_once("Applied weight processing for both w13 and w2")
 
             # Set up CUTLASS MoE parameters
             device = layer.w13_weight.device
