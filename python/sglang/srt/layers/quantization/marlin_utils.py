@@ -24,7 +24,7 @@ from sglang.srt.layers.quantization.utils import (
     pack_cols,
     unpack_cols,
 )
-from sglang.srt.utils import get_device_capability
+from sglang.srt.utils import get_device_capability, is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -33,6 +33,11 @@ try:
     from vllm import _custom_ops as ops
 except ImportError:
     ops = None
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import gptq_marlin_gemm
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +463,7 @@ def apply_gptq_marlin_linear(
         dtype=input.dtype,
     )
 
-    output = ops.gptq_marlin_gemm(
+    output = gptq_marlin_gemm(
         reshaped_x,
         None,
         weight,
@@ -509,7 +514,7 @@ def apply_awq_marlin_linear(
         dtype=input.dtype,
     )
 
-    output = ops.gptq_marlin_gemm(
+    output = gptq_marlin_gemm(
         reshaped_x,
         None,
         weight,

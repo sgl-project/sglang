@@ -111,19 +111,15 @@ elif is_mxfp_supported and is_hip():
 # VLLM-dependent quantization methods
 VLLM_QUANTIZATION_METHODS = {
     "aqlm": AQLMConfig,
-    "awq": AWQConfig,
     "deepspeedfp": DeepSpeedFPConfig,
     "tpu_int8": Int8TpuConfig,
     "fbgemm_fp8": FBGEMMFp8Config,
     "marlin": MarlinConfig,
     "gguf": GGUFConfig,
     "gptq_marlin_24": GPTQMarlin24Config,
-    "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "qqq": QQQConfig,
     "experts_int8": ExpertsInt8Config,
-    "gptq_marlin": GPTQMarlinConfig,
-    "gptq": GPTQConfig,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS, **VLLM_QUANTIZATION_METHODS}
@@ -143,23 +139,6 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
         )
 
     return QUANTIZATION_METHODS[quantization]
-
-
-def gptq_get_quant_method(self, layer, prefix):
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
-    if isinstance(layer, FusedMoE):
-        return GPTQMarlinMoEMethod(self)
-
-    if isinstance(self, GPTQConfig):
-        return get_linear_quant_method(
-            self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
-        )
-    elif isinstance(self, GPTQMarlinConfig):
-        return get_linear_quant_method(
-            self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod
-        )
-    return None
 
 
 original_isinstance = builtins.isinstance
@@ -239,10 +218,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
 
 def monkey_patch_quant_configs():
     """Apply all monkey patches in one place."""
-    setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
-    setattr(GPTQConfig, "get_quant_method", gptq_get_quant_method)
 
-    monkey_patch_moe_apply(GPTQMarlinMoEMethod)
     monkey_patch_moe_apply(CompressedTensorsW8A8Fp8MoEMethod)
     monkey_patch_moe_apply(CompressedTensorsWNA16MoEMethod)
 
