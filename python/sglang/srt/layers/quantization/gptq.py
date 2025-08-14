@@ -43,6 +43,7 @@ from sglang.srt.layers.quantization.utils import (
     unpack_cols,
 )
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, use_intel_amx_backend
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
@@ -51,7 +52,7 @@ try:
 except ImportError:
     ops = None
 
-from sglang.srt.utils import is_cuda, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_cuda
 
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -181,7 +182,7 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half,torch.bfloat16]
+        return [torch.half, torch.bfloat16]
 
     @classmethod
     # Need to figure it out
@@ -529,6 +530,7 @@ class GPTQLinearMethod(LinearMethodBase):
             _amx_process_int4_packed_qweight_after_loading(
                 layer, ["qweight", "qzeros", "scales"], "gptq"
             )
+            layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
         else:
             # for torch.compile
             layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
@@ -545,7 +547,9 @@ class GPTQLinearMethod(LinearMethodBase):
                     layer.g_idx.data = torch.empty(
                         (0,), dtype=torch.int, device=layer.g_idx.device
                     )
-                ops.gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+                ops.gptq_shuffle(
+                    layer.qweight, layer.g_idx, self.quant_config.weight_bits
+                )
 
     def apply(
         self,
@@ -885,7 +889,9 @@ def dequantize_weight(qweight, qzeros, scales):
     origin_dim = unpacked_qweight.shape[1]
     if origin_dim % scales.shape[1] != 0:
         new_dim1 = 64 * scales.shape[1]
-        new_unpacked_qweight = torch.zeros(unpacked_qweight.shape[0], new_dim1, unpacked_qweight.shape[2])
+        new_unpacked_qweight = torch.zeros(
+            unpacked_qweight.shape[0], new_dim1, unpacked_qweight.shape[2]
+        )
         new_unpacked_qweight[:, :origin_dim, :] = unpacked_qweight
         unpacked_qweight = new_unpacked_qweight
     group_size = unpacked_qweight.shape[1] // scales.shape[1]
@@ -893,7 +899,8 @@ def dequantize_weight(qweight, qzeros, scales):
     unpacked_qzeros = unpacked_qzeros.repeat_interleave(group_size, dim=1)
     unpacked_qweight = (unpacked_qweight - unpacked_qzeros) * scales
     unpacked_qweight = unpacked_qweight[:, :origin_dim, :]
-    return unpacked_qweight.transpose(1,2), unpacked_qzeros
+    return unpacked_qweight.transpose(1, 2), unpacked_qzeros
+
 
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
     """MoE Marlin method with quantization."""
@@ -921,13 +928,17 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         )
 
         if self.quant_config.group_size != -1:
-            scales_size13 = (hidden_size+self.quant_config.group_size-1) // self.quant_config.group_size
+            scales_size13 = (
+                hidden_size + self.quant_config.group_size - 1
+            ) // self.quant_config.group_size
             w2_scales_size = (
                 intermediate_size
                 if self.quant_config.desc_act
                 else intermediate_size_per_partition
             )
-            scales_size2 = (w2_scales_size+self.quant_config.group_size-1) // self.quant_config.group_size
+            scales_size2 = (
+                w2_scales_size + self.quant_config.group_size - 1
+            ) // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
             scales_size13 = 1
@@ -1073,8 +1084,12 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _moe_torch_native:
-            layer.w13_weight, _ = dequantize_weight(layer.w13_qweight, layer.w13_qzeros, layer.w13_scales)
-            layer.w2_weight, _ = dequantize_weight(layer.w2_qweight, layer.w2_qzeros, layer.w2_scales)
+            layer.w13_weight, _ = dequantize_weight(
+                layer.w13_qweight, layer.w13_qzeros, layer.w13_scales
+            )
+            layer.w2_weight, _ = dequantize_weight(
+                layer.w2_qweight, layer.w2_qzeros, layer.w2_scales
+            )
             return
         if _is_cpu:
             assert (
@@ -1182,6 +1197,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             layer.w13_weight_bias = layer.w13_bias
             layer.w2_weight_bias = layer.w2_bias
             from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+
             return moe_forward_native(
                 layer,
                 x,
