@@ -42,7 +42,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
-    recipe=None,
 ):
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
@@ -57,7 +56,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
             out,
             masked_m,
             expected_m,
-            **({"recipe": recipe} if DEEPGEMM_BLACKWELL else {})
         )
 
 
