@@ -8,7 +8,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
-import utils
+from sglang.srt.layers.attention.cute_ops import utils
 
 
 class Softmax:

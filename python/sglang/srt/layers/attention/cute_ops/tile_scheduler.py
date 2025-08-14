@@ -7,8 +7,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
 
-import utils
-from fast_math import FastDivmod, clz
+from sglang.srt.layers.attention.cute_ops import utils
+from sglang.srt.layers.attention.cute_ops.fast_math import FastDivmod, clz
 
 
 @dataclass

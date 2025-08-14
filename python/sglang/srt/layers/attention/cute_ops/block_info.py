@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 
-from seqlen_info import SeqlenInfo
+from sglang.srt.layers.attention.cute_ops.seqlen_info import SeqlenInfo
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from prefill_attention import flash_attn_varlen_func
+from sglang.srt.layers.attention.cute_ops.prefill_attention import flash_attn_varlen_func
 
 
 def _green(x: str) -> str:
@@ -141,14 +141,14 @@ if __name__ == "__main__":
         softmax_scale=None,
     )
 
-    # test_ragged(
-    #     qo_lens=(128,),
-    #     kv_lens=(1024,),
-    #     num_qo_heads=4,
-    #     num_kv_heads=4,
-    #     head_dim=128,
-    #     softmax_scale=None,
-    # )
+    test_ragged(
+        qo_lens=(128,),
+        kv_lens=(1024,),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=128,
+        softmax_scale=None,
+    )
 
     # test_ragged(
     #     qo_lens=(1024,),

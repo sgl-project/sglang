@@ -27,16 +27,15 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
-import blackwell_helpers as sm100_utils
-import mma_sm100_desc as sm100_desc
-import utils as utils
-
-from mask import AttentionMask
-from softmax import SoftmaxSm100
-from seqlen_info import SeqlenInfo
-from block_info import BlockInfo
-from fast_math import FastDivmod
-from tile_scheduler import (
+from sglang.srt.layers.attention.cute_ops import blackwell_helpers as sm100_utils
+from sglang.srt.layers.attention.cute_ops import mma_sm100_desc as sm100_desc
+from sglang.srt.layers.attention.cute_ops import utils as utils
+from sglang.srt.layers.attention.cute_ops.mask import AttentionMask
+from sglang.srt.layers.attention.cute_ops.softmax import SoftmaxSm100
+from sglang.srt.layers.attention.cute_ops.seqlen_info import SeqlenInfo
+from sglang.srt.layers.attention.cute_ops.block_info import BlockInfo
+from sglang.srt.layers.attention.cute_ops.fast_math import FastDivmod
+from sglang.srt.layers.attention.cute_ops.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     StaticPersistentTileScheduler,

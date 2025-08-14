@@ -13,7 +13,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from flash_fwd_sm100 import FlashAttentionForwardSm100
+from sglang.srt.layers.attention.cute_ops.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 
 def maybe_contiguous(x):

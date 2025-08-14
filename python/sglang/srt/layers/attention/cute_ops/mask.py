@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 
-import utils
+from sglang.srt.layers.attention.cute_ops import utils
 
 
 @dataclass(frozen=True)
