@@ -1,15 +1,12 @@
-#ifndef MARLIN_NAMESPACE_NAME
-#define MARLIN_NAMESPACE_NAME marlin_moe_wna16
-#endif
+#include "marlin.cuh"
 
-#include "core/registration.h"
-#include "gptq_marlin/marlin.cuh"
-#include "kernel.h"
-
-namespace MARLIN_NAMESPACE_NAME {
-
+namespace marlin {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-// No support for async in awq_marlin_repack_kernel
+template <int const num_threads, int const num_bits>
+__global__ void awq_marlin_repack_kernel(
+    uint32_t const* __restrict__ b_q_weight_ptr, uint32_t* __restrict__ out_ptr, int size_k, int size_n) {
+  return;
+}
 #else
 
 template <int const num_threads, int const num_bits>
@@ -178,21 +175,33 @@ __global__ void awq_marlin_repack_kernel(
     }
   }
 }
+#endif
+}  // namespace marlin
 
-#define CALL_IF(NUM_BITS)                                                                              \
-  else if (num_bits == NUM_BITS) {                                                                     \
-    cudaFuncSetAttribute(                                                                              \
-        awq_marlin_repack_kernel<repack_threads, NUM_BITS>,                                            \
-        cudaFuncAttributeMaxDynamicSharedMemorySize,                                                   \
-        max_shared_mem);                                                                               \
-    awq_marlin_repack_kernel<repack_threads, NUM_BITS>                                                 \
-        <<<blocks, repack_threads, max_shared_mem, stream>>>(b_q_weight_ptr, out_ptr, size_k, size_n); \
+#define CALL_IF(NUM_BITS)                                                                                      \
+  else if (num_bits == NUM_BITS) {                                                                             \
+    cudaFuncSetAttribute(                                                                                      \
+        marlin::awq_marlin_repack_kernel<marlin::repack_threads, NUM_BITS>,                                    \
+        cudaFuncAttributeMaxDynamicSharedMemorySize,                                                           \
+        max_shared_mem);                                                                                       \
+    marlin::awq_marlin_repack_kernel<marlin::repack_threads, NUM_BITS>                                         \
+        <<<blocks, marlin::repack_threads, max_shared_mem, stream>>>(b_q_weight_ptr, out_ptr, size_k, size_n); \
   }
 
 torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits) {
   // Verify compatibility with marlin tile of 16x64
-  TORCH_CHECK(size_k % tile_k_size == 0, "size_k = ", size_k, " is not divisible by tile_k_size = ", tile_k_size);
-  TORCH_CHECK(size_n % tile_n_size == 0, "size_n = ", size_n, " is not divisible by tile_n_size = ", tile_n_size);
+  TORCH_CHECK(
+      size_k % marlin::tile_k_size == 0,
+      "size_k = ",
+      size_k,
+      " is not divisible by tile_k_size = ",
+      marlin::tile_k_size);
+  TORCH_CHECK(
+      size_n % marlin::tile_n_size == 0,
+      "size_n = ",
+      size_n,
+      " is not divisible by tile_n_size = ",
+      marlin::tile_n_size);
 
   TORCH_CHECK(num_bits == 4 || num_bits == 8, "num_bits must be 4 or 8. Got = ", num_bits);
   int const pack_factor = 32 / num_bits;
@@ -216,7 +225,7 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64
   // Alloc buffers
   const at::cuda::OptionalCUDAGuard device_guard(device_of(b_q_weight));
   auto options = torch::TensorOptions().dtype(b_q_weight.dtype()).device(b_q_weight.device());
-  torch::Tensor out = torch::empty({size_k / tile_size, size_n * tile_size / pack_factor}, options);
+  torch::Tensor out = torch::empty({size_k / marlin::tile_size, size_n * marlin::tile_size / pack_factor}, options);
 
   // Get ptrs
   uint32_t const* b_q_weight_ptr = reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr());
@@ -242,14 +251,3 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64
 
   return out;
 }
-
-torch::Tensor
-awq_marlin_repack_meta(torch::Tensor& b_q_weight, c10::SymInt size_k, c10::SymInt size_n, int64_t num_bits) {
-  int const pack_factor = 32 / num_bits;
-  auto options = torch::TensorOptions().dtype(b_q_weight.dtype()).device(b_q_weight.device());
-  return torch::empty_symint({size_k / tile_size, size_n * tile_size / pack_factor}, options);
-}
-
-#endif
-
-}  // namespace MARLIN_NAMESPACE_NAME
