@@ -36,9 +36,9 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_zero_points,
     verify_marlin_supported,
 )
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
 from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
+    get_scalar_types,
     replace_parameter,
     unpack_cols,
 )
@@ -60,6 +60,7 @@ if _is_cuda:
 
 
 logger = logging.getLogger(__name__)
+ScalarType, scalar_types = get_scalar_types()
 
 
 def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
