@@ -15,11 +15,37 @@ from sgl_kernel import machete_prepack_B
 from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+
+def get_scalar_types():
+    """
+    Returns:
+        tuple: (ScalarType, scalar_types)
+    """
+    try:
+        from sgl_kernel.scalar_type import ScalarType, scalar_types
+
+        return ScalarType, scalar_types
+    except ImportError:
+
+        class MockScalarType:
+            pass
+
+        class MockScalarTypes:
+            uint4b8 = "uint4b8"
+            uint8b128 = "uint8b128"
+
+            def __getattr__(self, name):
+                return f"mock_{name}"
+
+        return MockScalarType, MockScalarTypes()
+
+
+ScalarType, scalar_types = get_scalar_types()
 
 
 def is_layer_skipped(

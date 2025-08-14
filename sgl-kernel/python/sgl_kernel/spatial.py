@@ -14,6 +14,11 @@ def create_greenctx_stream_by_value(
     Returns:
         tuple[ExternalStream, ExternalStream]: The two streams.
     """
+    if torch.version.cuda < "12.4":
+        raise RuntimeError(
+            "Green Contexts feature requires CUDA Toolkit 12.4 or newer."
+        )
+
     if device_id is None:
         device_id = torch.cuda.current_device()
 
