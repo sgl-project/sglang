@@ -238,13 +238,14 @@ class HiCacheController:
         self.io_backend = io_backend
 
         self.enable_storage = False
+        self.is_mla = isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
             from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
 
             if storage_backend == "file":
-                self.storage_backend = HiCacheFile()
+                self.storage_backend = HiCacheFile(is_mla=self.is_mla)
                 self.get_hash_str = get_hash_str
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
@@ -257,7 +258,7 @@ class HiCacheController:
                     get_hash_str_mooncake,
                 )
 
-                self.storage_backend = MooncakeStore()
+                self.storage_backend = MooncakeStore(is_mla=self.is_mla)
                 self.get_hash_str = get_hash_str_mooncake
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
@@ -267,7 +268,7 @@ class HiCacheController:
                     HiCacheHF3FS,
                 )
 
-                rank = get_tensor_model_parallel_rank()
+                rank = get_tensor_model_parallel_rank() if not self.is_mla else 0
                 bytes_per_page = (
                     mem_pool_host.get_size_per_token() * mem_pool_host.page_size
                 )
@@ -394,7 +395,7 @@ class HiCacheController:
     @property
     def backup_skip(self):
         return (
-            isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
+            self.is_mla
             and torch.cuda.current_device() != 0
         )
 

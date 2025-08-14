@@ -96,7 +96,7 @@ class MooncakeStoreConfig:
 
 
 class MooncakeStore(HiCacheStorage):
-    def __init__(self):
+    def __init__(self, is_mla: bool = False):
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as e:
@@ -126,6 +126,7 @@ class MooncakeStore(HiCacheStorage):
             logger.info("Connect to Mooncake store successfully.")
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
+            self.is_mla = is_mla
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -227,7 +228,7 @@ class MooncakeStore(HiCacheStorage):
             if key is None:
                 return None
 
-            if self.is_mla_model:
+            if self.is_mla:
                 _keys.append(f"{key}_k")
             else:
                 _keys.append(f"{key}_{local_rank}_k")
