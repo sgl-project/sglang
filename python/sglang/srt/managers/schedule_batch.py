@@ -85,8 +85,6 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "device",
     "disable_chunked_prefix_cache",
     "disable_radix_cache",
-    "enable_dp_attention",
-    "enable_dp_lm_head",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
