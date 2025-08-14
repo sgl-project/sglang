@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +259,12 @@ class HiCacheController:
                     MooncakeStore,
                 )
 
-                self.storage_backend = MooncakeStore()
+                if isinstance(self.mem_pool_device, MHATokenToKVPool):
+                    self.storage_backend = MooncakeStore(cache_type="mha")
+                elif isinstance(self.mem_pool_device, MLATokenToKVPool):
+                    self.storage_backend = MooncakeStore(cache_type="mla")
+                else:
+                    raise ValueError(f"Unsupported cache type: {self.mem_pool_device}")
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":

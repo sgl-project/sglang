@@ -84,7 +84,19 @@ class MooncakeStoreConfig:
 
 
 class MooncakeStore(HiCacheStorage):
-    def __init__(self):
+    def __init__(self, cache_type: str = "mha"):
+        """
+        Initialize MooncakeStore.
+
+        Args:
+            cache_type: Type of KV cache, either "mha" (Multi-Head Attention) or "mla" (Multi-Layer Attention)
+        """
+        if cache_type not in ["mha", "mla"]:
+            raise ValueError(f"cache_type must be 'mha' or 'mla', got {cache_type}")
+        print(f"MooncakeStore initialized with cache_type: {cache_type}")
+
+        self.cache_type = cache_type
+
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as e:
@@ -221,17 +233,23 @@ class MooncakeStore(HiCacheStorage):
         return self.batch_exists([key]) > 0
 
     def batch_exists(self, keys) -> int:
-        query_keys = []
-        for key in keys:
-            if key is None:
-                return 0
-            query_keys.append(f"{key}_{self.local_rank}_k")
-            query_keys.append(f"{key}_{self.local_rank}_v")
+        if self.cache_type == "mha":
+            query_keys = []
+            for key in keys:
+                query_keys.append(f"{key}_{self.local_rank}_k")
+                query_keys.append(f"{key}_{self.local_rank}_v")
+            key_multiplier = 2
+        elif self.cache_type == "mla":
+            query_keys = [f"{key}_{self.local_rank}_k" for key in keys]
+            key_multiplier = 1
+        else:
+            raise ValueError(f"Unsupported cache type: {self.cache_type}")
+
         exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
-                return i // 2
-        return len(query_keys) // 2
+                return i // key_multiplier
+        return len(query_keys) // key_multiplier
 
     def delete(self, key) -> None:
         raise (NotImplementedError)
