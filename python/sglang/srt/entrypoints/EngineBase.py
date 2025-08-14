@@ -56,6 +56,15 @@ class EngineBase(ABC):
         """Unload a LoRA adapter without re-launching the engine."""
         pass
 
+    def abort_request(self, rid: str = "", abort_all: bool = False):
+        """Abort a specific request or all requests.
+
+        Args:
+            rid: The request ID to abort. If empty and abort_all is False, no action is taken.
+            abort_all: If True, abort all running requests regardless of rid.
+        """
+        pass
+
     @abstractmethod
     def release_memory_occupation(self):
         """Release GPU memory occupation temporarily."""
