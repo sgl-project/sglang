@@ -1902,35 +1902,35 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            model_worker_batch = batch.get_model_worker_batch()
 
             if self.enable_overlap:
-                # need to wait for previous batch to finish storing to spec_info map
-                if batch.copy_done is not None:
-                    batch.copy_done.wait()
-                # 1. resolve spec_info reference with future_spec_info
-                # TODO: think about either resolve batch.spec_info or model_worker_batch.spec_info
-                self.future_spec_info_map.resolve_future(batch.spec_info, batch.allocate_lens)
-                # 2. construct a new future_spec_info
-                future_spec_info, future_spec_info_ct = self.future_spec_info_map.get_next_future(len(batch.reqs))
-                model_worker_batch = batch.get_model_worker_batch()
+                bs = len(batch.reqs)
+                # construct a new future_spec_info for the next batch
+                future_spec_info, future_spec_info_ct = self.future_spec_info_map.get_next_future(bs)
+                # assign the future_spec_info to the batch.spec_info
+                batch.spec_info = future_spec_info
+                
                 # Make a copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
                 self.cur_sampling_info = model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
-                # assign the future_spec_info to the batch.spec_info
-                batch.spec_info = future_spec_info
+                # resolve spec_info reference with future_spec_info
+                if batch.copy_done is not None:
+                    batch.copy_done.wait()
+                self.future_spec_info_map.resolve_future(model_worker_batch.spec_info, batch.allocate_lens)
 
                 # Run forward in a separate stream to avoid blocking the main stream.
                 with self.forward_stream_ctx:
                     forward_output = self.forward_worker.forward_batch_generation(
                         model_worker_batch
                     )
+                    # store the spec_info to the future_spec_info_map
                     if forward_output.spec_info is not None:
-                        self.future_spec_info_map.store_to_map(future_spec_info_ct, len(batch.reqs), forward_output.spec_info)
+                        self.future_spec_info_map.store_to_map(future_spec_info_ct, bs, forward_output.spec_info)
                     copy_done = torch.cuda.Event()
                     copy_done.record()
             else:
-                model_worker_batch = batch.get_model_worker_batch()
                 forward_output = self.forward_worker.forward_batch_generation(
                     model_worker_batch
                 )

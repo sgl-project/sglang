@@ -19,7 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, next_power_of_2, get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -373,7 +373,7 @@ class FutureSpecInfoMap:
         if spec_info is None:
             return
 
-        ids = (-spec_info.topk_p).tolist()
+        ids = [-idx for idx in spec_info.topk_p.tolist()]
 
         topk_p_stacked = [self.future_topk_p_map[idx] for idx in ids]
         topk_index_stacked = [self.future_topk_index_map[idx] for idx in ids]
