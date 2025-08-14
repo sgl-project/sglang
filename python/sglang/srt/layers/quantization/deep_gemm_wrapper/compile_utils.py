@@ -107,12 +107,12 @@ def _compile_warning_1():
         )
 
 
+# TODO improve code
 def _maybe_compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
     n: int,
     k: int,
     num_groups: int,
-    m_list: Optional[List[int]] = None,
 ) -> None:
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
@@ -133,7 +133,7 @@ def _maybe_compile_deep_gemm_one_type_all(
         )
 
         # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
-        for m in m_list if m_list is not None else _BUILTIN_M_LIST:
+        for m in _BUILTIN_M_LIST:
             # TODO can use multi thread
             _compile_one_deepgemm()
 
