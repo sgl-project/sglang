@@ -55,7 +55,7 @@ class HiCacheStorage(ABC):
         keys: List[str],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> List[torch.Tensor | None]:
+    ) -> List[torch.Tensor | None] | int:
         """
         Retrieve values for multiple keys.
         Returns a list of tensors or None for each key.
@@ -150,7 +150,7 @@ class HiCacheFile(HiCacheStorage):
         keys: List[str],
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
-    ) -> List[torch.Tensor | None] | int:
+    ) -> List[torch.Tensor | None]:
         return [
             self.get(key, target_location)
             for key, target_location in zip(
