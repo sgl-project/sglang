@@ -12,7 +12,7 @@ from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, ceil_div
+from sglang.srt.utils import ceil_div, get_bool_env_var, get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,13 @@ def _maybe_compile_deep_gemm_one_type_all(
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        _compile_deep_gemm_one_type_all(kernel_type=kernel_type, n=n, k=k, num_groups=num_groups, m_list=_BUILTIN_M_LIST)
+        _compile_deep_gemm_one_type_all(
+            kernel_type=kernel_type,
+            n=n,
+            k=k,
+            num_groups=num_groups,
+            m_list=_BUILTIN_M_LIST,
+        )
 
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
@@ -130,7 +136,9 @@ def _compile_deep_gemm_one_type_all(
         m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
         m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
-    executor = _BaseWarmupExecutor.create(kernel_type, max_m=max(m_list), n=n, k=k, num_groups=num_groups)
+    executor = _BaseWarmupExecutor.create(
+        kernel_type, max_m=max(m_list), n=n, k=k, num_groups=num_groups
+    )
 
     # TODO can use multi thread
     for m in m_list:
@@ -157,11 +165,14 @@ def _empty_token_fp8(size):
         torch.empty((*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda"),
     )
 
+
 def _empty_block_fp8(size):
     *dims, n, k = size
     return (
         torch.empty(size, device="cuda"),
-        torch.empty((*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)), device="cuda"),
+        torch.empty(
+            (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)), device="cuda"
+        ),
     )
 
 
