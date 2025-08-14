@@ -24,14 +24,13 @@
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
 from functools import lru_cache, partial
-from typing import Iterable, List, Optional, Tuple, Type
+from typing import Any, Callable, Iterable, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
-from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLVisionConfig,
@@ -41,8 +40,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
+from sglang.srt.distributed import utils as dist_utils
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -56,7 +57,15 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
+
+_is_npu = is_npu()
+
+if _is_npu:
+    import torch_npu
+
+MIN_PAD_SIZE = 64
+MAX_PAD_SIZE = 128
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +114,137 @@ class Qwen2_5_VLMLP(nn.Module):
         return x
 
 
+class AscendQwen2_5_VisionAttention(VisionAttention):
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        projection_size: int,
+        use_qkv_parallel: bool,
+        qkv_backend: Optional[str] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        dropout: float = 0.0,
+        softmax_in_single_precision: bool = False,
+        flatten_batch: bool = False,
+        prefix: str = "",
+        proj_bias: bool = True,
+        num_dummy_heads: int = 0,
+        qkv_bias: bool = True,
+        qk_normalization: bool = False,
+        layer_norm_eps: float = 1e-06,
+        customized_position_embedding_applier: Callable[
+            [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            embed_dim,
+            num_heads,
+            projection_size,
+            use_qkv_parallel,
+            qkv_backend,
+            quant_config,
+            dropout,
+            softmax_in_single_precision,
+            flatten_batch,
+            prefix,
+            proj_bias,
+            num_dummy_heads,
+            qkv_bias,
+            qk_normalization,
+            layer_norm_eps,
+            customized_position_embedding_applier,
+            **kwargs,
+        )
+        self.origin_hidden_size_per_attention_head = self.hidden_size_per_attention_head
+        self.pad_hidden_size_per_attention_head = 0
+        if (
+            self.hidden_size_per_attention_head > MIN_PAD_SIZE
+            and self.hidden_size_per_attention_head < MAX_PAD_SIZE
+        ):
+            self.pad_hidden_size_per_attention_head = (
+                MAX_PAD_SIZE - self.hidden_size_per_attention_head
+            )
+            self.hidden_size_per_attention_head = MAX_PAD_SIZE
+        self.q_size = self.num_attention_heads_per_partition * (
+            self.head_size + self.pad_hidden_size_per_attention_head
+        )
+        self.kv_size = self.num_attention_kv_heads_per_partition * (
+            self.head_size + self.pad_hidden_size_per_attention_head
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            x: [b, s, embed_dim]
+            cu_seqlens: [b]
+        Returns:
+             [s, b, head * head_size]
+        """
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        assert x.dim() == 3, x.shape
+        bsz, s, _ = x.shape
+        head = self.num_attention_heads_per_partition
+        kv_head = self.num_attention_kv_heads_per_partition
+
+        # [b, s, embed_dim] --> [b, s, embed_dim]
+        qkv, _ = self.qkv_proj(x)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # [b, s, embed_dim] --> [b, s, head, head_size]
+        q = q.reshape(bsz, s, head, -1).contiguous()
+        k = k.reshape(bsz, s, kv_head, -1).contiguous()
+        v = v.reshape(bsz, s, kv_head, -1).contiguous()
+
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            q = torch_npu.npu_rotary_mul(q, cos, sin)
+            k = torch_npu.npu_rotary_mul(k, cos, sin)
+
+        # [b, s, head, head_size] --> [b * s, head, head_size]
+        q, k, v = [rearrange(x, "b s ... -> (b s) ...").contiguous() for x in (q, k, v)]
+
+        assert q.dim() == 3, q.dim()
+        assert k.dim() == 3, k.dim()
+        assert v.dim() == 3, v.dim()
+
+        # internvl
+        if self.qk_normalization:
+            q, k = self._apply_qk_norm(q, k)
+
+        output = torch.empty_like(q)
+        # operator requires pta version >= 2.5.1
+        torch_npu._npu_flash_attention_unpad(
+            query=q,
+            key=k,
+            value=v,
+            seq_len=cu_seqlens,
+            scale_value=self.origin_hidden_size_per_attention_head**-0.5,
+            num_heads=self.num_attention_heads_per_partition,
+            num_kv_heads=self.num_attention_kv_heads_per_partition,
+            out=output,
+        )
+
+        assert output.dim() == 3, output.shape
+
+        # [b * s, h, head_size] --> [b, s, h * head_size]
+        output = rearrange(output, "(b s) ... h d -> b s ... (h d)", b=bsz)
+
+        # [b, s, h * head_size] --> [b, s, h * head_size]
+        output, _ = self.proj(output)
+
+        return output
+
+
 class Qwen2_5_VisionBlock(nn.Module):
 
     def __init__(
@@ -121,8 +261,8 @@ class Qwen2_5_VisionBlock(nn.Module):
         super().__init__()
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm1 = Qwen2RMSNorm(dim, eps=1e-6)
-        self.norm2 = Qwen2RMSNorm(dim, eps=1e-6)
+        self.norm1 = RMSNorm(dim, eps=1e-6)
+        self.norm2 = RMSNorm(dim, eps=1e-6)
 
         if attn_implementation is None:
             softmax_in_single_precision = False
@@ -145,7 +285,11 @@ class Qwen2_5_VisionBlock(nn.Module):
             qkv_backend = "fa3"
             flatten_batch = True
 
-        self.attn = VisionAttention(
+        if _is_npu:
+            vision_attention_class = AscendQwen2_5_VisionAttention
+        else:
+            vision_attention_class = VisionAttention
+        self.attn = vision_attention_class(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
@@ -199,7 +343,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = Qwen2RMSNorm(context_dim, eps=1e-6)
+        self.ln_q = RMSNorm(context_dim, eps=1e-6)
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -231,6 +375,15 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         return out
 
 
+class AscendQwen2_5_VisionPatchEmbed(Qwen2_5_VisionPatchEmbed):
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states.matmul(
+            self.proj.weight.data.view(self.embed_dim, -1).transpose(0, 1)
+        )
+        return hidden_states
+
+
 class Qwen2_5_VisionTransformer(nn.Module):
 
     def __init__(
@@ -255,12 +408,20 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.window_size = vision_config.window_size
         self.patch_size = vision_config.patch_size
         mlp_hidden_size: int = vision_config.intermediate_size
-        self.patch_embed = Qwen2_5_VisionPatchEmbed(
-            patch_size=patch_size,
-            temporal_patch_size=temporal_patch_size,
-            in_channels=in_channels,
-            embed_dim=hidden_size,
-        )
+        if _is_npu:
+            self.patch_embed = AscendQwen2_5_VisionPatchEmbed(
+                patch_size=patch_size,
+                temporal_patch_size=temporal_patch_size,
+                in_channels=in_channels,
+                embed_dim=hidden_size,
+            )
+        else:
+            self.patch_embed = Qwen2_5_VisionPatchEmbed(
+                patch_size=patch_size,
+                temporal_patch_size=temporal_patch_size,
+                in_channels=in_channels,
+                embed_dim=hidden_size,
+            )
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = hidden_size // num_heads
@@ -434,6 +595,176 @@ class Qwen2_5_VisionTransformer(nn.Module):
         return x
 
 
+class AscendQwen2_5_VisionTransformer(Qwen2_5_VisionTransformer):
+
+    def __init__(
+        self,
+        vision_config: Qwen2_5_VLVisionConfig,
+        norm_eps: float = 1e-6,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        interleaved=False,
+    ) -> None:
+        super().__init__(vision_config, norm_eps, quant_config, prefix)
+        self.interleaved = interleaved
+        self.enable_pad = False
+        self.hidden_size: int = vision_config.hidden_size
+        num_heads: int = vision_config.num_heads
+        self.hidden_size_per_attention_head = dist_utils.divide(
+            self.hidden_size, num_heads
+        )
+
+        if (
+            self.hidden_size_per_attention_head > MIN_PAD_SIZE
+            and self.hidden_size_per_attention_head < MAX_PAD_SIZE
+        ):
+            self.enable_pad = True
+            self.origin_hidden_size_per_attention_head = (
+                self.hidden_size_per_attention_head
+            )
+            self.half_origin_hidden_size_per_attention_head = (
+                self.hidden_size_per_attention_head // 2
+            )
+            self.half_pad_hidden_size_per_attention_head = (
+                MAX_PAD_SIZE - self.hidden_size_per_attention_head
+            ) // 2
+            self.hidden_size_per_attention_head = MAX_PAD_SIZE
+
+    def cal_cos_sin(self, rotary_pos_emb):
+        cos = rotary_pos_emb.cos()  # [seqlen, rotary_dim / 2]
+        sin = rotary_pos_emb.sin()
+        if self.enable_pad:
+            cos = torch.nn.functional.pad(
+                cos, (0, self.half_pad_hidden_size_per_attention_head)
+            )
+            sin = torch.nn.functional.pad(
+                sin, (0, self.half_pad_hidden_size_per_attention_head)
+            )
+
+        if not self.interleaved:
+            cos_new = torch.cat((cos, cos), dim=-1)
+            sin_new = torch.cat((sin, sin), dim=-1)
+        else:
+            cos_new = rearrange(
+                torch.stack((cos, cos), dim=-1), "... d two -> ...(d two)", two=2
+            )
+            sin_new = rearrange(
+                torch.stack((sin, sin), dim=-1), "... d two -> ...(d two)", two=2
+            )
+        cos_new = cos_new.reshape(1, -1, 1, self.hidden_size_per_attention_head)
+        sin_new = sin_new.reshape(1, -1, 1, self.hidden_size_per_attention_head)
+        return cos_new, sin_new
+
+    def pad_qkv_bias(self, bias: torch.Tensor):
+        first_half = bias.reshape(-1, 3, self.origin_hidden_size_per_attention_head)[
+            :, :, : self.half_origin_hidden_size_per_attention_head
+        ]
+        second_half = bias.reshape(-1, 3, self.origin_hidden_size_per_attention_head)[
+            :, :, self.half_origin_hidden_size_per_attention_head :
+        ]
+        first_half_padded = torch.nn.functional.pad(
+            first_half, (0, self.half_pad_hidden_size_per_attention_head)
+        )
+        second_half_padded = torch.nn.functional.pad(
+            second_half, (0, self.half_pad_hidden_size_per_attention_head)
+        )
+        bias_padded = torch.cat([first_half_padded, second_half_padded], dim=2)
+        bias_final = bias_padded.reshape(-1)
+        return bias_final
+
+    def pad_qkv_weight(self, data: torch.Tensor):
+        last_dim = data.shape[-1]
+        qkv_weight_first_half = data.reshape(
+            -1, 3, self.origin_hidden_size_per_attention_head, last_dim
+        )[:, :, : self.half_origin_hidden_size_per_attention_head, :]
+        qkv_weight_second_half = data.reshape(
+            -1, 3, self.origin_hidden_size_per_attention_head, last_dim
+        )[:, :, self.half_origin_hidden_size_per_attention_head :, :]
+
+        qkv_weight_first_half_padded = torch.nn.functional.pad(
+            qkv_weight_first_half,
+            (0, 0, 0, self.half_pad_hidden_size_per_attention_head),
+        )
+        qkv_weight_second_half_padded = torch.nn.functional.pad(
+            qkv_weight_second_half,
+            (0, 0, 0, self.half_pad_hidden_size_per_attention_head),
+        )
+        qkv_weight_padded = torch.cat(
+            [qkv_weight_first_half_padded, qkv_weight_second_half_padded], dim=2
+        )
+        qkv_weight_final = qkv_weight_padded.reshape(-1, last_dim)
+        return qkv_weight_final
+
+    def pad_proj_weight(self, data: torch.Tensor):
+        if data.shape[-1] == 1:
+            # weight_scale or weight_offset
+            return data
+        out_weight = torch.nn.functional.pad(
+            data.reshape(
+                self.hidden_size, -1, self.half_origin_hidden_size_per_attention_head
+            ),
+            (0, self.half_pad_hidden_size_per_attention_head, 0, 0),
+        ).reshape(self.hidden_size, -1)
+        return out_weight
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        # compute position embedding
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        cu_window_seqlens = torch.tensor(
+            cu_window_seqlens,
+            dtype=torch.int32,
+        )
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+        cu_window_seqlens = torch.diff(cu_window_seqlens)
+
+        seq_len, _ = x.size()
+
+        x = x.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+        x = x[window_index, :, :]
+        x = x.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        position_embeddings = self.cal_cos_sin(rotary_pos_emb)
+
+        # compute cu_seqlens
+        cu_seqlens = (
+            torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
+            .to(torch.int32)
+        )
+
+        # transformers
+        x = x.unsqueeze(1)
+        for layer_num, blk in enumerate(self.blocks):
+            if layer_num in self.fullatt_block_indexes:
+                cu_seqlens_now = cu_seqlens
+            else:
+                cu_seqlens_now = cu_window_seqlens
+            x = blk(
+                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+            )
+
+        # adapter
+        x = self.merger(x)
+
+        reverse_indices = torch.argsort(window_index)
+        x = x[reverse_indices, :]
+
+        return x
+
+
 cached_get_processor = lru_cache(get_processor)
 
 
@@ -466,7 +797,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
-        self.visual = Qwen2_5_VisionTransformer(
+        if _is_npu:
+            vision_transformer_class = AscendQwen2_5_VisionTransformer
+        else:
+            vision_transformer_class = Qwen2_5_VisionTransformer
+        self.visual = vision_transformer_class(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -615,6 +950,21 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                if (
+                    _is_npu
+                    and isinstance(self.visual, AscendQwen2_5_VisionTransformer)
+                    and self.visual.enable_pad
+                ):
+                    if "attn.proj.weight" in name:
+                        param.data = self.visual.pad_proj_weight(param.data)
+                    if "attn.qkv_proj.weight" in name:
+                        param.data = self.visual.pad_qkv_weight(param.data)
+                    if (
+                        "attn.qkv_proj.bias" in name
+                        or "attn.qkv_proj.deq_scale" in name
+                        or "attn.qkv_proj.quant_bias" in name
+                    ):
+                        param.data = self.visual.pad_qkv_bias(param.data)
 
 
 EntryClass = [Qwen2_5_VLForConditionalGeneration]
