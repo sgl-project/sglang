@@ -157,6 +157,7 @@ class _MMWarmupExecutor(_BaseWarmupExecutor):
         self.out = TODO
 
     def execute(self, m):
+        TODO_slice_m
         deep_gemm.fp8_gemm_nt(
             self.lhs,
             self.rhs,
@@ -171,6 +172,7 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
         self.out = TODO
 
     def execute(self, m):
+        TODO_slice_m
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             self.lhs,
             self.rhs,
@@ -186,6 +188,7 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         self.out = TODO
 
     def execute(self, m):
+        TODO_slice_m
         deep_gemm.fp8_m_grouped_gemm_nt_masked(
             self.lhs,
             self.rhs,
