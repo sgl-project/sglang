@@ -202,6 +202,7 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out,
             masked_m=masked_m,
+            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
