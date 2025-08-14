@@ -140,19 +140,37 @@ class _BaseWarmupExecutor:
     @staticmethod
     def create(kernel_type: DeepGemmKernelType, **kwargs):
         return {
-            DeepGemmKernelType.GEMM_NT_F8F8BF16: TODO,
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: TODO,
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: TODO,
+            DeepGemmKernelType.GEMM_NT_F8F8BF16: _MMWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
         }[kernel_type](**kwargs)
 
     def execute(self, m):
         raise NotImplementedError
+
 
 class _MMWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         TODO
 
     def execute(self, m):
+        TODO
+
+
+class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        TODO
+
+    def execute(self, m):
+        TODO
+
+
+class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        TODO
+
+    def execute(self, m):
+        TODO
 
 
 @contextmanager
