@@ -1586,7 +1586,6 @@ def per_group_transpose(
         a, trans_a, expert_offsets, k, M_ALIGNMENT, BLOCK_SIZE_M=16, BLOCK_SIZE_K=8
     )
     return trans_a
-<<<<<<< HEAD
 
 
 def is_weak_contiguous(x: torch.Tensor):
@@ -1805,7 +1804,7 @@ def triton_scaled_mm(
     )
 
     return result.to(out_dtype)
-=======
+
 shuffle_autotune = triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": block_m, "GROUP_M": group_m}, num_warps=num_warps)
@@ -1944,4 +1943,3 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
         )
 
     return sfa
->>>>>>> 753990ea (add shuffle_fp8_scale_hopper_moe_mn_major)
