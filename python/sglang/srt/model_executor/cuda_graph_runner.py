@@ -29,3 +29,6 @@ class CudaGraphRunner(GraphRunner):
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         super().__init__(model_runner)
+
+    def _create_device_graph(self):
+        return torch.cuda.CUDAGraph()
