@@ -85,7 +85,9 @@ from sgl_kernel.moe import (
 )
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
+    top_k_mask_logits,
     top_k_renorm_prob,
+    top_k_top_p_sampling_from_logits,
     top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
     top_p_sampling_from_probs,
