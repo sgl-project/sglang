@@ -124,6 +124,7 @@ class ServerArgs:
     # API related
     api_key: Optional[str] = None
     served_model_name: Optional[str] = None
+    weight_version: str = "default"
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
@@ -1162,6 +1163,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.served_model_name,
             help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
+        )
+        parser.add_argument(
+            "--weight-version",
+            type=str,
+            default=ServerArgs.weight_version,
+            help="Version identifier for the model weights. Defaults to 'default' if not specified.",
         )
         parser.add_argument(
             "--chat-template",
