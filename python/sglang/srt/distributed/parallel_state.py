@@ -40,11 +40,8 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.utils import (
-    create_device_stream,
-    device_stream_func,
     direct_register_custom_op,
     get_bool_env_var,
-    get_device_current_stream,
     get_int_env_var,
     is_cuda_alike,
     is_hip,
@@ -260,6 +257,8 @@ class GroupCoordinator:
         else:
             self.device = torch.device("cpu")
 
+        self.device_module = torch.get_device_module(self.device)
+
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
@@ -407,7 +406,7 @@ class GroupCoordinator:
         self, graph_capture_context: Optional[GraphCaptureContext] = None
     ):
         if graph_capture_context is None:
-            stream = create_device_stream(self.device)
+            stream = self.device_module.Stream()
             graph_capture_context = GraphCaptureContext(stream)
         else:
             stream = graph_capture_context.stream
@@ -418,11 +417,11 @@ class GroupCoordinator:
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
-        curr_stream = get_device_current_stream(self.device)
+        curr_stream = self.device_module.current_stream()
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with device_stream_func(self.device)(stream), maybe_ca_context:
+        with self.device_module.stream(stream), maybe_ca_context:
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
