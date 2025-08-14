@@ -293,7 +293,7 @@ def scaled_fp4_grouped_quant(
    input_tensor: torch.Tensor,
    input_global_scale: torch.Tensor,
 ):
-   """
+    """
     Quantize input tensor to FP4 and return quantized tensor and scale, for
     grouped gemm inputs (e.g., grouped_gemm_nt_masked for flashinfer).
     Args:
@@ -307,34 +307,37 @@ def scaled_fp4_grouped_quant(
             an uint8.
         output_scales: The blockscale tensor in FP8-E4M3, with shape (32, 4, rm, 4, rk, l)
             but the physical layout is (l, rm, rk, 32, 4, 4).
-   """
-   device = input_tensor.device
-   l, m, k = input_tensor.shape
-   offsets = torch.arange(0, (l + 1) * m * k, step=m * k, 
-                          dtype=torch.int, device=device)
-   sf_vec_size = 16
-   scale_k = k // sf_vec_size
-   padded_k = (scale_k + (4 - 1)) // 4 # 4 is bytes per int32
-   output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
-   output_scales = torch.empty(l, m, padded_k, device=device, dtype=torch.int32)
-   
-   torch.ops.sgl_kernel.scaled_fp4_experts_quant.default(
-       output.view(l * m, k // 2),
-       output_scales.view(l * m, padded_k),
-       input_tensor.view(l * m, k),
-       input_global_scale,
-       offsets,
-       offsets,
-   )
-   # The physical layout of the output is (l, m, k // 2), but we want to return a
-   # logical layout (m, k // 2, l) required by the flashinfer masked group gemm.
-   output = output.permute(1, 2, 0)
-   # The physical layout of the output scales is already swizzled as (l, rm, rk, 32, 4, 4), a
-   # requirement for the flashinfer masked group gemm, where rm=m/128 and rk=k/4. The logic
-   # layout is (32, 4, rm, 4, rk, l).
-   output_scales = output_scales.view(torch.float8_e4m3fn).view(l, m // 128, scale_k // 4, 32, 4, 4)
-   output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
-   return output, output_scales
+    """
+    device = input_tensor.device
+    l, m, k = input_tensor.shape
+    offsets = torch.arange(
+        0, (l + 1) * m * k, step=m * k, dtype=torch.int, device=device
+    )
+    sf_vec_size = 16
+    scale_k = k // sf_vec_size
+    padded_k = (scale_k + (4 - 1)) // 4  # 4 is bytes per int32
+    output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
+    output_scales = torch.empty(l, m, padded_k, device=device, dtype=torch.int32)
+
+    torch.ops.sgl_kernel.scaled_fp4_experts_quant.default(
+        output.view(l * m, k // 2),
+        output_scales.view(l * m, padded_k),
+        input_tensor.view(l * m, k),
+        input_global_scale,
+        offsets,
+        offsets,
+    )
+    # The physical layout of the output is (l, m, k // 2), but we want to return a
+    # logical layout (m, k // 2, l) required by the flashinfer masked group gemm.
+    output = output.permute(1, 2, 0)
+    # The physical layout of the output scales is already swizzled as (l, rm, rk, 32, 4, 4), a
+    # requirement for the flashinfer masked group gemm, where rm=m/128 and rk=k/4. The logic
+    # layout is (32, 4, rm, 4, rk, l).
+    output_scales = output_scales.view(torch.float8_e4m3fn).view(
+        l, m // 128, scale_k // 4, 32, 4, 4
+    )
+    output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+    return output, output_scales
 
 
 def scaled_fp4_experts_quant(
