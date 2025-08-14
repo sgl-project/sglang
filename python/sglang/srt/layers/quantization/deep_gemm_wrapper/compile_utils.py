@@ -5,6 +5,7 @@ from enum import IntEnum, auto
 from typing import Dict, List, Tuple
 
 import torch
+from tqdm import tqdm
 
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     ENABLE_JIT_DEEPGEMM,
@@ -135,7 +136,7 @@ def _compile_deep_gemm_one_type_all(
     )
 
     # TODO can use multi thread
-    for m in m_list:
+    for m in tqdm(m_list, desc=f"DeepGEMM warmup for {kernel_type.name}"):
         executor.execute(m=m)
 
 
