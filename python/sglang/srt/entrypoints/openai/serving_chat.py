@@ -473,30 +473,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content
-                reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
-
-                # Check if this is a gpt-oss model that should always have reasoning separated
-                is_gpt_oss = (
-                    hasattr(self.tokenizer_manager.model_config, "hf_config")
-                    and hasattr(
-                        self.tokenizer_manager.model_config.hf_config, "model_type"
-                    )
-                    and self.tokenizer_manager.model_config.hf_config.model_type
-                    == "gpt_oss"
-                )
-
-                # For gpt-oss models, automatically set reasoning parser if not configured
-                if is_gpt_oss and not reasoning_parser:
-                    reasoning_parser = "gpt-oss"
-
-                if reasoning_parser and (request.separate_reasoning or is_gpt_oss):
+                if (
+                    self.tokenizer_manager.server_args.reasoning_parser
+                    and request.separate_reasoning
+                ):
                     reasoning_text, delta = self._process_reasoning_stream(
-                        index,
-                        delta,
-                        reasoning_parser_dict,
-                        content,
-                        request,
-                        reasoning_parser,
+                        index, delta, reasoning_parser_dict, content, request
                     )
                     if reasoning_text:
                         choice_data = ChatCompletionResponseStreamChoice(
@@ -681,22 +663,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Handle reasoning content
             reasoning_text = None
             reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
-
-            # Check if this is a gpt-oss model that should always have reasoning separated
-            is_gpt_oss = (
-                hasattr(self.tokenizer_manager.model_config, "hf_config")
-                and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-                and self.tokenizer_manager.model_config.hf_config.model_type
-                == "gpt_oss"
-            )
-
-            # For gpt-oss models, automatically set reasoning parser if not configured
-            if is_gpt_oss and not reasoning_parser:
-                reasoning_parser = "gpt-oss"
-
-            # Apply reasoning parsing if parser is configured and either separate_reasoning is True
-            # or this is a gpt-oss model (which should always have reasoning separated)
-            if reasoning_parser and (request.separate_reasoning or is_gpt_oss):
+            if reasoning_parser and request.separate_reasoning:
                 is_force_reasoning = (
                     self.template_manager.force_reasoning
                     or self._get_enable_thinking_from_request(request)
@@ -865,7 +832,6 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser_dict: Dict[int, ReasoningParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
-        reasoning_parser_type: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
@@ -873,13 +839,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.template_manager.force_reasoning
                 or self._get_enable_thinking_from_request(request)
             )
-            # Use provided reasoning_parser_type or fall back to server args
-            parser_type = (
-                reasoning_parser_type
-                or self.tokenizer_manager.server_args.reasoning_parser
-            )
             reasoning_parser_dict[index] = ReasoningParser(
-                parser_type,
+                self.tokenizer_manager.server_args.reasoning_parser,
                 request.stream_reasoning,
                 is_force_reasoning,
             )
