@@ -129,9 +129,11 @@ def _compile_deep_gemm_one_type_all(
         m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
         m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
+    executor = _BaseWarmupExecutor.create(kernel_type, max_m=max(m_list), n=n, k=k, num_groups=num_groups)
+
+    # TODO can use multi thread
     for m in m_list:
-        # TODO can use multi thread
-        _compile_one_deepgemm()
+        executor.execute(m=m)
 
 
 class _BaseWarmupExecutor:
@@ -145,6 +147,12 @@ class _BaseWarmupExecutor:
 
     def execute(self, m):
         raise NotImplementedError
+
+class _MMWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        TODO
+
+    def execute(self, m):
 
 
 @contextmanager
