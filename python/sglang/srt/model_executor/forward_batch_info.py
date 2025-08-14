@@ -43,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
     get_attention_tp_size,
+    set_dp_buffer_len,
 )
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import (
@@ -642,12 +643,13 @@ class ForwardBatch:
         else:
             buffer_len = sum(global_num_tokens)
 
-        self.global_dp_buffer_len = buffer_len
-
         if len(global_num_tokens) > 1:
             num_tokens = global_num_tokens[get_attention_dp_rank()]
         else:
             num_tokens = global_num_tokens[0]
+
+        self.global_dp_buffer_len = buffer_len
+        set_dp_buffer_len(buffer_len, num_tokens)
 
         bs = self.batch_size
 
