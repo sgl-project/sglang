@@ -153,6 +153,10 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
 
+        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0, self.attn_tp_rank)})
+        set_weight_attrs(self.dt_bias,
+                         {"weight_loader": sharded_weight_loader(0, self.attn_tp_rank)})
+
         self.share_norm = config.share_norm
         self.norm_before_gate = config.norm_before_gate
         self.output_norm_size = config.output_norm_size
