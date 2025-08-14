@@ -12,13 +12,19 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
+    ScheduleBatch,
+    global_server_args_dict,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
+    ForwardBatchOutput,
     ForwardMode,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
 if TYPE_CHECKING:
@@ -51,19 +57,19 @@ SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
 class EagleDraftInput:
     # The inputs for decode
     # shape: (b, topk)
-    topk_p: torch.Tensor = None # future when overlap
-    topk_index: torch.Tensor = None # future when overlap
+    topk_p: torch.Tensor = None  # future when overlap
+    topk_index: torch.Tensor = None  # future when overlap
     # shape: (b, hidden_size)
-    hidden_states: torch.Tensor = None # future when overlap
+    hidden_states: torch.Tensor = None  # future when overlap
 
     # Inputs for extend
     # shape: (b,)
-    verified_id: torch.Tensor = None # future when overlap
+    verified_id: torch.Tensor = None  # future when overlap
 
     # Metadata for seq_lens
-    new_seq_lens: torch.Tensor = None # future when overlap
-    allocate_lens: torch.Tensor = None # never a future
-    verify_done: torch.cuda.Event = None # never a future
+    new_seq_lens: torch.Tensor = None  # future when overlap
+    allocate_lens: torch.Tensor = None  # never a future
+    verify_done: torch.cuda.Event = None  # never a future
 
     # for overlap schedule, these are references, so can be indexed without race condition
     def filter_batch(self, new_indices: torch.Tensor):
@@ -84,7 +90,9 @@ class EagleDraftInput:
         self.allocate_lens = torch.cat(
             [self.allocate_lens, spec_info.allocate_lens], axis=0
         )
-        self.new_seq_lens = torch.cat([self.new_seq_lens, spec_info.new_seq_lens], axis=0)
+        self.new_seq_lens = torch.cat(
+            [self.new_seq_lens, spec_info.new_seq_lens], axis=0
+        )
 
     def prepare_for_draft(
         self,
@@ -355,74 +363,118 @@ class EagleVerifyInput:
         return predict, accept_length, accept_index
 
 
-class FutureSpecInfoMap:
-    def __init__(self, max_running_requests: int, device: torch.device):
+class FutureMap:
+    def __init__(
+        self,
+        spec_algorithm: SpeculativeAlgorithm,
+        max_running_requests: int,
+        device: torch.device,
+    ):
+        self.spec_algorithm = spec_algorithm
+        self.future_ct = 0
+        self.future_limit = max_running_requests * 3
+        self.future_buffer_len = (
+            max_running_requests * 5
+        )  # 2 * max_running_requests for overlap schedule
         self.device = device
-        self.max_running_requests = max_running_requests
-        self.future_spec_info_ct = 0
-        self.future_spec_info_limit = max_running_requests * 3
-        self.future_spec_info_buffer_len = max_running_requests * 5 # 2 * max_running_requests for overlap schedule
-        self.future_topk_p_map = [None] * (self.future_spec_info_buffer_len)
-        self.future_topk_index_map = [None] * (self.future_spec_info_buffer_len)
-        self.future_hidden_states_map = [None] * (self.future_spec_info_buffer_len)
-        self.future_verified_id_map = [None] * (self.future_spec_info_buffer_len)
-        self.future_new_seq_lens_map = [None] * (self.future_spec_info_buffer_len)
 
-    def get_next_future_spec_info_ct(self, bs: int) -> int:
-        cur_future_spec_info_ct = self.future_spec_info_ct
-        # increment the future_spec_info_ct, circular buffer pointer
-        self.future_spec_info_ct = (cur_future_spec_info_ct + bs) % self.future_spec_info_limit
-        return cur_future_spec_info_ct
-    
-    def resolve_future(self, spec_info: EagleDraftInput):
-        if spec_info is None:
-            return
+        if self.spec_algorithm.is_eagle():
+            self.future_topk_p_map = [None] * (self.future_buffer_len)
+            self.future_topk_index_map = [None] * (self.future_buffer_len)
+            self.future_hidden_states_map = [None] * (self.future_buffer_len)
+            self.future_verified_id_map = [None] * (self.future_buffer_len)
+            self.future_new_seq_lens_map = [None] * (self.future_buffer_len)
+        else:
+            self.future_next_token_ids_map = torch.empty(
+                (self.future_buffer_len,), dtype=torch.int64, device=self.device
+            )
 
-        ids = [-idx for idx in spec_info.topk_p.tolist()]
+    def get_next_future_ct(self, bs: int) -> int:
+        cur_future_ct = self.future_ct
+        # increment the future_ct, circular buffer pointer
+        self.future_ct = (cur_future_ct + bs) % self.future_limit
+        return cur_future_ct
 
-        topk_p_stacked = [self.future_topk_p_map[idx] for idx in ids]
-        topk_index_stacked = [self.future_topk_index_map[idx] for idx in ids]
-        hidden_states_stacked = [self.future_hidden_states_map[idx] for idx in ids]
-        verified_id_stacked = [self.future_verified_id_map[idx] for idx in ids]
-        new_seq_lens_stacked = [self.future_new_seq_lens_map[idx] for idx in ids]
-        
-        # TODO: think if there's a good way to hide the stack overhead
-        # e.g. when the ids are continuous, we can just use a pointer to the first element
-        spec_info.topk_p = torch.stack(topk_p_stacked, dim=0)
-        spec_info.topk_index = torch.stack(topk_index_stacked, dim=0)
-        spec_info.hidden_states = torch.stack(hidden_states_stacked, dim=0)
-        spec_info.verified_id = torch.stack(verified_id_stacked, dim=0)
-        spec_info.new_seq_lens = torch.stack(new_seq_lens_stacked, dim=0)
+    def resolve_future(self, model_worker_batch: ModelWorkerBatch):
+        if self.spec_algorithm.is_eagle():
+            spec_info = model_worker_batch.spec_info
+            if spec_info is None:
+                return
 
-    def get_next_future(self, future_spec_info_ct: int, bs: int, allocate_lens: torch.Tensor) -> EagleDraftInput:
-        # future_spec_info_indices is a reference to the next spec_info fields, val is a reference id stored as a negative index.
-        future_spec_info_indices = torch.arange(
-            -(future_spec_info_ct + 1),
-            -(future_spec_info_ct + 1 + bs),
-            -1,
-            dtype=torch.int64,
-            device=self.device,
-        )
+            ids = [-idx for idx in spec_info.topk_p.tolist()]
 
-        return EagleDraftInput(
-            topk_p=future_spec_info_indices,
-            topk_index=future_spec_info_indices,
-            hidden_states=future_spec_info_indices,
-            verified_id=future_spec_info_indices,
-            new_seq_lens=future_spec_info_indices,
-            allocate_lens=allocate_lens, # allocate_lens is never a future
-        )
+            topk_p_stacked = [self.future_topk_p_map[idx] for idx in ids]
+            topk_index_stacked = [self.future_topk_index_map[idx] for idx in ids]
+            hidden_states_stacked = [self.future_hidden_states_map[idx] for idx in ids]
+            verified_id_stacked = [self.future_verified_id_map[idx] for idx in ids]
+            new_seq_lens_stacked = [self.future_new_seq_lens_map[idx] for idx in ids]
 
-    def store_to_map(self, future_spec_info_ct: int, bs: int, spec_info: EagleDraftInput):
-        # Store references (no clone) for each request into circular buffers
-        # NOTE: self.future_allocate_lens_map is not needed here because it's assigned to batch.spec_info.allocate_lens, not a future
-        for i in range(bs):
-            slot = future_spec_info_ct + i + 1
-            self.future_topk_p_map[slot] = spec_info.topk_p[i]
-            self.future_topk_index_map[slot] = spec_info.topk_index[i]
-            self.future_hidden_states_map[slot] = spec_info.hidden_states[i]
-            self.future_verified_id_map[slot] = spec_info.verified_id[i]
-            self.future_new_seq_lens_map[slot] = spec_info.new_seq_lens[i]
+            # TODO: think if there's a good way to hide the stack overhead
+            # e.g. when the ids are continuous, we can just use a pointer to the first element
+            spec_info.topk_p = torch.stack(topk_p_stacked, dim=0)
+            spec_info.topk_index = torch.stack(topk_index_stacked, dim=0)
+            spec_info.hidden_states = torch.stack(hidden_states_stacked, dim=0)
+            spec_info.verified_id = torch.stack(verified_id_stacked, dim=0)
+            spec_info.new_seq_lens = torch.stack(new_seq_lens_stacked, dim=0)
+        else:
+            input_ids = model_worker_batch.input_ids
+            input_ids[:] = torch.where(
+                input_ids < 0,
+                self.future_next_token_ids_map[torch.clamp(-input_ids, min=0)],
+                input_ids,
+            )
+
+    def update_next_future(
+        self,
+        schedule_batch: ScheduleBatch,
+        future_ct: int,
+        bs: int,
+        allocate_lens: torch.Tensor,
+    ):
+        if self.spec_algorithm.is_eagle():
+            # future_spec_info_indices is a reference to the next spec_info fields, val is a reference id stored as a negative index.
+            future_spec_info_indices = torch.arange(
+                -(future_ct + 1),
+                -(future_ct + 1 + bs),
+                -1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+            schedule_batch.spec_info = EagleDraftInput(
+                topk_p=future_spec_info_indices,
+                topk_index=future_spec_info_indices,
+                hidden_states=future_spec_info_indices,
+                verified_id=future_spec_info_indices,
+                new_seq_lens=future_spec_info_indices,
+                allocate_lens=allocate_lens,  # allocate_lens is never a future
+            )
+        else:
+            return torch.arange(
+                -(future_ct + 1),
+                -(future_ct + 1 + bs),
+                -1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+    def store_to_map(self, future_ct: int, bs: int, forward_output: ForwardBatchOutput):
+        if self.spec_algorithm.is_eagle():
+            spec_info = forward_output.spec_info
+            # Store references (no clone) for each request into circular buffers
+            # NOTE: self.future_allocate_lens_map is not needed here because it's assigned to batch.spec_info.allocate_lens, not a future
+            for i in range(bs):
+                slot = future_ct + i + 1
+                self.future_topk_p_map[slot] = spec_info.topk_p[i]
+                self.future_topk_index_map[slot] = spec_info.topk_index[i]
+                self.future_hidden_states_map[slot] = spec_info.hidden_states[i]
+                self.future_verified_id_map[slot] = spec_info.verified_id[i]
+                self.future_new_seq_lens_map[slot] = spec_info.new_seq_lens[i]
+        else:
+            self.future_next_token_ids_map[future_ct + 1 : future_ct + bs + 1] = (
+                forward_output.next_token_ids
+            )
+
 
 @triton.jit
 def fill_new_verified_id(

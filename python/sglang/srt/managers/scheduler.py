@@ -495,15 +495,13 @@ class Scheduler(
 
         # init future map for overlap schedule
         if self.enable_overlap:
-            if self.spec_algorithm.is_eagle():
-                from sglang.srt.speculative.eagle_utils_v2 import FutureSpecInfoMap
-                self.future_spec_info_map = FutureSpecInfoMap(
-                    max_running_requests=self.max_running_requests,
-                    device=self.device,
-                )
-            else:
-                # TODO: implement non-eagle
-                pass
+            from sglang.srt.speculative.eagle_utils_v2 import FutureMap
+
+            self.future_map = FutureMap(
+                spec_algorithm=self.spec_algorithm,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
 
         # Init watchdog thread
         self.watchdog_timeout = server_args.watchdog_timeout
@@ -1527,19 +1525,23 @@ class Scheduler(
 
             total_kv_indices = set(range(1, self.max_total_num_tokens + 1))
             evictable_kv_indices = set(self.tree_cache.evictable_kv_indices())
-            available_kv_indices = set(self.token_to_kv_pool_allocator.free_pages.tolist())
+            available_kv_indices = set(
+                self.token_to_kv_pool_allocator.free_pages.tolist()
+            )
 
-            kv_indices_leak = total_kv_indices != (evictable_kv_indices | available_kv_indices)
-            missing_kv_indices = total_kv_indices - (evictable_kv_indices | available_kv_indices)
+            kv_indices_leak = total_kv_indices != (
+                evictable_kv_indices | available_kv_indices
+            )
+            missing_kv_indices = total_kv_indices - (
+                evictable_kv_indices | available_kv_indices
+            )
 
             memory_leak = (available_size + evictable_size) != (
                 self.max_total_num_tokens
                 if not self.enable_hierarchical_cache
                 else self.max_total_num_tokens - protected_size
             ) or kv_indices_leak
-            token_msg = (
-                f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {kv_indices_leak=}\n"
-            )
+            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {kv_indices_leak=}\n"
             if kv_indices_leak:
                 token_msg += f"{len(total_kv_indices)=}, {len(evictable_kv_indices)=}, {len(available_kv_indices)=}, {len(missing_kv_indices)=}, {total_kv_indices=}, {evictable_kv_indices=}, {available_kv_indices=}, {missing_kv_indices=}\n"
 
@@ -1887,7 +1889,6 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -1906,8 +1907,8 @@ class Scheduler(
 
             if self.enable_overlap:
                 bs = len(batch.reqs)
-                future_spec_info_ct = self.future_spec_info_map.get_next_future_spec_info_ct(bs)
-                
+                future_ct = self.future_map.get_next_future_ct(bs)
+
                 # Make a copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
                 self.cur_sampling_info = model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
@@ -1916,21 +1917,27 @@ class Scheduler(
                 # Run forward in a separate stream to avoid blocking the main stream.
                 with self.forward_stream_ctx:
                     # model_worker_batch.spec_info is a future from the previous batch
-                    # resolve it with the future_spec_info_map
-                    self.future_spec_info_map.resolve_future(model_worker_batch.spec_info)
+                    # resolve it with the future_map
+                    self.future_map.resolve_future(model_worker_batch)
 
                     forward_output = self.forward_worker.forward_batch_generation(
                         model_worker_batch
                     )
-                    # store the spec_info to the future_spec_info_map for next batch resolution
+                    # store the spec_info to the future_map for next batch resolution
                     if forward_output.spec_info is not None:
-                        self.future_spec_info_map.store_to_map(future_spec_info_ct, bs, forward_output.spec_info)
+                        self.future_map.store_to_map(future_ct, bs, forward_output)
                     copy_done = torch.cuda.Event()
                     copy_done.record()
 
                 # construct a new future_spec_info for scheduler processing (e.g. merge, filter) in the next batch
-                future_spec_info = self.future_spec_info_map.get_next_future(future_spec_info_ct, bs, forward_output.spec_info.allocate_lens)
-                batch.spec_info = future_spec_info
+                output_allocate_lens = (
+                    forward_output.spec_info.allocate_lens
+                    if forward_output.spec_info is not None
+                    else None
+                )
+                self.future_map.update_next_future(
+                    batch, future_ct, bs, output_allocate_lens
+                )
             else:
                 forward_output = self.forward_worker.forward_batch_generation(
                     model_worker_batch
@@ -1941,8 +1948,12 @@ class Scheduler(
 
             # Handle speculative decoding output
             if forward_output.spec_info is not None:
-                new_seq_lens = forward_output.spec_info.new_seq_lens # val is ready after verify_done
-                allocate_lens = forward_output.spec_info.allocate_lens # val is always ready, at batch schedule time
+                new_seq_lens = (
+                    forward_output.spec_info.new_seq_lens
+                )  # val is ready after verify_done
+                allocate_lens = (
+                    forward_output.spec_info.allocate_lens
+                )  # val is always ready, at batch schedule time
                 batch.seq_lens = new_seq_lens
                 batch.verify_done = forward_output.spec_info.verify_done
             else:
