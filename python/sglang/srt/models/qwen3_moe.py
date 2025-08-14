@@ -144,11 +144,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.top_k = config.num_experts_per_tok
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
         if not global_server_args_dict["moe_a2a_backend"].is_deepep():
-            return self.forward_normal(hidden_states)
+            return self.forward_normal(hidden_states, use_reduce_scatter)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
@@ -159,7 +162,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             if name not in ["correction_bias"]
         ]
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal(
+        self,
+        hidden_states: torch.Tensor,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -167,7 +174,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -295,6 +302,7 @@ class Qwen3MoeAttention(nn.Module):
         attention_bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -353,6 +361,7 @@ class Qwen3MoeAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -458,6 +467,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
+        dual_chunk_attention_config = getattr(
+            config, "dual_chunk_attention_config", None
+        )
         self.self_attn = Qwen3MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -471,6 +483,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            dual_chunk_attention_config=dual_chunk_attention_config,
             alt_stream=alt_stream,
         )
 
@@ -515,6 +528,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
         )
 
     def forward(
@@ -540,7 +554,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -766,7 +785,10 @@ class Qwen3MoeForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-        params_dict = dict(self.named_parameters())
+        # Cache params_dict to avoid repeated expensive traversal of model parameters
+        if not hasattr(self, "_cached_params_dict"):
+            self._cached_params_dict = dict(self.named_parameters())
+        params_dict = self._cached_params_dict
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (
@@ -805,11 +827,22 @@ class Qwen3MoeForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # Track if this is an expert weight to enable early skipping
+                is_expert_weight = False
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
+
+                    # Mark as expert weight regardless of whether we can process it
+                    is_expert_weight = True
+
                     name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        # Expert weight not on this rank, will be skipped below
+                        continue
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -821,6 +854,10 @@ class Qwen3MoeForCausalLM(nn.Module):
                     )
                     break
                 else:
+                    if is_expert_weight:
+                        # This is an expert weight but not mapped to this rank, skip all remaining processing
+                        continue
+
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
@@ -837,11 +874,13 @@ class Qwen3MoeForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
         # TODO mimic deepseek
-        self.routed_experts_weights_of_layer = {
-            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-            for layer_id in range(self.start_layer, self.end_layer)
-            if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
-        }
+        # Lazy initialization of expert weights cache to avoid slowing down load_weights
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
+            }
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
