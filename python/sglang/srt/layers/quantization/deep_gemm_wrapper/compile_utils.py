@@ -165,8 +165,8 @@ class _MMWarmupExecutor(_BaseWarmupExecutor):
 
     def execute(self, m):
         deep_gemm.fp8_gemm_nt(
-            (self.lhs_q[TODO], self.lhs_s[TODO]),
-            (self.rhs_q[TODO], self.rhs_s[TODO]),
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
             self.out,
         )
 
@@ -181,9 +181,9 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
 
     def execute(self, m):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (self.lhs_q[TODO], self.lhs_s[TODO]),
-            (self.rhs_q[TODO], self.rhs_s[TODO]),
-            self.out,
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
             m_indices=m_indices,
         )
 
