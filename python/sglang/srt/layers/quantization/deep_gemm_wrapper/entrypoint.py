@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
+    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
 
 
 # TODO maybe rename these functions
