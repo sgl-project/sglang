@@ -21,7 +21,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/allreduce
    */
-
   m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
   m.def("register_graph_buffers", &register_graph_buffers);
   m.def("dispose", &dispose);
@@ -46,6 +45,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out, int nthreads, int nblocks) -> ()");
   m.impl("mscclpp_allreduce", torch::kCUDA, &mscclpp_allreduce);
+
   /*
    * From csrc/attention
    */
@@ -161,6 +161,28 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_router_gemm", torch::kCUDA, &dsv3_router_gemm);
 
+  // GPTQ related method
+  m.def(
+      "gptq_marlin_gemm(Tensor! a, Tensor? c_or_none,"
+      "Tensor! b_q_weight, Tensor! b_scales, Tensor? global_scale_or_none,"
+      "Tensor? b_zeros_or_none, Tensor? g_idx_or_none, Tensor? perm_or_none,"
+      "Tensor! workspace, int b_q_type_id, int size_m, int size_n, int size_k,"
+      "bool is_k_full, bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor");
+  m.impl("gptq_marlin_gemm", torch::kCUDA, &gptq_marlin_gemm);
+
+  m.def(
+      "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool "
+      "use_shuffle, int bit) -> Tensor");
+  m.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
+
+  m.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
+  m.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
+
+  m.def("gptq_marlin_repack(Tensor! b_q_weight, Tensor! perm, int size_k, int size_n, int num_bits) -> Tensor");
+  m.impl("gptq_marlin_repack", torch::kCUDA, &gptq_marlin_repack);
+
+  m.def("awq_marlin_repack(Tensor! b_q_weight, int size_k, int size_n, int num_bits) -> Tensor");
+  m.impl("awq_marlin_repack", torch::kCUDA, &awq_marlin_repack);
   /*
    * From csrc/moe
    */
@@ -206,12 +228,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
-
-  m.def("gptq_marlin_repack(Tensor! b_q_weight, Tensor! perm, int size_k, int size_n, int num_bits) -> Tensor");
-  m.impl("gptq_marlin_repack", torch::kCUDA, &marlin_moe_wna16::gptq_marlin_repack);
-
-  m.def("awq_marlin_repack(Tensor! b_q_weight, int size_k, int size_n, int num_bits) -> Tensor");
-  m.impl("awq_marlin_repack", torch::kCUDA, &marlin_moe_wna16::awq_marlin_repack);
 
   /*
    * From csrc/speculative
@@ -283,6 +299,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");
   m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);
+
+  /*
+   * From csrc/memory
+   */
+  m.def("store_kv_cache(Tensor k_cache, Tensor v_cache, Tensor out_loc, Tensor k, Tensor v) -> ()");
+  m.impl("store_kv_cache", &store_kv_cache);
 
   /*
    * From csrc/moe/cutlass_moe/w4a8
@@ -390,13 +412,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("convert_vertical_slash_indexes_mergehead", torch::kCUDA, &convert_vertical_slash_indexes_mergehead);
 
   /*
-   * From XGrammar
+   * From csrc/grammar
    */
   m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
   m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
 
   /*
-   * From QServe
+   * From csrc/gemm (QServe)
    */
   m.def(
       "qserve_w4a8_per_chn_gemm(Tensor _in_feats, Tensor _kernel, Tensor _wscales, Tensor _ascales, Tensor _w_szs, "
@@ -413,12 +435,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("create_greenctx_stream_by_value(int smA, int smB, int device) -> int[]");
   m.impl("create_greenctx_stream_by_value", &create_greenctx_stream_by_value);
-
-  /*
-   * From csrc/memory
-   */
-  m.def("store_kv_cache(Tensor k_cache, Tensor v_cache, Tensor out_loc, Tensor k, Tensor v) -> ()");
-  m.impl("store_kv_cache", &store_kv_cache);
 }
 
 REGISTER_EXTENSION(common_ops)

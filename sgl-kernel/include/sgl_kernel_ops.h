@@ -224,6 +224,40 @@ void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const t
 
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
+torch::Tensor gptq_marlin_gemm(
+    torch::Tensor& a,
+    std::optional<torch::Tensor> c_or_none,
+    torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& global_scale_or_none,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& g_idx_or_none,
+    std::optional<torch::Tensor> const& perm_or_none,
+    torch::Tensor& workspace,
+    sglang::ScalarTypeId const& b_q_type_id,
+    int64_t size_m,
+    int64_t size_n,
+    int64_t size_k,
+    bool is_k_full,
+    bool use_atomic_add,
+    bool use_fp32_reduce,
+    bool is_zp_float);
+
+torch::Tensor gptq_gemm(
+    torch::Tensor a,
+    torch::Tensor b_q_weight,
+    torch::Tensor b_gptq_qzeros,
+    torch::Tensor b_gptq_scales,
+    torch::Tensor b_g_idx,
+    bool use_shuffle,
+    int64_t bit);
+
+void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
+
+torch::Tensor
+gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits);
+
+torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
 /*
  * From csrc/moe
  */
@@ -339,15 +373,6 @@ void scaled_fp4_experts_quant(
     torch::Tensor const& input_global_scale,
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts);
-
-namespace marlin_moe_wna16 {
-
-torch::Tensor
-gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits);
-
-torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
-
-}  // namespace marlin_moe_wna16
 
 /*
  * From csrc/speculative
