@@ -9,7 +9,12 @@ name = "sglang_router_rs"
 # Python/C binding + Rust library: Use ["cdylib", "rlib"]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "sglang-router"
+path = "src/main.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
@@ -20,7 +25,7 @@ rand = "0.9.2"
 reqwest = { version = "0.12.8", features = ["stream", "blocking", "json"] }
 futures-util = "0.3"
 futures = "0.3"
-pyo3 = { version = "0.22.5", features = ["extension-module"] }
+pyo3 = { version = "0.25.1", features = ["extension-module"] }
 dashmap = "6.1.0"
 http = "1.1.0"
 tokio = { version = "1.42.0", features = ["full"] }
@@ -53,3 +58,18 @@ path = "benches/request_processing.rs"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = "unpacked"
+incremental = true
+
+
+[profile.dev.build-override]
+opt-level = 3
+codegen-units = 1
+
+[profile.dev-opt]
+inherits = "dev"
+opt-level = 1
