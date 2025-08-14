@@ -268,7 +268,7 @@ class HiCacheController:
                     HiCacheHF3FS,
                 )
 
-                rank = get_tensor_model_parallel_rank() if not self.is_mla else 0
+                rank = get_tensor_model_parallel_rank()
                 bytes_per_page = (
                     mem_pool_host.get_size_per_token() * mem_pool_host.page_size
                 )
@@ -400,6 +400,8 @@ class HiCacheController:
         return (
             self.is_mla
             and torch.cuda.current_device() != 0
+            # todo: only support file and mooncake
+            and self.storage_backend_type in ["file", "mooncake"]
         )
 
     def write(
