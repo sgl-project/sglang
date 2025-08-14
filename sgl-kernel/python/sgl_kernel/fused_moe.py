@@ -2,10 +2,12 @@ import functools
 from typing import Optional
 
 import torch
-from sgl_kernel.scalar_type import scalar_types
+from sgl_kernel import silu_and_mul
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
+    from sgl_kernel.scalar_type import scalar_types
+
     if has_zp:
         assert num_bits == 4
         return scalar_types.uint4
@@ -164,7 +166,7 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    torch.ops._C.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, 2 * N))
+    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
     if expert_map is not None:
         intermediate_cache3.zero_()

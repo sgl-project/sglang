@@ -114,7 +114,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         num_heads: int,
         hidden_act="silu",
         norm_layer: Type[nn.Module] = None,
-        attn_implementation: Optional[str] = "sdpa",
+        attn_implementation: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -123,7 +123,12 @@ class Qwen2_5_VisionBlock(nn.Module):
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = Qwen2RMSNorm(dim, eps=1e-6)
         self.norm2 = Qwen2RMSNorm(dim, eps=1e-6)
-        if attn_implementation == "sdpa":
+
+        if attn_implementation is None:
+            softmax_in_single_precision = False
+            qkv_backend = None
+            flatten_batch = True
+        elif attn_implementation == "sdpa":
             softmax_in_single_precision = False
             qkv_backend = "sdpa"
             flatten_batch = True
@@ -268,7 +273,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
                     num_heads=num_heads,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="sdpa",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                 )
@@ -497,7 +501,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
@@ -508,9 +512,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
-        pixel_values = torch.cat(
-            [getattr(item, "pixel_values_videos") for item in items], dim=0
-        ).type(self.visual.dtype)
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()

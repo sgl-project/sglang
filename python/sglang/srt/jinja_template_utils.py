@@ -9,6 +9,8 @@ import logging
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
+from sglang.srt.utils import ImageData
+
 logger = logging.getLogger(__name__)
 
 # ============================================================================
@@ -100,6 +102,12 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
             if _is_var_or_elems_access(loop_iter, "message", "content"):
                 return "openai"  # Found content iteration → openai format
 
+            # Also check for patterns like: {%- for item in msg.content -%} or {%- for item in m.content -%}
+            if _is_var_or_elems_access(
+                loop_iter, "msg", "content"
+            ) or _is_var_or_elems_access(loop_iter, "m", "content"):
+                return "openai"  # Found content iteration → openai format (glm4v)
+
         return "string"  # No content loops found → string format
     except Exception as e:
         logger.debug(f"Error when parsing AST of Jinja template: {e}")
@@ -140,7 +148,12 @@ def process_content_for_template_format(
                 chunk_type = chunk.get("type")
 
                 if chunk_type == "image_url":
-                    image_data.append(chunk["image_url"]["url"])
+                    image_data.append(
+                        ImageData(
+                            url=chunk["image_url"]["url"],
+                            detail=chunk["image_url"].get("detail", "auto"),
+                        )
+                    )
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'image' type for template compatibility
@@ -165,7 +178,7 @@ def process_content_for_template_format(
         new_msg["content"] = processed_content_parts
         return new_msg
 
-    else:  # content_format == "string"
+    elif content_format == "string":
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
         for chunk in msg_dict["content"]:
@@ -179,3 +192,6 @@ def process_content_for_template_format(
         new_msg["content"] = " ".join(text_parts) if text_parts else ""
         new_msg = {k: v for k, v in new_msg.items() if v is not None}
         return new_msg
+
+    else:
+        raise ValueError(f"Invalid content format: {content_format}")

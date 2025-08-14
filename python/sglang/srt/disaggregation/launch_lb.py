@@ -1,6 +1,8 @@
 import argparse
 import dataclasses
 
+from sglang.srt.disaggregation.mini_lb import PrefillConfig, run
+
 
 @dataclasses.dataclass
 class LBArgs:
@@ -18,7 +20,7 @@ class LBArgs:
         parser.add_argument(
             "--rust-lb",
             action="store_true",
-            help="Use Rust load balancer",
+            help="Deprecated, please use SGLang Router instead, this argument will have no effect.",
         )
         parser.add_argument(
             "--host",
@@ -115,25 +117,8 @@ def main():
     args = parser.parse_args()
     lb_args = LBArgs.from_cli_args(args)
 
-    if lb_args.rust_lb:
-        from sgl_pdlb._rust import LoadBalancer as RustLB
-
-        RustLB(
-            host=lb_args.host,
-            port=lb_args.port,
-            policy=lb_args.policy,
-            prefill_infos=lb_args.prefill_infos,
-            decode_infos=lb_args.decode_infos,
-            log_interval=lb_args.log_interval,
-            timeout=lb_args.timeout,
-        ).start()
-    else:
-        from sglang.srt.disaggregation.mini_lb import PrefillConfig, run
-
-        prefill_configs = [
-            PrefillConfig(url, port) for url, port in lb_args.prefill_infos
-        ]
-        run(prefill_configs, lb_args.decode_infos, lb_args.host, lb_args.port)
+    prefill_configs = [PrefillConfig(url, port) for url, port in lb_args.prefill_infos]
+    run(prefill_configs, lb_args.decode_infos, lb_args.host, lb_args.port)
 
 
 if __name__ == "__main__":
