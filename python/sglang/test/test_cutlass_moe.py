@@ -305,7 +305,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
         max_rel_err1 = rel_error1.max().item()
 
         abs_error2 = torch.abs(y_shuffle - y_triton)
-        rel_error2 = abs_error2 / torch.clamp(torch.abs(y_shuffle), min=1e-2)
+        rel_error2 = abs_error2 / torch.clamp(torch.abs(y_triton), min=1e-2)
 
         max_abs_err2 = abs_error2.max().item()
         max_rel_err2 = rel_error2.max().item()
