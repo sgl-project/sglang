@@ -629,6 +629,7 @@ class FlashAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         if k is not None:
             assert v is not None
@@ -687,6 +688,11 @@ class FlashAttentionBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify() and self.topk > 1
         )
 
+        # For fa3 interface version compatibility, we put new fields into conditional keyword args
+        kwargs = {}
+        if sinks is not None:
+            kwargs["sinks"] = sinks
+
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -737,6 +743,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
+                **kwargs,
             )
 
             if use_cascade_attn:
@@ -757,6 +764,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
+                    **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
@@ -898,6 +906,7 @@ class FlashAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -943,6 +952,11 @@ class FlashAttentionBackend(AttentionBackend):
         )
         causal = not layer.is_cross_attention
 
+        # For fa3 interface version compatibility, we put new fields into conditional keyword args
+        kwargs = {}
+        if sinks is not None:
+            kwargs["sinks"] = sinks
+
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -985,6 +999,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    **kwargs,
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
@@ -1003,6 +1018,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    **kwargs,
                 )
             else:
                 page_table = metadata.page_table
@@ -1030,6 +1046,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
+                    **kwargs,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -1050,6 +1067,7 @@ class FlashAttentionBackend(AttentionBackend):
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
+                            **kwargs,
                         )
                     )
                     o, _ = merge_state_v2(
@@ -1406,7 +1424,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                     metadata.page_table = self.decode_cuda_graph_metadata[
                         "page_table_draft_decode"
-                    ][req_pool_indices, :]
+                    ][:bs, :]
                     self.decode_cuda_graph_metadata[bs] = metadata
                 else:
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
@@ -1424,7 +1442,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ][: bs + 1]
                     metadata.page_table = self.draft_decode_metadata_topk_normal[
                         "page_table"
-                    ][req_pool_indices, :]
+                    ][:bs, :]
 
                     # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                     metadata_expand.cache_seqlens_int32 = (
@@ -1461,7 +1479,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k = seq_lens.max().item()
                 # Precompute page table
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
-                    req_pool_indices, :
+                    :bs, :
                 ]
                 # Precompute cumulative sequence lengths
                 metadata.cu_seqlens_q = torch.arange(
@@ -1498,9 +1516,7 @@ class FlashAttentionBackend(AttentionBackend):
                     : (bs + 1)
                 ]
 
-                metadata.page_table = self.target_verify_metadata["page_table"][
-                    req_pool_indices, :
-                ]
+                metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
 
                 self.target_verify_metadata[bs] = metadata
             else:
@@ -1519,7 +1535,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ][: bs + 1]
                 metadata.page_table = self.target_verify_metadata_topk_normal[
                     "page_table"
-                ][req_pool_indices, :]
+                ][:bs, :]
 
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                 metadata_expand.cache_seqlens_int32 = (
@@ -1562,9 +1578,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
                 : (bs + 1)
             ]
-            metadata.page_table = self.draft_extend_metadata["page_table"][
-                req_pool_indices, :
-            ]
+            metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
 
             self.draft_extend_metadata[bs] = metadata
 
@@ -1578,7 +1592,7 @@ class FlashAttentionBackend(AttentionBackend):
             ][: (encoder_bs + 1)]
 
             metadata.encoder_page_table = self.encoder_metadata["encoder_page_table"][
-                req_pool_indices, :
+                :bs, :
             ]
 
         self.forward_metadata = metadata

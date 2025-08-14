@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -19,6 +20,9 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 
 def get_weight_perm(num_bits: int):
@@ -348,15 +352,8 @@ class MoeWNA16Method(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        custom_routing_function: Optional[Callable] = None,
-        correction_bias: Optional[torch.Tensor] = None,
+        topk_output: TopKOutput,
+        *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
@@ -365,22 +362,8 @@ class MoeWNA16Method(FusedMoEMethodBase):
     ) -> torch.Tensor:
         # avoid circular import
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-        from sglang.srt.layers.moe.topk import select_experts
 
         assert activation == "silu", "Only SiLU activation is supported."
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
 
         weight_bits = self.quant_config.weight_bits
         has_zp = self.quant_config.has_zp
@@ -389,8 +372,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             x,
             layer.w13_qweight,
             layer.w2_qweight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            topk_output=topk_output,
             inplace=inplace,
             apply_router_weight_on_input=apply_router_weight_on_input,
             use_int4_w4a16=weight_bits == 4,

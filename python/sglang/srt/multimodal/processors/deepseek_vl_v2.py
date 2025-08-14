@@ -31,11 +31,11 @@ from sglang.srt.multimodal.processors.base_processor import (
 class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
     models = [DeepseekVL2ForCausalLM]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
-        self.mm_tokens = MultimodalSpecialTokens(image_token="<image>").build(
-            _processor
-        )
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<image>", image_token_id=self._processor.image_token_id
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,
@@ -50,36 +50,16 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
             input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
-            max_req_input_len=max_req_input_len,
         )
-        res = self.process_mm_data(
-            input_text=base_output.input_text,
-            images=base_output.images,
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            base_output,
+            self.mm_tokens,
             max_req_input_len=max_req_input_len,
             conversations=base_output.input_text,
         )
-        images_seq_mask = res["images_seq_mask"]
-        images_spatial_crop = res["images_spatial_crop"]
-        batched_images_spatial_crop = []
-        batched_images_spatial_crop.append(images_spatial_crop)
-        batched_images_spatial_crop = torch.stack(batched_images_spatial_crop, dim=0)
-
-        items = []
-        input_ids = res["input_ids"]
-        image_offsets = self.get_mm_items_offset(
-            input_ids=input_ids, mm_token_id=self._processor.image_token_id
-        )
-        item = MultimodalDataItem(
-            feature=res["images"],
-            offsets=image_offsets,
-            modality=Modality.IMAGE,
-            image_emb_mask=images_seq_mask,
-            image_spatial_crop=batched_images_spatial_crop,
-        )
-        items += [item]
 
         return {
-            "mm_items": items,
+            "mm_items": mm_items,
             "input_ids": input_ids.tolist(),
             "im_token_id": self._processor.image_token_id,
         }
