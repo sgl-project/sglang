@@ -292,12 +292,14 @@ set(SOURCES
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} --use_fast_math>)
+target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 target_include_directories(common_ops PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+set_source_files_properties("csrc/gemm/per_token_group_quant_8bit" PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
