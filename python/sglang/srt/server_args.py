@@ -433,7 +433,10 @@ class ServerArgs:
             )
             self.page_size = 128
 
-        if self.attention_backend == "trtllm_mla":
+        if (
+            self.attention_backend == "trtllm_mla"
+            or self.decode_attention_backend == "trtllm_mla"
+        ):
             if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -444,9 +447,15 @@ class ServerArgs:
                     f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
+
             if self.speculative_algorithm is not None:
                 raise ValueError(
                     "trtllm_mla backend does not support speculative decoding yet."
+                )
+
+            if self.kv_cache_dtype not in ["fp8_e4m3", "auto"]:
+                raise ValueError(
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
                 )
 
         if (
@@ -566,6 +575,12 @@ class ServerArgs:
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
+
+        # Hicache
+        if self.hicache_storage_backend == "mooncake":
+            # to use mooncake storage backend, the following conditions must be met:
+            self.hicache_io_backend = "kernel"
+            self.hicache_mem_layout = "page_first"
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1188,7 +1203,7 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=[
+            choices=[  # TODO: use FunctionCallParser.DetectorMap.keys()
                 "qwen25",
                 "mistral",
                 "llama3",
@@ -1198,6 +1213,7 @@ class ServerArgs:
                 "qwen3_coder",
                 "glm45",
                 "step3",
+                "gpt-oss",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
@@ -1308,18 +1324,23 @@ class ServerArgs:
 
         # Kernel backend
         ATTN_BACKENDS = [
-            "aiter",
+            # Common
+            "triton",
+            "torch_native",
+            # NVIDIA specific
             "cutlass_mla",
             "fa3",
             "flashinfer",
             "flashmla",
-            "intel_amx",
-            "torch_native",
-            "ascend",
-            "triton",
             "trtllm_mla",
             "trtllm_mha",
             "dual_chunk_flash_attn",
+            # AMD specific
+            "aiter",
+            "wave",
+            # Other platforms
+            "intel_amx",
+            "ascend",
         ]
         parser.add_argument(
             "--attention-backend",
@@ -1442,7 +1463,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
+            help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -2006,19 +2027,17 @@ class ServerArgs:
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
-        assert (
-            self.chunked_prefill_size % self.page_size == 0
-        ), "chunked_prefill_size must be divisible by page_size"
+        # Skip validation if chunked prefill is disabled (i.e., size <= 0).
+        if self.chunked_prefill_size > 0:
+            assert (
+                self.chunked_prefill_size % self.page_size == 0
+            ), "chunked_prefill_size must be divisible by page_size"
 
         # Check multi tokenizer
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
 
     def check_lora_server_args(self):
-        assert (
-            self.max_loras_per_batch > 0
-            # FIXME
-            and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and radix attention is in progress"
+        assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
@@ -2102,10 +2121,10 @@ class ServerArgs:
         if model_arch in ["GptOssForCausalLM"]:
             if self.attention_backend is None:
                 self.attention_backend = "triton"
-            assert self.attention_backend in [
-                "triton",
-                "trtllm_mha",
-            ], f"GptOssForCausalLM requires 'triton' or 'trtllm_mha' attention backend, but got {self.attention_backend}"
+            supported_backends = ["triton", "trtllm_mha", "fa3"]
+            assert (
+                self.attention_backend in supported_backends
+            ), f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got '{self.attention_backend}'"
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
