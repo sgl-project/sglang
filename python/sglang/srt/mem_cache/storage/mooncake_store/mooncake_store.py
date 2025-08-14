@@ -209,25 +209,29 @@ class MooncakeStore(HiCacheStorage):
         key,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> torch.Tensor | None:
-        return self.batch_get([key], [target_location], [target_sizes])
+    ) -> bool:
+        return self.batch_get([key], [target_location], [target_sizes]) == 1
 
     def batch_get(
         self,
         keys: List[str],
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> bool:
+    ) -> int:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
-            return False
-
-        for i in range(len(keys)):
-            if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
-                return False
-
+            return 0
         get_result = self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
-        return all(v >= 0 for v in get_result)
+        if self.cache_type == "mha":
+            key_multiplier = 2
+        elif self.cache_type == "mla":
+            key_multiplier = 1
+        else:
+            raise ValueError(f"Unsupported cache type: {self.cache_type}")
+        for i in range(len(keys)):
+            if get_result[i] < 0:
+                return i // key_multiplier
+        return len(keys) // key_multiplier
 
     def exists(self, key) -> bool:
         return self.batch_exists([key]) > 0

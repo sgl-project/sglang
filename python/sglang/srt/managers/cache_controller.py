@@ -557,11 +557,11 @@ class HiCacheController:
         operation.mark_done()
         return operation.completed_tokens, operation.hash_value
 
-    # Get batch by batch
     def generic_page_transfer(self, operation, batch_size=8):
         for i in range(0, len(operation.hash_value), batch_size):
             batch_hashes = operation.hash_value[i : i + batch_size]
-            # Get one batch token, and record the completed_tokens
+            prev_completed_tokens = operation.completed_tokens
+            # Get one batch token, and update the completed_tokens if succeed
             if self.is_mooncake_backend():
                 # zero copy
                 key_strs, buffer_ptrs, buffer_sizes = (
@@ -574,19 +574,16 @@ class HiCacheController:
                         ],
                     )
                 )
-                success = self.storage_backend.batch_get(
+                get_result = self.storage_backend.batch_get(
                     key_strs,
                     target_location=buffer_ptrs,
                     target_sizes=buffer_sizes,
                 )
-                if not success:
+                if get_result != len(batch_hashes):
                     logger.warning(
                         f"Prefetch operation {operation.request_id} failed to retrieve page {batch_hashes}."
                     )
-                    break  # early return
-                completed_tokens = (
-                    operation.completed_tokens + len(batch_hashes) * self.page_size
-                )
+                operation.increment(get_result * self.page_size)
             else:
                 # non-zero copy
                 # todo: zero copy
@@ -598,23 +595,24 @@ class HiCacheController:
                     logger.warning(
                         f"Prefetch operation {operation.request_id} failed to retrieve page {batch_hashes}."
                     )
-                    break  # early return
-                completed_tokens = operation.completed_tokens
-                for i in range(len(batch_hashes)):
-                    if page_data[i] is None:
-                        logger.warning(
-                            f"Prefetch operation {operation.request_id} failed to retrieve page {batch_hashes[i]}."
+                else:
+                    for i in range(len(batch_hashes)):
+                        if page_data[i] is None:
+                            logger.warning(
+                                f"Prefetch operation {operation.request_id} failed to retrieve page {batch_hashes[i]}."
+                            )
+                            break
+                        self.mem_pool_host.set_from_flat_data_page(
+                            operation.host_indices[operation.completed_tokens],
+                            page_data[i],
                         )
-                        break
-                    self.mem_pool_host.set_from_flat_data_page(
-                        operation.host_indices[completed_tokens],
-                        page_data[i],
-                    )
-                    completed_tokens += self.page_size
-            # Try to increment the completed_tokens
-            if not operation.increment(completed_tokens - operation.completed_tokens):
-                # operation terminated by controller
-                break
+                        if not operation.increment(self.page_size):
+                            break  # Operation terminated by controller
+            if (
+                operation.completed_tokens
+                != prev_completed_tokens + len(batch_hashes) * self.page_size
+            ):
+                break  # Some operations fail or operation terminated by controller
         # release pre-allocated memory
         self.mem_pool_host.free(operation.host_indices[operation.completed_tokens :])
 

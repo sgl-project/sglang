@@ -150,7 +150,7 @@ class HiCacheFile(HiCacheStorage):
         keys: List[str],
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
-    ) -> List[torch.Tensor | None]:
+    ) -> List[torch.Tensor | None] | int:
         return [
             self.get(key, target_location)
             for key, target_location in zip(
