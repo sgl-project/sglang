@@ -175,7 +175,6 @@ _BLOCK_SIZE = 128
 
 class _NormalWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        assert num_groups is None
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((n, k))
         self.out = torch.empty((max_m, n), device="cuda")
