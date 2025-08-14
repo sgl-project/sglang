@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
 from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_int_env_var, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -24,6 +24,141 @@ if _is_cuda:
         shuffle_rows,
         silu_and_mul,
     )
+
+
+def _run_chunk_cutlass_fused_experts_fp8(
+    a_chunk: torch.Tensor,
+    topk_ids_chunk: torch.Tensor,
+    topk_weights_chunk: torch.Tensor,
+    w1_q: torch.Tensor,
+    w2_q: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    a1_strides: torch.Tensor,
+    c1_strides: torch.Tensor,
+    a2_strides: torch.Tensor,
+    c2_strides: torch.Tensor,
+    workspace: torch.Tensor,
+    a_ptrs: torch.Tensor,
+    b_ptrs: torch.Tensor,
+    out_ptrs: torch.Tensor,
+    a_scales_ptrs: torch.Tensor,
+    b_scales_ptrs: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Process a chunk of tokens through the Fused MoE computation.
+
+    Args:
+        a_chunk: Input activations for this chunk. Shape: (chunk_m, k)
+        topk_ids_chunk: Expert indices for this chunk. Shape: (chunk_m, topk)
+        topk_weights_chunk: Router weights for this chunk. Shape: (chunk_m, topk)
+        ... (other parameters same as main function)
+
+    Returns:
+        torch.Tensor: Output for this chunk. Shape: (chunk_m, k)
+    """
+    if is_cuda:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            per_group_transpose,
+            per_token_group_quant_fp8_hopper_moe_mn_major,
+            sglang_per_token_group_quant_fp8,
+        )
+
+    chunk_m = a_chunk.size(0)
+    topk = topk_ids_chunk.size(1)
+    device = a_chunk.device
+
+    a_map = torch.empty((topk_ids_chunk.numel()), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids_chunk.numel()), dtype=torch.int32, device=device)
+
+    prepare_moe_input(
+        topk_ids_chunk,
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        a_map,
+        c_map,
+        num_experts,
+        n,
+        k,
+    )
+
+    a_q, a1_scale = sglang_per_token_group_quant_fp8(a_chunk, 128)
+    rep_a_q = shuffle_rows(a_q, a_map, (chunk_m * topk, k))
+    rep_a1_scales = shuffle_rows(a1_scale, a_map, (chunk_m * topk, int(k / 128)))
+
+    if not is_sm100_supported():
+        rep_a1_scales = per_group_transpose(rep_a1_scales, expert_offsets)
+        w1_scale = w1_scale.contiguous()
+
+    c1 = torch.empty((chunk_m * topk, n * 2), device=device, dtype=out_dtype)
+    c2 = torch.empty((chunk_m * topk, k), device=device, dtype=out_dtype)
+
+    a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
+    w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
+
+    fp8_blockwise_scaled_grouped_mm(
+        c1,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        rep_a_q,
+        w1_q,
+        rep_a1_scales,
+        w1_scale,
+        a1_strides,
+        a1_strides,
+        c1_strides,
+        a_sf_layout,
+        w_sf_layout,
+        problem_sizes1,
+        expert_offsets[:-1],
+        workspace,
+    )
+
+    intermediate = torch.empty((chunk_m * topk, n), device=device, dtype=out_dtype)
+    silu_and_mul(c1, intermediate)
+    del c1
+
+    intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+    del intermediate
+    if not is_sm100_supported():
+        a2_scale = per_group_transpose(a2_scale, expert_offsets)
+        w2_scale = w2_scale.contiguous()
+
+    fp8_blockwise_scaled_grouped_mm(
+        c2,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        intemediate_q,
+        w2_q,
+        a2_scale,
+        w2_scale,
+        a2_strides,
+        a2_strides,
+        c2_strides,
+        a_sf_layout,
+        w_sf_layout,
+        problem_sizes2,
+        expert_offsets[:-1],
+        workspace,
+    )
+
+    result_chunk = torch.empty((chunk_m, k), device=device, dtype=out_dtype)
+    apply_shuffle_mul_sum(c2, result_chunk, c_map, topk_weights_chunk.to(out_dtype))
+
+    return result_chunk
 
 
 def cutlass_fused_experts_fp8(
@@ -122,104 +257,83 @@ def cutlass_fused_experts_fp8(
     assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
-    if is_cuda:
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            per_group_transpose,
-            per_token_group_quant_fp8_hopper_moe_mn_major,
-            sglang_per_token_group_quant_fp8,
-        )
-
     out_dtype = a.dtype
     num_experts = w1_q.size(0)
     m = a.size(0)
     k = w1_q.size(1)
     n = w2_q.size(1)
-
-    topk = topk_ids.size(1)
     device = a.device
 
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    # Optional token-chunking to reduce peak memory
+    chunk_size = get_int_env_var("SGLANG_CUTLASS_MOE_CHUNK_SIZE", 0)
+    if chunk_size <= 0 or chunk_size >= m:
+        chunk_size = 0
 
-    prepare_moe_input(
-        topk_ids,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        a_map,
-        c_map,
-        num_experts,
-        n,
-        k,
-    )
+    if chunk_size == 0:
+        # Process all tokens as a single chunk
+        return _run_chunk_cutlass_fused_experts_fp8(
+            a,
+            topk_ids,
+            topk_weights,
+            w1_q,
+            w2_q,
+            w1_scale,
+            w2_scale,
+            a1_strides,
+            c1_strides,
+            a2_strides,
+            c2_strides,
+            workspace,
+            a_ptrs,
+            b_ptrs,
+            out_ptrs,
+            a_scales_ptrs,
+            b_scales_ptrs,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            num_experts,
+            k,
+            n,
+            out_dtype,
+        )
+    else:
+        # Process tokens in chunks
+        result = torch.empty((m, k), device=device, dtype=out_dtype)
+        for start in range(0, m, chunk_size):
+            end = min(start + chunk_size, m)
 
-    a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
-    rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
-    rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
+            a_chunk = a[start:end]
+            topk_ids_chunk = topk_ids[start:end]
+            topk_weights_chunk = topk_weights[start:end]
 
-    if not is_sm100_supported():
-        rep_a1_scales = per_group_transpose(rep_a1_scales, expert_offsets)
-        w1_scale = w1_scale.contiguous()
-
-    c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
-    c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
-
-    a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
-    w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
-
-    fp8_blockwise_scaled_grouped_mm(
-        c1,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        rep_a_q,
-        w1_q,
-        rep_a1_scales,
-        w1_scale,
-        a1_strides,
-        a1_strides,
-        c1_strides,
-        a_sf_layout,
-        w_sf_layout,
-        problem_sizes1,
-        expert_offsets[:-1],
-        workspace,
-    )
-
-    intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
-    silu_and_mul(c1, intermediate)
-
-    intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
-    if not is_sm100_supported():
-        a2_scale = per_group_transpose(a2_scale, expert_offsets)
-        w2_scale = w2_scale.contiguous()
-
-    fp8_blockwise_scaled_grouped_mm(
-        c2,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        intemediate_q,
-        w2_q,
-        a2_scale,
-        w2_scale,
-        a2_strides,
-        a2_strides,
-        c2_strides,
-        a_sf_layout,
-        w_sf_layout,
-        problem_sizes2,
-        expert_offsets[:-1],
-        workspace,
-    )
-
-    result = torch.empty((m, k), device=device, dtype=out_dtype)
-    apply_shuffle_mul_sum(c2, result, c_map, topk_weights.to(out_dtype))
-    return result
+            result[start:end, :] = _run_chunk_cutlass_fused_experts_fp8(
+                a_chunk,
+                topk_ids_chunk,
+                topk_weights_chunk,
+                w1_q,
+                w2_q,
+                w1_scale,
+                w2_scale,
+                a1_strides,
+                c1_strides,
+                a2_strides,
+                c2_strides,
+                workspace,
+                a_ptrs,
+                b_ptrs,
+                out_ptrs,
+                a_scales_ptrs,
+                b_scales_ptrs,
+                expert_offsets,
+                problem_sizes1,
+                problem_sizes2,
+                num_experts,
+                k,
+                n,
+                out_dtype,
+            )
+        return result
 
 
 FLOAT4_E2M1_MAX = 6.0
