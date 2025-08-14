@@ -1,3 +1,4 @@
+import torch
 import logging
 
 from sglang.srt.utils import get_bool_env_var, get_device_sm
@@ -20,7 +21,11 @@ def _compute_enable_deep_gemm():
     return get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true")
 
 
+def _is_blackwell_arch() -> bool:
+    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    return major == 10
+
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-DEEPGEMM_BLACKWELL = TODO_is_blackwell
+DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and _is_blackwell_arch()
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
