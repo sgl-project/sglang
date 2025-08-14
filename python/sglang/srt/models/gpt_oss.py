@@ -110,8 +110,8 @@ class GptOssSparseMoeBlock(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
         self.activation = config.hidden_act
-        self.activation_alpha = getattr(config, "hidden_act_alpha", 1.702)
-        self.swiglu_limit = config.swiglu_limit
+        self.gemm1_alpha = getattr(config, "hidden_act_alpha", 1.702)
+        self.gemm1_clamp_limit = config.gemm1_clamp_limit
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -139,8 +139,8 @@ class GptOssSparseMoeBlock(nn.Module):
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             activation=self.activation,
-            alpha=self.activation_alpha,
-            limit=self.swiglu_limit,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
             with_bias=True,
             prefix=add_prefix("experts", prefix),
             **extra_kwargs,

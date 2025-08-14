@@ -64,12 +64,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe import (
-    get_deepep_mode,
-    get_moe_a2a_backend,
-    initialize_moe_config,
-    is_tbo_enabled,
-)
+from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -1977,9 +1972,6 @@ class Scheduler(
                 is_extend_in_batch,
                 *tbo_preparer.prepare_all_gather(
                     local_batch,
-                    get_deepep_mode(),
-                    get_moe_a2a_backend().is_deepep(),
-                    is_tbo_enabled(),
                 ),
             ],
             dtype=torch.int64,

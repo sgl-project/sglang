@@ -15,7 +15,8 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.moe import (
-    DeepEPMode,
+    get_deepep_mode,
+    get_moe_a2a_backend,
     get_tbo_token_distribution_threshold,
     is_tbo_enabled,
 )
@@ -357,10 +358,12 @@ class TboDPAttentionPreparer:
     def prepare_all_gather(
         self,
         local_batch: ScheduleBatch,
-        deepep_mode: DeepEPMode,
-        enable_deepep_moe: bool,
-        enable_two_batch_overlap: bool,
     ):
+
+        deepep_mode = get_deepep_mode()
+        enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        enable_two_batch_overlap = is_tbo_enabled()
+
         self.enable_two_batch_overlap = enable_two_batch_overlap
 
         if local_batch is not None:
@@ -388,7 +391,7 @@ class TboDPAttentionPreparer:
                     and not local_batch.forward_mode.is_target_verify()
                 )
                 and enable_deepep_moe
-                and (resolved_deepep_mode == DeepEPMode.LOW_LATENCY)
+                and (resolved_deepep_mode.is_low_latency())
             )
         else:
             self.local_tbo_split_seq_index = 0

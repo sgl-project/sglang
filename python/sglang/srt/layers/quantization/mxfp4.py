@@ -345,6 +345,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 logger,
                 f"Shuffling MoE weights for FlashInfer MXFP4 moe kernel (layer: {self.prefix}), it might take a while...",
             )
+            # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
                 requires_grad=False,

@@ -93,8 +93,8 @@ class EPMoE(FusedMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
-        alpha: Optional[float] = None,
-        limit: Optional[float] = None,
+        gemm1_alpha: Optional[float] = None,
+        gemm1_clamp_limit: Optional[float] = None,
         with_bias: bool = False,
     ):
         super().__init__(
@@ -110,8 +110,8 @@ class EPMoE(FusedMoE):
             activation=activation,
             # apply_router_weight_on_input=apply_router_weight_on_input,
             routed_scaling_factor=routed_scaling_factor,
-            alpha=alpha,
-            limit=limit,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             with_bias=with_bias,
         )
 

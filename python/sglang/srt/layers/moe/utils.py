@@ -68,13 +68,13 @@ class DeepEPMode(Enum):
     LOW_LATENCY = "low_latency"
     AUTO = "auto"
 
-    def enable_normal(self):
+    def enable_normal(self) -> bool:
         return self in [DeepEPMode.NORMAL, DeepEPMode.AUTO]
 
-    def enable_low_latency(self):
+    def enable_low_latency(self) -> bool:
         return self in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]
 
-    def resolve(self, is_extend_in_batch: bool):
+    def resolve(self, is_extend_in_batch: bool) -> DeepEPMode:
         if self != DeepEPMode.AUTO:
             return self
 
@@ -82,6 +82,15 @@ class DeepEPMode(Enum):
             return DeepEPMode.NORMAL
         else:
             return DeepEPMode.LOW_LATENCY
+
+    def is_normal(self) -> bool:
+        return self == DeepEPMode.NORMAL
+
+    def is_low_latency(self) -> bool:
+        return self == DeepEPMode.LOW_LATENCY
+
+    def is_auto(self) -> bool:
+        return self == DeepEPMode.AUTO
 
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None

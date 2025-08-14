@@ -234,8 +234,8 @@ def triton_kernel_moe_with_bias_forward(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
-        alpha=moe_runner_config.alpha,
-        limit=moe_runner_config.limit,
+        alpha=moe_runner_config.gemm1_alpha,
+        limit=moe_runner_config.gemm1_clamp_limit,
     )
 
 
@@ -261,8 +261,8 @@ def triton_kernel_fused_experts_with_bias(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
-    alpha: Optional[float] = None,
-    limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     assert use_fp8_w8a8 == False, "use_fp8_w8a8 is not supported"
     assert per_channel_quant == False, "per_channel_quant is not supported"
@@ -309,7 +309,7 @@ def triton_kernel_fused_experts_with_bias(
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
-        (alpha, limit),
+        (gemm1_alpha, gemm1_clamp_limit),
         2,
     )
 

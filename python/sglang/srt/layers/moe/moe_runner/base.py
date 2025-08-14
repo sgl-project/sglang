@@ -9,5 +9,5 @@ class MoeRunnerConfig:
     inplace: bool = True
     no_combine: bool = False
     routed_scaling_factor: Optional[float] = None
-    alpha: Optional[float] = None  # activation_alpha
-    limit: Optional[float] = None  # swiglu_limit
+    gemm1_alpha: Optional[float] = None
+    gemm1_clamp_limit: Optional[float] = None
