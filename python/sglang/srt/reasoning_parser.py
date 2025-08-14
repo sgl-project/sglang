@@ -5,8 +5,10 @@ from typing import Dict, Optional, Tuple, Type
 class StreamingParseResult:
     """Result of streaming incremental parsing."""
 
-    def __init__(self, normal_text: str = "", reasoning_text: str = ""):
-        self.normal_text = normal_text
+    def __init__(
+        self, normal_text: Optional[str] = None, reasoning_text: Optional[str] = None
+    ):
+        self.normal_text = normal_text or ""
         self.reasoning_text = reasoning_text
 
 
@@ -337,94 +339,133 @@ class GptOssDetector(BaseReasoningFormatDetector):
         """
         self._buffer += new_text
 
+        # For text-based format, detect if we're starting with analysis/commentary and enter reasoning mode
         if not self._in_reasoning:
-            return StreamingParseResult(normal_text=new_text)
+            buf_low = self._buffer.lower().lstrip()
 
-        # Check if we have complete sections to process
-        # For GPT-OSS, we need to wait for complete channel sections
-        buf_low = self._buffer.lower()
-        key_markers = ["<|end|>", "<|call|>", "<|return|>"]
-        has_complete_section = any(
-            marker in self._buffer for marker in key_markers
-        ) or ("assistantfinal" in buf_low)
+            # Prefix hold: keep buffering while we might be collecting start markers
+            # This prevents leaking partial tokens like "a", "an", "anal" before "analysis"
+            prefixes = [
+                "analysis",
+                "commentary",
+                "assistantfinal",
+                "assistantanalysis",
+                "assistantcommentary",
+                "assistant",
+            ]
 
-        if not has_complete_section:
-            # Still accumulating, don't process yet
+            # Hold if buffer is a partial prefix of any start marker
+            is_partial_prefix = (
+                any(
+                    prefix.startswith(buf_low) and buf_low != prefix
+                    for prefix in prefixes
+                )
+                and buf_low != ""
+            )
+
+            if is_partial_prefix:
+                return StreamingParseResult()  # Keep buffering, don't leak
+
+            # Enter reasoning mode once we have a recognizable header
+            if re.match(
+                r"^\s*(?:assistant)?\s*(analysis|commentary)",
+                self._buffer,
+                re.IGNORECASE,
+            ):
+                self._in_reasoning = True
+            else:
+                return StreamingParseResult(normal_text=new_text)
+
+        # Handle text-based vs canonical formats
+        if "<|channel|>" not in self._buffer:
+            return self._handle_text_format_streaming()
+        else:
+            return self._handle_canonical_format_streaming()
+
+    def _handle_text_format_streaming(self) -> StreamingParseResult:
+        """Handle streaming for text-based Harmony format (analysis...assistantfinal...)"""
+        has_assistantfinal = "assistantfinal" in self._buffer.lower()
+
+        if has_assistantfinal:
+            return self._handle_text_format_with_final()
+        else:
+            return self._stream_analysis_content()
+
+    def _handle_text_format_with_final(self) -> StreamingParseResult:
+        """Handle text format when assistantfinal is present"""
+        # Check if we're transitioning to final mode
+        if not getattr(self, "_final_mode", False):
+            self._final_mode = True
+            # Return any remaining reasoning delta before switching to content
+            return self._get_remaining_reasoning_delta()
+
+        # Already in final mode - stream final content
+        return self._stream_final_content()
+
+    def _stream_analysis_content(self) -> StreamingParseResult:
+        """Stream analysis content incrementally before assistantfinal"""
+        m = re.match(
+            r"^\s*(?:assistant)?\s*(analysis|commentary)", self._buffer, re.IGNORECASE
+        )
+        if not m or not self.stream_reasoning:
             return StreamingParseResult()
 
-        # Handle text-based Harmony format with incremental streaming
-        if "<|channel|>" not in self._buffer:  # Text format without channel markers
-            # Check for assistantfinal-only pattern first
-            m = self.text_final_only.match(self._buffer)
-            if m:
-                out = StreamingParseResult(
-                    normal_text=m.group(1).strip(), reasoning_text=None
-                )
-                self._buffer = ""
-                self._in_reasoning = False
-                self._text_streamed_len = 0  # Reset for next stream
-                return out
+        channel_type = m.group(1).lower()
+        if channel_type != "analysis":
+            return StreamingParseResult()
 
-            # Check for analysis-only pattern (no assistantfinal)
-            if "assistantfinal" not in buf_low:
-                m = self.text_analysis_only.match(self._buffer)
-                if m:
-                    channel_type = m.group(1).lower()
-                    if channel_type == "analysis":
-                        reasoning_text = m.group(2).strip() or None
-                        out = StreamingParseResult(
-                            normal_text="",
-                            reasoning_text=(
-                                reasoning_text if self.stream_reasoning else None
-                            ),
-                        )
-                    else:
-                        # Commentary-only - treat as normal text
-                        out = StreamingParseResult(
-                            normal_text=self._buffer.strip(), reasoning_text=None
-                        )
-                    self._buffer = ""
-                    self._in_reasoning = False
-                    self._text_streamed_len = 0  # Reset for next stream
-                    return out
+        # Extract reasoning content after channel marker
+        reasoning_start = m.end()
+        current_reasoning = self._buffer[reasoning_start:]
 
-            # Check for analysis...assistantfinal pattern
-            m = self.text_analysis_then_final.match(self._buffer)
-            if m:
-                channel_type = m.group(1).lower()
-                self._in_reasoning = False
+        if len(current_reasoning) > self._text_streamed_len:
+            reasoning_delta = current_reasoning[self._text_streamed_len :]
+            self._text_streamed_len = len(current_reasoning)
+            return StreamingParseResult(reasoning_text=reasoning_delta)
 
-                if channel_type == "analysis":
-                    reasoning_text = m.group(2).strip() or None
-                    # Only return reasoning if stream_reasoning is True
-                    if self.stream_reasoning:
-                        reasoning_to_return = reasoning_text
-                    else:
-                        reasoning_to_return = None
-                else:
-                    # Commentary - don't extract as reasoning
-                    reasoning_to_return = None
+        return StreamingParseResult()
 
-                final_content = m.group(3).strip()
-                self._buffer = ""
-                self._text_streamed_len = 0  # Reset for next stream
-                return StreamingParseResult(
-                    reasoning_text=reasoning_to_return,
-                    normal_text=final_content,
-                )
+    def _get_remaining_reasoning_delta(self) -> StreamingParseResult:
+        """Get any remaining reasoning content before transitioning to final"""
+        m = self.text_analysis_then_final.match(self._buffer)
+        if not m or not self.stream_reasoning:
+            return StreamingParseResult()
 
-            # For incremental streaming of analysis content before assistantfinal
-            m = re.match(
-                r"^\s*(?:assistant)?\s*(analysis)", self._buffer, re.IGNORECASE
-            )
-            if m and self.stream_reasoning and "assistantfinal" not in buf_low:
-                start = m.end()  # chars to skip before reasoning payload
-                current = self._buffer[start:].strip()
-                if len(current) > self._text_streamed_len:
-                    delta = current[self._text_streamed_len :]
-                    self._text_streamed_len = len(current)
-                    return StreamingParseResult(reasoning_text=delta)
-                return StreamingParseResult()
+        channel_type = m.group(1).lower()
+        if channel_type != "analysis":
+            return StreamingParseResult()
+
+        full_reasoning = m.group(2).strip()
+        if len(full_reasoning) > self._text_streamed_len:
+            remaining_reasoning = full_reasoning[self._text_streamed_len :]
+            self._text_streamed_len = len(full_reasoning)
+            return StreamingParseResult(reasoning_text=remaining_reasoning)
+
+        return StreamingParseResult()
+
+    def _stream_final_content(self) -> StreamingParseResult:
+        """Stream final content after assistantfinal"""
+        m = self.text_analysis_then_final.match(self._buffer)
+        if not m:
+            return StreamingParseResult()
+
+        final_content = m.group(3)
+        final_streamed = getattr(self, "_final_streamed_len", 0)
+
+        if len(final_content) > final_streamed:
+            content_delta = final_content[final_streamed:]
+            self._final_streamed_len = final_streamed + len(content_delta)
+            return StreamingParseResult(normal_text=content_delta)
+
+        return StreamingParseResult()
+
+    def _handle_canonical_format_streaming(self) -> StreamingParseResult:
+        """Handle streaming for canonical format (<|channel|>analysis...)<|end|>)"""
+        key_markers = ["<|end|>", "<|call|>", "<|return|>"]
+        has_markers = any(marker in self._buffer for marker in key_markers)
+
+        if not has_markers:
+            return StreamingParseResult()
 
         # For full channel format, process sections as they complete
         result = StreamingParseResult()
@@ -507,7 +548,7 @@ class ReasoningParser:
         self,
         model_type: Optional[str] = None,
         stream_reasoning: bool = True,
-        force_reasoning: bool = False,
+        force_reasoning: Optional[bool] = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -516,19 +557,25 @@ class ReasoningParser:
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
 
-        if model_type.lower() == "qwen3-thinking":
+        # Special cases where we override force_reasoning
+        if model_type.lower() in {"qwen3-thinking", "gpt-oss"}:
             force_reasoning = True
 
-        self.detector = detector_class(
-            stream_reasoning=stream_reasoning, force_reasoning=force_reasoning
-        )
+        # Only pass force_reasoning if explicitly set, let detectors use their defaults
+        kwargs = {"stream_reasoning": stream_reasoning}
+        if force_reasoning is not None:
+            kwargs["force_reasoning"] = force_reasoning
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, str]:
+        self.detector = detector_class(**kwargs)
+
+    def parse_non_stream(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:
         """Non-streaming call: one-time parsing"""
         ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
 
-    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, str]:
+    def parse_stream_chunk(
+        self, chunk_text: str
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
