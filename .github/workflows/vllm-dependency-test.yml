@@ -30,8 +30,6 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_dependency.sh
-          pip install "vllm==0.10.0"
-          pip install "openai==1.99.1"
           pip install "bitsandbytes>=0.44.0"
 
           pip install "sgl-kernel==0.3.5"
