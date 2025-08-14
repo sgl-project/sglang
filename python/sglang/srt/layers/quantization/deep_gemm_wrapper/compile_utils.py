@@ -125,6 +125,8 @@ def _compile_deep_gemm_one_type_all(
     num_groups: int,
     m_list: List[int],
 ) -> None:
+    TODO_mult_128_for_cont
+
     for m in _BUILTIN_M_LIST:
         # TODO can use multi thread
         _compile_one_deepgemm()
