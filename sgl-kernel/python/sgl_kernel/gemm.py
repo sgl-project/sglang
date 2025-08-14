@@ -322,12 +322,12 @@ def scaled_fp4_grouped_quant(
         l, padded_m, padded_k_int32, device=device, dtype=torch.int32
     )
     input_offsets = torch.arange(
-        0, (l + 1) * m * k, step=m * k, dtype=torch.int, device=device
+        0, (l + 1) * m, step=m, dtype=torch.int, device=device
     )
     output_offsets = torch.arange(
         0,
-        (l + 1) * padded_m * padded_k_int32,
-        step=padded_m * padded_k_int32,
+        (l + 1) * padded_m,
+        step=padded_m,
         dtype=torch.int,
         device=device,
     )
