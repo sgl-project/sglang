@@ -432,13 +432,6 @@ class ModelRunner:
                     server_args.attention_backend = "fa3"
                 elif is_sm100_supported():
                     server_args.attention_backend = "flashinfer"
-                    if (
-                        server_args.speculative_algorithm is not None
-                        and server_args.page_size != 1
-                    ):
-                        raise ValueError(
-                            "Speculative decoding is used with flashinfer backend, page size != 1 is not supported."
-                        )
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
