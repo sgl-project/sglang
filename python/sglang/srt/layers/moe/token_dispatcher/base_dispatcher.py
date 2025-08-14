@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Protocol, TypeGuard, Union, runtime_checkable
 
@@ -16,8 +15,8 @@ if TYPE_CHECKING:
     )
 
 
-@dataclass
 class DispatchOutputChecker:
+
     @staticmethod
     def format_is_standard(
         dispatch_output: DispatchOutput,
@@ -50,6 +49,7 @@ class DispatchOutputChecker:
 
 
 class DispatchOutputFormat(Enum):
+
     STANDARD = auto()
     DEEPEP_NORMAL = auto()
     DEEPEP_LL = auto()

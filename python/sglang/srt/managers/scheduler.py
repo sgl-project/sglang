@@ -772,14 +772,7 @@ class Scheduler(
 
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
-            initialize_moe_config(
-                moe_a2a_backend=self.server_args.moe_a2a_backend,
-                moe_runner_backend=self.server_args.moe_runner_backend,
-                deepep_mode=self.server_args.deepep_mode,
-                deepep_config=self.server_args.deepep_config,
-                is_tbo_enabled=self.server_args.enable_two_batch_overlap,
-                tbo_token_distribution_threshold=self.server_args.tbo_token_distribution_threshold,
-            )
+            initialize_moe_config(self.server_args)
 
     @DynamicGradMode()
     def event_loop_normal(self):

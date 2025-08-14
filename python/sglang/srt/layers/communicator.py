@@ -112,7 +112,7 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
-                if not get_moe_a2a_backend().is_standard()
+                if not get_moe_a2a_backend().is_none()
                 else ScatterMode.FULL
             )
         else:

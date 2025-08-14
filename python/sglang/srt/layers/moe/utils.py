@@ -1,40 +1,50 @@
+from __future__ import annotations
+
 import importlib.util
 from enum import Enum
 from functools import lru_cache
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from packaging import version as pkg_version
 
 from sglang.srt.utils import logger
 
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
 
 class MoeA2ABackend(Enum):
 
-    STANDARD = "standard"
+    NONE = "none"
     DEEPEP = "deepep"
 
     @classmethod
     def _missing_(cls, value):
         if value is None:
-            return cls.STANDARD
+            return cls.NONE
         for member in cls:
             if value == member.value:
                 return member
         raise ValueError(f"No {cls.__name__} member for value {value}")
 
+    def is_none(self):
+        return self == MoeA2ABackend.NONE
+
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP
 
-    def is_standard(self):
-        return self == MoeA2ABackend.STANDARD
-
 
 class MoeRunnerBackend(Enum):
+
+    AUTO = "auto"
     TRITON = "triton"
     TRITON_KERNEL = "triton_kernel"
     FLASHINFER = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
+
+    def is_auto(self):
+        return self == MoeRunnerBackend.AUTO
 
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON
@@ -53,6 +63,7 @@ class MoeRunnerBackend(Enum):
 
 
 class DeepEPMode(Enum):
+
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"
     AUTO = "auto"
@@ -81,14 +92,7 @@ TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 
 
-def initialize_moe_config(
-    moe_a2a_backend: Optional[str],
-    moe_runner_backend: Optional[str],
-    deepep_mode: str,
-    deepep_config: Optional[str],
-    is_tbo_enabled: bool,
-    tbo_token_distribution_threshold: float,
-):
+def initialize_moe_config(server_args: ServerArgs):
     global MOE_A2A_BACKEND
     global MOE_RUNNER_BACKEND
     global DEEPEP_MODE
@@ -96,12 +100,12 @@ def initialize_moe_config(
     global IS_TBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
 
-    MOE_A2A_BACKEND = MoeA2ABackend(moe_a2a_backend)
-    MOE_RUNNER_BACKEND = MoeRunnerBackend(moe_runner_backend or "triton")
-    DEEPEP_MODE = DeepEPMode(deepep_mode)
-    DEEPEP_CONFIG = deepep_config or ""
-    IS_TBO_ENABLED = is_tbo_enabled
-    TBO_TOKEN_DISTRIBUTION_THRESHOLD = tbo_token_distribution_threshold
+    MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
+    MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
+    DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
+    DEEPEP_CONFIG = server_args.deepep_config or ""
+    IS_TBO_ENABLED = server_args.enable_two_batch_overlap
+    TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:

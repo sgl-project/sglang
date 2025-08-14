@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     is_hip,
     is_port_available,
     is_remote_url,
+    is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
 )
@@ -174,16 +175,15 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Optional[Literal["deepep"]] = None
-    moe_runner_backend: Optional[
-        Literal[
-            "triton",
-            "triton_kernel",
-            "flashinfer_trtllm",
-            "flashinfer_cutlass",
-            "flashinfer_mxfp4",
-        ]
-    ] = None
+    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_runner_backend: Literal[
+        "auto",
+        "triton",
+        "triton_kernel",
+        "flashinfer_trtllm",
+        "flashinfer_cutlass",
+        "flashinfer_mxfp4",
+    ] = "auto"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -1462,7 +1462,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["deepep"],
+            choices=["none", "deepep"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
@@ -1470,6 +1470,7 @@ class ServerArgs:
             "--moe-runner-backend",
             type=str,
             choices=[
+                "auto",
                 "triton",
                 "triton_kernel",
                 "flashinfer_trtllm",
@@ -2166,7 +2167,11 @@ class ServerArgs:
                     assert (
                         self.ep_size == 1
                     ), "Triton kernel MoE is only supported when ep_size == 1"
-                if self.moe_runner_backend is None and self.ep_size == 1:
+                if (
+                    self.moe_runner_backend == "auto"
+                    and self.ep_size == 1
+                    and is_triton_kernels_available()
+                ):
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
