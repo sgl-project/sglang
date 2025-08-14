@@ -290,8 +290,8 @@ def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
 
 
 def scaled_fp4_grouped_quant(
-   input_tensor: torch.Tensor,
-   input_global_scale: torch.Tensor,
+    input_tensor: torch.Tensor,
+    input_global_scale: torch.Tensor,
 ):
     """
     Quantize input tensor to FP4 and return quantized tensor and scale, for
