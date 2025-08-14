@@ -155,17 +155,17 @@ class _BaseWarmupExecutor:
 def _empty_token_fp8(size):
     *dims, k = size
     return (
-        torch.empty(size, device="cuda"),
-        torch.empty((*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda"),
+        torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty((*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32),
     )
 
 
 def _empty_block_fp8(size):
     *dims, n, k = size
     return (
-        torch.empty(size, device="cuda"),
+        torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
         torch.empty(
-            (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)), device="cuda"
+            (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
         ),
     )
 
