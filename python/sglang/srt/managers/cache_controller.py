@@ -24,7 +24,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
 
 
 logger = logging.getLogger(__name__)
@@ -259,7 +259,7 @@ class HiCacheController:
 
                 self.storage_backend = MooncakeStore()
                 self.get_hash_str = get_hash_str_mooncake
-                self.storage_backend.register_buffer(self.mem_pool_host)
+                self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -390,6 +390,13 @@ class HiCacheController:
             )
             self.prefetch_thread.start()
             self.backup_thread.start()
+
+    @property
+    def backup_skip(self):
+        return (
+            isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
+            and torch.cuda.current_device() != 0
+        )
 
     def write(
         self,
@@ -764,14 +771,17 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if self.is_mooncake_backend():
-                    self.mooncake_page_backup(operation)
-                elif self.storage_backend_type == "hf3fs":
-                    self.generic_page_backup(operation, batch_size=128)
+                if not self.backup_skip:
+                    if self.is_mooncake_backend():
+                        self.mooncake_page_backup(operation)
+                    elif self.storage_backend_type == "hf3fs":
+                        self.generic_page_backup(operation, batch_size=128)
+                    else:
+                        self.generic_page_backup(operation)
+                    min_completed_tokens = operation.completed_tokens
                 else:
-                    self.generic_page_backup(operation)
+                    min_completed_tokens = len(operation.token_ids)
 
-                min_completed_tokens = operation.completed_tokens
                 if self.tp_world_size > 1:
                     completed_tokens_tensor = torch.tensor(
                         min_completed_tokens, dtype=torch.int
