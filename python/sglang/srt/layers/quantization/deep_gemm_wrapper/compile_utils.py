@@ -157,7 +157,9 @@ def _empty_token_fp8(size):
     *dims, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty((*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32),
+        torch.empty(
+            (*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
+        ),
     )
 
 
@@ -166,7 +168,9 @@ def _empty_block_fp8(size):
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
         torch.empty(
-            (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
+            (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)),
+            device="cuda",
+            dtype=torch.float32,
         ),
     )
 
@@ -209,7 +213,9 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
         self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
-        self.out = torch.empty((num_groups, max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
 
     def execute(self, m):
         deep_gemm.fp8_m_grouped_gemm_nt_masked(
