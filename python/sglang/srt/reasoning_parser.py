@@ -407,21 +407,36 @@ class GptOssDetector(BaseReasoningFormatDetector):
         m = re.match(
             r"^\s*(?:assistant)?\s*(analysis|commentary)", self._buffer, re.IGNORECASE
         )
-        if not m or not self.stream_reasoning:
+        if not m:
             return StreamingParseResult()
 
         channel_type = m.group(1).lower()
-        if channel_type != "analysis":
-            return StreamingParseResult()
 
-        # Extract reasoning content after channel marker
-        reasoning_start = m.end()
-        current_reasoning = self._buffer[reasoning_start:]
+        if channel_type == "analysis":
+            # Stream analysis as reasoning content
+            if not self.stream_reasoning:
+                return StreamingParseResult()
 
-        if len(current_reasoning) > self._text_streamed_len:
-            reasoning_delta = current_reasoning[self._text_streamed_len :]
-            self._text_streamed_len = len(current_reasoning)
-            return StreamingParseResult(reasoning_text=reasoning_delta)
+            reasoning_start = m.end()
+            current_reasoning = self._buffer[reasoning_start:]
+
+            if len(current_reasoning) > self._text_streamed_len:
+                reasoning_delta = current_reasoning[self._text_streamed_len :]
+                self._text_streamed_len = len(current_reasoning)
+                return StreamingParseResult(reasoning_text=reasoning_delta)
+
+        elif channel_type == "commentary":
+            # Stream commentary as normal text (user-visible preambles, tool calls)
+            commentary_start = m.end()
+            current_commentary = self._buffer[commentary_start:]
+            commentary_streamed = getattr(self, "_commentary_streamed_len", 0)
+
+            if len(current_commentary) > commentary_streamed:
+                commentary_delta = current_commentary[commentary_streamed:]
+                self._commentary_streamed_len = commentary_streamed + len(
+                    commentary_delta
+                )
+                return StreamingParseResult(normal_text=commentary_delta)
 
         return StreamingParseResult()
 
