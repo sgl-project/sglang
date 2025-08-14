@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
+import torch
 from tqdm.contrib.concurrent import thread_map
 
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
@@ -149,14 +150,18 @@ class _BaseWarmupExecutor:
         raise NotImplementedError
 
 
+def _empty_on_device(size):
+    return torch.empty(size, device="cuda")
+
+
 class _MMWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         assert num_groups is None
-        self.lhs_q = TODO
+        self.lhs_q = _empty_on_device((max_m, k))
         self.lhs_s = TODO
-        self.rhs_q = TODO
+        self.rhs_q = _empty_on_device((n, k))
         self.rhs_s = TODO
-        self.out = TODO
+        self.out = _empty_on_device((max_m, n))
 
     def execute(self, m):
         deep_gemm.fp8_gemm_nt(
@@ -168,11 +173,11 @@ class _MMWarmupExecutor(_BaseWarmupExecutor):
 
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q = TODO
+        self.lhs_q = _empty_on_device((max_m, k))
         self.lhs_s = TODO
-        self.rhs_q = TODO
+        self.rhs_q = _empty_on_device((num_groups, n, k))
         self.rhs_s = TODO
-        self.out = TODO
+        self.out = _empty_on_device((max_m, n))
 
     def execute(self, m):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
@@ -185,11 +190,11 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
 
 class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q = TODO
+        self.lhs_q = _empty_on_device((num_groups, max_m, k))
         self.lhs_s = TODO
-        self.rhs_q = TODO
+        self.rhs_q = _empty_on_device((num_groups, n, k))
         self.rhs_s = TODO
-        self.out = TODO
+        self.out = _empty_on_device((num_groups, max_m, n))
 
     def execute(self, m):
         deep_gemm.fp8_m_grouped_gemm_nt_masked(
