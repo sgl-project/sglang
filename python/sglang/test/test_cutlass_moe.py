@@ -151,6 +151,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
         expert_offsets,
         problem_sizes1,
         problem_sizes2,
+        use_shuffle=False,
     )
 
     cutlass_shuffle_lambda = lambda: cutlass_fused_experts_fp8(

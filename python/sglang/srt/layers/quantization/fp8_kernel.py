@@ -1808,8 +1808,9 @@ def triton_scaled_mm(
 =======
 shuffle_autotune = triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": block_m}, num_warps=num_warps)
+        triton.Config({"BLOCK_M": block_m, "GROUP_M": group_m}, num_warps=num_warps)
         for block_m in [16, 32, 64, 128]
+        for group_m in [2, 4, 8]
         for num_warps in [4, 8]
     ],
     key=["K", "M_ALIGNMENT"],
@@ -1822,12 +1823,20 @@ def _shuffle_map_fp8_scale_hopper_moe_mn_major(
     problem_sizes,  # (num_experts, 3)
     sfa,  # (M, k)
     shuffle_map,
+    E: tl.constexpr,
     K: tl.constexpr,
     M_ALIGNMENT: tl.constexpr,
     BLOCK_M: tl.constexpr,  # tune
+    GROUP_M: tl.constexpr,
 ):
-    k_offset = tl.program_id(0)
-    expert_id = tl.program_id(1)
+    pid = tl.program_id(0)
+
+    # swizzled order
+    width = GROUP_M * K
+    group_id = pid // width
+    group_size = tl.minimum(E - group_id * GROUP_M, GROUP_M)
+    expert_id = group_id * GROUP_M + (pid % group_size)
+    k_offset = (pid % width) // group_size
 
     m = tl.load(problem_sizes + expert_id * 3)
     current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
@@ -1856,12 +1865,20 @@ def _shuffle_fp8_scale_hopper_moe_mn_major(
     expert_offsets,  # (num_experts,)
     problem_sizes,  # (num_experts, 3)
     sfa,  # (M, k)
+    E: tl.constexpr,
     K: tl.constexpr,
     M_ALIGNMENT: tl.constexpr,
     BLOCK_M: tl.constexpr,  # tune
+    GROUP_M: tl.constexpr,
 ):
-    k_offset = tl.program_id(0)
-    expert_id = tl.program_id(1)
+    pid = tl.program_id(0)
+
+    # swizzled order
+    width = GROUP_M * K
+    group_id = pid // width
+    group_size = tl.minimum(E - group_id * GROUP_M, GROUP_M)
+    expert_id = group_id * GROUP_M + (pid % group_size)
+    k_offset = (pid % width) // group_size
 
     m = tl.load(problem_sizes + expert_id * 3)
     current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
@@ -1902,7 +1919,8 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
     k = a_s.shape[1]
     sfa = torch.empty((output_m, k), device=a_s.device, dtype=a_s.dtype)
     num_experts = problem_sizes.shape[0]
-    grid = (k, num_experts)
+    # grid = (k, num_experts)
+    grid = (k * num_experts, )
     if shuffle_map is not None:
         _shuffle_map_fp8_scale_hopper_moe_mn_major[grid](
             a_s,
@@ -1910,6 +1928,7 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
             problem_sizes,
             sfa,
             shuffle_map,
+            num_experts,
             k,
             expert_tokens_alignment,
         )
@@ -1919,6 +1938,7 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
             expert_offsets,
             problem_sizes,
             sfa,
+            num_experts,
             k,
             expert_tokens_alignment,
         )
