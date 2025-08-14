@@ -318,12 +318,18 @@ def scaled_fp4_grouped_quant(
     padded_k_int32 = padded_k // 4
     padded_m = (m + (128 - 1)) // 128 * 128
     output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
-    output_scales = torch.empty(l, padded_m, padded_k_int32, device=device, dtype=torch.int32)
+    output_scales = torch.empty(
+        l, padded_m, padded_k_int32, device=device, dtype=torch.int32
+    )
     input_offsets = torch.arange(
         0, (l + 1) * m * k, step=m * k, dtype=torch.int, device=device
     )
     output_offsets = torch.arange(
-        0, (l + 1) * padded_m * padded_k_int32, step=padded_m * padded_k_int32, dtype=torch.int, device=device
+        0,
+        (l + 1) * padded_m * padded_k_int32,
+        step=padded_m * padded_k_int32,
+        dtype=torch.int,
+        device=device,
     )
 
     torch.ops.sgl_kernel.scaled_fp4_experts_quant.default(

@@ -165,6 +165,7 @@ def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
     torch.testing.assert_close(out_ans, out_ref)
     torch.testing.assert_close(scale_ans, scale_ref)
 
+
 @pytest.mark.skipif(
     skip_condition, reason="Nvfp4 Requires compute capability of 10 or above."
 )
@@ -188,7 +189,10 @@ def test_quantize_to_fp4_grouped():
     for i in range(l):
         a_fp4, a_scale_interleaved = scaled_fp4_quant(x[i], x_sf_global[i])
         torch.testing.assert_close(a_fp4, output[i])
-        torch.testing.assert_close(a_scale_interleaved.to(torch.float), output_scales[i].to(torch.float))
+        torch.testing.assert_close(
+            a_scale_interleaved.to(torch.float),
+            output_scales[i].to(torch.float)
+        )
 
 
 if __name__ == "__main__":
