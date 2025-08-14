@@ -183,7 +183,7 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
         deep_gemm.fp8_gemm_nt(
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
-            self.out,
+            self.out[:m],
         )
 
 
