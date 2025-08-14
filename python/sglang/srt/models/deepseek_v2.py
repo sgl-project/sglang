@@ -350,6 +350,13 @@ class DeepseekV2MoE(nn.Module):
             ),
             **(
                 dict(
+                    enable_flashinfer_cutedsl_moe=True,
+                )
+                if global_server_args_dict["enable_flashinfer_cutedsl_moe"]
+                else {}
+            ),            
+            **(
+                dict(
                     renormalize=config.norm_topk_prob,
                     use_grouped_topk=True,
                     num_expert_group=config.n_group,

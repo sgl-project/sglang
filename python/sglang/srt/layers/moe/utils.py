@@ -16,6 +16,15 @@ def should_use_flashinfer_trtllm_moe():
     )
     return result
 
+@lru_cache(maxsize=1)
+def should_use_flashinfer_cutedsl_moe():
+    result = global_server_args_dict["enable_flashinfer_cutedsl_moe"] and (
+        not importlib.util.find_spec("flashinfer")
+        or pkg_version.parse(__import__("flashinfer").__version__)
+        >= pkg_version.parse("0.2.11rc1")
+    )
+    return result
+
 
 class MoeA2ABackend(Enum):
 
