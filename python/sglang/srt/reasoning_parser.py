@@ -190,12 +190,14 @@ class GptOssDetector(BaseReasoningFormatDetector):
     """
     Detector for T4-style reasoning format.
 
-    Assumes reasoning format with two channels:
+    Assumes reasoning format with three channels:
       <|channel|>analysis<|message|>...reasoning content...<|end|>
+      <|channel|>commentary<|message|>...preambles or tool calls...<|end|>/<|call|>
       <|start|>assistant<|channel|>final<|message|>...final answer...<|return|>
 
-    Returns content from 'analysis' channel as reasoning_text
-    and content from 'final' channel as normal_text.
+    Returns content from 'analysis' channel as reasoning_text.
+    Content from 'commentary' and 'final' channels goes to normal_text.
+    Commentary without to= can be user-visible preambles, not chain-of-thought.
 
     Args:
         stream_reasoning (bool): If False, accumulates reasoning content until complete.
@@ -207,166 +209,119 @@ class GptOssDetector(BaseReasoningFormatDetector):
         super().__init__(
             "<|channel|>analysis<|message|>",
             "<|end|>",
-            force_reasoning=True,
+            force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
         )
         self.final_channel_start = "<|start|>assistant<|channel|>final<|message|>"
         self.final_channel_end = "<|return|>"
         self._in_final_channel = False
         self._analysis_complete = False
-        self._in_reasoning = True
+        self._in_reasoning = force_reasoning
+
+        # Regex patterns for text-based Harmony format (without channel markers)
+        self.text_analysis_then_final = re.compile(
+            r"^\s*(?:assistant)?\s*(analysis|commentary)(.*?)\s*assistantfinal\s*(.*)\s*$",
+            re.IGNORECASE | re.DOTALL,
+        )
+        self.text_final_only = re.compile(
+            r"^\s*assistantfinal\s*(.*)\s*$", re.IGNORECASE | re.DOTALL
+        )
+        self.text_analysis_only = re.compile(
+            r"^\s*(?:assistant)?\s*(analysis|commentary)(.*)\s*$",
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        self.analysis_channel_pattern = re.compile(
+            r"(?:<\|start\|>assistant)?<\|channel\|>analysis<\|message\|>(.*?)<\|end\|>",
+            re.DOTALL,
+        )
+
+        self.final_channel_pattern = re.compile(
+            r"<\|start\|>assistant<\|channel\|>final<\|message\|>(.*?)<\|return\|>",
+            re.DOTALL,
+        )
+
+        # For streaming text-based format
+        self._text_streamed_len = 0
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses both analysis and final channels.
         Tool call channels are preserved in normal_text for downstream processing.
 
-        HACK: Also handles simplified format where text starts with "analysis" and transitions
+        Handles text-based Harmony format where text starts with "analysis" and transitions
         to "assistantfinal" without full channel markers.
         """
-        # HACK: Handle simplified format (analysis...assistantfinal) without channel markers
-        if (
-            text.startswith("analysis")
-            and "assistantfinal" in text
-            and "<|channel|>" not in text
-        ):
-            # Split on "assistantfinal"
-            parts = text.split("assistantfinal", 1)
-            self._in_reasoning = False
-            if len(parts) == 2:
-                reasoning_text = parts[0][
-                    len("analysis") :
-                ].strip()  # Remove "analysis" prefix
-                normal_text = parts[1].strip()
+        # Handle text-based Harmony format first (no channel markers)
+        if "<|channel|>" not in text:
+            # Check for analysis...assistantfinal pattern
+            m = self.text_analysis_then_final.match(text)
+            if m:
+                channel_type = m.group(1).lower()
+                # Only extract reasoning from 'analysis' channel, not 'commentary'
+                if channel_type == "analysis":
+                    reasoning_text = m.group(2).strip() or None
+                else:
+                    reasoning_text = None
+                normal_text = m.group(3).strip()
+                self._in_reasoning = False
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
 
-        reasoning_parts = []
-        normal_parts = []
-        current_pos = 0
-
-        # Process text sequentially to preserve tool calls between analysis sections
-        while current_pos < len(text):
-            # Look for next analysis channel
-            analysis_start_idx = text.find(self.think_start_token, current_pos)
-
-            if analysis_start_idx == -1:
-                # No more analysis channels, rest goes to remaining
-                break
-
-            # Preserve any content before this analysis channel (could include tool calls)
-            if analysis_start_idx > current_pos:
-                between_content = text[current_pos:analysis_start_idx]
-                # This content will be added to normal_parts later
-                normal_parts.append(between_content)
-
-            # Extract analysis content
-            analysis_content_start = analysis_start_idx + len(self.think_start_token)
-            analysis_end_idx = text.find(self.think_end_token, analysis_content_start)
-
-            if analysis_end_idx != -1:
-                reasoning_parts.append(
-                    text[analysis_content_start:analysis_end_idx].strip()
+            # Check for assistantfinal-only pattern
+            m = self.text_final_only.match(text)
+            if m:
+                return StreamingParseResult(
+                    normal_text=m.group(1).strip(), reasoning_text=None
                 )
-                current_pos = analysis_end_idx + len(self.think_end_token)
-            else:
-                # Analysis not complete
-                reasoning_parts.append(text[analysis_content_start:].strip())
-                reasoning_text = "".join(reasoning_parts)
-                return StreamingParseResult(reasoning_text=reasoning_text)
 
-        # Add any remaining text after all analysis sections
-        if current_pos < len(text):
-            remaining = text[current_pos:]
-            normal_parts.append(remaining)
-
-        # Process non-analysis content for commentary sections
-        full_normal_text = "".join(normal_parts)
-
-        # Extract reasoning from non-tool-call commentary sections
-        # Tool calls have "to=" in their header, regular commentary does not
-        commentary_pattern = re.compile(
-            r"<\|start\|>assistant<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)",
-            re.DOTALL,
-        )
-
-        cleaned_text = full_normal_text
-        for match in reversed(list(commentary_pattern.finditer(full_normal_text))):
-            # Check if this commentary is a tool call by looking at the text before <|message|>
-            match_start = match.start()
-            # Find where "<|channel|>commentary" starts within the matched pattern
-            # The pattern starts with "<|start|>assistant<|channel|>commentary"
-            # So we look for the text between "commentary" and "<|message|>" in the match
-            match_text = full_normal_text[match_start : match.end()]
-            commentary_idx = match_text.find("<|channel|>commentary")
-            if commentary_idx != -1:
-                message_idx = match_text.find("<|message|>", commentary_idx)
-                if message_idx != -1:
-                    between_text = match_text[commentary_idx:message_idx]
-                    # If no "to=" found, this is regular commentary (reasoning content)
-                    if " to=" not in between_text:
-                        content = match.group(1).strip()
-                        reasoning_parts.append(content)
-                        # Remove this commentary section from normal text
-                        cleaned_text = (
-                            cleaned_text[: match.start()] + cleaned_text[match.end() :]
-                        )
-
-        full_normal_text = cleaned_text
-
-        # Combine all reasoning parts
-        reasoning_text = "".join(reasoning_parts)
-
-        # Process full_normal_text for final output
-        normal_text = ""
-        if self.final_channel_start in full_normal_text:
-            final_start = full_normal_text.find(self.final_channel_start)
-            final_content_start = final_start + len(self.final_channel_start)
-            final_end = full_normal_text.find(
-                self.final_channel_end, final_content_start
-            )
-
-            if final_end != -1:
-                # Extract content before final channel (includes tool calls)
-                before_final = full_normal_text[:final_start].strip()
-                # Extract ONLY the final channel content (not the channel markers)
-                final_text = full_normal_text[final_content_start:final_end].strip()
-                # Extract content after final channel
-                after_final = full_normal_text[
-                    final_end + len(self.final_channel_end) :
-                ].strip()
-
-                # For tool calls + final answer: concatenate tool calls with final text
-                parts = []
-                if before_final:
-                    parts.append(before_final)
-                if final_text:
-                    parts.append(final_text)
-                if after_final:
-                    parts.append(after_final)
-                normal_text = " ".join(parts)
-            else:
-                # Final channel not complete - extract what we have
-                # Look for just <|channel|>final<|message|> without <|return|>
-                alt_final_start = full_normal_text.find("<|channel|>final<|message|>")
-                if alt_final_start != -1:
-                    before_alt_final = full_normal_text[:alt_final_start].strip()
-                    alt_final_content = full_normal_text[
-                        alt_final_start + len("<|channel|>final<|message|>") :
-                    ].strip()
-
-                    parts = []
-                    if before_alt_final:
-                        parts.append(before_alt_final)
-                    if alt_final_content:
-                        parts.append(alt_final_content)
-                    normal_text = " ".join(parts)
+            # Check for analysis-only pattern (no assistantfinal)
+            m = self.text_analysis_only.match(text)
+            if m:
+                channel_type = m.group(1).lower()
+                if channel_type == "analysis":
+                    reasoning_text = m.group(2).strip() or None
+                    return StreamingParseResult(
+                        normal_text="", reasoning_text=reasoning_text
+                    )
                 else:
-                    normal_text = full_normal_text.strip()
+                    # Commentary-only without assistantfinal - treat as normal text
+                    return StreamingParseResult(
+                        normal_text=text.strip(), reasoning_text=None
+                    )
+
+        # Handle canonical format with channel markers
+        work = text
+
+        # Extract reasoning from analysis channels only
+        analysis_matches = list(self.analysis_channel_pattern.finditer(work))
+        reasoning_parts = [
+            m.group(1).strip() for m in analysis_matches if m.group(1).strip()
+        ]
+
+        # Remove analysis sections from work buffer
+        work = self.analysis_channel_pattern.sub("", work)
+
+        # Don't extract commentary as reasoning - per docs, commentary without to=
+        # can be user-visible preambles, not chain-of-thought
+
+        # Extract final channel content
+        normal_text = ""
+        fm = self.final_channel_pattern.search(work)
+        if fm:
+            # Take the first complete final channel
+            before = work[: fm.start()].strip()
+            final_text = fm.group(1).strip()
+            # Combine before content (tool calls) with final text, preserve order
+            parts = [p for p in (before, final_text) if p]
+            normal_text = " ".join(parts)
         else:
-            # No final channel, treat all as normal text (includes tool calls)
-            normal_text = full_normal_text.strip()
+            # No final channel, treat all remaining as normal text (includes tool calls)
+            normal_text = work.strip()
+
+        # Normalize empty reasoning to None
+        reasoning_text = " ".join(reasoning_parts).strip() or None
 
         return StreamingParseResult(
             normal_text=normal_text, reasoning_text=reasoning_text
@@ -378,7 +333,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
 
         This is a simplified streaming implementation that accumulates content
         and delegates to the non-streaming parser for complex multi-channel parsing.
-        TODO: Implement proper incremental parsing for better streaming performance.
+        Handles text-based Harmony format with incremental reasoning streaming.
         """
         self._buffer += new_text
 
@@ -387,51 +342,94 @@ class GptOssDetector(BaseReasoningFormatDetector):
 
         # Check if we have complete sections to process
         # For GPT-OSS, we need to wait for complete channel sections
-        # HACK: For now, use simplified approach - wait for key markers before processing
-        key_markers = ["<|end|>", "<|call|>", "<|return|>", "assistantfinal"]
-        has_complete_section = any(marker in self._buffer for marker in key_markers)
+        buf_low = self._buffer.lower()
+        key_markers = ["<|end|>", "<|call|>", "<|return|>"]
+        has_complete_section = any(
+            marker in self._buffer for marker in key_markers
+        ) or ("assistantfinal" in buf_low)
 
         if not has_complete_section:
             # Still accumulating, don't process yet
             return StreamingParseResult()
 
-        # Handle simplified format (analysis...assistantfinal) with true incremental streaming
-        if (
-            "<|channel|>" not in self._buffer
-        ):  # Simplified format without channel markers
-            if self._buffer.startswith("analysis"):
-                # Check if we have the transition to assistantfinal
-                if "assistantfinal" in self._buffer:
-                    self._in_reasoning = False
-                    # Complete reasoning section - extract and stream it
-                    parts = self._buffer.split("assistantfinal", 1)
-                    reasoning_text = parts[0][len("analysis") :].strip()
-                    final_content = parts[1].strip()
-
-                    # Clear buffer and return both reasoning and final content
-                    self._buffer = ""
-                    return StreamingParseResult(
-                        reasoning_text=reasoning_text if self.stream_reasoning else "",
-                        normal_text=final_content,
-                    )
-                elif self.stream_reasoning:
-                    # Stream reasoning content incrementally as it arrives
-                    current_reasoning = self._buffer[len("analysis") :].strip()
-                    self._buffer = ""
-                    return StreamingParseResult(reasoning_text=current_reasoning)
-                else:
-                    # Wait for assistantfinal
-                    return StreamingParseResult()
-            elif self._buffer.startswith("assistantfinal"):
-                # Direct final content without analysis
-                final_content = self._buffer[len("assistantfinal") :].strip()
+        # Handle text-based Harmony format with incremental streaming
+        if "<|channel|>" not in self._buffer:  # Text format without channel markers
+            # Check for assistantfinal-only pattern first
+            m = self.text_final_only.match(self._buffer)
+            if m:
+                out = StreamingParseResult(
+                    normal_text=m.group(1).strip(), reasoning_text=None
+                )
                 self._buffer = ""
-                return StreamingParseResult(normal_text=final_content)
+                self._in_reasoning = False
+                self._text_streamed_len = 0  # Reset for next stream
+                return out
+
+            # Check for analysis-only pattern (no assistantfinal)
+            if "assistantfinal" not in buf_low:
+                m = self.text_analysis_only.match(self._buffer)
+                if m:
+                    channel_type = m.group(1).lower()
+                    if channel_type == "analysis":
+                        reasoning_text = m.group(2).strip() or None
+                        out = StreamingParseResult(
+                            normal_text="",
+                            reasoning_text=(
+                                reasoning_text if self.stream_reasoning else None
+                            ),
+                        )
+                    else:
+                        # Commentary-only - treat as normal text
+                        out = StreamingParseResult(
+                            normal_text=self._buffer.strip(), reasoning_text=None
+                        )
+                    self._buffer = ""
+                    self._in_reasoning = False
+                    self._text_streamed_len = 0  # Reset for next stream
+                    return out
+
+            # Check for analysis...assistantfinal pattern
+            m = self.text_analysis_then_final.match(self._buffer)
+            if m:
+                channel_type = m.group(1).lower()
+                self._in_reasoning = False
+
+                if channel_type == "analysis":
+                    reasoning_text = m.group(2).strip() or None
+                    # Only return reasoning if stream_reasoning is True
+                    if self.stream_reasoning:
+                        reasoning_to_return = reasoning_text
+                    else:
+                        reasoning_to_return = None
+                else:
+                    # Commentary - don't extract as reasoning
+                    reasoning_to_return = None
+
+                final_content = m.group(3).strip()
+                self._buffer = ""
+                self._text_streamed_len = 0  # Reset for next stream
+                return StreamingParseResult(
+                    reasoning_text=reasoning_to_return,
+                    normal_text=final_content,
+                )
+
+            # For incremental streaming of analysis content before assistantfinal
+            m = re.match(
+                r"^\s*(?:assistant)?\s*(analysis)", self._buffer, re.IGNORECASE
+            )
+            if m and self.stream_reasoning and "assistantfinal" not in buf_low:
+                start = m.end()  # chars to skip before reasoning payload
+                current = self._buffer[start:].strip()
+                if len(current) > self._text_streamed_len:
+                    delta = current[self._text_streamed_len :]
+                    self._text_streamed_len = len(current)
+                    return StreamingParseResult(reasoning_text=delta)
+                return StreamingParseResult()
 
         # For full channel format, process sections as they complete
         result = StreamingParseResult()
 
-        # Process complete analysis sections
+        # Process complete analysis sections (reasoning only from analysis, not commentary)
         while (
             self.think_start_token in self._buffer
             and self.think_end_token in self._buffer
@@ -443,7 +441,9 @@ class GptOssDetector(BaseReasoningFormatDetector):
             if end_pos != -1:
                 reasoning_content = self._buffer[start_pos:end_pos].strip()
                 if self.stream_reasoning and reasoning_content:
-                    result.reasoning_text += reasoning_content
+                    result.reasoning_text = (
+                        result.reasoning_text or ""
+                    ) + reasoning_content
 
                 # Remove processed analysis section
                 self._buffer = (
@@ -452,26 +452,6 @@ class GptOssDetector(BaseReasoningFormatDetector):
                 )
             else:
                 break
-
-        # Process complete commentary sections
-        commentary_pattern = re.compile(
-            r"<\|start\|>assistant<\|channel\|>commentary<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)",
-            re.DOTALL,
-        )
-
-        for match in reversed(list(commentary_pattern.finditer(self._buffer))):
-            # Check if this is a tool call
-            start_pos = match.start()
-            commentary_content = match.group(1).strip()
-            if self.stream_reasoning and commentary_content:
-                result.reasoning_text += commentary_content
-
-            # Remove this commentary section
-            self._buffer = self._buffer[: match.start()] + self._buffer[match.end() :]
-            # Clean up any standalone <|start|>assistant
-            self._buffer = re.sub(
-                r"<\|start\|>assistant(?=<\|start\|>assistant)", "", self._buffer
-            )
 
         # Handle final channel completion
         if self.final_channel_start in self._buffer:
@@ -484,16 +464,18 @@ class GptOssDetector(BaseReasoningFormatDetector):
                 # Complete final channel - process everything
                 final_result = self.detect_and_parse(self._buffer)
                 self._buffer = ""
+                self._text_streamed_len = 0  # Reset for next stream
                 return StreamingParseResult(
                     normal_text=final_result.normal_text,
-                    reasoning_text=result.reasoning_text + final_result.reasoning_text,
+                    reasoning_text=(result.reasoning_text or "")
+                    + (final_result.reasoning_text or ""),
                 )
             else:
                 # Extract content before final channel (e.g. tool calls)
                 before_final = self._buffer[:final_start]
                 if before_final:
                     # Output tool calls for processing
-                    result.normal_text += before_final
+                    result.normal_text = (result.normal_text or "") + before_final
                     # Keep the final channel part in buffer
                     self._buffer = self._buffer[final_start:]
 
