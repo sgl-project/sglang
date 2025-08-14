@@ -14,7 +14,7 @@ class StreamingParseResult:
         tool_calls: Optional[list] = None,
     ):
         self.normal_text = normal_text or ""
-        self.reasoning_text = reasoning_text
+        self.reasoning_text = reasoning_text or ""
         self.tool_calls = tool_calls or []
 
 
@@ -210,7 +210,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         events = self.parser.parse(text)
-        # Assuming the buffer is flushed for one-shot parsing
+        # Flush the buffer for one-shot parsing
         events += self.parser.parse("")
 
         reasoning_text = "".join(
@@ -220,8 +220,8 @@ class GptOssDetector(BaseReasoningFormatDetector):
         tool_calls = [e.content for e in events if e.event_type == "tool_call"]
 
         return StreamingParseResult(
-            normal_text=normal_text or None,
-            reasoning_text=reasoning_text if reasoning_text else None,
+            normal_text=normal_text,
+            reasoning_text=reasoning_text,
             tool_calls=tool_calls,
         )
 
@@ -235,8 +235,8 @@ class GptOssDetector(BaseReasoningFormatDetector):
         tool_calls = [e.content for e in events if e.event_type == "tool_call"]
 
         return StreamingParseResult(
-            normal_text=normal_text or None,
-            reasoning_text=reasoning_text if reasoning_text else None,
+            normal_text=normal_text,
+            reasoning_text=reasoning_text,
             tool_calls=tool_calls,
         )
 
