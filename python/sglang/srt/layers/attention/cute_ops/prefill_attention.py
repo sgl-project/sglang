@@ -15,8 +15,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-# from flash_fwd_sm100 import FlashAttentionForwardSm100
-# from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_fwd_sm100 import FlashAttentionForwardSm100
 
 def _green(x: str) -> str:
     return f"\033[1;32m{x}\033[0m"
@@ -316,41 +315,41 @@ def _ref_impl(
 _flash_attn_fwd.compile_cache = {}
 
 
-# def flash_attn_varlen_func(
-#     q: torch.Tensor,
-#     k: torch.Tensor,
-#     v: torch.Tensor,
-#     cu_seqlens_q: Optional[torch.Tensor] = None,
-#     cu_seqlens_k: Optional[torch.Tensor] = None,
-#     seqused_q: Optional[torch.Tensor] = None,
-#     seqused_k: Optional[torch.Tensor] = None,
-#     softmax_scale: Optional[float] = None,
-#     causal: bool = True,
-#     window_size: tuple[Optional[int], Optional[int]] = (None, None),
-#     learnable_sink: Optional[torch.Tensor] = None,
-#     softcap: float = 0.0,
-# ) -> tuple[torch.Tensor, torch.Tensor]:
-#     assert causal, "Only support causal."
-#     assert (
-#         window_size[0] is None and window_size[1] is None
-#     ), "window_size is not supported."
-# 
-#     out, lse = _flash_attn_fwd(
-#         q,
-#         k,
-#         v,
-#         cu_seqlens_q,
-#         cu_seqlens_k,
-#         seqused_q,
-#         seqused_k,
-#         softmax_scale=softmax_scale,
-#         causal=causal,
-#         window_size_left=window_size[0],
-#         window_size_right=window_size[1],
-#         learnable_sink=learnable_sink,
-#         softcap=softcap,
-#     )
-#     return out, lse
+def flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    window_size: tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert causal, "Only support causal."
+    assert (
+        window_size[0] is None and window_size[1] is None
+    ), "window_size is not supported."
+
+    out, lse = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+    )
+    return out, lse
 
 
 def test_ragged(
@@ -367,8 +366,6 @@ def test_ragged(
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
-
-    from flash_attn.cute.interface import flash_attn_varlen_func
 
     qo_len = sum(qo_lens)
     kv_len = sum(kv_lens)
@@ -414,7 +411,10 @@ def test_ragged(
         softmax_scale=softmax_scale,
     )
 
-    print(_green(f"--> {q.shape=} {k.shape=} {v.shape=}"), f"{ref.shape=}")
+    diff = (out - ref).abs_().max().item()
+
+    print(_green(f"--> {q.shape=} {k.shape=} {v.shape=}"), f"{ref.shape=}", f"{out.shape=}")
+    print(_green("max_diff: "), f"{diff:<.5f}", flush=True)
 
 
 if __name__ == "__main__":
@@ -426,3 +426,21 @@ if __name__ == "__main__":
         head_dim=128,
         softmax_scale=None,
     )
+
+    # test_ragged(
+    #     qo_lens=(128,),
+    #     kv_lens=(1024,),
+    #     num_qo_heads=4,
+    #     num_kv_heads=4,
+    #     head_dim=128,
+    #     softmax_scale=None,
+    # )
+
+    # test_ragged(
+    #     qo_lens=(1024,),
+    #     kv_lens=(1024,),
+    #     num_qo_heads=8,
+    #     num_kv_heads=1,
+    #     head_dim=128,
+    #     softmax_scale=None,
+    # )

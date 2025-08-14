@@ -21,6 +21,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
@@ -1052,7 +1053,7 @@ class FlashAttentionForwardSm100:
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
-        pipeline_kv,  # cutlass.pipeline.PipelineAsync,
+        pipeline_kv: pipeline.PipelineAsync,
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
@@ -1060,8 +1061,8 @@ class FlashAttentionForwardSm100:
     ):
 
         q_producer_phase = Int32(1)
-        kv_producer_state = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Producer, self.kv_stage
+        kv_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.kv_stage
         )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1192,7 +1193,7 @@ class FlashAttentionForwardSm100:
         tStSs: tuple[cute.Tensor, cute.Tensor],
         tOtOs: tuple[cute.Tensor],
         tOrPs: tuple[cute.Tensor, cute.Tensor],
-        pipeline_kv,  # : cutlass.pipeline.PipelineAsync,
+        pipeline_kv: pipeline.PipelineAsync,
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
@@ -1237,8 +1238,8 @@ class FlashAttentionForwardSm100:
         ]
 
         mma_q_consumer_phase = Int32(0)
-        mma_kv_consumer_state = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.kv_stage
+        mma_kv_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.kv_stage
         )
         P_full_O_rescaled_phase = Int32(0)
 
@@ -2337,7 +2338,7 @@ class FlashAttentionForwardSm100:
         mbar_full_ptr: cute.Pointer,
         mbar_empty_ptr: cute.Pointer,
         block: Int32,
-        producer_state,  # : cutlass.pipeline.PipelineState,
+        producer_state: pipeline.PipelineState,
         K_or_V: str,
     ):
         assert K_or_V in ("K", "V")
@@ -2377,13 +2378,13 @@ class FlashAttentionForwardSm100:
             return sX
 
     def make_and_init_load_kv_pipeline(self, load_kv_mbar_ptr):
-        load_kv_producer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, len([self.load_warp_id])
+        load_kv_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, len([self.load_warp_id])
         )
-        load_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
+        load_kv_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, len([self.mma_warp_id])
         )
-        return cutlass.pipeline.PipelineTmaUmma.create(
+        return pipeline.PipelineTmaUmma.create(
             barrier_storage=load_kv_mbar_ptr,
             num_stages=self.kv_stage,
             producer_group=load_kv_producer_group,
