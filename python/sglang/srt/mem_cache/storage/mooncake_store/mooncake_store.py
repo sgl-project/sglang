@@ -221,7 +221,7 @@ class MooncakeStore(HiCacheStorage):
         keys: List[str],
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> List[int] | None:
+    ) -> bool:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
             return
@@ -230,7 +230,8 @@ class MooncakeStore(HiCacheStorage):
             if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
                 return
 
-        return self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
+        get_result = self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
+        return all(v >= 0 for v in get_result)
 
     def exists(self, keys) -> list[int] | None:
         _keys = []
