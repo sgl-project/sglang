@@ -251,7 +251,7 @@ class CudaGraphRunner(GraphRunner):
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        rank0_log(f"Capture graph bs {self.capture_bs}")
+        rank0_log(f"Capture cuda graph bs {self.capture_bs}")
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs

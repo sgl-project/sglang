@@ -184,9 +184,8 @@ class SchedulerMetricsMixin:
             msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
-        graph_msg = f"cpu torch-compile" if self.device == "cpu" else "cuda graph"
         msg += (
-            f"{graph_msg}: {can_run_graph}, "
+            f"{'cpu graph' if self.device == 'cpu' else 'cuda graph'}: {can_run_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )

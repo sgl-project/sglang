@@ -1,12 +1,10 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/parameter.py"""
 
-import copy
 import logging
 from fractions import Fraction
 from typing import Callable, Optional, Union
 
 import torch
-import torch.utils._pytree as pytree
 from torch.nn import Parameter
 
 from sglang.srt.utils import is_cpu
