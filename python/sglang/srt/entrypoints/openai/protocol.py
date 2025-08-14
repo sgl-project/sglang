@@ -240,6 +240,7 @@ class CompletionResponse(BaseModel):
     model: str
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class CompletionResponseStreamChoice(BaseModel):
@@ -517,6 +518,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class DeltaMessage(BaseModel):
