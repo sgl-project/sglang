@@ -1911,7 +1911,7 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
     output_m: int,
     shuffle_map: Optional[torch.Tensor] = None,
     expert_tokens_alignment: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     assert a_s.dim() == 2
     assert a_s.is_contiguous(), "`A` is not contiguous"
 
