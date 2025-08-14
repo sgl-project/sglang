@@ -176,6 +176,9 @@ if (ENABLE_BELOW_SM90)
     )
 endif()
 
+list(APPEND SGL_KERNEL_CUDA_FLAGS
+    "-use_fast_math"
+)
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
@@ -184,10 +187,6 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
         "-gencode=arch=compute_101a,code=sm_101a"
         "-gencode=arch=compute_120,code=sm_120"
         "-gencode=arch=compute_120a,code=sm_120a"
-    )
-else()
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-use_fast_math"
     )
 endif()
 
@@ -298,8 +297,6 @@ target_include_directories(common_ops PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
-set_source_files_properties("csrc/gemm/per_token_group_quant_8bit" PROPERTIES COMPILE_OPTIONS "--use_fast_math")
-
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
