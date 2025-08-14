@@ -150,8 +150,19 @@ class _BaseWarmupExecutor:
         raise NotImplementedError
 
 
-def _empty_on_device(size):
-    return torch.empty(size, device="cuda")
+def _empty_token_fp8(size):
+    *dims, k = size
+    return (
+        torch.empty(size, device="cuda"),
+        torch.empty((*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda"),
+    )
+
+def _empty_block_fp8(size):
+    *dims, n, k = size
+    return (
+        torch.empty(size, device="cuda"),
+        torch.empty((*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)), device="cuda"),
+    )
 
 
 _BLOCK_SIZE = 128
@@ -160,10 +171,8 @@ _BLOCK_SIZE = 128
 class _NormalWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         assert num_groups is None
-        self.lhs_q = _empty_on_device((max_m, k))
-        self.lhs_s = _empty_on_device((max_m, ceil_div(k, _BLOCK_SIZE)))
-        self.rhs_q = _empty_on_device((n, k))
-        self.rhs_s = _empty_on_device((ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)))
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8((n, k))
         self.out = torch.empty((max_m, n), device="cuda")
 
     def execute(self, m):
@@ -176,10 +185,8 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
 
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q = _empty_on_device((max_m, k))
-        self.lhs_s = _empty_on_device((max_m, ceil_div(k, _BLOCK_SIZE)))
-        self.rhs_q = _empty_on_device((num_groups, n, k))
-        self.rhs_s = _empty_on_device((num_groups, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)))
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
         self.m_indices = torch.zeros((max_m,), device="cuda")
         self.out = torch.empty((max_m, n), device="cuda")
 
@@ -194,10 +201,8 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
 
 class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q = _empty_on_device((num_groups, max_m, k))
-        self.lhs_s = TODO
-        self.rhs_q = _empty_on_device((num_groups, n, k))
-        self.rhs_s = TODO
+        self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
         self.masked_m = torch.zeros((num_groups,), device="cuda")
         self.out = torch.empty((num_groups, max_m, n), device="cuda")
 
