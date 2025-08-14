@@ -19,8 +19,11 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
-from sglang.srt.layers.quantization.utils import pack_cols, unpack_cols
+from sglang.srt.layers.quantization.utils import (
+    get_scalar_types,
+    pack_cols,
+    unpack_cols,
+)
 from sglang.srt.utils import get_device_capability
 
 if TYPE_CHECKING:
@@ -32,6 +35,8 @@ except ImportError:
     ops = None
 
 logger = logging.getLogger(__name__)
+
+ScalarType, scalar_types = get_scalar_types()
 
 GPTQ_MARLIN_TILE = 16
 GPTQ_MARLIN_MIN_THREAD_N = 64
