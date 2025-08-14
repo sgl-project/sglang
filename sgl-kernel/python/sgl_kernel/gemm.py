@@ -310,22 +310,29 @@ def scaled_fp4_grouped_quant(
     """
     device = input_tensor.device
     l, m, k = input_tensor.shape
-    offsets = torch.arange(
+    sf_vec_size = 16
+    assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
+
+    scale_k = k // sf_vec_size
+    padded_k = (scale_k + (4 - 1)) // 4 * 4
+    padded_k_int32 = padded_k // 4
+    padded_m = (m + (128 - 1)) // 128 * 128
+    output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
+    output_scales = torch.empty(l, padded_m, padded_k_int32, device=device, dtype=torch.int32)
+    input_offsets = torch.arange(
         0, (l + 1) * m * k, step=m * k, dtype=torch.int, device=device
     )
-    sf_vec_size = 16
-    scale_k = k // sf_vec_size
-    padded_k = (scale_k + (4 - 1)) // 4  # 4 is bytes per int32
-    output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
-    output_scales = torch.empty(l, m, padded_k, device=device, dtype=torch.int32)
+    output_offsets = torch.arange(
+        0, (l + 1) * padded_m * padded_k_int32, step=padded_m * padded_k_int32, dtype=torch.int, device=device
+    )
 
     torch.ops.sgl_kernel.scaled_fp4_experts_quant.default(
         output.view(l * m, k // 2),
-        output_scales.view(l * m, padded_k),
+        output_scales.view(l * m, padded_k_int32),
         input_tensor.view(l * m, k),
         input_global_scale,
-        offsets,
-        offsets,
+        input_offsets,
+        output_offsets,
     )
     # The physical layout of the output is (l, m, k // 2), but we want to return a
     # logical layout (m, k // 2, l) required by the flashinfer masked group gemm.
@@ -334,7 +341,7 @@ def scaled_fp4_grouped_quant(
     # requirement for the flashinfer masked group gemm, where rm=m/128 and rk=k/4. The logic
     # layout is (32, 4, rm, 4, rk, l).
     output_scales = output_scales.view(torch.float8_e4m3fn).view(
-        l, m // 128, scale_k // 4, 32, 4, 4
+        l, padded_m // 128, padded_k // 4, 32, 4, 4
     )
     output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
     return output, output_scales
