@@ -306,16 +306,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor output, Tensor? key, Tensor? value, "
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor(a!) output, Tensor? key, Tensor? "
+      "value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
       "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
   m.def(
-      "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor o_extend, Tensor k_buffer, "
+      "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
-      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? "
+      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
+      "sliding_window_size, Tensor? "
       "encoder_lens, Tensor? sinks) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
