@@ -89,6 +89,7 @@ def _maybe_compile_deep_gemm_one_type_all(
     ):
         _INITIALIZATION_DICT[query_key] = True
 
+        # TODO maybe improve logs
         if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
             logger.warning(
                 "Entering DeepGEMM JIT Pre-Compile session. "
@@ -132,7 +133,7 @@ def _compile_deep_gemm_one_type_all(
     )
 
     # TODO can use multi thread
-    for m in tqdm(m_list, desc=f"DeepGEMM warmup for {kernel_type.name}"):
+    for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
         executor.execute(m=m)
 
 
