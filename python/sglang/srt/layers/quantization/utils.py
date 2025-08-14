@@ -321,6 +321,30 @@ def pack_cols(
     return q_res
 
 
+def pack_rows(
+    q_w: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+):
+    assert q_w.shape == (size_k, size_n)
+
+    pack_factor = get_pack_factor(num_bits)
+    assert size_k % pack_factor == 0
+
+    orig_device = q_w.device
+
+    q_w = q_w.cpu().numpy().astype(numpy.uint32)
+
+    q_res = numpy.zeros((size_k // pack_factor, size_n), dtype=numpy.uint32)
+
+    for i in range(pack_factor):
+        q_res |= q_w[i::pack_factor, :] << num_bits * i
+
+    q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
+    return q_res
+
+
 def unpack_cols(
     packed_q_w: torch.Tensor,
     num_bits: int,
