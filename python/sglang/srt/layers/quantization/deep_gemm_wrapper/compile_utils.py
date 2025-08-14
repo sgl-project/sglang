@@ -177,9 +177,9 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q = _empty_on_device((max_m, k))
-        self.lhs_s = TODO
+        self.lhs_s = _empty_on_device((max_m, ceil_div(k, _BLOCK_SIZE)))
         self.rhs_q = _empty_on_device((num_groups, n, k))
-        self.rhs_s = TODO
+        self.rhs_s = _empty_on_device((num_groups, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)))
         self.m_indices = torch.zeros((max_m,), device="cuda")
         self.out = _empty_on_device((max_m, n))
 
