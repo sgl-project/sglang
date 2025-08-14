@@ -1130,6 +1130,35 @@ def sample_random_requests(
     return input_requests
 
 
+def parse_random_image_resolution(image_resolution: str) -> Tuple[int, int]:
+    """Parse image resolution into (width, height).
+
+    Supports presets '1080p', '720p', '360p' and custom 'heightxwidth' format
+    (e.g., '1080x1920' means height=1080, width=1920).
+    """
+    resolution_to_size = {
+        "1080p": (1920, 1080),
+        "720p": (1280, 720),
+        "360p": (640, 360),
+    }
+    if image_resolution in resolution_to_size:
+        return resolution_to_size[image_resolution]
+
+    res = image_resolution.strip().lower()
+    if "x" in res:
+        parts = res.split("x")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            height = int(parts[0])
+            width = int(parts[1])
+            if height > 0 and width > 0:
+                return (width, height)
+
+    raise ValueError(
+        f"Unsupported random-image resolution: {image_resolution}. "
+        "Choose from 1080p, 720p, 360p, or provide custom 'heightxwidth' (e.g., 1080x1920)."
+    )
+
+
 def sample_random_image_requests(
     num_requests: int,
     num_images: int,
@@ -1143,7 +1172,8 @@ def sample_random_image_requests(
     """Generate requests with random images.
 
     - Each request includes ``num_images`` random images.
-    - Supported resolutions: 1080p (1920x1080), 720p (1280x720), 360p (640x360).
+    - Supported resolutions: 1080p (1920x1080), 720p (1280x720), 360p (640x360),
+      or custom 'heightxwidth' (e.g., 1080x1920).
     - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
       only counts text tokens and excludes image data.
     """
@@ -1154,17 +1184,10 @@ def sample_random_image_requests(
             "Please install Pillow to generate random images: pip install pillow"
         ) from e
 
-    # Parse resolution
-    resolution_to_size = {
-        "1080p": (1920, 1080),
-        "720p": (1280, 720),
-        "360p": (640, 360),
-    }
-    if image_resolution not in resolution_to_size:
-        raise ValueError(
-            f"Unsupported random-image resolution: {image_resolution}. Choose from 1080p, 720p, 360p."
-        )
-    width, height = resolution_to_size[image_resolution]
+    import base64
+
+    # Parse resolution (supports presets and 'heightxwidth')
+    width, height = parse_random_image_resolution(image_resolution)
 
     # Sample text lengths
     input_lens = np.random.randint(
@@ -2006,9 +2029,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-image-resolution",
         type=str,
-        choices=["1080p", "720p", "360p"],
         default="1080p",
-        help="Resolution of random images for random-image dataset.",
+        help=(
+            "Resolution of random images for random-image dataset. "
+            "Supports presets 1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
+        ),
     )
     parser.add_argument(
         "--request-rate",
