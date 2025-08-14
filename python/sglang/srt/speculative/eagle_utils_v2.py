@@ -373,35 +373,22 @@ class FutureSpecInfoMap:
         if spec_info is None:
             return
 
-        def _resolve_field(ref_list, field_tensor):
-            # Only resolve when it's a vector of negative reference ids
-            if field_tensor is None:
-                return None
-            if field_tensor.dim() != 1:
-                return field_tensor
-            if field_tensor.dtype not in (torch.int64, torch.int32):
-                return field_tensor
-            if not torch.all(field_tensor < 0):
-                return field_tensor
-            # Expect a vector of negative reference ids
-            ids = (-field_tensor).tolist()
-            stacked = []
-            for rid in ids:
-                slot = rid
-                value = ref_list[slot]
-                stacked.append(value)
-            return torch.stack(stacked, dim=0)
+        ids = (-spec_info.topk_p).tolist()
 
-        spec_info.topk_p = _resolve_field(self.future_topk_p_map, spec_info.topk_p)
-        spec_info.topk_index = _resolve_field(self.future_topk_index_map, spec_info.topk_index)
-        spec_info.hidden_states = _resolve_field(self.future_hidden_states_map, spec_info.hidden_states)
-        spec_info.verified_id = _resolve_field(self.future_verified_id_map, spec_info.verified_id)
-        spec_info.new_seq_lens = _resolve_field(self.future_new_seq_lens_map, spec_info.new_seq_lens)
-        # update spec_info.allocate_lens with allocate_lens if not None because it is updated when allocate_for_eagle
-        if allocate_lens is not None:
-            spec_info.allocate_lens = allocate_lens
-        else:
-            spec_info.allocate_lens = _resolve_field(self.future_allocate_lens_map, spec_info.allocate_lens)
+        topk_p_stacked = [self.future_topk_p_map[idx] for idx in ids]
+        topk_index_stacked = [self.future_topk_index_map[idx] for idx in ids]
+        hidden_states_stacked = [self.future_hidden_states_map[idx] for idx in ids]
+        verified_id_stacked = [self.future_verified_id_map[idx] for idx in ids]
+        new_seq_lens_stacked = [self.future_new_seq_lens_map[idx] for idx in ids]
+        
+        # TODO: think if there's a good way to hide the stack overhead
+        # e.g. when the ids are continuous, we can just use a pointer to the first element
+        spec_info.topk_p = torch.stack(topk_p_stacked, dim=0)
+        spec_info.topk_index = torch.stack(topk_index_stacked, dim=0)
+        spec_info.hidden_states = torch.stack(hidden_states_stacked, dim=0)
+        spec_info.verified_id = torch.stack(verified_id_stacked, dim=0)
+        spec_info.new_seq_lens = torch.stack(new_seq_lens_stacked, dim=0)
+        spec_info.allocate_lens = allocate_lens
 
     def get_next_future(self, bs: int) -> EagleDraftInput:
         # future_spec_info_indices is a reference to the next spec_info fields, val is a reference id stored as a negative index.
