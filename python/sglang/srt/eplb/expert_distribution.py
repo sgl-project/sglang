@@ -287,14 +287,14 @@ class _SinglePassGatherer(ABC):
             )
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
-            if server_args.moe_a2a_backend is not None and (
+            if server_args.moe_a2a_backend != "none" and (
                 server_args.deepep_mode == "normal"
             ):
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
-        if server_args.moe_a2a_backend is not None:
+        if server_args.moe_a2a_backend != "none":
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":
