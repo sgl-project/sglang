@@ -25,7 +25,7 @@ class _ForwardMetaData:
     kv_indices: torch.Tensor
     qo_indptr: torch.Tensor
 
-    # Sliding window
+    # Sliding windowcute
     window_kv_indptr: torch.Tensor
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
@@ -54,6 +54,7 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        sinks=None,
     ):
         return q
 
