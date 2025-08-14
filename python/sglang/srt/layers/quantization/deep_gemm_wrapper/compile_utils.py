@@ -1,12 +1,10 @@
 import logging
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
-from tqdm.contrib.concurrent import thread_map
 
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     ENABLE_JIT_DEEPGEMM,
