@@ -63,15 +63,16 @@ You can find additional accuracy eval examples in:
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md).
 
-## Request a Review
+## Request a review
 You can identify potential reviewers for your code by checking the [code owners](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and [reviewers](https://github.com/sgl-project/sglang/blob/main/.github/REVIEWERS.md) files.
 Another effective strategy is to review the file modification history and contact individuals who have frequently edited the files.
 If you modify files protected by code owners, their approval is required to merge the code.
 
-## General Code Style
-- Avoid code duplication. If the same code snippet (more than 5 lines) appears multiple times, extract it into a shared function.
-- Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, as much as possible. Use vectorized code instead.
-- Keep files short. If a file exceeds 2,000 lines of code, please split it into multiple smaller files.
+## General code style
+- Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
+- Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
+- Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files.
+- Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize every minor overhead as much as possible.
 
 ## Tips for newcomers
 

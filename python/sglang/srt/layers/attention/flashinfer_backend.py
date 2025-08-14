@@ -870,6 +870,8 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         if use_ragged:
+            # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
+            # and forward_batch.extend_seq_lens_cpu
             paged_kernel_lens = prefix_lens
             paged_kernel_lens_sum = paged_kernel_lens.sum().item()
         else:
