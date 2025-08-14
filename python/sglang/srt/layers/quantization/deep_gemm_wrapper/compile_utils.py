@@ -164,7 +164,7 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
         self.lhs_s = _empty_on_device((max_m, ceil_div(k, _BLOCK_SIZE)))
         self.rhs_q = _empty_on_device((n, k))
         self.rhs_s = _empty_on_device((ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)))
-        self.out = _empty_on_device((max_m, n))
+        self.out = torch.empty((max_m, n), device="cuda")
 
     def execute(self, m):
         deep_gemm.fp8_gemm_nt(
@@ -181,7 +181,7 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
         self.rhs_q = _empty_on_device((num_groups, n, k))
         self.rhs_s = _empty_on_device((num_groups, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)))
         self.m_indices = torch.zeros((max_m,), device="cuda")
-        self.out = _empty_on_device((max_m, n))
+        self.out = torch.empty((max_m, n), device="cuda")
 
     def execute(self, m):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
@@ -199,7 +199,7 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         self.rhs_q = _empty_on_device((num_groups, n, k))
         self.rhs_s = TODO
         self.masked_m = torch.zeros((num_groups,), device="cuda")
-        self.out = _empty_on_device((num_groups, max_m, n))
+        self.out = torch.empty((num_groups, max_m, n), device="cuda")
 
     def execute(self, m):
         deep_gemm.fp8_m_grouped_gemm_nt_masked(
