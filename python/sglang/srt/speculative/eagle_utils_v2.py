@@ -19,7 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2, get_compiler_backend
+from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -361,7 +361,7 @@ class FutureSpecInfoMap:
         self.max_running_requests = max_running_requests
         self.future_spec_info_ct = 0
         self.future_spec_info_limit = max_running_requests * 3
-        self.future_spec_info_buffer_len = max_running_requests * 5
+        self.future_spec_info_buffer_len = max_running_requests * 5 # 2 * max_running_requests for overlap schedule
         self.future_topk_p_map = [None] * (self.future_spec_info_buffer_len)
         self.future_topk_index_map = [None] * (self.future_spec_info_buffer_len)
         self.future_hidden_states_map = [None] * (self.future_spec_info_buffer_len)
@@ -414,13 +414,13 @@ class FutureSpecInfoMap:
 
     def store_to_map(self, future_spec_info_ct: int, bs: int, spec_info: EagleDraftInput):
         # Store references (no clone) for each request into circular buffers
+        # NOTE: self.future_allocate_lens_map is not needed here because it's assigned to batch.allocate_lens without future
         for i in range(bs):
             slot = future_spec_info_ct + i + 1
             self.future_topk_p_map[slot] = spec_info.topk_p[i]
             self.future_topk_index_map[slot] = spec_info.topk_index[i]
             self.future_hidden_states_map[slot] = spec_info.hidden_states[i]
             self.future_verified_id_map[slot] = spec_info.verified_id[i]
-            self.future_allocate_lens_map[slot] = spec_info.allocate_lens[i]
             self.future_new_seq_lens_map[slot] = spec_info.new_seq_lens[i]
 
 @triton.jit

@@ -41,14 +41,12 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-# refactor based on this
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def resolve_future_token_ids(input_ids, future_token_ids_map):
-    # inplace update input_ids, the input_ids is a reference
     input_ids[:] = torch.where(
-        input_ids < 0, # store index in the future_token_ids_map in a negative value
-        future_token_ids_map[torch.clamp(-input_ids, min=0)], # retrieve the index from the future_token_ids_map
-        input_ids, # if the value is not negative, keep it
+        input_ids < 0,
+        future_token_ids_map[torch.clamp(-input_ids, min=0)],
+        input_ids,
     )
 
 
@@ -168,7 +166,6 @@ class TpModelWorkerClient:
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
-            # resolved at the beginning of the batch, should be after batch.spec_info is assigned after copy_done, needs a new event.
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
 
             # update the consumer index of hicache to the running batch
@@ -184,7 +181,7 @@ class TpModelWorkerClient:
             bs = len(model_worker_batch.seq_lens)
             self.future_token_ids_map[
                 future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
-            ] = next_token_ids # keeps the current batch's next_token_ids in the future_token_ids_map
+            ] = next_token_ids
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
@@ -251,17 +248,17 @@ class TpModelWorkerClient:
 
         # Allocate output future objects
         bs = len(model_worker_batch.seq_lens)
-        future_next_token_ids = torch.arange( # future_next_token_ids is a reference to the next token ids, val is a reference, stored as a negatvie index.
+        future_next_token_ids = torch.arange(
             -(self.future_token_ids_ct + 1),
             -(self.future_token_ids_ct + 1 + bs),
             -1,
             dtype=torch.int64,
             device=self.device,
         )
-        self.future_token_ids_ct = ( # increment the future_token_ids_ct, it is similar to a circular buffer pointer
+        self.future_token_ids_ct = (
             self.future_token_ids_ct + bs
         ) % self.future_token_ids_limit
-        return None, future_next_token_ids, False # async return the future_next_token_ids, i.e. future reference to the next token ids
+        return None, future_next_token_ids, False
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.worker.update_weights_from_disk(recv_req)
