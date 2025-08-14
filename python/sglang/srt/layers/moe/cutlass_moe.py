@@ -9,7 +9,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
-from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
+from sglang.srt.layers.utils import is_sm100_supported, is_sm90_supported
+from sglang.srt.layers.quantization.fp8_kernel import (
+    per_token_group_quant_fp8_hopper_moe_mn_major,
+    shuffle_fp8_scale_hopper_moe_mn_major,
+)
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -48,6 +52,7 @@ def cutlass_fused_experts_fp8(
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
     use_fp8_blockscale: bool = True,
+    use_shuffle: bool = True,
 ) -> torch.Tensor:
     """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
 
@@ -153,9 +158,33 @@ def cutlass_fused_experts_fp8(
         k,
     )
 
-    a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
-    rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
-    rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
+    if is_sm100_supported():
+        a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
+        rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
+        rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
+    elif is_sm90_supported():
+        if not use_shuffle:
+            a_q = shuffle_rows(a, a_map, (m * topk, k))
+            rep_a_q, rep_a1_scales = per_token_group_quant_fp8_hopper_moe_mn_major(
+                a_q,
+                expert_offsets[:-1],
+                problem_sizes1,
+                group_size=128,
+                expert_tokens_alignment=16,
+            )
+        else:
+            a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
+            rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
+            rep_a1_scales = shuffle_fp8_scale_hopper_moe_mn_major(
+                a1_scale,
+                expert_offsets[:-1],
+                problem_sizes1,
+                m * topk,
+                a_map,
+                expert_tokens_alignment=16,
+            )
+    else:
+        raise NotImplementedError("Only support sm100 and sm90 for now")
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
@@ -187,7 +216,28 @@ def cutlass_fused_experts_fp8(
     intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
     silu_and_mul(c1, intermediate)
 
-    intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+    if is_sm100_supported():
+        intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+    elif is_sm90_supported():
+        if not use_shuffle:
+            intemediate_q, a2_scale = per_token_group_quant_fp8_hopper_moe_mn_major(
+                intermediate,
+                expert_offsets[:-1],
+                problem_sizes2,
+                group_size=128,
+                expert_tokens_alignment=16,
+            )
+        else:
+            intemediate_q, _a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+            a2_scale = shuffle_fp8_scale_hopper_moe_mn_major(
+                _a2_scale,
+                expert_offsets[:-1],
+                problem_sizes2,
+                m * topk,
+                expert_tokens_alignment=16,
+            )
+    else:
+        raise NotImplementedError("Only support sm100 and sm90 for now")
 
     fp8_blockwise_scaled_grouped_mm(
         c2,
@@ -218,6 +268,61 @@ def cutlass_fused_experts_fp8(
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = 448.0
 
+
+def cutlass_moe_fp8(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    c: torch.Tensor,
+    m_indices: torch.Tensor,
+) -> None:
+    """Performs EP MoE computation using CUTLASS-like kernels with per-block-fp8-quant weights and per-token-group-fp8-quant activations."""
+    device = a.device
+    num_experts, k_g, n_g = w.shape
+    layout_sfa = torch.zeros((num_experts, 5), device=device, dtype=torch.int32)
+    layout_sfb = torch.zeros((num_experts, 5), device=device, dtype=torch.int32)
+    a_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    b_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    out_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    a_scales_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    b_scales_ptrs = torch.empty((num_experts,), device=device, dtype=torch.int64)
+    workspace = torch.empty((1024 * 1024 * 1024), device=device, dtype=torch.uint8)
+    a_strides = torch.full(
+        (num_experts,), a.stride(0), device=device, dtype=torch.int64
+    )
+    c_strides = torch.full(
+        (num_experts,), c.stride(0), device=device, dtype=torch.int64
+    )
+    m_tensor = m_indices[1:] - m_indices[:-1]
+    n_tensor = torch.full_like(m_tensor, fill_value=n_g)
+    k_tensor = torch.full_like(m_tensor, fill_value=k_g)
+    problem_sizes = torch.stack([m_tensor, n_tensor, k_tensor], dim=1)
+    # (E, K, N):(K*N, N, 1) -> (E, N, K):(N*K, 1, N) -> (E, N, K):(N*K, K, 1)
+    # w_scale = w_scale.transpose(1, 2).contiguous()
+    # TODO: a_scale
+    
+    fp8_blockwise_scaled_grouped_mm(
+        c,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        w,
+        a_scale,
+        w_scale,
+        a_strides,
+        a_strides,
+        c_strides,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        m_indices[:-1],
+        workspace,
+    )
+    
 
 def cutlass_moe_fp4(
     a: torch.Tensor,

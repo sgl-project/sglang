@@ -109,6 +109,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
         torch.rand(batch_size, topk, device="cuda", dtype=dtype), dim=-1
     )
     topk_ids = torch.randint(0, E, (batch_size, topk), dtype=torch.int32, device="cuda")
+    router_logits = torch.rand(batch_size, E, device="cuda", dtype=dtype)
 
     a1_strides = torch.full((E,), H, dtype=torch.int64, device="cuda")
     c1_strides = torch.full((E,), I, dtype=torch.int64, device="cuda")
@@ -152,6 +153,30 @@ def run_test(tp_size, batch_size, model_config, check=False):
         problem_sizes2,
     )
 
+    cutlass_shuffle_lambda = lambda: cutlass_fused_experts_fp8(
+        x,
+        w1.transpose(1, 2),  # Transposed
+        w2.transpose(1, 2),  # Transposed
+        w1_scale.transpose(1, 2),
+        w2_scale.transpose(1, 2),
+        topk_weights,
+        topk_ids,
+        a1_strides,
+        c1_strides,
+        a2_strides,
+        c2_strides,
+        workspace,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        use_shuffle=True,
+    )
+
     # Note: Triton expects non-transposed weights
     moe_config = MoeRunnerConfig(inplace=False)
     triton_lambda = lambda: fused_experts(
@@ -170,6 +195,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
     print("Warming up...")
     for _ in range(10):
         _ = cutlass_lambda()
+        _ = cutlass_shuffle_lambda()
         _ = triton_lambda()
     torch.cuda.synchronize()
 
@@ -180,12 +206,21 @@ def run_test(tp_size, batch_size, model_config, check=False):
         cutlass_lambda, rep=1000, quantiles=quantiles
     )
 
+    quantiles = [0.5, 0.2, 0.8]
+    print(f"Benchmarking Cutlass shuffle fused_experts...")
+    shuffle_ms, shuffle_min, shuffle_max = triton.testing.do_bench_cudagraph(
+        cutlass_shuffle_lambda, rep=1000, quantiles=quantiles
+    )
+
     print(f"Benchmarking Triton fused_experts...")
     triton_ms, triton_min, triton_max = triton.testing.do_bench_cudagraph(
         triton_lambda, rep=1000, quantiles=quantiles
     )
     print(
         f"Cutlass fused_experts time: {cutlass_ms:.3f} ms (median) [{cutlass_min:.3f} - {cutlass_max:.3f}]"
+    )
+    print(
+        f"Shuffle fused_experts time: {shuffle_ms:.3f} ms (median) [{shuffle_min:.3f} - {shuffle_max:.3f}]"
     )
     print(
         f"Triton  fused_experts time: {triton_ms:.3f} ms (median) [{triton_min:.3f} - {triton_max:.3f}]"
@@ -219,6 +254,30 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 problem_sizes2,
             )
 
+            y_shuffle = cutlass_fused_experts_fp8(
+                x,
+                w1.transpose(1, 2),  # Transposed
+                w2.transpose(1, 2),  # Transposed
+                w1_scale.transpose(1, 2),
+                w2_scale.transpose(1, 2),
+                topk_weights,
+                topk_ids,
+                a1_strides,
+                c1_strides,
+                a2_strides,
+                c2_strides,
+                workspace,
+                a_ptrs,
+                b_ptrs,
+                out_ptrs,
+                a_scales_ptrs,
+                b_scales_ptrs,
+                expert_offsets,
+                problem_sizes1,
+                problem_sizes2,
+                use_shuffle=True
+            )
+
             # Run Triton version (requires original shape weights, use inplace=False)
             y_triton = fused_experts(
                 x,
@@ -235,13 +294,17 @@ def run_test(tp_size, batch_size, model_config, check=False):
         diff = calc_diff(y_cutlass, y_triton)
         print(f"Diff: {diff:.6f}")
 
+        diff_shuffle = calc_diff(y_shuffle, y_triton)
+        print(f"Shuffle Diff: {diff_shuffle:.6f}")
+
         # Tolerance might need adjustment based on FP8 specifics and kernel differences
         # FP8 comparisons often require higher tolerance than FP16/BF16
         assert diff < 1e-4, f"Diff too high! {diff}"
+        assert diff_shuffle < 1e-4, f"Shuffle Diff too high! {diff_shuffle}"
         print("Correctness check passed.")
 
 
-def main(tp_size=8, batch_sizes=[1, 4, 8, 16, 32, 64, 128, 256, 512], check=False):
+def main(tp_size=8, batch_sizes=[1, 4, 8, 16, 32, 64, 128, 256, 512, 32768], check=False, prof=False):
     model_config = get_model_config(tp_size)
     print("Model Config:", model_config)
     for batch_size in batch_sizes:

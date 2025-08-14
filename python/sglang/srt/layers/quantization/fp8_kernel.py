@@ -1586,6 +1586,7 @@ def per_group_transpose(
         a, trans_a, expert_offsets, k, M_ALIGNMENT, BLOCK_SIZE_M=16, BLOCK_SIZE_K=8
     )
     return trans_a
+<<<<<<< HEAD
 
 
 def is_weak_contiguous(x: torch.Tensor):
@@ -1804,3 +1805,123 @@ def triton_scaled_mm(
     )
 
     return result.to(out_dtype)
+=======
+shuffle_autotune = triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": block_m}, num_warps=num_warps)
+        for block_m in [16, 32, 64, 128]
+        for num_warps in [4, 8]
+    ],
+    key=["K", "M_ALIGNMENT"],
+)
+
+@triton.jit
+def _shuffle_map_fp8_scale_hopper_moe_mn_major(
+    a_s,  # (M, k):(k, 1)
+    expert_offsets,  # (num_experts,)
+    problem_sizes,  # (num_experts, 3)
+    sfa,  # (M, k)
+    shuffle_map,
+    K: tl.constexpr,
+    M_ALIGNMENT: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # tune
+):
+    k_offset = tl.program_id(0)
+    expert_id = tl.program_id(1)
+
+    m = tl.load(problem_sizes + expert_id * 3)
+    current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
+    tl.multiple_of(m, M_ALIGNMENT)
+    tl.multiple_of(current_expert_offset, M_ALIGNMENT)
+
+    for i in tl.range(tl.cdiv(m, BLOCK_M)):
+        coord_m = i * BLOCK_M + tl.arange(0, BLOCK_M)
+        m_dst_offset = current_expert_offset + coord_m
+        m_dst_mask = coord_m < m
+        m_src_offset = tl.load(shuffle_map + m_dst_offset, mask=m_dst_mask).to(tl.int64)
+
+        as_ptrs = a_s + m_src_offset * K + k_offset
+        as_mask = (coord_m < m) & (k_offset < K)
+        as_val = tl.load(as_ptrs, mask=as_mask).to(tl.float32)
+
+        # Store sfa
+        sfa_ptrs = (
+            sfa + current_expert_offset * K + k_offset * m + coord_m
+        )  # MN-Major with sfa
+        tl.store(sfa_ptrs, as_val, mask=coord_m < m)
+
+@triton.jit
+def _shuffle_fp8_scale_hopper_moe_mn_major(
+    a_s,  # (M, k):(k, 1)
+    expert_offsets,  # (num_experts,)
+    problem_sizes,  # (num_experts, 3)
+    sfa,  # (M, k)
+    K: tl.constexpr,
+    M_ALIGNMENT: tl.constexpr,
+    BLOCK_M: tl.constexpr,  # tune
+):
+    k_offset = tl.program_id(0)
+    expert_id = tl.program_id(1)
+
+    m = tl.load(problem_sizes + expert_id * 3)
+    current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
+    tl.multiple_of(m, M_ALIGNMENT)
+    tl.multiple_of(current_expert_offset, M_ALIGNMENT)
+
+    for i in tl.range(tl.cdiv(m, BLOCK_M)):
+        coord_m = i * BLOCK_M + tl.arange(0, BLOCK_M)
+        as_ptrs = a_s + current_expert_offset * K + coord_m * K + k_offset
+        as_mask = (coord_m < m) & (k_offset < K)
+        as_val = tl.load(as_ptrs, mask=as_mask).to(tl.float32)
+
+        # Store sfa
+        sfa_ptrs = (
+            sfa + current_expert_offset * K + k_offset * m + coord_m
+        )  # MN-Major with sfa
+        tl.store(sfa_ptrs, as_val, mask=coord_m < m)
+
+if not _is_cpu:
+    _shuffle_fp8_scale_hopper_moe_mn_major = shuffle_autotune(
+        _shuffle_fp8_scale_hopper_moe_mn_major
+    )
+    _shuffle_map_fp8_scale_hopper_moe_mn_major = shuffle_autotune(
+        _shuffle_map_fp8_scale_hopper_moe_mn_major
+    )
+
+def shuffle_fp8_scale_hopper_moe_mn_major(
+    a_s: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    problem_sizes: torch.Tensor,
+    output_m: int,
+    shuffle_map: Optional[torch.Tensor] = None,
+    expert_tokens_alignment: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert a_s.dim() == 2
+    assert a_s.is_contiguous(), "`A` is not contiguous"
+
+    k = a_s.shape[1]
+    sfa = torch.empty((output_m, k), device=a_s.device, dtype=a_s.dtype)
+    num_experts = problem_sizes.shape[0]
+    grid = (k, num_experts)
+    if shuffle_map is not None:
+        _shuffle_map_fp8_scale_hopper_moe_mn_major[grid](
+            a_s,
+            expert_offsets,
+            problem_sizes,
+            sfa,
+            shuffle_map,
+            k,
+            expert_tokens_alignment,
+        )
+    else:
+        _shuffle_fp8_scale_hopper_moe_mn_major[grid](
+            a_s,
+            expert_offsets,
+            problem_sizes,
+            sfa,
+            k,
+            expert_tokens_alignment,
+        )
+
+    return sfa
+>>>>>>> 753990ea (add shuffle_fp8_scale_hopper_moe_mn_major)
