@@ -17,6 +17,7 @@ from sglang.srt.utils import get_bool_env_var, get_int_env_var
 logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM and not DEEPGEMM_BLACKWELL:
+    import deep_gemm
     from deep_gemm import get_num_sms
     from deep_gemm.jit import build
     from deep_gemm.jit_kernels.gemm import get_best_configs
@@ -125,9 +126,11 @@ def _compile_deep_gemm_one_type_all(
     num_groups: int,
     m_list: List[int],
 ) -> None:
-    TODO_mult_128_for_cont
+    if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+        m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+        m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
-    for m in _BUILTIN_M_LIST:
+    for m in m_list:
         # TODO can use multi thread
         _compile_one_deepgemm()
 
