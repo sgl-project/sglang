@@ -150,6 +150,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
         expert_offsets,
         problem_sizes1,
         problem_sizes2,
+        use_shuffle=False,
     )
 
     cutlass_shuffle_lambda = lambda: cutlass_fused_experts_fp8(
@@ -336,7 +337,7 @@ if __name__ == "__main__":
         "--batch-sizes",
         type=int,
         nargs="+",
-        default=[1, 4, 8, 16, 32, 64, 128, 256, 512, 32768],  # Adjusted default
+        default=[1, 4, 8, 16, 32, 64, 128, 256, 512, 4096, 8192, 16384, 32768],  # Adjusted default
         help="List of batch sizes to test",
     )
     parser.add_argument("--check", action="store_true", help="Enable check mode")
