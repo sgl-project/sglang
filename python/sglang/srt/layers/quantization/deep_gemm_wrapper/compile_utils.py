@@ -59,8 +59,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     # Default each rank will try compile all Ms to
     # load all symbols at the launch stages.
     # Avoid loading symbols at the serving stages.
-    # TODO shall we remove the `or not _IN_PRECOMPILE_STAGE`
-    _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE or not _IN_PRECOMPILE_STAGE
+    _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
 
 
 class DeepGemmKernelType(IntEnum):
