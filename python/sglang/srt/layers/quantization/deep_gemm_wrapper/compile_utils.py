@@ -8,7 +8,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 from tqdm.contrib.concurrent import thread_map
 
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
-    DEEPGEMM_BLACKWELL,
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
@@ -16,7 +15,7 @@ from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 logger = logging.getLogger(__name__)
 
-if ENABLE_JIT_DEEPGEMM and not DEEPGEMM_BLACKWELL:
+if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
     from deep_gemm import get_num_sms
     from deep_gemm.jit import build
