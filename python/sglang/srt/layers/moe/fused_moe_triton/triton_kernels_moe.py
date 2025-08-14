@@ -234,8 +234,8 @@ def triton_kernel_moe_with_bias_forward(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
-        alpha=moe_runner_config.gemm1_alpha,
-        limit=moe_runner_config.gemm1_clamp_limit,
+        gemm1_alpha=moe_runner_config.gemm1_alpha,
+        gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
     )
 
 

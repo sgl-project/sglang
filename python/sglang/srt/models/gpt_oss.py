@@ -111,7 +111,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self.layer_id = layer_id
         self.activation = config.hidden_act
         self.gemm1_alpha = getattr(config, "hidden_act_alpha", 1.702)
-        self.gemm1_clamp_limit = config.gemm1_clamp_limit
+        self.gemm1_clamp_limit = config.swiglu_limit
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
