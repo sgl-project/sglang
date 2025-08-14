@@ -58,7 +58,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.4.post1",
+    "sgl-kernel==0.3.5",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
