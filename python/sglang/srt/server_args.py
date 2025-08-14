@@ -2141,6 +2141,11 @@ class ServerArgs:
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
+            
+            # auto-configure reasoning parser for Harmony support
+            if self.reasoning_parser is None:
+                self.reasoning_parser = "gpt-oss"
+
         elif "Llama4" in model_arch:
             assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
         elif model_arch in [
