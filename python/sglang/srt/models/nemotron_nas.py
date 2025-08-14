@@ -177,9 +177,7 @@ class DeciModel(nn.Module):
             else 0
         )
         vocab_size = config.vocab_size + lora_vocab
-        if get_pp_group().is_first_rank or (
-            config.tie_word_embeddings and get_pp_group().is_last_rank
-        ):
+        if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 vocab_size,
                 config.hidden_size,
@@ -197,8 +195,12 @@ class DeciModel(nn.Module):
                 prefix=prefix,
             )
 
-        self.layers = make_layers(
-            config.num_hidden_layers, get_layer, prefix=add_prefix("layers", prefix)
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            get_layer,
+            pp_rank=get_pp_group().rank_in_group,
+            pp_size=get_pp_group().world_size,
+            prefix=add_prefix("layers", prefix),
         )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -214,6 +216,7 @@ class DeciModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -222,12 +225,12 @@ class DeciModel(nn.Module):
                 hidden_states = self.get_input_embeddings(input_ids)
             residual = None
         else:
-            assert forward_batch is not None
-            hidden_states = forward_batch["hidden_states"]
-            residual = forward_batch["residual"]
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
 
         kv_cache_index = 0
-        for i in range(len(self.layers)):
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if not layer._is_no_op_attention:
                 hidden_states, residual = layer(
@@ -304,8 +307,9 @@ class DeciLMForCausalLM(nn.Module):
         self.model = self._init_model(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-
-        if get_pp_group().is_last_rank:
+        if self.config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
             self.unpadded_vocab_size = config.vocab_size
             if lora_config:
                 self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
@@ -323,13 +327,8 @@ class DeciLMForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-            if config.tie_word_embeddings:
-                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
-
-            self.logits_processor = LogitsProcessor(config)
-            self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        else:
-            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
     def _init_model(
         self,
@@ -350,14 +349,24 @@ class DeciLMForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput:
-        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            inputs_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        if get_pp_group().is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids, hidden_states, self.lm_head, forward_batch
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
         else:
-            return self.pooler(hidden_states, forward_batch)
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         stacked_params_mapping = [
