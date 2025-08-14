@@ -132,10 +132,20 @@ def _maybe_compile_deep_gemm_one_type_all(
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
-        for m in _BUILTIN_M_LIST:
-            # TODO can use multi thread
-            _compile_one_deepgemm()
+        _compile_deep_gemm_one_type_all(kernel_type=kernel_type, n=n, k=k, num_groups=num_groups, m_list=_BUILTIN_M_LIST)
+
+
+def _compile_deep_gemm_one_type_all(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+    m_list: List[int],
+) -> None:
+    # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
+    for m in _BUILTIN_M_LIST:
+        # TODO can use multi thread
+        _compile_one_deepgemm()
 
 
 @contextmanager
