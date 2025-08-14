@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
@@ -35,7 +35,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
-        encoder_lens=None,
+        encoder_lens: Optional[torch.Tensor] = None,
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -80,10 +80,12 @@ class TorchNativeAttnBackend(AttentionBackend):
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q
             if encoder_lens is not None:
-                start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
-                end_kv = (
-                    encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
-                )
+                if is_cross_attn:
+                    start_kv = 0
+                    end_kv = encoder_lens[seq_idx]
+                else:
+                    start_kv = encoder_lens[seq_idx]
+                    end_kv = start_kv + seq_len_kv
             else:
                 start_kv = 0
                 end_kv = start_kv + seq_len_kv
@@ -128,7 +130,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens=None,
+        encoder_lens: Optional[torch.Tensor] = None,
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -166,10 +168,12 @@ class TorchNativeAttnBackend(AttentionBackend):
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + seq_len_q
             if encoder_lens is not None:
-                start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
-                end_kv = (
-                    encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
-                )
+                if is_cross_attn:
+                    start_kv = 0
+                    end_kv = encoder_lens[seq_idx]
+                else:
+                    start_kv = encoder_lens[seq_idx]
+                    end_kv = start_kv + seq_len_kv
             else:
                 start_kv = 0
                 end_kv = start_kv + seq_len_kv
@@ -219,10 +223,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-        if save_kv_cache:
-            if k is not None:
-                assert v is not None
-                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+        if save_kv_cache and k is not None and v is not None:
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -243,7 +245,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.seq_lens,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_seq_lens,
-            encoder_lens=forward_batch.encoder_lens,
+            forward_batch.encoder_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=causal,
@@ -292,7 +294,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
-            encoder_lens=forward_batch.encoder_lens,
+            forward_batch.encoder_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=False,

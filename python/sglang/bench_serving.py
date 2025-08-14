@@ -881,36 +881,25 @@ def sample_mmmu_requests(
                 if apply_chat_template:
                     try:
                         if "llama" in tokenizer.name_or_path.lower():
-                            prompt = tokenizer.apply_chat_template(
-                                [
-                                    {
-                                        "role": "user",
-                                        "content": [
-                                            {"type": "image", "image": image_data},
-                                            {"type": "text", "text": prompt},
-                                        ],
-                                    }
-                                ],
-                                add_generation_prompt=True,
-                                tokenize=False,
-                            )
+                            image_field = {"type": "image", "image": image_data}
                         else:
-                            prompt = tokenizer.apply_chat_template(
-                                [
-                                    {
-                                        "role": "user",
-                                        "content": [
-                                            {
-                                                "type": "image_url",
-                                                "image_url": {"url": image_data},
-                                            },
-                                            {"type": "text", "text": prompt},
-                                        ],
-                                    }
-                                ],
-                                add_generation_prompt=True,
-                                tokenize=False,
-                            )
+                            image_field = {
+                                "type": "image_url",
+                                "image_url": {"url": image_data},
+                            }
+                        prompt = tokenizer.apply_chat_template(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        image_field,
+                                        {"type": "text", "text": prompt},
+                                    ],
+                                }
+                            ],
+                            add_generation_prompt=True,
+                            tokenize=False,
+                        )
                     except Exception as e:
                         # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
                         print(
