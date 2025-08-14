@@ -1,5 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/mxfp4.py
 
 from __future__ import annotations
 
@@ -209,6 +222,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         super().__init__()
 
+        self.prefix = prefix
         self.topk_indices_dtype = None
         self.use_triton_kernels = global_server_args_dict["enable_triton_kernel_moe"]
         self.with_bias = False
@@ -332,7 +346,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_flashinfer:
             log_info_on_rank0(
                 logger,
-                "Shuffling MoE weights for FlashInfer MXFP4 moe kernel, it might take a while...",
+                f"Shuffling MoE weights for FlashInfer MXFP4 moe kernel (layer: {self.prefix}), it might take a while...",
             )
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
@@ -570,8 +584,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         if self.use_flashinfer:
             # Based on profiling results, we need to quantize x to mxfp8 here to achieve better performance
-            x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
+            x_quant, x_scale = mxfp8_quantize(
+                x, False, alignment=self.hidden_size
+            )  # to mxfp8
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            assert x_quant.shape[-1] == self.hidden_size
 
             top_k, router_logits = topk_output
 
