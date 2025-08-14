@@ -325,10 +325,6 @@ class Qwen3GatedDeltaNet(nn.Module):
                 last_recurrent_state = last_recurrent_state.to(torch.bfloat16, copy=False)
                 cache_params.ssm_state[cache_params.state_indices_tensor] = last_recurrent_state
         else:
-            indices = cache_params.state_indices_tensor
-            mask = (indices == -1)
-            indices[mask] = cache_params.ssm_state.shape[0] - 1
-
             core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
                 k=key,
@@ -336,7 +332,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 g=g,
                 beta=beta,
                 initial_state_source=cache_params.ssm_state,
-                initial_state_indices=indices,
+                initial_state_indices=cache_params.state_indices_tensor,
                 cu_seqlens=forward_batch.extend_start_loc,
                 # head_first=False,
                 use_qk_l2norm_in_kernel=True
