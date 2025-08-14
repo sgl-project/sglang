@@ -58,3 +58,18 @@ path = "benches/request_processing.rs"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = "unpacked"
+incremental = true
+
+
+[profile.dev.build-override]
+opt-level = 3
+codegen-units = 1
+
+[profile.dev-opt]
+inherits = "dev"
+opt-level = 1

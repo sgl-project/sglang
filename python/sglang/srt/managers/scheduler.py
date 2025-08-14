@@ -1466,8 +1466,9 @@ class Scheduler(
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
-            # Merge the new batch into the running batch
-            if not self.last_batch.is_empty():
+            # Merge the new batch into the running batch.
+            # For prefill-only batch, we can avoid going through decoding step.
+            if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
@@ -1634,7 +1635,6 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            self.server_args.enable_custom_logit_processor,
             chunked_req=self.chunked_req,
         )
         if self.enable_hierarchical_cache:
@@ -2031,7 +2031,6 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            self.server_args.enable_custom_logit_processor,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
