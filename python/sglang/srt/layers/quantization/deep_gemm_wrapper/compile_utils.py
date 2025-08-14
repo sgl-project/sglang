@@ -158,3 +158,11 @@ def _maybe_compile_deep_gemm_one_type_all(
             n, k, num_groups, config
         )
         thread_map(compile_func, collected_configs, max_workers=_COMPILE_WORKERS)
+
+
+@contextmanager
+def deep_gemm_execution_hook(
+    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+):
+    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+    yield
