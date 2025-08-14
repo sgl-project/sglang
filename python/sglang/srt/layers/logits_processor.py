@@ -24,7 +24,11 @@ from torch import nn
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
     DPPaddingMode,
@@ -186,18 +190,20 @@ class LogitsMetadata:
         self.dp_local_start_pos = dp_local_start_pos
         self.dp_local_num_tokens = dp_local_num_tokens
 
-        if self.global_num_tokens_for_logprob_cpu is not None:
-            # create a smaller buffer to reduce peak memory usage
-            self.gathered_buffer = torch.empty(
-                (
-                    sum(self.global_num_tokens_for_logprob_cpu),
-                    self.gathered_buffer.shape[1],
-                ),
-                dtype=self.gathered_buffer.dtype,
-                device=self.gathered_buffer.device,
-            )
-        else:
-            self.gathered_buffer = torch.empty_like(self.gathered_buffer)
+        with use_symmetric_memory(get_tp_group()) as sm:
+            if self.global_num_tokens_for_logprob_cpu is not None:
+                # create a smaller buffer to reduce peak memory usage
+                self.gathered_buffer = torch.empty(
+                    (
+                        sum(self.global_num_tokens_for_logprob_cpu),
+                        self.gathered_buffer.shape[1],
+                    ),
+                    dtype=self.gathered_buffer.dtype,
+                    device=self.gathered_buffer.device,
+                )
+            else:
+                self.gathered_buffer = torch.empty_like(self.gathered_buffer)
+            sm.tag(self.gathered_buffer)
 
 
 class LogitsProcessor(nn.Module):
@@ -448,22 +454,29 @@ class LogitsProcessor(nn.Module):
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
-        if hasattr(lm_head, "weight"):
-            if use_intel_amx_backend(lm_head):
-                logits = torch.ops.sgl_kernel.weight_packed_linear(
-                    hidden_states.to(lm_head.weight.dtype),
-                    lm_head.weight,
-                    None,  # bias
-                    True,  # is_vnni
-                )
+        with use_symmetric_memory(
+            get_tp_group(),
+            disabled=(not self.do_tensor_parallel_all_gather or self.use_attn_tp_group),
+        ) as sm:
+            if hasattr(lm_head, "weight"):
+                if use_intel_amx_backend(lm_head):
+                    logits = torch.ops.sgl_kernel.weight_packed_linear(
+                        hidden_states.to(lm_head.weight.dtype),
+                        lm_head.weight,
+                        None,  # bias
+                        True,  # is_vnni
+                    )
+                else:
+                    logits = torch.matmul(
+                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                    )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                # GGUF models
+                # TODO: use weight_packed_linear for GGUF models
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states, embedding_bias
                 )
-        else:
-            # GGUF models
-            # TODO: use weight_packed_linear for GGUF models
-            logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
+            sm.tag(logits)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)

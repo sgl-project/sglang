@@ -38,6 +38,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
     DPPaddingMode,
@@ -612,6 +613,9 @@ class ForwardBatch:
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
 
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            use_symmetric_memory,
+        )
         from sglang.srt.speculative.eagle_utils import EagleDraftInput
 
         assert self.global_num_tokens_cpu is not None
@@ -642,11 +646,15 @@ class ForwardBatch:
         else:
             buffer_len = sum(global_num_tokens)
 
-        self.gathered_buffer = torch.zeros(
-            (buffer_len, model_runner.model_config.hidden_size),
-            dtype=model_runner.dtype,
-            device=model_runner.device,
-        )
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not dp_padding_mode.is_max_len()
+        ) as sm:
+            self.gathered_buffer = torch.zeros(
+                (buffer_len, model_runner.model_config.hidden_size),
+                dtype=model_runner.dtype,
+                device=model_runner.device,
+            )
+            sm.tag(self.gathered_buffer)
 
         if len(global_num_tokens) > 1:
             num_tokens = global_num_tokens[get_attention_dp_rank()]

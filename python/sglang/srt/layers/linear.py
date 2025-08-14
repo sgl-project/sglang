@@ -1277,7 +1277,7 @@ class RowParallelLinear(LinearBase):
             # It does not support additional parameters.
             param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False):
+    def forward(self, input_, skip_all_reduce=False, disable_symmetric_memory=False):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1291,7 +1291,9 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+        with use_symmetric_memory(
+            parallel_state.get_tp_group(), disabled=disable_symmetric_memory
+        ) as sm:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
             sm.tag(output_parallel)
 

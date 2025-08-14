@@ -21,7 +21,11 @@ import torch.distributed
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -422,7 +426,13 @@ class CommunicateWithAllReduceAndLayerNormFn:
             use_layer_norm_before_gather = context.attn_tp_size == 1
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
                 residual = hidden_states
-                hidden_states = layernorm(hidden_states)
+                with use_symmetric_memory(
+                    get_tp_group(),
+                    disabled=not forward_batch.dp_padding_mode.is_max_len(),
+                ) as sm:
+                    hidden_states = layernorm(hidden_states)
+                    sm.tag(hidden_states)
+
             hidden_states, local_hidden_states = (
                 torch.empty_like(forward_batch.gathered_buffer),
                 hidden_states,

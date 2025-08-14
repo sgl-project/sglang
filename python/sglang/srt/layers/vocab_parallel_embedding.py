@@ -473,7 +473,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
         # Get the embeddings.
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+        with use_symmetric_memory(
+            parallel_state.get_tp_group(), disabled=(self.tp_size == 1)
+        ) as sm:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
             sm.tag(output_parallel)
         # Mask the output embedding.

@@ -214,6 +214,7 @@ class DeepseekV2MLP(nn.Module):
         forward_batch=None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        disable_symmetric_memory: bool = False,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
@@ -221,7 +222,9 @@ class DeepseekV2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+            x,
+            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+            disable_symmetric_memory=disable_symmetric_memory,
         )
         return x
 
@@ -450,6 +453,7 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        disable_symmetric_memory: bool = False,
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -459,11 +463,17 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
                 return self.forward_normal_dual_stream(
-                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                    hidden_states,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                    disable_symmetric_memory,
                 )
             else:
                 return self.forward_normal(
-                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                    hidden_states,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                    disable_symmetric_memory,
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -473,11 +483,14 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        disable_symmetric_memory: bool = False,
     ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(hidden_states)
+        shared_output = self._forward_shared_experts(
+            hidden_states, disable_symmetric_memory
+        )
 
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
@@ -495,7 +508,9 @@ class DeepseekV2MoE(nn.Module):
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+        with use_symmetric_memory(
+            parallel_state.get_tp_group(), disabled=disable_symmetric_memory
+        ) as sm:
             final_hidden_states_out = torch.empty_like(final_hidden_states)
         torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
         final_hidden_states = final_hidden_states_out
@@ -509,13 +524,16 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        disable_symmetric_memory: bool = False,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
-        shared_output = self._forward_shared_experts(hidden_states)
+        shared_output = self._forward_shared_experts(
+            hidden_states, disable_symmetric_memory
+        )
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         kwargs = {"hidden_states": hidden_states}
@@ -532,7 +550,9 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
-            with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            with use_symmetric_memory(
+                parallel_state.get_tp_group(), disabled=disable_symmetric_memory
+            ) as sm:
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
@@ -600,7 +620,9 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         shared_output = None
         if hidden_states.shape[0] > 0:
@@ -639,9 +661,11 @@ class DeepseekV2MoE(nn.Module):
 
         return final_hidden_states
 
-    def _forward_shared_experts(self, hidden_states):
+    def _forward_shared_experts(self, hidden_states, disable_symmetric_memory=False):
         if self.num_fused_shared_experts == 0:
-            return self.shared_experts(hidden_states)
+            return self.shared_experts(
+                hidden_states, disable_symmetric_memory=disable_symmetric_memory
+            )
         else:
             return None
 
@@ -1075,6 +1099,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        disable_symmetric_memory: bool = False,
     ):
         s = self.forward_prepare(
             positions=positions,
@@ -1082,7 +1107,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
-        return self.forward_core(s)
+        return self.forward_core(s, disable_symmetric_memory)
 
     def forward_prepare(
         self,
@@ -1126,7 +1151,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             raise NotImplementedError
         return None, attn_forward_method, forward_batch, inner_state
 
-    def forward_core(self, intermediate_state):
+    def forward_core(self, intermediate_state, disable_symmetric_memory: bool = False):
         hidden_states, attn_forward_method, forward_batch, inner_state = (
             intermediate_state
         )
@@ -1134,13 +1159,17 @@ class DeepseekV2AttentionMLA(nn.Module):
             return hidden_states
 
         if attn_forward_method == AttnForwardMethod.MHA:
-            return self.forward_normal_core(*inner_state)
+            return self.forward_normal_core(*inner_state, disable_symmetric_memory)
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
-            return self.forward_normal_chunked_kv_core(*inner_state)
+            return self.forward_normal_chunked_kv_core(
+                *inner_state, disable_symmetric_memory
+            )
         elif attn_forward_method == AttnForwardMethod.MLA:
-            return self.forward_absorb_core(*inner_state)
+            return self.forward_absorb_core(*inner_state, disable_symmetric_memory)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
-            return self.forward_absorb_fused_mla_rope_core(*inner_state)
+            return self.forward_absorb_fused_mla_rope_core(
+                *inner_state, disable_symmetric_memory
+            )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
             return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
         else:
@@ -1190,10 +1219,14 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return q, k, v, forward_batch
 
-    def forward_normal_core(self, q, k, v, forward_batch):
+    def forward_normal_core(
+        self, q, k, v, forward_batch, disable_symmetric_memory: bool = False
+    ):
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(
+            attn_output, disable_symmetric_memory=disable_symmetric_memory
+        )
         return output
 
     def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
@@ -1292,7 +1325,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
 
     def forward_absorb_core(
-        self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
+        self,
+        q_pe,
+        k_pe,
+        q_nope_out,
+        k_nope,
+        forward_batch,
+        zero_allocator,
+        disable_symmetric_memory: bool = False,
     ):
         if (
             self.current_attention_backend == "fa3"
@@ -1373,7 +1413,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                     -1, self.num_local_heads, self.v_head_dim
                 ).transpose(0, 1),
             )
-        output, _ = self.o_proj(attn_bmm_output)
+        output, _ = self.o_proj(
+            attn_bmm_output, disable_symmetric_memory=disable_symmetric_memory
+        )
 
         return output
 
@@ -1560,6 +1602,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_input,
         forward_batch,
         zero_allocator,
+        disable_symmetric_memory: bool = False,
     ):
         decode_attention_fwd_grouped_rope(
             q_input,
@@ -1611,7 +1654,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(
+            attn_output, disable_symmetric_memory=disable_symmetric_memory
+        )
 
         return output
 
@@ -1755,7 +1800,9 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return q, k, v, forward_batch
 
-    def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
+    def forward_normal_chunked_kv_core(
+        self, q, k, v, forward_batch, disable_symmetric_memory: bool = False
+    ):
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
         attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
@@ -1776,7 +1823,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(
+            attn_output, disable_symmetric_memory=disable_symmetric_memory
+        )
         return output
 
 
@@ -1904,11 +1953,18 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        disable_symmetric_memory = not use_reduce_scatter and self.enable_dp_attention
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            disable_symmetric_memory=disable_symmetric_memory,
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -1921,12 +1977,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             and not self.is_nextn
         )
 
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
         hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+            hidden_states,
+            forward_batch,
+            should_allreduce_fusion,
+            use_reduce_scatter,
+            disable_symmetric_memory,
         )
 
         if should_allreduce_fusion:

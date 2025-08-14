@@ -270,7 +270,13 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            is_symmetric_memory_tensor,
+            use_symmetric_memory,
+        )
 
+        self.is_symmetric_memory_tensor = is_symmetric_memory_tensor
+        self.use_symmetric_memory = use_symmetric_memory
         if is_hip():
             from sglang.srt.distributed.device_communicators.quick_all_reduce import (
                 QuickAllReduce,
@@ -499,11 +505,7 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if (
-            self.pynccl_comm is not None
-            and hasattr(input_, "symmetric_memory")
-            and input_.symmetric_memory
-        ):
+        if self.pynccl_comm is not None and self.is_symmetric_memory_tensor(input_):
             with self.pynccl_comm.change_state(
                 enable=True, stream=torch.cuda.current_stream()
             ):
@@ -569,9 +571,23 @@ class GroupCoordinator:
         self,
         output: torch.Tensor,
         input: torch.Tensor,
-    ) -> None:
-        # TODO(ch-wan): support other backends
-        torch.distributed.reduce_scatter_tensor(output, input, group=self.device_group)
+    ) -> torch.Tensor:
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and (
+            not pynccl_comm.disabled
+            or (
+                self.is_symmetric_memory_tensor(output)
+                and self.is_symmetric_memory_tensor(input)
+            )
+        ):
+            with pynccl_comm.change_state(
+                enable=True, stream=torch.cuda.current_stream()
+            ):
+                pynccl_comm.reduce_scatter(output, input)
+        else:
+            torch.distributed.reduce_scatter_tensor(
+                output, input, group=self.device_group
+            )
         return output
 
     def reduce_scatter(
@@ -585,8 +601,17 @@ class GroupCoordinator:
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.all_gather(output, input)
+        if pynccl_comm is not None and (
+            not pynccl_comm.disabled
+            or (
+                self.is_symmetric_memory_tensor(output)
+                and self.is_symmetric_memory_tensor(input)
+            )
+        ):
+            with pynccl_comm.change_state(
+                enable=True, stream=torch.cuda.current_stream()
+            ):
+                pynccl_comm.all_gather(output, input)
         else:
             torch.distributed.all_gather_into_tensor(
                 output, input, group=self.device_group
@@ -648,9 +673,11 @@ class GroupCoordinator:
         # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
         output_size = (input_size[0] * world_size,) + input_size[1:]
         # Allocate output tensor.
-        output_tensor = torch.empty(
-            output_size, dtype=input_.dtype, device=input_.device
-        )
+        with self.use_symmetric_memory(self) as sm:
+            output_tensor = torch.empty(
+                output_size, dtype=input_.dtype, device=input_.device
+            )
+            sm.tag(output_tensor)
 
         # All-gather.
         if input_.is_cpu and is_shm_available(
