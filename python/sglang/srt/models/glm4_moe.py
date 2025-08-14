@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -634,7 +635,6 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
-        self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
         self.self_attn = Glm4MoeAttention(
             hidden_size=self.hidden_size,
@@ -744,7 +744,7 @@ class Glm4MoeModel(DeepseekV2Model):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(

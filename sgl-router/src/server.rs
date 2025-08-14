@@ -285,7 +285,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     ));
 
     // Create router with the context
-    let router = RouterFactory::create_router(&app_context)?;
+    let router = RouterFactory::create_router(&app_context).await?;
 
     // Create app state with router and context
     let app_state = Arc::new(AppState {

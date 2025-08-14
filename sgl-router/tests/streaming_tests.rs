@@ -61,11 +61,7 @@ impl TestContext {
         config.mode = RoutingMode::Regular { worker_urls };
 
         let app_context = common::create_test_context(config);
-        let router =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
-                .await
-                .unwrap()
-                .unwrap();
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
 
         if !workers.is_empty() {

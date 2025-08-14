@@ -31,7 +31,7 @@ Here are some reviewers for common areas. You can ping them to review your code 
 - tensor parallelism @merrymercy
 
 ## PD disaggregation
-- general @ByronHsu @ShangmingCai @@ShangmingCai @hnyls2002
+- general @ByronHsu @ShangmingCai @hnyls2002
 - Mooncake backend @ShangmingCai
 
 ## Build and release

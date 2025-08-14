@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -1797,7 +1798,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
         self.layer_id = layer_id
         self.is_nextn = is_nextn
@@ -1917,7 +1917,9 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         should_allreduce_fusion = (
             self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
-            and not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
+            and not (
+                is_dp_attention_enabled() and self.speculative_algorithm.is_eagle()
+            )
             and not self.is_nextn
         )
 
@@ -2047,7 +2049,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(

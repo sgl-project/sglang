@@ -122,6 +122,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
+            # different from flashinfer zero_init_global_workspace_buffer
             global_workspace_buffer = torch.empty(
                 global_config.flashinfer_workspace_size,
                 dtype=torch.uint8,
@@ -870,6 +871,8 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         if use_ragged:
+            # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
+            # and forward_batch.extend_seq_lens_cpu
             paged_kernel_lens = prefix_lens
             paged_kernel_lens_sum = paged_kernel_lens.sum().item()
         else:
