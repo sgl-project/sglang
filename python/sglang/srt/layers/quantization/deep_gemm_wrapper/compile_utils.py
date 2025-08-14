@@ -12,7 +12,7 @@ from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, ceil_div
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ class _BaseWarmupExecutor:
     @staticmethod
     def create(kernel_type: DeepGemmKernelType, **kwargs):
         return {
-            DeepGemmKernelType.GEMM_NT_F8F8BF16: _MMWarmupExecutor,
+            DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
         }[kernel_type](**kwargs)
@@ -154,13 +154,16 @@ def _empty_on_device(size):
     return torch.empty(size, device="cuda")
 
 
-class _MMWarmupExecutor(_BaseWarmupExecutor):
+_BLOCK_SIZE = 128
+
+
+class _NormalWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         assert num_groups is None
         self.lhs_q = _empty_on_device((max_m, k))
-        self.lhs_s = TODO
+        self.lhs_s = _empty_on_device((max_m, ceil_div(k, _BLOCK_SIZE)))
         self.rhs_q = _empty_on_device((n, k))
-        self.rhs_s = TODO
+        self.rhs_s = _empty_on_device((ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)))
         self.out = _empty_on_device((max_m, n))
 
     def execute(self, m):
