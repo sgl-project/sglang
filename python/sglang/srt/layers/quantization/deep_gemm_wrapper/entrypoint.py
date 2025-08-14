@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
+
+# TODO maybe rename these functions
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
