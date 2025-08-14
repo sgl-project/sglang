@@ -194,6 +194,7 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         self.lhs_s = TODO
         self.rhs_q = _empty_on_device((num_groups, n, k))
         self.rhs_s = TODO
+        self.masked_m = torch.zeros((num_groups,), device="cuda")
         self.out = _empty_on_device((num_groups, max_m, n))
 
     def execute(self, m):
@@ -201,7 +202,7 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q, self.lhs_s),
             (self.rhs_q, self.rhs_s),
             self.out,
-            masked_m=masked_m,
+            masked_m=self.masked_m,
             # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
