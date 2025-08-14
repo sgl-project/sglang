@@ -297,6 +297,9 @@ class HiCacheController:
                 self.prefetch_tp_group = torch.distributed.new_group(
                     group_ranks, backend="gloo"
                 )
+                self.prefetch_io_tp_group = torch.distributed.new_group(
+                    group_ranks, backend="gloo"
+                )
                 self.backup_tp_group = torch.distributed.new_group(
                     group_ranks, backend="gloo"
                 )
@@ -610,7 +613,7 @@ class HiCacheController:
 
                 if self.tp_world_size > 1:
                     # to ensure all TP workers release the host memory at the same time
-                    torch.distributed.barrier(group=self.prefetch_tp_group)
+                    torch.distributed.barrier(group=self.prefetch_io_tp_group)
                 # operation terminated by controller, release pre-allocated memory
                 self.mem_pool_host.free(
                     operation.host_indices[operation.completed_tokens :]
