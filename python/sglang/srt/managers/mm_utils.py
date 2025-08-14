@@ -726,8 +726,17 @@ def get_multimodal_data_bounds(
 
 
 def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+    def list_to_hash(int_list):
+        return hash(tuple(int_list))
+
+    if isinstance(data, dict):
+        assert "hash_keys" in data, "invalid dict data"
+        hash_keys = data["hash_keys"]
+        return list_to_hash(hash_keys)
+    else:
+        hash_bytes = hashlib.sha256(data).digest()[:8]
+        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
 def tensor_hash(tensor_list) -> int:
