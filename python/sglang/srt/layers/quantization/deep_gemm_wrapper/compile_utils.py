@@ -72,24 +72,6 @@ class DeepGemmKernelType(IntEnum):
     GEMM_NT_F8F8BF16 = auto()
 
 
-@dataclass
-class DeepGemmKernelHelper:
-    name: str
-    compile_func: Callable[
-        [
-            int,
-            int,
-            int,
-            Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]],
-        ],
-        None,
-    ]
-    configure_func: Callable[
-        [int, int, int, int, int],
-        Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]],
-    ]
-
-
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
 
