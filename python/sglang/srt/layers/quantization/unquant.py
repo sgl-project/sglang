@@ -176,7 +176,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, 2 * intermediate_size, dtype=torch.float32),
+                torch.empty(num_experts, 2 * intermediate_size, dtype=params_dtype),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
@@ -198,7 +198,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         if self.with_bias:
             w2_weight_bias = torch.nn.Parameter(
-                torch.ones(num_experts, hidden_size, dtype=torch.float32),
+                torch.ones(num_experts, hidden_size, dtype=params_dtype),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
@@ -375,8 +375,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 None,  # block_size
                 None,  # a1_scale
                 None,  # a2_scale
-                layer.w13_weight_bias.to(torch.bfloat16),
-                layer.w2_weight_bias.to(torch.bfloat16),
+                layer.w13_weight_bias,
+                layer.w2_weight_bias,
                 activation_alpha,
                 swiglu_limit,
                 True,  # is_vnni
