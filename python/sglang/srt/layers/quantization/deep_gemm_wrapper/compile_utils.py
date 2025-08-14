@@ -152,38 +152,44 @@ class _BaseWarmupExecutor:
 class _MMWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         assert num_groups is None
-        TODO
+        self.lhs = TODO
+        self.rhs = TODO
+        self.out = TODO
 
     def execute(self, m):
         deep_gemm.fp8_gemm_nt(
-            lhs,
-            rhs,
-            out,
+            self.lhs,
+            self.rhs,
+            self.out,
         )
 
 
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        TODO
+        self.lhs = TODO
+        self.rhs = TODO
+        self.out = TODO
 
     def execute(self, m):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            lhs,
-            rhs,
-            out,
+            self.lhs,
+            self.rhs,
+            self.out,
             m_indices=m_indices,
         )
 
 
 class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        TODO
+        self.lhs = TODO
+        self.rhs = TODO
+        self.out = TODO
 
     def execute(self, m):
         deep_gemm.fp8_m_grouped_gemm_nt_masked(
-            lhs,
-            rhs,
-            out,
+            self.lhs,
+            self.rhs,
+            self.out,
             masked_m=masked_m,
             expected_m=expected_m,
         )
