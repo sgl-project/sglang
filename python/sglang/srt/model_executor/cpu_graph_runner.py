@@ -429,6 +429,7 @@ class CPUGraphRunner(GraphRunner):
         )
 
         if self.enable_torch_compile:
+            register_fake_ops()
             set_torch_compile_config()
 
         # Graph inputs
