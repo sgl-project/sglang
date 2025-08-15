@@ -2134,7 +2134,7 @@ class ServerArgs:
                     "Expected a list or a dictionary."
                 )
             assert len(set(l.lora_name for l in self.lora_paths)) == len(
-                lora_paths
+                self.lora_paths
             ), "Duplicate LoRA names found in --lora-paths."
 
             # Expand target modules
