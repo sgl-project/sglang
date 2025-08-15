@@ -22,6 +22,7 @@ from sglang.srt.utils import get_device_capability, set_weight_attrs
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 
@@ -353,17 +354,14 @@ class MoeWNA16Method(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         # avoid circular import
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
-        assert activation == "silu", "Only SiLU activation is supported."
+        assert (
+            moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
 
         weight_bits = self.quant_config.weight_bits
         has_zp = self.quant_config.has_zp
@@ -373,8 +371,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             layer.w13_qweight,
             layer.w2_qweight,
             topk_output=topk_output,
-            inplace=inplace,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+            moe_runner_config=moe_runner_config,
             use_int4_w4a16=weight_bits == 4,
             use_int8_w8a16=weight_bits == 8,
             w1_scale=layer.w13_scales,
@@ -382,8 +379,6 @@ class MoeWNA16Method(FusedMoEMethodBase):
             w1_zp=layer.w13_qzeros if has_zp else None,
             w2_zp=layer.w2_qzeros if has_zp else None,
             block_shape=[0, layer.group_size],
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )
 
     @staticmethod
@@ -486,16 +481,16 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 )
 
             if "w13_qzeros" in weight_name:
-                tensor = loaded_weight.view(layer.tp_size, -1, loaded_weight.size(1))[
-                    tp_rank
-                ]
+                tensor = loaded_weight.view(
+                    layer.moe_tp_size, -1, loaded_weight.size(1)
+                )[tp_rank]
                 if shard_id == "w1":
                     param.data[expert_id, : shard_size // 2] = tensor
                 else:
                     param.data[expert_id, shard_size // 2 :] = tensor
             elif "w2_qzeros" in weight_name:
                 param.data[expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), layer.tp_size, -1
+                    loaded_weight.size(0), layer.moe_tp_size, -1
                 )[:, tp_rank]
             else:
                 weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
