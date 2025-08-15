@@ -13,7 +13,7 @@ class StandardDispatchOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.standard
+        return DispatchOutputFormat.STANDARD
 
 
 assert isinstance(StandardDispatchOutput, DispatchOutput)

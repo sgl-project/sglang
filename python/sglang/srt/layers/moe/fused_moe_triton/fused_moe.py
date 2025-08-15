@@ -2,17 +2,20 @@
 
 """Fused MoE kernel."""
 
+from __future__ import annotations
+
 import functools
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -1025,8 +1028,8 @@ def inplace_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -1053,8 +1056,8 @@ def inplace_fused_experts(
         block_shape,
         False,
         routed_scaling_factor,
-        activation_alpha,
-        swiglu_limit,
+        gemm1_alpha,
+        gemm1_limit,
     )
 
 
@@ -1081,8 +1084,8 @@ def inplace_fused_experts_fake(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
 ) -> None:
     pass
 
@@ -1119,8 +1122,8 @@ def outplace_fused_experts(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -1147,8 +1150,8 @@ def outplace_fused_experts(
         block_shape,
         no_combine=no_combine,
         routed_scaling_factor=routed_scaling_factor,
-        activation_alpha=activation_alpha,
-        swiglu_limit=swiglu_limit,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
     )
 
 
@@ -1176,8 +1179,8 @@ def outplace_fused_experts_fake(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1194,12 +1197,10 @@ def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_output: TopKOutput,
+    topk_output: StandardTopKOutput,
+    moe_runner_config: MoeRunnerConfig,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
-    inplace: bool = False,
-    activation: str = "silu",
-    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1212,14 +1213,10 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    no_combine: bool = False,
-    routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
-    if inplace:
-        assert not no_combine, "no combine + inplace makes no sense"
+    if moe_runner_config.inplace:
+        assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         torch.ops.sglang.inplace_fused_experts(
             hidden_states,
             w1,
@@ -1228,8 +1225,8 @@ def fused_experts(
             topk_ids,
             b1,
             b2,
-            activation,
-            apply_router_weight_on_input,
+            moe_runner_config.activation,
+            moe_runner_config.apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -1242,9 +1239,9 @@ def fused_experts(
             a1_scale,
             a2_scale,
             block_shape,
-            routed_scaling_factor,
-            activation_alpha,
-            swiglu_limit,
+            moe_runner_config.routed_scaling_factor,
+            moe_runner_config.gemm1_alpha,
+            moe_runner_config.gemm1_clamp_limit,
         )
         return hidden_states
     else:
@@ -1256,8 +1253,8 @@ def fused_experts(
             topk_ids,
             b1,
             b2,
-            activation,
-            apply_router_weight_on_input,
+            moe_runner_config.activation,
+            moe_runner_config.apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -1270,10 +1267,10 @@ def fused_experts(
             a1_scale,
             a2_scale,
             block_shape,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
-            activation_alpha=activation_alpha,
-            swiglu_limit=swiglu_limit,
+            no_combine=moe_runner_config.no_combine,
+            routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_limit=moe_runner_config.gemm1_clamp_limit,
         )
 
 
@@ -1370,11 +1367,11 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
 
 
 @torch.compile
-def swiglu_with_alpha_and_limit(x, alpha, limit):
+def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
     gate, up = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(min=None, max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    return gate * torch.sigmoid(gate * alpha) * (up + 1)
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
 def fused_experts_impl(
@@ -1402,8 +1399,8 @@ def fused_experts_impl(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1533,12 +1530,12 @@ def fused_experts_impl(
             block_shape=block_shape,
         )
         if activation == "silu":
-            if activation_alpha is not None:
-                assert swiglu_limit is not None
+            if gemm1_alpha is not None:
+                assert gemm1_limit is not None
                 intermediate_cache2 = swiglu_with_alpha_and_limit(
                     intermediate_cache1.view(-1, N),
-                    activation_alpha,
-                    swiglu_limit,
+                    gemm1_alpha,
+                    gemm1_limit,
                 )
             elif _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -1547,10 +1544,8 @@ def fused_experts_impl(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
         elif activation == "gelu":
-            assert (
-                activation_alpha is None
-            ), "activation_alpha is not supported for gelu"
-            assert swiglu_limit is None, "swiglu_limit is not supported for gelu"
+            assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
+            assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
             if _is_cuda:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
@@ -1641,12 +1636,10 @@ def fused_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_output: TopKOutput,
+    topk_output: StandardTopKOutput,
+    moe_runner_config: MoeRunnerConfig = MoeRunnerConfig(),
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
-    inplace: bool = False,
-    activation: str = "silu",
-    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1659,10 +1652,6 @@ def fused_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-    no_combine: bool = False,
-    routed_scaling_factor: Optional[float] = None,
-    activation_alpha: Optional[float] = None,
-    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1672,11 +1661,10 @@ def fused_moe(
     - hidden_states (torch.Tensor): The input tensor to the MoE layer.
     - w1 (torch.Tensor): The first set of expert weights.
     - w2 (torch.Tensor): The second set of expert weights.
-    - topk_output (TopKOutput): The top-k output of the experts.
+    - topk_output (StandardTopKOutput): The top-k output of the experts.
+    - moe_runner_config (MoeRunnerConfig): The configuration for the MoE runner.
     - b1 (Optional[torch.Tensor]): Optional bias for w1.
     - b2 (Optional[torch.Tensor]): Optional bias for w2.
-    - inplace (bool): If True, perform the operation in-place.
-        Defaults to False.
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
     - use_int8_w8a8 (bool): If True, use int8 arithmetic to compute the inner
@@ -1696,9 +1684,9 @@ def fused_moe(
         a2.
     - block_shape: (Optional[List[int]]): Optional block size for block-wise
         quantization.
-    - activation_alpha (Optional[float]): Optional alpha for the activation
+    - gemm1_alpha (Optional[float]): Optional gemm1_alpha for the activation
         function.
-    - swiglu_limit (Optional[float]): Optional limit for the swiglu activation
+    - gemm1_limit (Optional[float]): Optional gemm1_limit for the swiglu activation
         function.
 
     Returns:
@@ -1710,11 +1698,9 @@ def fused_moe(
         w1,
         w2,
         topk_output,
+        moe_runner_config=moe_runner_config,
         b1=b1,
         b2=b2,
-        inplace=inplace,
-        activation=activation,
-        apply_router_weight_on_input=apply_router_weight_on_input,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
@@ -1727,8 +1713,4 @@ def fused_moe(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
-        no_combine=no_combine,
-        routed_scaling_factor=routed_scaling_factor,
-        activation_alpha=activation_alpha,
-        swiglu_limit=swiglu_limit,
     )

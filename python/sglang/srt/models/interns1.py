@@ -6,6 +6,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
@@ -254,7 +255,7 @@ class InternS1ForConditionalGeneration(nn.Module):
         ]
         expert_params_mapping = []
         if "Qwen3MoeForCausalLM" in self.config.text_config.architectures:
-            expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
