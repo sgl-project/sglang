@@ -37,6 +37,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base_causal_lm import BaseCausalLM
 from sglang.srt.utils import add_prefix
 
 

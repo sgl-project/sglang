@@ -22,6 +22,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.base_causal_lm import BaseCausalLM
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer, Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
 
@@ -43,7 +44,7 @@ class MiMoModel(Qwen2Model):
         )
 
 
-class MiMoForCausalLM(nn.Module):
+class MiMoForCausalLM(BaseCausalLM):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -69,12 +70,8 @@ class MiMoForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
-        self.config = config
-        self.quant_config = quant_config
-        self.model = MiMoModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
-        )
+        super().__init__(config, quant_config)
+        self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -84,8 +81,15 @@ class MiMoForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-        self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
+    def _init_model(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        """Initialize the MiMo model."""
+        return MiMoModel(config, quant_config=quant_config, prefix=prefix)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -152,20 +156,6 @@ class MiMoForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
-
-    def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
 
 
 EntryClass = MiMoForCausalLM
