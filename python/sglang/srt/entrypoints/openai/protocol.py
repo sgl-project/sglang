@@ -240,6 +240,7 @@ class CompletionResponse(BaseModel):
     model: str
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class CompletionResponseStreamChoice(BaseModel):
@@ -517,6 +518,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class DeltaMessage(BaseModel):
@@ -857,15 +859,6 @@ class MessageProcessingResult:
 class ResponseReasoningTextContent(BaseModel):
     text: str
     type: Literal["reasoning_text"] = "reasoning_text"
-
-
-class ResponseReasoningItem(BaseModel):
-    id: str
-    content: list[ResponseReasoningTextContent] = Field(default_factory=list)
-    summary: list = Field(default_factory=list)
-    type: Literal["reasoning"] = "reasoning"
-    encrypted_content: Optional[str] = None
-    status: Optional[Literal["in_progress", "completed", "incomplete"]]
 
 
 ResponseInputOutputItem: TypeAlias = Union[

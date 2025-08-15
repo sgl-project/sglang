@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tracing::info;
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone)]
@@ -113,6 +114,7 @@ impl CircuitBreaker {
         self.total_successes.fetch_add(1, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Release);
         let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+        // Outcome-level metrics are recorded at the worker level where the worker label is known
 
         let current_state = *self.state.read().unwrap();
 
@@ -138,6 +140,7 @@ impl CircuitBreaker {
         self.total_failures.fetch_add(1, Ordering::Relaxed);
         self.consecutive_successes.store(0, Ordering::Release);
         let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        // Outcome-level metrics are recorded at the worker level where the worker label is known
 
         // Update last failure time
         {
@@ -204,11 +207,18 @@ impl CircuitBreaker {
                 }
             }
 
-            tracing::info!(
-                "Circuit breaker state transition: {} -> {}",
-                old_state,
-                new_state
-            );
+            let from = match old_state {
+                CircuitState::Closed => "closed",
+                CircuitState::Open => "open",
+                CircuitState::HalfOpen => "half_open",
+            };
+            let to = match new_state {
+                CircuitState::Closed => "closed",
+                CircuitState::Open => "open",
+                CircuitState::HalfOpen => "half_open",
+            };
+            info!("Circuit breaker state transition: {} -> {}", from, to);
+            // Transition metrics are recorded at the worker level where the worker label is known
         }
     }
 

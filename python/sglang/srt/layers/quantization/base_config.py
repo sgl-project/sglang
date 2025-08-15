@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 
@@ -100,12 +101,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         raise NotImplementedError
 

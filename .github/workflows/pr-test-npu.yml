@@ -27,14 +27,20 @@ jobs:
         github.event.pull_request.draft == false
     runs-on: linux-arm64-npu-1
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1.alpha003-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/npu_ci_install_dependency.sh
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host ${CACHING_URL}
+
+          bash scripts/ci/npu_ci_install_dependency.sh
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -56,14 +62,20 @@ jobs:
         github.event.pull_request.draft == false
     runs-on: linux-arm64-npu-2
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1.alpha003-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/npu_ci_install_dependency.sh
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host ${CACHING_URL}
+
+          bash scripts/ci/npu_ci_install_dependency.sh
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -85,14 +97,20 @@ jobs:
         github.event.pull_request.draft == false
     runs-on: linux-arm64-npu-4
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1.alpha003-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/npu_ci_install_dependency.sh
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host ${CACHING_URL}
+
+          bash scripts/ci/npu_ci_install_dependency.sh
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
