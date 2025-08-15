@@ -312,13 +312,27 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
-    modified_request.update(
-        {
-            "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
-        }
-    )
+
+    parallel_sample_n = request_data.get("n", 1)
+
+    if parallel_sample_n > 1:
+        modified_request.update(
+            {
+                "bootstrap_host": hostname,
+                "bootstrap_port": bootstrap_port,
+                "bootstrap_room": [
+                    _generate_bootstrap_room() for _ in range(parallel_sample_n)
+                ],
+            }
+        )
+    else:
+        modified_request.update(
+            {
+                "bootstrap_host": hostname,
+                "bootstrap_port": bootstrap_port,
+                "bootstrap_room": _generate_bootstrap_room(),
+            }
+        )
 
     if request_data.get("stream", False):
         return await load_balancer.generate_stream(

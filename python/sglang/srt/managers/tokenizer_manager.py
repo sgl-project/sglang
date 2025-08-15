@@ -875,21 +875,35 @@ class TokenizerManager:
             )
 
             # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
-                tmp_obj = copy.copy(objs[i])
-                tokenized_obj = copy.copy(tokenized_objs[i])
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
-                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
-                tokenized_obj.sampling_params.max_new_tokens = 0
-                tokenized_obj.stream = False
-                state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                await self._wait_one_response(tmp_obj, state, request).__anext__()
+            if self.server_args.disaggregation_mode != "decode":
+                for i in range(batch_size):
+                    tmp_obj = copy.copy(objs[i])
+                    tokenized_obj = copy.copy(tokenized_objs[i])
+                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    if tokenized_obj.bootstrap_host is not None:
+                        # For PD disaggregation, we need to fake the bootstrap host for the prefill server
+                        logger.info(
+                            f"[SampleParallel] bootstrap_host: {tokenized_obj.bootstrap_host}->fake_host"
+                        )
+                        tokenized_obj.bootstrap_host = "2.2.2.2"
+                    tokenized_obj.sampling_params = copy.copy(
+                        tokenized_obj.sampling_params
+                    )
+                    tokenized_obj.sampling_params.max_new_tokens = 0
+                    tokenized_obj.stream = False
+                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    await self._wait_one_response(tmp_obj, state, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
                 for _ in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    if tokenized_obj.bootstrap_host is not None:
+                        # For PD disaggregation, we need to use specific bootstrap room for each child request
+                        tokenized_obj.bootstrap_room = tokenized_objs[i].bootstrap_room[
+                            _
+                        ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, state, request))
