@@ -1,16 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/mxfp4.py
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
-import triton.language as tl
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -18,7 +30,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.utils import is_sm100_supported
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -47,6 +58,7 @@ if is_flashinfer_available():
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 OCP_MX_BLOCK_SIZE = 32
@@ -205,14 +217,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self,
         prefix: str,
     ):
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-
         super().__init__()
 
+        self.prefix = prefix
         self.topk_indices_dtype = None
-        self.use_triton_kernels = global_server_args_dict["enable_triton_kernel_moe"]
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         self.with_bias = False
-        self.use_flashinfer = global_server_args_dict["enable_flashinfer_mxfp4_moe"]
+        self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
 
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
@@ -332,8 +343,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_flashinfer:
             log_info_on_rank0(
                 logger,
-                "Shuffling MoE weights for FlashInfer MXFP4 moe kernel, it might take a while...",
+                f"Shuffling MoE weights for FlashInfer MXFP4 moe kernel (layer: {self.prefix}), it might take a while...",
             )
+            # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
                 requires_grad=False,
@@ -559,15 +571,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-        activation_alpha: Optional[float] = None,
-        swiglu_limit: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
+
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
         if self.use_flashinfer:
             # Based on profiling results, we need to quantize x to mxfp8 here to achieve better performance
             x_quant, x_scale = mxfp8_quantize(
@@ -575,8 +583,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )  # to mxfp8
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
             assert x_quant.shape[-1] == self.hidden_size
+            assert TopKOutputChecker.format_is_bypassed(topk_output)
 
-            top_k, router_logits = topk_output
+            top_k = topk_output.topk_config.top_k
+            router_logits = topk_output.router_logits
 
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
@@ -597,8 +607,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 None,  # output2_scale_scalar
                 layer.num_experts,
                 top_k,
-                None,  # n_group
-                None,  # topk_group
+                None,  # n_group      # TODO: support n_group
+                None,  # topk_group   # TODO: support topk_group
                 self.intermediate_size,  # padded to multiple of 256
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
@@ -623,9 +633,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     b1=layer.w13_weight_bias,
                     b2=layer.w2_weight_bias,
                     topk_output=topk_output,
-                    activation=activation,
-                    activation_alpha=activation_alpha,
-                    swiglu_limit=swiglu_limit,
+                    moe_runner_config=moe_runner_config,
                 )
             else:
                 return self.triton_kernel_moe_forward(
@@ -633,6 +641,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w1=layer.w13_weight,
                     w2=layer.w2_weight,
                     topk_output=topk_output,
+                    moe_runner_config=moe_runner_config,
                 )
         else:
             from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -642,13 +651,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
                 topk_output=topk_output,
+                moe_runner_config=moe_runner_config,
                 b1=layer.w13_weight_bias,
                 b2=layer.w2_weight_bias,
-                inplace=inplace,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                no_combine=no_combine,
-                routed_scaling_factor=routed_scaling_factor,
-                activation_alpha=activation_alpha,
-                swiglu_limit=swiglu_limit,
             )

@@ -55,6 +55,7 @@ impl RouterFactory {
             ctx.router_config.api_key.clone(),
             ctx.router_config.retry.clone(),
             ctx.router_config.circuit_breaker.clone(),
+            ctx.router_config.health_check.clone(),
         )
         .await?;
 
@@ -87,6 +88,7 @@ impl RouterFactory {
             ctx.router_config.worker_startup_check_interval_secs,
             ctx.router_config.retry.clone(),
             ctx.router_config.circuit_breaker.clone(),
+            ctx.router_config.health_check.clone(),
         )
         .await?;
 
