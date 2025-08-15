@@ -2379,15 +2379,26 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 layer = self.model.layers[layer_id]
 
-            for module in [
-                layer.self_attn.fused_qkv_a_proj_with_mqa,
-                layer.self_attn.q_b_proj,
-                layer.self_attn.kv_b_proj,
-                layer.self_attn.o_proj,
-            ]:
-                requant_weight_ue8m0_inplace(
-                    module.weight, module.weight_scale_inv, weight_block_size
-                )
+            # Support both fused and non-fused cases. Only requantize modules that actually exist and carry fp8 scales.
+            attn = layer.self_attn
+            candidate_names = [
+                "fused_qkv_a_proj_with_mqa",  # fused case
+                "q_b_proj",  # fused case
+                "q_proj",  # non-fused case
+                "kv_a_proj_with_mqa",  # non-fused case
+                "kv_b_proj",
+                "o_proj",
+            ]
+            for name in candidate_names:
+                module = getattr(attn, name, None)
+                if (
+                    module is not None
+                    and hasattr(module, "weight")
+                    and hasattr(module, "weight_scale_inv")
+                ):
+                    requant_weight_ue8m0_inplace(
+                        module.weight, module.weight_scale_inv, weight_block_size
+                    )
 
             if layer_id in moe_layers or is_nextn:
                 shared_experts = getattr(layer.mlp, "shared_experts", None)
