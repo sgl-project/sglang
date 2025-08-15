@@ -146,11 +146,10 @@ class TestIterTokens(CustomTestCase):
 
 class TestCanonicalStrategy(CustomTestCase):
     def setUp(self):
-        self.strategy = CanonicalStrategy(stream_reasoning=True)
+        self.strategy = CanonicalStrategy()
 
     def test_init(self):
         """Test CanonicalStrategy initialization."""
-        self.assertTrue(self.strategy.stream_reasoning)
         self.assertIn("<|start|>", self.strategy.guard_tokens)
         self.assertIn("<|constrain|>", self.strategy.guard_tokens)
 
@@ -291,24 +290,13 @@ class TestCanonicalStrategy(CustomTestCase):
         self.assertEqual(events[0].content, "")
         self.assertEqual(remaining, "")
 
-    def test_parse_stream_reasoning_false(self):
-        """Test parsing with stream_reasoning=False."""
-        strategy = CanonicalStrategy(stream_reasoning=False)
-        text = "<|channel|>analysis<|message|>reasoning content<|end|>"
-        events, remaining = strategy.parse(text)
-
-        # Should not emit reasoning events when stream_reasoning=False
-        self.assertEqual(len(events), 0)
-        self.assertEqual(remaining, "")
-
 
 class TestTextStrategy(CustomTestCase):
     def setUp(self):
-        self.strategy = TextStrategy(stream_reasoning=True)
+        self.strategy = TextStrategy()
 
     def test_init(self):
         """Test TextStrategy initialization."""
-        self.assertTrue(self.strategy.stream_reasoning)
         self.assertIn("analysis_then_final", self.strategy.patterns)
 
     def test_parse_analysis_then_final(self):
@@ -350,10 +338,11 @@ class TestTextStrategy(CustomTestCase):
         text = "analysis This is reasoning content."
         events, remaining = self.strategy.parse(text)
 
+        # For analysis-only, streaming parse should keep header and emit with leading space
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event_type, "reasoning")
-        self.assertEqual(events[0].content, "This is reasoning content.")
-        self.assertEqual(remaining, "")
+        self.assertEqual(events[0].content, " This is reasoning content.")
+        self.assertEqual(remaining, "analysis")
 
     def test_parse_incomplete_assistantfinal(self):
         """Test parsing with incomplete assistantfinal."""
@@ -381,17 +370,6 @@ class TestTextStrategy(CustomTestCase):
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].event_type, "reasoning")
         self.assertEqual(events[1].event_type, "normal")
-
-    def test_parse_stream_reasoning_false(self):
-        """Test parsing with stream_reasoning=False."""
-        strategy = TextStrategy(stream_reasoning=False)
-        text = "analysis reasoning content assistantfinal answer"
-        events, remaining = strategy.parse(text)
-
-        # Should not emit reasoning when stream_reasoning=False
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].event_type, "normal")
-        self.assertEqual(events[0].content, "answer")
 
     def test_parse_plain_text_fallback(self):
         """Test parsing plain text without harmony markers."""
@@ -422,11 +400,10 @@ class TestTextStrategy(CustomTestCase):
 
 class TestHarmonyParser(CustomTestCase):
     def setUp(self):
-        self.parser = HarmonyParser(stream_reasoning=True)
+        self.parser = HarmonyParser()
 
     def test_init(self):
         """Test HarmonyParser initialization."""
-        self.assertTrue(self.parser.stream_reasoning)
         self.assertIsNone(self.parser.strategy)
         self.assertEqual(self.parser._buffer, "")
 
@@ -502,7 +479,7 @@ class TestIntegrationScenarios(CustomTestCase):
 
     def test_complete_reasoning_flow(self):
         """Test complete reasoning flow from HARMONY_DOCS.md examples."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         text = (
             '<|channel|>analysis<|message|>User asks: "What is 2 + 2?" Simple arithmetic. Provide answer.<|end|>'
@@ -519,7 +496,7 @@ class TestIntegrationScenarios(CustomTestCase):
 
     def test_tool_call_sequence(self):
         """Test tool call sequence from HARMONY_DOCS.md examples."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         text = (
             "<|channel|>analysis<|message|>Need to use function get_weather.<|end|>"
@@ -537,7 +514,7 @@ class TestIntegrationScenarios(CustomTestCase):
 
     def test_preamble_sequence(self):
         """Test preamble sequence with multiple commentary blocks."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         text = (
             "<|channel|>analysis<|message|>Long chain of thought<|end|>"
@@ -556,7 +533,7 @@ class TestIntegrationScenarios(CustomTestCase):
 
     def test_built_in_tool_call(self):
         """Test built-in tool call on analysis channel."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         text = '<|channel|>analysis to=browser.search<|message|>{"query": "SGLang"}<|call|>'
 
@@ -568,7 +545,7 @@ class TestIntegrationScenarios(CustomTestCase):
 
     def test_tool_response_handling(self):
         """Test tool response message handling."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         text = '<|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>{"sunny": true, "temperature": 20}<|end|>'
 
@@ -580,7 +557,7 @@ class TestIntegrationScenarios(CustomTestCase):
 
     def test_text_fallback_formats(self):
         """Test various text fallback formats."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         # Test analysis then final
         events1 = parser.parse("analysis thinking assistantfinal answer")
@@ -588,7 +565,7 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertEqual(len([e for e in events1 if e.event_type == "normal"]), 1)
 
         # Reset parser for next test
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         # Test final only
         events2 = parser.parse("assistantfinal direct answer")
@@ -603,11 +580,11 @@ class TestIntegrationScenarios(CustomTestCase):
         )
 
         # One-shot parsing
-        parser1 = HarmonyParser(stream_reasoning=True)
+        parser1 = HarmonyParser()
         events_oneshot = parser1.parse(full_text)
 
         # Chunked parsing
-        parser2 = HarmonyParser(stream_reasoning=True)
+        parser2 = HarmonyParser()
         chunks = [full_text[i : i + 10] for i in range(0, len(full_text), 10)]
         events_chunked = []
         for chunk in chunks:
@@ -624,11 +601,11 @@ class TestIntegrationScenarios(CustomTestCase):
         full_text = "analysis reasoning content assistantfinal final answer"
 
         # One-shot parsing
-        parser1 = HarmonyParser(stream_reasoning=True)
+        parser1 = HarmonyParser()
         events_oneshot = parser1.parse(full_text)
 
         # Chunked parsing
-        parser2 = HarmonyParser(stream_reasoning=True)
+        parser2 = HarmonyParser()
         chunks = ["analysis reason", "ing content assistant", "final final answer"]
         events_chunked = []
         for chunk in chunks:
@@ -658,7 +635,7 @@ class TestEdgeCases(CustomTestCase):
 
     def test_malformed_channel_headers(self):
         """Test handling of malformed channel headers."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         # Unknown channel type
         text = "<|channel|>unknown<|message|>content<|end|>"
@@ -669,7 +646,7 @@ class TestEdgeCases(CustomTestCase):
 
     def test_mixed_unknown_tokens(self):
         """Test handling of mixed unknown tokens."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         text = "text <|weird|> more text <|channel|>analysis<|message|>content<|end|>"
         events = parser.parse(text)
@@ -683,13 +660,13 @@ class TestEdgeCases(CustomTestCase):
 
     def test_empty_input(self):
         """Test handling of empty input."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
         events = parser.parse("")
         self.assertEqual(len(events), 0)
 
     def test_whitespace_preservation(self):
         """Test that whitespace is preserved correctly."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         text = "<|channel|>analysis<|message|>  content with spaces  <|end|>"
         events = parser.parse(text)
@@ -699,7 +676,7 @@ class TestEdgeCases(CustomTestCase):
 
     def test_streaming_whitespace_preservation(self):
         """Test that streaming preserves whitespace between chunks."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         # Simulate streaming where space is at chunk boundary
         chunks = ["analysis The user typed ", '"wapppa". Not a question.']
@@ -722,7 +699,7 @@ class TestEdgeCases(CustomTestCase):
 
     def test_consecutive_blocks_same_type(self):
         """Test consecutive blocks of the same type."""
-        parser = HarmonyParser(stream_reasoning=True)
+        parser = HarmonyParser()
 
         text = (
             "<|channel|>analysis<|message|>first reasoning<|end|>"

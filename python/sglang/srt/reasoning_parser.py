@@ -15,6 +15,7 @@ class StreamingParseResult:
     ):
         self.normal_text = normal_text or ""
         self.reasoning_text = reasoning_text or ""
+        self.reasoning_text = reasoning_text or ""
         self.tool_calls = tool_calls or []
 
 
@@ -206,7 +207,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
         )
-        self.parser = HarmonyParser(stream_reasoning=stream_reasoning)
+        self.parser = HarmonyParser()
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         events = self.parser.parse(text)

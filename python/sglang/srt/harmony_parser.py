@@ -122,8 +122,7 @@ def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
 class CanonicalStrategy:
     """Parses the canonical Harmony format with channel markers."""
 
-    def __init__(self, stream_reasoning: bool):
-        self.stream_reasoning = stream_reasoning
+    def __init__(self):
         self.guard_tokens = [
             "<|start|>",
             "<|channel|>",
@@ -269,10 +268,8 @@ class CanonicalStrategy:
             if end_token.type == "CALL":
                 # Built-in tools (browser, python) use analysis channel with <|call|>
                 return Event("tool_call", content.strip()), end_pos + 1
-            elif self.stream_reasoning:
-                return Event("reasoning", content), end_pos + 1
             else:
-                return None, end_pos + 1  # Skip if not streaming reasoning
+                return Event("reasoning", content), end_pos + 1
         elif channel_type == "commentary":
             if end_token.type == "CALL":
                 return Event("tool_call", content.strip()), end_pos + 1
@@ -294,8 +291,7 @@ class CanonicalStrategy:
 class TextStrategy:
     """Parses the text-based Harmony fallback format."""
 
-    def __init__(self, stream_reasoning: bool):
-        self.stream_reasoning = stream_reasoning
+    def __init__(self):
         self.buffer_context = ""
         self.patterns = {
             "analysis_then_final": re.compile(
@@ -320,11 +316,7 @@ class TextStrategy:
         m = self.patterns["analysis_then_final"].match(text)
         if m:
             channel, reasoning, final = m.groups()
-            if (
-                channel.lower() == "analysis"
-                and reasoning.strip()
-                and self.stream_reasoning
-            ):
+            if channel.lower() == "analysis" and reasoning.strip():
                 events.append(Event("reasoning", reasoning.strip()))
             elif channel.lower() == "commentary" and reasoning.strip():
                 events.append(Event("normal", reasoning.strip()))
@@ -351,35 +343,16 @@ class TextStrategy:
         if m:
             channel, content = m.groups()
             emit, hold = prefix_hold(content, ["assistantfinal"])
-            if channel.lower() == "analysis" and emit and self.stream_reasoning:
-                content_stripped = emit.strip()
-                is_complete_sentence = content_stripped.endswith((".", "!", "?"))
-
-                if not hold and not is_complete_sentence:
-                    # Streaming emission. Decide whether to trim leading space.
-                    is_first_emission = emit.startswith(" ")
-                    if is_first_emission:
-                        buffer_has_assistant_hint = (
-                            "assistant" in self.buffer_context.lower()
-                        )
-                        looks_like_split_word = (
-                            emit.rstrip().split()[-1] == "reason"
-                            and len(emit.strip().split()) == 1
-                        )
-                        if buffer_has_assistant_hint or looks_like_split_word:
-                            events.append(Event("reasoning", content_stripped))
-                        else:
-                            events.append(Event("reasoning", emit))
-                    else:
-                        events.append(Event("reasoning", emit))
-                    # Keep just the channel header for continuation
-                    return events, channel
+            if channel.lower() == "analysis" and emit:
+                # Stream reasoning content as-is based on structural markers only.
+                events.append(Event("reasoning", emit))
+                # Keep the channel header in the remaining buffer to continue parsing
+                # subsequent chunks in the text fallback format. Preserve any held
+                # prefix that may complete into "assistantfinal".
+                if hold:
+                    return events, text[: m.start(2)] + hold
                 else:
-                    events.append(Event("reasoning", content_stripped))
-                    if hold:
-                        return events, text[: m.start(2)] + hold
-                    else:
-                        return events, ""
+                    return events, channel
             elif channel.lower() == "commentary" and emit:
                 # For commentary, stream as normal text. Preserve spaces unless holding.
                 content_out = emit if hold else emit.strip()
@@ -388,7 +361,7 @@ class TextStrategy:
                     return events, text[: m.start(2)] + hold
                 else:
                     return events, ""
-            # If no emit or stream_reasoning disabled
+            # If no emit, just return the held content
             return events, text[: m.start(2)] + hold
 
         emit, hold = prefix_hold(text, ["analysis", "commentary", "assistantfinal"])
@@ -400,8 +373,7 @@ class TextStrategy:
 class HarmonyParser:
     """Facade for parsing Harmony format, switching between strategies."""
 
-    def __init__(self, stream_reasoning: bool = True):
-        self.stream_reasoning = stream_reasoning
+    def __init__(self):
         self.strategy = None
         self._buffer = ""
 
@@ -410,13 +382,13 @@ class HarmonyParser:
 
         if self.strategy is None:
             if "<|channel|>" in self._buffer or "<|start|>" in self._buffer:
-                self.strategy = CanonicalStrategy(self.stream_reasoning)
+                self.strategy = CanonicalStrategy()
             elif re.search(
                 r"(?:^|\s)(?:assistant)?\s*(analysis|commentary|assistantfinal)",
                 self._buffer,
                 re.IGNORECASE,
             ):
-                self.strategy = TextStrategy(self.stream_reasoning)
+                self.strategy = TextStrategy()
             else:
                 # Not yet determined, hold
                 return []
