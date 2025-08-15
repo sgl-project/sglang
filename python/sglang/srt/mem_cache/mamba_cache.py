@@ -29,7 +29,8 @@ class MambaCacheParams:
 class MambaCacheManager:
     def __init__(
         self,
-        dtype: torch.dtype,
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
         num_mamba_layers: int,
         conv_state_shape: Tuple[int, int],
         temporal_state_shape: Tuple[int, int],
@@ -40,11 +41,11 @@ class MambaCacheManager:
 
         conv_state = torch.empty(size=(num_mamba_layers, max_batch_size + 1) +
                                  conv_state_shape,
-                                 dtype=dtype,
+                                 dtype=conv_dtype,
                                  device="cuda")
         temporal_state = torch.empty(size=(num_mamba_layers, max_batch_size + 1) +
                                      temporal_state_shape,
-                                     dtype=dtype,
+                                     dtype=ssm_dtype,
                                      device="cuda")
 
         self.mamba_cache = (conv_state, temporal_state)

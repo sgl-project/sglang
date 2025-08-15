@@ -322,7 +322,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             )
 
             if recurrent_state is not None and cache_params is not None:
-                last_recurrent_state = last_recurrent_state.to(torch.bfloat16, copy=False)
+                last_recurrent_state = last_recurrent_state.to(cache_params.ssm_state.dtype, copy=False)
                 cache_params.ssm_state[cache_params.state_indices_tensor] = last_recurrent_state
         else:
             core_attn_out = fused_recurrent_gated_delta_rule_update(
@@ -574,11 +574,11 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             logger.warning_once('using attn output gate!')
 
         if hasattr(config, "rotary_percent"):
-            rotary_dim = self.head_dim * config.rotary_percent
+            rotary_dim = int(self.head_dim * config.rotary_percent)
         elif hasattr(config, "partial_rotary_factor"):
-            rotary_dim = self.head_dim * config.partial_rotary_factor
+            rotary_dim = int(self.head_dim * config.partial_rotary_factor)
         elif hasattr(config, "attn_rotary_emb"):
-            rotary_dim = config.attn_rotary_emb  # for backward compatibility
+            rotary_dim = int(config.attn_rotary_emb)  # for backward compatibility
         else:
             rotary_dim = self.head_dim  # default
         self.rotary_emb = get_rope(
@@ -877,6 +877,7 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
+        self.lm_head = self.lm_head.float()
         self.logits_processor = LogitsProcessor(config)
 
         # Used to track and store by the Mamba cache between steps.
@@ -950,7 +951,7 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
             num_mamba_layers = sum(type_value == HybridLayerType.mamba2.value for type_value in layers_block_type_value)
             conv_state_shape, temporal_state_shape = self._get_mamba_cache_shape()
         self.mamba_cache = MambaCacheManager(
-            self.lm_head.weight.dtype, num_mamba_layers,
+            torch.bfloat16, torch.float32, num_mamba_layers,
             conv_state_shape, temporal_state_shape)
 
     def prepare_extend_start_loc(self, forward_batch: ForwardBatch):
