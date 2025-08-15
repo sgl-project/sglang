@@ -55,7 +55,7 @@ RUN pip install $MEMFABRIC_URL --no-cache-dir
 
 # Install vLLM
 RUN git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG && \
-    (cd vllm && VLLM_TARGET_DEVICE="empty" pip install -v -e . --no-cache-dir)
+    (cd vllm && VLLM_TARGET_DEVICE="empty" pip install -v . --no-cache-dir) && rm -rf vllm
 
 # TODO: install from pypi released triton-ascend
 RUN pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu --no-cache-dir \
@@ -65,7 +65,7 @@ RUN pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --inde
 
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
-    (cd sglang && pip install -v -e "python[srt_npu]" --no-cache-dir)
+    (cd sglang && pip install -v "python[srt_npu]" --no-cache-dir) && rm -rf sglang
 
 # Install Deep-ep
 RUN git clone  --branch $SGLANG_KERNEL_NPU_TAG https://github.com/sgl-project/sgl-kernel-npu.git \
