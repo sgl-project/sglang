@@ -60,6 +60,86 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         result = detect_jinja_template_content_format("")
         self.assertEqual(result, "string")
 
+    def test_detect_msg_content_pattern(self):
+        """Test detection of template with msg.content pattern (should be 'openai' format)."""
+        msg_content_pattern = """
+[gMASK]<sop>
+{%- for msg in messages %}
+    {%- if msg.role == 'system' %}
+<|system|>
+{{ msg.content }}
+    {%- elif msg.role == 'user' %}
+<|user|>{{ '\n' }}
+        {%- if msg.content is string %}
+{{ msg.content }}
+        {%- else %}
+            {%- for item in msg.content %}
+                {%- if item.type == 'video' or 'video' in item %}
+<|begin_of_video|><|video|><|end_of_video|>
+                {%- elif item.type == 'image' or 'image' in item %}
+<|begin_of_image|><|image|><|end_of_image|>
+                {%- elif item.type == 'text' %}
+{{ item.text }}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+    {%- elif msg.role == 'assistant' %}
+        {%- if msg.metadata %}
+<|assistant|>{{ msg.metadata }}
+{{ msg.content }}
+        {%- else %}
+<|assistant|>
+{{ msg.content }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{% if add_generation_prompt %}<|assistant|>
+{% endif %}
+        """
+
+        result = detect_jinja_template_content_format(msg_content_pattern)
+        self.assertEqual(result, "openai")
+
+    def test_detect_m_content_pattern(self):
+        """Test detection of template with m.content pattern (should be 'openai' format)."""
+        msg_content_pattern = """
+[gMASK]<sop>
+{%- for m in messages %}
+    {%- if m.role == 'system' %}
+<|system|>
+{{ m.content }}
+    {%- elif m.role == 'user' %}
+<|user|>{{ '\n' }}
+        {%- if m.content is string %}
+{{ m.content }}
+        {%- else %}
+            {%- for item in m.content %}
+                {%- if item.type == 'video' or 'video' in item %}
+<|begin_of_video|><|video|><|end_of_video|>
+                {%- elif item.type == 'image' or 'image' in item %}
+<|begin_of_image|><|image|><|end_of_image|>
+                {%- elif item.type == 'text' %}
+{{ item.text }}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+    {%- elif m.role == 'assistant' %}
+        {%- if m.metadata %}
+<|assistant|>{{ m.metadata }}
+{{ m.content }}
+        {%- else %}
+<|assistant|>
+{{ m.content }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{% if add_generation_prompt %}<|assistant|>
+{% endif %}
+        """
+
+        result = detect_jinja_template_content_format(msg_content_pattern)
+        self.assertEqual(result, "openai")
+
     def test_process_content_openai_format(self):
         """Test content processing for openai format."""
         msg_dict = {

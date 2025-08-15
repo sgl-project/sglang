@@ -19,8 +19,10 @@ format: check-deps ## Format modified Python files using isort and black
 FILES_TO_UPDATE = docker/Dockerfile.rocm \
                  python/pyproject.toml \
                  python/sglang/version.py \
-                 docs/references/setup_github_runner.md \
-                 docs/start/install.md \
+                 docs/developer_guide/setup_github_runner.md \
+                 docs/get_started/install.md \
+                 docs/platforms/amd_gpu.md \
+                 docs/platforms/ascend_npu.md \
 				 benchmark/deepseek_v3/README.md
 
 update: ## Update version numbers across project files. Usage: make update <new_version>
