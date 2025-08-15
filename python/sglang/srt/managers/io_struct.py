@@ -988,6 +988,17 @@ class ProfileReqOutput:
 
 
 @dataclass
+class FreezeGCReq:
+    pass
+
+
+@dataclass
+class FreezeGCReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
 class ConfigureLoggingReq:
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None

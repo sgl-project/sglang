@@ -78,6 +78,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    FreezeGCReq,
+    FreezeGCReqOutput,
     GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -126,13 +128,14 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
+    freeze_gc,
+    configure_gc_warning,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
-
 
 @dataclasses.dataclass
 class ReqState:
@@ -353,6 +356,10 @@ class TokenizerManager:
                 collect_tokens_histogram=self.server_args.collect_tokens_histogram,
             )
 
+        # Configure GC warning
+        if self.server_args.gc_warning_threshold_secs > 0.0:
+            configure_gc_warning(self.server_args.gc_warning_threshold_secs)
+
         # Communicators
         self.init_weights_update_group_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
@@ -379,6 +386,9 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
         self.profile_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.freeze_gc_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.get_internal_state_communicator = _Communicator(
@@ -446,6 +456,10 @@ class TokenizerManager:
                 (
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
+                ),
+                (
+                    FreezeGCReqOutput,
+                    self.freeze_gc_communicator.handle_recv,
                 ),
                 (
                     GetInternalStateReqOutput,
@@ -1337,6 +1351,15 @@ class TokenizerManager:
             self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
         self.log_request_metadata = self.get_log_request_metadata()
+
+    async def freeze_gc(self):
+        """Send a freeze_gc message to the scheduler first, then freeze locally."""
+        req = FreezeGCReq()
+        result = (await self.freeze_gc_communicator(req))[0]
+
+        freeze_gc("Tokenizer Manager")
+        return result
+        
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
