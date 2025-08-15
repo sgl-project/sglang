@@ -118,7 +118,7 @@ class NixlRegistration:
             items: List of tuples or tensors to register
             mem_type: Memory type ("FILE", "OBJ") or None for tensor or list of tensors
         """
-        if items == []:
+        if isinstance(items, list) and not items:
             return None
 
         reg_descs = self.agent.get_reg_descs(items, mem_type)

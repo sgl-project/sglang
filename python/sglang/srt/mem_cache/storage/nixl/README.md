@@ -49,7 +49,7 @@ To customize the base directory for files, you can set the following environment
 export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/desired/dir
 ```
 
-Selection of any storage backend like 3FS requires availability of that library on the system, and the bakcend is selected based on the priority mentioned above.
+Selection of any storage backend like 3FS requires availability of that library on the system, and the backend is selected based on the priority mentioned above.
 
 ## Running Unit Tests
 

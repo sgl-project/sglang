@@ -47,10 +47,14 @@ class HiCacheNixl(HiCacheStorage):
         self.registration = NixlRegistration(self.agent)
 
     def register_buffers(
-        self, buffers: Union[torch.Tensor, List[torch.Tensor]]
+        self, buffers: Union[torch.Tensor, List[torch.Tensor], List[tuple]]
     ) -> Optional[Any]:
-        """Register tensor(s) with NIXL. Can be extended to tuple mode of registration."""
-        return self.registration._register_memory(buffers)
+        """Register tensor(s) or target locations in host memory (list of addr,len tuples) with NIXL."""
+        if isinstance(buffers[0], tuple):
+            tuples = [(x[0], x[1], 0, "") for x in buffers]
+            return self.registration._register_memory(tuples, "DRAM")
+        else:
+            return self.registration._register_memory(buffers)
 
     def register_files(
         self, file_paths: List[str], open_file: Optional[bool] = True
@@ -69,10 +73,13 @@ class HiCacheNixl(HiCacheStorage):
         return self.registration._register_memory(tuples, "OBJ")
 
     def _execute_transfer(
-        self, tensors: List[torch.Tensor], keys: List[str], direction: str
+        self,
+        buffers: Optional[List[torch.Tensor | tuple]],
+        keys: List[str],
+        direction: str
     ) -> bool:
-        if len(tensors) != len(keys):
-            logger.error("Mismatch between number of tensors and files/objects")
+        if len(buffers) != len(keys):
+            logger.error("Mismatch between number of tensors/buffers and files/objects")
             return False
 
         # Registering file and object keys per transfer, to be updated when
@@ -88,29 +95,32 @@ class HiCacheNixl(HiCacheStorage):
                 logger.error("Failed to register objects")
                 return False
 
-        # Prepare transfer tuples based on tensor sizes
-        tensor_sizes = [tensor.element_size() * tensor.numel() for tensor in tensors]
-        transfer_tuples = [(x[0], s, x[2]) for x, s in zip(tuples, tensor_sizes)]
+        # Prepare transfer descriptors
+        if isinstance(buffers[0], torch.Tensor):
+            tensor_sizes = [tensor.element_size() * tensor.numel() for tensor in buffers]
+            storage_tuples = [(x[0], s, x[2]) for x, s in zip(tuples, tensor_sizes)]
+            host_descs = self.agent.get_xfer_descs(buffers)
+        else:
+            storage_tuples = [(x[0], y[1], x[2]) for x, y in zip(tuples, buffers)]
+            host_descs = self.agent.get_xfer_descs([(x[0], x[1], 0) for x in buffers], "DRAM")
 
-        # Get transfer descriptors
-        tensor_descs = self.agent.get_xfer_descs(tensors)
-        storage_descs = self.agent.get_xfer_descs(transfer_tuples, self.backend_selector.mem_type)
+        storage_descs = self.agent.get_xfer_descs(storage_tuples, self.backend_selector.mem_type)
 
-        if (tensor_descs is None) or (storage_descs is None):
+        if (host_descs is None) or (storage_descs is None):
             logger.error("Failed to get transfer descriptors")
             return False
 
         # Initialize transfer, default assumption that tensor was registered
         try:
-            xfer_req = self.agent.initialize_xfer(direction, tensor_descs, storage_descs, self.agent_name)
-        except:
+            xfer_req = self.agent.initialize_xfer(direction, host_descs, storage_descs, self.agent_name)
+        except Exception:
             # Check if it was due to missing pre-registration
-            if not self.register_buffers(tensors):
-                logger.error("Failed to register tensors")
+            if not self.register_buffers(buffers):
+                logger.error("Failed to register tensors/buffers")
                 return False
 
             try:
-                xfer_req = self.agent.initialize_xfer(direction, tensor_descs, storage_descs, self.agent_name)
+                xfer_req = self.agent.initialize_xfer(direction, host_descs, storage_descs, self.agent_name)
             except Exception as e:
                 logger.error(f"Failed to create transfer request: {e}")
                 return False
@@ -139,33 +149,45 @@ class HiCacheNixl(HiCacheStorage):
         self,
         key: str,
         target_location: Optional[torch.Tensor]=None,
-        target_sizes: Optional[Any] = None,
+        target_sizes: Optional[int] = None,
     ) -> torch.Tensor | None:
-        # TODO: add support for location/size mode. Later API always target to be passed.
-        if target_location is None or target_sizes is not None:
+        # To be removed, being compatible with the current API
+        if target_location is None:
             return None
-        result = self.batch_get([key], [target_location], [target_sizes])
+        if target_sizes:
+            result = self.batch_get([key], [target_location], [target_sizes])
+        else:
+            result = self.batch_get([key], [target_location])
         return result[0] if result else None
 
     def batch_get(
         self,
         keys: List[str],
-        target_locations: Optional[List[torch.Tensor]] = None,
-        target_sizes: Optional[Any] = None,
+        target_locations: Optional[List[torch.Tensor | int]] = None,
+        target_sizes: Optional[List[int]] = None,
     ) -> List[torch.Tensor | None]:
         if not keys:
             return []
 
-        # TODO: add support for location/size mode. Later API always target to be passed.
-        if not target_locations or target_sizes:
+        # To be removed, being compatible with the current API
+        if not target_locations:
             return [None] * len(keys)
+
+        if target_sizes and (len(target_sizes) != len(target_locations)):
+            logger.error("Mismatch between number of target_locations and target_sizes")
+            return [None] * len(keys)
+
+        if target_sizes:
+            dest = list(zip(target_locations, target_sizes))
+        else:
+            dest = target_locations
 
         if self.backend_selector.mem_type == "FILE":
             file_paths = [self.file_manager.get_file_path(key) for key in keys]
-            success = self._execute_transfer(target_locations, file_paths, "READ")
+            success = self._execute_transfer(dest, file_paths, "READ")
         else:
-            success = self._execute_transfer(target_locations, keys, "READ")
-        return target_locations if success else [None] * len(keys)
+            success = self._execute_transfer(dest, keys, "READ")
+        return target_locations if success and not target_sizes else [None] * len(keys)
 
     def set(
         self,
@@ -174,7 +196,10 @@ class HiCacheNixl(HiCacheStorage):
         target_location: Optional[int] = None,
         target_sizes: Optional[int] = None,
     ) -> bool:
-        return self.batch_set([key], [value], [target_location], [target_sizes])
+        if target_location and target_sizes:
+            return self.batch_set([key], [value], [target_location], [target_sizes])
+        else:
+            return self.batch_set([key], [value])
 
     def batch_set(
         self,
@@ -184,8 +209,12 @@ class HiCacheNixl(HiCacheStorage):
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
         # TODO: add support for location/size mode
-        if not keys or not values or target_locations or target_sizes:
-            return True
+        if not keys or (not values and (not target_locations or not target_sizes)):
+            logger.error("Keys or values were not passed")
+            return False
+
+        if not values:
+            values = list(zip(target_locations, target_sizes))
 
         if self.backend_selector.mem_type == "FILE":
             file_paths = []
