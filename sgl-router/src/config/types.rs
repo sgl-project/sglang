@@ -352,7 +352,7 @@ impl RouterConfig {
 
     /// Check if service discovery is enabled
     pub fn has_service_discovery(&self) -> bool {
-        self.discovery.as_ref().map_or(false, |d| d.enabled)
+        self.discovery.as_ref().is_some_and(|d| d.enabled)
     }
 
     /// Check if metrics are enabled

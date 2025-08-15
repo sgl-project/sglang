@@ -211,7 +211,7 @@ impl<B> OnRequest<B> for RequestLogger {
         // Try to get the request ID from extensions
         // This will work if RequestIdLayer has already run
         if let Some(request_id) = request.extensions().get::<RequestId>() {
-            span.record("request_id", &request_id.0.as_str());
+            span.record("request_id", request_id.0.as_str());
         }
 
         // Don't log here - we already log in RequestIdService with the proper request_id

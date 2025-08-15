@@ -276,7 +276,7 @@ impl Router {
 
     fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
         let sync_client = reqwest::blocking::Client::new();
-        let mut req_builder = sync_client.get(&format!("{}/get_server_info", worker_url));
+        let mut req_builder = sync_client.get(format!("{}/get_server_info", worker_url));
         if let Some(key) = api_key {
             req_builder = req_builder.bearer_auth(key);
         }
@@ -628,7 +628,7 @@ impl Router {
                     if let Ok(workers_guard) = self.workers.read() {
                         if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
                             worker.decrement_load();
-                            RouterMetrics::set_running_requests(&worker_url, worker.load());
+                            RouterMetrics::set_running_requests(worker_url, worker.load());
                         }
                     }
                 }
@@ -659,7 +659,7 @@ impl Router {
                 if let Ok(workers_guard) = self.workers.read() {
                     if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
                         worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
+                        RouterMetrics::set_running_requests(worker_url, worker.load());
                     }
                 }
             }
@@ -688,7 +688,7 @@ impl Router {
                             {
                                 if let Ok(workers_guard) = workers.read() {
                                     if let Some(worker) =
-                                        workers_guard.iter().find(|w| w.url() == &worker_url)
+                                        workers_guard.iter().find(|w| w.url() == worker_url)
                                     {
                                         worker.decrement_load();
                                         RouterMetrics::set_running_requests(
@@ -711,8 +711,7 @@ impl Router {
                 }
                 if !decremented {
                     if let Ok(workers_guard) = workers.read() {
-                        if let Some(worker) = workers_guard.iter().find(|w| w.url() == &worker_url)
-                        {
+                        if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
                             worker.decrement_load();
                             RouterMetrics::set_running_requests(&worker_url, worker.load());
                         }
@@ -783,7 +782,7 @@ impl Router {
                 ));
             }
 
-            match client.get(&format!("{}/health", worker_url)).send().await {
+            match client.get(format!("{}/health", worker_url)).send().await {
                 Ok(res) => {
                     if res.status().is_success() {
                         let mut workers_guard = self.workers.write().unwrap();
@@ -953,7 +952,7 @@ impl Router {
 
         match self
             .client
-            .get(&format!("{}/get_load", worker_url))
+            .get(format!("{}/get_load", worker_url))
             .send()
             .await
         {
@@ -1036,7 +1035,7 @@ impl Router {
             worker_url
         };
 
-        match client.get(&format!("{}/get_load", worker_url)).send().await {
+        match client.get(format!("{}/get_load", worker_url)).send().await {
             Ok(res) if res.status().is_success() => match res.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(data) => data

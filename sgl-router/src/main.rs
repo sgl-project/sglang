@@ -467,10 +467,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Skip --prefill and its URL
             i += 2;
             // Also skip bootstrap port if present
-            if i < raw_args.len() && !raw_args[i].starts_with("--") {
-                if raw_args[i].parse::<u16>().is_ok() || raw_args[i].to_lowercase() == "none" {
-                    i += 1;
-                }
+            if i < raw_args.len()
+                && !raw_args[i].starts_with("--")
+                && (raw_args[i].parse::<u16>().is_ok() || raw_args[i].to_lowercase() == "none")
+            {
+                i += 1;
             }
         } else {
             filtered_args.push(raw_args[i].clone());

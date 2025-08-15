@@ -606,7 +606,7 @@ impl WorkerFactory {
 
     /// Get DP size from a worker
     async fn get_worker_dp_size(url: &str, api_key: &Option<String>) -> WorkerResult<usize> {
-        let mut req_builder = WORKER_CLIENT.get(&format!("{}/get_server_info", url));
+        let mut req_builder = WORKER_CLIENT.get(format!("{}/get_server_info", url));
 
         if let Some(key) = api_key {
             req_builder = req_builder.bearer_auth(key);
