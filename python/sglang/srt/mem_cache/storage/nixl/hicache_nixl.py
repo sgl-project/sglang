@@ -135,11 +135,56 @@ class HiCacheNixl(HiCacheStorage):
             logger.error(f"Traceback: {traceback.format_exc()}")
             return False
 
-    def set(self, key: str, value: torch.Tensor) -> bool:
-        return self.batch_set([key], [value])
+    def get(
+        self,
+        key: str,
+        target_location: Optional[torch.Tensor]=None,
+        target_sizes: Optional[Any] = None,
+    ) -> torch.Tensor | None:
+        # TODO: add support for location/size mode. Later API always target to be passed.
+        if target_location is None or target_sizes is not None:
+            return None
+        result = self.batch_get([key], [target_location], [target_sizes])
+        return result[0] if result else None
 
-    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: Optional[List[torch.Tensor]] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> List[torch.Tensor | None]:
         if not keys:
+            return []
+
+        # TODO: add support for location/size mode. Later API always target to be passed.
+        if not target_locations or target_sizes:
+            return [None] * len(keys)
+
+        if self.backend_selector.mem_type == "FILE":
+            file_paths = [self.file_manager.get_file_path(key) for key in keys]
+            success = self._execute_transfer(target_locations, file_paths, "READ")
+        else:
+            success = self._execute_transfer(target_locations, keys, "READ")
+        return target_locations if success else [None] * len(keys)
+
+    def set(
+        self,
+        key: str,
+        value: Optional[torch.Tensor] = None,
+        target_location: Optional[int] = None,
+        target_sizes: Optional[int] = None,
+    ) -> bool:
+        return self.batch_set([key], [value], [target_location], [target_sizes])
+
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[List[torch.Tensor]] = None,
+        target_locations: Optional[List[int]] = None,
+        target_sizes: Optional[List[int]] = None,
+    ) -> bool:
+        # TODO: add support for location/size mode
+        if not keys or not values or target_locations or target_sizes:
             return True
 
         if self.backend_selector.mem_type == "FILE":
@@ -154,27 +199,6 @@ class HiCacheNixl(HiCacheStorage):
             return self._execute_transfer(values, file_paths, "WRITE")
         else: # mem_type == "OBJ"
             return self._execute_transfer(values, keys, "WRITE")
-
-    def get(
-        self, key: str, dst_tensor: Optional[torch.Tensor] = None
-    ) -> torch.Tensor | None:
-        if dst_tensor is None:  # To be removed, being compatible with the current API
-            return None
-        result = self.batch_get([key], [dst_tensor])
-        return result[0] if result else None
-
-    def batch_get(
-        self, keys: List[str], dst_tensors: List[torch.Tensor]
-    ) -> List[Optional[torch.Tensor]]:
-        if not keys:
-            return []
-
-        if self.backend_selector.mem_type == "FILE":
-            file_paths = [self.file_manager.get_file_path(key) for key in keys]
-            success = self._execute_transfer(dst_tensors, file_paths, "READ")
-        else:
-            success = self._execute_transfer(dst_tensors, keys, "READ")
-        return dst_tensors if success else [None] * len(keys)
 
     def exists(self, key: str) -> bool:
         tuples = self.registration.create_query_tuples(
