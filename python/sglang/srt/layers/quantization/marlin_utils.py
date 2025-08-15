@@ -19,9 +19,12 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
-from sglang.srt.layers.quantization.utils import pack_cols, unpack_cols
-from sglang.srt.utils import get_device_capability
+from sglang.srt.layers.quantization.utils import (
+    get_scalar_types,
+    pack_cols,
+    unpack_cols,
+)
+from sglang.srt.utils import get_device_capability, is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -31,7 +34,14 @@ try:
 except ImportError:
     ops = None
 
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import gptq_marlin_gemm
+
 logger = logging.getLogger(__name__)
+
+ScalarType, scalar_types = get_scalar_types()
 
 GPTQ_MARLIN_TILE = 16
 GPTQ_MARLIN_MIN_THREAD_N = 64
@@ -453,7 +463,7 @@ def apply_gptq_marlin_linear(
         dtype=input.dtype,
     )
 
-    output = ops.gptq_marlin_gemm(
+    output = gptq_marlin_gemm(
         reshaped_x,
         None,
         weight,
@@ -504,7 +514,7 @@ def apply_awq_marlin_linear(
         dtype=input.dtype,
     )
 
-    output = ops.gptq_marlin_gemm(
+    output = gptq_marlin_gemm(
         reshaped_x,
         None,
         weight,

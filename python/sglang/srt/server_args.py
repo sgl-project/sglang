@@ -24,7 +24,7 @@ import tempfile
 from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
@@ -108,7 +108,7 @@ class ServerArgs:
     log_level: str = "info"
     log_level_http: Optional[str] = None
     log_requests: bool = False
-    log_requests_level: int = 0
+    log_requests_level: int = 2
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -124,12 +124,14 @@ class ServerArgs:
     # API related
     api_key: Optional[str] = None
     served_model_name: Optional[str] = None
+    weight_version: str = "default"
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    tool_server: Optional[str] = None
 
     # Data parallelism
     dp_size: int = 1
@@ -201,6 +203,7 @@ class ServerArgs:
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
+    hicache_storage_prefetch_policy: str = "best_effort"
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -229,6 +232,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
+    tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
@@ -247,6 +251,8 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
     enable_triton_kernel_moe: bool = False
+    enable_flashinfer_mxfp4_moe: bool = False
+    scheduler_recv_interval: int = 1
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -278,7 +284,6 @@ class ServerArgs:
     enable_deepep_moe: bool = False
 
     def __post_init__(self):
-
         # Check deprecated arguments
         def print_deprecated_warning(message: str):
             logger.warning(f"\033[33m{message}\033[0m")
@@ -384,6 +389,9 @@ class ServerArgs:
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
+        # Model-specific adjustments
+        self.model_specific_adjustments()
+
         # Set kernel backends
         if self.device == "cpu":
             if self.attention_backend is None:
@@ -425,7 +433,10 @@ class ServerArgs:
             )
             self.page_size = 128
 
-        if self.attention_backend == "trtllm_mla":
+        if (
+            self.attention_backend == "trtllm_mla"
+            or self.decode_attention_backend == "trtllm_mla"
+        ):
             if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -436,12 +447,22 @@ class ServerArgs:
                     f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
+
             if self.speculative_algorithm is not None:
                 raise ValueError(
                     "trtllm_mla backend does not support speculative decoding yet."
                 )
 
-        if self.attention_backend == "trtllm_mha":
+            if self.kv_cache_dtype not in ["fp8_e4m3", "auto"]:
+                raise ValueError(
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
+                )
+
+        if (
+            self.attention_backend == "trtllm_mha"
+            or self.decode_attention_backend == "trtllm_mha"
+            or self.prefill_attention_backend == "trtllm_mha"
+        ):
             if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -455,12 +476,16 @@ class ServerArgs:
 
             if self.speculative_algorithm is not None:
                 raise ValueError(
-                    "trtllm_mla backend does not support speculative decoding yet."
+                    "trtllm_mha backend does not support speculative decoding yet."
                 )
-        model_arch = self.get_hf_config().architectures[0]
-        if model_arch in ["GptOssForCausalLM"]:
-            self.attention_backend = "triton"
-            self.enable_triton_kernel_moe = True
+
+        if self.attention_backend == "dual_chunk_flash_attn":
+            logger.warning(
+                "Mixed chunk, radix cache, and cuda graphs are disabled because of using dual chunk flash attention backend"
+            )
+            self.enable_mixed_chunk = False
+            self.disable_cuda_graph = True
+            self.disable_radix_cache = True
 
         # Set page size
         if self.page_size is None:
@@ -521,7 +546,7 @@ class ServerArgs:
 
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
-            logger.info(
+            logger.warning(
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
@@ -529,9 +554,6 @@ class ServerArgs:
             self.ep_dispatch_algorithm is None
         ):
             self.ep_dispatch_algorithm = "static"
-            logger.info(
-                "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
-            )
 
         if self.enable_eplb:
             assert self.ep_size > 1 or self.moe_a2a_backend is not None
@@ -553,6 +575,12 @@ class ServerArgs:
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
+
+        # Hicache
+        if self.hicache_storage_backend == "mooncake":
+            # to use mooncake storage backend, the following conditions must be met:
+            self.hicache_io_backend = "kernel"
+            self.hicache_mem_layout = "page_first"
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1050,7 +1078,7 @@ class ServerArgs:
         parser.add_argument(
             "--log-requests-level",
             type=int,
-            default=0,
+            default=ServerArgs.log_requests_level,
             help="0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.",
             choices=[0, 1, 2, 3],
         )
@@ -1137,6 +1165,12 @@ class ServerArgs:
             help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
         )
         parser.add_argument(
+            "--weight-version",
+            type=str,
+            default=ServerArgs.weight_version,
+            help="Version identifier for the model weights. Defaults to 'default' if not specified.",
+        )
+        parser.add_argument(
             "--chat-template",
             type=str,
             default=ServerArgs.chat_template,
@@ -1169,7 +1203,7 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=[
+            choices=[  # TODO: use FunctionCallParser.DetectorMap.keys()
                 "qwen25",
                 "mistral",
                 "llama3",
@@ -1179,9 +1213,16 @@ class ServerArgs:
                 "qwen3_coder",
                 "glm45",
                 "step3",
+                "gpt-oss",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
+        )
+        parser.add_argument(
+            "--tool-server",
+            type=str,
+            default=None,
+            help="Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",
         )
 
         # Data parallelism
@@ -1282,53 +1323,45 @@ class ServerArgs:
         )
 
         # Kernel backend
+        ATTN_BACKENDS = [
+            # Common
+            "triton",
+            "torch_native",
+            # NVIDIA specific
+            "cutlass_mla",
+            "fa3",
+            "flashinfer",
+            "flashmla",
+            "trtllm_mla",
+            "trtllm_mha",
+            "dual_chunk_flash_attn",
+            # AMD specific
+            "aiter",
+            "wave",
+            # Other platforms
+            "intel_amx",
+            "ascend",
+        ]
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=[
-                "aiter",
-                "cutlass_mla",
-                "fa3",
-                "flashinfer",
-                "flashmla",
-                "intel_amx",
-                "torch_native",
-                "ascend",
-                "triton",
-                "trtllm_mla",
-                "trtllm_mha",
-            ],
+            choices=ATTN_BACKENDS,
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
         parser.add_argument(
-            "--decode-attention-backend",
-            type=str,
-            choices=[
-                "flashinfer",
-                "triton",
-                "torch_native",
-                "fa3",
-                "flashmla",
-                "cutlass_mla",
-            ],
-            default=ServerArgs.decode_attention_backend,
-            help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
-        )
-
-        parser.add_argument(
             "--prefill-attention-backend",
             type=str,
-            choices=[
-                "flashinfer",
-                "triton",
-                "torch_native",
-                "fa3",
-                "flashmla",
-                "cutlass_mla",
-            ],
+            choices=ATTN_BACKENDS,
             default=ServerArgs.prefill_attention_backend,
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
+        )
+        parser.add_argument(
+            "--decode-attention-backend",
+            type=str,
+            choices=ATTN_BACKENDS,
+            default=ServerArgs.decode_attention_backend,
+            help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
         )
         parser.add_argument(
             "--sampling-backend",
@@ -1430,7 +1463,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
+            help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1549,13 +1582,19 @@ class ServerArgs:
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
         )
-
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
             choices=["file", "mooncake", "hf3fs", "nixl"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache.",
+        )
+        parser.add_argument(
+            "--hicache-storage-prefetch-policy",
+            type=str,
+            choices=["best_effort", "wait_complete", "timeout"],
+            default=ServerArgs.hicache_storage_prefetch_policy,
+            help="Control when prefetching from the storage backend should stop.",
         )
 
         # Double Sparsity
@@ -1689,6 +1728,12 @@ class ServerArgs:
             help="Enabling two micro batches to overlap.",
         )
         parser.add_argument(
+            "--tbo-token-distribution-threshold",
+            type=float,
+            default=ServerArgs.tbo_token_distribution_threshold,
+            help="The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
+        )
+        parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
@@ -1784,6 +1829,17 @@ class ServerArgs:
             "--enable-triton-kernel-moe",
             action="store_true",
             help="Use triton moe grouped gemm kernel.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-mxfp4-moe",
+            action="store_true",
+            help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
+        parser.add_argument(
+            "--scheduler-recv-interval",
+            type=int,
+            default=ServerArgs.scheduler_recv_interval,
+            help="The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",
         )
 
         # Debug tensor dumps
@@ -1961,23 +2017,6 @@ class ServerArgs:
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
 
-        # Check model architecture
-        model_arch = self.get_hf_config().architectures[0]
-        if "Llama4" in model_arch:
-            assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
-
-        if model_arch in [
-            "Gemma2ForCausalLM",
-            "Gemma3nForCausalLM",
-            "Gemma3nForConditionalGeneration",
-        ]:
-            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
-            # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
-            logger.warning(
-                f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
-            )
-            self.disable_hybrid_swa_memory = True
-
         # Check LoRA
         self.check_lora_server_args()
 
@@ -1988,22 +2027,20 @@ class ServerArgs:
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
-        assert (
-            self.chunked_prefill_size % self.page_size == 0
-        ), "chunked_prefill_size must be divisible by page_size"
+        # Skip validation if chunked prefill is disabled (i.e., size <= 0).
+        if self.chunked_prefill_size > 0:
+            assert (
+                self.chunked_prefill_size % self.page_size == 0
+            ), "chunked_prefill_size must be divisible by page_size"
 
     def check_lora_server_args(self):
-        assert (
-            self.max_loras_per_batch > 0
-            # FIXME
-            and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and radix attention is in progress"
+        assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
             if self.enable_lora is None:
                 self.enable_lora = True
-                logger.info(
+                logger.warning(
                     "--enable-lora is set to True because --lora-paths is provided."
                 )
             elif self.enable_lora is False:
@@ -2013,21 +2050,23 @@ class ServerArgs:
 
         if self.enable_lora:
             # Normalize lora_paths to a dictionary if it is a list.
+            # TODO (lifuhuang): support specifying pinned adapters in server_args.
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
                 self.lora_paths = {}
                 for lora_path in lora_paths:
                     if "=" in lora_path:
                         name, path = lora_path.split("=", 1)
-                        self.lora_paths[name] = LoRARef(lora_name=name, lora_path=path)
+                        self.lora_paths[name] = LoRARef(
+                            lora_name=name, lora_path=path, pinned=False
+                        )
                     else:
                         self.lora_paths[lora_path] = LoRARef(
-                            lora_name=lora_path,
-                            lora_path=lora_path,
+                            lora_name=lora_path, lora_path=lora_path, pinned=False
                         )
             elif isinstance(self.lora_paths, dict):
                 self.lora_paths = {
-                    k: LoRARef(lora_name=k, lora_path=v)
+                    k: LoRARef(lora_name=k, lora_path=v, pinned=False)
                     for k, v in self.lora_paths.items()
                 }
             elif self.lora_paths is None:
@@ -2073,6 +2112,72 @@ class ServerArgs:
             f"decode_tp={decode_tp}, prefill_tp={prefill_tp}"
         )
 
+    def model_specific_adjustments(self):
+        hf_config = self.get_hf_config()
+        model_arch = hf_config.architectures[0]
+        if model_arch in ["GptOssForCausalLM"]:
+            if self.attention_backend is None:
+                if is_sm100_supported():
+                    self.attention_backend = "trtllm_mha"
+                elif is_sm90_supported():
+                    self.attention_backend = "fa3"
+                else:
+                    self.attention_backend = "triton"
+            supported_backends = ["triton", "trtllm_mha", "fa3"]
+            logger.info(
+                f"Use {self.attention_backend} as attention backend for GptOssForCausalLM"
+            )
+            assert (
+                self.attention_backend in supported_backends
+            ), f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got '{self.attention_backend}'"
+
+            if is_sm100_supported():
+                self.enable_flashinfer_allreduce_fusion = True
+                logger.info(
+                    "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
+                )
+            quantization_config = getattr(hf_config, "quantization_config", None)
+            is_mxfp4_quant_format = (
+                quantization_config is not None
+                and quantization_config.get("quant_method") == "mxfp4"
+            )
+
+            if is_sm100_supported() and is_mxfp4_quant_format:
+                self.enable_flashinfer_mxfp4_moe = True
+                self.enable_triton_kernel_moe = False
+                logger.warning(
+                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                )
+            else:
+                if self.enable_triton_kernel_moe:
+                    assert (
+                        self.ep_size == 1
+                    ), "Triton kernel MoE is only supported when ep_size == 1"
+                if not self.enable_triton_kernel_moe and self.ep_size == 1:
+                    self.enable_triton_kernel_moe = True
+                    logger.warning(
+                        "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
+                    )
+            self.disable_hybrid_swa_memory = True
+            if is_mxfp4_quant_format:
+                # use bf16 for mxfp4 triton kernels
+                self.dtype = "bfloat16"
+        elif "Llama4" in model_arch:
+            assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
+        elif model_arch in [
+            "Gemma2ForCausalLM",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma3nForCausalLM",
+            "Gemma3nForConditionalGeneration",
+        ]:
+            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
+            # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
+            logger.warning(
+                f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
+            )
+            self.disable_hybrid_swa_memory = True
+
     def adjust_mem_fraction_for_vlm(self, model_config):
         vision_config = getattr(model_config.hf_config, "vision_config", None)
         if vision_config is None:
@@ -2109,10 +2214,6 @@ class ServerArgs:
         )
         self.mem_fraction_static = (
             original_server_arg_mem_fraction * final_overall_factor
-        )
-        logger.warning(
-            f"Multimodal model: Dynamically adjusted --mem-fraction-static "
-            f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
         )
 
 
