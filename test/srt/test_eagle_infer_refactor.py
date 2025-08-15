@@ -12,6 +12,7 @@ from sglang.test.test_utils import (
 
 
 class TestEagleBS1(CustomTestCase):
+    num_questions = 10000
     @classmethod
     def setUpClass(cls):
         cls.model = "meta-llama/Llama-2-7b-chat-hf"
@@ -47,7 +48,7 @@ class TestEagleBS1(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=60,
+            num_questions=self.num_questions,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -55,12 +56,12 @@ class TestEagleBS1(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"TestEagleBS1 -- {metrics=}")
-        # self.assertGreater(metrics["accuracy"], 0.3)  # 0.3333 for 60 questions; 0.234 for 1319 questions
+        self.assertGreater(metrics["accuracy"], 0.23)  # 0.3333 for 60 questions; 0.234 for 1319 questions
 
 
 class TestEagleLargeBS(CustomTestCase):
-    num_questions = 60
-    max_running_requests = 4
+    num_questions = 10000
+    max_running_requests = 64
     other_args = [
         "--trust-remote-code",
         "--attention-backend",
@@ -110,12 +111,12 @@ class TestEagleLargeBS(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"TestEagleLargeBS -- {metrics=}")
-        # self.assertGreater(metrics["accuracy"], 0.3)  # 0.3333 for 60 questions; 0.234 for 1319 questions
+        self.assertGreater(metrics["accuracy"], 0.23)  # 0.3333 for 60 questions; 0.234 for 1319 questions
 
 
 class TestEagleLargeBSNoSD(TestEagleLargeBS):
-    num_questions = 64
-    max_running_requests = 4
+    num_questions = 10000
+    max_running_requests = 64
     other_args = [
         "--trust-remote-code",
         "--attention-backend",

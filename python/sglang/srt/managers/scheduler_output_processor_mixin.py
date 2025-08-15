@@ -241,6 +241,8 @@ class SchedulerOutputProcessorMixin:
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
+        allocate_lens_cpu = result.allocate_lens.tolist() if result.allocate_lens is not None else None
+        new_seq_lens_cpu = result.new_seq_lens.tolist() if result.new_seq_lens is not None else None
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
@@ -249,7 +251,7 @@ class SchedulerOutputProcessorMixin:
                 if self.page_size == 1:
                     if batch.spec_algorithm.is_eagle():
                         self.free_spec_dec_tokens_page_size_1(
-                            i, req, result.allocate_lens, None, overlap=True
+                            i, req, allocate_lens_cpu, None
                         )
                     else:
                         # not spec dec: free the one extra delayed token
@@ -275,25 +277,13 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished()
             if req.finished():
-                if (
-                    not self.enable_overlap
-                    and batch.spec_algorithm.is_eagle()
-                    and self.page_size == 1
-                ):
-                    self.free_spec_dec_tokens_page_size_1(
-                        i, req, result.allocate_lens, result.new_seq_lens, overlap=False
-                    )
-
-                # TODO: make this less ugly
-                if (
-                    self.cur_batch.forward_mode.is_extend()
-                    and self.enable_overlap
-                    and batch.spec_algorithm.is_eagle()
-                    and self.page_size == 1
-                ):
-                    self.free_spec_dec_tokens_page_size_1(
-                        i, req, result.allocate_lens, result.new_seq_lens, overlap=True
-                    )
+                if batch.spec_algorithm.is_eagle() and self.page_size == 1:
+                    if not self.enable_overlap or (self.enable_overlap and self.cur_batch.forward_mode.is_extend()):
+                        # 1) when not overlap, we free the extra token in the req
+                        # 2) when overlap and current batch is extend, we free the extra token in the req of the previous batch
+                        self.free_spec_dec_tokens_page_size_1(
+                            i, req, allocate_lens_cpu, new_seq_lens_cpu
+                        )
 
                 self.tree_cache.cache_finished_req(req)
                 req.time_stats.completion_time = time.time()
@@ -779,7 +769,6 @@ class SchedulerOutputProcessorMixin:
         req: Req,
         allocate_lens: Optional[torch.Tensor],
         new_seq_lens: Optional[torch.Tensor],
-        overlap: bool,
     ):
         # free extra allocated tokens
         allocate_len = allocate_lens[batch_idx]
