@@ -52,7 +52,6 @@ from importlib.util import find_spec
 from io import BytesIO
 from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
-from numa import memory as numa_memory
 from pathlib import Path
 from typing import (
     Any,
@@ -78,6 +77,7 @@ import torch.distributed as dist
 import triton
 import zmq
 from fastapi.responses import ORJSONResponse
+from numa import memory as numa_memory
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
