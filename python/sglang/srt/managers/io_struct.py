@@ -804,7 +804,6 @@ class UpdateWeightFromDiskReqInput:
     weight_version: Optional[str] = None
 
 
-
 @dataclass
 class UpdateWeightFromDiskReqOutput:
     success: bool
@@ -828,7 +827,6 @@ class UpdateWeightsFromDistributedReqInput:
     rids: Optional[Union[List[str], str]] = None
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-
 
 
 @dataclass
