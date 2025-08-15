@@ -951,7 +951,7 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
             cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(store_dtype)
+            cache_k = cache_k.view(self.store_dtype)
 
         import torch_npu
 
