@@ -494,7 +494,7 @@ class RadixCache(BasePrefixCache):
 
         return ret_list
     
-    def evictable_kv_indices(self):
+    def cached_kv_indices(self):
         """Return a list of all kv indices stored in the tree"""
         ret_list = []
         stack = [self.root_node]

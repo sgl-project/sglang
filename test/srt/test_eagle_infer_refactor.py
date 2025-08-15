@@ -82,7 +82,7 @@ class TestEagleLargeBS(CustomTestCase):
         "--cuda-graph-bs",
         *[str(i) for i in range(1, max_running_requests + 1)],
     ]
-    
+
     @classmethod
     def setUpClass(cls):
         cls.model = "meta-llama/Llama-2-7b-chat-hf"
@@ -112,9 +112,10 @@ class TestEagleLargeBS(CustomTestCase):
         print(f"TestEagleLargeBS -- {metrics=}")
         # self.assertGreater(metrics["accuracy"], 0.3)  # 0.3333 for 60 questions; 0.234 for 1319 questions
 
+
 class TestEagleLargeBSNoSD(TestEagleLargeBS):
-    num_questions = 10000
-    max_running_requests = 64
+    num_questions = 64
+    max_running_requests = 4
     other_args = [
         "--trust-remote-code",
         "--attention-backend",

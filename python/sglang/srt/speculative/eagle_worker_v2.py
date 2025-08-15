@@ -61,6 +61,10 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.alloc_len_per_eagle_decode = max(
+            self.num_steps * self.topk,
+            self.num_draft_tokens,
+        )
 
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -482,7 +486,7 @@ class EAGLEWorker(TpModelWorker):
         # need record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
         seq_lens_backup.record_stream(torch.cuda.current_stream())
-        
+
         # Construct the return values
         draft_input = EagleDraftInput(
             topk_p=ret_topk_p,

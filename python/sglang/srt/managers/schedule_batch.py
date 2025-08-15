@@ -65,7 +65,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, next_power_of_2, support_triton, alloc_len_per_eagle_decode
+from sglang.srt.utils import flatten_nested_list, next_power_of_2, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -1036,18 +1036,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def allocate_for_eagle(self):
         from sglang.srt.speculative.eagle_utils import assign_req_to_token_pool
 
-        worker = self.draft_worker
         bs = self.batch_size()
 
-        # We need this to get the correct self.seq_lens
+        # We need this to get the correct self.seq_lens values
         if self.verify_done is not None:
             self.verify_done.synchronize()
-        
+
         self.seq_lens_sum = self.seq_lens.sum().item()
-        new_allocate_lens = self.seq_lens + alloc_len_per_eagle_decode(worker)
-        # TODO: remove assert
-        assert torch.all(new_allocate_lens > self.spec_info.allocate_lens), f"{new_allocate_lens=}, {self.spec_info.allocate_lens=}"
-        assert torch.all(self.seq_lens <= self.spec_info.allocate_lens), f"{self.seq_lens=}, {self.spec_info.allocate_lens=}"
+        new_allocate_lens = self.seq_lens + self.draft_worker.alloc_len_per_eagle_decode
         num_needed_tokens = (
             (new_allocate_lens - self.spec_info.allocate_lens).sum().item()
         )
@@ -1610,7 +1606,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
-        # needed to ensure self.seq_lens is ready
+        # needed to ensure self.seq_lens futures are ready
         if self.verify_done is not None:
             self.verify_done.synchronize()
 
@@ -1670,6 +1666,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
+
+        # NOTE: when overlap eagle, implicitly depends on self.verify_done.synchronize(), but an earlier
+        #       filter_batch() also calls verify_done.synchronize(), so we don't need to call it here.
 
         self.sampling_info.merge_batch(other.sampling_info)
 

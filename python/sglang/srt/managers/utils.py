@@ -2,7 +2,7 @@ import logging
 from http import HTTPStatus
 from typing import Optional
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
