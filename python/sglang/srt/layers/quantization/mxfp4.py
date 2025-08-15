@@ -775,12 +775,7 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         topk_weights, topk_ids, _ = topk_output
 
@@ -794,7 +789,7 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             activation=(
-                ActivationType.Silu if activation == "silu" else ActivationType.Gelu
+                ActivationType.Silu if moe_runner_config.activation == "silu" else ActivationType.Gelu
             ),
             doweight_stage1=False,
         )
