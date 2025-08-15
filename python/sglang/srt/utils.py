@@ -52,6 +52,7 @@ from importlib.util import find_spec
 from io import BytesIO
 from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
+from numa import memory as numa_memory
 from pathlib import Path
 from typing import (
     Any,
@@ -412,7 +413,10 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        free_gpu_memory = psutil.virtual_memory().available
+        if gpu_id in numa_memory.get_allocation_allowed_nodes():
+            _, free_gpu_memory = numa_memory.node_memory_info(gpu_id)
+        else:
+            free_gpu_memory = psutil.virtual_memory().available
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus

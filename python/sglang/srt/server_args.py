@@ -31,7 +31,6 @@ from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
-    get_cpu_ids_by_node,
     get_device,
     get_device_memory_capacity,
     is_flashinfer_available,
@@ -392,13 +391,8 @@ class ServerArgs:
         # Model-specific adjustments
         self.model_specific_adjustments()
 
-        # Adjust memory fraction and set kernel backends
+        # Set kernel backends
         if self.device == "cpu":
-            # On CPU the memory is shared by the numa nodes
-            n_numa_node: int = len(get_cpu_ids_by_node())
-            self.mem_fraction_static = round(
-                self.mem_fraction_static / max(n_numa_node, self.tp_size), 3
-            )
             if self.attention_backend is None:
                 self.attention_backend = "intel_amx"
             self.sampling_backend = "pytorch"
