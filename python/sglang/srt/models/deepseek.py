@@ -37,6 +37,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import fused_moe
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -180,7 +181,7 @@ class DeepseekMoE(nn.Module):
             w1=self.w1,
             w2=self.w2,
             topk_output=topk_output,
-            inplace=True,
+            moe_runner_config=MoeRunnerConfig(inplace=True),
         )
 
         if self.config.n_shared_experts is not None:
