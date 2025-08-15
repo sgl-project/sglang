@@ -96,7 +96,6 @@ if is_cuda():
     BASE_QUANTIZATION_METHODS.update(
         {
             "quark": QuarkConfig,
-            "mxfp4": Mxfp4Config,
         }
     )
 elif _is_mxfp_supported and is_hip():

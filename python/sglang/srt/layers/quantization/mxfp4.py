@@ -7,7 +7,6 @@ import importlib.util
 import logging
 from typing import TYPE_CHECKING, List, Optional
 
-import aiter
 import torch
 import triton.language as tl
 from torch.nn.parameter import Parameter
@@ -54,13 +53,11 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 
 if _is_hip:
+    #import aiter
     from aiter import ActivationType, QuantType, dtypes
     from aiter.fused_moe import fused_moe
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
     from aiter.utility.fp4_utils import e8m0_shuffle
-
-OCP_MX_BLOCK_SIZE = 32
-
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
@@ -755,15 +752,11 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
             w_last_dim_size = w_shape[-1]
             w = w.view(-1, w_last_dim_size)
 
-        # log_info_on_rank0(logger, f"[Pre-quant] w.shape: {w.shape}")
         w, mx_scales = dynamic_mxfp4_quant(w)
-        # log_info_on_rank0(logger, f"[Post-quant] w.shape: {w.shape} mx_scales.shape: {mx_scales.shape}")
 
         if w_need_reshape:
             w_new_shape = w_shape[:-1] + (w.shape[-1],)
             w = w.view(w_new_shape)
-
-        # log_info_on_rank0(logger, f"[re-shape] w.shape: {w.shape} mx_scales.shape: {mx_scales.shape}")
 
         mx_scales = e8m0_shuffle(mx_scales)
 

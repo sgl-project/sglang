@@ -46,6 +46,7 @@ class QuarkConfig(QuantizationConfig):
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
 
+    @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.float16, torch.bfloat16]
 
@@ -248,7 +249,7 @@ class QuarkConfig(QuantizationConfig):
                 if fnmatch.fnmatch(layer_name, name_pattern):
                     return layer_quant_config[name_pattern]
 
-            layer_type = cast(str, type(module))
+            layer_type = type(module).__name__
             layer_type_quant_config = cast(
                 dict[str, Any],
                 self.quant_config.get("layer_type_quant_config"))
