@@ -84,7 +84,6 @@ git checkout <YOUR-DESIRED-VERSION>
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
-pip install intel-openmp py-libnuma
 pip install -e "python[all_cpu]"
 
 # Build the CPU backend kernels
