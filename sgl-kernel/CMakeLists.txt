@@ -171,7 +171,6 @@ option(SGL_KERNEL_ENABLE_MACHETE          "Enable Machete"          OFF)
 
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_75,code=sm_75"
         "-gencode=arch=compute_80,code=sm_80"
         "-gencode=arch=compute_89,code=sm_89"
     )
@@ -268,13 +267,15 @@ set(SOURCES
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
+    "csrc/gemm/marlin/gptq_marlin.cu"
+    "csrc/gemm/marlin/gptq_marlin_repack.cu"
+    "csrc/gemm/marlin/awq_marlin_repack.cu"
+    "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
     "csrc/moe/marlin_moe_wna16/ops.cu"
-    "csrc/moe/marlin_moe_wna16/gptq_marlin_repack.cu"
-    "csrc/moe/marlin_moe_wna16/awq_marlin_repack.cu"
     "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
     "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
     "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
@@ -372,6 +373,8 @@ target_include_directories(common_ops PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+set_source_files_properties("csrc/gemm/per_token_group_quant_8bit" PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(

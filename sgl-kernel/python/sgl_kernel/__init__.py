@@ -44,6 +44,9 @@ from sgl_kernel.gemm import (
     dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
+    gptq_gemm,
+    gptq_marlin_gemm,
+    gptq_shuffle,
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
@@ -87,7 +90,9 @@ from sgl_kernel.moe import (
 )
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
+    top_k_mask_logits,
     top_k_renorm_prob,
+    top_k_top_p_sampling_from_logits,
     top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
     top_p_sampling_from_probs,
