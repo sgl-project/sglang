@@ -16,7 +16,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode, should_use_flashinfer_trtllm_moe
+from sglang.srt.layers.moe.utils import (DeepEPMode, should_use_flashinfer_trtllm_moe, should_use_flashinfer_cutedsl_moe)
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import (
@@ -467,6 +467,10 @@ class DeepEPMoE(EPMoE):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif dispatch_output.format.is_deepep_ll():
+            if should_use_flashinfer_cutedsl_moe():
+                # TODO(shuw): what?
+                # assert not self.use_fp8_w8a8
+                return self.forward_flashinfer_masked(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -645,6 +649,20 @@ class DeepEPMoE(EPMoE):
         ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
 
         return gather_out
+
+    def forward_flashinfer_masked(
+        self,
+        dispatch_output: DeepEPLLOutput,
+    ): # use_fp8 is False
+        # hidden_states is bf16
+        hidden_states, _, _, masked_m, expected_m = dispatch_output
+        assert self.quant_method is not None
+        assert self.activation == "silu"
+        
+        # quantize bf16 to fp4
+        out = flashinfer.cute_dsl.grouped_gemm_nt_masked(
+        
+        )
 
     def forward_deepgemm_masked(
         self,

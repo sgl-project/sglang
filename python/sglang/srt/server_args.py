@@ -178,6 +178,7 @@ class ServerArgs:
     moe_a2a_backend: Optional[Literal["deepep"]] = None
     enable_flashinfer_cutlass_moe: bool = False
     enable_flashinfer_trtllm_moe: bool = False
+    enable_flashinfer_cutedsl_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -526,13 +527,21 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-
         if self.enable_flashinfer_trtllm_moe:
             if not self.disable_shared_experts_fusion:
                 self.disable_shared_experts_fusion = True
                 logger.warning(
                     "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
                 )
+        if self.enable_flashinfer_cutedsl_moe:
+            assert (
+                self.quantization == "modelopt_fp4"
+            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+            os.environ["TRTLLM_ENABLE_PDL"] = "1"
+            assert self.ep_size in [
+                1,
+                self.tp_size,
+            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
@@ -1455,6 +1464,11 @@ class ServerArgs:
             action="store_true",
             help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
         )
+        parser.add_argument(
+            "--enable-flashinfer-cutedsl-moe",
+            action="store_true",
+            help="Enable FlashInfer CuteDSL MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+        )        
         parser.add_argument(
             "--enable-flashinfer-trtllm-moe",
             action="store_true",

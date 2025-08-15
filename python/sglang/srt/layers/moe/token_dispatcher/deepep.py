@@ -505,7 +505,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=True,
+            # use_fp8=True,
+            # TODO(shuw):
+            use_fp8=False,
         )
         return (
             hidden_states,
