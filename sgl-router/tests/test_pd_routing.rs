@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod test_pd_routing {
-    use rand::Rng;
     use serde_json::json;
     use sglang_router_rs::config::{
         CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
@@ -811,7 +810,7 @@ mod test_pd_routing {
             large_batch_request["bootstrap_host"] = json!(vec![hostname; batch_size]);
             large_batch_request["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
             large_batch_request["bootstrap_room"] = json!((0..batch_size)
-                .map(|_| rand::rng().random::<u64>())
+                .map(|_| rand::random::<u64>())
                 .collect::<Vec<_>>());
 
             let elapsed = start.elapsed();
