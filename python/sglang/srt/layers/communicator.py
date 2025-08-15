@@ -382,7 +382,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
 
         raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {residual_output_mode=} {residual_output_mode=}"
+            f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
         )
 
     @staticmethod
