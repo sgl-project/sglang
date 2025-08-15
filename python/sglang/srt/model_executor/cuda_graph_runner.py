@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.model_executor.graph_runner import GraphRunner
 
 if TYPE_CHECKING:
