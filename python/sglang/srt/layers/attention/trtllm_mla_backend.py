@@ -99,7 +99,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
-        self.cuda_graph_kv_indices = None
+        self.decode_cuda_graph_kv_indices = None
         self.forward_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -173,12 +173,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
 
-        self.cuda_graph_kv_indices = torch.full(
+        self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_workspace = torch.empty(
+        self.decode_cuda_graph_workspace = torch.empty(
             self.workspace_size, dtype=torch.int8, device=self.device
         )
+
+        super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -191,8 +193,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         spec_info: Optional[SpecInfo],
     ):
         """Initialize metadata for CUDA graph capture."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (forward_mode.is_decode_or_idle() and spec_info is None):
+
+        # Delegate to parent for non-decode modes.
+        if not forward_mode.is_decode_or_idle():
             return super().init_forward_metadata_capture_cuda_graph(
                 bs,
                 num_tokens,
@@ -203,9 +206,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 spec_info,
             )
 
-        # Custom fast-path for decode/idle without speculative execution.
+        # Custom fast-path for decode/idle.
         max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
-        block_kv_indices = self.cuda_graph_kv_indices[:bs, :max_seqlen_pad]
+        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_seqlen_pad]
 
         create_flashmla_kv_indices_triton[(bs,)](
             self.req_to_token,
@@ -219,7 +222,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PAGED_SIZE=self.page_size,
         )
 
-        metadata = TRTLLMMLADecodeMetadata(self.cuda_graph_workspace, block_kv_indices)
+        metadata = TRTLLMMLADecodeMetadata(self.decode_cuda_graph_workspace, block_kv_indices)
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
