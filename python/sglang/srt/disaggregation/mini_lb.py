@@ -316,23 +316,17 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     parallel_sample_n = request_data.get("n", 1)
 
     if parallel_sample_n > 1:
-        modified_request.update(
-            {
-                "bootstrap_host": hostname,
-                "bootstrap_port": bootstrap_port,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(parallel_sample_n)
-                ],
-            }
-        )
+        bootstrap_room = [_generate_bootstrap_room() for _ in range(parallel_sample_n)]
     else:
-        modified_request.update(
-            {
-                "bootstrap_host": hostname,
-                "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
-            }
-        )
+        bootstrap_room = _generate_bootstrap_room()
+
+    modified_request.update(
+        {
+            "bootstrap_host": hostname,
+            "bootstrap_port": bootstrap_port,
+            "bootstrap_room": bootstrap_room,
+        }
+    )
 
     if request_data.get("stream", False):
         return await load_balancer.generate_stream(

@@ -54,6 +54,7 @@ from fastapi import BackgroundTasks
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import (
+    FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     KVClassType,
     TransferBackend,
@@ -881,11 +882,7 @@ class TokenizerManager:
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     if tokenized_obj.bootstrap_host is not None:
-                        # For PD disaggregation, we need to fake the bootstrap host for the prefill server
-                        logger.info(
-                            f"[SampleParallel] bootstrap_host: {tokenized_obj.bootstrap_host}->fake_host"
-                        )
-                        tokenized_obj.bootstrap_host = "2.2.2.2"
+                        tokenized_obj.bootstrap_host = FAKE_BOOTSTRAP_HOST
                     tokenized_obj.sampling_params = copy.copy(
                         tokenized_obj.sampling_params
                     )
