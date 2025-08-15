@@ -300,24 +300,11 @@ class TopK(CustomOp):
         global_num_experts = router_logits.shape[-1]
 
         # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
-        if global_num_experts == 256:
+        if global_num_experts == 256 and self.topk_config.renormalize is False:
 
-            if self.topk_config.renormalize:
-                self.topk_config.renormalize = False
-                logger.warning(
-                    "renormalize is not supported for npu_moe_gating_top_k, set to False"
-                )
-
-            if (
-                self.topk_config.routed_scaling_factor is None
-                or self.topk_config.routed_scaling_factor != 1
-            ):
-                self.topk_config.routed_scaling_factor = 1
-                logger.warning(
-                    "routed_scaling_factor != 1 is not supported for npu_moe_gating_top_k, set to 1"
-                )
-
+            routed_scaling_factor = self.topk_config.routed_scaling_factor or 1
             router_logits = router_logits.to(torch.float32)
+
             return torch_npu.npu_moe_gating_top_k(
                 router_logits,
                 k=self.topk_config.top_k,
@@ -327,7 +314,7 @@ class TopK(CustomOp):
                 group_select_mode=1,
                 renorm=0,
                 norm_type=1,
-                routed_scaling_factor=1,
+                routed_scaling_factor=routed_scaling_factor,
                 eps=float(1e-20),
             )
         else:
