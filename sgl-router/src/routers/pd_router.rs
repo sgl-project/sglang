@@ -232,7 +232,7 @@ impl PDRouter {
             })?;
 
         // Check if already exists
-        if workers.iter().any(|w| w.url() == &url) {
+        if workers.iter().any(|w| w.url() == url) {
             return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
         }
 
@@ -271,7 +271,7 @@ impl PDRouter {
             })?;
 
         // Check if already exists
-        if workers.iter().any(|w| w.url() == &url) {
+        if workers.iter().any(|w| w.url() == url) {
             return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
         }
 
@@ -532,11 +532,9 @@ impl PDRouter {
     // Helper to determine batch size from a GenerateRequest
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
         // Check prompt array
-        if let Some(prompt) = &req.prompt {
-            if let crate::openai_api_types::StringOrArray::Array(arr) = prompt {
-                if !arr.is_empty() {
-                    return Some(arr.len());
-                }
+        if let Some(crate::openai_api_types::StringOrArray::Array(arr)) = &req.prompt {
+            if !arr.is_empty() {
+                return Some(arr.len());
             }
         }
         // Check text array
@@ -978,14 +976,14 @@ impl PDRouter {
 
         // Select workers using helper function
         let prefill = Self::pick_worker_by_policy(
-            &*prefill_workers,
+            &prefill_workers,
             &*self.prefill_policy,
             request_text,
             "prefill",
         )?;
 
         let decode = Self::pick_worker_by_policy(
-            &*decode_workers,
+            &decode_workers,
             &*self.decode_policy,
             request_text,
             "decode",
@@ -1488,7 +1486,7 @@ impl RouterTrait for PDRouter {
         let (prefill_result, decode_result) = tokio::join!(
             self.client.get(&prefill_url).send(),
             self.client
-                .get(&format!("{}/health_generate", decode.url()))
+                .get(format!("{}/health_generate", decode.url()))
                 .send()
         );
 
