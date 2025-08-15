@@ -334,7 +334,6 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-
         # RoPE is applied inside the attention kernel in HiP Attention
         if not (
             forward_batch.hip_metadata_cache_pool is not None
@@ -351,13 +350,13 @@ class GptOssAttention(nn.Module):
                         forward_batch=forward_batch,
                     )
                     if (
-                        _enable_fused_set_kv_buffer() 
+                        _enable_fused_set_kv_buffer()
                         and (forward_batch.hip_metadata_cache_pool is None)
                     )
                     else None
                 ),
             )
-        
+
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -369,7 +368,7 @@ class GptOssAttention(nn.Module):
             *inner_state,
             sinks=self.sinks,
             save_kv_cache=not (
-                _enable_fused_set_kv_buffer() 
+                _enable_fused_set_kv_buffer()
                 and (forward_batch.hip_metadata_cache_pool is None)
             ),
         )
