@@ -23,10 +23,12 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 # Constants
-DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
+DEFAULT_WORKSPACE_SIZE_MB = (
+    512  # Memory workspace size in MB, todo(Yingyi): read from config
+)
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
-global_workspace_buffer = None
+global_zero_init_workspace_buffer = None
 
 
 @dataclass
@@ -73,14 +75,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
         # Allocate buffers
-        global global_workspace_buffer
-        if global_workspace_buffer is None:
-            global_workspace_buffer = torch.empty(
+        global global_zero_init_workspace_buffer
+        if global_zero_init_workspace_buffer is None:
+            global_zero_init_workspace_buffer = torch.zeros(
                 self.workspace_size,
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
-        self.workspace_buffer = global_workspace_buffer
+        self.workspace_buffer = global_zero_init_workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}

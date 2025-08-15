@@ -373,6 +373,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             created=created,
             choices=choices,
             usage=usage,
+            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:
