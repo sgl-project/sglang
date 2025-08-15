@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_remote_url,
     is_triton_kernels_available,
     is_valid_ipv6_address,
+    json_loads_safe,
     nullable_str,
 )
 
@@ -151,7 +152,7 @@ class ServerArgs:
     enable_lora: Optional[bool] = None
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
-    lora_paths: Optional[Union[dict[str, str], dict[str, LoRARef], List[str]]] = None
+    lora_paths: Union[None, dict[str, str], List[str], List[LoRARef]] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
@@ -2091,33 +2092,50 @@ class ServerArgs:
                 )
 
         if self.enable_lora:
-            # Normalize lora_paths to a dictionary if it is a list.
-            # TODO (lifuhuang): support specifying pinned adapters in server_args.
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
-                self.lora_paths = {}
+                self.lora_paths = []
                 for lora_path in lora_paths:
-                    if "=" in lora_path:
-                        name, path = lora_path.split("=", 1)
-                        self.lora_paths[name] = LoRARef(
-                            lora_name=name, lora_path=path, pinned=False
+                    if isinstance(lora_path, str):
+                        if "=" in lora_path:
+                            name, path = lora_path.split("=", 1)
+                            lora_ref = LoRARef(
+                                lora_name=name, lora_path=path, pinned=False
+                            )
+                        else:
+                            lora_ref = LoRARef(
+                                lora_name=lora_path, lora_path=lora_path, pinned=False
+                            )
+                    elif isinstance(lora_path, dict):
+                        assert (
+                            "lora_name" in lora_path and "lora_path" in lora_path
+                        ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                        lora_ref = LoRARef(
+                            lora_name=lora_path["lora_name"],
+                            lora_path=lora_path["lora_path"],
+                            pinned=lora_path.get("pinned", False),
                         )
                     else:
-                        self.lora_paths[lora_path] = LoRARef(
-                            lora_name=lora_path, lora_path=lora_path, pinned=False
+                        raise ValueError(
+                            f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
+                            "Expected a string or a dictionary."
                         )
+                    self.lora_paths.append(lora_ref)
             elif isinstance(self.lora_paths, dict):
-                self.lora_paths = {
-                    k: LoRARef(lora_name=k, lora_path=v, pinned=False)
+                self.lora_paths = [
+                    LoRARef(lora_name=k, lora_path=v, pinned=False)
                     for k, v in self.lora_paths.items()
-                }
+                ]
             elif self.lora_paths is None:
-                self.lora_paths = {}
+                self.lora_paths = []
             else:
                 raise ValueError(
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
                     "Expected a list or a dictionary."
                 )
+            assert len(set(l.lora_name for l in self.lora_paths)) == len(
+                lora_paths
+            ), "Duplicate LoRA names found in --lora-paths."
 
             # Expand target modules
             if self.lora_target_modules:
@@ -2139,9 +2157,7 @@ class ServerArgs:
                     "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
                     f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
                 )
-                assert (
-                    not self.lora_paths or len(self.lora_paths) <= self.max_loaded_loras
-                ), (
+                assert len(self.lora_paths) <= self.max_loaded_loras, (
                     "The number of LoRA paths should not exceed max_loaded_loras. "
                     f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
                 )
@@ -2362,13 +2378,13 @@ class PortArgs:
 
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, {})
-        for lora_path in values:
-            if "=" in lora_path:
-                name, path = lora_path.split("=", 1)
-                getattr(namespace, self.dest)[name] = path
-            else:
-                getattr(namespace, self.dest)[lora_path] = lora_path
+        if values:
+            assert isinstance(values, list), "Expected a list of LoRA paths."
+            lora_paths = [json_loads_safe(lora_path, lora_path) for lora_path in values]
+        else:
+            lora_paths = []
+
+        setattr(namespace, self.dest, lora_paths)
 
 
 class DeprecatedAction(argparse.Action):

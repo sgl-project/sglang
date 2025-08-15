@@ -2966,3 +2966,11 @@ class ConcurrentCounter:
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
     return importlib.util.find_spec("triton_kernels") is not None
+
+
+def json_loads_safe(s, default=None):
+    """Safely load a JSON string, returning a default value on failure."""
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        return default
