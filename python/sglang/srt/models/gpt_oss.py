@@ -350,7 +350,10 @@ class GptOssAttention(nn.Module):
                         layer=self.attn,
                         forward_batch=forward_batch,
                     )
-                    if _enable_fused_set_kv_buffer()
+                    if (
+                        _enable_fused_set_kv_buffer() 
+                        and (forward_batch.hip_metadata_cache_pool is None)
+                    )
                     else None
                 ),
             )
@@ -365,7 +368,10 @@ class GptOssAttention(nn.Module):
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            save_kv_cache=not _enable_fused_set_kv_buffer(),
+            save_kv_cache=not (
+                _enable_fused_set_kv_buffer() 
+                and (forward_batch.hip_metadata_cache_pool is None)
+            ),
         )
         output, _ = self.o_proj(attn_output)
         return output

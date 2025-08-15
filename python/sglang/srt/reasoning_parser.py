@@ -229,7 +229,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
-        self.final_channel_start = "<|start|>assistant<|channel|>final<|message|>"
+        self.final_channel_start = "<|channel|>final<|message|>"
         self.final_channel_end = "<|return|>"
         self._in_final_channel = False
         self._analysis_complete = False
