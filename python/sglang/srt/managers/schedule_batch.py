@@ -38,7 +38,7 @@ import threading
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -431,6 +431,7 @@ class Req:
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        cfg_params: Optional[Dict] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -611,6 +612,8 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+
+        self.cfg_params = cfg_params
 
     @property
     def seqlen(self):
@@ -910,6 +913,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
 
+    # Mapping from conditional CFG request to unconditional pair
+    cfg_rid_map: Optional[Dict[str, str]] = None
+    cfg_weights: Optional[List[float]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -920,6 +927,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
+        cfg_rid_map: Dict[str, str],
         chunked_req: Optional[Req] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -951,6 +959,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.sampling_params.max_new_tokens == 0 for req in reqs
             ),
             chunked_req=chunked_req,
+            cfg_rid_map=cfg_rid_map,
         )
 
     def batch_size(self):
@@ -1334,6 +1343,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+        # Add CFG params
+        self.cfg_weights = [
+            req.cfg_params["cfg_weight"] for req in self.reqs if req.cfg_params
+        ]
+
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
@@ -1641,6 +1655,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens = self.encoder_lens[keep_indices_device]
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
+        # Remove finished CFG requests from bookkeeping
+        if self.cfg_rid_map or self.cfg_weights:
+            self.cfg_weights = [
+                weight
+                for idx, weight in enumerate(self.cfg_weights)
+                if idx in keep_indices
+            ]
+
+            finished_rids = set(
+                req.rid for idx, req in enumerate(self.reqs) if idx not in keep_indices
+            )
+
+            for rid in finished_rids & self.cfg_rid_map.keys():
+                assert (
+                    self.cfg_rid_map[rid] in finished_rids
+                ), "CFG requests should finish in pairs"
+
+                del self.cfg_rid_map[rid]
+
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
@@ -1670,6 +1703,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
         self.sampling_info.merge_batch(other.sampling_info)
+
+        # Merge CFG bookkeeping
+        for other_cfg_rid in other.cfg_rid_map.keys():
+            assert other_cfg_rid not in self.cfg_rid_map
+
+        self.cfg_rid_map.update(other.cfg_rid_map)
+        self.cfg_weights.extend(other.cfg_weights)
 
         # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:
@@ -1729,6 +1769,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         global bid
         bid += 1
+
+        # Build CFG index mapping if necessary
+        cfg_cond_to_uncond_idx = {}
+        if self.cfg_rid_map:
+            rid_to_idx = {req.rid: idx for idx, req in enumerate(self.reqs)}
+
+            for cond_rid, uncond_rid in self.cfg_rid_map.items():
+                assert cond_rid in rid_to_idx and uncond_rid in rid_to_idx
+                cfg_cond_to_uncond_idx[rid_to_idx[cond_rid]] = rid_to_idx[uncond_rid]
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1777,6 +1827,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            cfg_cond_to_uncond_idx=cfg_cond_to_uncond_idx,
+            cfg_weights=self.cfg_weights,
         )
 
     def copy(self):
@@ -1918,6 +1970,10 @@ class ModelWorkerBatch:
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
+
+    # CFG parameters
+    cfg_cond_to_uncond_idx: Optional[Dict[int, int]] = None
+    cfg_weights: Optional[List[float]] = None
 
 
 @triton.jit
