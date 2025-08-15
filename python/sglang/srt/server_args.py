@@ -24,7 +24,7 @@ import tempfile
 from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
@@ -124,6 +124,7 @@ class ServerArgs:
     # API related
     api_key: Optional[str] = None
     served_model_name: Optional[str] = None
+    weight_version: str = "default"
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
@@ -574,6 +575,12 @@ class ServerArgs:
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
+
+        # Hicache
+        if self.hicache_storage_backend == "mooncake":
+            # to use mooncake storage backend, the following conditions must be met:
+            self.hicache_io_backend = "kernel"
+            self.hicache_mem_layout = "page_first"
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1158,6 +1165,12 @@ class ServerArgs:
             help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
         )
         parser.add_argument(
+            "--weight-version",
+            type=str,
+            default=ServerArgs.weight_version,
+            help="Version identifier for the model weights. Defaults to 'default' if not specified.",
+        )
+        parser.add_argument(
             "--chat-template",
             type=str,
             default=ServerArgs.chat_template,
@@ -1311,18 +1324,23 @@ class ServerArgs:
 
         # Kernel backend
         ATTN_BACKENDS = [
-            "aiter",
+            # Common
+            "triton",
+            "torch_native",
+            # NVIDIA specific
             "cutlass_mla",
             "fa3",
             "flashinfer",
             "flashmla",
-            "intel_amx",
-            "torch_native",
-            "ascend",
-            "triton",
             "trtllm_mla",
             "trtllm_mha",
             "dual_chunk_flash_attn",
+            # AMD specific
+            "aiter",
+            "wave",
+            # Other platforms
+            "intel_amx",
+            "ascend",
         ]
         parser.add_argument(
             "--attention-backend",
@@ -2099,11 +2117,25 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
             if self.attention_backend is None:
-                self.attention_backend = "triton"
-            assert self.attention_backend in [
-                "triton",
-                "trtllm_mha",
-            ], f"GptOssForCausalLM requires 'triton' or 'trtllm_mha' attention backend, but got {self.attention_backend}"
+                if is_sm100_supported():
+                    self.attention_backend = "trtllm_mha"
+                elif is_sm90_supported():
+                    self.attention_backend = "fa3"
+                else:
+                    self.attention_backend = "triton"
+            supported_backends = ["triton", "trtllm_mha", "fa3"]
+            logger.info(
+                f"Use {self.attention_backend} as attention backend for GptOssForCausalLM"
+            )
+            assert (
+                self.attention_backend in supported_backends
+            ), f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got '{self.attention_backend}'"
+
+            if is_sm100_supported():
+                self.enable_flashinfer_allreduce_fusion = True
+                logger.info(
+                    "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
+                )
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None

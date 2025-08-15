@@ -39,6 +39,8 @@ DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 # compute the LCM with other padding constraints.
 TRTLLM_BLOCK_CONSTRAINT = 128
 
+global_zero_init_workspace_buffer = None
+
 
 @dataclass
 class TRTLLMMLADecodeMetadata:
@@ -83,9 +85,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        self.workspace_buffer = torch.empty(
-            self.workspace_size, dtype=torch.int8, device=self.device
-        )
+        global global_zero_init_workspace_buffer
+        if global_zero_init_workspace_buffer is None:
+            global_zero_init_workspace_buffer = torch.zeros(
+                self.workspace_size,
+                dtype=torch.uint8,
+                device=model_runner.device,
+            )
+        self.workspace_buffer = global_zero_init_workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}

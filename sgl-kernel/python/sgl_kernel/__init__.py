@@ -44,6 +44,9 @@ from sgl_kernel.gemm import (
     dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
+    gptq_gemm,
+    gptq_marlin_gemm,
+    gptq_shuffle,
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
@@ -67,6 +70,7 @@ from sgl_kernel.marlin import (
     awq_marlin_repack,
     gptq_marlin_repack,
 )
+from sgl_kernel.memory import set_kv_buffer_kernel
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
@@ -81,7 +85,9 @@ from sgl_kernel.moe import (
 )
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
+    top_k_mask_logits,
     top_k_renorm_prob,
+    top_k_top_p_sampling_from_logits,
     top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
     top_p_sampling_from_probs,
