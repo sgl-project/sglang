@@ -29,29 +29,26 @@ from sglang.srt.layers.quantization.marlin_utils import (
     verify_marlin_supported,
     verify_marlin_supports_shape,
 )
-from sglang.srt.layers.quantization.scalar_type import scalar_types
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.utils import replace_parameter
+from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
-
-try:
-    from vllm import _custom_ops as ops
-
-    warnings.warn(
-        f"Using kernels directly from vllm. This might lead to performance degradation or "
-        f"missing functionalities as certain kernels may not be optimized. "
-    )
-except ImportError:
-    ops = None
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda:
-    from sgl_kernel import awq_dequantize, fused_marlin_moe
+    from sgl_kernel import (
+        awq_dequantize,
+        awq_marlin_moe_repack,
+        awq_marlin_repack,
+        fused_marlin_moe,
+    )
+
+
 elif _is_hip:
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
@@ -62,6 +59,9 @@ else:
     warnings.warn(f"Only CUDA and HIP support AWQ currently.")
 
 logger = logging.getLogger(__name__)
+
+
+ScalarType, scalar_types = get_scalar_types()
 
 
 def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
@@ -516,7 +516,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         layer.workspace = marlin_make_workspace(device)
 
         # Repack weights from AWQ format to marlin format.
-        marlin_qweight = ops.awq_marlin_repack(
+        marlin_qweight = awq_marlin_repack(
             layer.qweight,
             size_k=layer.input_size_per_partition,
             size_n=layer.output_size_per_partition,
@@ -684,7 +684,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
 
-        marlin_w13_qweight = ops.awq_marlin_moe_repack(
+        marlin_w13_qweight = awq_marlin_moe_repack(
             layer.w13_qweight,
             layer.w13_g_idx_sort_indices,
             size_k=layer.w13_qweight.shape[1],
@@ -693,7 +693,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         )
         replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
 
-        marlin_w2_qweight = ops.awq_marlin_moe_repack(
+        marlin_w2_qweight = awq_marlin_moe_repack(
             layer.w2_qweight,
             layer.w2_g_idx_sort_indices,
             size_k=layer.w2_qweight.shape[1],
@@ -740,13 +740,12 @@ class AWQMoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        **kwargs,
+        topk_output: StandardTopKOutput,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
-
-        assert activation == "silu", "Only SiLU activation is supported."
+        assert (
+            moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
 
         # The input must currently be float16
         orig_dtype = x.dtype
