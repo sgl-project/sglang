@@ -77,32 +77,18 @@ class FlashInferMhaChunkKVRunner:
 
         # Buffers and wrappers
         self.qo_indptr = attn_backend.qo_indptr
+        self.workspace_buffer = attn_backend.workspace_buffer
+        self.fmha_backend = attn_backend.fmha_backend
 
-        # Allocate buffers
-        global global_workspace_buffer
-        if global_workspace_buffer is None:
-            global_workspace_buffer = torch.empty(
-                global_config.flashinfer_workspace_size,
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        self.workspace_buffer = global_workspace_buffer
-
-        self.fmha_backend = "auto"
-        if is_sm100_supported():
-            self.fmha_backend = "cutlass"
-
-        self.chunk_ragger_wrappers = []
-        init_chunk_wrappers = 1
-        self.update_prefix_chunks(init_chunk_wrappers)
-        self.ragger_wrapper = attn_backend.prefill_wrapper_ragged
+        self.chunk_ragged_wrappers = []
+        self.ragged_wrapper = attn_backend.prefill_wrapper_ragged
 
     def update_prefix_chunks(self, num_prefix_chunks: int):
-        while num_prefix_chunks > len(self.chunk_ragger_wrappers):
-            ragger_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+        while num_prefix_chunks > len(self.chunk_ragged_wrappers):
+            ragged_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
                 self.workspace_buffer, "NHD", backend=self.fmha_backend
             )
-            self.chunk_ragger_wrappers.append(ragger_wrapper)
+            self.chunk_ragged_wrappers.append(ragged_wrapper)
 
     def update_wrapper(
         self,
@@ -127,8 +113,8 @@ class FlashInferMhaChunkKVRunner:
             assert forward_batch.prefix_chunk_max_seq_lens is not None
 
             kv_indptr = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
-            wrapper_ragged = self.chunk_ragger_wrappers[chunk_idx]
-            wrapper_ragged.begin_forward(
+            wrapper = self.chunk_ragged_wrappers[chunk_idx]
+            wrapper.begin_forward(
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
                 num_qo_heads=self.num_local_heads,
@@ -139,7 +125,7 @@ class FlashInferMhaChunkKVRunner:
                 causal=False,
             )
         # ragged prefill
-        self.ragger_wrapper.begin_forward(
+        self.ragged_wrapper.begin_forward(
             qo_indptr=qo_indptr,
             kv_indptr=qo_indptr,
             num_qo_heads=self.num_local_heads,
@@ -162,8 +148,8 @@ class FlashInferMhaChunkKVRunner:
         if forward_batch.attn_attend_prefix_cache:
             chunk_idx = forward_batch.prefix_chunk_idx
             assert chunk_idx >= 0
-            ragger_wrapper = self.chunk_ragger_wrappers[chunk_idx]
-            o1, s1 = ragger_wrapper.forward_return_lse(
+            wrapper = self.chunk_ragged_wrappers[chunk_idx]
+            o1, s1 = wrapper.forward_return_lse(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
@@ -172,7 +158,7 @@ class FlashInferMhaChunkKVRunner:
                 logits_soft_cap=logits_soft_cap,
             )
         else:
-            o1, s1 = self.ragger_wrapper.forward_return_lse(
+            o1, s1 = self.ragged_wrapper.forward_return_lse(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
@@ -204,6 +190,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             not skip_prefill
             and global_server_args_dict["disaggregation_mode"] != "decode"
             and not global_server_args_dict["disable_chunked_prefix_cache"]
+            and not global_server_args_dict["flashinfer_mla_disable_ragged"]
         )
 
         # Allocate buffers
@@ -237,11 +224,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        fmha_backend = "auto"
+        self.fmha_backend = "auto"
         if is_sm100_supported():
-            fmha_backend = "cutlass"
+            self.fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
+            self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
 
         if not self.skip_prefill:
