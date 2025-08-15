@@ -50,22 +50,17 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-cutlass)
 
-# DeepGEMM
-if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
-  set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
-  set(DeepGEMM_TAG "blackwell")
-elseif("${CUDA_VERSION}" VERSION_EQUAL "12.9")
-  set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
-  set(DeepGEMM_TAG "blackwell")
-else()
-  set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
-  set(DeepGEMM_TAG "391755ada0ffefa9a6a52b6f14dcaf22d1a463e0")
-endif()
-
+FetchContent_Declare(
+    repo-fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt
+    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-fmt)
 FetchContent_Declare(
     repo-deepgemm
-    GIT_REPOSITORY ${DeepGEMM_REPO}
-    GIT_TAG        ${DeepGEMM_TAG}
+    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
+    GIT_TAG        cabi
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -87,6 +82,7 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
+
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
@@ -95,6 +91,7 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
+
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
@@ -168,7 +165,6 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_75,code=sm_75"
         "-gencode=arch=compute_80,code=sm_80"
         "-gencode=arch=compute_89,code=sm_89"
     )
@@ -232,6 +228,7 @@ set(SOURCES
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
+    "csrc/common_extension.cc"
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/dsv3_fused_a_gemm.cu"
@@ -251,6 +248,21 @@ set(SOURCES
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
+    "csrc/gemm/marlin/gptq_marlin.cu"
+    "csrc/gemm/marlin/gptq_marlin_repack.cu"
+    "csrc/gemm/marlin/awq_marlin_repack.cu"
+    "csrc/gemm/gptq/gptq_kernel.cu"
+    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
+    "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
+    "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
+    "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
+    "csrc/moe/marlin_moe_wna16/ops.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
@@ -259,25 +271,12 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
     "csrc/moe/ep_moe_reorder_kernel.cu"
     "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
+    "csrc/kvcacheio/transfer.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/spatial/greenctx_stream.cu"
     "csrc/speculative/speculative_sampling.cu"
-    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
-    "csrc/kvcacheio/transfer.cu"
-    "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
-    "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
-    "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
-    "csrc/common_extension.cc"
-    "csrc/moe/marlin_moe_wna16/ops.cu"
-    "csrc/moe/marlin_moe_wna16/gptq_marlin_repack.cu"
-    "csrc/moe/marlin_moe_wna16/awq_marlin_repack.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
+    "csrc/memory/store.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
@@ -296,6 +295,8 @@ target_include_directories(common_ops PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+set_source_files_properties("csrc/gemm/per_token_group_quant_8bit" PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
@@ -312,12 +313,15 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
+
+# mscclpp
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
 add_subdirectory(${repo-mscclpp_SOURCE_DIR})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
+# flash attention
 target_compile_definitions(common_ops PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
@@ -413,13 +417,44 @@ if (SGL_KERNEL_ENABLE_FA3)
     target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()
 
-# JIT Logic
-# DeepGEMM
+# ============================ DeepGEMM (JIT) ============================= #
+# Create a separate library for DeepGEMM's Python API.
+# This keeps its compilation isolated from the main common_ops.
+set(DEEPGEMM_SOURCES
+    "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
+)
 
-install(DIRECTORY "${repo-deepgemm_SOURCE_DIR}/deep_gemm/"
-        DESTINATION "deep_gemm"
-        PATTERN ".git*" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)
+Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
+
+# Link against necessary libraries, including nvrtc for JIT compilation.
+target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
+
+# Add include directories needed by DeepGEMM.
+target_include_directories(deep_gemm_cpp PRIVATE
+    ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
+    ${repo-cutlass_SOURCE_DIR}/include
+    ${repo-fmt_SOURCE_DIR}/include
+)
+
+# Apply the same compile options as common_ops.
+target_compile_options(deep_gemm_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+
+# Create an empty __init__.py to make `deepgemm` a Python package.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
+install(
+    FILES ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py
+    DESTINATION deep_gemm
+    RENAME __init__.py
+)
+
+# Install the compiled DeepGEMM API library.
+install(TARGETS deep_gemm_cpp LIBRARY DESTINATION deep_gemm)
+
+# Install the source files required by DeepGEMM for runtime JIT compilation.
+install(
+    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
+    DESTINATION deep_gemm
+)
 
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
         DESTINATION "deep_gemm/include/cute")

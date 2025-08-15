@@ -50,7 +50,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_local_attention_dp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -60,9 +60,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -212,7 +213,7 @@ class DeepseekV2MLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        can_fuse_mlp_allreduce: bool = False,
+        should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
@@ -221,7 +222,7 @@ class DeepseekV2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
-            x, skip_all_reduce=can_fuse_mlp_allreduce or use_reduce_scatter
+            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
         return x
 
@@ -335,30 +336,6 @@ class DeepseekV2MoE(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
-            **(
-                dict(deepep_mode=global_server_args_dict["deepep_mode"])
-                if global_server_args_dict["moe_a2a_backend"].is_deepep()
-                else {}
-            ),
-            # Additional args for FusedMoE
-            **(
-                dict(
-                    enable_flashinfer_cutlass_moe=True,
-                )
-                if global_server_args_dict["enable_flashinfer_cutlass_moe"]
-                else {}
-            ),
-            **(
-                dict(
-                    renormalize=config.norm_topk_prob,
-                    use_grouped_topk=True,
-                    num_expert_group=config.n_group,
-                    topk_group=config.topk_group,
-                    correction_bias=self.gate.e_score_correction_bias,
-                )
-                if should_use_flashinfer_trtllm_moe()
-                else {}
-            ),
         )
 
         self.shared_experts_is_int8 = False
@@ -376,7 +353,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if global_server_args_dict["moe_a2a_backend"].is_deepep()
+                    if get_moe_a2a_backend().is_deepep()
                     else {}
                 ),
             )
@@ -406,7 +383,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
-        if global_server_args_dict["moe_a2a_backend"].is_deepep():
+        if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -430,12 +407,12 @@ class DeepseekV2MoE(nn.Module):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
-                deepep_mode=global_server_args_dict["deepep_mode"],
+                deepep_mode=get_deepep_mode(),
                 async_finish=True,
                 return_recv_hook=True,
             )
 
-        self._enable_deepep_moe = global_server_args_dict["moe_a2a_backend"].is_deepep()
+        self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
 
     def get_moe_weights(self):
         return [
@@ -448,7 +425,7 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        can_fuse_mlp_allreduce: bool = False,
+        should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
@@ -459,11 +436,11 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
                 return self.forward_normal_dual_stream(
-                    hidden_states, can_fuse_mlp_allreduce, use_reduce_scatter
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
                 )
             else:
                 return self.forward_normal(
-                    hidden_states, can_fuse_mlp_allreduce, use_reduce_scatter
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -471,7 +448,7 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
-        can_fuse_mlp_allreduce: bool = False,
+        should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
@@ -482,52 +459,39 @@ class DeepseekV2MoE(nn.Module):
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            kwargs = {"hidden_states": hidden_states}
-
-            # FlashInferFP4MoE (TRTLLM path) expects (TopK, router_logits) tuple
-            # Regular FusedMoE (CUTLASS path) expects StandardTopKOutput
-            if should_use_flashinfer_trtllm_moe():
-                kwargs["topk_output"] = (self.topk, router_logits)
-            else:
-                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
-
-            final_hidden_states = self.experts(**kwargs)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
+
         current_stream.wait_stream(self.alt_stream)
         with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
             final_hidden_states_out = torch.empty_like(final_hidden_states)
+
         torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
         final_hidden_states = final_hidden_states_out
         sm.tag(final_hidden_states)
-        if self.tp_size > 1 and not can_fuse_mlp_allreduce and not use_reduce_scatter:
+        if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        can_fuse_mlp_allreduce: bool = False,
+        should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states, can_fuse_mlp_allreduce)
+            return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        kwargs = {"hidden_states": hidden_states}
+        topk_output = self.topk(hidden_states, router_logits)
 
-        # FlashInferFP4MoE (TRTLLM path) expects (TopK, router_logits) tuple
-        # Regular FusedMoE (CUTLASS path) expects StandardTopKOutput
-        if should_use_flashinfer_trtllm_moe():
-            kwargs["topk_output"] = (self.topk, router_logits)
-        else:
-            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
-
-        final_hidden_states = self.experts(**kwargs)
+        final_hidden_states = self.experts(hidden_states, topk_output)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
@@ -537,12 +501,14 @@ class DeepseekV2MoE(nn.Module):
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
             sm.tag(final_hidden_states)
-        if self.tp_size > 1 and not can_fuse_mlp_allreduce and not use_reduce_scatter:
+        if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_cpu(
-        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -593,7 +559,7 @@ class DeepseekV2MoE(nn.Module):
             None,  # a2_scale
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not can_fuse_mlp_allreduce:
+        if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
@@ -1194,6 +1160,16 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
+        """
+        Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
+        """
+        return (
+            self.current_attention_backend == "trtllm_mla"
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+        )
+
     def forward_absorb_prepare(
         self,
         positions: torch.Tensor,
@@ -1273,7 +1249,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        if not self._fuse_rope_for_trtllm_mla(forward_batch):
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
 
@@ -1286,8 +1264,20 @@ class DeepseekV2AttentionMLA(nn.Module):
             or self.current_attention_backend == "cutlass_mla"
             or self.current_attention_backend == "trtllm_mla"
         ):
+            extra_args = {}
+            if self._fuse_rope_for_trtllm_mla(forward_batch):
+                extra_args = {
+                    "cos_sin_cache": self.rotary_emb.cos_sin_cache,
+                    "is_neox": self.rotary_emb.is_neox_style,
+                }
             attn_output = self.attn_mqa(
-                q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
+                q_nope_out,
+                k_nope,
+                k_nope,
+                forward_batch,
+                q_rope=q_pe,
+                k_rope=k_pe,
+                **extra_args,
             )
         else:
             q = torch.cat([q_nope_out, q_pe], dim=-1)
@@ -1771,7 +1761,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
         self.layer_id = layer_id
         self.is_nextn = is_nextn
@@ -1842,6 +1831,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             allow_reduce_scatter=True,
         )
 
+        self._fuse_allreduce_lookup_table = self._build_fuse_allreduce_lookup_table()
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
@@ -1850,27 +1841,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
-        """Check if MLP allreduce can be fused with next layer's add_rmsnorm"""
+        """Check if MLP allreduce can be fused with next layer's residual_rmsnorm"""
 
-        if (
-            self.layer_id == self.config.num_hidden_layers - 1
-            or get_tensor_model_parallel_world_size() <= 1
-        ):
+        batch_size = (
+            forward_batch.input_ids.shape[0]
+            if hasattr(forward_batch, "input_ids")
+            else 0
+        )
+
+        if batch_size > 128:
             return False
 
-        if not global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False):
-            return False
-
-        if not _is_sm100_supported or not _is_flashinfer_available:
-            return False
-
-        if hasattr(forward_batch, "input_ids") and (
-            forward_batch.input_ids.shape[0] == 0
-            or forward_batch.input_ids.shape[0] > 128
-        ):
-            return False
-
-        return True
+        return self._fuse_allreduce_lookup_table.get(batch_size, False)
 
     def forward(
         self,
@@ -1896,9 +1878,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        can_fuse_mlp_allreduce = (
+        should_allreduce_fusion = (
             self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
-            and not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
+            and not (
+                is_dp_attention_enabled() and self.speculative_algorithm.is_eagle()
+            )
             and not self.is_nextn
         )
 
@@ -1907,13 +1891,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch
         )
         hidden_states = self.mlp(
-            hidden_states, forward_batch, can_fuse_mlp_allreduce, use_reduce_scatter
+            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
 
-        if can_fuse_mlp_allreduce:
+        if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
 
-        if not can_fuse_mlp_allreduce:
+        if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
@@ -1990,6 +1974,26 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         return output
 
+    def _build_fuse_allreduce_lookup_table(self):
+        static_conditions_met = (
+            self.layer_id != self.config.num_hidden_layers - 1
+            and get_tensor_model_parallel_world_size() > 1
+            and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
+            and _is_sm100_supported
+            and _is_flashinfer_available
+        )
+
+        if not static_conditions_met:
+            return {}
+
+        lookup_table = {}
+        for batch_size in range(129):  # 0 to 128
+            is_last_layer = self.layer_id == self.config.num_hidden_layers - 1
+            should_fuse = batch_size > 0 and batch_size <= 128 and not is_last_layer
+            lookup_table[batch_size] = should_fuse
+
+        return lookup_table
+
 
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -2008,7 +2012,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
@@ -2437,17 +2441,15 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
         if self.quant_config and self.quant_config.get_name() == "w4afp8":
-            expert_params_mapping += (
-                get_moe_impl_class().make_expert_input_scale_params_mapping(
-                    num_experts=self.config.n_routed_experts
-                )
+            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
+                num_experts=self.config.n_routed_experts
             )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
