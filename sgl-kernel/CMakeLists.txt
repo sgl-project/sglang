@@ -165,7 +165,6 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_75,code=sm_75"
         "-gencode=arch=compute_80,code=sm_80"
         "-gencode=arch=compute_89,code=sm_89"
     )
@@ -296,6 +295,8 @@ target_include_directories(common_ops PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+set_source_files_properties("csrc/gemm/per_token_group_quant_8bit" PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
