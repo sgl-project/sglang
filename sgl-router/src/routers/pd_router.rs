@@ -1,10 +1,13 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
 use super::pd_types::{api_path, PDRouterError};
-use crate::config::types::{CircuitBreakerConfig as ConfigCircuitBreakerConfig, RetryConfig};
+use crate::config::types::{
+    CircuitBreakerConfig as ConfigCircuitBreakerConfig,
+    HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
+};
 use crate::core::{
-    is_retryable_status, CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory,
-    WorkerLoadGuard,
+    is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig,
+    RetryExecutor, Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
@@ -360,6 +363,7 @@ impl PDRouter {
         interval_secs: u64,
         retry_config: RetryConfig,
         circuit_breaker_config: ConfigCircuitBreakerConfig,
+        health_check_config: ConfigHealthCheckConfig,
     ) -> Result<Self, String> {
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
         let core_cb_config = CircuitBreakerConfig {
@@ -369,17 +373,42 @@ impl PDRouter {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        // Convert URLs to Worker trait objects
+        // Convert URLs to Worker trait objects with health check config
         let prefill_workers: Vec<Box<dyn Worker>> = prefill_urls
             .into_iter()
             .map(|(url, port)| {
-                WorkerFactory::create_prefill_with_config(url, port, core_cb_config.clone())
+                let worker = BasicWorker::new(
+                    url,
+                    WorkerType::Prefill {
+                        bootstrap_port: port,
+                    },
+                )
+                .with_circuit_breaker_config(core_cb_config.clone())
+                .with_health_config(HealthConfig {
+                    timeout_secs: health_check_config.timeout_secs,
+                    check_interval_secs: health_check_config.check_interval_secs,
+                    endpoint: health_check_config.endpoint.clone(),
+                    failure_threshold: health_check_config.failure_threshold,
+                    success_threshold: health_check_config.success_threshold,
+                });
+                Box::new(worker) as Box<dyn Worker>
             })
             .collect();
 
         let decode_workers: Vec<Box<dyn Worker>> = decode_urls
             .into_iter()
-            .map(|url| WorkerFactory::create_decode_with_config(url, core_cb_config.clone()))
+            .map(|url| {
+                let worker = BasicWorker::new(url, WorkerType::Decode)
+                    .with_circuit_breaker_config(core_cb_config.clone())
+                    .with_health_config(HealthConfig {
+                        timeout_secs: health_check_config.timeout_secs,
+                        check_interval_secs: health_check_config.check_interval_secs,
+                        endpoint: health_check_config.endpoint.clone(),
+                        failure_threshold: health_check_config.failure_threshold,
+                        success_threshold: health_check_config.success_threshold,
+                    });
+                Box::new(worker) as Box<dyn Worker>
+            })
             .collect();
 
         // Wait for PD workers to be healthy (skip if empty - for service discovery mode)
@@ -443,10 +472,14 @@ impl PDRouter {
         let decode_workers = Arc::new(RwLock::new(decode_workers));
 
         // Start health checkers for both worker pools
-        let prefill_health_checker =
-            crate::core::start_health_checker(Arc::clone(&prefill_workers), interval_secs);
-        let decode_health_checker =
-            crate::core::start_health_checker(Arc::clone(&decode_workers), interval_secs);
+        let prefill_health_checker = crate::core::start_health_checker(
+            Arc::clone(&prefill_workers),
+            health_check_config.check_interval_secs,
+        );
+        let decode_health_checker = crate::core::start_health_checker(
+            Arc::clone(&decode_workers),
+            health_check_config.check_interval_secs,
+        );
 
         // Build a dedicated prefill client for fire-and-forget semantics
         let prefill_client = reqwest::Client::builder()
