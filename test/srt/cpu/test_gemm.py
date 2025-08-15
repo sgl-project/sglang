@@ -6,10 +6,12 @@ import sgl_kernel
 import torch
 import torch.nn as nn
 from utils import (
+    autoawq_to_int4pack,
     convert_weight,
     native_w8a8_per_token_matmul,
     per_token_quant_int8,
     precision,
+    unpack_and_dequant_awq,
 )
 
 from sglang.test.test_utils import CustomTestCase
@@ -39,6 +41,10 @@ class TestGemm(CustomTestCase):
     M_fp8 = [1, 11]
     N_fp8 = [128, 224]
     K_fp8 = [512, 576]
+
+    M_awq = [1, 32]
+    N_awq = [4096]
+    K_awq = [4096]
 
     def _bf16_gemm(self, M, N, K, has_bias):
 
@@ -183,6 +189,58 @@ class TestGemm(CustomTestCase):
                 has_bias=params[3],
             ):
                 self._fp8_gemm(*params)
+
+    def _int4_awq_gemm(self, M, N, K, group_size, has_bias, w4a8):
+        awq_weight = torch.randint(-128, 128, (K, N // 8)).to(torch.int)
+        awq_zero = torch.randint(0, 10, (K // group_size, N // 8)).to(torch.int)
+        awq_scales = torch.rand(int(K // group_size), N).to(torch.bfloat16)
+        bf16_weight, _ = unpack_and_dequant_awq(
+            awq_weight, awq_zero, awq_scales, 4, 128
+        )
+        if has_bias:
+            bias = torch.rand(bf16_weight.shape[0]).to(torch.float)
+        else:
+            bias = None
+        x = torch.rand(M, bf16_weight.size(-1)).to(torch.bfloat16)
+        ref_res = torch.nn.functional.linear(
+            x, bf16_weight, bias=bias.to(torch.bfloat16) if has_bias else None
+        )
+        if w4a8:
+            packed_weight, packed_zero, packed_scales, packed_compensation = (
+                autoawq_to_int4pack(awq_weight, awq_zero, awq_scales, True)
+            )
+            target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu_with_quant(
+                x,
+                packed_weight,
+                packed_scales,
+                packed_zero,
+                packed_compensation,
+                bias,
+                torch.bfloat16,
+            )
+        else:
+            packed_weight, packed_zero, packed_scales = autoawq_to_int4pack(
+                awq_weight, awq_zero, awq_scales, False
+            )
+            target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+                x, packed_weight, packed_zero, packed_scales, bias
+            )
+        atol = rtol = precision[ref_res.dtype]
+        torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
+
+    def test_int4_awq_gemm(self):
+        for params in itertools.product(
+            self.M_awq, self.N_awq, self.K_awq, [128], self.has_bias, [True, False]
+        ):
+            with self.subTest(
+                M=params[0],
+                N=params[1],
+                K=params[2],
+                group_size=params[3],
+                has_bias=params[4],
+                w4a8=params[5],
+            ):
+                self._int4_awq_gemm(*params)
 
 
 if __name__ == "__main__":
