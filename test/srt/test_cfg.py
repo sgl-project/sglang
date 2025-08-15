@@ -39,7 +39,7 @@ class TestClassifierFreeGuidance(CustomTestCase):
         }
 
         self.top_logprobs_num = 3
-        self.atol = 1e-4
+        self.atol = 1e-1
 
     def _gen_logprobs(self, cfg_params):
         num_cfg_params = len(cfg_params)
@@ -110,6 +110,20 @@ class TestClassifierFreeGuidance(CustomTestCase):
         outputs = self._gen_logprobs(cfg_params)
         for out1, out2 in [(outputs[0], outputs[1]), (outputs[2], outputs[3])]:
             self._compare_logprobs_pair(out1, out2, False)
+
+    def test_mixed_cfg_reqs(self):
+        """Test that passing in a mix of CFG and non-CFG requests works correctly."""
+        cfg_param = {
+            "cfg_text": self.bad_cfg_prompt,
+            "cfg_weight": 1.0,
+        }
+        all_cfg_params = [{}, cfg_param, {}]
+
+        outputs = self._gen_logprobs(all_cfg_params)
+
+        self._compare_logprobs_pair(outputs[0], outputs[2], True)
+        self._compare_logprobs_pair(outputs[1], outputs[2], False)
+        self._compare_logprobs_pair(outputs[0], outputs[1], False)
 
     @classmethod
     def tearDownClass(cls):

@@ -1345,7 +1345,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Add CFG params
         self.cfg_weights = [
-            req.cfg_params["cfg_weight"] for req in self.reqs if req.cfg_params
+            req.cfg_params["cfg_weight"] if req.cfg_params else None
+            for req in self.reqs
         ]
 
     def prepare_for_split_prefill(self):

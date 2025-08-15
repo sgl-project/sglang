@@ -231,10 +231,18 @@ class GenerateReqInput:
                 if isinstance(self.cfg_params, dict)
                 else self.cfg_params
             )
-            if not all(param["cfg_weight"] >= 0.0 for param in norm_params):
-                raise ValueError("All cfg_weights must be greater than or equal to 0.0")
-
             for param in norm_params:
+                if not param:
+                    continue
+
+                if param.get("cfg_weight") is None:
+                    raise ValueError("cfg_weight must be provided for a CFG request")
+
+                if param["cfg_weight"] < 0.0:
+                    raise ValueError(
+                        "All cfg_weights must be greater than or equal to 0.0"
+                    )
+
                 if ("cfg_text" in param) == ("cfg_input_ids" in param):
                     raise ValueError(
                         "exactly one of cfg_text and cfg_input_ids must be provided"
