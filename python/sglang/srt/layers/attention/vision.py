@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.utils import is_cuda, print_info_once
 
 _is_cuda = is_cuda()
@@ -244,6 +245,8 @@ class VisionTritonAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor],
+        bsz: int,
+        seq_len: int,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -252,6 +255,8 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
 
         # [b * s, head, head_size]
         output = torch.empty_like(q)
@@ -365,19 +370,20 @@ class VisionAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.tp_size = world_size
-        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+        self.tp_size = attn_tp_size
+        self.tp_rank = attn_tp_rank
         self.dropout = dropout
         self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
         self.num_attention_heads_per_partition = dist_utils.divide(
-            num_dummy_heads + num_heads, world_size
+            num_dummy_heads + num_heads, self.tp_size
         )
         self.num_attention_kv_heads_per_partition = dist_utils.divide(
-            num_dummy_heads + num_heads, world_size
+            num_dummy_heads + num_heads, self.tp_size
         )
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
@@ -399,7 +405,11 @@ class VisionAttention(nn.Module):
         # priority: server_args > passed qkv_backend > sdpa
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
-                qkv_backend = "sdpa"
+                if is_cuda():
+                    # Double prefill throughput by setting attn backend to Triton on CUDA
+                    qkv_backend = "triton_attn"
+                else:
+                    qkv_backend = "sdpa"
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         else:
             qkv_backend = global_server_args_dict["mm_attention_backend"]
@@ -427,6 +437,8 @@ class VisionAttention(nn.Module):
                 total_num_kv_heads=num_dummy_heads + num_heads,
                 bias=qkv_bias,
                 quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
@@ -435,6 +447,8 @@ class VisionAttention(nn.Module):
                 output_size=3 * self.dummy_dim,
                 bias=qkv_bias,
                 quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         self.proj = RowParallelLinear(
@@ -442,6 +456,8 @@ class VisionAttention(nn.Module):
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
         )
 

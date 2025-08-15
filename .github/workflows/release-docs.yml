@@ -5,8 +5,8 @@ on:
     branches:
       - main
     paths:
-      - 'docs/**'
-      - 'python/sglang/version.py'
+      - "docs/**"
+      - "python/sglang/version.py"
       - "python/sglang/**"
   workflow_dispatch:
 
@@ -24,29 +24,31 @@ jobs:
 
       - name: Install dependencies
         run: |
-          find /public_sglang_ci/runner-a-gpu-1/_work/_tool/Python/3.9.21/x64/lib/python3.9/site-packages -name "sgl-kernel*" -exec rm -rf {} + || true
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
           pip install -r docs/requirements.txt
-          apt-get update
-          apt-get install -y pandoc
-          apt-get update && apt-get install -y parallel retry
-
+          apt-get update && apt-get install -y pandoc parallel retry
           ln -sf "$(which python3)" /usr/bin/python
 
       - name: Setup Jupyter Kernel
         run: |
           python -m ipykernel install --user --name python3 --display-name "Python 3"
 
-      - name: Execute notebooks and push to documents
-        env:
-          GITHUB_TOKEN: ${{ secrets.DOCUMENTATION_PAT_TOKEN }}
+      - name: Execute notebooks
+        timeout-minutes: 40
         run: |
           cd docs
           make clean
           make compile
 
+      - name: Push HTML to sgl-project.github.io
+        timeout-minutes: 60
+        env:
+          GITHUB_TOKEN: ${{ secrets.DOCUMENTATION_PAT_TOKEN }}
+        run: |
+          cd docs
           make html
           python3 wrap_run_llm.py
+
           cd _build/html
 
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io --depth 1

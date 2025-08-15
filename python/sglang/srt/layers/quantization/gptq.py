@@ -36,30 +36,27 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_zero_points,
     verify_marlin_supported,
 )
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
 from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
+    get_scalar_types,
     replace_parameter,
     unpack_cols,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
-
-try:
-    from vllm import _custom_ops as ops
-except ImportError:
-    ops = None
 
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_marlin_moe
+    from sgl_kernel import fused_marlin_moe, gptq_gemm, gptq_marlin_repack, gptq_shuffle
 
 
 logger = logging.getLogger(__name__)
+ScalarType, scalar_types = get_scalar_types()
 
 
 def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
@@ -85,9 +82,7 @@ def gptq_marlin_moe_repack(
         dtype=b_q_weight.dtype,
     )
     for e in range(num_experts):
-        output[e] = torch.ops.sgl_kernel.gptq_marlin_repack(
-            b_q_weight[e], perm[e], size_k, size_n, num_bits
-        )
+        output[e] = gptq_marlin_repack(b_q_weight[e], perm[e], size_k, size_n, num_bits)
     return output
 
 
@@ -204,11 +199,12 @@ class GPTQConfig(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        if isinstance(layer, LinearBase):
-            return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
-        elif isinstance(layer, FusedMoE):
+        if isinstance(layer, FusedMoE):
             raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
-        return None
+        else:
+            return get_linear_quant_method(
+                self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
+            )
 
 
 class GPTQMarlinConfig(QuantizationConfig):
@@ -530,7 +526,7 @@ class GPTQLinearMethod(LinearMethodBase):
                 layer.g_idx.data = torch.empty(
                     (0,), dtype=torch.int, device=layer.g_idx.device
                 )
-            ops.gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+            gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
 
     def apply(
         self,
@@ -541,7 +537,7 @@ class GPTQLinearMethod(LinearMethodBase):
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        output = ops.gptq_gemm(
+        output = gptq_gemm(
             reshaped_x,
             layer.qweight,
             layer.qzeros,
@@ -726,7 +722,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
-            x.data = torch.ops.sgl_kernel.gptq_marlin_repack(
+            x.data = gptq_marlin_repack(
                 x.data.contiguous(),
                 perm=layer.g_idx_sort_indices,
                 size_k=c.partition_weight_shape[0],
@@ -1061,13 +1057,13 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        **kwargs,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         # Delay the import to avoid circular dependency
 
-        assert activation == "silu", "Only SiLU activation is supported."
+        assert (
+            moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
 
         # The input must currently be float16
         orig_dtype = x.dtype

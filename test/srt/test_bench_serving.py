@@ -1,7 +1,6 @@
 import asyncio
 import itertools
 import unittest
-from random import random, uniform
 
 import requests
 
@@ -57,7 +56,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_non_stream_small_batch_size\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
-            self.assertGreater(res["output_throughput"], 1050)
+            if is_in_amd_ci():
+                self.assertGreater(res["output_throughput"], 1000)
+            else:
+                self.assertGreater(res["output_throughput"], 1050)
 
     def test_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(

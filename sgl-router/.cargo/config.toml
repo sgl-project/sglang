@@ -1,6 +1,6 @@
 [build]
-rustflags = [
-]
+rustflags = []
+incremental = true
 
 [target.aarch64-apple-darwin]
 rustflags = [

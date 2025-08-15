@@ -83,7 +83,6 @@ class TestUtilsUpdateWeights(unittest.TestCase):
         # Set up environment variables
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
         os.environ["NCCL_CUMEM_ENABLE"] = "0"
-        os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
         os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 

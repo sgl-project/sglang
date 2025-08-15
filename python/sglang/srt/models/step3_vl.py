@@ -25,7 +25,11 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -34,6 +38,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -146,7 +151,7 @@ class Step3TextMoEMLP(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if global_server_args_dict["moe_a2a_backend"].is_deepep():
+        if get_moe_a2a_backend().is_deepep():
             raise NotImplementedError("DeepEP MoE is not supported yet in Step3 model.")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -437,7 +442,7 @@ class Step3TextModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -531,11 +536,18 @@ class Step3VisionMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # Since this is a dense model,
+        # the MLP component likewise adopts a DP-MLP approach modeled after DP Attention.
+        # This choice may not represent the optimal solution and remains open to further deliberation.
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
         self.fc1 = ColumnParallelLinear(
             dim,
             intermediate_size,
             bias=bias,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("gate_proj", prefix),
         )
         self.act = ACT2FN[hidden_act]  # quick_gelu
@@ -544,6 +556,8 @@ class Step3VisionMLP(nn.Module):
             dim,
             bias=bias,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=add_prefix("down_proj", prefix),
         )
 

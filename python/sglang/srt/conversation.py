@@ -30,8 +30,10 @@ import re
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+from typing_extensions import Literal
+
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import read_system_prompt_from_file
+from sglang.srt.utils import ImageData, read_system_prompt_from_file
 
 
 class SeparatorStyle(IntEnum):
@@ -91,7 +93,7 @@ class Conversation:
     video_token: str = "<video>"
     audio_token: str = "<audio>"
 
-    image_data: Optional[List[str]] = None
+    image_data: Optional[List[ImageData]] = None
     video_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
     stop_token_ids: Optional[int] = None
@@ -381,9 +383,9 @@ class Conversation:
         """Append a new message."""
         self.messages.append([role, message])
 
-    def append_image(self, image: str):
+    def append_image(self, image: str, detail: Literal["auto", "low", "high"]):
         """Append a new image."""
-        self.image_data.append(image)
+        self.image_data.append(ImageData(url=image, detail=detail))
 
     def append_video(self, video: str):
         """Append a new video."""
@@ -627,7 +629,9 @@ def generate_chat_conv(
                             real_content = image_token + real_content
                         else:
                             real_content += image_token
-                        conv.append_image(content.image_url.url)
+                        conv.append_image(
+                            content.image_url.url, content.image_url.detail
+                        )
                     elif content.type == "video_url":
                         real_content += video_token
                         conv.append_video(content.video_url.url)
