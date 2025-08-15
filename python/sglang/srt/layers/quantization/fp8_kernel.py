@@ -1821,7 +1821,7 @@ def _shuffle_map_fp8_scale_hopper_moe_mn_major(
     expert_offsets,  # (num_experts,)
     problem_sizes,  # (num_experts, 3)
     sfa,  # (M, k)
-    shuffle_map,
+    shuffle_map, # (topk * M,)
     E: tl.constexpr,
     K: tl.constexpr,
     M_ALIGNMENT: tl.constexpr,
@@ -1909,8 +1909,8 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
     expert_offsets: torch.Tensor,
     problem_sizes: torch.Tensor,
     output_m: int,
+    # index mapping from the shuffled destination (topk * M) to the source (M)
     shuffle_map: Optional[torch.Tensor] = None,
-    expert_tokens_alignment: int = 1,
 ) -> torch.Tensor:
     assert a_s.dim() == 2
     assert a_s.is_contiguous(), "`A` is not contiguous"
@@ -1918,7 +1918,8 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
     k = a_s.shape[1]
     sfa = torch.empty((output_m, k), device=a_s.device, dtype=a_s.dtype)
     num_experts = problem_sizes.shape[0]
-    # grid = (k, num_experts)
+    expert_tokens_alignment = a_s.element_size() * 8
+
     grid = (k * num_experts, )
     if shuffle_map is not None:
         _shuffle_map_fp8_scale_hopper_moe_mn_major[grid](

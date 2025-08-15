@@ -162,7 +162,6 @@ def cutlass_fused_experts_fp8(
         if not use_shuffle:
             rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
             rep_a1_scales = per_group_transpose(rep_a1_scales, expert_offsets)
-            w1_scale = w1_scale.contiguous()
         else:
             rep_a1_scales = shuffle_fp8_scale_hopper_moe_mn_major(
                 a1_scale,
@@ -170,11 +169,10 @@ def cutlass_fused_experts_fp8(
                 problem_sizes1,
                 m * topk,
                 a_map,
-                expert_tokens_alignment=16,
             )
-            w1_scale = w1_scale.contiguous()
     else:
         raise NotImplementedError("Only support sm100 and sm90 for now")
+    w1_scale = w1_scale.contiguous()
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
@@ -210,16 +208,14 @@ def cutlass_fused_experts_fp8(
     if not is_sm100_supported():
         if not use_shuffle:
             a2_scale = per_group_transpose(a2_scale, expert_offsets)
-            w2_scale = w2_scale.contiguous()
         else:
             a2_scale = shuffle_fp8_scale_hopper_moe_mn_major(
                 a2_scale,
                 expert_offsets[:-1],
                 problem_sizes2,
                 m * topk,
-                expert_tokens_alignment=16,
             )
-            w2_scale = w2_scale.contiguous()
+    w2_scale = w2_scale.contiguous()
 
     fp8_blockwise_scaled_grouped_mm(
         c2,
