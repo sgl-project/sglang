@@ -536,6 +536,8 @@ class Qwen2MoeForCausalLM(nn.Module):
             use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
         self.logits_processor = LogitsProcessor(config)
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(
