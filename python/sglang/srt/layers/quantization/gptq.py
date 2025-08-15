@@ -996,7 +996,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition,
-                dtype=params_dtype,
+                dtype=torch.float32,
             ),
             requires_grad=False,
         )
@@ -1007,7 +1007,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             torch.empty(
                 num_experts,
                 hidden_size,
-                dtype=params_dtype,
+                dtype=torch.float32,
             ),
             requires_grad=False,
         )
