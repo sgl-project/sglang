@@ -951,7 +951,7 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
             cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(store_dtype)
+            cache_k = cache_k.view(self.store_dtype)
 
         import torch_npu
 
@@ -1070,7 +1070,7 @@ def copy_all_layer_kv_cache(
     num_loop = tl.cdiv(stride, BLOCK_SIZE)
     for i in range(num_loop):
         copy_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = (num_locs_offset < num_locs)[:, None] and (copy_offset < stride)[None, :]
+        mask = (num_locs_offset < num_locs)[:, None] & (copy_offset < stride)[None, :]
         value = tl.load(
             data_ptr + src_locs[:, None] * stride + copy_offset[None, :], mask=mask
         )
