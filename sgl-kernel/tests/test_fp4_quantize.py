@@ -175,7 +175,8 @@ def test_quantize_to_fp4_grouped():
 
     l, m, k = 2, 512, 2048
     x = torch.randn((l, m, k), dtype=torch.bfloat16)
-    x_sf_global = torch.ones((l,), dtype=torch.float32)
+    tensor_amax = x.abs().amax(dim=(1, 2)).to(torch.float32)
+    x_sf_global = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
     output, output_scales = scaled_fp4_grouped_quant(
         x,
         x_sf_global,
