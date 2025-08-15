@@ -7,6 +7,11 @@ import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.graph_runner import (
     GRAPH_CAPTURE_FAILED_MSG,
     get_batch_sizes_to_capture,
