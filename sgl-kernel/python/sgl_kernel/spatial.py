@@ -1,6 +1,15 @@
 import torch
 from torch.cuda.streams import ExternalStream
 
+# Load the spatial extension only when this module is imported
+try:
+    from . import spatial_ops  # noqa: F401  # triggers TORCH extension registration
+except Exception as _e:  # pragma: no cover
+    # Defer failure until functions are called, but give informative error on import issues
+    _spatial_import_error = _e
+else:
+    _spatial_import_error = None
+
 
 def create_greenctx_stream_by_value(
     SM_a: int, SM_b: int, device_id: int = None
@@ -14,6 +23,11 @@ def create_greenctx_stream_by_value(
     Returns:
         tuple[ExternalStream, ExternalStream]: The two streams.
     """
+    if _spatial_import_error is not None:
+        raise ImportError(
+            "Failed to load sgl_kernel.spatial_ops extension. "
+            "Ensure CUDA Toolkit >= 12.4 and the project is built with spatial_ops enabled."
+        ) from _spatial_import_error
     if torch.version.cuda < "12.4":
         raise RuntimeError(
             "Green Contexts feature requires CUDA Toolkit 12.4 or newer."
@@ -42,6 +56,11 @@ def get_sm_available(device_id: int = None) -> int:
     Returns:
         int: The SMs available.
     """
+    if _spatial_import_error is not None:
+        raise ImportError(
+            "Failed to load sgl_kernel.spatial_ops extension. "
+            "Ensure CUDA Toolkit >= 12.4 and the project is built with spatial_ops enabled."
+        ) from _spatial_import_error
     if device_id is None:
         device_id = torch.cuda.current_device()
 
