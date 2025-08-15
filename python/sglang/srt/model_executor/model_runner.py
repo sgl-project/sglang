@@ -603,12 +603,8 @@ class ModelRunner:
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(
-                enable_dp_attention=self.server_args.enable_dp_attention,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                dp_size=self.server_args.dp_size,
-                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
-                pp_size=self.server_args.pp_size,
+                server_args=self.server_args,
+                model_config=self.model_config,
             )
 
         min_per_gpu_memory = get_available_gpu_memory(
