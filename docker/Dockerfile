@@ -304,7 +304,7 @@ set-window-option -g mode-keys vi
 set-option -g escape-time 0
 set-option -g base-index 1
 set-window-option -g mouse on
-set -g history-limit 10000000
+set -g history-limit 1000000
 EOF
 
 # Configure Git
