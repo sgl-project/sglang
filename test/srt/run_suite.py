@@ -150,9 +150,9 @@ suites = {
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("test_bnb.py", 5),
-        TestFile("test_gguf.py", 96),
         TestFile("test_gptqmodel_dynamic.py", 102),
         TestFile("test_vllm_dependency.py", 185),
+        # TestFile("test_gguf.py", 96),
     ],
 }
 

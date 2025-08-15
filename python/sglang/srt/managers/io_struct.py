@@ -800,6 +800,9 @@ class UpdateWeightFromDiskReqInput:
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
     rids: Optional[Union[List[str], str]] = None
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+
 
 
 @dataclass
@@ -823,6 +826,9 @@ class UpdateWeightsFromDistributedReqInput:
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
     rids: Optional[Union[List[str], str]] = None
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+
 
 
 @dataclass
@@ -848,6 +854,8 @@ class UpdateWeightsFromTensorReqInput:
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
     rids: Optional[Union[List[str], str]] = None
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
 
 
 @dataclass
@@ -879,6 +887,14 @@ class InitWeightsUpdateGroupReqOutput:
     success: bool
     message: str
     rids: Optional[Union[List[str], str]] = None
+
+
+@dataclass
+class UpdateWeightVersionReqInput:
+    # The new weight version
+    new_version: str
+    # Whether to abort all running requests before updating
+    abort_all_requests: bool = True
 
 
 @dataclass
