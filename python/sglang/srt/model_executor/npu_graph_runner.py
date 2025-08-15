@@ -40,7 +40,7 @@ class NPUGraphRunner(GraphRunner):
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
-    
+
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         with torch.npu.graph(
             graph,
