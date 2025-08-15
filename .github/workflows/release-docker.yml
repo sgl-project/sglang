@@ -1,10 +1,10 @@
 name: Release Docker Images
 on:
+  # HACK!!!
   push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
