@@ -38,10 +38,10 @@ from sglang.srt.utils import (
     is_hip,
     is_triton_kernels_available,
     log_info_on_rank0,
+    mxfp_supported,
     next_power_of_2,
     round_up,
     set_weight_attrs,
-    mxfp_supported,
 )
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
@@ -65,11 +65,12 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 
 if _is_hip:
-    #import aiter
+    # import aiter
     from aiter import ActivationType, QuantType, dtypes
     from aiter.fused_moe import fused_moe
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
     from aiter.utility.fp4_utils import e8m0_shuffle
+
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
@@ -184,7 +185,9 @@ class Mxfp4Config(QuantizationConfig):
             if mxfp_supported():
                 quant_method = cls.get_from_keys(config, ["quant_method"])
                 is_checkpoint_mxfp4_serialized = True if quant_method else False
-                return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
+                return cls(
+                    is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
+                )
 
             else:
 
@@ -233,7 +236,7 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
-                return Mxfp4MoEMethod(prefix=prefix) 
+                return Mxfp4MoEMethod(prefix=prefix)
             else:
                 return Mxfp4DynamicQuantMoEMethod()
         else:
@@ -243,6 +246,7 @@ class Mxfp4Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
@@ -689,6 +693,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 b2=layer.w2_weight_bias,
             )
 
+
 class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
     def create_weights(
         self,
@@ -794,7 +799,9 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             activation=(
-                ActivationType.Silu if moe_runner_config.activation == "silu" else ActivationType.Gelu
+                ActivationType.Silu
+                if moe_runner_config.activation == "silu"
+                else ActivationType.Gelu
             ),
             doweight_stage1=False,
         )
