@@ -25,6 +25,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use std::env;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
@@ -705,7 +706,8 @@ impl PDRouter {
     ) -> Response {
         // Update load tracking for both workers
         let _guard = WorkerLoadGuard::new_multi(vec![prefill, decode]);
-
+        let safe_dispatch: bool = env::var("SGL_ROUTER_SAFE_DISPATCH")
+            .map_or(false, |v| v.parse::<bool>().unwrap_or(false));
         // Build decode request with shared client
         let decode_request = self.build_post_with_headers(
             &self.client,
@@ -718,12 +720,13 @@ impl PDRouter {
 
         // Send both requests concurrently
         debug!(
-            "Sending concurrent requests to prefill={} decode={}",
+            "Sending concurrent logprobs={} requests to prefill={} decode={}",
+            return_logprob,
             prefill.url(),
             decode.url()
         );
 
-        if return_logprob {
+        if safe_dispatch || return_logprob {
             // Build prefill request with shared client when we need response body
             let prefill_request = self.build_post_with_headers(
                 &self.client,
