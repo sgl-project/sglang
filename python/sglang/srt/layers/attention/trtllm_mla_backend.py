@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from sglang.srt.layers.attention.flashinfer_mla_backend import (
+    FlashInferMLAAttnBackend,
+    FlashInferMLAMultiStepDraftBackend,
+)
 from sglang.srt.layers.attention.utils import (
     TRITON_PAD_NUM_PAGE_PER_BLOCK,
     create_flashmla_kv_indices_triton,
@@ -167,6 +170,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MLA."""
+
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
 
         self.cuda_graph_kv_indices = torch.full(
@@ -231,8 +235,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Replay CUDA graph with new inputs."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (forward_mode.is_decode_or_idle() and spec_info is None):
+        # Delegate to parent for non-decode modes.
+        if not forward_mode.is_decode_or_idle():
             return super().init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -265,11 +269,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is None
-        ):
+        # Delegate to parent for non-decode modes.
+        if not forward_batch.forward_mode.is_decode_or_idle():
             return super().init_forward_metadata(forward_batch)
 
         bs = forward_batch.batch_size
@@ -474,3 +475,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         return output
+
+
+class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
+    """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
+
+    def __init__(
+        self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int
+    ):
+        super().__init__(model_runner, topk, speculative_num_steps)
+
+        for i in range(self.speculative_num_steps):
+            self.attn_backends[i] = TRTLLMMLABackend(
+                model_runner,
+                skip_prefill=True,
+                kv_indptr_buf=self.kv_indptr[i],
+                q_indptr_decode_buf=self.q_indptr_decode,
+            )
