@@ -332,7 +332,7 @@ def scaled_fp4_grouped_quant(
 
     torch.ops.sgl_kernel.scaled_fp4_experts_quant.default(
         output.view(l * m, k // 2),
-        output_scales.view(l * m, padded_k_int32),
+        output_scales.view(l * padded_m, padded_k_int32),
         input_tensor.view(l * m, k),
         input_global_scale,
         input_offsets,
