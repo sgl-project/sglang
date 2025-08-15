@@ -1640,11 +1640,11 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       int group_size_temp = K / w1_zero.value().size(1);
-      if (group_size_temp * w1_zero.value().size(1) < K){
+      if (group_size_temp * w1_zero.value().size(1) < K) {
         int round_32 = (group_size_temp + 32 - 1) / 32;
         group_size_temp = round_32 * 32;
       }
-      const int group_size = group_size_temp;// group_size_temp;
+      const int group_size = group_size_temp;  // group_size_temp;
       // TODO: This "with_bias" is only for gptoss models,
       //       refine this check to support common cases.
       bool with_bias = w1_bias.has_value();
@@ -1664,8 +1664,8 @@ at::Tensor fused_experts_cpu(
           w2_zero.value().data_ptr<uint8_t>(),
           w1_scale.value().data_ptr<scalar_t>(),
           w2_scale.value().data_ptr<scalar_t>(),
-          with_bias ? w1_bias.value().data_ptr<scalar_t>() : nullptr,
-          with_bias ? w2_bias.value().data_ptr<scalar_t>() : nullptr,
+          with_bias ? w1_bias.value().to(at::kFloat).data_ptr<float>() : nullptr,
+          with_bias ? w2_bias.value().to(at::kFloat).data_ptr<float>() : nullptr,
           group_size,
           topk_weights.data_ptr<float>(),
           sorted_ids,

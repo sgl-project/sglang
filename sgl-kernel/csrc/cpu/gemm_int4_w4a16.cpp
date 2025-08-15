@@ -691,6 +691,7 @@ void tinygemm_kernel(
     const scalar_t* __restrict__ Bs,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ bias,
     int64_t M,
     int64_t N,
     int64_t K,
@@ -701,8 +702,8 @@ void tinygemm_kernel(
     int64_t strideBz,
     int64_t strideBs,
     bool brg) {
-  tinygemm_kernel<scalar_t, false>(
-      A, B, C, Bz, Bs, Btmp, Ctmp, nullptr, M, N, K, group_size, lda, ldb, ldc, strideBz, strideBs, brg);
+  tinygemm_kernel<scalar_t, true>(
+      A, B, C, Bz, Bs, Btmp, Ctmp, bias, M, N, K, group_size, lda, ldb, ldc, strideBz, strideBs, brg);
 }
 
 #define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE) \
@@ -714,6 +715,7 @@ void tinygemm_kernel(
       const TYPE* __restrict__ Bs,          \
       TYPE* __restrict__ Btmp,              \
       float* __restrict__ Ctmp,             \
+      const float* __restrict__ bias,       \
       int64_t M,                            \
       int64_t N,                            \
       int64_t K,                            \
