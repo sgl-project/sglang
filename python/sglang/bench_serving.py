@@ -864,11 +864,11 @@ def sample_mmmu_requests(
                     if image.mode == "RGBA":
                         image = image.convert("RGB")
 
-                    # Encode image to base64
+                    # Encode image to base64 (save as PNG to support palette/alpha modes)
                     buffered = io.BytesIO()
-                    image.save(buffered, format="JPEG")
+                    image.save(buffered, format="PNG")
                     img_str = pybase64.b64encode(buffered.getvalue()).decode("utf-8")
-                    image_data = f"data:image/jpeg;base64,{img_str}"
+                    image_data = f"data:image/png;base64,{img_str}"
                 else:
                     continue
 
