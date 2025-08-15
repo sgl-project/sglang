@@ -512,14 +512,14 @@ class HiPAttentionBackend(AttentionBackend):
                     k_cache = kv_cache
                     v_cache = c_kv_cache
 
-                    if sk is not None:
+                    if sinks is not None:
                         if forward_batch.forward_mode.is_draft_extend():
                             sw_size = 512
                             sw_sink = 128
                         else:
                             sw_sink = -1
                     else:
-                        sw_sink = sk
+                        sw_sink = sinks
 
                     # print(q_merged.shape, k_cache.shape, v_cache.shape, sw_sink, sw_size)
 
