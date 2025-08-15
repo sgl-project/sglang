@@ -1,6 +1,10 @@
-use crate::config::types::{CircuitBreakerConfig as ConfigCircuitBreakerConfig, RetryConfig};
+use crate::config::types::{
+    CircuitBreakerConfig as ConfigCircuitBreakerConfig,
+    HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
+};
 use crate::core::{
-    is_retryable_status, CircuitBreakerConfig, HealthChecker, RetryExecutor, Worker, WorkerFactory,
+    is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig,
+    RetryExecutor, Worker, WorkerFactory, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
@@ -61,6 +65,7 @@ impl Router {
         api_key: Option<String>,
         retry_config: RetryConfig,
         circuit_breaker_config: ConfigCircuitBreakerConfig,
+        health_check_config: ConfigHealthCheckConfig,
     ) -> Result<Self, String> {
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
@@ -86,11 +91,20 @@ impl Router {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        // Create Worker trait objects from URLs
+        // Create Worker trait objects from URLs with health check config
         let workers: Vec<Box<dyn Worker>> = worker_urls
             .iter()
             .map(|url| {
-                WorkerFactory::create_regular_with_config(url.clone(), core_cb_config.clone())
+                let worker = BasicWorker::new(url.clone(), WorkerType::Regular)
+                    .with_circuit_breaker_config(core_cb_config.clone())
+                    .with_health_config(HealthConfig {
+                        timeout_secs: health_check_config.timeout_secs,
+                        check_interval_secs: health_check_config.check_interval_secs,
+                        endpoint: health_check_config.endpoint.clone(),
+                        failure_threshold: health_check_config.failure_threshold,
+                        success_threshold: health_check_config.success_threshold,
+                    });
+                Box::new(worker) as Box<dyn Worker>
             })
             .collect();
 

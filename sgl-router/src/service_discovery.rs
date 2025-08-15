@@ -592,6 +592,7 @@ mod tests {
             None,
             crate::config::types::RetryConfig::default(),
             crate::config::types::CircuitBreakerConfig::default(),
+            crate::config::types::HealthCheckConfig::default(),
         )
         .await
         .unwrap();
