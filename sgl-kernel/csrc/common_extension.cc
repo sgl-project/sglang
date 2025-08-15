@@ -78,13 +78,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
 
-  m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
+  m.def("silu_and_mul(Tensor! out, Tensor input, bool enable_pdl) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
-  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
+  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input, bool enable_pdl) -> ()");
   m.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
 
-  m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
+  m.def("gelu_and_mul(Tensor! out, Tensor input, bool enable_pdl) -> ()");
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
   m.def(
@@ -330,7 +330,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def(
       "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, int "
-      "cublas_handle, int cuda_stream) -> ()",
+      "cublas_handle) -> ()",
       {at::Tag::needs_fixed_stride_order});
   m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
 
