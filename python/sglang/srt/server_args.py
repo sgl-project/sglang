@@ -290,6 +290,7 @@ class ServerArgs:
     enable_flashinfer_cutlass_moe: bool = False
     enable_flashinfer_trtllm_moe: bool = False
     enable_triton_kernel_moe: bool = False
+    enable_flashinfer_mxfp4_moe: bool = False
 
     def __post_init__(self):
         # Check deprecated arguments
@@ -320,6 +321,11 @@ class ServerArgs:
             self.moe_runner_backend = "flashinfer_trtllm"
             print_deprecated_warning(
                 "NOTE: --enable-flashinfer-trtllm-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
+            )
+        if self.enable_flashinfer_mxfp4_moe:
+            self.moe_runner_backend = "flashinfer_mxfp4"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead."
             )
 
         # Set missing default values
@@ -1852,11 +1858,6 @@ class ServerArgs:
             help="Enable returning hidden states with responses.",
         )
         parser.add_argument(
-            "--enable-flashinfer-mxfp4-moe",
-            action="store_true",
-            help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
-        )
-        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -2000,6 +2001,11 @@ class ServerArgs:
             "--enable-triton-kernel-moe",
             action="store_true",
             help="(Deprecated) Use triton moe grouped gemm kernel.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-mxfp4-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
         )
 
     @classmethod
