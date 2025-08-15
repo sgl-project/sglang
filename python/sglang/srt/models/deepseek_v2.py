@@ -2274,7 +2274,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight,
                                 weight_scale,
                                 weight_block_size,
-                                torch.bfloat16,
+                                self_attn.kv_b_proj.params_dtype,
                             )
                     else:
                         w, scale = block_quant_to_tensor_quant(

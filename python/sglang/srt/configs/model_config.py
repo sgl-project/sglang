@@ -446,6 +446,9 @@ class ModelConfig:
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
 
+        if self.quantization == "w4a8_machete" and self.hf_config.architectures[0] == "DeepseekV3ForCausalLMNextN":
+            self.quantization = None
+
         # Parse quantization method from the HF model config, if available.
         quant_cfg = self._parse_quant_hf_config()
 
