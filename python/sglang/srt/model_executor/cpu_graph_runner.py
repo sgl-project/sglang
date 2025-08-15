@@ -119,18 +119,16 @@ def register_fake_ops():
         def _(*args, **kwargs):
             return
 
-    def register_empty_like(op):
-        @torch.library.register_fake(f"sgl_kernel::{op}")
-        def _(input, *args, **kwargs):
-            return torch.empty_like(input)
-
     for op in [
         "rmsnorm_cpu",
         "l2norm_cpu",
         "fused_experts_cpu",
         "shared_expert_cpu",
     ]:
-        register_empty_like(op)
+
+        @torch.library.register_fake(f"sgl_kernel::{op}")
+        def _(input, *args, **kwargs):
+            return torch.empty_like(input)
 
     @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope")
     def _(
