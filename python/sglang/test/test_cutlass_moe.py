@@ -13,7 +13,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 def get_model_config(tp_size: int):
     config = AutoConfig.from_pretrained(
-        "/workdir/huggingface.co/deepseek-ai/DeepSeek-V3-0324/", trust_remote_code=True
+        "deepseek-ai/deepseek-R1", trust_remote_code=True
     )
     E = config.n_routed_experts
     topk = config.num_experts_per_tok
