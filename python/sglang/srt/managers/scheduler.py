@@ -2069,10 +2069,10 @@ class Scheduler(
 
             # Handle speculative decoding output
             if forward_output.spec_info is not None:
-                new_seq_lens = ( # val is ready after verify_done
+                new_seq_lens = (  # val is ready after verify_done
                     forward_output.spec_info.new_seq_lens
                 )
-                allocate_lens = ( # val is always ready, at batch schedule time
+                allocate_lens = (  # val is always ready, at batch schedule time
                     forward_output.spec_info.allocate_lens
                 )
                 batch.seq_lens = new_seq_lens

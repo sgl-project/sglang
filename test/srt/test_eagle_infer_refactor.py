@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
 
 class TestEagleBS1(CustomTestCase):
     num_questions = 10000
+
     @classmethod
     def setUpClass(cls):
         cls.model = "meta-llama/Llama-2-7b-chat-hf"
@@ -56,7 +57,9 @@ class TestEagleBS1(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"TestEagleBS1 -- {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.23)  # 0.3333 for 60 questions; 0.234 for 1319 questions
+        self.assertGreater(
+            metrics["accuracy"], 0.23
+        )  # 0.3333 for 60 questions; 0.234 for 1319 questions
 
 
 class TestEagleLargeBS(CustomTestCase):
@@ -111,7 +114,9 @@ class TestEagleLargeBS(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"TestEagleLargeBS -- {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.23)  # 0.3333 for 60 questions; 0.234 for 1319 questions
+        self.assertGreater(
+            metrics["accuracy"], 0.23
+        )  # 0.3333 for 60 questions; 0.234 for 1319 questions
 
 
 class TestEagleLargeBSNoSD(TestEagleLargeBS):

@@ -241,8 +241,12 @@ class SchedulerOutputProcessorMixin:
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
-        allocate_lens_cpu = result.allocate_lens.tolist() if result.allocate_lens is not None else None
-        new_seq_lens_cpu = result.new_seq_lens.tolist() if result.new_seq_lens is not None else None
+        allocate_lens_cpu = (
+            result.allocate_lens.tolist() if result.allocate_lens is not None else None
+        )
+        new_seq_lens_cpu = (
+            result.new_seq_lens.tolist() if result.new_seq_lens is not None else None
+        )
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
@@ -278,7 +282,9 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 if batch.spec_algorithm.is_eagle() and self.page_size == 1:
-                    if not self.enable_overlap or (self.enable_overlap and self.cur_batch.forward_mode.is_extend()):
+                    if not self.enable_overlap or (
+                        self.enable_overlap and self.cur_batch.forward_mode.is_extend()
+                    ):
                         # 1) when not overlap, we free the extra token in the req
                         # 2) when overlap and current batch is extend, we free the extra token in the req of the previous batch
                         self.free_spec_dec_tokens_page_size_1(
