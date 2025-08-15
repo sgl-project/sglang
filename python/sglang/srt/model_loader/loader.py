@@ -206,6 +206,7 @@ class BaseModelLoader(ABC):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        load_encode_weight: str = "full",
     ) -> nn.Module:
         """Load a model with the given configurations."""
         raise NotImplementedError
@@ -437,6 +438,7 @@ class DefaultModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        load_encode_weight: str = "full",
     ) -> nn.Module:
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
@@ -445,10 +447,26 @@ class DefaultModelLoader(BaseModelLoader):
                     model_config,
                     self.load_config,
                 )
-
-        self.load_weights_and_postprocess(
-            model, self._get_all_weights(model_config, model), target_device
-        )
+        if load_encode_weight == "disable":
+            def filtered_weights(weights):
+                for name,tensor in weights:
+                    if not name.startswith("visual."):
+                        yield name, tensor
+            self.load_weights_and_postprocess(
+                model, filtered_weights(self._get_all_weights(model_config, model)), target_device
+            )
+        elif load_encode_weight == "only":
+            def filtered_weights(weights):
+                for name,tensor in weights:
+                    if name.startswith("visual."):
+                        yield name, tensor
+            self.load_weights_and_postprocess(
+                model, filtered_weights(self._get_all_weights(model_config, model)), target_device
+            )
+        else:
+            self.load_weights_and_postprocess(
+                model, self._get_all_weights(model_config, model), target_device
+            )
 
         return model.eval()
 
@@ -482,6 +500,7 @@ class LayeredModelLoader(DefaultModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        load_encode_weight: str = "full",
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
         from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -559,6 +578,7 @@ class DummyModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        load_encode_weight: str = "full",
     ) -> nn.Module:
 
         if get_bool_env_var("SGL_CPU_QUANTIZATION"):
@@ -680,6 +700,7 @@ class ShardedStateLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        load_encode_weight: str = "full",
     ) -> nn.Module:
         from safetensors.torch import safe_open
 
@@ -1237,6 +1258,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        load_encode_weight: str = "full",
     ) -> nn.Module:
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
@@ -1329,6 +1351,7 @@ class GGUFModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        load_encode_weight: str = "full",
     ) -> nn.Module:
 
         local_model_path = self._prepare_weights(model_config.model_path)
@@ -1466,6 +1489,7 @@ class RemoteModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
+        load_encode_weight: str = "full",
     ) -> nn.Module:
         logger.info("Loading weights from remote storage ...")
         start = time.perf_counter()
