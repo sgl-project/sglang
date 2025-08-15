@@ -459,15 +459,15 @@ class DeepseekV2MoE(nn.Module):
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            kwargs = {"hidden_states": hidden_states}
-            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
-
-            final_hidden_states = self.experts(**kwargs)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
+
         current_stream.wait_stream(self.alt_stream)
         with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
             final_hidden_states_out = torch.empty_like(final_hidden_states)
+
         torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
         final_hidden_states = final_hidden_states_out
         sm.tag(final_hidden_states)
@@ -489,10 +489,9 @@ class DeepseekV2MoE(nn.Module):
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        kwargs = {"hidden_states": hidden_states}
-        kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+        topk_output = self.topk(hidden_states, router_logits)
 
-        final_hidden_states = self.experts(**kwargs)
+        final_hidden_states = self.experts(hidden_states, topk_output)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
