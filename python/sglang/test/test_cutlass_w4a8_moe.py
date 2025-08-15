@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
@@ -100,11 +100,12 @@ def test_cutlass_w4a8_moe(M, N, K, E, ep_size, topk, group_size, dtype):
     s_strides2 = c_strides2
 
     score = torch.randn((M, E), dtype=dtype, device=device)
-    topk_weights, topk_ids, _ = select_experts(
+    topk_output = select_experts(
         hidden_states=a,
         router_logits=score,
-        top_k=topk,
+        topk_config=TopKConfig(top_k=topk, renormalize=False),
     )
+    topk_weights, topk_ids, _ = topk_output
     expert_map = torch.arange(E, dtype=torch.int32, device=device)
     expert_map[local_e:] = E
 
