@@ -84,7 +84,7 @@ git checkout <YOUR-DESIRED-VERSION>
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
-pip install intel-openmp
+pip install intel-openmp py-libnuma
 pip install -e "python[all_cpu]"
 
 # Build the CPU backend kernels
@@ -133,6 +133,11 @@ Notes:
     ```bash
     export SGLANG_CPU_OMP_THREADS_BIND="0-39|43-82|86-125|128-167|171-210|214-253"
     ```
+
+    Please beware that with SGLANG_CPU_OMP_THREADS_BIND set,
+    the available memory amounts of the ranks cannot be determined in prior.
+    You may need to set proper `--mem-fraction-static` or `--max-total-tokens`
+    to eliminate the out-of-memory risk.
 
 3. A warmup step is automatically triggered when the service is started.
 The server is ready when you see the log `The server is fired up and ready to roll!`.
