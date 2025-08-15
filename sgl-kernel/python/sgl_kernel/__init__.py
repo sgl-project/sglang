@@ -95,15 +95,13 @@ from sgl_kernel.sampling import (
 
 
 def create_greenctx_stream_by_value(*args, **kwargs):
-    # Lazy import to avoid importing spatial ops unless needed
-    from .spatial import create_greenctx_stream_by_value as _impl
+    from sgl_kernel.spatial import create_greenctx_stream_by_value as _impl
 
     return _impl(*args, **kwargs)
 
 
 def get_sm_available(*args, **kwargs):
-    # Lazy import to avoid importing spatial ops unless needed
-    from .spatial import get_sm_available as _impl
+    from sgl_kernel.spatial import get_sm_available as _impl
 
     return _impl(*args, **kwargs)
 
