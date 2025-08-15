@@ -122,6 +122,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
+            # different from flashinfer zero_init_global_workspace_buffer
             global_workspace_buffer = torch.empty(
                 global_config.flashinfer_workspace_size,
                 dtype=torch.uint8,

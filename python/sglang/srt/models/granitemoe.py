@@ -76,7 +76,6 @@ class GraniteMoeMoE(nn.Module):
             params_dtype=params_dtype,
             reduce_results=True,
             quant_config=quant_config,
-            tp_size=tp_size,
             prefix=f"{prefix}.experts",
         )
 
