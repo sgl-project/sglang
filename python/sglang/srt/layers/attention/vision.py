@@ -4,13 +4,14 @@ import dataclasses
 import functools
 import math
 from functools import lru_cache, partial
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.utils import is_cuda, print_info_once
 
 _is_cuda = is_cuda()
@@ -244,6 +245,8 @@ class VisionTritonAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor],
+        bsz: int,
+        seq_len: int,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -252,6 +255,8 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
 
         # [b * s, head, head_size]
         output = torch.empty_like(q)
@@ -308,6 +313,7 @@ class VisionFlash3Attention(nn.Module):
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
+
         output = flash_attn_varlen_func(
             q,
             k,
@@ -358,22 +364,26 @@ class VisionAttention(nn.Module):
         qkv_bias: bool = True,
         qk_normalization: bool = False,
         layer_norm_eps: float = 1e-06,
+        customized_position_embedding_applier: Callable[
+            [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
         **kwargs,
     ):
         super().__init__()
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.tp_size = world_size
-        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+        self.tp_size = attn_tp_size
+        self.tp_rank = attn_tp_rank
         self.dropout = dropout
         self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
         self.num_attention_heads_per_partition = dist_utils.divide(
-            num_dummy_heads + num_heads, world_size
+            num_dummy_heads + num_heads, self.tp_size
         )
         self.num_attention_kv_heads_per_partition = dist_utils.divide(
-            num_dummy_heads + num_heads, world_size
+            num_dummy_heads + num_heads, self.tp_size
         )
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
@@ -392,15 +402,23 @@ class VisionAttention(nn.Module):
                 self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
             )
 
+        # priority: server_args > passed qkv_backend > sdpa
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
-                qkv_backend = "sdpa"
+                if is_cuda():
+                    # Double prefill throughput by setting attn backend to Triton on CUDA
+                    qkv_backend = "triton_attn"
+                else:
+                    qkv_backend = "sdpa"
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         else:
             qkv_backend = global_server_args_dict["mm_attention_backend"]
 
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
+        self.customized_position_embedding_applier = (
+            customized_position_embedding_applier
+        )
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
             head_dim=self.head_size,
             num_heads=self.num_attention_heads_per_partition,
@@ -419,6 +437,8 @@ class VisionAttention(nn.Module):
                 total_num_kv_heads=num_dummy_heads + num_heads,
                 bias=qkv_bias,
                 quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
@@ -427,6 +447,8 @@ class VisionAttention(nn.Module):
                 output_size=3 * self.dummy_dim,
                 bias=qkv_bias,
                 quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         self.proj = RowParallelLinear(
@@ -434,6 +456,8 @@ class VisionAttention(nn.Module):
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
         )
 
@@ -473,13 +497,13 @@ class VisionAttention(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
-        bsz, s, _ = x.shape
+        x_shape = x.shape
+        bsz, s, _ = x_shape
         head = self.num_attention_heads_per_partition
         kv_head = self.num_attention_kv_heads_per_partition
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
-
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             # [b, s, embed_dim] --> [b * s, head, head_size]
@@ -508,16 +532,25 @@ class VisionAttention(nn.Module):
             ]
 
         if position_embeddings is not None:
-            cos, sin = position_embeddings
             original_shape = q.shape
-            # [total_tokens, head, head_size]
-            q = q.view(-1, head, self.head_size)
-            k = k.view(-1, head, self.head_size)
 
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            if self.customized_position_embedding_applier is not None:
+                q, k = self.customized_position_embedding_applier(
+                    q, k, position_embeddings, x_shape
+                )
+                q = q.view(original_shape)
+                k = k.view(original_shape)
+            else:
+                cos, sin = position_embeddings
 
-            q = q.view(original_shape)
-            k = k.view(original_shape)
+                # [total_tokens, head, head_size]
+                q = q.view(-1, head, self.head_size)
+                k = k.view(-1, head, self.head_size)
+
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+                q = q.view(original_shape)
+                k = k.view(original_shape)
 
         if q.dim() == 4:
             # [b, s, head, head_size] --> [b * s, head, head_size]

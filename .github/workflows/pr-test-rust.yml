@@ -25,7 +25,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_rust.sh
+          bash scripts/ci/ci_install_rust.sh
 
       - name: Run fmt
         run: |
@@ -56,14 +56,19 @@ jobs:
 
   e2e-python:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: 2-gpu-runner
+    runs-on: BM.A10.4
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install rust dependencies
         run: |
-          bash scripts/ci_install_rust.sh
+          bash scripts/ci/ci_install_rust.sh
+
+      - name: Install SGLang dependencies
+        run: |
+          sudo bash scripts/ci/ci_install_dependency.sh
 
       - name: Build python binding
         run: |

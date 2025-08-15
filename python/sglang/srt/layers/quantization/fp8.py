@@ -63,7 +63,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -72,12 +72,14 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     log_info_on_rank0,
+    next_power_of_2,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 
@@ -96,9 +98,6 @@ if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
-
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip):
-    from vllm._custom_ops import scaled_fp8_quant
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -172,7 +171,6 @@ class Fp8Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
@@ -181,8 +179,6 @@ class Fp8Config(QuantizationConfig):
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return Fp8MoEMethod(self)
-        elif isinstance(layer, EPMoE):
-            return Fp8EPMoEMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -493,6 +489,16 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
 
+def get_tile_tokens_dim(num_tokens, top_k, num_experts):
+    # Guess tokens per expert assuming perfect expert distribution first.
+    num_tokens_per_expert = (num_tokens * top_k) // num_experts
+    # And pad the number to the next power of 2.
+    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
+    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
+    return tile_tokens_dim
+
+
 class Fp8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
@@ -611,7 +617,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if (
                 get_bool_env_var("SGLANG_CUTLASS_MOE")
                 and self.cutlass_fp8_supported
-                and is_sm100_supported()
+                and (is_sm100_supported() or is_sm90_supported())
             ):
                 self.ab_strides1 = torch.full(
                     (num_experts,),
@@ -977,36 +983,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-
-        if isinstance(layer, EPMoE):
-            layer.w13_weight_scale = (
-                layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
-            )
-            layer.w2_weight_scale = (
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
-            )
-            return layer.run_moe(
-                hidden_states=x,
-                topk_output=topk_output,
-            )
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
-                apply_router_weight_on_input, topk_weights, x
+                moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
 
             return torch.ops.sgl_kernel.fused_experts_cpu(
@@ -1031,8 +1017,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer,
                 x,
                 topk_output,
-                activation,
-                no_combine,
+                moe_runner_config.activation,
+                moe_runner_config.no_combine,
             )
             if ret is not None:
                 return ret
@@ -1041,12 +1027,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             get_bool_env_var("SGLANG_CUTLASS_MOE")
             and self.cutlass_fp8_supported
             and self.block_quant
-            and is_sm100_supported()
+            and (is_sm100_supported() or is_sm90_supported())
         ):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = topk_output
-            return cutlass_fused_experts_fp8(
+            output = cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
                 layer.w2_weight.transpose(1, 2),
@@ -1069,15 +1055,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
             )
+            # TODO: Fuse into select_experts
+            if moe_runner_config.routed_scaling_factor is not None:
+                output *= moe_runner_config.routed_scaling_factor
+            return output
         # Expert fusion with FP8 quantization
         return fused_experts(
             x,
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            inplace=inplace and not no_combine,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+            moe_runner_config=moe_runner_config,
             use_fp8_w8a8=True,
             w1_scale=(
                 layer.w13_weight_scale_inv
@@ -1090,8 +1078,55 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
-            no_combine=no_combine,
+        )
+
+    def apply_with_router_logits(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_output: TopKOutput,
+        moe_runner_config: MoeRunnerConfig,
+    ) -> torch.Tensor:
+
+        activation = moe_runner_config.activation
+        routed_scaling_factor = moe_runner_config.routed_scaling_factor
+
+        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
+        assert (
+            activation == "silu"
+        ), "Only silu is supported for flashinfer blockscale fp8 moe"
+        a_q, a_sf = per_token_group_quant_fp8(x, self.quant_config.weight_block_size[1])
+        # NOTE: scales of hidden states have to be transposed!
+        a_sf_t = a_sf.t().contiguous()
+
+        return trtllm_fp8_block_scale_moe(
+            routing_logits=router_logits.to(torch.float32),
+            routing_bias=layer.correction_bias.to(x.dtype),
+            hidden_states=a_q,
+            hidden_states_scale=a_sf_t,
+            gemm1_weights=layer.w13_weight,
+            gemm1_weights_scale=layer.w13_weight_scale_inv,
+            gemm2_weights=layer.w2_weight,
+            gemm2_weights_scale=layer.w2_weight_scale_inv,
+            num_experts=layer.num_experts,
+            top_k=topk_config.top_k,
+            n_group=topk_config.num_expert_group,
+            topk_group=topk_config.topk_group,
+            intermediate_size=layer.w2_weight.shape[2],
+            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            local_num_experts=layer.num_local_experts,
             routed_scaling_factor=routed_scaling_factor,
+            tile_tokens_dim=get_tile_tokens_dim(
+                x.shape[0], layer.top_k, layer.num_experts
+            ),
+            routing_method_type=2,  # DeepSeek-styled routing method
+            use_shuffled_weight=False,
         )
 
     def maybe_apply_hip_fused_experts(
