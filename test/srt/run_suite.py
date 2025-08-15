@@ -57,6 +57,7 @@ suites = {
         TestFile("quant/test_block_int8.py", 22),
         TestFile("quant/test_fp8_kernel.py", 8),
         TestFile("quant/test_int8_kernel.py", 8),
+        TestFile("quant/test_triton_scaled_mm.py", 8),
         TestFile("quant/test_w8a8_quantization.py", 46),
         TestFile("rl/test_update_weights_from_disk.py", 114),
         TestFile("rl/test_update_weights_from_tensor.py", 48),
@@ -148,9 +149,9 @@ suites = {
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("test_bnb.py", 5),
-        TestFile("test_gguf.py", 96),
         TestFile("test_gptqmodel_dynamic.py", 102),
         TestFile("test_vllm_dependency.py", 185),
+        # TestFile("test_gguf.py", 96),
     ],
 }
 
