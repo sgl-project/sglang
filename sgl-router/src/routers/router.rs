@@ -1,3 +1,4 @@
+use super::header_utils;
 use crate::config::types::{
     CircuitBreakerConfig as ConfigCircuitBreakerConfig,
     HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
@@ -24,17 +25,6 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
-pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
-    req.headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.to_string(), v.to_string()))
-        })
-        .collect()
-}
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -276,7 +266,7 @@ impl Router {
 
     fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
         let sync_client = reqwest::blocking::Client::new();
-        let mut req_builder = sync_client.get(&format!("{}/get_server_info", worker_url));
+        let mut req_builder = sync_client.get(format!("{}/get_server_info", worker_url));
         if let Some(key) = api_key {
             req_builder = req_builder.bearer_auth(key);
         }
@@ -400,7 +390,7 @@ impl Router {
 
     // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
-        let headers = copy_request_headers(&req);
+        let headers = super::header_utils::copy_request_headers(&req);
 
         match self.select_first_worker() {
             Ok(worker_url) => {
@@ -416,8 +406,18 @@ impl Router {
                     Ok(res) => {
                         let status = StatusCode::from_u16(res.status().as_u16())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+                        // Preserve headers from backend
+                        let response_headers =
+                            header_utils::preserve_response_headers(res.headers());
+
                         match res.bytes().await {
-                            Ok(body) => (status, body).into_response(),
+                            Ok(body) => {
+                                let mut response = Response::new(axum::body::Body::from(body));
+                                *response.status_mut() = status;
+                                *response.headers_mut() = response_headers;
+                                response
+                            }
                             Err(e) => (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 format!("Failed to read response: {}", e),
@@ -628,7 +628,7 @@ impl Router {
                     if let Ok(workers_guard) = self.workers.read() {
                         if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
                             worker.decrement_load();
-                            RouterMetrics::set_running_requests(&worker_url, worker.load());
+                            RouterMetrics::set_running_requests(worker_url, worker.load());
                         }
                     }
                 }
@@ -645,9 +645,16 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
-            // For non-streaming requests, get response first
+            // For non-streaming requests, preserve headers
+            let response_headers = super::header_utils::preserve_response_headers(res.headers());
+
             let response = match res.bytes().await {
-                Ok(body) => (status, body).into_response(),
+                Ok(body) => {
+                    let mut response = Response::new(axum::body::Body::from(body));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                }
                 Err(e) => {
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
@@ -659,7 +666,7 @@ impl Router {
                 if let Ok(workers_guard) = self.workers.read() {
                     if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
                         worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
+                        RouterMetrics::set_running_requests(worker_url, worker.load());
                     }
                 }
             }
@@ -669,6 +676,11 @@ impl Router {
             // For streaming with load tracking, we need to manually decrement when done
             let workers = Arc::clone(&self.workers);
             let worker_url = worker_url.to_string();
+
+            // Preserve headers for streaming response
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            // Ensure we set the correct content-type for SSE
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -688,7 +700,7 @@ impl Router {
                             {
                                 if let Ok(workers_guard) = workers.read() {
                                     if let Some(worker) =
-                                        workers_guard.iter().find(|w| w.url() == &worker_url)
+                                        workers_guard.iter().find(|w| w.url() == worker_url)
                                     {
                                         worker.decrement_load();
                                         RouterMetrics::set_running_requests(
@@ -711,8 +723,7 @@ impl Router {
                 }
                 if !decremented {
                     if let Ok(workers_guard) = workers.read() {
-                        if let Some(worker) = workers_guard.iter().find(|w| w.url() == &worker_url)
-                        {
+                        if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
                             worker.decrement_load();
                             RouterMetrics::set_running_requests(&worker_url, worker.load());
                         }
@@ -725,12 +736,15 @@ impl Router {
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            *response.headers_mut() = response_headers;
             response
         } else {
             // For requests without load tracking, just stream
+            // Preserve headers for streaming response
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            // Ensure we set the correct content-type for SSE
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -757,9 +771,7 @@ impl Router {
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            *response.headers_mut() = response_headers;
             response
         }
     }
@@ -783,7 +795,7 @@ impl Router {
                 ));
             }
 
-            match client.get(&format!("{}/health", worker_url)).send().await {
+            match client.get(format!("{}/health", worker_url)).send().await {
                 Ok(res) => {
                     if res.status().is_success() {
                         let mut workers_guard = self.workers.write().unwrap();
@@ -953,7 +965,7 @@ impl Router {
 
         match self
             .client
-            .get(&format!("{}/get_load", worker_url))
+            .get(format!("{}/get_load", worker_url))
             .send()
             .await
         {
@@ -1036,7 +1048,7 @@ impl Router {
             worker_url
         };
 
-        match client.get(&format!("{}/get_load", worker_url)).send().await {
+        match client.get(format!("{}/get_load", worker_url)).send().await {
             Ok(res) if res.status().is_success() => match res.bytes().await {
                 Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(data) => data
