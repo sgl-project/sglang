@@ -220,7 +220,7 @@ class HiCacheController:
 
     @staticmethod
     def get_hash_str_with_prefix(get_hash_str, prefix):
-        def prefix_hash(input_str):
+        def prefix_hash(input_str, prior_hash: str = None):
             hash_result = get_hash_str(input_str)
             return prefix + hash_result
         return prefix_hash
