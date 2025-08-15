@@ -1697,7 +1697,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
-
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             if output.shape[0] != lse.shape[0] and output.shape[0] == lse.shape[1]:
                 lse = torch.transpose(lse, 0, 1).contiguous()
@@ -1774,6 +1773,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             # Only initialize the info once
             if forward_batch.num_prefix_chunks is None:
                 forward_batch.prepare_chunked_prefix_cache_info(q.device)
+            if hasattr(forward_batch.attn_backend, "init_chunked_kv"):
+                forward_batch.attn_backend.init_chunked_kv(forward_batch)
 
             forward_batch.set_attn_attend_prefix_cache(True)
             attn_output = self._chunked_prefix_attn_mha(

@@ -181,33 +181,23 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify, False)
         else:
             prefix_lens = forward_batch.extend_prefix_lens
-            extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-            use_ragged = (
-                not global_server_args_dict["flashinfer_mla_disable_ragged"]
-                and extend_no_prefix
-            )
-            if not use_ragged:
-                if forward_batch.num_prefix_chunks is None:
-                    forward_batch.prepare_chunked_prefix_cache_info(
-                        forward_batch.seq_lens.device
-                    )
-                self.indices_updater_prefill.update_chunked_kv(
-                    self.workspace_buffer,
-                    forward_batch,
-                    prefill_chunk_wrapper=self.prefill_chunk_wrapper,
-                    fmha_backend=self.fmha_backend,
-                )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
                 prefix_lens,
                 prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=use_ragged,
+                use_ragged=True,
             )
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrapper_paged, use_ragged
-            )
+            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged, True)
+
+    def init_chunked_kv(self, forward_batch: ForwardBatch):
+        self.indices_updater_prefill.update_chunked_kv(
+            self.workspace_buffer,
+            forward_batch,
+            prefill_chunk_wrapper=self.prefill_chunk_wrapper,
+            fmha_backend=self.fmha_backend,
+        )
 
     def init_cuda_graph_state(
         self,
@@ -413,26 +403,30 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
 
         qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-        if self.forward_metadata.use_ragged:
+        if not forward_batch.attn_attend_prefix_cache:
             # ragged prefill
             if q_rope is not None:
                 q = torch.cat([q, q_rope], dim=-1)
             if k_rope is not None:
                 k = torch.cat([k, k_rope], dim=-1)
-            o, lse = self.prefill_wrapper_ragged.run(
+            o, lse = self.prefill_wrapper_ragged.forward_return_lse(
                 qall,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim),
                 v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
-                return_lse=True,
+                causal=True,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
             )
             return o, lse
         else:
             chunk_idx = forward_batch.prefix_chunk_idx
-            o, lse = self.prefill_chunk_wrapper[chunk_idx].run(
+            o, lse = self.prefill_chunk_wrapper[chunk_idx].forward_return_lse(
                 qall,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim),
                 v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
-                return_lse=True,
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
             )
             return o, lse
 
@@ -666,6 +660,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         fmha_backend: str,
     ):
         num_chunks = forward_batch.num_prefix_chunks
+
         # Allocate more prefill chunk wrappers if needed
         if len(prefill_chunk_wrapper) < num_chunks:
             for _ in range(len(prefill_chunk_wrapper), num_chunks):
@@ -688,7 +683,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
                 head_dim_vo=self.v_head_dim,
                 q_data_type=self.q_data_type,
-                sm_scale=self.scaling,
                 causal=False,
             )
 
