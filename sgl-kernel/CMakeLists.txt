@@ -274,7 +274,6 @@ set(SOURCES
     "csrc/kvcacheio/transfer.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/packbit.cu"
-    "csrc/spatial/greenctx_stream.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/memory/store.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
@@ -416,6 +415,18 @@ if (SGL_KERNEL_ENABLE_FA3)
     endif()
     target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()
+
+# Build spatial_ops as a separate, optional extension for green contexts
+set(SPATIAL_SOURCES
+    "csrc/spatial/greenctx_stream.cu"
+    "csrc/spatial_extension.cc"
+)
+
+Python_add_library(spatial_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SPATIAL_SOURCES})
+target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
+
 
 # ============================ DeepGEMM (JIT) ============================= #
 # Create a separate library for DeepGEMM's Python API.
