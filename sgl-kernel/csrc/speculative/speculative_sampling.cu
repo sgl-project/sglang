@@ -28,6 +28,8 @@ using namespace flashinfer;
 // retrive_next_sibling: [bs, num_draft_tokens]
 // uniform_samples: [bs, num_draft_tokens]
 // target_probs: [bs, num_draft_tokens, vocab_size]
+// threshold_singles: [bs]
+// threshold_accs: [bs]
 void tree_speculative_sampling_target_only(
     at::Tensor predicts,
     at::Tensor accept_index,
@@ -40,8 +42,8 @@ void tree_speculative_sampling_target_only(
     at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
     at::Tensor draft_probs,
-    double threshold_single,
-    double threshold_acc,
+    at::Tensor threshold_singles,
+    at::Tensor threshold_accs,
     bool deterministic = true,
     int64_t cuda_stream = 0) {
   CHECK_INPUT(candidates);
@@ -51,6 +53,8 @@ void tree_speculative_sampling_target_only(
   CHECK_INPUT(uniform_samples);
   CHECK_INPUT(uniform_samples_for_final_sampling);
   CHECK_INPUT(target_probs);
+  CHECK_INPUT(threshold_singles);
+  CHECK_INPUT(threshold_accs);
   auto device = target_probs.device();
   CHECK_EQ(candidates.device(), device);
   CHECK_EQ(retrive_index.device(), device);
@@ -59,6 +63,8 @@ void tree_speculative_sampling_target_only(
   CHECK_EQ(uniform_samples.device(), device);
   CHECK_EQ(uniform_samples_for_final_sampling.device(), device);
   CHECK_EQ(target_probs.device(), device);
+  CHECK_EQ(threshold_singles.device(), device);
+  CHECK_EQ(threshold_accs.device(), device);
   CHECK_DIM(1, predicts);
   CHECK_DIM(2, accept_index);
   CHECK_DIM(1, accept_token_num);
@@ -69,6 +75,8 @@ void tree_speculative_sampling_target_only(
   CHECK_DIM(2, uniform_samples);
   CHECK_DIM(3, target_probs);
   CHECK_DIM(3, draft_probs);
+  CHECK_DIM(1, threshold_singles);
+  CHECK_DIM(1, threshold_accs);
   unsigned int batch_size = uniform_samples.size(0);
   unsigned int num_spec_step = accept_index.size(1);
   unsigned int num_draft_tokens = candidates.size(1);
@@ -86,6 +94,8 @@ void tree_speculative_sampling_target_only(
   CHECK_EQ(vocab_size, target_probs.size(2));
   CHECK_EQ(batch_size, accept_index.size(0));
   CHECK_EQ(batch_size, accept_token_num.size(0));
+  CHECK_EQ(batch_size, threshold_singles.size(0));
+  CHECK_EQ(batch_size, threshold_accs.size(0));
   if (predicts.scalar_type() != at::kInt) {
     throw std::runtime_error("Expected 'predicts' to be of type int (torch.int32).");
   }
@@ -119,10 +129,18 @@ void tree_speculative_sampling_target_only(
   if (draft_probs.scalar_type() != at::kFloat) {
     throw std::runtime_error("Expected 'target_probs' to be of type float (torch.float32).");
   }
-  CHECK_GE(threshold_single, 0);
-  CHECK_GE(1, threshold_single);
-  CHECK_GE(threshold_acc, 0);
-  CHECK_GE(1, threshold_acc);
+  if (threshold_singles.scalar_type() != at::kFloat) {
+    throw std::runtime_error("Expected 'threshold_singles' to be of type float (torch.float32).");
+  }
+  if (threshold_accs.scalar_type() != at::kFloat) {
+    throw std::runtime_error("Expected 'threshold_accs' to be of type float (torch.float32).");
+  }
+  for (int i = 0; i < batch_size; ++i) {
+    CHECK_GE(threshold_singles[i].item<float>(), 0);
+    CHECK_GE(1, threshold_singles[i].item<float>());
+    CHECK_GE(threshold_accs[i].item<float>(), 0);
+    CHECK_GE(1, threshold_accs[i].item<float>());
+  }
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TreeSpeculativeSamplingTargetOnly<float, int32_t, int64_t>(
@@ -141,8 +159,8 @@ void tree_speculative_sampling_target_only(
       num_spec_step,
       num_draft_tokens,
       vocab_size,
-      static_cast<float>(threshold_single),
-      static_cast<float>(threshold_acc),
+      static_cast<float*>(threshold_singles.data_ptr()),
+      static_cast<float*>(threshold_accs.data_ptr()),
       deterministic,
       stream);
 
