@@ -23,7 +23,7 @@ from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -344,14 +344,18 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         # Block quant doesn't need to process weights after loading
         return
 
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         # Expert fusion with INT8 quantization
         return fused_experts(
@@ -359,7 +363,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+            moe_runner_config=self.moe_runner_config,
             use_int8_w8a8=True,
             w1_scale=(layer.w13_weight_scale_inv),
             w2_scale=(layer.w2_weight_scale_inv),

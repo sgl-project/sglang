@@ -45,7 +45,7 @@ from sglang.srt.layers.quantization.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 from sglang.srt.utils import is_cuda
 
@@ -1052,17 +1052,22 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         )
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
 
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
         # Delay the import to avoid circular dependency
 
         assert (
-            moe_runner_config.activation == "silu"
+            self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
         # The input must currently be float16

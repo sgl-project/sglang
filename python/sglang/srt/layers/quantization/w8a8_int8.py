@@ -50,7 +50,7 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -483,21 +483,25 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale.data, requires_grad=False
         )
 
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+    
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
-                moe_runner_config.apply_router_weight_on_input, topk_weights, x
+                self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
@@ -521,7 +525,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+            moe_runner_config=self.moe_runner_config,
             use_int8_w8a8=True,
             per_channel_quant=True,
             w1_scale=(layer.w13_weight_scale),
@@ -969,13 +973,16 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
         )
 
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer,
-        x,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)

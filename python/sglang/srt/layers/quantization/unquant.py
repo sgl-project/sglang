@@ -25,7 +25,7 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 
@@ -216,28 +216,30 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         return
 
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
 
         return self.forward(
-            x=x,
             layer=layer,
-            topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+            dispatch_output=dispatch_output,
         )
 
     def forward_cuda(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        moe_runner_config = self.moe_runner_config
 
         if self.use_triton_kernels:
             if self.with_bias:
@@ -308,10 +310,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def forward_cpu(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        moe_runner_config = self.moe_runner_config
+
         assert (
             moe_runner_config.activation == "silu"
         ), f"activation = {moe_runner_config.activation} is not supported."
@@ -355,17 +361,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def forward_npu(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+
         from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         return moe_forward_native(
             layer,
             x,
             topk_output,
-            moe_runner_config,
+            self.moe_runner_config,
         )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:

@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_runner_backend,
@@ -25,6 +26,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -151,16 +153,6 @@ class FusedMoE(torch.nn.Module):
         self.expert_map_cpu = None
         self.expert_map_gpu = None
 
-        self.moe_runner_config = MoeRunnerConfig(
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            inplace=inplace,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
-            gemm1_alpha=gemm1_alpha,
-            gemm1_clamp_limit=gemm1_clamp_limit,
-        )
-
         enable_flashinfer_cutlass_moe = get_moe_runner_backend().is_flashinfer_cutlass()
 
         if enable_flashinfer_cutlass_moe and quant_config is None:
@@ -197,11 +189,11 @@ class FusedMoE(torch.nn.Module):
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
+            self.quant_method: FusedMoEMethodBase = UnquantizedFusedMoEMethod(
                 self.use_triton_kernels
             )
         else:
-            self.quant_method = quant_config.get_quant_method(self, prefix)
+            self.quant_method: FusedMoEMethodBase = quant_config.get_quant_method(self, prefix)
         assert self.quant_method is not None
 
         self.quant_config = quant_config
@@ -213,6 +205,26 @@ class FusedMoE(torch.nn.Module):
             and self.use_flashinfer_mxfp4_moe
         ):
             hidden_size = round_up(hidden_size, 256)
+        self.hidden_size = hidden_size
+
+        self.moe_runner_config = MoeRunnerConfig(
+            num_experts=num_experts,
+            num_local_experts=self.num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
+            top_k=top_k,
+            num_fused_shared_experts=num_fused_shared_experts,
+            params_dtype=params_dtype,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            inplace=inplace,
+            no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+        )
+
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
@@ -228,6 +240,8 @@ class FusedMoE(torch.nn.Module):
             ),
             with_bias=with_bias,
         )
+        
+        self.quant_method.create_moe_runner(self.moe_runner_config)
 
     def _load_per_tensor_weight_scale(
         self,
@@ -806,15 +820,15 @@ class FusedMoE(torch.nn.Module):
                 )
             elif TopKOutputChecker.format_is_triton_kernel(topk_output):
                 raise NotImplementedError()
+            
+        dispatch_output = StandardDispatchOutput(hidden_states=hidden_states, topk_output=topk_output)
 
         # Matrix multiply.
         with use_symmetric_memory(get_tp_group()) as sm:
 
             final_hidden_states = self.quant_method.apply(
                 layer=self,
-                x=hidden_states,
-                topk_output=topk_output,
-                moe_runner_config=self.moe_runner_config,
+                dispatch_output=dispatch_output,
             )
             sm.tag(final_hidden_states)
 
@@ -945,7 +959,6 @@ class FlashInferFusedMoE(FusedMoE):
             layer=self,
             x=hidden_states,
             topk_output=topk_output,
-            moe_runner_config=self.moe_runner_config,
         )
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):

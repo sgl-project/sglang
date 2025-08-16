@@ -77,9 +77,12 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutput, StandardDispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 
@@ -516,6 +519,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
         self.cutlass_fp8_supported = cutlass_fp8_supported()
+
+        self.triton_moe_runner = MoeRunner(MoeRunnerBackend.TRITON, MoeRunnerConfig())
 
     def create_weights(
         self,
@@ -977,15 +982,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
+        
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+        self.triton_moe_runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: DispatchOutput,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+
+        assert DispatchOutputChecker.format_is_standard(dispatch_output), NotImplementedError("Only standard dispatch output is supported for fp8 quantization")
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        moe_runner_config = self.moe_runner_config
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
@@ -1059,6 +1071,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if moe_runner_config.routed_scaling_factor is not None:
                 output *= moe_runner_config.routed_scaling_factor
             return output
+        
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+        from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
+
+        return self.triton_moe_runner(StandardDispatchOutput(hidden_states=x, topk_output=topk_output), MoeQuantInfo(w1_scale=layer.w13_weight_scale_inv, w2_scale=layer.w2_weight_scale_inv, a1_scale=layer.w13_input_scale, a2_scale=layer.w2_input_scale))
+        """
         # Expert fusion with FP8 quantization
         return fused_experts(
             x,
@@ -1079,17 +1097,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
         )
+        """
 
     def apply_with_router_logits(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
 
-        activation = moe_runner_config.activation
-        routed_scaling_factor = moe_runner_config.routed_scaling_factor
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        activation = self.moe_runner_config.activation
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
 

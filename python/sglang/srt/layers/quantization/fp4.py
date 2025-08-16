@@ -42,7 +42,7 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 logger = logging.getLogger(__name__)
 
@@ -347,14 +347,20 @@ class W4A4MXFp4MoEDynamicMethod(MxFp4MoEMethod):
 
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w2_weight_scale = torch.nn.Parameter(w2_mx_scales, requires_grad=False)
+    
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
 
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
         topk_weights, topk_ids, _ = topk_output
 
         return fused_moe(
@@ -368,7 +374,7 @@ class W4A4MXFp4MoEDynamicMethod(MxFp4MoEMethod):
             w2_scale=layer.w2_weight_scale,
             activation=(
                 ActivationType.Silu
-                if moe_runner_config.activation == "silu"
+                if self.moe_runner_config.activation == "silu"
                 else ActivationType.Gelu
             ),
             doweight_stage1=False,
@@ -478,13 +484,18 @@ class W4A4MXFp4MoEStaticMethod(MxFp4MoEMethod):
         w2_weight_scale = e8m0_shuffle(w2_weight_scale)
         layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
         topk_weights, topk_ids, _ = topk_output
 
         return fused_moe(
@@ -498,7 +509,7 @@ class W4A4MXFp4MoEStaticMethod(MxFp4MoEMethod):
             w2_scale=layer.w2_weight_scale,
             activation=(
                 ActivationType.Silu
-                if moe_runner_config.activation == "silu"
+                if self.moe_runner_config.activation == "silu"
                 else ActivationType.Gelu
             ),
             doweight_stage1=False,

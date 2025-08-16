@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import torch
@@ -10,8 +11,7 @@ from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
-
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
@@ -96,12 +96,14 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
     @abstractmethod
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        raise NotImplementedError
+
+    @abstractmethod
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: DispatchOutput,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -197,6 +199,13 @@ class QuantizationConfig(ABC):
         For now, this is only used by AWQ.
         """
         raise NotImplementedError()
+
+
+@dataclass
+class MoeQuantInfo:
+    """Moe quantication data."""
+
+    pass
 
 
 def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:

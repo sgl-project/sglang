@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 if is_cuda():
     from sgl_kernel import scaled_fp4_quant
@@ -418,21 +419,25 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale.max(), requires_grad=False
             )
 
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         return fused_experts(
             x,
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+            moe_runner_config=self.moe_runner_config,
             use_fp8_w8a8=True,
             per_channel_quant=False,  # ModelOpt uses per-tensor quantization
             w1_scale=layer.w13_weight_scale,
@@ -1154,16 +1159,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
         return self.enable_flashinfer_cutlass_moe
 
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: FusedMoE,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
         assert (
-            moe_runner_config.activation == "silu"
+            self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
+        
+        moe_runner_config = self.moe_runner_config
 
         # Check if this is a FlashInferFP4MoE layer that should handle its own forward
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):

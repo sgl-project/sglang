@@ -20,7 +20,7 @@ from sglang.srt.utils import set_weight_attrs
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.ep_moe.layer import EPMoE
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -277,14 +277,18 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             [w2_input_scale_max], dtype=dtype, device=device
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
+    
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
 
     def apply(
         self,
         layer: EPMoE,
-        x: torch.Tensor,
-        topk_output: StandardTopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         # TODO(ch-wan): move it out of this class
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
@@ -323,6 +327,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
         )
-        if moe_runner_config.routed_scaling_factor is not None:
-            output *= moe_runner_config.routed_scaling_factor
+        if self.moe_runner_config.routed_scaling_factor is not None:
+            output *= self.moe_runner_config.routed_scaling_factor
         return output

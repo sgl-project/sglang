@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 
 def get_weight_perm(num_bits: int):
@@ -349,18 +349,23 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 layer.register_parameter(key, param)
                 set_weight_attrs(param, extra_weight_attrs)
 
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
+
         # avoid circular import
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         assert (
-            moe_runner_config.activation == "silu"
+            self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
         weight_bits = self.quant_config.weight_bits
@@ -371,7 +376,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             layer.w13_qweight,
             layer.w2_qweight,
             topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+            moe_runner_config=self.moe_runner_config,
             use_int4_w4a16=weight_bits == 4,
             use_int8_w8a16=weight_bits == 8,
             w1_scale=layer.w13_scales,

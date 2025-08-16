@@ -27,7 +27,7 @@ from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
@@ -266,21 +266,26 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale.data, requires_grad=False
         )
 
+    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+        self.moe_runner_config = moe_runner_config
+        
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: StandardTopKOutput,
-        moe_runner_config: MoeRunnerConfig,
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
 
         return fused_experts(
             x,
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+            moe_runner_config=self.moe_runner_config,
             use_fp8_w8a8=True,
             per_channel_quant=True,
             w1_scale=(layer.w13_weight_scale),
