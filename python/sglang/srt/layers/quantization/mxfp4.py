@@ -225,7 +225,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
-        self.flashinfer_mxfp4_moe_precision = global_server_args_dict["flashinfer_mxfp4_moe_precision"]
+        self.flashinfer_mxfp4_moe_precision = global_server_args_dict[
+            "flashinfer_mxfp4_moe_precision"
+        ]
 
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
