@@ -586,15 +586,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 assert x.dtype == torch.bfloat16
                 x_quant = x
                 x_scale = None
-            if self.flashinfer_mxfp4_moe_precision == "default":
-                x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
+            elif self.flashinfer_mxfp4_moe_precision == "default":
+                x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
             else:
                 raise NotImplementedError
-
-            # TODO old
-            x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)  # to mxfp8
-            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
 
             assert x_quant.shape[-1] == self.hidden_size
             assert TopKOutputChecker.format_is_bypassed(topk_output)
