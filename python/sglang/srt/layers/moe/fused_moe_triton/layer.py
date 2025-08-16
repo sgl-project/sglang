@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
@@ -621,9 +622,7 @@ class FusedMoE(torch.nn.Module):
 
         if "ModelOpt" in self.quant_method.__class__.__name__:
             # Determine per-tensor weight scale patterns based on variant
-            is_fp4_variant = (
-                "ModelOptNvFp4FusedMoEMethod" in self.quant_method.__class__.__name__
-            )
+            is_fp4_variant = isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
 
             # FP4 uses "weight_scale_2" for per-tensor, FP8 uses "weight_scale" for per-tensor
             per_tensor_conditions = (

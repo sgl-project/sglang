@@ -230,6 +230,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
+    disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
@@ -1713,6 +1714,11 @@ class ServerArgs:
             "--enable-symm-mem",
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-cutlass-moe-fp4-allgather",
+            action="store_true",
+            help="Disables quantize before all-gather for flashinfer cutlass moe.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",
