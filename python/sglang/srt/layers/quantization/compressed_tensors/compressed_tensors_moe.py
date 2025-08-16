@@ -329,7 +329,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             params_dtype == torch.float16
         ), "float16 is required for MoE compressed models. Set dtype=torch.float16"  # noqa: E501
 
-        intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
+        for key in ("intermediate_size_full", "intermediate_size"):
+            if key in extra_weight_attrs:
+                intermediate_size_full = extra_weight_attrs.pop(key)
+                break
+        else:
+            raise KeyError("extra_weight_attrs must contain 'intermediate_size_full' or 'intermediate_size'")
 
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
