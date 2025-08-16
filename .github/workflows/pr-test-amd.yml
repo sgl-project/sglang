@@ -302,12 +302,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
+        run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run CustomAllReduce test
         timeout-minutes: 20
