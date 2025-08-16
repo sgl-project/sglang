@@ -238,6 +238,23 @@ class TpModelWorker:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
+
+            # Handle CFG biasing if enabled
+            for (
+                cond_idx,
+                uncond_idx,
+            ) in model_worker_batch.cfg_cond_to_uncond_idx.items():
+                logits_cond = logits_output.next_token_logits[cond_idx]
+                logits_uncond = logits_output.next_token_logits[uncond_idx]
+
+                cfg_weight = model_worker_batch.cfg_weights[cond_idx]
+                assert cfg_weight == model_worker_batch.cfg_weights[uncond_idx]
+                cfg_logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
+
+                # Replace logits for both requests in a CFG pair
+                for replace_idx in [cond_idx, uncond_idx]:
+                    logits_output.next_token_logits[replace_idx] = cfg_logits
+
             if launch_done is not None:
                 launch_done.set()
 
@@ -247,6 +264,13 @@ class TpModelWorker:
                 next_token_ids = self.model_runner.sample(
                     logits_output, model_worker_batch
                 )
+
+                # CFG pairs should always produce the same token
+                for (
+                    cond_idx,
+                    uncond_idx,
+                ) in model_worker_batch.cfg_cond_to_uncond_idx.items():
+                    next_token_ids[uncond_idx] = next_token_ids[cond_idx]
 
             return logits_output, next_token_ids, can_run_cuda_graph
         else:

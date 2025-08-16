@@ -567,3 +567,48 @@ class PrefillAdder:
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
+
+    # Use rough heuristics to get safe lowerbound on the capacity of our adder to
+    # handle these two requests
+    def dry_run_cfg(self, req: Req, cfg_req: Req):
+        snapshot = {
+            "rem_total_tokens": self.rem_total_tokens,
+            "rem_input_tokens": self.rem_input_tokens,
+            "cur_rem_tokens": self.cur_rem_tokens,
+            "rem_chunk_tokens": self.rem_chunk_tokens,
+        }
+
+        for cur_req in [req, cfg_req]:
+            # Use upperbound heuristic if `ignore_eos` is on
+            max_new_tokens = (
+                cur_req.sampling_params.max_new_tokens
+                if cur_req.sampling_params.ignore_eos
+                else min(cur_req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            )
+
+            total_tokens = cur_req.extend_input_len + max_new_tokens
+            input_tokens = cur_req.extend_input_len
+
+            # Update snapshot
+            snapshot["rem_total_tokens"] -= total_tokens
+            snapshot["rem_input_tokens"] -= input_tokens
+            snapshot["cur_rem_tokens"] -= input_tokens
+            if snapshot["rem_chunk_tokens"] is not None:
+                snapshot["rem_chunk_tokens"] -= input_tokens
+
+                if snapshot["rem_chunk_tokens"] < 0 and len(self.can_run_list) == 0:
+                    raise RuntimeError("CFG requests cannot be chunk prefilled.")
+
+            # Check budgets
+            if (
+                snapshot["rem_total_tokens"] < 0
+                or snapshot["rem_input_tokens"] < 0
+                or snapshot["cur_rem_tokens"] < 0
+                or (
+                    snapshot["rem_chunk_tokens"] is not None
+                    and snapshot["rem_chunk_tokens"] < 0
+                )
+            ):
+                return False
+
+        return True

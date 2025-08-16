@@ -20,9 +20,10 @@ import signal
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from concurrent import futures
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
@@ -542,6 +543,9 @@ class Scheduler(
 
         self.recv_dp_balance_id_this_term = []
 
+        # CFG bookkeeping
+        self.cfg_rid_to_uncond: Dict[str, Req] = {}
+
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
@@ -1054,6 +1058,15 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        def _dispatch_request(recv_req: TokenizedGenerateReqInput):
+            output = self._request_dispatcher(recv_req)
+            if output is not None:
+                if isinstance(output, RpcReqOutput):
+                    if self.recv_from_rpc is not None:
+                        self.recv_from_rpc.send_pyobj(output)
+                else:
+                    self.send_to_tokenizer.send_pyobj(output)
+
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
@@ -1077,13 +1090,20 @@ class Scheduler(
                     )
                     self.send_to_tokenizer.send_pyobj(abort_req)
                     continue
-            output = self._request_dispatcher(recv_req)
-            if output is not None:
-                if isinstance(output, RpcReqOutput):
-                    if self.recv_from_rpc is not None:
-                        self.recv_from_rpc.send_pyobj(output)
-                else:
-                    self.send_to_tokenizer.send_pyobj(output)
+            _dispatch_request(recv_req)
+
+            # Create an unconditioned copy if `recv_req` is a CFG prompt
+            if not recv_req.cfg_params:
+                continue
+
+            cfg_req = replace(
+                recv_req,
+                rid=uuid.uuid4().hex,
+                input_ids=recv_req.cfg_params["cfg_input_ids"],
+                cfg_parent_rid=recv_req.rid,
+            )
+
+            _dispatch_request(cfg_req)
 
     def handle_generate_request(
         self,
@@ -1130,6 +1150,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
+                cfg_params=recv_req.cfg_params,
             )
             req.tokenizer = self.tokenizer
 
@@ -1243,6 +1264,11 @@ class Scheduler(
                 if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
                     error_msg = f"Invalid grammar request with cache hit: {key=}"
                     req.set_finish_with_abort(error_msg)
+
+        # If `recv_req` is a CFG prompt, don't add to queue and update bookkeeping
+        if recv_req.cfg_parent_rid is not None:
+            self.cfg_rid_to_uncond[recv_req.cfg_parent_rid] = req
+            return
 
         if add_to_grammar_queue:
             req.queue_time_start = time.perf_counter()
@@ -1567,6 +1593,22 @@ class Scheduler(
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
+        def _try_add_req(req: Req, is_cfg_req: bool) -> bool:
+            res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
+
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    if self.enable_hierarchical_cache:
+                        # Set batch_is_full after making sure there are requests that can be served
+                        self.running_batch.batch_is_full = len(
+                            adder.can_run_list
+                        ) > 0 or (not self.running_batch.is_empty())
+                    else:
+                        self.running_batch.batch_is_full = True
+                return False
+
+            return True
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
 
@@ -1596,17 +1638,30 @@ class Scheduler(
                     continue
 
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
-            if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
-                        self.running_batch.batch_is_full = len(
-                            adder.can_run_list
-                        ) > 0 or (not self.running_batch.is_empty())
-                    else:
-                        self.running_batch.batch_is_full = True
+            # If `req` is a CFG prompt, make sure that `adder` can take both
+            if req.rid in self.cfg_rid_to_uncond:
+                if (
+                    running_bs + len(adder.can_run_list) + 1
+                    >= self.max_running_requests
+                ):
+                    continue
+
+                cfg_req = self.cfg_rid_to_uncond[req.rid]
+                cfg_req.init_next_round_input(self.tree_cache)
+
+                dry_run_res = adder.dry_run_cfg(req, cfg_req)
+                if not dry_run_res:
+                    continue
+
+                can_continue = _try_add_req(cfg_req, True)
+                if not can_continue:
+                    raise ValueError(
+                        "Added unconditioned half of CFG prompt to batch but not its conditioned parent"
+                    )
+
+            can_continue = _try_add_req(req, req.rid in self.cfg_rid_to_uncond)
+            if not can_continue:
                 break
 
         # Update waiting queue
@@ -1634,6 +1689,14 @@ class Scheduler(
         if self.current_scheduler_metrics_enabled():
             self.log_prefill_stats(adder, can_run_list, running_bs)
 
+        # Query CFG bookkeeping for requests in new batch
+        can_run_rids = set(req.rid for req in can_run_list)
+        can_run_cfg_rid_map = {
+            rid: uncond_req.rid
+            for rid, uncond_req in self.cfg_rid_to_uncond.items()
+            if rid in can_run_rids
+        }
+
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -1643,6 +1706,7 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
+            can_run_cfg_rid_map,
             chunked_req=self.chunked_req,
         )
         if self.enable_hierarchical_cache:
