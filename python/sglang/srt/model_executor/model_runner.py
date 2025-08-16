@@ -28,7 +28,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
@@ -231,6 +231,9 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        # Init mindspore running environment when model impl is "mindspore"
+        self.init_mindspore_runner()
+
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
@@ -245,6 +248,20 @@ class ModelRunner:
 
         # For weight updates
         self._model_update_group = {}
+
+    def init_mindspore_runner(self):
+        # Init the mindspore runner
+        # for now, there is only some communication initialization work
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE and _is_npu:
+            from sglang.srt.model_executor.mindspore_runner import init_ms_distributed
+
+            init_ms_distributed(
+                world_size=self.tp_size * self.pp_size,
+                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                local_rank=self.gpu_id,
+                server_args=self.server_args,
+                port=self.dist_port,
+            )
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
