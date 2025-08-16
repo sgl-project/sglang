@@ -8,7 +8,7 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflows/release-docker-npu.yaml"
+      - ".github/workflows/release-docker-npu.yml"
 
 jobs:
   build:
