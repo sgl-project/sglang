@@ -32,8 +32,8 @@ from sglang.srt.lora.utils import (
     LoRABatchInfo,
     LoRAType,
     get_layer_id,
-    get_normalized_lora_weight_names,
-    get_weight_name,
+    get_normalized_target_modules,
+    get_target_module_name,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -350,12 +350,20 @@ class LoRAManager:
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
-                weight_name = get_weight_name(
-                    module_name, self.memory_pool.lora_weight_names
+                target_module = get_target_module_name(
+                    module_name, self.memory_pool.target_modules
                 )
                 module.set_lora_info(
-                    self.memory_pool.get_tensor(weight_name, layer_id, LoRAType.LORA_A),
-                    self.memory_pool.get_tensor(weight_name, layer_id, LoRAType.LORA_B),
+                    self.memory_pool.get_tensor(
+                        target_module=target_module,
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_A,
+                    ),
+                    self.memory_pool.get_tensor(
+                        target_module=target_module,
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_B,
+                    ),
                 )
 
     def init_state(
@@ -380,7 +388,6 @@ class LoRAManager:
             max_lora_rank=max_lora_rank,
             target_modules=target_modules,
         )
-        self.init_lora_weight_names()
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
@@ -426,6 +433,7 @@ class LoRAManager:
                         "enable all support modules types. "
                     )
                 self.target_modules.update(config.target_modules)
+        self.target_modules = get_normalized_target_modules(self.target_modules)
 
         if max_lora_rank is not None:
             self.max_lora_rank = max_lora_rank
@@ -434,15 +442,6 @@ class LoRAManager:
                 [x.r for x in self.configs.values()],
                 default=0,
             )
-
-    def init_lora_weight_names(self):
-        """
-        Add new LoRA weight names if needed based on the current `self.configs`.
-        """
-
-        self.lora_weight_names: Set[str] = get_normalized_lora_weight_names(
-            self.target_modules
-        )
 
     def load_lora_weights(self, lora_ref: LoRARef):
         """
@@ -467,7 +466,7 @@ class LoRAManager:
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             max_lora_rank=self.max_lora_rank,
-            lora_weight_names=self.lora_weight_names,
+            target_modules=self.target_modules,
             base_model=self.base_model,
         )
 
@@ -494,7 +493,7 @@ class LoRAManager:
                 continue
 
             # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.lora_weight_names:
+            if module_name.split(".")[-1] in self.target_modules:
                 layer_id = get_layer_id(module_name)
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
