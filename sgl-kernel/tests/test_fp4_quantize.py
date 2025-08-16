@@ -1,6 +1,6 @@
 import pytest
 import torch
-from sgl_kernel import scaled_fp4_quant
+from sgl_kernel import scaled_fp4_grouped_quant, scaled_fp4_quant
 
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
 
@@ -164,6 +164,35 @@ def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
 
     torch.testing.assert_close(out_ans, out_ref)
     torch.testing.assert_close(scale_ans, scale_ref)
+
+
+@pytest.mark.skipif(
+    skip_condition, reason="Nvfp4 Requires compute capability of 10 or above."
+)
+def test_quantize_to_fp4_grouped():
+    torch.manual_seed(42)
+    torch.set_default_device("cuda:0")
+
+    l, m, k = 2, 512, 2048
+    x = torch.randn((l, m, k), dtype=torch.bfloat16)
+    tensor_amax = x.abs().amax(dim=(1, 2)).to(torch.float32)
+    x_sf_global = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+    output, output_scales = scaled_fp4_grouped_quant(
+        x,
+        x_sf_global,
+    )
+    # output in logical (m, k, l), but its physical layout is (l, m, k).
+    # So permute first to (l, m, k).
+    output = output.permute(2, 0, 1)
+    # output_scale in logical (32, 4, rm, 4, rk, l), but its physical layout is (l, rm, rk, 32, 4, 4).
+    # So permute first to (l, rm, rk, 32, 4, 4).
+    output_scales = output_scales.permute(5, 2, 4, 0, 1, 3).view(l, m, -1)
+    for i in range(l):
+        a_fp4, a_scale_interleaved = scaled_fp4_quant(x[i], x_sf_global[i])
+        torch.testing.assert_close(a_fp4, output[i])
+        torch.testing.assert_close(
+            a_scale_interleaved.to(torch.float), output_scales[i].to(torch.float)
+        )
 
 
 if __name__ == "__main__":

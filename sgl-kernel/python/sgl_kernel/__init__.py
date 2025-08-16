@@ -51,6 +51,7 @@ from sgl_kernel.gemm import (
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
     scaled_fp4_experts_quant,
+    scaled_fp4_grouped_quant,
     scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_fp8,
