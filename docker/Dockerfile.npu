@@ -65,7 +65,7 @@ RUN pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --inde
 
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
-    (cd sglang && pip install -v "python[srt_npu]" --no-cache-dir) && rm -rf sglang
+    (cd sglang/python && pip install -v ".[srt_npu]" --no-cache-dir) && rm -rf sglang
 
 # Install Deep-ep
 RUN git clone  --branch $SGLANG_KERNEL_NPU_TAG https://github.com/sgl-project/sgl-kernel-npu.git \
