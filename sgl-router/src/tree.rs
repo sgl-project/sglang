@@ -74,11 +74,17 @@ fn shared_prefix_count(a: &str, b: &str) -> usize {
         }
     }
 
-    return i;
+    i
 }
 
 fn slice_by_chars(s: &str, start: usize, end: usize) -> String {
     s.chars().skip(start).take(end - start).collect()
+}
+
+impl Default for Tree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Tree {
@@ -517,7 +523,7 @@ impl Tree {
             // add parent to queue if it becomes a leaf
             if let Some(parent) = curr.parent.read().unwrap().as_ref() {
                 if Tree::leaf_of(parent).contains(&tenant.to_string()) {
-                    queue.push_back(Arc::clone(&parent));
+                    queue.push_back(Arc::clone(parent));
                 }
             }
         }
@@ -653,8 +659,6 @@ impl Tree {
         }
 
         println!("{result}");
-
-        return;
     }
 }
 

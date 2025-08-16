@@ -612,6 +612,8 @@ class EmbeddingReqInput:
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
+            elif isinstance(self.sampling_params, dict):
+                self.sampling_params = [self.sampling_params] * self.batch_size
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
@@ -660,6 +662,8 @@ class TokenizedEmbeddingReqInput:
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
 
@@ -798,6 +802,8 @@ class UpdateWeightFromDiskReqInput:
     load_format: Optional[str] = None
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
 
 
 @dataclass
@@ -819,6 +825,8 @@ class UpdateWeightsFromDistributedReqInput:
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
 
 
 @dataclass
@@ -842,6 +850,8 @@ class UpdateWeightsFromTensorReqInput:
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
 
 
 @dataclass
@@ -870,6 +880,14 @@ class InitWeightsUpdateGroupReqInput:
 class InitWeightsUpdateGroupReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class UpdateWeightVersionReqInput:
+    # The new weight version
+    new_version: str
+    # Whether to abort all running requests before updating
+    abort_all_requests: bool = True
 
 
 @dataclass

@@ -42,6 +42,7 @@ static std::vector<int64_t> create_greenctx_stream_direct_dynamic(CUgreenCtx gct
   // This symbol is introduced in CUDA 12.5
   const static auto pfn = probe_cuGreenCtxStreamCreate();
   if (!pfn) {
+    TORCH_WARN("cuGreenCtxStreamCreate(cuda>=12.5) is not available, using fallback");
     return create_greenctx_stream_fallback(gctx);
   }
 
@@ -55,17 +56,12 @@ static std::vector<int64_t> create_greenctx_stream_direct_dynamic(CUgreenCtx gct
 std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device) {
   CUDA_DRV(cuDriverGetVersion(&CUDA_DRIVER_VERSION));
 
-  if (CUDA_DRIVER_VERSION < 12040) {
-    TORCH_CHECK(false, "Green Contexts feature requires CUDA Toolkit 12.4 or newer.");
-  }
-
   CUgreenCtx gctx[3];
   CUdevResourceDesc desc[3];
   CUdevResource input;
   CUdevResource resources[4];
-  if (smA <= 0 || smB <= 0) {
-    TORCH_CHECK(false, "SM counts must be positive");
-  }
+
+  TORCH_CHECK(smA > 0 && smB > 0, "SM counts must be positive");
 
   CUDA_DRV(cuDeviceGetDevResource((CUdevice)device, &input, CU_DEV_RESOURCE_TYPE_SM));
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from torch.nn import Module
@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -348,12 +349,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
@@ -363,15 +359,11 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            inplace=inplace,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+            moe_runner_config=moe_runner_config,
             use_int8_w8a8=True,
             w1_scale=(layer.w13_weight_scale_inv),
             w2_scale=(layer.w2_weight_scale_inv),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )

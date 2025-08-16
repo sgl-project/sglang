@@ -17,7 +17,7 @@ from enum import Enum, auto
 from functools import partial
 from typing import Dict, Optional
 
-import torch.distributed
+import torch
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -34,6 +34,10 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     get_global_dp_buffer,
     get_local_dp_buffer,
+)
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -111,7 +115,11 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
-                if not global_server_args_dict["moe_a2a_backend"].is_standard()
+                if (
+                    # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
+                    not get_moe_a2a_backend().is_none()
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                )
                 else ScatterMode.FULL
             )
         else:
@@ -382,7 +390,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
 
         raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {residual_output_mode=} {residual_output_mode=}"
+            f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
         )
 
     @staticmethod

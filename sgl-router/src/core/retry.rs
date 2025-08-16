@@ -33,7 +33,7 @@ impl BackoffCalculator {
         }
 
         // Apply jitter in range [-j, +j]
-        let jitter = config.jitter_factor.max(0.0).min(1.0);
+        let jitter = config.jitter_factor.clamp(0.0, 1.0);
         if jitter > 0.0 {
             let mut rng = rand::rng();
             let jitter_scale: f32 = rng.random_range(-jitter..=jitter);
