@@ -348,7 +348,7 @@ class W4A4MXFp4MoEDynamicMethod(MxFp4MoEMethod):
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w2_weight_scale = torch.nn.Parameter(w2_mx_scales, requires_grad=False)
     
-    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig):
         self.moe_runner_config = moe_runner_config
 
     def apply(
@@ -484,7 +484,7 @@ class W4A4MXFp4MoEStaticMethod(MxFp4MoEMethod):
         w2_weight_scale = e8m0_shuffle(w2_weight_scale)
         layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
-    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig):
         self.moe_runner_config = moe_runner_config
 
     def apply(

@@ -52,10 +52,10 @@ class DispatchOutputChecker:
 
 class DispatchOutputFormat(Enum):
 
-    STANDARD = auto()
-    DEEPEP_NORMAL = auto()
-    DEEPEP_LL = auto()
-    ASCENT_LL = auto()
+    STANDARD = "standard"
+    DEEPEP_NORMAL = "deepep_normal"
+    DEEPEP_LL = "deepep_ll"
+    ASCENT_LL = "ascent_ll"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -119,9 +119,10 @@ class CombineInputChecker:
 
 
 class CombineInputFormat(Enum):
-    STANDARD = auto()
-    DEEPEP_NORMAL = auto()
-    DEEPEP_LL = auto()
+    STANDARD = "standard"
+    DEEPEP_NORMAL = "deepep_normal"
+    DEEPEP_LL = "deepep_ll"
+    ASCENT_LL = "ascent_ll"
 
 
 @runtime_checkable

@@ -349,7 +349,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 layer.register_parameter(key, param)
                 set_weight_attrs(param, extra_weight_attrs)
 
-    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig):
         self.moe_runner_config = moe_runner_config
 
     def apply(

@@ -344,7 +344,7 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         # Block quant doesn't need to process weights after loading
         return
 
-    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig):
         self.moe_runner_config = moe_runner_config
 
     def apply(

@@ -240,8 +240,8 @@ class FusedMoE(torch.nn.Module):
             ),
             with_bias=with_bias,
         )
-        
-        self.quant_method.create_moe_runner(self.moe_runner_config)
+
+        self.quant_method.create_moe_runner(self, self.moe_runner_config)
 
     def _load_per_tensor_weight_scale(
         self,

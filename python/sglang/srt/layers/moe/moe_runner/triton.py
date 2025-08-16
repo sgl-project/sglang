@@ -36,27 +36,30 @@ class TritonRunnerCore(MoeRunnerCore):
         super().__init__(config)
 
     def run(self, runner_input: TritonRunnerInput, quant_info: MoeQuantInfo) -> TritonRunnerOutput:
-        pass
+        print("run")
 
-    @classmethod
-    def get_runner_input_format(cls) -> RunnerInputFormat:
+    @property
+    def input_format(self) -> RunnerInputFormat:
         return RunnerInputFormat.TRITON
 
-    @classmethod
-    def get_runner_output_format(cls) -> RunnerOutputFormat:
+    @property
+    def output_format(self) -> RunnerOutputFormat:
         return RunnerOutputFormat.TRITON
 
 
-@register_pre_permute(DispatchOutputFormat.STANDARD, RunnerInputFormat.TRITON)
+@register_pre_permute("standard", "triton")
 def pre_permute_standard_to_triton(
     dispatch_output: StandardDispatchOutput,
     runner_config: MoeRunnerConfig,
 ) -> TritonRunnerInput:
     hidden_states, topk_output = dispatch_output
+    print("pre_permute_standard_to_triton")
 
 
-@register_post_permute(RunnerOutputFormat.TRITON, CombineInputFormat.STANDARD)
+@register_post_permute("triton", "standard")
 def post_permute_triton_to_standard(
     runner_output: TritonRunnerOutput,
+    runner_config: MoeRunnerConfig,
 ) -> StandardDispatchOutput:
-    pass
+    print("post_permute_triton_to_standard")
+

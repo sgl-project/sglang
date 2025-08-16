@@ -736,7 +736,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         )
         replace_parameter(layer, "w2_qzeros", marlin_w2_zp)
 
-    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig):
         self.moe_runner_config = moe_runner_config
 
     def apply(

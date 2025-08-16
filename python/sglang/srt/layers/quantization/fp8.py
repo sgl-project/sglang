@@ -40,6 +40,7 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
+    MoeQuantInfo,
 )
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -520,8 +521,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = self.quant_config.weight_block_size is not None
         self.cutlass_fp8_supported = cutlass_fp8_supported()
 
-        self.triton_moe_runner = MoeRunner(MoeRunnerBackend.TRITON, MoeRunnerConfig())
-
     def create_weights(
         self,
         layer: Module,
@@ -983,9 +982,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             torch.cuda.empty_cache()
         
-    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig):
         self.moe_runner_config = moe_runner_config
-        self.triton_moe_runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def apply(
         self,
@@ -1072,20 +1071,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 output *= moe_runner_config.routed_scaling_factor
             return output
         
-        from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-        from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
-
-        return self.triton_moe_runner(StandardDispatchOutput(hidden_states=x, topk_output=topk_output), MoeQuantInfo(w1_scale=layer.w13_weight_scale_inv, w2_scale=layer.w2_weight_scale_inv, a1_scale=layer.w13_input_scale, a2_scale=layer.w2_input_scale))
-        """
-        # Expert fusion with FP8 quantization
-        return fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+        quant_info = MoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
             use_fp8_w8a8=True,
-            w1_scale=(
+            w13_scale=(
                 layer.w13_weight_scale_inv
                 if self.block_quant
                 else layer.w13_weight_scale
@@ -1093,11 +1083,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w2_scale=(
                 layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
             ),
-            a1_scale=layer.w13_input_scale,
+            a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
         )
-        """
+        return self.runner.run(dispatch_output, quant_info)
 
     def apply_with_router_logits(
         self,

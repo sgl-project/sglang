@@ -96,7 +96,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
     @abstractmethod
-    def create_moe_runner(self, moe_runner_config: MoeRunnerConfig):
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig):
         raise NotImplementedError
 
     @abstractmethod
@@ -205,7 +205,14 @@ class QuantizationConfig(ABC):
 class MoeQuantInfo:
     """Moe quantication data."""
 
-    pass
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    w13_scale: torch.Tensor
+    w2_scale: torch.Tensor
+    a13_scale: torch.Tensor
+    a2_scale: torch.Tensor
+    block_shape: List[int]
+    use_fp8_w8a8: bool = False
 
 
 def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:

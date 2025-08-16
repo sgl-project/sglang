@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -10,7 +10,9 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 
 class StandardDispatchOutput(NamedTuple):

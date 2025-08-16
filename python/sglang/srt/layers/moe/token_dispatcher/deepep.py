@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled
+from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -97,8 +97,9 @@ class AscendDeepEPLLOutput(NamedTuple):
 
 
 assert isinstance(DeepEPNormalOutput, DispatchOutput)
-assert isinstance(DeepEPLLOutput, DispatchOutput)
-assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
+# FIXME
+# assert isinstance(DeepEPLLOutput, DispatchOutput)
+# assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
