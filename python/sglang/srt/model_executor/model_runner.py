@@ -615,7 +615,7 @@ class ModelRunner:
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if self.tp_size > 1 and not self.is_draft_worker:
+        if self.tp_size > 1 and self.device != "cpu" and not self.is_draft_worker:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
                     logger.warning(
@@ -1637,6 +1637,10 @@ class ModelRunner:
             self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
         else:
             self.local_omp_cpuid = omp_cpuids.split("|")[self.tp_rank]
+            logger.warning(
+                f"With SGLANG_CPU_OMP_THREADS_BIND set, the available memory amounts of the ranks are not able to be determined in prior. "
+                f"Please set proper `--mem-fraction-static` or `--max-total-tokens` to eliminate the out-of-memory risk."
+            )
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
