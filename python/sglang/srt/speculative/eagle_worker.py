@@ -844,9 +844,13 @@ class EAGLEWorker(TpModelWorker):
                 unfinished_req_index.append(i)
         if has_finished:
             unfinished_index_device = torch.tensor(
-                unfinished_req_index, dtype=torch.int64, device=batch.spec_info.topk_p.device
+                unfinished_req_index,
+                dtype=torch.int64,
+                device=batch.spec_info.topk_p.device,
             )
-            batch.spec_info.filter_batch(unfinished_index_device, has_been_filtered=False)
+            batch.spec_info.filter_batch(
+                unfinished_index_device, has_been_filtered=False
+            )
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)

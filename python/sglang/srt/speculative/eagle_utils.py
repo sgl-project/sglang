@@ -182,7 +182,9 @@ class EagleDraftInput:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
             if len(new_indices) != len(self.topk_p):
-                logger.warning(f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen")
+                logger.warning(
+                    f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
+                )
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
