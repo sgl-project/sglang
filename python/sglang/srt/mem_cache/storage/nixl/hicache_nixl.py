@@ -100,9 +100,11 @@ class HiCacheNixl(HiCacheStorage):
             tensor_sizes = [tensor.element_size() * tensor.numel() for tensor in buffers]
             storage_tuples = [(x[0], s, x[2]) for x, s in zip(tuples, tensor_sizes)]
             host_descs = self.agent.get_xfer_descs(buffers)
-        else:
+        elif isinstance(buffers[0], tuple):
             storage_tuples = [(x[0], y[1], x[2]) for x, y in zip(tuples, buffers)]
             host_descs = self.agent.get_xfer_descs([(x[0], x[1], 0) for x in buffers], "DRAM")
+        else:
+            return False
 
         storage_descs = self.agent.get_xfer_descs(storage_tuples, self.backend_selector.mem_type)
 
@@ -135,6 +137,7 @@ class HiCacheNixl(HiCacheStorage):
                     logger.error("Transfer failed")
                     return False
                 time.sleep(0.0001)  # Can be changed to os.sched_yield() or parametrized
+
             self.agent.release_xfer_handle(xfer_req)
             return True
 
@@ -148,7 +151,7 @@ class HiCacheNixl(HiCacheStorage):
     def get(
         self,
         key: str,
-        target_location: Optional[torch.Tensor]=None,
+        target_location: Optional[torch.Tensor | int]=None,
         target_sizes: Optional[int] = None,
     ) -> torch.Tensor | None:
         # To be removed, being compatible with the current API
@@ -176,7 +179,6 @@ class HiCacheNixl(HiCacheStorage):
         if target_sizes and (len(target_sizes) != len(target_locations)):
             logger.error("Mismatch between number of target_locations and target_sizes")
             return [None] * len(keys)
-
         if target_sizes:
             dest = list(zip(target_locations, target_sizes))
         else:
@@ -197,7 +199,7 @@ class HiCacheNixl(HiCacheStorage):
         target_sizes: Optional[int] = None,
     ) -> bool:
         if target_location and target_sizes:
-            return self.batch_set([key], [value], [target_location], [target_sizes])
+            return self.batch_set([key], None, [target_location], [target_sizes])
         else:
             return self.batch_set([key], [value])
 
@@ -208,7 +210,6 @@ class HiCacheNixl(HiCacheStorage):
         target_locations: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
-        # TODO: add support for location/size mode
         if not keys or (not values and (not target_locations or not target_sizes)):
             logger.error("Keys or values were not passed")
             return False
