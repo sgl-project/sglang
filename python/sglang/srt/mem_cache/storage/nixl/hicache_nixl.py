@@ -106,7 +106,12 @@ class HiCacheNixl(HiCacheStorage):
             logger.error(f"Traceback: {traceback.format_exc()}")
             return False
 
-    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
+    def batch_set(
+        self,
+        keys: List[str],
+        values: List[torch.Tensor],
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
+    ) -> bool:
         if not keys:
             return True
 

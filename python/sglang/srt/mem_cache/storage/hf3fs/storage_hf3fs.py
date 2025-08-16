@@ -276,7 +276,12 @@ class HiCacheHF3FS(HiCacheStorage):
     def set(self, key: str, value: torch.Tensor) -> bool:
         return self.batch_set([key], [value])
 
-    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
+    def batch_set(
+        self,
+        keys: List[str],
+        values: List[torch.Tensor],
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
+    ) -> bool:
         # Todo: Add prefix block's hash key
         key_with_prefix = [(key, "") for key in keys]
         indices = self.metadata_client.reserve_and_allocate_page_indices(
