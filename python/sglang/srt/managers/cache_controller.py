@@ -24,7 +24,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
 
 
 logger = logging.getLogger(__name__)
@@ -238,13 +238,14 @@ class HiCacheController:
         self.io_backend = io_backend
 
         self.enable_storage = False
+        self.is_mla = isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
             from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
 
             if storage_backend == "file":
-                self.storage_backend = HiCacheFile()
+                self.storage_backend = HiCacheFile(is_mla=self.is_mla)
                 self.get_hash_str = get_hash_str
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
@@ -257,7 +258,7 @@ class HiCacheController:
                     get_hash_str_mooncake,
                 )
 
-                self.storage_backend = MooncakeStore()
+                self.storage_backend = MooncakeStore(is_mla=self.is_mla)
                 self.get_hash_str = get_hash_str_mooncake
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
@@ -393,6 +394,15 @@ class HiCacheController:
             )
             self.prefetch_thread.start()
             self.backup_thread.start()
+
+    @property
+    def backup_skip(self):
+        return (
+            self.is_mla
+            and torch.cuda.current_device() != 0
+            # todo: only support file and mooncake
+            and self.storage_backend_type in ["file", "mooncake"]
+        )
 
     def write(
         self,
@@ -767,14 +777,17 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if self.is_mooncake_backend():
-                    self.mooncake_page_backup(operation)
-                elif self.storage_backend_type == "hf3fs":
-                    self.generic_page_backup(operation, batch_size=128)
+                if not self.backup_skip:
+                    if self.is_mooncake_backend():
+                        self.mooncake_page_backup(operation)
+                    elif self.storage_backend_type == "hf3fs":
+                        self.generic_page_backup(operation, batch_size=128)
+                    else:
+                        self.generic_page_backup(operation)
+                    min_completed_tokens = operation.completed_tokens
                 else:
-                    self.generic_page_backup(operation)
+                    min_completed_tokens = len(operation.token_ids)
 
-                min_completed_tokens = operation.completed_tokens
                 if self.tp_world_size > 1:
                     completed_tokens_tensor = torch.tensor(
                         min_completed_tokens, dtype=torch.int
