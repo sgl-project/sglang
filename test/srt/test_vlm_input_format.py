@@ -16,6 +16,9 @@ from transformers import (
 from sglang import Engine
 from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 
@@ -45,15 +48,22 @@ class VLMInputTestBase:
         raise NotImplementedError
 
     def setUp(self):
-        self.engine = Engine(
-            model_path=self.model_path,
-            chat_template=self.chat_template,
-            device=self.device.type,
-            mem_fraction_static=0.8,
-            enable_multimodal=True,
-            disable_cuda_graph=True,
-            trust_remote_code=True,
-        )
+        # Prepare engine arguments
+        engine_args = {
+            "model_path": self.model_path,
+            "chat_template": self.chat_template,
+            "device": self.device.type,
+            "mem_fraction_static": 0.8,
+            "enable_multimodal": True,
+            "disable_cuda_graph": True,
+            "trust_remote_code": True,
+        }
+        
+        # Use triton attention backend for AMD/ROCm compatibility
+        if _is_hip:
+            engine_args["attention_backend"] = "triton"
+            
+        self.engine = Engine(**engine_args)
 
     def tearDown(self):
         self.engine.shutdown()
