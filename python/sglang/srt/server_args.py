@@ -24,7 +24,7 @@ import tempfile
 from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     is_hip,
     is_port_available,
     is_remote_url,
+    is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
 )
@@ -124,6 +125,7 @@ class ServerArgs:
     # API related
     api_key: Optional[str] = None
     served_model_name: Optional[str] = None
+    weight_version: str = "default"
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
@@ -174,9 +176,15 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Optional[Literal["deepep"]] = None
-    enable_flashinfer_cutlass_moe: bool = False
-    enable_flashinfer_trtllm_moe: bool = False
+    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_runner_backend: Literal[
+        "auto",
+        "triton",
+        "triton_kernel",
+        "flashinfer_trtllm",
+        "flashinfer_cutlass",
+        "flashinfer_mxfp4",
+    ] = "auto"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -249,9 +257,6 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
-    enable_triton_kernel_moe: bool = False
-    enable_flashinfer_mxfp4_moe: bool = False
-    enable_flashinfer_mxfp4_bf16_moe: bool = False
     scheduler_recv_interval: int = 1
 
     # Debug tensor dumps
@@ -282,6 +287,10 @@ class ServerArgs:
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    enable_flashinfer_cutlass_moe: bool = False
+    enable_flashinfer_trtllm_moe: bool = False
+    enable_triton_kernel_moe: bool = False
+    enable_flashinfer_mxfp4_moe: bool = False
 
     def __post_init__(self):
         # Check deprecated arguments
@@ -297,6 +306,26 @@ class ServerArgs:
             self.moe_a2a_backend = "deepep"
             print_deprecated_warning(
                 "NOTE: --enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead."
+            )
+        if self.enable_triton_kernel_moe:
+            self.moe_runner_backend = "triton_kernel"
+            print_deprecated_warning(
+                "NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead."
+            )
+        if self.enable_flashinfer_cutlass_moe:
+            self.moe_runner_backend = "flashinfer_cutlass"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-cutlass-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutlass' instead."
+            )
+        if self.enable_flashinfer_trtllm_moe:
+            self.moe_runner_backend = "flashinfer_trtllm"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-trtllm-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
+            )
+        if self.enable_flashinfer_mxfp4_moe:
+            self.moe_runner_backend = "flashinfer_mxfp4"
+            print_deprecated_warning(
+                "NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead."
             )
 
         # Set missing default values
@@ -433,7 +462,10 @@ class ServerArgs:
             )
             self.page_size = 128
 
-        if self.attention_backend == "trtllm_mla":
+        if (
+            self.attention_backend == "trtllm_mla"
+            or self.decode_attention_backend == "trtllm_mla"
+        ):
             if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -444,9 +476,15 @@ class ServerArgs:
                     f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
+
             if self.speculative_algorithm is not None:
                 raise ValueError(
                     "trtllm_mla backend does not support speculative decoding yet."
+                )
+
+            if self.kv_cache_dtype not in ["fp8_e4m3", "auto"]:
+                raise ValueError(
+                    "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
                 )
 
         if (
@@ -508,7 +546,7 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
         # MoE kernel
-        if self.enable_flashinfer_cutlass_moe:
+        if self.moe_runner_backend == "flashinfer_cutlass":
             assert (
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
@@ -518,7 +556,7 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
-        if self.enable_flashinfer_trtllm_moe:
+        if self.moe_runner_backend == "flashinfer_trtllm":
             if not self.disable_shared_experts_fusion:
                 self.disable_shared_experts_fusion = True
                 logger.warning(
@@ -547,7 +585,7 @@ class ServerArgs:
             self.ep_dispatch_algorithm = "static"
 
         if self.enable_eplb:
-            assert self.ep_size > 1 or self.moe_a2a_backend is not None
+            assert self.ep_size > 1
 
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
@@ -566,6 +604,12 @@ class ServerArgs:
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
+
+        # Hicache
+        if self.hicache_storage_backend == "mooncake":
+            # to use mooncake storage backend, the following conditions must be met:
+            self.hicache_io_backend = "kernel"
+            self.hicache_mem_layout = "page_first"
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1150,6 +1194,12 @@ class ServerArgs:
             help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
         )
         parser.add_argument(
+            "--weight-version",
+            type=str,
+            default=ServerArgs.weight_version,
+            help="Version identifier for the model weights. Defaults to 'default' if not specified.",
+        )
+        parser.add_argument(
             "--chat-template",
             type=str,
             default=ServerArgs.chat_template,
@@ -1182,7 +1232,7 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=[
+            choices=[  # TODO: use FunctionCallParser.DetectorMap.keys()
                 "qwen25",
                 "mistral",
                 "llama3",
@@ -1192,6 +1242,7 @@ class ServerArgs:
                 "qwen3_coder",
                 "glm45",
                 "step3",
+                "gpt-oss",
             ],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
@@ -1302,18 +1353,23 @@ class ServerArgs:
 
         # Kernel backend
         ATTN_BACKENDS = [
-            "aiter",
+            # Common
+            "triton",
+            "torch_native",
+            # NVIDIA specific
             "cutlass_mla",
             "fa3",
             "flashinfer",
             "flashmla",
-            "intel_amx",
-            "torch_native",
-            "ascend",
-            "triton",
             "trtllm_mla",
             "trtllm_mha",
             "dual_chunk_flash_attn",
+            # AMD specific
+            "aiter",
+            "wave",
+            # Other platforms
+            "intel_amx",
+            "ascend",
         ]
         parser.add_argument(
             "--attention-backend",
@@ -1419,24 +1475,27 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["deepep"],
+            choices=["none", "deepep"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
         parser.add_argument(
-            "--enable-flashinfer-cutlass-moe",
-            action="store_true",
-            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
-        )
-        parser.add_argument(
-            "--enable-flashinfer-trtllm-moe",
-            action="store_true",
-            help="Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
+            "--moe-runner-backend",
+            type=str,
+            choices=[
+                "auto",
+                "triton",
+                "triton_kernel",
+                "flashinfer_trtllm",
+                "flashinfer_cutlass",
+            ],
+            default=ServerArgs.moe_runner_backend,
+            help="Choose the runner backend for MoE.",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
+            help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1799,21 +1858,6 @@ class ServerArgs:
             help="Enable returning hidden states with responses.",
         )
         parser.add_argument(
-            "--enable-triton-kernel-moe",
-            action="store_true",
-            help="Use triton moe grouped gemm kernel.",
-        )
-        parser.add_argument(
-            "--enable-flashinfer-mxfp4-moe",
-            action="store_true",
-            help="Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
-        )
-        parser.add_argument(
-            "--enable-flashinfer-mxfp4-bf16-moe",
-            action="store_true",
-            help="Enable FlashInfer MXFP4 MoE backend with bf16 input precision for modelopt_fp4 quant on Blackwell.",
-        )
-        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -1943,6 +1987,26 @@ class ServerArgs:
             action="store_true",
             help="(Deprecated) Enabling DeepEP MoE implementation for EP MoE.",
         )
+        parser.add_argument(
+            "--enable-flashinfer-cutlass-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-trtllm-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer TRTLLM MoE backend on Blackwell. Supports BlockScale FP8 MoE-EP",
+        )
+        parser.add_argument(
+            "--enable-triton-kernel-moe",
+            action="store_true",
+            help="(Deprecated) Use triton moe grouped gemm kernel.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-mxfp4-moe",
+            action="store_true",
+            help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -2005,16 +2069,14 @@ class ServerArgs:
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
-        assert (
-            self.chunked_prefill_size % self.page_size == 0
-        ), "chunked_prefill_size must be divisible by page_size"
+        # Skip validation if chunked prefill is disabled (i.e., size <= 0).
+        if self.chunked_prefill_size > 0:
+            assert (
+                self.chunked_prefill_size % self.page_size == 0
+            ), "chunked_prefill_size must be divisible by page_size"
 
     def check_lora_server_args(self):
-        assert (
-            self.max_loras_per_batch > 0
-            # FIXME
-            and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and radix attention is in progress"
+        assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
@@ -2097,11 +2159,25 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
             if self.attention_backend is None:
-                self.attention_backend = "triton"
-            assert self.attention_backend in [
-                "triton",
-                "trtllm_mha",
-            ], f"GptOssForCausalLM requires 'triton' or 'trtllm_mha' attention backend, but got {self.attention_backend}"
+                if is_sm100_supported():
+                    self.attention_backend = "trtllm_mha"
+                elif is_sm90_supported():
+                    self.attention_backend = "fa3"
+                else:
+                    self.attention_backend = "triton"
+            supported_backends = ["triton", "trtllm_mha", "fa3"]
+            logger.info(
+                f"Use {self.attention_backend} as attention backend for GptOssForCausalLM"
+            )
+            assert (
+                self.attention_backend in supported_backends
+            ), f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got '{self.attention_backend}'"
+
+            if is_sm100_supported():
+                self.enable_flashinfer_allreduce_fusion = True
+                logger.info(
+                    "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
+                )
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
@@ -2109,26 +2185,21 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and is_mxfp4_quant_format:
-                # TODO we should use --moe-backend
-                num_enabled_backends = (
-                    int(self.enable_flashinfer_mxfp4_moe)
-                    + int(self.enable_flashinfer_mxfp4_bf16_moe)
-                    + int(self.enable_triton_kernel_moe)
+                self.moe_runner_backend = "flashinfer_mxfp4"
+                logger.warning(
+                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                 )
-                assert num_enabled_backends <= 1
-                if num_enabled_backends == 0:
-                    # TODO shall we use mxfp4 or mxfp4_bf16 by default?
-                    self.enable_flashinfer_mxfp4_moe = True
-                    logger.warning(
-                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
-                    )
             else:
-                if self.enable_triton_kernel_moe:
+                if self.moe_runner_backend == "triton_kernel":
                     assert (
                         self.ep_size == 1
                     ), "Triton kernel MoE is only supported when ep_size == 1"
-                if not self.enable_triton_kernel_moe and self.ep_size == 1:
-                    self.enable_triton_kernel_moe = True
+                if (
+                    self.moe_runner_backend == "auto"
+                    and self.ep_size == 1
+                    and is_triton_kernels_available()
+                ):
+                    self.moe_runner_backend = "triton_kernel"
                     logger.warning(
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
                     )
@@ -2188,10 +2259,6 @@ class ServerArgs:
         )
         self.mem_fraction_static = (
             original_server_arg_mem_fraction * final_overall_factor
-        )
-        logger.warning(
-            f"Multimodal model: Dynamically adjusted --mem-fraction-static "
-            f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
         )
 
 

@@ -42,14 +42,14 @@ class RouterArgs:
     policy: str = "cache_aware"
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
-    worker_startup_timeout_secs: int = 300
-    worker_startup_check_interval: int = 10
-    cache_threshold: float = 0.5
-    balance_abs_threshold: int = 32
-    balance_rel_threshold: float = 1.0001
-    eviction_interval: int = 60
-    max_tree_size: int = 2**24
-    max_payload_size: int = 256 * 1024 * 1024  # 256MB default for large batches
+    worker_startup_timeout_secs: int = 600
+    worker_startup_check_interval: int = 30
+    cache_threshold: float = 0.3
+    balance_abs_threshold: int = 64
+    balance_rel_threshold: float = 1.5
+    eviction_interval: int = 120
+    max_tree_size: int = 2**26
+    max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     dp_aware: bool = False
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
@@ -69,11 +69,30 @@ class RouterArgs:
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
-    request_timeout_secs: int = 600
+    request_timeout_secs: int = 1800
     # Max concurrent requests for rate limiting
-    max_concurrent_requests: int = 64
+    max_concurrent_requests: int = 256
     # CORS allowed origins
     cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
+    # Retry configuration
+    retry_max_retries: int = 5
+    retry_initial_backoff_ms: int = 50
+    retry_max_backoff_ms: int = 30_000
+    retry_backoff_multiplier: float = 1.5
+    retry_jitter_factor: float = 0.2
+    disable_retries: bool = False
+    # Health check configuration
+    health_failure_threshold: int = 3
+    health_success_threshold: int = 2
+    health_check_timeout_secs: int = 5
+    health_check_interval_secs: int = 60
+    health_check_endpoint: str = "/health"
+    # Circuit breaker configuration
+    cb_failure_threshold: int = 10
+    cb_success_threshold: int = 3
+    cb_timeout_duration_secs: int = 60
+    cb_window_duration_secs: int = 120
+    disable_circuit_breaker: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -289,6 +308,94 @@ class RouterArgs:
             default=RouterArgs.request_timeout_secs,
             help="Request timeout in seconds",
         )
+        # Retry configuration
+        parser.add_argument(
+            f"--{prefix}retry-max-retries",
+            type=int,
+            default=RouterArgs.retry_max_retries,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-initial-backoff-ms",
+            type=int,
+            default=RouterArgs.retry_initial_backoff_ms,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-max-backoff-ms",
+            type=int,
+            default=RouterArgs.retry_max_backoff_ms,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-backoff-multiplier",
+            type=float,
+            default=RouterArgs.retry_backoff_multiplier,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-jitter-factor",
+            type=float,
+            default=RouterArgs.retry_jitter_factor,
+        )
+        parser.add_argument(
+            f"--{prefix}disable-retries",
+            action="store_true",
+            help="Disable retries (equivalent to setting retry_max_retries=1)",
+        )
+        # Circuit breaker configuration
+        parser.add_argument(
+            f"--{prefix}cb-failure-threshold",
+            type=int,
+            default=RouterArgs.cb_failure_threshold,
+        )
+        parser.add_argument(
+            f"--{prefix}cb-success-threshold",
+            type=int,
+            default=RouterArgs.cb_success_threshold,
+        )
+        parser.add_argument(
+            f"--{prefix}cb-timeout-duration-secs",
+            type=int,
+            default=RouterArgs.cb_timeout_duration_secs,
+        )
+        parser.add_argument(
+            f"--{prefix}cb-window-duration-secs",
+            type=int,
+            default=RouterArgs.cb_window_duration_secs,
+        )
+        parser.add_argument(
+            f"--{prefix}disable-circuit-breaker",
+            action="store_true",
+            help="Disable circuit breaker (equivalent to setting cb_failure_threshold to u32::MAX)",
+        )
+        # Health check configuration
+        parser.add_argument(
+            f"--{prefix}health-failure-threshold",
+            type=int,
+            default=RouterArgs.health_failure_threshold,
+            help="Number of consecutive health check failures before marking worker unhealthy",
+        )
+        parser.add_argument(
+            f"--{prefix}health-success-threshold",
+            type=int,
+            default=RouterArgs.health_success_threshold,
+            help="Number of consecutive health check successes before marking worker healthy",
+        )
+        parser.add_argument(
+            f"--{prefix}health-check-timeout-secs",
+            type=int,
+            default=RouterArgs.health_check_timeout_secs,
+            help="Timeout in seconds for health check requests",
+        )
+        parser.add_argument(
+            f"--{prefix}health-check-interval-secs",
+            type=int,
+            default=RouterArgs.health_check_interval_secs,
+            help="Interval in seconds between runtime health checks",
+        )
+        parser.add_argument(
+            f"--{prefix}health-check-endpoint",
+            type=str,
+            default=RouterArgs.health_check_endpoint,
+            help="Health check endpoint path",
+        )
         parser.add_argument(
             f"--{prefix}max-concurrent-requests",
             type=int,
@@ -372,6 +479,42 @@ class RouterArgs:
                 RouterArgs.max_concurrent_requests,
             ),
             cors_allowed_origins=getattr(args, f"{prefix}cors_allowed_origins", []),
+            retry_max_retries=getattr(args, f"{prefix}retry_max_retries"),
+            retry_initial_backoff_ms=getattr(args, f"{prefix}retry_initial_backoff_ms"),
+            retry_max_backoff_ms=getattr(args, f"{prefix}retry_max_backoff_ms"),
+            retry_backoff_multiplier=getattr(args, f"{prefix}retry_backoff_multiplier"),
+            retry_jitter_factor=getattr(args, f"{prefix}retry_jitter_factor"),
+            cb_failure_threshold=getattr(args, f"{prefix}cb_failure_threshold"),
+            cb_success_threshold=getattr(args, f"{prefix}cb_success_threshold"),
+            cb_timeout_duration_secs=getattr(args, f"{prefix}cb_timeout_duration_secs"),
+            cb_window_duration_secs=getattr(args, f"{prefix}cb_window_duration_secs"),
+            disable_retries=getattr(args, f"{prefix}disable_retries", False),
+            disable_circuit_breaker=getattr(
+                args, f"{prefix}disable_circuit_breaker", False
+            ),
+            health_failure_threshold=getattr(
+                args,
+                f"{prefix}health_failure_threshold",
+                RouterArgs.health_failure_threshold,
+            ),
+            health_success_threshold=getattr(
+                args,
+                f"{prefix}health_success_threshold",
+                RouterArgs.health_success_threshold,
+            ),
+            health_check_timeout_secs=getattr(
+                args,
+                f"{prefix}health_check_timeout_secs",
+                RouterArgs.health_check_timeout_secs,
+            ),
+            health_check_interval_secs=getattr(
+                args,
+                f"{prefix}health_check_interval_secs",
+                RouterArgs.health_check_interval_secs,
+            ),
+            health_check_endpoint=getattr(
+                args, f"{prefix}health_check_endpoint", RouterArgs.health_check_endpoint
+            ),
         )
 
     @staticmethod
@@ -558,6 +701,22 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             request_id_headers=router_args.request_id_headers,
             max_concurrent_requests=router_args.max_concurrent_requests,
             cors_allowed_origins=router_args.cors_allowed_origins,
+            retry_max_retries=router_args.retry_max_retries,
+            retry_initial_backoff_ms=router_args.retry_initial_backoff_ms,
+            retry_max_backoff_ms=router_args.retry_max_backoff_ms,
+            retry_backoff_multiplier=router_args.retry_backoff_multiplier,
+            retry_jitter_factor=router_args.retry_jitter_factor,
+            cb_failure_threshold=router_args.cb_failure_threshold,
+            cb_success_threshold=router_args.cb_success_threshold,
+            cb_timeout_duration_secs=router_args.cb_timeout_duration_secs,
+            cb_window_duration_secs=router_args.cb_window_duration_secs,
+            disable_retries=router_args.disable_retries,
+            disable_circuit_breaker=router_args.disable_circuit_breaker,
+            health_failure_threshold=router_args.health_failure_threshold,
+            health_success_threshold=router_args.health_success_threshold,
+            health_check_timeout_secs=router_args.health_check_timeout_secs,
+            health_check_interval_secs=router_args.health_check_interval_secs,
+            health_check_endpoint=router_args.health_check_endpoint,
         )
 
         router.start()

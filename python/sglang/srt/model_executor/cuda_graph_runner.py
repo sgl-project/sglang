@@ -33,7 +33,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
-from sglang.srt.layers.dp_attention import DPPaddingMode, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    set_dp_buffer_len,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import (
@@ -255,6 +260,9 @@ class CudaGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
 
+        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
+
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         rank0_log(f"Capture cuda graph bs {self.capture_bs}")
@@ -342,30 +350,15 @@ class CudaGraphRunner:
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
-                    self.gathered_buffer = torch.zeros(
-                        (
-                            self.max_num_token * self.dp_size,
-                            self.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.model_runner.dtype,
-                    )
                 else:
                     assert self.require_attn_tp_gather
                     self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )
-                    self.gathered_buffer = torch.zeros(
-                        (
-                            self.max_num_token,
-                            self.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.model_runner.dtype,
-                    )
             else:
                 self.global_num_tokens_gpu = None
                 self.global_num_tokens_for_logprob_gpu = None
-                self.gathered_buffer = None
 
             self.custom_mask = torch.ones(
                 (
@@ -549,7 +542,7 @@ class CudaGraphRunner:
                     device=input_ids.device,
                 )
             )
-            gathered_buffer = self.gathered_buffer[: num_tokens * self.dp_size]
+            global_dp_buffer_len = num_tokens * self.dp_size
         elif self.require_attn_tp_gather:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -565,9 +558,9 @@ class CudaGraphRunner:
                     device=input_ids.device,
                 )
             )
-            gathered_buffer = self.gathered_buffer[:num_tokens]
+            global_dp_buffer_len = num_tokens
         else:
-            gathered_buffer = None
+            global_dp_buffer_len = None
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -600,8 +593,8 @@ class CudaGraphRunner:
             positions=positions,
             global_num_tokens_gpu=self.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DPPaddingMode.get_default_mode_in_cuda_graph(),
-            gathered_buffer=gathered_buffer,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
@@ -630,6 +623,7 @@ class CudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
 
             kwargs = {}
             if (
@@ -729,10 +723,12 @@ class CudaGraphRunner:
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
 
+        seq_lens_cpu = None
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(self.seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            seq_lens_cpu = self.seq_lens_cpu[:bs]
 
         if pp_proxy_tensors:
             for key in self.pp_proxy_tensors.keys():
@@ -747,7 +743,17 @@ class CudaGraphRunner:
             self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
             self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
         if enable_num_token_non_padded(self.model_runner.server_args):
-            self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
+            num_token_non_padded = forward_batch.num_token_non_padded
+            if self.require_gathered_buffer:
+                tokens_per_rank = bs // self.attn_tp_size * self.num_tokens_per_bs
+                num_local_token_non_padded = torch.clamp(
+                    num_token_non_padded - tokens_per_rank * self.attn_tp_rank,
+                    min=0,
+                    max=tokens_per_rank,
+                )
+                self.num_token_non_padded.copy_(num_local_token_non_padded)
+            else:
+                self.num_token_non_padded.copy_(num_token_non_padded)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
@@ -766,7 +772,7 @@ class CudaGraphRunner:
             self.encoder_lens[:bs] if self.is_encoder_decoder else None,
             self.capture_forward_mode,
             forward_batch.spec_info,
-            seq_lens_cpu=self.seq_lens_cpu[:bs],
+            seq_lens_cpu=seq_lens_cpu,
         )
 
         # Store fields

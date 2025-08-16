@@ -55,13 +55,13 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         }
 
         // Select two random workers
-        let mut rng = rand::thread_rng();
-        let idx1 = rng.gen_range(0..healthy_indices.len());
-        let mut idx2 = rng.gen_range(0..healthy_indices.len());
+        let mut rng = rand::rng();
+        let idx1 = rng.random_range(0..healthy_indices.len());
+        let mut idx2 = rng.random_range(0..healthy_indices.len());
 
         // Ensure we pick two different workers
         while idx2 == idx1 {
-            idx2 = rng.gen_range(0..healthy_indices.len());
+            idx2 = rng.random_range(0..healthy_indices.len());
         }
 
         let worker_idx1 = healthy_indices[idx1];

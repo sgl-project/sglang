@@ -26,7 +26,7 @@ import os
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -88,6 +88,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
@@ -174,7 +175,6 @@ async def lifespan(fast_api_app: FastAPI):
             tool_server=tool_server,
         )
     except Exception as e:
-        # print stack trace
         import traceback
 
         traceback.print_exc()
@@ -277,7 +277,7 @@ async def health_generate(request: Request) -> Response:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
 
-    if not _global_state.tokenizer_manager.server_status.is_healthy():
+    if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
@@ -317,7 +317,7 @@ async def health_generate(request: Request) -> Response:
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.health_check_failed = False
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
             return Response(status_code=200)
 
     task.cancel()
@@ -331,7 +331,7 @@ async def health_generate(request: Request) -> Response:
         f"last_heartbeat time: {last_receive_time}"
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.health_check_failed = True
+    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
 
 
@@ -343,8 +343,17 @@ async def get_model_info():
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
+        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
     }
     return result
+
+
+@app.get("/get_weight_version")
+async def get_weight_version():
+    """Get the current weight version."""
+    return {
+        "weight_version": _global_state.tokenizer_manager.server_args.weight_version
+    }
 
 
 @app.get("/get_server_info")
@@ -538,6 +547,12 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
     success, message, num_paused_requests = (
         await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
     )
+
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
+
     content = {
         "success": success,
         "message": message,
@@ -584,6 +599,12 @@ async def update_weights_from_tensor(
     success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
         obj, request
     )
+
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
+
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -600,11 +621,47 @@ async def update_weights_from_distributed(
             obj, request
         )
     )
+
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
+
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_weight_version")
+async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
+    """Update the weight version. This operation requires no active requests."""
+    if obj.abort_all_requests:
+        _global_state.tokenizer_manager.abort_request(abort_all=True)
+
+    # Use a simple approach without the complex lock mechanism for now
+    # since weight_version update is a simple operation that doesn't affect model weights
+    try:
+        # Update the weight version in server args (the single source of truth)
+        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
+
+        return ORJSONResponse(
+            {
+                "success": True,
+                "message": f"Weight version updated to {obj.new_version}",
+                "new_version": obj.new_version,
+            },
+            status_code=HTTPStatus.OK,
+        )
+    except Exception as e:
+        return ORJSONResponse(
+            {
+                "success": False,
+                "message": f"Failed to update weight version: {str(e)}",
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 
 @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
@@ -965,6 +1022,12 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     if isinstance(ret, Response):
         return ret
     return ORJSONResponse({"predictions": ret})
+
+
+def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
+    """Update weight version if provided."""
+    if weight_version is not None:
+        _global_state.tokenizer_manager.server_args.weight_version = weight_version
 
 
 def _create_error_response(e):
