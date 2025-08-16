@@ -45,6 +45,7 @@ pub struct Router {
 
 impl Router {
     /// Create a new router with injected policy and client
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         worker_urls: Vec<String>,
         policy: Arc<dyn LoadBalancingPolicy>,

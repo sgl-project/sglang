@@ -100,7 +100,7 @@ impl TestContext {
         let worker_url = &worker_urls[0];
 
         let response = client
-            .post(&format!("{}{}", worker_url, endpoint))
+            .post(format!("{}{}", worker_url, endpoint))
             .json(&body)
             .send()
             .await
@@ -128,8 +128,8 @@ impl TestContext {
             if let Ok(bytes) = chunk {
                 let text = String::from_utf8_lossy(&bytes);
                 for line in text.lines() {
-                    if line.starts_with("data: ") {
-                        events.push(line[6..].to_string());
+                    if let Some(stripped) = line.strip_prefix("data: ") {
+                        events.push(stripped.to_string());
                     }
                 }
             }

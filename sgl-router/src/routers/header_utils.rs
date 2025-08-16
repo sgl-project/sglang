@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::HeaderMap;
 
 /// Copy request headers to a Vec of name-value string pairs
 /// Used for forwarding headers to backend workers

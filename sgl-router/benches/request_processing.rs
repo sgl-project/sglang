@@ -22,7 +22,7 @@ fn create_test_worker() -> BasicWorker {
 fn get_bootstrap_info(worker: &BasicWorker) -> (String, Option<u16>) {
     let hostname = get_hostname(worker.url());
     let bootstrap_port = match worker.worker_type() {
-        WorkerType::Prefill { bootstrap_port } => bootstrap_port.clone(),
+        WorkerType::Prefill { bootstrap_port } => bootstrap_port,
         _ => None,
     };
     (hostname, bootstrap_port)

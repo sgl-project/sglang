@@ -249,6 +249,7 @@ impl Router {
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
