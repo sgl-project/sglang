@@ -683,6 +683,7 @@ multimodal_model_archs = [
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
+    "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
 ]
 
@@ -706,11 +707,18 @@ def is_image_gen_model(model_architectures: List[str]):
 
 
 def is_audio_model(model_architectures: List[str]):
-    return False
+    models = [
+        "WhisperForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):
-    return "MllamaForConditionalGeneration" in model_architectures
+    models = [
+        "MllamaForConditionalGeneration",
+        "WhisperForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
 
 
 def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
