@@ -62,6 +62,7 @@ class TreeNode:
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        self.backuped_storage = False
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -73,10 +74,6 @@ class TreeNode:
     @property
     def backuped(self):
         return self.host_value is not None
-
-    @property
-    def backuped_storage(self):
-        return self.hash_value is not None and len(self.hash_value) > 0
 
     def protect_host(self):
         """Protect the host value from eviction."""
@@ -498,7 +495,7 @@ class RadixCache(BasePrefixCache):
         # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
             # First chunk links to the last page of the parent node (if any).
-            if node.parent is None:
+            if node.parent is None or node != self.root_node:
                 parent_block_hash = None
             else:
                 last_page_start = (
