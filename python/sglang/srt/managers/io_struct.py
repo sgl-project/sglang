@@ -120,7 +120,7 @@ class GenerateReqInput:
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
+    bootstrap_room: Optional[Union[List[List[int]], List[int], int]] = None
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -223,6 +223,13 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+
+            if self.bootstrap_host is not None:
+                self.bootstrap_host = [self.bootstrap_host]
+            if self.bootstrap_port is not None:
+                self.bootstrap_port = [self.bootstrap_port]
+            if self.bootstrap_room is not None:
+                self.bootstrap_room = [self.bootstrap_room]
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -524,7 +531,7 @@ class TokenizedGenerateReqInput:
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_room: Optional[Union[int, List[int]]] = None
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
