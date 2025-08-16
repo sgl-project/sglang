@@ -420,12 +420,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 logits_soft_cap=logits_soft_cap,
             )
         else:
-            raise Exception("chunked prefill + fp8 not done")
-
             # mla paged prefill
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
             )
+
+            assert k.dtype == torch.bfloat16
+            if k_buf.dtype != torch.bfloat16:
+                k_buf = (k_buf.to(torch.float32) * layer.k_scale).to(torch.bfloat16)
+
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
