@@ -143,6 +143,9 @@ suites = {
     "per-commit-8-gpu-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
     ],
+    "per-commit-8-gpu-h20": [
+        TestFile("quant/test_w4a8_deepseek_v3.py", 371),
+    ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
     ],
