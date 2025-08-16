@@ -33,13 +33,17 @@ from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    KVCacheTransferLatencyMonitor,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
 )
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
@@ -144,6 +148,7 @@ class MooncakeKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         self.kv_args = args
         self.local_ip = get_local_ip_auto()
@@ -171,6 +176,7 @@ class MooncakeKVManager(BaseKVManager):
         if is_valid_ipv6_address(self.local_ip):
             self.server_socket.setsockopt(zmq.IPV6, 1)
 
+        self.scheduler_metrics_collector = scheduler_metrics_collector
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
@@ -211,9 +217,14 @@ class MooncakeKVManager(BaseKVManager):
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
             )
 
+            self.kvcache_transfer_latency_monitor = KVCacheTransferLatencyMonitor(
+                self.scheduler_metrics_collector
+            )
+
             self.enable_custom_mem_pool = get_bool_env_var(
                 "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
             )
+
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)
@@ -649,6 +660,11 @@ class MooncakeKVManager(BaseKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+
+                        self.kvcache_transfer_latency_monitor.collect_begin_timestamp(
+                            req.room, req.mooncake_session_id
+                        )
+
                         if self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
@@ -671,6 +687,11 @@ class MooncakeKVManager(BaseKVManager):
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                             )
+
+                        self.kvcache_transfer_latency_monitor.collect_finish_timestamp(
+                            req.room, req.mooncake_session_id, ret
+                        )
+
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -695,6 +716,9 @@ class MooncakeKVManager(BaseKVManager):
                             break
 
                         if kv_chunk.is_last:
+                            self.kvcache_transfer_latency_monitor.record(
+                                req.room, req.mooncake_session_id
+                            )
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
                                 req.mooncake_session_id,
@@ -727,6 +751,7 @@ class MooncakeKVManager(BaseKVManager):
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
+                    self.kvcache_transfer_latency_monitor.pop_room(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free

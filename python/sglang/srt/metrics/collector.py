@@ -146,13 +146,18 @@ class SchedulerStats:
     num_decode_prealloc_queue_reqs: int = 0
     num_decode_transfer_queue_reqs: int = 0
     total_retracted_reqs: int = 0
+    kvcache_transfer_latency: float = 0.0
 
 
 class SchedulerMetricsCollector:
 
-    def __init__(self, labels: Dict[str, str]) -> None:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+        bucket_kvcache_transfer_latency: Optional[List[float]] = None,
+    ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Gauge
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels
         self.last_log_time = time.perf_counter()
@@ -268,9 +273,49 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        if bucket_kvcache_transfer_latency is None:
+            bucket_kvcache_transfer_latency = [
+                0.001,
+                0.002,
+                0.004,
+                0.006,
+                0.008,
+                0.01,
+                0.02,
+                0.04,
+                0.06,
+                0.08,
+                0.1,
+                0.2,
+                0.4,
+                0.6,
+                0.8,
+                1,
+                2,
+                4,
+                6,
+                8,
+                10,
+                20,
+                40,
+                60,
+                80,
+                100,
+            ]
+
+        self.histogram_kvcache_transfer_latency = Histogram(
+            name="sglang:kvcache_transfer_latency",
+            documentation="Histogram of kvcache transfer latency in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_kvcache_transfer_latency,
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
+
+    def observe_kvcache_transfer_latency(self, value: float) -> None:
+        self.histogram_kvcache_transfer_latency.labels(**self.labels).observe(value)
 
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
