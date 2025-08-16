@@ -3,7 +3,6 @@ import importlib
 import inspect
 import logging
 import pkgutil
-from functools import lru_cache
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.server_args import ServerArgs
@@ -11,18 +10,6 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 PROCESSOR_MAPPING = {}
-
-
-class DummyMultimodalProcessor(BaseMultimodalProcessor):
-    def __init__(self):
-        pass
-
-    async def process_mm_data_async(self, *args, **kwargs):
-        return None
-
-
-def get_dummy_processor():
-    return DummyMultimodalProcessor()
 
 
 def import_processors():
@@ -33,7 +20,7 @@ def import_processors():
             try:
                 module = importlib.import_module(name)
             except Exception as e:
-                logger.warning(f"Ignore import error when loading {name}: " f"{e}")
+                logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
             all_members = inspect.getmembers(module, inspect.isclass)
             classes = [
@@ -50,11 +37,12 @@ def import_processors():
 
 
 def get_mm_processor(
-    hf_config, server_args: ServerArgs, processor
+    hf_config, server_args: ServerArgs, processor, transport_mode
 ) -> BaseMultimodalProcessor:
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ in hf_config.architectures:
-            return processor_cls(hf_config, server_args, processor)
+            return processor_cls(hf_config, server_args, processor, transport_mode)
+
     raise ValueError(
         f"No processor registered for architecture: {hf_config.architectures}.\n"
         f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"

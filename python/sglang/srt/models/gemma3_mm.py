@@ -283,7 +283,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         # Process images one by one to handle flatten_batch=True constraint in vision_tower
-        all_pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        all_pixel_values = flatten_nested_list([item.feature for item in items])
         vision_outputs_list = []
 
         for pixel_values_batch in all_pixel_values:
@@ -374,7 +374,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             input_ids=llm_input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
+            multimodal_model=self,
             positions=positions,
         )
 
