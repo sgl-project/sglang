@@ -200,8 +200,10 @@ class Qwen2DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
+        dual_chunk_attention_config = (
+            getattr(config, "dual_chunk_attention_config", None)
+            if global_server_args_dict["attention_backend"] == "dual_chunk_flash_attn"
+            else None
         )
         self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
