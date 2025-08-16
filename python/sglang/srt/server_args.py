@@ -2133,9 +2133,6 @@ class ServerArgs:
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
                     "Expected a list or a dictionary."
                 )
-            assert len(set(l.lora_name for l in self.lora_paths)) == len(
-                self.lora_paths
-            ), "Duplicate LoRA names found in --lora-paths."
 
             # Expand target modules
             if self.lora_target_modules:
@@ -2378,11 +2375,20 @@ class PortArgs:
 
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
+        lora_paths = []
         if values:
             assert isinstance(values, list), "Expected a list of LoRA paths."
-            lora_paths = [json_loads_safe(lora_path, lora_path) for lora_path in values]
-        else:
-            lora_paths = []
+            for lora_path in values:
+                lora_path = lora_path.strip()
+                if lora_path.startswith("{") and lora_path.endswith("}"):
+                    obj = json.loads(lora_path)
+                    assert "lora_path" in obj and "lora_name" in obj, (
+                        f"{repr(lora_path)} looks like a JSON str, "
+                        "but it does not contain 'lora_name' and 'lora_path' keys."
+                    )
+                    lora_paths.append(obj)
+                else:
+                    lora_paths.append(lora_path)
 
         setattr(namespace, self.dest, lora_paths)
 
