@@ -18,7 +18,7 @@ import math
 import threading
 import time
 from queue import Empty, Full, PriorityQueue, Queue
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 
@@ -182,12 +182,14 @@ class StorageOperation:
         token_ids: List[int],
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
+        self.prefix_pages = prefix_pages
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -263,6 +265,7 @@ class HiCacheController:
             self.storage_config = self._generate_storage_config(
                 model_name, storage_backend_extra_config
             )
+            self.should_pass_through_prefix_pages = False
             # In MLA backend, only one rank needs to backup the KV cache
             self.backup_skip = (
                 self.storage_config.is_mla_model
@@ -276,6 +279,7 @@ class HiCacheController:
                 from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 
                 self.storage_backend = HiCacheFile(self.storage_config)
+                self.should_pass_through_prefix_pages = True
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 
@@ -308,6 +312,11 @@ class HiCacheController:
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
+                )
+
+            if self.should_pass_through_prefix_pages:
+                self.storage_backend.register_page_retriever(
+                    self.retrieve_host_page_data
                 )
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -456,6 +465,16 @@ class HiCacheController:
             )
             self.prefetch_thread.start()
             self.backup_thread.start()
+
+    def retrieve_host_page_data(
+        self, page_key: str, host_indices: torch.Tensor
+    ) -> Optional[Any]:
+        if self.storage_backend_type == "mooncake":
+            buffer_info = self.mem_pool_host.get_buffer_meta([page_key], host_indices)
+            return buffer_info
+        else:
+            page_data = self.mem_pool_host.get_flat_data_page(host_indices[0])
+            return page_data
 
     def write(
         self,
@@ -818,11 +837,14 @@ class HiCacheController:
         host_indices: torch.Tensor,
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
-        operation = StorageOperation(host_indices, token_ids, hash_value=hash_value)
+        operation = StorageOperation(
+            host_indices, token_ids, hash_value=hash_value, prefix_pages=prefix_pages
+        )
         self.backup_queue.put(operation)
         return operation.id
 
@@ -876,6 +898,14 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+
+            # Set prefix pages in the last batch
+            prefix_pages = (
+                operation.prefix_pages
+                if i + batch_size >= len(operation.hash_value)
+                else None
+            )
+
             # Set one batch token, and record if success.
             # todo: allow partial success
             success = backup_set_func(batch_hashes, batch_host_indices)

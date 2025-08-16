@@ -3,7 +3,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 
@@ -39,6 +39,16 @@ class HiCacheStorage(ABC):
 
     # todo, potentially pass model and TP configs into storage backend
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
+
+    def register_page_retriever(
+        self, page_retriever: Callable[Tuple[str, torch.Tensor], Optional[Any]]
+    ) -> None:
+        """
+        Register a page retriever function.
+        The page retriever function should take a page key and a host memory indices tensor,
+        and return a tensor of the page data.
+        """
+        self.page_retriever = page_retriever
 
     @abstractmethod
     def get(
@@ -87,6 +97,7 @@ class HiCacheStorage(ABC):
         values: Optional[Any] = None,
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
     ) -> bool:
         """
         Store multiple key-value pairs.
@@ -194,10 +205,31 @@ class HiCacheFile(HiCacheStorage):
         values: Optional[Any] = None,
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
     ) -> bool:
         for key, value in zip(keys, values):
             if not self.set(key, value):
                 return False
+
+        if prefix_pages is not None and self.page_retriever is not None:
+            prefix_page_hashes, prefix_host_indices, page_size = prefix_pages
+
+            missing_pages = 0
+            for i, page_key in enumerate(prefix_page_hashes):
+                if not self.exists(page_key):
+                    data = self.page_retriever(
+                        page_key,
+                        prefix_host_indices[i * page_size : (i + 1) * page_size],
+                    )
+                    if data is not None and isinstance(data, torch.Tensor):
+                        self.set(page_key, data)
+                    missing_pages += 1
+
+            if missing_pages > 0:
+                logger.info(
+                    f"Rebuild prefix missing pages, prefix page cnt: {len(prefix_page_hashes)}, missing page cnt: {missing_pages}"
+                )
+
         return True
 
     def exists(self, key: str) -> bool:

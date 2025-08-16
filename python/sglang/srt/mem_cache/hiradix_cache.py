@@ -149,8 +149,9 @@ class HiRadixCache(RadixCache):
         return len(host_indices)
 
     def write_backup_storage(self, node: TreeNode):
+        prefix_pages = self._retrieve_prefix_pages(node)
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.hash_value
+            node.host_value, node.key, node.hash_value, prefix_pages
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -643,6 +644,34 @@ class HiRadixCache(RadixCache):
                     child_key = self.get_child_key_fn(key)
 
         return value, node
+
+    def _retrieve_prefix_pages(self, node: TreeNode):
+        """
+        Retrieve all parent nodes from current node up to root, collecting their page hashes,
+        and host indices. Returns a list of tuples in root-to-leaf order.
+        """
+        if not self.cache_controller.should_pass_through_prefix_pages:
+            return None
+
+        prefix_pages = []
+        host_indices = torch.empty((0,), dtype=torch.int64, device="cpu")
+        current_node = node
+
+        while current_node != self.root_node:
+            if current_node.backuped and len(current_node.hash_value) > 0:
+                page_hashes = current_node.hash_value
+                current_host_indices = current_node.host_value[
+                    : len(page_hashes) * self.page_size
+                ]
+
+                prefix_pages = page_hashes + prefix_pages
+                host_indices = torch.cat([current_host_indices, host_indices])
+
+                current_node = current_node.parent
+            else:
+                return None
+
+        return prefix_pages, host_indices, self.page_size
 
     def _split_node(self, key, child: TreeNode, split_len: int):
         # child node split into new_node -> child

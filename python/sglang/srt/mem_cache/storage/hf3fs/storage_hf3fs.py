@@ -311,6 +311,7 @@ class HiCacheHF3FS(HiCacheStorage):
         values: Optional[Any] = None,
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
     ) -> bool:
         # Todo: Add prefix block's hash key
         key_with_prefix = [(key, "") for key in keys]
