@@ -304,6 +304,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self.actorder = config.actorder
         assert config.symmetric, "Only symmetric quantization is supported for MoE"
 
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+            WNA16_SUPPORTED_BITS,
+        )
         if not (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
             and self.num_bits in WNA16_SUPPORTED_BITS
