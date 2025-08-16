@@ -103,6 +103,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
     Req,
+    RequestStage,
     ScheduleBatch,
     global_server_args_dict,
 )
@@ -1130,6 +1131,9 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
+                metrics_collector=(
+                    self.metrics_collector if self.enable_metrics else None
+                ),
             )
             req.tokenizer = self.tokenizer
 
@@ -1618,6 +1622,7 @@ class Scheduler(
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
                 req.queue_time_end = time.perf_counter()
+                req.add_latency(RequestStage.PREFILL_WAITING)
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
