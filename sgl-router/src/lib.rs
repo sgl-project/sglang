@@ -72,6 +72,12 @@ struct Router {
     cb_timeout_duration_secs: u64,
     cb_window_duration_secs: u64,
     disable_circuit_breaker: bool,
+    // Health check configuration
+    health_failure_threshold: u32,
+    health_success_threshold: u32,
+    health_check_timeout_secs: u64,
+    health_check_interval_secs: u64,
+    health_check_endpoint: String,
 }
 
 impl Router {
@@ -174,6 +180,13 @@ impl Router {
             },
             disable_retries: false,
             disable_circuit_breaker: false,
+            health_check: config::HealthCheckConfig {
+                failure_threshold: self.health_failure_threshold,
+                success_threshold: self.health_success_threshold,
+                timeout_secs: self.health_check_timeout_secs,
+                check_interval_secs: self.health_check_interval_secs,
+                endpoint: self.health_check_endpoint.clone(),
+            },
         })
     }
 }
@@ -186,14 +199,14 @@ impl Router {
         policy = PolicyType::RoundRobin,
         host = String::from("127.0.0.1"),
         port = 3001,
-        worker_startup_timeout_secs = 300,
-        worker_startup_check_interval = 10,
-        cache_threshold = 0.50,
-        balance_abs_threshold = 32,
-        balance_rel_threshold = 1.0001,
-        eviction_interval_secs = 60,
-        max_tree_size = 2usize.pow(24),
-        max_payload_size = 256 * 1024 * 1024,  // 256MB default for large batches
+        worker_startup_timeout_secs = 600,
+        worker_startup_check_interval = 30,
+        cache_threshold = 0.3,
+        balance_abs_threshold = 64,
+        balance_rel_threshold = 1.5,
+        eviction_interval_secs = 120,
+        max_tree_size = 2usize.pow(26),
+        max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
         dp_aware = false,
         api_key = None,
         log_dir = None,
@@ -207,28 +220,34 @@ impl Router {
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
-        request_timeout_secs = 600,  // Add configurable request timeout
+        request_timeout_secs = 1800,  // Add configurable request timeout
         request_id_headers = None,  // Custom request ID headers
         pd_disaggregation = false,  // New flag for PD mode
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
         decode_policy = None,
-        max_concurrent_requests = 64,
+        max_concurrent_requests = 256,
         cors_allowed_origins = vec![],
         // Retry defaults
-        retry_max_retries = 3,
-        retry_initial_backoff_ms = 100,
-        retry_max_backoff_ms = 10_000,
-        retry_backoff_multiplier = 2.0,
-        retry_jitter_factor = 0.1,
+        retry_max_retries = 5,
+        retry_initial_backoff_ms = 50,
+        retry_max_backoff_ms = 30_000,
+        retry_backoff_multiplier = 1.5,
+        retry_jitter_factor = 0.2,
         disable_retries = false,
         // Circuit breaker defaults
-        cb_failure_threshold = 5,
-        cb_success_threshold = 2,
-        cb_timeout_duration_secs = 30,
-        cb_window_duration_secs = 60,
+        cb_failure_threshold = 10,
+        cb_success_threshold = 3,
+        cb_timeout_duration_secs = 60,
+        cb_window_duration_secs = 120,
         disable_circuit_breaker = false,
+        // Health check defaults
+        health_failure_threshold = 3,
+        health_success_threshold = 2,
+        health_check_timeout_secs = 5,
+        health_check_interval_secs = 60,
+        health_check_endpoint = String::from("/health"),
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -276,6 +295,11 @@ impl Router {
         cb_timeout_duration_secs: u64,
         cb_window_duration_secs: u64,
         disable_circuit_breaker: bool,
+        health_failure_threshold: u32,
+        health_success_threshold: u32,
+        health_check_timeout_secs: u64,
+        health_check_interval_secs: u64,
+        health_check_endpoint: String,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -323,6 +347,11 @@ impl Router {
             cb_timeout_duration_secs,
             cb_window_duration_secs,
             disable_circuit_breaker,
+            health_failure_threshold,
+            health_success_threshold,
+            health_check_timeout_secs,
+            health_check_interval_secs,
+            health_check_endpoint,
         })
     }
 
