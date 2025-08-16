@@ -4,7 +4,7 @@ The [compressed-tensors](https://github.com/neuralmagic/compressed-tensors) libr
 
 ## CompressedTensors for MoE Models
 
-To successfully run the Mixture of Experts (MoE) models that are quantized with the `compressed-tensors` format, please follow the steps below to ensure a smooth usage and development experience. 
+To successfully run the Mixture of Experts (MoE) models that are quantized with the `compressed-tensors` format, please follow the steps below to ensure a smooth usage and development experience.
 
 **1. Compilation Issue with `vllm`/`sgl-kernel` and CUDA 12.6**
 

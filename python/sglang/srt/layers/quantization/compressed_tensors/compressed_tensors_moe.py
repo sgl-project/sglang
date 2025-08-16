@@ -316,6 +316,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
             WNA16_SUPPORTED_BITS,
         )
+
         if not (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
             and self.num_bits in WNA16_SUPPORTED_BITS
@@ -348,7 +349,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 intermediate_size_full = extra_weight_attrs.pop(key)
                 break
         else:
-            raise KeyError("extra_weight_attrs must contain 'intermediate_size_full' or 'intermediate_size'")
+            raise KeyError(
+                "extra_weight_attrs must contain 'intermediate_size_full' or 'intermediate_size'"
+            )
 
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
