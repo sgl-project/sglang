@@ -298,7 +298,7 @@ class TokenizerManager:
         # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
         # serves as the source of truth for available adapters and maps user-friendly LoRA names
         # to internally used unique LoRA IDs.
-        self.lora_registry = LoRARegistry(self.server_args.lora_paths or {})
+        self.lora_registry = LoRARegistry(self.server_args.lora_paths)
         # Lock to serialize LoRA update operations.
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
