@@ -47,7 +47,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
@@ -104,7 +103,6 @@ class MixtralMoE(nn.Module):
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            tp_size=tp_size,
             prefix=add_prefix("experts", prefix),
         )
 
