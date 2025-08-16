@@ -42,6 +42,7 @@ impl TestContext {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
         };
 
         let mut workers = Vec::new();

@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.layers.moe import is_tbo_enabled
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -84,17 +85,10 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "device",
     "disable_chunked_prefix_cache",
     "disable_radix_cache",
-    "enable_two_batch_overlap",
-    "tbo_token_distribution_threshold",
     "enable_dp_lm_head",
-    "moe_a2a_backend",
-    "deepep_mode",
-    "enable_flashinfer_cutlass_moe",
-    "enable_flashinfer_trtllm_moe",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
-    "deepep_config",
     "ep_num_redundant_experts",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
@@ -107,8 +101,6 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
     "weight_loader_disable_mmap",
-    "enable_triton_kernel_moe",
-    "enable_flashinfer_mxfp4_moe",
     "enable_multimodal",
     "enable_symm_mem",
     "quantization",
