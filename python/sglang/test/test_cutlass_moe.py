@@ -8,6 +8,7 @@ from transformers import AutoConfig
 
 from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 
 def get_model_config(tp_size: int):
@@ -105,6 +106,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
         torch.rand(batch_size, topk, device="cuda", dtype=dtype), dim=-1
     )
     topk_ids = torch.randint(0, E, (batch_size, topk), dtype=torch.int32, device="cuda")
+    router_logits = torch.rand(batch_size, E, device="cuda", dtype=dtype)
 
     a1_strides = torch.full((E,), H, dtype=torch.int64, device="cuda")
     c1_strides = torch.full((E,), I, dtype=torch.int64, device="cuda")
@@ -123,6 +125,8 @@ def run_test(tp_size, batch_size, model_config, check=False):
     expert_offsets = torch.empty((E + 1,), dtype=torch.int32, device="cuda")
     problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
     problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
+
+    topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
     # --- Lambdas for Benchmarking ---
     cutlass_lambda = lambda: cutlass_fused_experts_fp8(
@@ -146,6 +150,31 @@ def run_test(tp_size, batch_size, model_config, check=False):
         expert_offsets,
         problem_sizes1,
         problem_sizes2,
+        use_shuffle=False,
+    )
+
+    cutlass_shuffle_lambda = lambda: cutlass_fused_experts_fp8(
+        x,
+        w1.transpose(1, 2),  # Transposed
+        w2.transpose(1, 2),  # Transposed
+        w1_scale.transpose(1, 2),
+        w2_scale.transpose(1, 2),
+        topk_weights,
+        topk_ids,
+        a1_strides,
+        c1_strides,
+        a2_strides,
+        c2_strides,
+        workspace,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        use_shuffle=True,
     )
 
     # Note: Triton expects non-transposed weights
@@ -153,8 +182,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
         x,
         w1,
         w2,
-        topk_weights,
-        topk_ids,
+        topk_output,
         inplace=False,  # Use False for benchmarking to avoid side effects if run multiple times
         activation="silu",  # Assuming SiLU activation common in MoEs
         use_fp8_w8a8=True,
@@ -167,6 +195,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
     print("Warming up...")
     for _ in range(10):
         _ = cutlass_lambda()
+        _ = cutlass_shuffle_lambda()
         _ = triton_lambda()
     torch.cuda.synchronize()
 
@@ -177,12 +206,21 @@ def run_test(tp_size, batch_size, model_config, check=False):
         cutlass_lambda, rep=1000, quantiles=quantiles
     )
 
+    quantiles = [0.5, 0.2, 0.8]
+    print(f"Benchmarking Cutlass shuffle fused_experts...")
+    shuffle_ms, shuffle_min, shuffle_max = triton.testing.do_bench_cudagraph(
+        cutlass_shuffle_lambda, rep=1000, quantiles=quantiles
+    )
+
     print(f"Benchmarking Triton fused_experts...")
     triton_ms, triton_min, triton_max = triton.testing.do_bench_cudagraph(
         triton_lambda, rep=1000, quantiles=quantiles
     )
     print(
         f"Cutlass fused_experts time: {cutlass_ms:.3f} ms (median) [{cutlass_min:.3f} - {cutlass_max:.3f}]"
+    )
+    print(
+        f"Shuffle fused_experts time: {shuffle_ms:.3f} ms (median) [{shuffle_min:.3f} - {shuffle_max:.3f}]"
     )
     print(
         f"Triton  fused_experts time: {triton_ms:.3f} ms (median) [{triton_min:.3f} - {triton_max:.3f}]"
@@ -216,13 +254,36 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 problem_sizes2,
             )
 
+            y_shuffle = cutlass_fused_experts_fp8(
+                x,
+                w1.transpose(1, 2),  # Transposed
+                w2.transpose(1, 2),  # Transposed
+                w1_scale.transpose(1, 2),
+                w2_scale.transpose(1, 2),
+                topk_weights,
+                topk_ids,
+                a1_strides,
+                c1_strides,
+                a2_strides,
+                c2_strides,
+                workspace,
+                a_ptrs,
+                b_ptrs,
+                out_ptrs,
+                a_scales_ptrs,
+                b_scales_ptrs,
+                expert_offsets,
+                problem_sizes1,
+                problem_sizes2,
+                use_shuffle=True
+            )
+
             # Run Triton version (requires original shape weights, use inplace=False)
             y_triton = fused_experts(
                 x,
                 w1,  # Original shape
                 w2,  # Original shape
-                topk_weights,
-                topk_ids,
+                topk_output,
                 inplace=False,  # Important: Use False to get output tensor
                 activation="silu",
                 use_fp8_w8a8=True,
@@ -233,26 +294,35 @@ def run_test(tp_size, batch_size, model_config, check=False):
 
         # Ensure outputs are same dtype for comparison
         y_cutlass = y_cutlass.to(dtype)
+        y_shuffle = y_shuffle.to(dtype)
         y_triton = y_triton.to(dtype)
 
-        abs_error = torch.abs(y_cutlass - y_triton)
-        rel_error = abs_error / torch.clamp(torch.abs(y_triton), min=1e-2)
+        abs_error1 = torch.abs(y_cutlass - y_triton)
+        rel_error1 = abs_error1 / torch.clamp(torch.abs(y_triton), min=1e-2)
 
-        max_abs_err = abs_error.max().item()
-        max_rel_err = rel_error.max().item()
+        max_abs_err1 = abs_error1.max().item()
+        max_rel_err1 = rel_error1.max().item()
+
+        abs_error2 = torch.abs(y_shuffle - y_triton)
+        rel_error2 = abs_error2 / torch.clamp(torch.abs(y_triton), min=1e-2)
+
+        max_abs_err2 = abs_error2.max().item()
+        max_rel_err2 = rel_error2.max().item()
 
         print("y_cutlass:", y_cutlass[:, :10])
+        print("y_shuffle:", y_shuffle[:, :10])
         print("y_triton:", y_triton[:, :10])
-        print(f"Max absolute error: {max_abs_err:.6f}")
-        print(f"Max relative error: {max_rel_err:.6f}")
+        print(f"Cutlass max absolute error: {max_abs_err1:.6f}, Cutlass shuffle max absolute error: {max_abs_err2:.6f}")
+        print(f"Cutlass max relative error: {max_rel_err1:.6f}, Cutlass shuffle max relative error: {max_rel_err2:.6f}")
 
         # Tolerance might need adjustment based on FP8 specifics and kernel differences
         # FP8 comparisons often require higher tolerance than FP16/BF16
-        assert max_rel_err < 5e-1, f"Relative error too high! {max_rel_err}"
+        assert max_rel_err1 < 5e-1, f"Relative error too high! {max_rel_err1}"
+        assert max_rel_err2 < 5e-1, f"Relative error too high! {max_rel_err2}"
         print("Correctness check passed.")
 
 
-def main(tp_size=8, batch_sizes=[1, 4, 8, 16, 32, 64, 128, 256, 512], check=False):
+def main(tp_size=8, batch_sizes=[1, 4, 8, 16, 32, 64, 128, 256, 512, 32768], check=False, prof=False):
     model_config = get_model_config(tp_size)
     print("Model Config:", model_config)
     for batch_size in batch_sizes:
@@ -266,7 +336,7 @@ if __name__ == "__main__":
         "--batch-sizes",
         type=int,
         nargs="+",
-        default=[1, 4, 8, 16, 32, 64, 128, 256, 512],  # Adjusted default
+        default=[1, 4, 8, 16, 32, 64, 128, 256, 512, 4096, 8192, 16384, 32768],  # Adjusted default
         help="List of batch sizes to test",
     )
     parser.add_argument("--check", action="store_true", help="Enable check mode")

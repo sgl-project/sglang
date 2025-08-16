@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
-from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
+from sglang.srt.layers.utils import is_sm100_supported, is_sm90_supported
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -48,6 +48,7 @@ def cutlass_fused_experts_fp8(
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
     use_fp8_blockscale: bool = True,
+    use_shuffle: bool = True,
 ) -> torch.Tensor:
     """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
 
@@ -125,8 +126,8 @@ def cutlass_fused_experts_fp8(
     if is_cuda:
         from sglang.srt.layers.quantization.fp8_kernel import (
             per_group_transpose,
-            per_token_group_quant_fp8_hopper_moe_mn_major,
             sglang_per_token_group_quant_fp8,
+            shuffle_fp8_scale_hopper_moe_mn_major,
         )
 
     out_dtype = a.dtype
@@ -155,11 +156,23 @@ def cutlass_fused_experts_fp8(
 
     a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
     rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
-    rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
-
-    if not is_sm100_supported():
-        rep_a1_scales = per_group_transpose(rep_a1_scales, expert_offsets)
-        w1_scale = w1_scale.contiguous()
+    if is_sm100_supported():
+        rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
+    elif is_sm90_supported():
+        if not use_shuffle:
+            rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
+            rep_a1_scales = per_group_transpose(rep_a1_scales, expert_offsets)
+        else:
+            rep_a1_scales = shuffle_fp8_scale_hopper_moe_mn_major(
+                a1_scale,
+                expert_offsets[:-1],
+                problem_sizes1,
+                m * topk,
+                a_map,
+            )
+    else:
+        raise NotImplementedError("Only support sm100 and sm90 for now")
+    w1_scale = w1_scale.contiguous()
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
@@ -193,8 +206,16 @@ def cutlass_fused_experts_fp8(
 
     intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
     if not is_sm100_supported():
-        a2_scale = per_group_transpose(a2_scale, expert_offsets)
-        w2_scale = w2_scale.contiguous()
+        if not use_shuffle:
+            a2_scale = per_group_transpose(a2_scale, expert_offsets)
+        else:
+            a2_scale = shuffle_fp8_scale_hopper_moe_mn_major(
+                a2_scale,
+                expert_offsets[:-1],
+                problem_sizes2,
+                m * topk,
+            )
+    w2_scale = w2_scale.contiguous()
 
     fp8_blockwise_scaled_grouped_mm(
         c2,
@@ -224,7 +245,6 @@ def cutlass_fused_experts_fp8(
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = 448.0
-
 
 def cutlass_moe_fp4(
     a: torch.Tensor,
