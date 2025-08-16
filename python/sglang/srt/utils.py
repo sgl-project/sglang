@@ -2599,6 +2599,23 @@ def dynamic_import(func_path: str):
     return func
 
 
+@contextmanager
+def temp_set_cuda_visible_devices(gpu_id: int):
+    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if original_cuda_visible_devices:
+        cuda_visisble_devices = original_cuda_visible_devices.split(",")
+    else:
+        cuda_visisble_devices = []
+
+    str_gpu_id = cuda_visisble_devices[gpu_id] if cuda_visisble_devices else str(gpu_id)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
+    yield
+    if original_cuda_visible_devices:
+        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+    else:
+        del os.environ["CUDA_VISIBLE_DEVICES"]
+
+
 def configure_gc_logger():
     logger.info("Enable GC Logger")
 

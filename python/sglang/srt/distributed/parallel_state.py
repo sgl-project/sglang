@@ -251,7 +251,7 @@ class GroupCoordinator:
         assert self.device_group is not None
 
         if is_cuda_alike():
-            self.device = torch.device(f"cuda:{local_rank}")
+            self.device = torch.device(f"cuda:{0}")
         else:
             self.device = torch.device("cpu")
 

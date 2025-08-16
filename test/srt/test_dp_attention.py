@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_amd_ci,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -124,6 +125,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestDPAttentionMinimumTokenLoadBalance(CustomTestCase):
     @classmethod
     def setUpClass(cls):
