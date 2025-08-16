@@ -106,7 +106,7 @@ def is_in_amd_ci():
 
 
 def _use_cached_default_models(model_repo: str):
-    cache_dir = os.getenv("HF_HOME")
+    cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
     if cache_dir and model_repo:
         model_path = os.path.join(cache_dir, model_repo)
         if os.path.isdir(model_path):
