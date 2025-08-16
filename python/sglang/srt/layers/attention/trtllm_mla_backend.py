@@ -455,7 +455,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             else 1.0
         )
 
+        v_scale = layer.v_scale_float
+        assert k_scale == v_scale, f"{k_scale=} {v_scale=}"
+
         bmm1_scale = q_scale * k_scale * layer.scaling
+        bmm2_scale = v_scale
 
         # Call TRT-LLM kernel
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -469,6 +473,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
             bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
         )
 
         # Extract value projection part and reshape
