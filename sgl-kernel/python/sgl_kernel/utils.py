@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import functools
+import subprocess
 from typing import Dict, Tuple
 
 import torch
@@ -39,3 +41,11 @@ def _to_tensor_scalar_tuple(x):
         return (x, 0)
     else:
         return (None, x)
+
+
+@functools.lru_cache(maxsize=1)
+def is_hopper_arch() -> bool:
+    # Hopper arch's compute capability == 9.0
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    return major == 9

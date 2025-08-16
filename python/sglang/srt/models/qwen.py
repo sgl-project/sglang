@@ -15,6 +15,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/qwen.py#L1
 
+import time
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -285,6 +286,42 @@ class QWenLMHeadModel(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+    ):
+        start, end = split_interval
+        # embed
+        if start == 0:
+            forward_batch.hidden_states = self.transformer.wte(input_ids)
+
+        # decoder layer
+        for i in range(start, end):
+            layer = self.transformer.h[i]
+            forward_batch.hidden_states = layer(
+                positions,
+                forward_batch.hidden_states,
+                forward_batch,
+            )
+
+        if end == self.transformer.config.num_hidden_layers:
+            # norm
+            forward_batch.hidden_states = self.transformer.ln_f(
+                forward_batch.hidden_states
+            )
+            # logits process
+            result = self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            result = None
+
+        return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

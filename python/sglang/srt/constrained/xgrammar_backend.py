@@ -28,13 +28,19 @@ from xgrammar import (
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
+    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
 )
-from sglang.srt.constrained.triton_ops.bitmask_ops import (
-    apply_token_bitmask_inplace_triton,
-)
+from sglang.srt.utils import is_hip
 
+_is_hip = is_hip()
+if _is_hip:
+    from sgl_kernel import apply_token_bitmask_inplace_cuda
+else:
+    from sglang.srt.constrained.triton_ops.bitmask_ops import (
+        apply_token_bitmask_inplace_triton,
+    )
 logger = logging.getLogger(__name__)
 
 
@@ -93,7 +99,10 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type == "cuda":
-            apply_token_bitmask_inplace_triton(logits, vocab_mask)
+            if _is_hip:
+                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
+            else:
+                apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "cpu" and self.apply_vocab_mask_cpu:
             self.apply_vocab_mask_cpu(logits, vocab_mask)
         else:
@@ -149,11 +158,14 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self,
         tokenizer,
         vocab_size: int,
+        model_eos_token_ids: Optional[List[int]] = None,
     ):
         super().__init__()
 
+        # Create TokenizerInfo with model's EOS tokens as the authoritative stop tokens
+        # This ensures consistency between what the model considers EOS and what XGrammar uses
         tokenizer_info = TokenizerInfo.from_huggingface(
-            tokenizer, vocab_size=vocab_size
+            tokenizer, vocab_size=vocab_size, stop_token_ids=model_eos_token_ids
         )
         override_stop_tokens = None
 
@@ -178,25 +190,26 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
                 ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
-        except RuntimeError as e:
-            logging.warning(f"Skip invalid json_schema: json_schema={key_string}, {e=}")
-            return None
+
+        except (RuntimeError, json.decoder.JSONDecodeError) as e:
+            logging.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
         return self._from_context(ctx, key_string)
 
     def dispatch_ebnf(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             ctx = self.grammar_compiler.compile_grammar(key_string)
         except RuntimeError as e:
-            logging.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
-            return None
+            logging.error(f"Hit invalid ebnf: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
         return self._from_context(ctx, key_string)
 
     def dispatch_regex(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             ctx = self.grammar_compiler.compile_regex(key_string)
         except RuntimeError as e:
-            logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
-            return None
+            logging.error(f"Hit invalid regex: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
         return self._from_context(ctx, key_string)
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
@@ -213,13 +226,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             ctx = self.grammar_compiler.compile_structural_tag(
                 tags, structural_tag["triggers"]
             )
-        except RuntimeError as e:
-            logging.warning(
-                f"Skip invalid structural_tag: structural_tag={key_string}, {e=}"
-            )
-            return None
+        except (RuntimeError, json.decoder.JSONDecodeError) as e:
+            logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
         return self._from_context(ctx, key_string)
 
     def reset(self):
-        if self.grammar_compiler:
-            self.grammar_compiler.clear_cache()
+        self.grammar_compiler.clear_cache()

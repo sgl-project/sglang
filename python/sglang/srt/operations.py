@@ -1,9 +1,16 @@
+from __future__ import annotations
+
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Generator, List, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Sequence, Union
 
 import torch
+
+from sglang.srt.layers.dp_attention import set_dp_buffer_len
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_OPERATIONS_ENABLE_PROFILE", "0")))
 
@@ -12,12 +19,43 @@ if _ENABLE_PROFILE:
 
 
 def execute_operations(inputs, operations):
-    stages = _convert_operations_to_stages(decorate_operations(operations))
+    stages = _convert_operations_to_stages(operations)
     executor = _StageExecutor("primary", stages, inputs=inputs)
     for _ in range(executor.num_stages):
         executor.next()
     assert executor.done
     return executor.output
+
+
+def execute_overlapped_operations(
+    inputs_arr: Sequence,
+    operations_arr: Sequence,
+    delta_stages: Sequence[int],
+) -> Sequence:
+    # Make it explicit for clarity; if we need multi-batch overlap, this can be generalized
+    inputs_a, inputs_b = inputs_arr
+    operations_a, operations_b = operations_arr
+    delta_stage_a, delta_stage_b = delta_stages
+    assert delta_stage_a == 0
+    delta_stage = delta_stage_b
+
+    stages_a = _convert_operations_to_stages(operations_a)
+    stages_b = _convert_operations_to_stages(operations_b)
+    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a)
+    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b)
+
+    for _ in range(delta_stage):
+        executor_a.next()
+
+    for _ in range(executor_a.num_stages - delta_stage):
+        executor_a.next()
+        executor_b.next()
+
+    for _ in range(delta_stage):
+        executor_b.next()
+
+    assert executor_a.done and executor_b.done
+    return [executor_a.output, executor_b.output]
 
 
 class YieldOperation:
@@ -35,17 +73,25 @@ Stage = List[ExecutionOperation]
 
 
 class _StageExecutor:
-    def __init__(self, debug_name: str, stages: List[Stage], inputs):
+    def __init__(self, debug_name: str, stages: List[Stage], inputs: dict):
         self._debug_name = debug_name
         self._stages = stages
         self._index = 0
         self._stage_state = _StateDict()
         self._stage_output = inputs
 
+        # handling DP attention
+        forward_batch: ForwardBatch = inputs["forward_batch"]
+        self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
+        self._local_dp_buffer_len = forward_batch.input_ids.shape[0]
+
     def next(self):
         assert not self.done
 
         stage = self._stages[self._index]
+
+        if self._global_dp_buffer_len is not None:
+            set_dp_buffer_len(self._global_dp_buffer_len, self._local_dp_buffer_len)
 
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
             for op in stage:
@@ -109,6 +155,9 @@ class _StateDict:
         for k, v in values.items():
             setattr(self, k, v)
 
+    def get(self, item):
+        return self._data.get(item)
+
     def clear(self, expect_keys: Sequence[str]):
         if set(self._data.keys()) != set(expect_keys):
             raise Exception(
@@ -119,6 +168,7 @@ class _StateDict:
 
 
 def _convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
+    operations = _decorate_operations(operations)
     operation_chunks = list(
         _chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation))
     )
@@ -140,7 +190,7 @@ def _chunk_by_separator(
         yield pending_items
 
 
-def decorate_operations(operations: List[Operation], debug_name_prefix: str = ""):
+def _decorate_operations(operations: List[Operation], debug_name_prefix: str = ""):
     return [_decorate_operation(op, debug_name_prefix) for op in operations]
 
 
