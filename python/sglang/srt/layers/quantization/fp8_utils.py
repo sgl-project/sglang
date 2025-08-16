@@ -736,14 +736,25 @@ def apply_fp8_linear(
                     assert (
                         weight_scale.numel() == weight.shape[1]
                     ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
-                    output = fp8_scaled_mm(
-                        qinput,
-                        weight,
-                        x_scale,
-                        weight_scale,
-                        out_dtype=input.dtype,
-                        bias=bias,
+                    
+                    cutlass_compatible_b = (
+                        weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
                     )
+                    if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
+                        # Massage the input to be 2D
+                        qinput = qinput.view(-1, qinput.shape[-1])
+                        output = triton_scaled_mm(
+                            qinput, weight, x_scale, weight_scale, input.dtype, bias
+                        )
+                    else:
+                        output = fp8_scaled_mm(
+                            qinput,
+                            weight,
+                            x_scale,
+                            weight_scale,
+                            out_dtype=input.dtype,
+                            bias=bias,
+                        )
                 return output.view(*output_shape)
             except (ImportError, NameError, AttributeError):
                 pass
