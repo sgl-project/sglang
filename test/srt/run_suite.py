@@ -79,7 +79,7 @@ suites = {
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
-        TestFile("test_mla.py", 167),
+        TestFile("test_mla.py", 500),
         TestFile("test_mla_deepseek_v3.py", 700),
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
@@ -261,7 +261,7 @@ suite_xeon = {
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
-        TestFile("test_intel_amx_attention_backend.py"),
+        TestFile("test_attention_backend_on_cpu.py"),
     ],
 }
 
