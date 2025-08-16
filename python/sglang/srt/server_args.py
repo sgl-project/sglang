@@ -39,7 +39,6 @@ from sglang.srt.utils import (
     is_remote_url,
     is_triton_kernels_available,
     is_valid_ipv6_address,
-    json_loads_safe,
     nullable_str,
 )
 
