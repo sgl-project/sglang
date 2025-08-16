@@ -218,6 +218,13 @@ class PrefetchOperation(StorageOperation):
 
 class HiCacheController:
 
+    @staticmethod
+    def get_hash_str_with_prefix(get_hash_str, prefix):
+        def prefix_hash(input_str, prior_hash: str = None):
+            hash_result = get_hash_str(input_str)
+            return prefix + hash_result
+        return prefix_hash
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -228,6 +235,7 @@ class HiCacheController:
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
+        storage_backend_tag: Optional[str] = None,
         prefetch_threshold: int = 256,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -238,6 +246,7 @@ class HiCacheController:
         self.io_backend = io_backend
 
         self.enable_storage = False
+        self.enable_storage_tag = storage_backend_tag is not None and storage_backend_tag != ""
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -245,12 +254,22 @@ class HiCacheController:
 
             if storage_backend == "file":
                 self.storage_backend = HiCacheFile()
-                self.get_hash_str = get_hash_str
+                if self.enable_storage_tag:
+                    self.get_hash_str = self.get_hash_str_with_prefix(
+                        get_hash_str, str(storage_backend_tag) + ":"
+                    )
+                else:
+                    self.get_hash_str = get_hash_str
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 
                 self.storage_backend = HiCacheNixl()
-                self.get_hash_str = get_hash_str
+                if self.enable_storage_tag:
+                    self.get_hash_str = self.get_hash_str_with_prefix(
+                        get_hash_str, str(storage_backend_tag) + ":"
+                    )
+                else:
+                    self.get_hash_str = get_hash_str
             elif storage_backend == "mooncake":
                 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                     MooncakeStore,
@@ -258,7 +277,12 @@ class HiCacheController:
                 )
 
                 self.storage_backend = MooncakeStore()
-                self.get_hash_str = get_hash_str_mooncake
+                if self.enable_storage_tag:
+                    self.get_hash_str = self.get_hash_str_with_prefix(
+                        get_hash_str_mooncake, str(storage_backend_tag) + ":"
+                    )
+                else:
+                    self.get_hash_str = get_hash_str_mooncake
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":
