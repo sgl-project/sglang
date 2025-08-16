@@ -37,6 +37,13 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import fused_marlin_moe
+
 logger = logging.getLogger(__name__)
 
 
@@ -611,7 +618,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         topk_weights, topk_ids, router_logits = topk_output
 
-        return torch.ops.vllm.fused_marlin_moe(
+        return fused_marlin_moe(
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
