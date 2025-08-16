@@ -335,9 +335,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         **extra_weight_attrs,
     ):
 
-        assert (
-            params_dtype == torch.float16
-        ), "float16 is required for MoE compressed models. Set dtype=torch.float16"  # noqa: E501
+        if params_dtype not in (torch.float16, torch.bfloat16):
+            raise AssertionError(
+                "float16 or bfloat16 is required for MoE compressed models. "
+                "Set dtype=torch.float16 or torch.bfloat16"
+            )
 
         for key in ("intermediate_size_full", "intermediate_size"):
             if key in extra_weight_attrs:
@@ -618,12 +620,26 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         topk_weights, topk_ids, router_logits = topk_output
 
+        # The environments/kernel implementations expect float16 scales.
+        # If the stored parameter dtype is bfloat16, cast the scales to float16
+        # for the fused op on-the-fly to improve compatibility.
+        w13_ws = layer.w13_weight_scale
+        w2_ws = layer.w2_weight_scale
+        if w13_ws is not None and w13_ws.dtype == torch.bfloat16:
+            w13_ws = w13_ws.to(torch.float16)
+        if w2_ws is not None and w2_ws.dtype == torch.bfloat16:
+            w2_ws = w2_ws.to(torch.float16)
+
+        # The input must currently be float16
+        orig_dtype = x.dtype
+        x = x.half()
+
         return fused_marlin_moe(
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
+            w13_ws,
+            w2_ws,
             router_logits,
             topk_weights,
             topk_ids,
@@ -633,4 +649,4 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             sort_indices2=layer.w2_g_idx_sort_indices,
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
-        )
+        ).to(orig_dtype)
