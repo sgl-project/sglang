@@ -579,11 +579,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         if self.use_flashinfer:
-            # Based on profiling results, we need to quantize x to mxfp8 here to achieve better performance
-            x_quant, x_scale = mxfp8_quantize(
-                x, False, alignment=self.hidden_size
-            )  # to mxfp8
+            # When bf16 mode is enabled, we don't need to quantize the input,
+            # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
+            # which can theoretically improve performance
+            if self.flashinfer_mxfp4_moe_precision == "bf16":
+                assert x.dtype == torch.bfloat16
+                x_quant = x
+                x_scale = None
+            if self.flashinfer_mxfp4_moe_precision == "default":
+                x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
+                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            else:
+                raise NotImplementedError
+
+            # TODO old
+            x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)  # to mxfp8
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+
             assert x_quant.shape[-1] == self.hidden_size
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 

@@ -185,7 +185,7 @@ class ServerArgs:
         "flashinfer_cutlass",
         "flashinfer_mxfp4",
     ] = "auto"
-    flashinfer_mxfp4_moe_precision: Literal["mxfp4", "bf16"] = "mxfp4"
+    flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
