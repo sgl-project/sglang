@@ -270,6 +270,22 @@ def flash_attn_varlen_func(
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Entry point to Flash Attention.
+
+    Args:
+        q:
+        k:
+        v:
+        cu_seqlens_q: `(batch_size+1,)`cumsum of seqlens, starting with 0.
+        cu_seqlens_k: `(batch_size+1,)`cumsum of seqlens, starting with 0.
+        seqused_q:
+        seqused_k:
+        softmax_scale: `q[i] @ k[j].T * softmax_scale`. If `None`, uses `rsqrt(head_dim)`.
+        causal:
+        window_size: `(left, right)`. Leaving `None, None` means full attention.
+        learnable_sink: this is actually not learnable, just a Tensor containing the sink constant.
+        softcap: if not `0`, each logit will become `softcap * tanh(q[i] @ k[j].T * softmax_scale / softcap)`.
+    """
     assert causal, "Only support causal."
     assert (
         window_size[0] is None and window_size[1] is None

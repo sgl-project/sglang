@@ -551,65 +551,47 @@ def cvt_f16(src: cute.Tensor, dst: cute.Tensor):
 
 
 @dsl_user_op
-def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
-    vec_i64x1 = vector.from_elements(
-        T.vector(1, T.i64()), (c.ir_value(),), loc=loc, ip=ip
+def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    out_f32x2 = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [Float32(x).ir_value(loc=loc, ip=ip), Float32(y, loc=loc, ip=ip).ir_value()],
+        "{\n\t"
+        ".reg .f32 f1, f2, f3, f4, f5, f6, f7;\n\t"
+        ".reg .b64 l1, l2, l3, l4, l5, l6, l7, l8, l9, l10;\n\t"
+        ".reg .s32 r1, r2, r3, r4, r5, r6, r7, r8;\n\t"
+        "max.ftz.f32 f1, $2, 0fC2FE0000;\n\t"
+        "max.ftz.f32 f2, $3, 0fC2FE0000;\n\t"
+        "mov.b64 l1, {f1, f2};\n\t"
+        "mov.f32 f3, 0f4B400000;\n\t"
+        "mov.b64 l2, {f3, f3};\n\t"
+        "add.rm.ftz.f32x2 l7, l1, l2;\n\t"
+        "sub.rn.ftz.f32x2 l8, l7, l2;\n\t"
+        "sub.rn.ftz.f32x2 l9, l1, l8;\n\t"
+        "mov.f32 f7, 0f3D9DF09D;\n\t"
+        "mov.b64 l6, {f7, f7};\n\t"
+        "mov.f32 f6, 0f3E6906A4;\n\t"
+        "mov.b64 l5, {f6, f6};\n\t"
+        "mov.f32 f5, 0f3F31F519;\n\t"
+        "mov.b64 l4, {f5, f5};\n\t"
+        "mov.f32 f4, 0f3F800000;\n\t"
+        "mov.b64 l3, {f4, f4};\n\t"
+        "fma.rn.ftz.f32x2 l10, l9, l6, l5;\n\t"
+        "fma.rn.ftz.f32x2 l10, l10, l9, l4;\n\t"
+        "fma.rn.ftz.f32x2 l10, l10, l9, l3;\n\t"
+        "mov.b64 {r1, r2}, l7;\n\t"
+        "mov.b64 {r3, r4}, l10;\n\t"
+        "shl.b32 r5, r1, 23;\n\t"
+        "add.s32 r7, r5, r3;\n\t"
+        "shl.b32 r6, r2, 23;\n\t"
+        "add.s32 r8, r6, r4;\n\t"
+        "mov.b32 $0, r7;\n\t"
+        "mov.b32 $1, r8;\n\t"
+        "}\n",
+        "=r,=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
-    vec_f32x2 = vector.bitcast(T.vector(2, T.f32()), vec_i64x1)
-    res0 = Float32(
-        vector.extract(
-            vec_f32x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip
-        )
-    )
-    res1 = Float32(
-        vector.extract(
-            vec_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip
-        )
-    )
-    return res0, res1
-
-
-@cute.jit
-def e2e_asm2(x: Float32, y: Float32) -> Tuple[Float32, Float32]:
-    out_i64 = cutlass.Int64(
-        llvm.inline_asm(
-            T.i64(),
-            [Float32(x).ir_value(), Float32(y).ir_value()],
-            "{\n\t"
-            ".reg .f32 f1, f2, f3, f4, f5, f6, f7;\n\t"
-            ".reg .b64 l1, l2, l3, l4, l5, l6, l7, l8, l9, l10;\n\t"
-            ".reg .s32 r1, r2, r3, r4, r5, r6, r7, r8;\n\t"
-            "max.ftz.f32 f1, $1, 0fC2FE0000;\n\t"
-            "max.ftz.f32 f2, $2, 0fC2FE0000;\n\t"
-            "mov.b64 l1, {f1, f2};\n\t"
-            "mov.f32 f3, 0f4B400000;\n\t"
-            "mov.b64 l2, {f3, f3};\n\t"
-            "add.rm.ftz.f32x2 l7, l1, l2;\n\t"
-            "sub.rn.ftz.f32x2 l8, l7, l2;\n\t"
-            "sub.rn.ftz.f32x2 l9, l1, l8;\n\t"
-            "mov.f32 f7, 0f3D9DF09D;\n\t"
-            "mov.b64 l6, {f7, f7};\n\t"
-            "mov.f32 f6, 0f3E6906A4;\n\t"
-            "mov.b64 l5, {f6, f6};\n\t"
-            "mov.f32 f5, 0f3F31F519;\n\t"
-            "mov.b64 l4, {f5, f5};\n\t"
-            "mov.f32 f4, 0f3F800000;\n\t"
-            "mov.b64 l3, {f4, f4};\n\t"
-            "fma.rn.ftz.f32x2 l10, l9, l6, l5;\n\t"
-            "fma.rn.ftz.f32x2 l10, l10, l9, l4;\n\t"
-            "fma.rn.ftz.f32x2 l10, l10, l9, l3;\n\t"
-            "mov.b64 {r1, r2}, l7;\n\t"
-            "mov.b64 {r3, r4}, l10;\n\t"
-            "shl.b32 r5, r1, 23;\n\t"
-            "add.s32 r7, r5, r3;\n\t"
-            "shl.b32 r6, r2, 23;\n\t"
-            "add.s32 r8, r6, r4;\n\t"
-            "mov.b64 $0, {r7, r8};\n\t"
-            "}\n",
-            "=l,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-    return i64_to_f32x2(out_i64)
+    out0 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [0], loc=loc, ip=ip))
+    out1 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [1], loc=loc, ip=ip))
+    return out0, out1

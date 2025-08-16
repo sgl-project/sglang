@@ -6,7 +6,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
-from sglang.srt.layers.attention.cute_ops import mma_sm100_desc as sm100_desc
+import sglang.srt.layers.attention.cute_ops.mma_sm100_desc as sm100_desc
 
 
 @cute.jit

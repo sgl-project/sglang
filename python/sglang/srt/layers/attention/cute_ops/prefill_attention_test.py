@@ -100,14 +100,14 @@ def test_ragged(
         size=(kv_len, num_kv_heads, head_dim), dtype=dtype, device="cuda"
     ).uniform_(-init_range, init_range)
 
-    out, lse, *rest = flash_attn_varlen_func(
+    out = flash_attn_varlen_func(
         q,
         k,
         v,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         causal=causal,
-    )
+    )[0]
 
     # out = flash_attn_varlen_func(
     #     q=q,

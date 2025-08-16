@@ -184,12 +184,14 @@ class AttentionMask:
                         # 0 -> 0b00...00, 1 -> 0b00...01, ..., 31 -> 0b01...11, 32 -> 0b11...11
                         mask = cutlass.Uint32((1 << col_limit_right_cur) - 1)
                         # if tidx == 0: cute.printf("mask = 0x%x, col_limit_right_s = %d, col_limit_right_cur = %d", mask, col_limit_right_s, col_limit_right_cur)
-                        for i in cutlass.range(16, unroll_full=True):
+                        # This needs to be range_constexpr, otherwise the compiler can't generate
+                        # the R2P instruction
+                        for i in cutlass.range_constexpr(16):
                             # mask >> i does not produce correct result for 0b11..11 >> 31
                             # However, if we use utils.shr_u32, the compiler doesn't generate
                             # the R2P instruction, so it's slower.
                             # Instead we just move by 16 instead of 32.
-                            mask_i_bit = cutlass.Boolean((mask >> i) & 1)
+                            mask_i_bit = cutlass.Boolean(mask & (1 << i))
                             # mask_i_bit = cutlass.Boolean(utils.shr_u32(mask, i) & 1)
                             # if tidx == 0: cute.printf("mask_i_bit = %d, after shift = 0x%x, i = %d, s = %d", mask_i_bit, utils.shr_u32(mask, i), i, s)
                             acc_S[s * 16 + i] = (
@@ -229,9 +231,11 @@ class AttentionMask:
                         col_limit_right_cur = cutlass.Uint32(max(col_limit_right_s, 0))
                         # 0 -> 0b00...00, 1 -> 0b00...01, ..., 31 -> 0b01...11, 32 -> 0b11...11
                         mask = cutlass.Uint32((1 << col_limit_right_cur) - 1)
-                        for i in cutlass.range(16, unroll_full=True):
+                        # This needs to be range_constexpr, otherwise the compiler can't generate
+                        # the R2P instruction
+                        for i in cutlass.range_constexpr(16):
                             # mask_i_bit = cutlass.Boolean(utils.shr_u32(mask, i) & 1)
-                            mask_i_bit = cutlass.Boolean((mask >> i) & 1)
+                            mask_i_bit = cutlass.Boolean(mask & (1 << i))
                             acc_S[s * 16 + i] = (
                                 acc_S[s * 16 + i]
                                 if mask_i_bit
