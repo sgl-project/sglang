@@ -77,7 +77,9 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             if not VLLM_AVAILABLE:
                 raise ImportError(
-                    "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm."
+                    "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm. "
+                    "Please refer to `compressed_tensors.md` for the vllm installation instructions: "
+                    "https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/compressed_tensors.md"
                 )
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
