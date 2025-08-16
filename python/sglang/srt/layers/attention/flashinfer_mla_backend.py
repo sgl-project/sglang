@@ -420,6 +420,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 logits_soft_cap=logits_soft_cap,
             )
         else:
+            raise Exception("chunked prefill + fp8 not done")
+
             # mla paged prefill
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
