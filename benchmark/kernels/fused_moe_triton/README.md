@@ -39,6 +39,7 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --model meituan/DeepSeek-R1-Channel-INT8 \
     --tp-size 16 \
     --dtype int8_w8a8 \
+    --per-channel-quant \
     --tune
 ```
 
