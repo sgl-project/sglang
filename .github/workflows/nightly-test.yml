@@ -46,6 +46,7 @@ jobs:
       - name: Run performance test for text models
         timeout-minutes: 180
         run: |
+          rm -rf test/srt/performance_profiles/
           cd test/srt
           python3 test_nightly_text_models_performance.py
 
@@ -64,6 +65,8 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           ARTIFACT_NAME: performance-profiles-${{ github.run_id }}
         run: |
+          echo 'Artifact ID is ${{ steps.artifact-upload-step.outputs.artifact-id }}'
+          echo 'Artifact URL is ${{ steps.artifact-upload-step.outputs.artifact-url }}'
           python3 - <<'PY'
           import json, os, urllib.request, datetime
           token = os.environ['GITHUB_TOKEN']

@@ -150,10 +150,11 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
 
         # Persist the report for later substitution of artifact URL in the workflow
         with open(REPORT_MD_FILENAME, "w") as f:
+            print(f"results written to {REPORT_MD_FILENAME=}")
             f.write(full_report)
 
-        if is_in_ci():
-            write_github_step_summary(full_report)
+        # if is_in_ci():
+        #     write_github_step_summary(full_report)
 
 
 if __name__ == "__main__":
