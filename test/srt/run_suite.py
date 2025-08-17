@@ -110,8 +110,8 @@ suites = {
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vlm_input_format.py", 300),
-        TestFile("test_vision_openai_server_a.py", 989),
-        TestFile("test_vision_openai_server_b.py", 620),
+        TestFile("test_vision_openai_server_a.py", 403),
+        TestFile("test_vision_openai_server_b.py", 446),
     ],
     "per-commit-2-gpu": [
         TestFile("lora/test_lora_tp.py", 116),
