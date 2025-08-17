@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y sudo && \
 
 # Install Python 3.10 and set it as default
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends software-properties-common && \
+    apt-get install -y --no-install-recommends software-properties-common python3-apt && \
     add-apt-repository -y ppa:deadsnakes/ppa && \
     apt-get update && \
     apt-get install -y --no-install-recommends python3.10 python3.10-venv python3.10-dev python3-pip && \
