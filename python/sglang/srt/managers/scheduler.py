@@ -1593,7 +1593,7 @@ class Scheduler(
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
-        def _try_add_req(req: Req, is_cfg_req: bool) -> bool:
+        def _try_add_req(req: Req) -> bool:
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
             if res != AddReqResult.CONTINUE:
@@ -1654,15 +1654,20 @@ class Scheduler(
                 if not dry_run_res:
                     continue
 
-                can_continue = _try_add_req(cfg_req, True)
-                if not can_continue:
-                    raise ValueError(
-                        "Added unconditioned half of CFG prompt to batch but not its conditioned parent"
+                if not _try_add_req(cfg_req):
+                    raise RuntimeError(
+                        "Couldn't add uncond CFG prompt to batch, or "
+                        "did add uncond CFG prompt but not the conditioned prompt to batch."
                     )
 
-            can_continue = _try_add_req(req, req.rid in self.cfg_rid_to_uncond)
-            if not can_continue:
-                break
+                can_run_len = len(adder.can_run_list)
+                if not _try_add_req(req) and len(adder.can_run_list) == can_run_len:
+                    raise RuntimeError(
+                        "Added uncond CFG prompt to batch, but not the conditioned prompt."
+                    )
+            else:
+                if not _try_add_req(req):
+                    break
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
