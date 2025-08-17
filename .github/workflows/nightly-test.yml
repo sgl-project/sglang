@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  nightly-test:
+  nightly-test-eval-text-models:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: 2-gpu-runner
     steps:
@@ -26,8 +26,94 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run test
+      - name: Run eval test for text models
         timeout-minutes: 120
         run: |
           cd test/srt
           python3 run_suite.py --suite nightly --timeout-per-file 3600
+
+  nightly-test-text-models-performance:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run performance test for text models
+        timeout-minutes: 180
+        run: |
+          cd test/srt
+          python3 test_nightly_text_models_performance.py
+
+      - name: Upload profile traces' artifacts
+        id: upload_profiles
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-profiles-${{ github.run_id }}
+          path: test/srt/performance_profiles/
+
+      - name: Resolve artifact URL for performance profiles
+        id: resolve_artifact_url
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ARTIFACT_NAME: performance-profiles-${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, datetime
+          token = os.environ['GITHUB_TOKEN']
+          repo = os.environ['REPO']
+          run_id = os.environ['RUN_ID']
+          target_name = os.environ['ARTIFACT_NAME']
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read().decode())
+          # Filter by exact name and non-expired
+          cand = [a for a in data.get('artifacts', []) if a.get('name') == target_name and not a.get('expired')]
+          # Pick the latest by updated_at
+          def parse_dt(s):
+              try:
+                  return datetime.datetime.fromisoformat(s.replace('Z','+00:00'))
+              except Exception:
+                  return datetime.datetime.min
+          cand.sort(key=lambda a: parse_dt(a.get('updated_at') or a.get('created_at') or ''), reverse=True)
+          url = cand[0]['archive_download_url'] if cand else ''
+          out = os.environ.get("GITHUB_OUTPUT")
+          if out:
+              with open(out, 'a') as f:
+                  f.write(f"url={url}\n")
+          print(f"Resolved artifact url: {url}")
+          PY
+
+      - name: Print full performance table with artifact link
+        if: steps.resolve_artifact_url.outputs.url != ''
+        env:
+          ARTIFACT_URL: ${{ steps.resolve_artifact_url.outputs.url }}
+        run: |
+          python3 - <<'PY'
+          import os
+          p = 'test/srt/performance_report.md'
+          if not os.path.exists(p):
+              print('Report not found, skip printing')
+              raise SystemExit(0)
+          s = open(p, 'r').read()
+          s = s.replace('<<ARTIFACT_URL>>', os.environ['ARTIFACT_URL'])
+          # overwrite file for record
+          open(p, 'w').write(s)
+          # append to GitHub summary
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('\n')
+              f.write(s)
+          PY

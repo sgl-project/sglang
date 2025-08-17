@@ -50,6 +50,7 @@ class BenchArgs:
     profile: bool = False
     profile_steps: int = 3
     profile_by_stage: bool = False
+    profile_filename_prefix: str = None
     dataset_path: str = ""
     parallel_batch: bool = False
 
@@ -96,14 +97,24 @@ class BenchArgs:
             help="Path to the dataset.",
         )
         parser.add_argument("--parallel-batch", action="store_true")
+        parser.add_argument(
+            "--profile-filename-prefix",
+            type=str,
+            default=BenchArgs.profile_filename_prefix,
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to cast the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        return cls(
-            **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
-        )
+        kwargs = {}
+        for attr, attr_type in attrs:
+            val = getattr(args, attr)
+            if attr_type is type(None):
+                kwargs[attr] = val
+            else:
+                kwargs[attr] = attr_type(val)
+        return cls(**kwargs)
 
 
 def launch_server_internal(server_args):
@@ -151,6 +162,7 @@ def run_one_case(
     profile: bool = False,
     profile_steps: int = 3,
     profile_by_stage: bool = False,
+    profile_filename_prefix: str = None,
     dataset_path: str = "",
     parallel_batch: bool = False,
 ):
@@ -181,8 +193,12 @@ def run_one_case(
 
     profile_link = None
     if profile:
+        output_dir, profile_name = None, None
+        if profile_filename_prefix:
+            output_dir = os.path.dirname(profile_filename_prefix)
+            profile_name = os.path.basename(profile_filename_prefix)
         profile_link: str = run_profile(
-            url, profile_steps, ["CPU", "GPU"], None, None, profile_by_stage
+            url, profile_steps, ["CPU", "GPU"], output_dir, profile_name, profile_by_stage
         )
 
     tic = time.perf_counter()
@@ -264,7 +280,7 @@ def run_one_case(
         overall_throughput,
         last_gen_throughput,
         acc_length,
-        profile_link if profile else None,
+        profile_link,
     )
 
 
@@ -388,6 +404,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     tokenizer=tokenizer,
                     dataset_path=bench_args.dataset_path,
                     parallel_batch=bench_args.parallel_batch,
+                    profile_filename_prefix=bench_args.profile_filename_prefix,
+
                 )
             )
 
@@ -415,6 +433,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 profile_by_stage=bench_args.profile_by_stage,
                                 dataset_path=bench_args.dataset_path,
                                 parallel_batch=bench_args.parallel_batch,
+                                profile_filename_prefix=bench_args.profile_filename_prefix,
                             )[-1],
                         )
                     )
