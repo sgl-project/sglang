@@ -65,8 +65,6 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           ARTIFACT_NAME: performance-profiles-${{ github.run_id }}
         run: |
-          echo 'Artifact ID is ${{ steps.artifact-upload-step.outputs.artifact-id }}'
-          echo 'Artifact URL is ${{ steps.artifact-upload-step.outputs.artifact-url }}'
           python3 - <<'PY'
           import json, os, urllib.request, datetime
           token = os.environ['GITHUB_TOKEN']
@@ -85,6 +83,7 @@ jobs:
               data = json.loads(resp.read().decode())
           # Filter by exact name and non-expired
           cand = [a for a in data.get('artifacts', []) if a.get('name') == target_name and not a.get('expired')]
+          print(f"{cand=}")
           # Pick the latest by updated_at
           def parse_dt(s):
               try:

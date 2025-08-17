@@ -1,23 +1,14 @@
-import json
 import os
 import re
 import subprocess
 import time
 import unittest
-from datetime import datetime
-from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    is_in_ci,
     popen_launch_server,
-    write_github_step_summary,
 )
 
 PROFILE_DIR = "performance_profiles"
@@ -142,11 +133,6 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                             model, model_results, self.input_len, self.output_len
                         )
                         full_report += report_part + "\n"
-
-        print("\n" + "=" * 80)
-        print("Final Performance Report")
-        print("=" * 80)
-        print(full_report)
 
         # Persist the report for later substitution of artifact URL in the workflow
         with open(REPORT_MD_FILENAME, "w") as f:
