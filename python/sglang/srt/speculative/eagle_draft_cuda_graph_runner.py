@@ -5,20 +5,20 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.srt.layers.dp_attention import DPPaddingMode
-from sglang.srt.model_executor.cuda_graph_runner import (
-    CUDA_GRAPH_CAPTURE_FAILED_MSG,
-    CudaGraphRunner,
+from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.model_executor.graph_runner import (
+    GRAPH_CAPTURE_FAILED_MSG,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
     model_capture_mode,
     set_global_graph_memory_pool,
     set_torch_compile_config,
-)
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
 )
 from sglang.srt.speculative.eagle_utils import EagleDraftInput
 from sglang.srt.utils import (
@@ -105,30 +105,15 @@ class EAGLEDraftCudaGraphRunner:
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
-                    self.gathered_buffer = torch.zeros(
-                        (
-                            self.max_num_token * self.dp_size,
-                            self.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.model_runner.dtype,
-                    )
                 else:
                     assert self.require_attn_tp_gather
                     self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )
-                    self.gathered_buffer = torch.zeros(
-                        (
-                            self.max_num_token,
-                            self.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.model_runner.dtype,
-                    )
             else:
                 self.global_num_tokens_gpu = None
                 self.global_num_tokens_for_logprob_gpu = None
-                self.gathered_buffer = None
 
         # Capture
         try:
@@ -136,7 +121,7 @@ class EAGLEDraftCudaGraphRunner:
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                f"Capture cuda graph failed: {e}\n{GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def can_run(self, forward_batch: ForwardBatch):
@@ -193,7 +178,7 @@ class EAGLEDraftCudaGraphRunner:
                 )
             )
             global_num_tokens = self.global_num_tokens_gpu
-            gathered_buffer = self.gathered_buffer[: num_tokens * self.dp_size]
+            global_dp_buffer_len = num_tokens * self.dp_size
             global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
         elif self.require_attn_tp_gather:
             self.global_num_tokens_gpu.copy_(
@@ -211,11 +196,11 @@ class EAGLEDraftCudaGraphRunner:
                 )
             )
             global_num_tokens = self.global_num_tokens_gpu
-            gathered_buffer = self.gathered_buffer[:num_tokens]
+            global_dp_buffer_len = num_tokens
             global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
         else:
             global_num_tokens = None
-            gathered_buffer = None
+            global_dp_buffer_len = None
             global_num_tokens_for_logprob = None
 
         spec_info = EagleDraftInput(
@@ -239,8 +224,8 @@ class EAGLEDraftCudaGraphRunner:
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
-            dp_padding_mode=DPPaddingMode.get_default_mode_in_cuda_graph(),
-            gathered_buffer=gathered_buffer,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=(
@@ -258,6 +243,7 @@ class EAGLEDraftCudaGraphRunner:
         def run_once():
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(global_dp_buffer_len, num_tokens)
 
             # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc

@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.layers.moe import is_tbo_enabled
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -83,19 +84,12 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "chunked_prefill_size",
     "device",
     "disable_chunked_prefix_cache",
+    "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_radix_cache",
-    "enable_dp_attention",
-    "enable_two_batch_overlap",
-    "tbo_token_distribution_threshold",
     "enable_dp_lm_head",
-    "moe_a2a_backend",
-    "deepep_mode",
-    "enable_flashinfer_cutlass_moe",
-    "enable_flashinfer_trtllm_moe",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
-    "deepep_config",
     "ep_num_redundant_experts",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
@@ -108,8 +102,6 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
     "weight_loader_disable_mmap",
-    "enable_triton_kernel_moe",
-    "enable_flashinfer_mxfp4_moe",
     "enable_multimodal",
     "enable_symm_mem",
     "quantization",
@@ -913,6 +905,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
 
@@ -953,6 +948,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            is_prefill_only=all(
+                req.sampling_params.max_new_tokens == 0 for req in reqs
+            ),
             chunked_req=chunked_req,
         )
 
@@ -1796,6 +1794,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
+            is_prefill_only=self.is_prefill_only,
         )
 
     def _evict_tree_cache_if_needed(self, num_tokens: int):
