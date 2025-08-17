@@ -13,6 +13,15 @@ RUN apt-get update && apt-get install -y sudo && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
 
+# Install Python 3.10 and set it as default
+RUN apt-get update && \
+    apt-get install -y software-properties-common && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y python3.10 python3.10-venv && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
+    rm -rf /var/lib/apt/lists/*
+
 # Set up oh-my-zsh for devuser
 RUN cp -r /root/.oh-my-zsh /home/devuser/.oh-my-zsh && \
     cp /root/.zshrc /home/devuser/.zshrc && \
