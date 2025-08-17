@@ -94,12 +94,17 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
+
+        # The minimal size for RDMA is 64Bytes, so we pad it to >= 64Bytes
+        padding = 16
         device = "cpu"
         if is_npu():
             # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
             device = "npu"
         elif self.custom_mem_pool:
             device = "cuda"
+            # TODO: Revert this when the small size NVLink transport synchronization issue is fixed, we pad it to >= 512Bytes currently
+            padding = 128
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -108,14 +113,15 @@ class MetadataBuffers:
             # TODO: abort top_logprobs_num > 128 in PD
 
             # We transfer the metadata of first output token to decode
-            # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-            self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
+            self.output_ids = torch.zeros(
+                (size, padding), dtype=torch.int32, device=device
+            )
 
             self.output_token_logprobs_val = torch.zeros(
-                (size, 16), dtype=torch.float32, device=device
+                (size, padding), dtype=torch.float32, device=device
             )
             self.output_token_logprobs_idx = torch.zeros(
-                (size, 16), dtype=torch.int32, device=device
+                (size, padding), dtype=torch.int32, device=device
             )
             self.output_top_logprobs_val = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.float32, device=device
