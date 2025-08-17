@@ -43,9 +43,12 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda, is_flashinfer_available
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
+
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
 class ScatterMode(Enum):
@@ -162,11 +165,17 @@ class LayerCommunicator:
         post_attention_layernorm: torch.nn.Module,
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
+        # Whether current layer is the last layer of the model (or logical segment). If true, fusion is disabled.
+        is_last_layer: bool = False,
+        # Whether this layer is used as a nextn layer. If true, fusion is disabled.
+        is_nextn: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
         self.allow_reduce_scatter = allow_reduce_scatter
+        self.is_last_layer = is_last_layer
+        self.is_nextn = is_nextn
 
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -191,6 +200,9 @@ class LayerCommunicator:
                 context=self._context,
             )
         )
+
+        # Precompute lookup table for allreduce+add_rmsnorm fusion decision
+        self._fuse_allreduce_lookup_table = self._build_fuse_allreduce_lookup_table()
 
     def prepare_attn(
         self,
@@ -263,6 +275,54 @@ class LayerCommunicator:
             is CommunicateSummableTensorPairFn._scatter_hidden_states
             and forward_batch.dp_padding_mode.is_max_len()
         )
+
+    def _build_fuse_allreduce_lookup_table(self):
+        static_conditions_met = (
+            (not self.is_last_layer)
+            and (self._context.tp_size > 1)
+            and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
+            and _is_sm100_supported
+            and _is_flashinfer_available
+        )
+
+        if not static_conditions_met:
+            return {}
+
+        lookup_table = {}
+        for batch_size in range(FUSE_ALLREDUCE_MAX_BATCH_SIZE + 1):
+            should_fuse = (
+                batch_size > 0
+                and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
+                and (not self.is_last_layer)
+            )
+            lookup_table[batch_size] = should_fuse
+        return lookup_table
+
+    def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch: ForwardBatch) -> bool:
+        if self.is_nextn:
+            return False
+
+        # dynamic blockers
+        try:
+            speculative_algo = global_server_args_dict.get("speculative_algorithm", None)
+            if (
+                is_dp_attention_enabled()
+                and speculative_algo is not None
+                and hasattr(speculative_algo, "is_eagle")
+                and speculative_algo.is_eagle()
+            ):
+                return False
+        except Exception:
+            pass
+
+        batch_size = (
+            forward_batch.input_ids.shape[0]
+            if hasattr(forward_batch, "input_ids") and hasattr(forward_batch.input_ids, "shape")
+            else 0
+        )
+        if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
+            return False
+        return self._fuse_allreduce_lookup_table.get(batch_size, False)
 
 
 @dataclass
