@@ -398,7 +398,7 @@ class CustomAllreduce:
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
-                return torch.empty_like(input)
+                return torch.zeros_like(input)
         else:
             if _is_hip:
                 # note: outside of cuda graph context,
