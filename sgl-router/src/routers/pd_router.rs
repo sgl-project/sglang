@@ -363,6 +363,7 @@ impl PDRouter {
         Ok(format!("Successfully removed decode server: {}", url))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
@@ -733,6 +734,7 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[allow(clippy::too_many_arguments)]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
@@ -1145,7 +1147,7 @@ impl PDRouter {
         *response.status_mut() = status;
 
         // Use provided headers or create new ones, then ensure content-type is set for streaming
-        let mut headers = headers.unwrap_or_else(HeaderMap::new);
+        let mut headers = headers.unwrap_or_default();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = headers;
 
@@ -1160,41 +1162,41 @@ impl PDRouter {
         return_logprob: bool,
         prefill_body: Option<bytes::Bytes>,
     ) -> Response {
-        match res.bytes().await {
-            Ok(decode_body) => {
-                if return_logprob && prefill_body.is_some() {
-                    // Merge logprobs from prefill and decode
-                    let prefill_body = prefill_body.as_ref().unwrap();
-                    match (
-                        serde_json::from_slice::<Value>(prefill_body),
-                        serde_json::from_slice::<Value>(&decode_body),
-                    ) {
-                        (Ok(prefill_json), Ok(mut decode_json)) => {
-                            // Use helper to merge logprobs
-                            Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
-
-                            // Return merged response
-                            match serde_json::to_vec(&decode_json) {
-                                Ok(body) => (status, body).into_response(),
-                                Err(e) => {
-                                    error!("Failed to serialize merged response: {}", e);
-                                    (status, decode_body).into_response()
-                                }
-                            }
-                        }
-                        _ => {
-                            // If parsing fails, just return decode response
-                            warn!("Failed to parse responses for logprob merging");
-                            (status, decode_body).into_response()
-                        }
-                    }
-                } else {
-                    (status, decode_body).into_response()
-                }
-            }
+        let response = res.bytes().await;
+        let decode_body = match response {
+            Ok(decode_body) => decode_body,
             Err(e) => {
                 error!("Failed to read decode response: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response").into_response()
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response")
+                    .into_response();
+            }
+        };
+
+        if !return_logprob {
+            return (status, decode_body).into_response();
+        }
+
+        let Some(prefill_body) = prefill_body else {
+            return (status, decode_body).into_response();
+        };
+
+        // Merge logprobs from prefill and decode
+        let (Ok(prefill_json), Ok(mut decode_json)) = (
+            serde_json::from_slice::<Value>(&prefill_body),
+            serde_json::from_slice::<Value>(&decode_body),
+        ) else {
+            warn!("Failed to parse responses for logprob merging");
+            return (status, decode_body).into_response();
+        };
+
+        Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+
+        // Return merged response
+        match serde_json::to_vec(&decode_json) {
+            Ok(body) => (status, body).into_response(),
+            Err(e) => {
+                error!("Failed to serialize merged response: {}", e);
+                (status, decode_body).into_response()
             }
         }
     }
