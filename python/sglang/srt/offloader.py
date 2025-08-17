@@ -67,7 +67,10 @@ class OffloaderV1(BaseOffloader):
         return [self.maybe_offload_to_cpu(module) for module in all_modules_generator]
 
     def maybe_offload_to_cpu(self, module: torch.nn.Module) -> torch.nn.Module:
-        device = next(module.parameters()).device
+        if (params := next(module.parameters(), None)) is None:
+            return module
+
+        device = params.device
 
         if device == torch.device("cpu"):
             return module
