@@ -9,7 +9,7 @@ from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisi
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -471,7 +471,7 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         nn.Module.__init__(self)
 
         self.config = config
-        self._update_hf_config()
+        vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.model = Glm4Model(
             config,
             quant_config,
@@ -631,7 +631,9 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if "visual" in name:
-                    loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
+                    loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                        self.config, name, loaded_weight
+                    )
                 weight_loader(param, loaded_weight)
 
 
