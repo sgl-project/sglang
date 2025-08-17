@@ -91,6 +91,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -336,9 +337,12 @@ class ModelRunner:
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
-            self.init_cuda_graphs()
+            self.init_device_graphs()
+        elif self.device == "npu":
+            self.init_attention_backend()
+            self.init_device_graphs()
         else:
-            self.cuda_graph_runner = None
+            self.graph_runner = None
             self.cuda_graph_mem_usage = 0
             self.init_attention_backend()
 
@@ -912,7 +916,8 @@ class ModelRunner:
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        infered_device = torch.cuda.current_device()
+        self.device_module = torch.get_device_module(self.device)
+        infered_device = self.device_module.current_device()
 
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
@@ -1588,9 +1593,9 @@ class ModelRunner:
                 .cuda()
             )
 
-    def init_cuda_graphs(self):
+    def init_device_graphs(self):
         """Capture cuda graphs."""
-        self.cuda_graph_runner = None
+        self.graph_runner = None
         self.cuda_graph_mem_usage = 0
 
         if not self.is_generation:
@@ -1605,8 +1610,9 @@ class ModelRunner:
         logger.info(
             f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.cuda_graph_runner = CudaGraphRunner(self)
-
+        self.graph_runner = (
+            CudaGraphRunner(self) if not _is_npu else NPUGraphRunner(self)
+        )
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.cuda_graph_mem_usage = before_mem - after_mem
         logger.info(
@@ -1758,11 +1764,11 @@ class ModelRunner:
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
-            and self.cuda_graph_runner
-            and self.cuda_graph_runner.can_run(forward_batch)
+            and self.graph_runner
+            and self.graph_runner.can_run(forward_batch)
         )
         if can_run_cuda_graph:
-            ret = self.cuda_graph_runner.replay(
+            ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
