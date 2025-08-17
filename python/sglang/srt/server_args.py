@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
+    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -230,6 +231,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
+    disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
@@ -1715,6 +1717,11 @@ class ServerArgs:
             help="Enable NCCL symmetric memory for fast collectives.",
         )
         parser.add_argument(
+            "--disable-flashinfer-cutlass-moe-fp4-allgather",
+            action="store_true",
+            help="Disables quantize before all-gather for flashinfer cutlass moe.",
+        )
+        parser.add_argument(
             "--enable-tokenizer-batch-encode",
             action="store_true",
             help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
@@ -2159,9 +2166,9 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
             if self.attention_backend is None:
-                if is_sm100_supported():
+                if is_cuda() and is_sm100_supported():
                     self.attention_backend = "trtllm_mha"
-                elif is_sm90_supported():
+                elif is_cuda() and is_sm90_supported():
                     self.attention_backend = "fa3"
                 else:
                     self.attention_backend = "triton"

@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
@@ -473,6 +474,7 @@ class FusedMoE(torch.nn.Module):
             not expert_id
             and self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
+            and self.quant_config.is_static_cfg()
         ):
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
@@ -621,9 +623,7 @@ class FusedMoE(torch.nn.Module):
 
         if "ModelOpt" in self.quant_method.__class__.__name__:
             # Determine per-tensor weight scale patterns based on variant
-            is_fp4_variant = (
-                "ModelOptNvFp4FusedMoEMethod" in self.quant_method.__class__.__name__
-            )
+            is_fp4_variant = isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
 
             # FP4 uses "weight_scale_2" for per-tensor, FP8 uses "weight_scale" for per-tensor
             per_tensor_conditions = (
@@ -725,7 +725,11 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         tp_rank = self.moe_tp_rank
 
-        if self.quant_config is not None and self.quant_config.get_name() == "mxfp4":
+        if (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "mxfp4"
+            and self.quant_config.is_static_cfg()
+        ):
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
