@@ -504,44 +504,73 @@ impl PDRouter {
             .build()
             .map_err(|e| format!("Failed to build prefill client: {}", e))?;
 
-        // Create bounded channel for prefill response draining to prevent unbounded memory growth
-        // Buffer size of 1000 should handle bursts while preventing memory issues
-        let (prefill_drain_tx, mut prefill_drain_rx) = mpsc::channel::<reqwest::Response>(1000);
+        // Create bounded channel for prefill response draining
+        // Larger buffer for high concurrency scenarios
+        let (prefill_drain_tx, mut prefill_drain_rx) = mpsc::channel::<reqwest::Response>(2000);
 
-        // Spawn a single coordinator that spawns concurrent drain tasks
-        // This provides high concurrency without complex worker pools
+        // Spawn a coordinator with limited concurrent drain tasks
+        // This prevents unbounded task spawning under extreme load
         tokio::spawn(async move {
-            info!("Prefill drain worker started");
-            // Process multiple responses concurrently
+            info!("Prefill drain coordinator started");
+
+            // Use a semaphore to limit concurrent drain operations
+            let max_concurrent_drains = 100;
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_drains));
+
             while let Some(response) = prefill_drain_rx.recv().await {
-                // Spawn a task for each response to drain them concurrently
-                tokio::spawn(async move {
-                    let url = response.url().to_string();
-                    let status = response.status();
+                let permit = semaphore.clone().acquire_owned().await;
 
-                    if !status.is_success() {
-                        error!("Prefill drain: error status={} url={}", status, url);
-                        RouterMetrics::record_pd_prefill_error(&url);
-                    }
+                match permit {
+                    Ok(permit) => {
+                        // Spawn a task to drain this response
+                        tokio::spawn(async move {
+                            let url = response.url().to_string();
+                            let status = response.status();
 
-                    // Drain the response body
-                    let start = std::time::Instant::now();
-                    match response.bytes().await {
-                        Ok(body) => {
-                            let bytes_drained = body.len();
+                            if !status.is_success() {
+                                error!("Prefill drain: error status={} url={}", status, url);
+                                RouterMetrics::record_pd_prefill_error(&url);
+                            }
+
+                            // Drain the response body efficiently
+                            // Use streaming to avoid loading entire body into memory
+                            let start = std::time::Instant::now();
+                            let mut stream = response.bytes_stream();
+                            let mut bytes_drained = 0;
+
+                            while let Some(chunk_result) = stream.next().await {
+                                match chunk_result {
+                                    Ok(chunk) => bytes_drained += chunk.len(),
+                                    Err(e) => {
+                                        debug!(
+                                            "Prefill drain: error streaming url={} error={}",
+                                            url, e
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+
                             let elapsed = start.elapsed();
-                            debug!(
-                                "Prefill drain: drained {} bytes from {} in {:?}",
-                                bytes_drained, url, elapsed
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Prefill drain: error draining url={} error={}", url, e);
-                        }
+                            if elapsed > Duration::from_millis(100) {
+                                // Only log slow drains
+                                debug!(
+                                    "Prefill drain: slow drain {} bytes from {} in {:?}",
+                                    bytes_drained, url, elapsed
+                                );
+                            }
+
+                            // Permit is automatically released when dropped
+                            drop(permit);
+                        });
                     }
-                });
+                    Err(_) => {
+                        // Semaphore closed, shutting down
+                        break;
+                    }
+                }
             }
-            info!("Prefill drain worker shutting down");
+            info!("Prefill drain coordinator shutting down");
         });
 
         Ok(PDRouter {
@@ -932,6 +961,7 @@ impl PDRouter {
             // Send prefill response to background worker for draining
             // This ensures HTTP compliance without blocking
             let drain_tx = self.prefill_drain_tx.clone();
+            let prefill_url = prefill.url().to_string();
             tokio::spawn(async move {
                 if let Ok(response) = prefill_future.await {
                     // Try to send to drain worker
@@ -939,11 +969,25 @@ impl PDRouter {
                     match drain_tx.try_send(response) {
                         Ok(_) => {
                             // Successfully queued for draining
+                            debug!("Prefill response queued for draining");
                         }
                         Err(mpsc::error::TrySendError::Full(response)) => {
                             // Channel full - drain inline as fallback
-                            warn!("Prefill drain channel full, draining inline");
-                            let _ = response.bytes().await;
+                            warn!("Prefill drain channel full (capacity exceeded), draining inline for {}", prefill_url);
+                            RouterMetrics::record_pd_prefill_error(&prefill_url);
+
+                            // Drain inline with timeout to prevent blocking too long
+                            let drain_future = async {
+                                let mut stream = response.bytes_stream();
+                                while stream.next().await.is_some() {
+                                    // Just drain
+                                }
+                            };
+
+                            match tokio::time::timeout(Duration::from_secs(1), drain_future).await {
+                                Ok(_) => debug!("Inline drain completed for {}", prefill_url),
+                                Err(_) => error!("Inline drain timeout for {}", prefill_url),
+                            }
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             error!("Prefill drain channel closed!");
