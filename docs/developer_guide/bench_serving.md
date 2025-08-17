@@ -55,7 +55,7 @@ Select with `--dataset-name`:
 - `sharegpt` (default): loads ShareGPT-style pairs; optionally restrict with `--sharegpt-context-len` and override outputs with `--sharegpt-output-len`
 - `random`: random text lengths; sampled from ShareGPT token space
 - `random-ids`: random token ids (can lead to gibberish)
-- `random-image`: generates random images and wraps them in chat messages
+- `random-image`: generates random images and wraps them in chat messages; supports custom resolutions via 'heightxwidth' format
 - `generated-shared-prefix`: synthetic dataset with shared long system prompts and short questions
 - `mmmu`: samples from MMMU (Math split) and includes images
 
@@ -63,7 +63,7 @@ Common dataset flags:
 
 - `--num-prompts N`: number of requests
 - `--random-input-len`, `--random-output-len`, `--random-range-ratio`: for random/random-ids/random-image
-- `--random-image-num-images`, `--random-image-resolution`: for random-image dataset
+- `--random-image-num-images`, `--random-image-resolution`: for random-image dataset (supports presets 1080p/720p/360p or custom 'heightxwidth' format)
 - `--apply-chat-template`: apply tokenizer chat template when constructing prompts
 - `--dataset-path PATH`: file path for ShareGPT json; if blank and missing, it will be downloaded and cached
 
@@ -74,6 +74,11 @@ Generated Shared Prefix flags (for `generated-shared-prefix`):
 - `--gsp-system-prompt-len`
 - `--gsp-question-len`
 - `--gsp-output-len`
+
+Random Image dataset flags (for `random-image`):
+
+- `--random-image-num-images`: Number of images per request
+- `--random-image-resolution`: Image resolution; supports presets (1080p, 720p, 360p) or custom 'heightxwidth' format (e.g., 1080x1920, 512x768)
 
 ### Choosing model and tokenizer
 
@@ -195,6 +200,21 @@ python3 -m sglang.bench_serving \
   --random-image-resolution 720p \
   --random-input-len 128 --random-output-len 256 \
   --num-prompts 200 \
+  --apply-chat-template
+```
+
+4a) Random images with custom resolution:
+
+```bash
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 --port 30000 \
+  --model your-vlm-model \
+  --dataset-name random-image \
+  --random-image-num-images 1 \
+  --random-image-resolution 512x768 \
+  --random-input-len 64 --random-output-len 128 \
+  --num-prompts 100 \
   --apply-chat-template
 ```
 

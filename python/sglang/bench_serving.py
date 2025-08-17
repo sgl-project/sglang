@@ -1178,13 +1178,21 @@ def sample_random_image_requests(
       only counts text tokens and excludes image data.
     """
     try:
+        import pybase64
         from PIL import Image
     except ImportError as e:
         raise ImportError(
             "Please install Pillow to generate random images: pip install pillow"
         ) from e
 
-    import base64
+    # Check for potentially problematic combinations and warn user
+    if width * height >= 1920 * 1080 and num_images * num_requests >= 100:
+        warnings.warn(
+            f"High resolution ({width}x{height}) with {num_images * num_requests} total images "
+            f"may take a long time. Consider reducing resolution or image count.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # Parse resolution (supports presets and 'heightxwidth')
     width, height = parse_random_image_resolution(image_resolution)
@@ -1202,7 +1210,7 @@ def sample_random_image_requests(
         img = Image.fromarray(arr, mode="RGB")
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
-        encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+        encoded = pybase64.b64encode(buf.getvalue()).decode("utf-8")
         return f"data:image/jpeg;base64,{encoded}"
 
     dataset: List[DatasetRow] = []
@@ -2074,9 +2082,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Return logprob.",
     )
-    parser.add_argument(
-        "--seed", type=int, default=int(time.time()), help="The random seed."
-    )
+    parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
         "--disable-ignore-eos",
         action="store_true",
