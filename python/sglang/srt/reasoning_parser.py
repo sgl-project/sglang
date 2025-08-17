@@ -199,7 +199,7 @@ class GptOssSimpleDetector(BaseReasoningFormatDetector):
         # GPT-OSS is assumed to be reasoning until `</think>` token
         super().__init__(
             "<|channel|>analysis<|message|>",
-            "<|channel|>final<|message|>",
+            "<|start|>assistant<|channel|>final<|message|>",
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
@@ -229,7 +229,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
-        self.final_channel_start = "<|channel|>final<|message|>"
+        self.final_channel_start = "<|start|>assistant<|channel|>final<|message|>"
         self.final_channel_end = "<|return|>"
         self._in_final_channel = False
         self._analysis_complete = False
@@ -368,11 +368,11 @@ class GptOssDetector(BaseReasoningFormatDetector):
             else:
                 # Final channel not complete - extract what we have
                 # Look for just <|channel|>final<|message|> without <|return|>
-                alt_final_start = full_normal_text.find("<|channel|>final<|message|>")
+                alt_final_start = full_normal_text.find(self.final_channel_start)
                 if alt_final_start != -1:
                     before_alt_final = full_normal_text[:alt_final_start].strip()
                     alt_final_content = full_normal_text[
-                        alt_final_start + len("<|channel|>final<|message|>") :
+                        alt_final_start + len(self.final_channel_start) :
                     ].strip()
 
                     parts = []
@@ -409,6 +409,11 @@ class GptOssDetector(BaseReasoningFormatDetector):
         # HACK: For now, use simplified approach - wait for key markers before processing
         key_markers = ["<|end|>", "<|call|>", "<|return|>", "assistantfinal"]
         has_complete_section = any(marker in self._buffer for marker in key_markers)
+
+        # HACK(ainl) I have no idea about this parser :(
+        if self.final_channel_start in self._buffer:
+            has_complete_section = True
+            self._in_reasoning = False
 
         if not has_complete_section:
             # Still accumulating, don't process yet
