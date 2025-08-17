@@ -29,6 +29,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
@@ -49,6 +50,8 @@ pub struct PDRouter {
     pub circuit_breaker_config: CircuitBreakerConfig,
     _prefill_health_checker: Option<HealthChecker>,
     _decode_health_checker: Option<HealthChecker>,
+    // Channel for sending prefill responses to background workers for draining
+    prefill_drain_tx: mpsc::UnboundedSender<reqwest::Response>,
 }
 
 // Request context for PD router operations
@@ -501,6 +504,46 @@ impl PDRouter {
             .build()
             .map_err(|e| format!("Failed to build prefill client: {}", e))?;
 
+        // Create channel for prefill response draining
+        let (prefill_drain_tx, mut prefill_drain_rx) =
+            mpsc::unbounded_channel::<reqwest::Response>();
+
+        // Spawn a single background worker to drain prefill responses
+        // This ensures HTTP compliance without blocking decode responses
+        tokio::spawn(async move {
+            info!("Prefill drain worker started");
+            while let Some(response) = prefill_drain_rx.recv().await {
+                let url = response.url().to_string();
+                let status = response.status();
+
+                if !status.is_success() {
+                    error!("Prefill drain worker: error status={} url={}", status, url);
+                    RouterMetrics::record_pd_prefill_error(&url);
+                }
+
+                // Drain the response body to maintain HTTP compliance
+                let mut stream = response.bytes_stream();
+                let mut bytes_drained = 0;
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => bytes_drained += chunk.len(),
+                        Err(e) => {
+                            warn!(
+                                "Prefill drain worker: error draining url={} error={}",
+                                url, e
+                            );
+                            break;
+                        }
+                    }
+                }
+                debug!(
+                    "Prefill drain worker: drained {} bytes from {}",
+                    bytes_drained, url
+                );
+            }
+            info!("Prefill drain worker shutting down");
+        });
+
         Ok(PDRouter {
             prefill_workers,
             decode_workers,
@@ -512,6 +555,7 @@ impl PDRouter {
             load_monitor_handle,
             client,
             prefill_client,
+            prefill_drain_tx,
             retry_config,
             circuit_breaker_config: core_cb_config,
             _prefill_health_checker: Some(prefill_health_checker),
@@ -885,11 +929,15 @@ impl PDRouter {
                 .send();
             let decode_future = decode_request.send();
 
+            // Send prefill response to background worker for draining
+            // This ensures HTTP compliance without blocking
+            let drain_tx = self.prefill_drain_tx.clone();
             tokio::spawn(async move {
                 if let Ok(response) = prefill_future.await {
-                    // Consume the entire response body to maintain HTTP compliance
-                    // This runs in the background and won't block the decode response
-                    let _ = response.bytes().await;
+                    // Send to drain worker - this is non-blocking
+                    if let Err(e) = drain_tx.send(response) {
+                        error!("Failed to send prefill response to drain worker: {:?}", e);
+                    }
                 }
             });
 
@@ -1893,6 +1941,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             prefill_client: Client::new(),
+            prefill_drain_tx: mpsc::unbounded_channel().0,
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _prefill_health_checker: None,
