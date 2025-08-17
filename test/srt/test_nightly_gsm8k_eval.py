@@ -86,8 +86,8 @@ def write_results_to_json(model, metrics, mode="a"):
 
 def check_model_scores(results):
     failed_models = []
-    summary = " | model | score | threshold |\n"
-    summary += "| ----- | ----- | --------- |\n"
+    summary = " | model | score | threshold | status |\n"
+    summary += "| ----- | ----- | --------- | ------ |\n"
 
     for model, score in results:
         threshold = MODEL_SCORE_THRESHOLDS.get(model)
@@ -95,13 +95,16 @@ def check_model_scores(results):
             print(f"Warning: No threshold defined for model {model}")
             continue
 
-        if score < threshold:
+        is_success = score >= threshold
+        status_emoji = "✅" if is_success else "❌"
+
+        if not is_success:
             failed_models.append(
                 f"\nScore Check Failed: {model}\n"
                 f"Model {model} score ({score:.4f}) is below threshold ({threshold:.4f})"
             )
 
-        line = f"| {model} | {score} | {threshold} |\n"
+        line = f"| {model} | {score} | {threshold} | {status_emoji} |\n"
         summary += line
 
     print(summary)
