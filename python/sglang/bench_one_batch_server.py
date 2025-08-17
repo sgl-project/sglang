@@ -24,11 +24,16 @@ from typing import List, Tuple
 import numpy as np
 import requests
 
-from sglang.bench_serving import get_tokenizer, sample_random_requests
+from sglang.bench_serving import (
+    get_tokenizer,
+    sample_mmmu_requests,
+    sample_random_requests,
+)
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
+from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 
@@ -68,6 +73,13 @@ class BenchArgs:
             "--output-len", type=int, nargs="+", default=BenchArgs.output_len
         )
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
+        parser.add_argument(
+            "--dataset-name",
+            type=str,
+            default="",
+            choices=["mmmu"],
+            help="Name of the dataset to benchmark on.",
+        )
         parser.add_argument("--return-logprob", action="store_true")
         parser.add_argument(
             "--client-stream-interval",
@@ -159,6 +171,7 @@ def run_one_case(
     run_name: str,
     result_filename: str,
     tokenizer,
+    dataset_name="",
     profile: bool = False,
     profile_steps: int = 3,
     profile_by_stage: bool = False,
@@ -167,16 +180,26 @@ def run_one_case(
     parallel_batch: bool = False,
 ):
     requests.post(url + "/flush_cache")
-    input_requests = sample_random_requests(
-        input_len=input_len,
-        output_len=output_len,
-        num_prompts=batch_size,
-        range_ratio=1.0,
-        tokenizer=tokenizer,
-        dataset_path=dataset_path,
-        random_sample=True,
-        return_text=False,
-    )
+    # TODO: reuse bench_serving.get_dataset ?
+    if dataset_name == "mmmu":
+        input_requests = sample_mmmu_requests(
+            num_requests=batch_size,
+            tokenizer=tokenizer,
+            fixed_output_len=output_len,
+            apply_chat_template=True,
+            random_sample=True,
+        )
+    else:
+        input_requests = sample_random_requests(
+            input_len=input_len,
+            output_len=output_len,
+            num_prompts=batch_size,
+            range_ratio=1.0,
+            tokenizer=tokenizer,
+            dataset_path=dataset_path,
+            random_sample=True,
+            return_text=False,
+        )
 
     use_structured_outputs = False
     if use_structured_outputs:
@@ -202,23 +225,45 @@ def run_one_case(
         )
 
     tic = time.perf_counter()
-    response = requests.post(
-        url + "/generate",
-        json={
-            "input_ids": [req.prompt for req in input_requests],
-            "sampling_params": {
+    print(f"{input_requests[0].prompt=}")
+    print(f"{input_requests[0].image_data=}")
+    if dataset_name == "mmmu":
+        # vlm
+        for input_req in input_requests:
+            messages = MMMUVLMEval.build_chat_messages_from_prompt(
+                input_req.prompt, input_req.image_data
+            )
+
+        response = requests.post(
+            url + "/v1/completions",
+            json={
+                "model": "",
+                "prompt": [req.prompt for req in input_requests],
+                "image_data": [req.image_data for req in input_requests],
                 "temperature": temperature,
                 "max_new_tokens": output_len,
-                "ignore_eos": True,
-                "json_schema": json_schema,
                 "stream_interval": stream_interval,
+                "stream": True,
             },
-            "return_logprob": return_logprob,
-            "stream": True,
-            **({"parallel_batch": parallel_batch} if parallel_batch else {}),
-        },
-        stream=True,
-    )
+            stream=True,
+        )
+    else:
+        response = requests.post(
+            url + "/generate",
+            json={
+                "input_ids": [req.prompt for req in input_requests],
+                "sampling_params": {
+                    "temperature": temperature,
+                    "max_new_tokens": output_len,
+                    "ignore_eos": True,
+                    "json_schema": json_schema,
+                    "stream_interval": stream_interval,
+                },
+                "return_logprob": return_logprob,
+                "stream": True,
+            **({"parallel_batch": parallel_batch} if parallel_batch else {}),},
+            stream=True,
+        )
 
     # The TTFT of the last request in the batch
     ttft = 0.0
@@ -231,12 +276,18 @@ def run_one_case(
             if "error" in data:
                 raise RuntimeError(f"Request has failed. {data}.")
 
-            assert (
-                data["meta_info"]["finish_reason"] is None
-                or data["meta_info"]["finish_reason"]["type"] == "length"
-            )
-            if data["meta_info"]["completion_tokens"] == 1:
-                ttft = time.perf_counter() - tic
+            if dataset_name == "mmmu":
+                if data["choices"][0]["text"]:
+                    # First token
+                    if ttft == 0.0:
+                        ttft = time.perf_counter() - tic
+            else:
+                assert (
+                    data["meta_info"]["finish_reason"] is None
+                    or data["meta_info"]["finish_reason"]["type"] == "length"
+                )
+                if data["meta_info"]["completion_tokens"] == 1:
+                    ttft = time.perf_counter() - tic
 
     latency = time.perf_counter() - tic
     input_throughput = batch_size * input_len / ttft
@@ -374,6 +425,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             return_logprob=bench_args.return_logprob,
             stream_interval=bench_args.client_stream_interval,
             input_len_step_percentage=bench_args.input_len_step_percentage,
+            dataset_name=bench_args.dataset_name,
             run_name="",
             result_filename="",
             tokenizer=tokenizer,
@@ -400,6 +452,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     stream_interval=bench_args.client_stream_interval,
                     input_len_step_percentage=bench_args.input_len_step_percentage,
                     run_name=bench_args.run_name,
+                    dataset_name=bench_args.dataset_name,
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
                     dataset_path=bench_args.dataset_path,
@@ -427,6 +480,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 run_name=bench_args.run_name,
                                 result_filename=bench_args.result_filename,
                                 tokenizer=tokenizer,
+                                dataset_name=bench_args.dataset_name,
                                 profile=bench_args.profile,
                                 profile_steps=bench_args.profile_steps,
                                 profile_by_stage=bench_args.profile_by_stage,

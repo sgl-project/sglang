@@ -46,16 +46,16 @@ jobs:
       - name: Run performance test for text models
         timeout-minutes: 180
         run: |
-          rm -rf test/srt/performance_profiles/
+          rm -rf test/srt/performance_profiles_text_models/
           cd test/srt
-          python3 test_nightly_text_models_performance.py
+          python3 test_nightly_gsm8k_eval.py
 
       - name: Upload profile traces' artifacts
         id: upload_profiles
         uses: actions/upload-artifact@v4
         with:
           name: performance-profiles-${{ github.run_id }}
-          path: test/srt/performance_profiles/
+          path: test/srt/performance_profiles_text_models/
 
       - name: Resolve artifact URL for performance profiles
         id: resolve_artifact_url
@@ -112,8 +112,6 @@ jobs:
 
       - name: Run eval test for VLM models (MMMU-100)
         timeout-minutes: 240
-        env:
-          NIGHTLY_VLM_MODELS: Qwen/Qwen2-VL-7B-Instruct,Qwen/Qwen2.5-VL-7B-Instruct,OpenGVLab/InternVL2_5-2B,google/gemma-3-4b-it
         run: |
           cd test/srt
           python3 test_nightly_vlm_mmmu_eval.py
@@ -138,3 +136,20 @@ jobs:
               f.write('\n')
               f.write(s)
           PY
+
+  nightly-test-perf-vlm-models:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run perf test for VLM models (MMMU-100)
+        timeout-minutes: 240
+        run: |
+          cd test/srt
+          python3 test_nightly_vlm_models_perf.py

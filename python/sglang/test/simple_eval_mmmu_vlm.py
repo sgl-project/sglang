@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import base64
 import io
-import re
 from typing import List, Optional, Tuple
 
 from datasets import concatenate_datasets, load_dataset
@@ -176,21 +175,32 @@ class MMMUVLMEval(Eval):
             return prefix, suffix
         return prompt, ""
 
+    @staticmethod
+    def build_chat_messages_from_prompt(prompt: str, image_data) -> List:
+        """Split a prompt containing an inline image tag into prefix and suffix.
+
+        If no tag is present, treat the whole prompt as prefix and empty suffix.
+        """
+        # Build a vision+text message for OpenAI-compatible API
+        prefix, suffix = MMMUVLMEval._split_prompt_for_image(prompt)
+
+        content: List[dict] = []
+        if prefix:
+            content.append({"type": "text", "text": prefix})
+        content.append({"type": "image_url", "image_url": {"url": image_data}})
+        if suffix:
+            content.append({"type": "text", "text": suffix})
+        prompt_messages = [{"role": "user", "content": content}]
+
+        return prompt_messages
+
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(sample: dict):
             prompt = sample["final_input_prompt"]
             image_data = sample["image_data"]
-            prefix, suffix = self._split_prompt_for_image(prompt)
-
-            # Build a vision+text message for OpenAI-compatible API
-            content: List[dict] = []
-            if prefix:
-                content.append({"type": "text", "text": prefix})
-            content.append({"type": "image_url", "image_url": {"url": image_data}})
-            if suffix:
-                content.append({"type": "text", "text": suffix})
-
-            prompt_messages = [{"role": "user", "content": content}]
+            prompt_messages = MMMUVLMEval.build_chat_messages_from_prompt(
+                prompt, image_data
+            )
 
             # Sample
             response_text = sampler(prompt_messages)

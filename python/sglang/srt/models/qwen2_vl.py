@@ -484,6 +484,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
+        print(f"get_image_feature {items=}")
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
@@ -535,6 +536,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         """
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
+        print("qwen2_vl forward")
 
         if not (
             forward_batch.forward_mode.is_decode()
