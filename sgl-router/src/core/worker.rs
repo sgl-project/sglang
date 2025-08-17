@@ -311,13 +311,7 @@ impl Worker for BasicWorker {
 
         // Use the shared client with a custom timeout for this request
         let health_result = match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    true
-                } else {
-                    false
-                }
-            }
+            Ok(response) => response.status().is_success(),
             Err(_) => false,
         };
 
@@ -571,6 +565,7 @@ impl WorkerFactory {
     }
 
     /// Create workers from URLs with automatic type detection
+    #[allow(clippy::type_complexity)]
     pub fn create_from_urls(
         regular_urls: Vec<String>,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -1202,12 +1197,6 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
-
-        // Final state should be deterministic (last write wins)
-        // We can't predict the exact final state due to scheduling,
-        // but we can verify no data corruption occurred
-        let final_health = worker.is_healthy();
-        assert!(final_health == true || final_health == false);
     }
 
     // Test WorkerFactory

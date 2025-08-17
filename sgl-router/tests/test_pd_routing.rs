@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod test_pd_routing {
-    use rand::Rng;
     use serde_json::json;
     use sglang_router_rs::config::{
         CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
@@ -422,41 +421,6 @@ mod test_pd_routing {
     }
 
     #[test]
-    fn test_power_of_two_load_selection() {
-        // Test the power-of-two selection logic with different load scenarios
-
-        // Scenario 1: Clear winner for both prefill and decode
-        let _loads = vec![
-            ("prefill1", 100),
-            ("prefill2", 10), // Should be selected
-            ("decode1", 50),
-            ("decode2", 5), // Should be selected
-        ];
-
-        // In actual implementation, the lower load should be selected
-        assert!(10 < 100);
-        assert!(5 < 50);
-
-        // Scenario 2: Equal loads (should select first)
-        let _equal_loads = vec![
-            ("prefill1", 20),
-            ("prefill2", 20), // Either could be selected
-            ("decode1", 30),
-            ("decode2", 30), // Either could be selected
-        ];
-
-        // When loads are equal, <= comparison means first is selected
-        assert!(20 <= 20);
-        assert!(30 <= 30);
-
-        // Scenario 3: Missing load data (should default to usize::MAX)
-        // This tests the unwrap_or(usize::MAX) behavior
-        let missing_load = usize::MAX;
-        assert!(10 < missing_load);
-        assert!(missing_load > 0);
-    }
-
-    #[test]
     fn test_load_monitoring_configuration() {
         // Test that load monitoring is only enabled for PowerOfTwo policy
         let policies = vec![
@@ -605,12 +569,10 @@ mod test_pd_routing {
     #[test]
     fn test_streaming_response_parsing() {
         // Test SSE format parsing from streaming responses
-        let sse_chunks = vec![
-            "data: {\"text\":\"Hello\",\"meta_info\":{\"completion_tokens\":1,\"finish_reason\":null}}",
+        let sse_chunks = ["data: {\"text\":\"Hello\",\"meta_info\":{\"completion_tokens\":1,\"finish_reason\":null}}",
             "data: {\"text\":\" world\",\"meta_info\":{\"completion_tokens\":2,\"finish_reason\":null}}",
             "data: {\"text\":\"!\",\"meta_info\":{\"completion_tokens\":3,\"finish_reason\":{\"type\":\"length\"}}}",
-            "data: [DONE]",
-        ];
+            "data: [DONE]"];
 
         for chunk in &sse_chunks[..3] {
             assert!(chunk.starts_with("data: "));
@@ -848,7 +810,7 @@ mod test_pd_routing {
             large_batch_request["bootstrap_host"] = json!(vec![hostname; batch_size]);
             large_batch_request["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
             large_batch_request["bootstrap_room"] = json!((0..batch_size)
-                .map(|_| rand::thread_rng().gen::<u64>())
+                .map(|_| rand::random::<u64>())
                 .collect::<Vec<_>>());
 
             let elapsed = start.elapsed();

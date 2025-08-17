@@ -27,6 +27,12 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
+      - name: Run lint
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Run fmt
         run: |
           source "$HOME/.cargo/env"

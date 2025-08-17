@@ -116,6 +116,7 @@ fn default_completion_request() -> CompletionRequest {
     }
 }
 
+#[allow(dead_code)]
 fn create_test_worker() -> BasicWorker {
     BasicWorker::new(
         "http://test-server:8000".to_string(),
