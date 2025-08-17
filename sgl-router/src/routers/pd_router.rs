@@ -51,7 +51,7 @@ pub struct PDRouter {
     _prefill_health_checker: Option<HealthChecker>,
     _decode_health_checker: Option<HealthChecker>,
     // Channel for sending prefill responses to background workers for draining
-    prefill_drain_tx: mpsc::UnboundedSender<reqwest::Response>,
+    prefill_drain_tx: mpsc::Sender<reqwest::Response>,
 }
 
 // Request context for PD router operations
@@ -504,42 +504,42 @@ impl PDRouter {
             .build()
             .map_err(|e| format!("Failed to build prefill client: {}", e))?;
 
-        // Create channel for prefill response draining
-        let (prefill_drain_tx, mut prefill_drain_rx) =
-            mpsc::unbounded_channel::<reqwest::Response>();
+        // Create bounded channel for prefill response draining to prevent unbounded memory growth
+        // Buffer size of 1000 should handle bursts while preventing memory issues
+        let (prefill_drain_tx, mut prefill_drain_rx) = mpsc::channel::<reqwest::Response>(1000);
 
-        // Spawn a single background worker to drain prefill responses
-        // This ensures HTTP compliance without blocking decode responses
+        // Spawn a single coordinator that spawns concurrent drain tasks
+        // This provides high concurrency without complex worker pools
         tokio::spawn(async move {
             info!("Prefill drain worker started");
+            // Process multiple responses concurrently
             while let Some(response) = prefill_drain_rx.recv().await {
-                let url = response.url().to_string();
-                let status = response.status();
+                // Spawn a task for each response to drain them concurrently
+                tokio::spawn(async move {
+                    let url = response.url().to_string();
+                    let status = response.status();
 
-                if !status.is_success() {
-                    error!("Prefill drain worker: error status={} url={}", status, url);
-                    RouterMetrics::record_pd_prefill_error(&url);
-                }
+                    if !status.is_success() {
+                        error!("Prefill drain: error status={} url={}", status, url);
+                        RouterMetrics::record_pd_prefill_error(&url);
+                    }
 
-                // Drain the response body to maintain HTTP compliance
-                let mut stream = response.bytes_stream();
-                let mut bytes_drained = 0;
-                while let Some(chunk_result) = stream.next().await {
-                    match chunk_result {
-                        Ok(chunk) => bytes_drained += chunk.len(),
-                        Err(e) => {
-                            warn!(
-                                "Prefill drain worker: error draining url={} error={}",
-                                url, e
+                    // Drain the response body
+                    let start = std::time::Instant::now();
+                    match response.bytes().await {
+                        Ok(body) => {
+                            let bytes_drained = body.len();
+                            let elapsed = start.elapsed();
+                            debug!(
+                                "Prefill drain: drained {} bytes from {} in {:?}",
+                                bytes_drained, url, elapsed
                             );
-                            break;
+                        }
+                        Err(e) => {
+                            warn!("Prefill drain: error draining url={} error={}", url, e);
                         }
                     }
-                }
-                debug!(
-                    "Prefill drain worker: drained {} bytes from {}",
-                    bytes_drained, url
-                );
+                });
             }
             info!("Prefill drain worker shutting down");
         });
@@ -934,9 +934,20 @@ impl PDRouter {
             let drain_tx = self.prefill_drain_tx.clone();
             tokio::spawn(async move {
                 if let Ok(response) = prefill_future.await {
-                    // Send to drain worker - this is non-blocking
-                    if let Err(e) = drain_tx.send(response) {
-                        error!("Failed to send prefill response to drain worker: {:?}", e);
+                    // Try to send to drain worker
+                    // If channel is full (under extreme load), drain inline as fallback
+                    match drain_tx.try_send(response) {
+                        Ok(_) => {
+                            // Successfully queued for draining
+                        }
+                        Err(mpsc::error::TrySendError::Full(response)) => {
+                            // Channel full - drain inline as fallback
+                            warn!("Prefill drain channel full, draining inline");
+                            let _ = response.bytes().await;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            error!("Prefill drain channel closed!");
+                        }
                     }
                 }
             });
@@ -1941,7 +1952,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             prefill_client: Client::new(),
-            prefill_drain_tx: mpsc::unbounded_channel().0,
+            prefill_drain_tx: mpsc::channel(100).0,
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _prefill_health_checker: None,
