@@ -2874,6 +2874,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_proj",
     "up_proj",
     "down_proj",
+    "qkv_proj",
+    "gate_up_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
