@@ -288,6 +288,9 @@ class TpModelWorkerClient:
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
         return self.worker.unload_lora_adapter(recv_req)
 
+    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
+        return self.worker.can_run_lora_batch(lora_ids)
+
     def __delete__(self):
         self.input_queue.put((None, None))
         self.copy_queue.put((None, None, None))
