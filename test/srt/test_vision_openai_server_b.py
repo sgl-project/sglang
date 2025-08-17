@@ -189,6 +189,9 @@ class TestGemma3nServer(TestOpenAIVisionServer):
         # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
         # self._test_audio_ambient_completion()
 
+    def _test_mixed_image_audio_chat_completion(self):
+        self._test_mixed_image_audio_chat_completion()
+
 
 class TestQwen2AudioServer(TestOpenAIVisionServer):
     @classmethod
