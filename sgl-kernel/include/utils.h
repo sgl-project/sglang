@@ -254,6 +254,25 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
+inline bool isDeviceType(const std::string& device_type) {
+  int deviceCount;
+  CHECK_CUDA_SUCCESS(cudaGetDeviceCount(&deviceCount));
+
+  int device_id = -1;
+  if (deviceCount >= 1) {
+    CHECK_CUDA_SUCCESS(cudaGetDevice(&device_id));
+  } else {
+    return false;
+  }
+
+  cudaDeviceProp prop;
+  CHECK_CUDA_SUCCESS(cudaGetDeviceProperties(&prop, device_id));
+  if (device_type == std::string(prop.name)) {
+    return true;
+  }
+  return false;
+}
+
 inline bool getBoolEnv(char const* name) {
   char const* env = std::getenv(name);
   return env && env[0] == '1' && env[1] == '\0';
