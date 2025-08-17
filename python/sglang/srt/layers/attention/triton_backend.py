@@ -57,16 +57,36 @@ class TritonAttnBackend(AttentionBackend):
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
 
+        # Parse args
         self.skip_prefill = skip_prefill
-
         max_bs = model_runner.req_to_token_pool.size
+        self.sliding_window_size = model_runner.sliding_window_size
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.num_head = (
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        )
+        self.num_kv_head = model_runner.model_config.get_num_kv_heads(
+            get_attention_tp_size()
+        )
+        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        self.max_context_len = model_runner.model_config.context_len
+        self.device = model_runner.device
+        self.device_core_count = get_device_core_count(model_runner.gpu_id)
+        self.static_kv_splits = get_bool_env_var(
+            "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
+        )
+        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
 
+        # Check arguments
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
-        self.sliding_window_size = model_runner.sliding_window_size
 
+        # Initialize buffers
         # TODO(Jianan Ji): Make sure it behaves as expected when kv_indptr_buf is provided and sliding window is enabled
         if kv_indptr_buf is None:
             self.kv_indptr = torch.zeros(
@@ -87,9 +107,6 @@ class TritonAttnBackend(AttentionBackend):
                 # When provided a buffer, create a clone for the second buffer
                 self.window_kv_indptr = torch.zeros_like(kv_indptr_buf)
 
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
-
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -99,28 +116,8 @@ class TritonAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int64, device=model_runner.device
             )
 
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
-
-        self.num_head = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
-        )
-        self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_attention_tp_size()
-        )
-
-        self.static_kv_splits = get_bool_env_var(
-            "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
-        )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
-
+        # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
-
-        self.max_context_len = model_runner.model_config.context_len
-
-        self.device = model_runner.device
-        self.device_core_count = get_device_core_count(model_runner.gpu_id)
 
     def get_num_kv_splits(
         self,
@@ -333,7 +330,7 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
-            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             num_kv_splits = None
 
         self.forward_metadata = ForwardMetadata(
