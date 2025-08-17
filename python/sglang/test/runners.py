@@ -488,7 +488,7 @@ class SRTRunner:
         tp_size: int = 1,
         model_impl: str = "auto",
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-        lora_paths: Union[None, list[str], list[dict]] = None,
+        lora_paths: Optional[Union[List[str], List[dict[str, str]]]] = None,
         max_loras_per_batch: int = 4,
         attention_backend: Optional[str] = None,
         prefill_attention_backend: Optional[str] = None,
