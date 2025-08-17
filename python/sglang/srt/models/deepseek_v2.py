@@ -1852,7 +1852,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)),
+            is_last_layer=(
+                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+            ),
             is_nextn=self.is_nextn,
         )
 
@@ -1862,7 +1864,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id >= self.config.first_k_dense_replace
             and layer_id % self.config.moe_layer_freq == 0
         )
-
 
     def forward(
         self,
@@ -1888,8 +1889,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        should_allreduce_fusion = self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-            forward_batch
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.

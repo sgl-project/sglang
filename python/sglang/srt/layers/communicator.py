@@ -34,6 +34,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     get_global_dp_buffer,
     get_local_dp_buffer,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -43,7 +44,6 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda, is_flashinfer_available
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
@@ -298,13 +298,17 @@ class LayerCommunicator:
             lookup_table[batch_size] = should_fuse
         return lookup_table
 
-    def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch: ForwardBatch) -> bool:
+    def should_fuse_mlp_allreduce_with_next_layer(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
         if self.is_nextn:
             return False
 
         # dynamic blockers
         try:
-            speculative_algo = global_server_args_dict.get("speculative_algorithm", None)
+            speculative_algo = global_server_args_dict.get(
+                "speculative_algorithm", None
+            )
             if (
                 is_dp_attention_enabled()
                 and speculative_algo is not None
@@ -317,7 +321,8 @@ class LayerCommunicator:
 
         batch_size = (
             forward_batch.input_ids.shape[0]
-            if hasattr(forward_batch, "input_ids") and hasattr(forward_batch.input_ids, "shape")
+            if hasattr(forward_batch, "input_ids")
+            and hasattr(forward_batch.input_ids, "shape")
             else 0
         )
         if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
