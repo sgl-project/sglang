@@ -168,6 +168,7 @@ suites = {
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
         TestFile("test_nightly_text_models_performance.py"),
+        TestFile("test_nightly_vlm_mmmu_eval.py"),
     ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),

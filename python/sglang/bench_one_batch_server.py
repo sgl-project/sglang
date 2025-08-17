@@ -405,7 +405,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     dataset_path=bench_args.dataset_path,
                     parallel_batch=bench_args.parallel_batch,
                     profile_filename_prefix=bench_args.profile_filename_prefix,
-
                 )
             )
 

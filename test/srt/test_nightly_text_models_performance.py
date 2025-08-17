@@ -86,54 +86,72 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                 with self.subTest(model=model):
                     process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
                     model_results = []
-                    
+
                     for batch_size in self.batch_sizes:
                         profile_filename = f"{model.replace('/', '_')}_bs{batch_size}_{int(time.time())}"
-                        profile_path_prefix = os.path.join(PROFILE_DIR, profile_filename)
+                        profile_path_prefix = os.path.join(
+                            PROFILE_DIR, profile_filename
+                        )
 
                         command = [
-                            "python3", "-m", "sglang.bench_one_batch_server",
-                            "--model", model,
-                            "--base-url", self.base_url,
-                            "--batch-size", str(batch_size),
-                            "--input-len", str(self.input_len),
-                            "--output-len", str(self.output_len),
-                            "--show-report", "--profile", "--profile-by-stage",
-                            "--profile-filename-prefix", profile_path_prefix,
+                            "python3",
+                            "-m",
+                            "sglang.bench_one_batch_server",
+                            "--model",
+                            model,
+                            "--base-url",
+                            self.base_url,
+                            "--batch-size",
+                            str(batch_size),
+                            "--input-len",
+                            str(self.input_len),
+                            "--output-len",
+                            str(self.output_len),
+                            "--show-report",
+                            "--profile",
+                            "--profile-by-stage",
+                            "--profile-filename-prefix",
+                            profile_path_prefix,
                         ]
-                        
+
                         print(f"Running command: {' '.join(command)}")
                         result = subprocess.run(command, capture_output=True, text=True)
-                        
+
                         if result.returncode != 0:
-                            print(f"Error running benchmark for {model} with batch size {batch_size}:")
+                            print(
+                                f"Error running benchmark for {model} with batch size {batch_size}:"
+                            )
                             print(result.stderr)
                             # Continue to next batch size even if one fails
                             continue
 
                         print(f"Output for {model} with batch size {batch_size}:")
                         print(result.stdout)
-                        
-                        model_results.append({
-                            "output": result.stdout,
-                            "profile_filename": f"{profile_filename}.json",
-                        })
+
+                        model_results.append(
+                            {
+                                "output": result.stdout,
+                                "profile_filename": f"{profile_filename}.json",
+                            }
+                        )
 
                     kill_process_tree(process.pid)
 
                     if model_results:
-                        report_part = generate_markdown_report(model, model_results, self.input_len, self.output_len)
+                        report_part = generate_markdown_report(
+                            model, model_results, self.input_len, self.output_len
+                        )
                         full_report += report_part + "\n"
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("Final Performance Report")
-        print("="*80)
+        print("=" * 80)
         print(full_report)
-        
+
         # Persist the report for later substitution of artifact URL in the workflow
         with open(REPORT_MD_FILENAME, "w") as f:
             f.write(full_report)
-        
+
         if is_in_ci():
             write_github_step_summary(full_report)
 
