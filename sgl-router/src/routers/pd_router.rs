@@ -702,11 +702,9 @@ impl PDRouter {
                             .execute_dual_dispatch_internal(
                                 headers,
                                 json_request,
-                                context.route,
+                                context,
                                 prefill.as_ref(),
                                 decode.as_ref(),
-                                context.is_stream,
-                                context.return_logprob,
                                 start_time,
                             )
                             .await;
@@ -734,16 +732,13 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
-    #[allow(clippy::too_many_arguments)]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
         json_request: Value,
-        route: &str,
+        context: PDRequestContext,
         prefill: &dyn Worker,
         decode: &dyn Worker,
-        is_stream: bool,
-        return_logprob: bool,
         start_time: Instant,
     ) -> Response {
         // Update load tracking for both workers
@@ -753,7 +748,7 @@ impl PDRouter {
         let decode_request = self.build_post_with_headers(
             &self.client,
             decode.url(),
-            route,
+            context.route,
             &json_request,
             headers,
             false,
@@ -766,12 +761,12 @@ impl PDRouter {
             decode.url()
         );
 
-        if return_logprob {
+        if context.return_logprob {
             // Build prefill request with shared client when we need response body
             let prefill_request = self.build_post_with_headers(
                 &self.client,
                 prefill.url(),
-                route,
+                context.route,
                 &json_request,
                 headers,
                 false,
@@ -783,8 +778,8 @@ impl PDRouter {
 
             // Update metrics
             let duration = start_time.elapsed();
-            RouterMetrics::record_pd_request_duration(route, duration);
-            RouterMetrics::record_pd_request(route);
+            RouterMetrics::record_pd_request_duration(context.route, duration);
+            RouterMetrics::record_pd_request(context.route);
             RouterMetrics::record_pd_prefill_request(prefill.url());
             RouterMetrics::record_pd_decode_request(decode.url());
 
@@ -818,14 +813,18 @@ impl PDRouter {
 
                     // Process prefill response for logprobs
                     let prefill_body = match self
-                        .process_prefill_response(prefill_result, prefill.url(), return_logprob)
+                        .process_prefill_response(
+                            prefill_result,
+                            prefill.url(),
+                            context.return_logprob,
+                        )
                         .await
                     {
                         Ok((_, body)) => body,
                         Err(error_response) => return error_response,
                     };
 
-                    if is_stream {
+                    if context.is_stream {
                         // Streaming response with logprobs
                         let prefill_logprobs = prefill_body
                             .as_ref()
@@ -841,7 +840,7 @@ impl PDRouter {
                             res.bytes_stream(),
                             status,
                             prefill_logprobs,
-                            return_logprob,
+                            context.return_logprob,
                             None,
                             Some(response_headers),
                         )
@@ -850,7 +849,7 @@ impl PDRouter {
                         self.process_non_streaming_response(
                             res,
                             status,
-                            return_logprob,
+                            context.return_logprob,
                             prefill_body,
                         )
                         .await
@@ -878,7 +877,7 @@ impl PDRouter {
                 .build_post_with_headers(
                     &self.prefill_client,
                     prefill.url(),
-                    route,
+                    context.route,
                     &json_request,
                     headers,
                     true,
@@ -900,8 +899,8 @@ impl PDRouter {
 
             // Update metrics
             let duration = start_time.elapsed();
-            RouterMetrics::record_pd_request_duration(route, duration);
-            RouterMetrics::record_pd_request(route);
+            RouterMetrics::record_pd_request_duration(context.route, duration);
+            RouterMetrics::record_pd_request(context.route);
             RouterMetrics::record_pd_prefill_request(prefill.url());
             RouterMetrics::record_pd_decode_request(decode.url());
 
@@ -928,7 +927,7 @@ impl PDRouter {
                                 (status, format!("Decode server error: {}", e)).into_response()
                             }
                         }
-                    } else if is_stream {
+                    } else if context.is_stream {
                         // Streaming response without logprobs - direct passthrough
                         let decode_url = decode.url().to_string();
                         let response_headers =
@@ -1280,10 +1279,10 @@ impl PDRouter {
 
     fn build_post_with_headers(
         &self,
-        client: &reqwest::Client,
+        client: &Client,
         url: &str,
         route: &str,
-        json_request: &serde_json::Value,
+        json_request: &Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
     ) -> reqwest::RequestBuilder {
