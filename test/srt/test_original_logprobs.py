@@ -13,6 +13,7 @@ The test covers the following scenarios:
   match the values computed from Hugging Face logits.
 """
 
+import os
 import random
 import unittest
 
@@ -45,19 +46,12 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = False
 
 
-class TestLogprob(unittest.TestCase):
+class TestOriginalLogprob(unittest.TestCase):
     def setUp(self):
         # ----- HF side (float32 weights) -----
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="right")
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID, torch_dtype=torch.float32, device_map="auto"
-        )
-
-        # ----- SGLang side -----
-        self.sgl_engine = sgl.Engine(
-            model_path=MODEL_ID,
-            skip_tokenizer_init=True,
-            trust_remote_code=True,
         )
 
         # Shared sampling parameters
@@ -67,13 +61,6 @@ class TestLogprob(unittest.TestCase):
             "top_k": 10,
             "max_new_tokens": 1,
         }
-
-    def tearDown(self):
-        try:
-            if hasattr(self.sgl_engine, "shutdown"):
-                self.sgl_engine.shutdown()
-        except Exception:
-            pass
 
     # ---------------------------------------------------------------------
     # Helper: compare one SGLang block (token_logprobs / top_logprobs / ids_logprobs)
@@ -137,58 +124,76 @@ class TestLogprob(unittest.TestCase):
     def test_logprob_match(self):
         vocab_size = self.tokenizer.vocab_size
 
-        for prompt in PROMPTS:
-            random_token_ids = sorted(
-                random.sample(range(vocab_size), NUM_RANDOM_TOKEN_IDS)
-            )
+        for env_val in ["True", "False"]:
+            with self.subTest(return_original_logprob=env_val):
+                os.environ["RETURN_ORIGINAL_LOGPROB"] = env_val
 
-            enc = self.tokenizer(prompt, return_tensors="pt")
-            input_ids = enc["input_ids"].to(self.hf_model.device)
-            attn_mask = enc["attention_mask"].to(self.hf_model.device)
-
-            with torch.inference_mode():
-                hf_out = self.hf_model(
-                    input_ids=input_ids,
-                    attention_mask=attn_mask,
-                    return_dict=True,
+                # ----- SGLang side -----
+                sgl_engine = sgl.Engine(
+                    model_path=MODEL_ID,
+                    skip_tokenizer_init=True,
+                    trust_remote_code=True,
                 )
-            logits = hf_out.logits[:, -1, :]  # [1, V]
-            hf_log_probs = F.log_softmax(
-                logits.float() / self.sampling_params["temperature"], dim=-1
-            )[
-                0
-            ]  # [V]
-            hf_original_log_probs = F.log_softmax(logits.float(), dim=-1)[0]  # [V]
 
-            outputs = self.sgl_engine.generate(
-                input_ids=input_ids[0].tolist(),
-                sampling_params=self.sampling_params,
-                return_logprob=True,
-                top_logprobs_num=TOP_LOGPROBS_NUM,
-                token_ids_logprob=random_token_ids,
-            )
+                for prompt in PROMPTS:
+                    random_token_ids = sorted(
+                        random.sample(range(vocab_size), NUM_RANDOM_TOKEN_IDS)
+                    )
 
-            if isinstance(outputs, list):
-                outputs = outputs[0]
-            meta = outputs["meta_info"]
+                    enc = self.tokenizer(prompt, return_tensors="pt")
+                    input_ids = enc["input_ids"].to(self.hf_model.device)
+                    attn_mask = enc["attention_mask"].to(self.hf_model.device)
 
-            self.assert_logprobs_block_equal(
-                hf_log_probs=hf_log_probs,
-                token_log_probs=meta["output_token_logprobs"],
-                top_log_probs=meta["output_top_logprobs"],
-                ids_log_probs=meta["output_token_ids_logprobs"],
-                random_token_ids=random_token_ids,
-                tag=f"logprobs SGLang vs HF: {prompt}",
-            )
+                    with torch.inference_mode():
+                        hf_out = self.hf_model(
+                            input_ids=input_ids,
+                            attention_mask=attn_mask,
+                            return_dict=True,
+                        )
+                    logits = hf_out.logits[:, -1, :]  # [1, V]
+                    hf_log_probs = F.log_softmax(
+                        logits.float() / self.sampling_params["temperature"], dim=-1
+                    )[0]
+                    hf_original_log_probs = F.log_softmax(logits.float(), dim=-1)[0]
 
-            self.assert_logprobs_block_equal(
-                hf_log_probs=hf_original_log_probs,
-                token_log_probs=meta["output_token_original_logprobs"],
-                top_log_probs=meta["output_top_original_logprobs"],
-                ids_log_probs=meta["output_token_ids_original_logprobs"],
-                random_token_ids=random_token_ids,
-                tag=f"Original logprobs SGLang vs HF: {prompt}",
-            )
+                    outputs = sgl_engine.generate(
+                        input_ids=input_ids[0].tolist(),
+                        sampling_params=self.sampling_params,
+                        return_logprob=True,
+                        top_logprobs_num=TOP_LOGPROBS_NUM,
+                        token_ids_logprob=random_token_ids,
+                    )
+
+                    if isinstance(outputs, list):
+                        outputs = outputs[0]
+                    meta = outputs["meta_info"]
+
+                    # Always check regular logprobs
+                    self.assert_logprobs_block_equal(
+                        hf_log_probs=hf_log_probs,
+                        token_log_probs=meta["output_token_logprobs"],
+                        top_log_probs=meta["output_top_logprobs"],
+                        ids_log_probs=meta["output_token_ids_logprobs"],
+                        random_token_ids=random_token_ids,
+                        tag=f"logprobs SGLang vs HF: {prompt} ({env_val})",
+                    )
+
+                    # Check original logprobs only if enabled
+                    if env_val.lower() == "true":
+                        self.assert_logprobs_block_equal(
+                            hf_log_probs=hf_original_log_probs,
+                            token_log_probs=meta["output_token_original_logprobs"],
+                            top_log_probs=meta["output_top_original_logprobs"],
+                            ids_log_probs=meta["output_token_ids_original_logprobs"],
+                            random_token_ids=random_token_ids,
+                            tag=f"Original logprobs SGLang vs HF: {prompt} ({env_val})",
+                        )
+                    else:
+                        # Assert original logprobs are not returned
+                        self.assertNotIn("output_token_original_logprobs", meta)
+                        self.assertNotIn("output_top_original_logprobs", meta)
+                        self.assertNotIn("output_token_ids_original_logprobs", meta)
+                sgl_engine.shutdown()
 
 
 if __name__ == "__main__":

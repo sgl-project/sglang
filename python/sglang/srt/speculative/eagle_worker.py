@@ -47,6 +47,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
     is_cuda,
     next_power_of_2,
 )
@@ -55,6 +56,7 @@ if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
+RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB", default=False)
 
 
 @contextmanager
@@ -746,16 +748,17 @@ class EAGLEWorker(TpModelWorker):
         accepted_indices = res.accepted_indices
         assert len(accepted_indices) == len(logits_output.next_token_logits)
 
-        # Temperature rescales logits (logits / temperature); only temperature = 1.0 leaves the model’s “true” log‑probs unchanged.
-        is_temperatures_one = torch.all(batch.sampling_info.temperatures == 1.0)
         temperatures = batch.sampling_info.temperatures
         num_draft_tokens = batch.spec_info.draft_token_num
         # acceptance indices are the indices in a "flattened" batch.
         # dividing it to num_draft_tokens will yield the actual batch index.
         temperatures = temperatures[accepted_indices // num_draft_tokens]
-        original_logprobs = torch.nn.functional.log_softmax(
-            logits_output.next_token_logits, dim=-1
-        )
+        if RETURN_ORIGINAL_LOGPROB:
+            original_logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits, dim=-1
+            )
+        else:
+            original_logprobs = None
         logprobs = torch.nn.functional.log_softmax(
             logits_output.next_token_logits / temperatures, dim=-1
         )
@@ -780,7 +783,6 @@ class EAGLEWorker(TpModelWorker):
                 logprobs,
                 original_logprobs,
                 top_logprobs_nums_repeat_interleaved,
-                is_temperatures_one,
             )
 
         if any(x is not None for x in token_ids_logprobs):
@@ -792,7 +794,6 @@ class EAGLEWorker(TpModelWorker):
                 logprobs,
                 original_logprobs,
                 token_ids_logprobs_repeat_interleaved,
-                is_temperatures_one,
             )
 
         logits_output.next_token_logprobs = logprobs[
