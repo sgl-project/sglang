@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
