@@ -135,7 +135,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         )
         is_first = True
         all_results = []
-
+        print(f"{self.model_groups=}")
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
