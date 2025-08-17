@@ -8,7 +8,7 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflows/release-docker-npu.yaml"
+      - ".github/workflows/release-docker-npu.yml"
 
 jobs:
   build:
@@ -16,7 +16,7 @@ jobs:
     strategy:
       matrix:
         cann_version: ["8.2.rc1"]
-        device_type: ["a3"]
+        device_type: ["910b", "a3"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
