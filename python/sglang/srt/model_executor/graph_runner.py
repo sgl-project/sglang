@@ -521,7 +521,7 @@ class GraphRunner:
                             (
                                 graph,
                                 output_buffers,
-                            ) = self.capture_one_batch_size(bs, forward)
+                            ) = self.capture_one_batch_size(bs, forward, capture_config)
                             graph_handle = (bs, *capture_config)
                             self.graphs[graph_handle] = graph
                             self.output_buffers[graph_handle] = output_buffers
