@@ -516,12 +516,12 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
   torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
   torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
 
-  bool tuning_kernel = getenv("SGL_TUNE_DEVICE_KERNEL") ? true : false;
+  bool tuning_H20_kernel = getBoolEnv("SGL_TUNE_DEVICE_KERNEL");
 
   const std::string H20_device_type_str = "NVIDIA H20";
   bool is_h20 = isDeviceType(H20_device_type_str);
 
-  if (is_h20 && tuning_kernel) {
+  if (is_h20 && tuning_H20_kernel) {
     using execute_gemm_config = sm90_fp8_pp_config_64_128_128_1_2_1;
     run_get_group_gemm_starts<
         execute_gemm_config::LayoutSFA,
