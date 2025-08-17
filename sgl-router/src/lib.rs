@@ -10,6 +10,7 @@ pub mod policies;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
+pub mod tokenizer;
 pub mod tree;
 use crate::metrics::PrometheusConfig;
 
@@ -249,6 +250,7 @@ impl Router {
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
