@@ -153,9 +153,8 @@ def run_test(tp_size, batch_size, model_config, check=False):
         x,
         w1,
         w2,
-        topk_weights,
-        topk_ids,
-        inplace=False,  # Use False for benchmarking to avoid side effects if run multiple times
+        (topk_weights, topk_ids, "dummy"),
+        inplace=False,
         activation="silu",  # Assuming SiLU activation common in MoEs
         use_fp8_w8a8=True,
         w1_scale=w1_scale,
@@ -221,8 +220,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 x,
                 w1,  # Original shape
                 w2,  # Original shape
-                topk_weights,
-                topk_ids,
+                (topk_weights, topk_ids, "dummy"),
                 inplace=False,  # Important: Use False to get output tensor
                 activation="silu",
                 use_fp8_w8a8=True,
@@ -266,7 +264,7 @@ if __name__ == "__main__":
         "--batch-sizes",
         type=int,
         nargs="+",
-        default=[1, 4, 8, 16, 32, 64, 128, 256, 512],  # Adjusted default
+        default=[1, 4, 8, 16, 32, 64, 128, 256, 512, 1024],  # Adjusted default
         help="List of batch sizes to test",
     )
     parser.add_argument("--check", action="store_true", help="Enable check mode")
