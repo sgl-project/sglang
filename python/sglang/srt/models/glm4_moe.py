@@ -153,21 +153,13 @@ class Glm4MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(
-        self,
-        x,
-        forward_batch=None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ):
+    def forward(self, x, forward_batch=None, should_allreduce_fusion=False):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
+        x, _ = self.down_proj(x, skip_all_reduce=should_allreduce_fusion)
         return x
 
 
@@ -665,8 +657,6 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)),
-            is_nextn=is_nextn,
         )
 
     def forward(
@@ -691,23 +681,11 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
             hidden_states, residual, forward_batch
         )
 
-        should_allreduce_fusion = self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-            forward_batch
-        )
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(forward_batch)
+        hidden_states = self.mlp(hidden_states, forward_batch)
 
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
         )
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        
-        if not should_allreduce_fusion:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
 
         return hidden_states, residual
 
