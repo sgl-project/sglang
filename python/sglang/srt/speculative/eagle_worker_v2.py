@@ -482,7 +482,7 @@ class EAGLEWorker(TpModelWorker):
         # need record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
         seq_lens_backup.record_stream(torch.cuda.current_stream())
-        
+
         # Construct the return values
         draft_input = EagleDraftInput(
             topk_p=ret_topk_p,

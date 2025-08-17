@@ -55,8 +55,7 @@ class TestEagleBS1(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"TestEagleBS1 -- {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.3) # 0.3 is the baseline
-
+        self.assertGreater(metrics["accuracy"], 0.3)  # 0.3 is the baseline
 
 
 class TestEagleLargeBS(CustomTestCase):
@@ -109,6 +108,7 @@ class TestEagleLargeBS(CustomTestCase):
         metrics = run_eval(args)
         print(f"TestEagleLargeBS -- {metrics=}")
         # self.assertGreater(metrics["accuracy"], 0.3) # fails, currently 0.1
+
 
 if __name__ == "__main__":
     unittest.main()

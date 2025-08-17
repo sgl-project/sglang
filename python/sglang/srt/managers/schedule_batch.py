@@ -65,7 +65,12 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, next_power_of_2, support_triton, alloc_len_per_eagle_decode
+from sglang.srt.utils import (
+    alloc_len_per_eagle_decode,
+    flatten_nested_list,
+    next_power_of_2,
+    support_triton,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -1042,12 +1047,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # We need this to get the correct self.seq_lens
         if self.verify_done is not None:
             self.verify_done.synchronize()
-        
+
         self.seq_lens_sum = self.seq_lens.sum().item()
         new_allocate_lens = self.seq_lens + alloc_len_per_eagle_decode(worker)
         # TODO: remove assert
-        assert torch.all(new_allocate_lens > self.spec_info.allocate_lens), f"new_allocate_lens={new_allocate_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
-        assert torch.all(self.seq_lens <= self.spec_info.allocate_lens), f"self.seq_lens={self.seq_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
+        assert torch.all(
+            new_allocate_lens > self.spec_info.allocate_lens
+        ), f"new_allocate_lens={new_allocate_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
+        assert torch.all(
+            self.seq_lens <= self.spec_info.allocate_lens
+        ), f"self.seq_lens={self.seq_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
         num_needed_tokens = (
             (new_allocate_lens - self.spec_info.allocate_lens).sum().item()
         )

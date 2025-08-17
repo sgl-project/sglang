@@ -83,7 +83,9 @@ class EagleDraftInput:
         self.allocate_lens = torch.cat(
             [self.allocate_lens, spec_info.allocate_lens], axis=0
         )
-        self.new_seq_lens = torch.cat([self.new_seq_lens, spec_info.new_seq_lens], axis=0)
+        self.new_seq_lens = torch.cat(
+            [self.new_seq_lens, spec_info.new_seq_lens], axis=0
+        )
 
     def prepare_for_draft(
         self,
