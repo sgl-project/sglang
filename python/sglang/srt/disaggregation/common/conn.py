@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
@@ -42,6 +43,7 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        scheduler_metrics_collector: Optional[SchedulerMetricsCollector] = None,
     ):
         self.kv_args = args
         self.is_mla_backend = is_mla_backend
