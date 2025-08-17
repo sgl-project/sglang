@@ -190,7 +190,7 @@ def _decode_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
-    batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
+    batch, head_num = q.shape[0], q.shape[1]
 
     grid = (batch, head_num, MAX_KV_SPLITS)
     kv_group_num = q.shape[1] // k_buffer.shape[1]
@@ -433,7 +433,7 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
+    batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     BLOCK_H = 16

@@ -110,8 +110,8 @@ suites = {
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vlm_input_format.py", 300),
-        TestFile("test_vision_openai_server_a.py", 989),
-        TestFile("test_vision_openai_server_b.py", 620),
+        TestFile("test_vision_openai_server_a.py", 403),
+        TestFile("test_vision_openai_server_b.py", 446),
     ],
     "per-commit-2-gpu": [
         TestFile("lora/test_lora_tp.py", 116),
@@ -142,6 +142,9 @@ suites = {
     ],
     "per-commit-8-gpu-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
+    ],
+    "per-commit-8-gpu-h20": [
+        TestFile("quant/test_w4a8_deepseek_v3.py", 371),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
@@ -225,6 +228,17 @@ suite_amd = {
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_wave_attention_kernels.py", 2),
         TestFile("test_wave_attention_backend.py", 150),
+    ],
+    "per-commit-1-ascend-npu": [
+        TestFile("test_ascend_tp1_bf16.py", 400),
+        TestFile("test_ascend_graph_tp1_bf16.py", 400),
+    ],
+    "per-commit-2-ascend-npu": [
+        TestFile("test_ascend_tp2_bf16.py", 400),
+        TestFile("test_ascend_graph_tp2_bf16.py", 400),
+    ],
+    "per-commit-4-ascend-npu": [
+        TestFile("test_ascend_mla_w8a8int8.py", 400),
     ],
     "per-commit-2-gpu-amd": [
         TestFile("lora/test_lora_tp.py", 116),
