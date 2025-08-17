@@ -24,6 +24,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -43,10 +44,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -55,13 +54,10 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_kernel import (
-    is_fp8_fnuz,
-    per_tensor_quant_mla_fp8,
-    per_token_group_quant_mla_deep_gemm_masked_fp8,
-)
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -81,17 +77,14 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    bind_or_assign,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
-    get_int_env_var,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
     is_hip,
-    is_non_idle_and_non_empty,
     log_info_on_rank0,
+    make_layers,
     use_intel_amx_backend,
 )
 
@@ -699,27 +692,37 @@ class Glm4MoeModel(DeepseekV2Model):
         nn.Module.__init__(self)
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.pp_group = get_pp_group()
         self.first_k_dense_replace = config.first_k_dense_replace
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
-        )
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                enable_tp=not is_dp_attention_enabled(),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
-        self.layers = nn.ModuleList(
-            [
-                Glm4MoeDecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                    alt_stream=self.alt_stream,
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: Glm4MoeDecoderLayer(
+                config=config,
+                layer_id=idx,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
+            ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=add_prefix("layers", prefix),
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
 
 
 class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
@@ -734,6 +737,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
         config.moe_layer_freq = 1
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.pp_group = get_pp_group()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts("Glm4MoeForCausalLM")
         self.model = Glm4MoeModel(
@@ -789,6 +793,14 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
         if is_nextn:
@@ -817,17 +829,9 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             weights_list = list(weights)
             weights_dict = dict(weights_list)
             if self.quant_config is not None:
-                if self.quant_config.get_name() == "w8a8_int8":
-                    suffix_list = [
-                        "down_proj.weight",
-                        "down_proj.weight_scale",
-                        "gate_proj.weight",
-                        "gate_proj.weight_scale",
-                        "up_proj.weight",
-                        "up_proj.weight_scale",
-                    ]
-                elif (
-                    self.quant_config.get_name() == "fp8"
+                if (
+                    self.quant_config.get_name() == "w8a8_int8"
+                    or self.quant_config.get_name() == "fp8"
                     or self.quant_config.get_name() == "blockwise_int8"
                     or self.quant_config.get_name() == "compressed_tensors"
                 ):
