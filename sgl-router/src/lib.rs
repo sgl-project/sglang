@@ -10,6 +10,7 @@ pub mod policies;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
+pub mod tokenizer;
 pub mod tree;
 use crate::metrics::PrometheusConfig;
 
