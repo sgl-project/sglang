@@ -17,8 +17,6 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
-from dataclasses import dataclass
-from enum import Enum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
@@ -31,10 +29,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.eplb.expert_distribution import (
-    ExpertDistributionRecorder,
-    get_global_expert_distribution_recorder,
-)
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
@@ -45,7 +40,6 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_local_attention_dp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -55,8 +49,8 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE, get_moe_impl_class
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -149,14 +143,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            # Additional args for FusedMoE
-            **(
-                dict(
-                    enable_flashinfer_cutlass_moe=True,
-                )
-                if global_server_args_dict["enable_flashinfer_cutlass_moe"]
-                else {}
-            ),
         )
 
         self.gate = ReplicatedLinear(
@@ -340,7 +326,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-        self.local_dp_size = get_local_attention_dp_size()
 
         # Qwen2MoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
