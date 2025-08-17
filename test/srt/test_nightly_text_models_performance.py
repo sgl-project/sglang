@@ -8,7 +8,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    popen_launch_server,
+    popen_launch_server, DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
 )
 
 PROFILE_DIR = "performance_profiles"
@@ -57,8 +57,8 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
-            # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
-            (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
+            (parse_models("meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3"), False, False),
+            # (parse_models("meta-llama/Llama-3.1-8B-Instruct"), False, False),
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
