@@ -165,11 +165,6 @@ suites = {
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 371),
     ],
-    "nightly": [
-        TestFile("test_nightly_gsm8k_eval.py"),
-        TestFile("test_nightly_text_models_performance.py"),
-        TestFile("test_nightly_vlm_mmmu_eval.py"),
-    ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("test_bnb.py", 5),

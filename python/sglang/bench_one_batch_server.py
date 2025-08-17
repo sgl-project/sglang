@@ -225,8 +225,6 @@ def run_one_case(
         )
 
     tic = time.perf_counter()
-    print(f"{input_requests[0].prompt=}")
-    print(f"{input_requests[0].image_data=}")
     if dataset_name == "mmmu":
         # vlm
         for input_req in input_requests:

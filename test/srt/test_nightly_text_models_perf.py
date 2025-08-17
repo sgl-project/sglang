@@ -6,10 +6,9 @@ import unittest
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    popen_launch_server,
+    popen_launch_server, is_in_ci, write_github_step_summary,
 )
 
 PROFILE_DIR = "performance_profiles_text_models"
@@ -71,21 +70,24 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.batch_sizes = [1]
+        cls.batch_sizes = (1, 1, 8, 32, 64, 160, 256, 384)
+        cls.batch_sizes = (1, 1, 8, 32)
         cls.input_len = 4096
         cls.output_len = 1024
         os.makedirs(PROFILE_DIR, exist_ok=True)
 
-    def test_bench_one_batch(self):
+    def test_bench_one_batch(self, batch_sizes: tuple = None):
         full_report = "## Nightly Performance Test Summary\n"
 
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
+                    full_report += f"### {model}\n"
+
                     process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
                     model_results = []
 
-                    for batch_size in self.batch_sizes:
+                    for batch_size in batch_sizes or self.batch_sizes:
                         profile_filename = f"{model.replace('/', '_')}_bs{batch_size}_{int(time.time())}"
                         profile_path_prefix = os.path.join(
                             PROFILE_DIR, profile_filename
@@ -146,8 +148,8 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
             print(f"results written to {REPORT_MD_FILENAME=}")
             f.write(full_report)
 
-        # if is_in_ci():
-        #     write_github_step_summary(full_report)
+        if is_in_ci():
+            write_github_step_summary(full_report)
 
 
 if __name__ == "__main__":

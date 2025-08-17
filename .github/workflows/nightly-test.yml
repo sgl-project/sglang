@@ -30,7 +30,7 @@ jobs:
         timeout-minutes: 120
         run: |
           cd test/srt
-          python3 run_suite.py --suite nightly --timeout-per-file 3600
+          python3 test_nightly_gsm8k_eval.py
 
   nightly-test-perf-text-models:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
