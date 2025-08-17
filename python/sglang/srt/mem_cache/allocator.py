@@ -488,7 +488,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         assert self.max_num_extend_tokens_next_power_of_2 >= extend_num_tokens, (
             f"{self.max_num_extend_tokens_next_power_of_2=} >= {extend_num_tokens=} does not hold. "
-            f"If this happens in PD, consider letting chunked_prefill_size in Dbe as large as in P"
+            f"If this happens in PD, consider letting chunked_prefill_size in D be as large as in P"
         )
 
         out_indices = torch.empty(
