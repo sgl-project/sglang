@@ -13,6 +13,7 @@
 # ==============================================================================
 """Pydantic models for OpenAI API protocol"""
 
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -440,7 +441,7 @@ class ChatCompletionRequest(BaseModel):
     )  # noqa
     return_hidden_states: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
-        default="medium",
+        default=os.getenv("SRT_DEFAULT_REASONING_EFFORT", "medium"),
         description="Constrains effort on reasoning for reasoning models. "
         "'low' is the least effort, 'high' is the most effort. Reducing reasoning effort can "
         "result in faster responses and fewer tokens used on reasoning in a response. "
