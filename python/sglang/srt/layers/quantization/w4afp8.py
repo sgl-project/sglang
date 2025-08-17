@@ -18,7 +18,9 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.ep_moe.layer import EPMoE, TopKOutput
+    from sglang.srt.layers.moe import MoeRunnerConfig
+    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -116,6 +118,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         assert "weight_loader" in extra_weight_attrs
 
         # Fused gate_up_proj (column parallel)
@@ -144,6 +148,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
+        )
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
@@ -274,9 +281,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
     def apply(
         self,
         layer: EPMoE,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-        **kwargs,
+        x: torch.Tensor,
+        topk_output: StandardTopKOutput,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
 
         # TODO(ch-wan): move it out of this class
@@ -284,19 +291,17 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         topk_weights, topk_ids, _ = topk_output
         local_topk_ids = topk_ids
-        if layer.expert_map is not None:
-            "Translate info from expert_map to topk_ids"
-            local_topk_ids = torch.where(
-                layer.expert_map[topk_ids] != layer.num_experts,
-                layer.expert_map[topk_ids],
-                layer.num_experts,
-            )
+        local_topk_ids = torch.where(
+            topk_ids == -1,
+            layer.num_experts,
+            topk_ids,
+        )
 
-        return cutlass_w4a8_moe(
+        output = cutlass_w4a8_moe(
             layer.start_expert_id,
             layer.end_expert_id,
             layer.num_experts,
-            hidden_states,
+            x,
             layer.w13_weight,
             layer.w2_weight,
             layer.w13_weight_scale_inv,
@@ -318,3 +323,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
         )
+        if moe_runner_config.routed_scaling_factor is not None:
+            output *= moe_runner_config.routed_scaling_factor
+        return output

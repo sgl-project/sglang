@@ -15,7 +15,7 @@ from sglang.srt.distributed import (
 )
 
 
-def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
+def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
     hasher = hashlib.sha256()
 
     if prior_hash:
