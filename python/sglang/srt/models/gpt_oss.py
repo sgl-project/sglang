@@ -130,10 +130,6 @@ class GptOssSparseMoeBlock(nn.Module):
                 "use_weight_loader_fused": quant_config_name
                 != "mxfp4"
             }
-
-        # from remote_pdb import set_trace
-        # set_trace()
-
         self.experts = experts_type(
             num_experts=config.num_local_experts
             + global_server_args_dict["ep_num_redundant_experts"],
