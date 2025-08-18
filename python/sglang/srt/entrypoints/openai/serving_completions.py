@@ -45,7 +45,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         """Validate that the input is valid."""
         prompt = request.prompt
         if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
-            return "prompt cannot be empty."
+            return "Prompt cannot be empty"
 
         return None
 
