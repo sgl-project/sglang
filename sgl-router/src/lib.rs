@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod openai_api_types;
 pub mod policies;
+pub mod reasoning_parser;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
