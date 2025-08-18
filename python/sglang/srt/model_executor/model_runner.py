@@ -1353,11 +1353,6 @@ class ModelRunner:
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
-        max_num_extend_tokens = (
-            self.server_args.chunked_prefill_size
-            if self.server_args.chunked_prefill_size > 0
-            else self.server_args.max_prefill_tokens
-        )
         if self.token_to_kv_pool_allocator is None:
             if self.server_args.attention_backend == "ascend":
                 self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
@@ -1396,7 +1391,6 @@ class ModelRunner:
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
                         need_sort=need_sort,
-                        max_num_extend_tokens=max_num_extend_tokens,
                     )
         else:
             assert self.is_draft_worker
