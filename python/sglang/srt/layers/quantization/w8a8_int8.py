@@ -49,6 +49,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 _is_cuda = is_cuda()
@@ -255,17 +256,23 @@ class W8A8Int8Config(QuantizationConfig):
 
         if _is_npu:
             if isinstance(layer, LinearBase):
+                key = "model"
+                if "vision_model" in prefix:
+                    key = "vision_model"
+                elif "visual" in prefix:
+                    key = "visual"
+                packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
                 prefix_in_quant_config = prefix
                 proj_name = prefix.split(".")[-1]
-                if proj_name in self.packed_modules_mapping:
+                if proj_name in packed_modules_mapping_subset:
                     prefix_in_quant_config = prefix.replace(
-                        proj_name, self.packed_modules_mapping[proj_name][0]
+                        proj_name, packed_modules_mapping_subset[proj_name][0]
                     )
                 self.is_dynamic = (
                     self.quant_description[prefix_in_quant_config + ".weight"]
                     == "W8A8_DYNAMIC"
                 )
-                if self.is_layer_skipped(prefix, self.packed_modules_mapping):
+                if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                     return UnquantizedLinearMethod()
                 return (
                     NPU_W8A8DynamicLinearMethod(self)
@@ -481,12 +488,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
@@ -495,7 +497,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 
             topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
-                apply_router_weight_on_input, topk_weights, x
+                moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
@@ -519,17 +521,13 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            inplace=inplace,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+            moe_runner_config=moe_runner_config,
             use_int8_w8a8=True,
             per_channel_quant=True,
             w1_scale=(layer.w13_weight_scale),
             w2_scale=(layer.w2_weight_scale),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )
 
 
@@ -976,7 +974,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer,
         x,
         topk_output: TopKOutput,
-        **kwargs,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
 
         topk_weights, topk_ids, _ = topk_output
