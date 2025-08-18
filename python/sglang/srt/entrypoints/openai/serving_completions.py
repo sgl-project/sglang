@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Union
+from typing import Any, AsyncGenerator, Dict, List, Union, Optional
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -40,6 +40,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
     def _request_id_prefix(self) -> str:
         return "cmpl-"
+
+    def _validate_request(self, request: CompletionRequest) -> Optional[str]:
+        """Validate that the input is valid."""
+        if len(request.prompt) == 0:
+            return "prompt cannot be empty."
+
+        return None
 
     def _convert_to_internal_request(
         self,
