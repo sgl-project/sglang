@@ -298,6 +298,9 @@ def triton_kernel_fused_experts_with_bias(
         global_num_experts = E
 
     # TODO maybe completely remove this branch
+    # from remote_pdb import set_trace
+    # set_trace()
+
     if w1.dtype == torch.bfloat16:
         device = "cuda"
         optg = dict()

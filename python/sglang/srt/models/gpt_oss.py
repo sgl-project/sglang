@@ -130,6 +130,10 @@ class GptOssSparseMoeBlock(nn.Module):
                 "use_weight_loader_fused": quant_config_name
                 != "mxfp4"
             }
+
+        # from remote_pdb import set_trace
+        # set_trace()
+
         self.experts = experts_type(
             num_experts=config.num_local_experts
             + global_server_args_dict["ep_num_redundant_experts"],
@@ -246,6 +250,7 @@ class GptOssAttention(nn.Module):
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
+
         self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
@@ -1123,7 +1128,12 @@ class GptOssForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "sinks" in name:
-                            start = tp_rank * param.numel()
+                            attn_tp_rank = get_attention_tp_rank()
+                            start = attn_tp_rank * param.numel()
+
+                            # from remote_pdb import set_trace
+                            # set_trace()
+
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
