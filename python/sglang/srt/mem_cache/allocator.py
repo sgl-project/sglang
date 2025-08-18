@@ -494,7 +494,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.ret_values,
             next_power_of_2(bs),
             self.page_size,
-            max_num_extend_tokens_next_power_of_2,
+            seen_max_num_extend_tokens_next_power_of_2,
         )
 
         if self.debug_mode:
