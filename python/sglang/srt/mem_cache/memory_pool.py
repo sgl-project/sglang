@@ -376,7 +376,7 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.graph_runner import get_is_capture_mode
 
         if layer_id_override is not None:
             layer_id = layer_id_override
@@ -849,7 +849,7 @@ class MLATokenToKVPool(KVCache):
             cache_k_rope = cache_k_rope.view(self.store_dtype)
 
         set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+            self.kv_buffer[layer_id - self.start_layer], loc, cache_k_nope, cache_k_rope
         )
 
     def get_cpu_copy(self, indices):
