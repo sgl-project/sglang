@@ -24,8 +24,8 @@ limitations under the License.
 at::Tensor silu_and_mul_cpu(at::Tensor& input);
 
 // gelu_and_mul
-at::Tensor gelu_tanh_and_mul_cpu(at::Tensor& input);
-at::Tensor gelu_and_mul_cpu(at::Tensor& input);
+at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input);
+at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
 
 // l2norm
 at::Tensor l2norm_cpu(at::Tensor& input, double eps);

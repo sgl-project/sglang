@@ -78,7 +78,7 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input) {
   return out;
 }
 
-at::Tensor gelu_tanh_and_mul_cpu(at::Tensor& input) {
+at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
   RECORD_FUNCTION("sgl-kernel::gelu_tanh_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
@@ -86,7 +86,7 @@ at::Tensor gelu_tanh_and_mul_cpu(at::Tensor& input) {
   sizes[last_dim] = d;
   int64_t num_tokens = input.numel() / input.size(-1);
   at::Tensor out = at::empty(sizes, input.options());
-
+  const float sqrt_2_div_pi = std::sqrt(2.f / M_PI);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
     using Vec = at::vec::Vectorized<float>;
     act_and_mul_kernel_impl(
@@ -94,14 +94,14 @@ at::Tensor gelu_tanh_and_mul_cpu(at::Tensor& input) {
         input.data_ptr<scalar_t>(),
         num_tokens,
         d,
-        [](float x) {
+        [sqrt_2_div_pi](float x) {
           float x3 = x * x * x;
-          float tanh_arg = std::sqrt(2.f / M_PI) * (x + 0.044715f * x3);
+          float tanh_arg = sqrt_2_div_pi * (x + 0.044715f * x3);
           return 0.5f * x * (1.f + std::tanh(tanh_arg));
         },
-        [](Vec x) {
+        [sqrt_2_div_pi](Vec x) {
           Vec x3 = x * x * x;
-          Vec tanh_arg = Vec(std::sqrt(2.f / M_PI)) * (x + Vec(0.044715f) * x3);
+          Vec tanh_arg = Vec(sqrt_2_div_pi) * (x + Vec(0.044715f) * x3);
           return Vec(0.5f) * x * (Vec(1.f) + tanh_arg.tanh());
         });
   });
@@ -109,7 +109,7 @@ at::Tensor gelu_tanh_and_mul_cpu(at::Tensor& input) {
   return out;
 }
 
-at::Tensor gelu_and_mul_cpu(at::Tensor& input) {
+at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
   RECORD_FUNCTION("sgl-kernel::gelu_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
