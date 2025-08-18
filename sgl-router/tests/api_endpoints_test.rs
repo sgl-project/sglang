@@ -50,6 +50,7 @@ impl TestContext {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -717,7 +718,7 @@ mod worker_management_tests {
         // Add the worker
         let req = Request::builder()
             .method("POST")
-            .uri(&format!("/add_worker?url={}", url))
+            .uri(format!("/add_worker?url={}", url))
             .body(Body::empty())
             .unwrap();
 
@@ -775,7 +776,7 @@ mod worker_management_tests {
         // Remove the worker
         let req = Request::builder()
             .method("POST")
-            .uri(&format!("/remove_worker?url={}", worker_url))
+            .uri(format!("/remove_worker?url={}", worker_url))
             .body(Body::empty())
             .unwrap();
 
@@ -855,7 +856,7 @@ mod worker_management_tests {
         // Add worker first time
         let req = Request::builder()
             .method("POST")
-            .uri(&format!("/add_worker?url={}", url))
+            .uri(format!("/add_worker?url={}", url))
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -866,7 +867,7 @@ mod worker_management_tests {
         // Try to add same worker again
         let req = Request::builder()
             .method("POST")
-            .uri(&format!("/add_worker?url={}", url))
+            .uri(format!("/add_worker?url={}", url))
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -895,7 +896,7 @@ mod worker_management_tests {
         // Try to add unhealthy worker
         let req = Request::builder()
             .method("POST")
-            .uri(&format!("/add_worker?url={}", url))
+            .uri(format!("/add_worker?url={}", url))
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1091,6 +1092,7 @@ mod error_tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
@@ -1410,7 +1412,7 @@ mod pd_mode_tests {
         // Extract port from prefill URL
         let prefill_port = prefill_url
             .split(':')
-            .last()
+            .next_back()
             .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
             .unwrap_or(9000);
 
@@ -1441,6 +1443,7 @@ mod pd_mode_tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
         };
 
         // Create app context
@@ -1595,6 +1598,7 @@ mod request_id_tests {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
