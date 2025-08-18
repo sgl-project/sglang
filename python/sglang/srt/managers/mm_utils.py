@@ -560,7 +560,7 @@ def embed_mm_inputs(
                 ]
                 items_size[i + 1] = len(mm_items)
                 items_offsets.append(
-                    flatten_nested_list([item.offsets for item in mm_inputs.mm_items])
+                    flatten_nested_list([item.offsets for item in mm_items])
                 )
             items_size = torch.cumsum(items_size, dim=0).tolist()
 

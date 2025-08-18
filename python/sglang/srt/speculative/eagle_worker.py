@@ -840,6 +840,21 @@ class EAGLEWorker(TpModelWorker):
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
+        has_finished, unfinished_req_index = False, []
+        for i, req in enumerate(batch.reqs):
+            if req.finished():
+                has_finished = True
+            else:
+                unfinished_req_index.append(i)
+        if has_finished:
+            unfinished_index_device = torch.tensor(
+                unfinished_req_index,
+                dtype=torch.int64,
+                device=batch.spec_info.topk_p.device,
+            )
+            batch.spec_info.filter_batch(
+                unfinished_index_device, has_been_filtered=False
+            )
 
     def get_mm_embeds(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Get the input embeds for the draft model forward.
