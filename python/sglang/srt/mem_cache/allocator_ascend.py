@@ -75,7 +75,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         kvcache: KVCache,
         need_sort: bool,
     ):
-        super().__init__(size, page_size, dtype, device, kvcache, need_sort, 1)
+        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
 
     def alloc_extend(
         self,
