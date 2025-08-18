@@ -80,7 +80,7 @@ class GPUTrace2Graph:
 
         # Keep track of current interval end
         current_end = ends[0]
-        display_units = int(len(df) / 100)
+        display_units = max(1, int(len(df) / 100))
         # Update current_end for overlapping intervals
         for i in range(1, len(df)):
             if i % display_units == 0:
