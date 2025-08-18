@@ -1107,9 +1107,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             topk_config.num_expert_group is not None
             and topk_config.topk_group is not None
         ), "Current trtllm_fp8_block_scale_moe kernel does not support these two arguments as None"
+
+        if topk_config.correction_bias is None:
+            correction_bias = topk_config.correction_bias.to(x.dtype)
+        else:
+            correction_bias = None
         return trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
-            routing_bias=topk_config.correction_bias,
+            routing_bias=correction_bias,
             hidden_states=a_q,
             hidden_states_scale=a_sf_t,
             gemm1_weights=layer.w13_weight,
