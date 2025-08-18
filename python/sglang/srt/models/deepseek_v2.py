@@ -1036,7 +1036,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             ):
                 sum_seq_lens = sum(forward_batch.extend_seq_lens_cpu) 
                 assert forward_batch.batch_size != 0, "Invalid batch size: zero"
-                current_workload = sum_seq_lens // forward_batch.batch_size * sum_seq_lens
+                current_workload = sum_seq_lens / forward_batch.batch_size * sum_seq_lens
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
             if forward_batch.extend_prefix_lens_cpu is not None:
                 sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
