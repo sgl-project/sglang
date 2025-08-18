@@ -2,15 +2,27 @@ use anyhow::Result;
 use std::ops::Deref;
 use std::sync::Arc;
 
+pub mod factory;
 pub mod mock;
+pub mod stop;
 pub mod stream;
 pub mod traits;
+
+// Feature-gated modules
+#[cfg(feature = "huggingface")]
+pub mod huggingface;
 
 #[cfg(test)]
 mod tests;
 
+// Re-exports
+pub use factory::{create_tokenizer, create_tokenizer_from_file, TokenizerType};
+pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 pub use stream::DecodeStream;
 pub use traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as TokenizerTrait};
+
+#[cfg(feature = "huggingface")]
+pub use huggingface::{ChatMessage, HuggingFaceTokenizer};
 
 /// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations
 #[derive(Clone)]
@@ -18,10 +30,8 @@ pub struct Tokenizer(Arc<dyn traits::Tokenizer>);
 
 impl Tokenizer {
     /// Create a tokenizer from a file path
-    /// Will be implemented in Phase 3 with factory pattern
-    pub fn from_file(_file_path: &str) -> Result<Tokenizer> {
-        // TODO: Implement factory pattern in Phase 3
-        unimplemented!("Factory pattern will be implemented in Phase 3")
+    pub fn from_file(file_path: &str) -> Result<Tokenizer> {
+        Ok(Tokenizer(factory::create_tokenizer_from_file(file_path)?))
     }
 
     /// Create a tokenizer from an Arc<dyn Tokenizer>
