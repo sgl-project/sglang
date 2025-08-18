@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
+    parse_models,
     popen_launch_server,
     write_github_step_summary,
 )
@@ -71,10 +72,6 @@ TRITON_MOE_MODELS = {
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistralai/Mistral-7B-Instruct-v0.3",
 }
-
-
-def parse_models(model_string):
-    return [model.strip() for model in model_string.split(",") if model.strip()]
 
 
 def popen_launch_server_wrapper(base_url, model, is_tp2):

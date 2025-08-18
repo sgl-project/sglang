@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
+    parse_models,
     popen_launch_server,
     write_github_step_summary,
 )
@@ -39,10 +40,6 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
 }
-
-
-def parse_models(model_string):
-    return [model.strip() for model in model_string.split(",") if model.strip()]
 
 
 def popen_launch_server_wrapper(base_url, model, is_tp2):

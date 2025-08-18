@@ -11,6 +11,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
+    parse_models,
     popen_launch_server,
     write_github_step_summary,
 )
@@ -32,10 +33,6 @@ DEFAULT_VLM_MODELS = ",".join(
         # "google/gemma-3-4b-it",
     ]
 )
-
-
-def parse_models(model_string):
-    return [model.strip() for model in model_string.split(",") if model.strip()]
 
 
 def _extra_args_for_model(model: str):

@@ -8,7 +8,9 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    generate_markdown_report,
     is_in_ci,
+    parse_models,
     popen_launch_server,
     write_github_step_summary,
 )
@@ -16,10 +18,6 @@ from sglang.test.test_utils import (
 PROFILE_DIR = "performance_profiles_text_models"
 PROFILE_URL_PLACEHOLDER = "<<ARTIFACT_URL>>"
 REPORT_MD_FILENAME = "performance_report.md"
-
-
-def parse_models(model_string):
-    return [model.strip() for model in model_string.split(",") if model.strip()]
 
 
 def popen_launch_server_wrapper(base_url, model, is_tp2):
@@ -33,26 +31,6 @@ def popen_launch_server_wrapper(base_url, model, is_tp2):
         other_args=other_args,
     )
     return process
-
-
-def generate_markdown_report(model, results, input_len, output_len):
-    summary = f"### {model}\n"
-    summary += f"Input lens: {input_len}. Output lens: {output_len}.\n"
-    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile |\n"
-    summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
-
-    for result in results:
-        # Extract the metrics row that bench_one_batch_server prints (without the profile column)
-        m = re.search(
-            r"\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*(?:n/a|[\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|",
-            result["output"],
-        )
-        if m:
-            # Reconstruct the row and append a placeholder artifact link for profile
-            parts = [part.strip() for part in m.group(0).split("|") if part.strip()]
-            row = f"| {' | '.join(parts)} | [Profile]({PROFILE_URL_PLACEHOLDER}) |\n"
-            summary += row
-    return summary
 
 
 class TestNightlyTextModelsPerformance(unittest.TestCase):

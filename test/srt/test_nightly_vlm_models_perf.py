@@ -1,5 +1,4 @@
 import os
-import re
 import subprocess
 import unittest
 import warnings
@@ -8,7 +7,9 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    generate_markdown_report,
     is_in_ci,
+    parse_models,
     popen_launch_server,
     write_github_step_summary,
 )
@@ -21,10 +22,6 @@ MODEL_DEFAULTS = [
     # Keep conservative defaults. Can be overridden by env NIGHTLY_VLM_MODELS
     "Qwen/Qwen2-VL-7B-Instruct",
 ]
-
-
-def parse_models(model_string: str):
-    return [model.strip() for model in model_string.split(",") if model.strip()]
 
 
 def _extra_args_for_model(model: str):
@@ -49,40 +46,6 @@ def popen_launch_server_wrapper(base_url: str, model: str):
     return process
 
 
-def _parse_bench_one_batch_metrics(stdout: str):
-    # Extract key metrics from bench_one_batch_server stdout (last run)
-    def _m_last(pattern: str, default: str = "n/a"):
-        matches = list(re.finditer(pattern, stdout))
-        return matches[-1].group(1) if matches else default
-
-    metrics = {
-        "latency_s": _m_last(r"latency:\s+([0-9.]+) s"),
-        "ttft_s": _m_last(r"ttft:\s+([0-9.]+) s"),
-        "input_throughput": _m_last(r"input throughput:\s+([0-9.]+) tok/s"),
-        "output_throughput": _m_last(r"output throughput:\s+([0-9.]+) tok/s"),
-        "last_gen_throughput": _m_last(
-            r"last generation throughput:\s+([0-9.]+) tok/s"
-        ),
-    }
-    return metrics
-
-
-def _generate_markdown_report(
-    model: str,
-    metrics: dict,
-    batch_sizes: list[int],
-    input_lens: list[int],
-    output_lens: list[int],
-):
-    summary = f"### {model}\n"
-    summary += f"Batch sizes: {batch_sizes}. Input lens: {input_lens}. Output lens: {output_lens}.\n"
-    summary += "| latency (s) | TTFT (s) | input tok/s | output tok/s | last gen tok/s | profile |\n"
-    summary += "| ----------- | -------- | ----------- | ------------ | -------------- | ------- |\n"
-    row = f"| {metrics['latency_s']} | {metrics['ttft_s']} | {metrics['input_throughput']} | {metrics['output_throughput']} | {metrics['last_gen_throughput']} | [Profile]({PROFILE_URL_PLACEHOLDER}) |\n"
-    summary += row
-    return summary
-
-
 class TestNightlyVLMModelsPerformance(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -97,9 +60,9 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         # Bench knobs for bench_one_batch_server (override by env)
         def _parse_int_list_env(name: str, default_val: str):
             val = os.environ.get(name, default_val)
-            return [int(x) for x in val.split() if x]
+            return [int(x) for x in val.split(',') if x]
 
-        cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "16")
+        cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
         cls.input_lens = _parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "1024")
         cls.output_lens = _parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "16")
 
@@ -110,10 +73,12 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         for model in self.models:
             with self.subTest(model=model):
                 process = popen_launch_server_wrapper(self.base_url, model)
+                model_results = []
+
                 try:
                     # Run bench_one_batch_server against the launched server
                     os.makedirs(PROFILE_DIR, exist_ok=True)
-                    safe_model = model.replace("/", "_")
+                    profile_filename = model.replace("/", "_")
                     command = [
                         "python3",
                         "-m",
@@ -132,7 +97,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                         "--profile",
                         "--profile-by-stage",
                         "--profile-filename-prefix",
-                        f"{PROFILE_DIR}/{safe_model}",
+                        f"{PROFILE_DIR}/{profile_filename}",
                     ]
 
                     print(f"Running command: {' '.join(command)}")
@@ -145,18 +110,24 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
 
                     print(f"Output for {model}:")
                     print(result.stdout)
-
-                    metrics = _parse_bench_one_batch_metrics(result.stdout)
-                    report_part = _generate_markdown_report(
-                        model,
-                        metrics,
-                        self.batch_sizes,
-                        self.input_lens,
-                        self.output_lens,
+                    model_results.append(
+                        {
+                            "output": result.stdout,
+                            "profile_filename": f"{profile_filename}.json",
+                        }
                     )
-                    full_report += report_part + "\n"
+
                 finally:
                     kill_process_tree(process.pid)
+
+            if model_results:
+                report_part = generate_markdown_report(
+                    model,
+                    model_results,
+                    self.input_lens,
+                    self.output_lens,
+                )
+                full_report += report_part + "\n"
 
         with open(REPORT_MD_FILENAME, "w") as f:
             print(f"results written to {REPORT_MD_FILENAME=}")
