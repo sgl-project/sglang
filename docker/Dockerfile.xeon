@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 SHELL ["/bin/bash", "-c"]
 
-ARG VER_SGLANG=main
+ARG VER_SGLANG=gptoss_cpu
 ARG VER_TORCH=2.7.1
 ARG VER_TORCHVISION=0.22.1
 ARG VER_TRITON=3.3.1
@@ -34,7 +34,7 @@ RUN pip config set global.index-url https://download.pytorch.org/whl/cpu && \
     pip config set global.extra-index-url https://pypi.org/simple && \
     pip install intel-openmp
 
-RUN git clone https://github.com/sgl-project/sglang.git && \
+RUN git clone https://github.com/jianan-gu/sglang.git && \
     cd sglang && \
     git checkout ${VER_SGLANG} && \
     pip install -e "python[all_cpu]" && \
