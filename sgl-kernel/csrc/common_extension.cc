@@ -94,6 +94,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? v, Tensor!? k_buffer, Tensor!? v_buffer, Tensor? kv_cache_loc) -> ()");
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
+  m.def(
+      "downcast_fp8(Tensor k, Tensor v, Tensor k_out, Tensor v_out, Tensor k_scale, Tensor v_scale, Tensor loc, int "
+      "mult, int offset, int cuda_stream) -> ()");
+  m.impl("downcast_fp8", torch::kCUDA, &downcast_fp8);
+
   /*
    * From csrc/gemm
    */
