@@ -1107,7 +1107,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         return trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
-            routing_bias=layer.correction_bias.to(x.dtype),
+            routing_bias=topk_config.correction_bias.to(x.dtype) if topk_config.correction_bias is not None else None,
             hidden_states=a_q,
             hidden_states_scale=a_sf_t,
             gemm1_weights=layer.w13_weight,
@@ -1123,7 +1123,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             local_num_experts=layer.num_local_experts,
             routed_scaling_factor=routed_scaling_factor,
             tile_tokens_dim=get_tile_tokens_dim(
-                x.shape[0], layer.top_k, layer.num_experts
+                x.shape[0], topk_config.top_k, layer.num_experts
             ),
             routing_method_type=2,  # DeepSeek-styled routing method
             use_shuffled_weight=False,
