@@ -66,17 +66,6 @@ def alloc_extend_kernel_ascend(
 
 class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
-    def __init__(
-        self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        device: str,
-        kvcache: KVCache,
-        need_sort: bool,
-    ):
-        super().__init__(size, page_size, dtype, device, kvcache, need_sort, 1)
-
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
