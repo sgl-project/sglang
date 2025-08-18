@@ -428,6 +428,10 @@ class EagleVerifyInput:
             batch.sampling_info.is_all_greedy
             or "tree_speculative_sampling_target_only" not in globals()
         ):
+            logger.warning(
+                "Speculative tree sampling kernel unavailable "
+                "(likely AMD/HIP build). Falling back to greedy verification."
+            )
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
 
