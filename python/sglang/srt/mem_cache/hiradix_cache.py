@@ -87,7 +87,7 @@ class HiRadixCache(RadixCache):
             write_policy=hicache_write_policy,
             io_backend=hicache_io_backend,
             storage_backend=hicache_storage_backend,
-            storage_backend_tag= hicache_storage_backend_tag,
+            storage_backend_tag=hicache_storage_backend_tag,
             prefetch_threshold=self.prefetch_threshold,
         )
 

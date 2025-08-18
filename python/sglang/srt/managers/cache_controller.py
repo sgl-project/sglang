@@ -223,6 +223,7 @@ class HiCacheController:
         def prefix_hash(input_str, prior_hash: str = None):
             hash_result = get_hash_str(input_str)
             return prefix + hash_result
+
         return prefix_hash
 
     def __init__(
@@ -246,7 +247,9 @@ class HiCacheController:
         self.io_backend = io_backend
 
         self.enable_storage = False
-        self.enable_storage_tag = storage_backend_tag is not None and storage_backend_tag != ""
+        self.enable_storage_tag = (
+            storage_backend_tag is not None and storage_backend_tag != ""
+        )
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
