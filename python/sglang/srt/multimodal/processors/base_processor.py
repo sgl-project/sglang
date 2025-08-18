@@ -227,24 +227,32 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audios"] = audios
 
         processor = self._processor
+        used_gpu_processing = False
         if (
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
             kwargs["device"] = "cuda"
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="pt",
-            **kwargs,
-        )
-        # move feature tensors to cpu
-        for feature_name in self.FEATURE_NAMES:
-            if feature_name in result and isinstance(
-                result[feature_name], torch.Tensor
-            ):
-                result[feature_name] = result[feature_name].to("cpu")
+            used_gpu_processing = True
+
+        # Store original result to ensure all GPU tensors are properly cleaned up
+        gpu_result = None
+        try:
+            gpu_result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+            result = {}
+            for key, value in gpu_result.items():
+                if isinstance(value, torch.Tensor):
+                    result[key] = value.to("cpu")
+
+        finally:
+            if used_gpu_processing and gpu_result is not None:
+                del gpu_result
 
         return result
 
