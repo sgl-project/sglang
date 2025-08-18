@@ -38,6 +38,7 @@ struct EvictionEntry {
 
 impl Eq for EvictionEntry {}
 
+#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for EvictionEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.timestamp.cmp(&other.timestamp))
@@ -74,11 +75,17 @@ fn shared_prefix_count(a: &str, b: &str) -> usize {
         }
     }
 
-    return i;
+    i
 }
 
 fn slice_by_chars(s: &str, start: usize, end: usize) -> String {
     s.chars().skip(start).take(end - start).collect()
+}
+
+impl Default for Tree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Tree {
@@ -517,7 +524,7 @@ impl Tree {
             // add parent to queue if it becomes a leaf
             if let Some(parent) = curr.parent.read().unwrap().as_ref() {
                 if Tree::leaf_of(parent).contains(&tenant.to_string()) {
-                    queue.push_back(Arc::clone(&parent));
+                    queue.push_back(Arc::clone(parent));
                 }
             }
         }
@@ -653,8 +660,6 @@ impl Tree {
         }
 
         println!("{result}");
-
-        return;
     }
 }
 
@@ -858,8 +863,8 @@ mod tests {
         // spawn 3 threads for insert
         let tree_clone = Arc::clone(&tree);
 
-        let texts = vec!["hello", "apple", "banana"];
-        let tenants = vec!["tenant1", "tenant2", "tenant3"];
+        let texts = ["hello", "apple", "banana"];
+        let tenants = ["tenant1", "tenant2", "tenant3"];
 
         let mut handles = vec![];
 
@@ -912,13 +917,12 @@ mod tests {
         // spawn 3 threads for insert
         let tree_clone = Arc::clone(&tree);
 
-        let texts = vec!["apple", "apabc", "acbdeds"];
+        static TEXTS: [&str; 3] = ["apple", "apabc", "acbdeds"];
 
         let mut handles = vec![];
 
-        for i in 0..3 {
+        for text in TEXTS.iter() {
             let tree_clone = Arc::clone(&tree_clone);
-            let text = texts[i];
             let tenant = "tenant0";
 
             let handle = thread::spawn(move || {
@@ -938,14 +942,13 @@ mod tests {
 
         let tree_clone = Arc::clone(&tree);
 
-        for i in 0..3 {
+        for text in TEXTS.iter() {
             let tree_clone = Arc::clone(&tree_clone);
-            let text = texts[i];
             let tenant = "tenant0";
 
             let handle = thread::spawn(move || {
                 let (matched_text, matched_tenant) = tree_clone.prefix_match(text);
-                assert_eq!(matched_text, text);
+                assert_eq!(matched_text, *text);
                 assert_eq!(matched_tenant, tenant);
             });
 
@@ -960,13 +963,13 @@ mod tests {
 
     #[test]
     fn test_group_prefix_insert_match_concurrent() {
-        let prefix = vec![
+        static PREFIXES: [&str; 4] = [
             "Clock strikes midnight, I'm still wide awake",
             "Got dreams bigger than these city lights",
             "Time waits for no one, gotta make my move",
             "Started from the bottom, that's no metaphor",
         ];
-        let suffix = vec![
+        let suffixes = [
             "Got too much to prove, ain't got time to lose",
             "History in the making, yeah, you can't erase this",
         ];
@@ -974,10 +977,10 @@ mod tests {
 
         let mut handles = vec![];
 
-        for i in 0..prefix.len() {
-            for j in 0..suffix.len() {
+        for (i, prefix) in PREFIXES.iter().enumerate() {
+            for suffix in suffixes.iter() {
                 let tree_clone = Arc::clone(&tree);
-                let text = format!("{} {}", prefix[i], suffix[j]);
+                let text = format!("{} {}", prefix, suffix);
                 let tenant = format!("tenant{}", i);
 
                 let handle = thread::spawn(move || {
@@ -996,17 +999,15 @@ mod tests {
         tree.pretty_print();
 
         // check matching using multi threads
-
         let mut handles = vec![];
 
-        for i in 0..prefix.len() {
+        for (i, prefix) in PREFIXES.iter().enumerate() {
             let tree_clone = Arc::clone(&tree);
-            let text = prefix[i];
 
             let handle = thread::spawn(move || {
-                let (matched_text, matched_tenant) = tree_clone.prefix_match(text);
+                let (matched_text, matched_tenant) = tree_clone.prefix_match(prefix);
                 let tenant = format!("tenant{}", i);
-                assert_eq!(matched_text, text);
+                assert_eq!(matched_text, *prefix);
                 assert_eq!(matched_tenant, tenant);
             });
 
@@ -1023,13 +1024,13 @@ mod tests {
     fn test_mixed_concurrent_insert_match() {
         // ensure it does not deadlock instead of doing correctness check
 
-        let prefix = vec![
+        static PREFIXES: [&str; 4] = [
             "Clock strikes midnight, I'm still wide awake",
             "Got dreams bigger than these city lights",
             "Time waits for no one, gotta make my move",
             "Started from the bottom, that's no metaphor",
         ];
-        let suffix = vec![
+        let suffixes = [
             "Got too much to prove, ain't got time to lose",
             "History in the making, yeah, you can't erase this",
         ];
@@ -1037,10 +1038,10 @@ mod tests {
 
         let mut handles = vec![];
 
-        for i in 0..prefix.len() {
-            for j in 0..suffix.len() {
+        for (i, prefix) in PREFIXES.iter().enumerate() {
+            for suffix in suffixes.iter() {
                 let tree_clone = Arc::clone(&tree);
-                let text = format!("{} {}", prefix[i], suffix[j]);
+                let text = format!("{} {}", prefix, suffix);
                 let tenant = format!("tenant{}", i);
 
                 let handle = thread::spawn(move || {
@@ -1052,13 +1053,11 @@ mod tests {
         }
 
         // check matching using multi threads
-
-        for i in 0..prefix.len() {
+        for prefix in PREFIXES.iter() {
             let tree_clone = Arc::clone(&tree);
-            let text = prefix[i];
 
             let handle = thread::spawn(move || {
-                let (_matched_text, _matched_tenant) = tree_clone.prefix_match(text);
+                let (_matched_text, _matched_tenant) = tree_clone.prefix_match(prefix);
             });
 
             handles.push(handle);
@@ -1076,16 +1075,14 @@ mod tests {
         // use .chars() to get the iterator of the utf-8 value
         let tree = Arc::new(Tree::new());
 
-        let test_pairs = vec![
+        static TEST_PAIRS: [(&str, &str); 3] = [
             ("你好嗎", "tenant1"),
             ("你好喔", "tenant2"),
             ("你心情好嗎", "tenant3"),
         ];
 
         // Insert sequentially
-        for i in 0..test_pairs.len() {
-            let text = test_pairs[i].0;
-            let tenant = test_pairs[i].1;
+        for (text, tenant) in TEST_PAIRS.iter() {
             tree.insert(text, tenant);
         }
 
@@ -1093,10 +1090,10 @@ mod tests {
 
         // Test sequentially
 
-        for i in 0..test_pairs.len() {
-            let (matched_text, matched_tenant) = tree.prefix_match(test_pairs[i].0);
-            assert_eq!(matched_text, test_pairs[i].0);
-            assert_eq!(matched_tenant, test_pairs[i].1);
+        for (text, tenant) in TEST_PAIRS.iter() {
+            let (matched_text, matched_tenant) = tree.prefix_match(text);
+            assert_eq!(matched_text, *text);
+            assert_eq!(matched_tenant, *tenant);
         }
     }
 
@@ -1104,7 +1101,7 @@ mod tests {
     fn test_utf8_split_concurrent() {
         let tree = Arc::new(Tree::new());
 
-        let test_pairs = vec![
+        static TEST_PAIRS: [(&str, &str); 3] = [
             ("你好嗎", "tenant1"),
             ("你好喔", "tenant2"),
             ("你心情好嗎", "tenant3"),
@@ -1113,13 +1110,11 @@ mod tests {
         // Create multiple threads for insertion
         let mut handles = vec![];
 
-        for i in 0..test_pairs.len() {
+        for (text, tenant) in TEST_PAIRS.iter() {
             let tree_clone = Arc::clone(&tree);
-            let text = test_pairs[i].0.to_string();
-            let tenant = test_pairs[i].1.to_string();
 
             let handle = thread::spawn(move || {
-                tree_clone.insert(&text, &tenant);
+                tree_clone.insert(text, tenant);
             });
 
             handles.push(handle);
@@ -1135,15 +1130,13 @@ mod tests {
         // Create multiple threads for matching
         let mut handles = vec![];
 
-        for i in 0..test_pairs.len() {
+        for (text, tenant) in TEST_PAIRS.iter() {
             let tree_clone = Arc::clone(&tree);
-            let text = test_pairs[i].0.to_string();
-            let tenant = test_pairs[i].1.to_string();
 
             let handle = thread::spawn(move || {
-                let (matched_text, matched_tenant) = tree_clone.prefix_match(&text);
-                assert_eq!(matched_text, text);
-                assert_eq!(matched_tenant, tenant);
+                let (matched_text, matched_tenant) = tree_clone.prefix_match(text);
+                assert_eq!(matched_text, *text);
+                assert_eq!(matched_tenant, *tenant);
             });
 
             handles.push(handle);
@@ -1198,7 +1191,7 @@ mod tests {
         let max_size: usize = 100;
 
         // Define prefixes
-        let prefixes = vec!["aqwefcisdf", "iajsdfkmade", "kjnzxcvewqe", "iejksduqasd"];
+        let prefixes = ["aqwefcisdf", "iajsdfkmade", "kjnzxcvewqe", "iejksduqasd"];
 
         // Insert strings with shared prefixes
         for _i in 0..100 {
