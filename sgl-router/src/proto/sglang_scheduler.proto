@@ -290,10 +290,15 @@ message GenerateComplete {
 
   // Finish reason
   enum FinishReason {
+    // The model generated a stop sequence.
     STOP = 0;
+    // The model reached the maximum generation length.
     LENGTH = 1;
+    // The model generated an end-of-sequence (EOS) token.
     EOS_TOKEN = 2;
+    // The model generated a user-provided stop string.
     STOP_STR = 3;
+    // The request was aborted by the user or system.
     ABORT = 4;
   }
   FinishReason finish_reason = 3;
@@ -320,7 +325,7 @@ message GenerateComplete {
 
 message GenerateError {
   string message = 1;
-  string code = 2;
+  string http_status_code = 2;
   string details = 3;
 }
 
@@ -363,6 +368,7 @@ message EmbedRequest {
   MultimodalInputs mm_inputs = 4;
 
   // Dummy sampling params for compatibility
+  // EmbedRequest doesn't use sampling_params
   SamplingParams sampling_params = 5;
 
   bool log_metrics = 6;
