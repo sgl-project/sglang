@@ -60,7 +60,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         # Bench knobs for bench_one_batch_server (override by env)
         def _parse_int_list_env(name: str, default_val: str):
             val = os.environ.get(name, default_val)
-            return [int(x) for x in val.split(',') if x]
+            return [int(x) for x in val.split(",") if x]
 
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
         cls.input_lens = _parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "1024")
