@@ -45,6 +45,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 
@@ -59,6 +60,7 @@ class TpModelWorker:
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+        moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
@@ -69,6 +71,7 @@ class TpModelWorker:
         # Parse args
         self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
+        self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
 
         # Init model and tokenizer
@@ -88,6 +91,8 @@ class TpModelWorker:
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
             pp_rank=pp_rank,
             pp_size=server_args.pp_size,
             nccl_port=nccl_port,
@@ -133,6 +138,10 @@ class TpModelWorker:
             self.model_runner.req_to_token_pool.size,
         )
         assert self.max_running_requests > 0, "max_running_request is zero"
+        self.max_queued_requests = server_args.max_queued_requests
+        assert (
+            self.max_running_requests > 0
+        ), "max_queued_requests is zero. We need to be at least 1 to schedule a request."
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
@@ -168,6 +177,7 @@ class TpModelWorker:
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.max_queued_requests,
             self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
@@ -294,6 +304,8 @@ class TpModelWorker:
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+
+        monkey_patch_torch_reductions()
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_rank]
@@ -309,11 +321,12 @@ class TpModelWorker:
         return parameter
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        result = self.model_runner.load_lora_adapter(
-            recv_req.lora_name, recv_req.lora_path
-        )
+        result = self.model_runner.load_lora_adapter(recv_req.to_ref())
         return result
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
-        result = self.model_runner.unload_lora_adapter(recv_req.lora_name)
+        result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
+
+    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
+        return self.model_runner.lora_manager.validate_lora_batch(lora_ids)

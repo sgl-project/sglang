@@ -1,6 +1,6 @@
 import re
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.models.qwen2_audio import Qwen2AudioForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -11,8 +11,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
     models = [Qwen2AudioForConditionalGeneration]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.AUDIO_TOKEN = "<|audio_bos|><|AUDIO|><|audio_eos|>"
         self.AUDIO_TOKEN_REGEX = re.compile(
             r"<\|audio_bos\|>(?:<\|AUDIO\|>)+<\|audio_eos\|>"
@@ -28,6 +28,8 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             audio_token_regex=self.AUDIO_TOKEN_REGEX,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+
+        self.ATTR_NAME_TO_MODALITY.update({"feature_attention_mask": Modality.AUDIO})
 
     async def process_mm_data_async(
         self,
@@ -54,7 +56,7 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         input_lengths = (input_lengths - 1) // 2 + 1
         output_lengths = (input_lengths - 2) // 2 + 1
 
-        mm_items[0].model_specific_data["audio_feature_lens"] = output_lengths
+        mm_items[0].audio_feature_lens = output_lengths
 
         return {
             "mm_items": mm_items,
