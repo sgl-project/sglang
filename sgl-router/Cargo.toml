@@ -3,13 +3,22 @@ name = "sglang_router_rs"
 version = "0.0.0"
 edition = "2021"
 
+[features]
+default = ["huggingface"]
+huggingface = ["tokenizers"]
+
 [lib]
 name = "sglang_router_rs"
 # Pure Rust library: Just omit crate-type (defaults to rlib)
 # Python/C binding + Rust library: Use ["cdylib", "rlib"]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "sglang-router"
+path = "src/main.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
@@ -38,6 +47,8 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 thiserror = "2.0.12"
 url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
+anyhow = "1.0"
+tokenizers = { version = "0.21.4", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -53,3 +64,18 @@ path = "benches/request_processing.rs"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true
+split-debuginfo = "unpacked"
+incremental = true
+
+
+[profile.dev.build-override]
+opt-level = 3
+codegen-units = 1
+
+[profile.dev-opt]
+inherits = "dev"
+opt-level = 1
