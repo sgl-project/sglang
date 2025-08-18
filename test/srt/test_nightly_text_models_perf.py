@@ -37,7 +37,7 @@ def popen_launch_server_wrapper(base_url, model, is_tp2):
 
 def generate_markdown_report(model, results, input_len, output_len):
     summary = f"### {model}\n"
-    summary += f"Input lens: ({input_len},). Output lens: ({output_len},).\n"
+    summary += f"Input lens: {input_len}. Output lens: {output_len}.\n"
     summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile |\n"
     summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |-------------|\n"
 
@@ -72,14 +72,14 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
             # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.batch_sizes = (1, 1, 8, 32, 64, 160, 256, 384)
-        cls.batch_sizes = (1, 1, 8, 32)
+        cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
+        cls.batch_sizes = [1, 1, 8, 32]
         cls.input_len = 4096
         cls.output_len = 1024
         os.makedirs(PROFILE_DIR, exist_ok=True)
 
     def test_bench_one_batch(self, batch_sizes: tuple = None):
-        full_report = "## Nightly Text Models Performance Test Summary\n"
+        full_report = f"## {self.__class__.__name__}\n"
 
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:

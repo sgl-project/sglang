@@ -8,7 +8,9 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
 
 PROFILE_URL_PLACEHOLDER = "<<ARTIFACT_URL>>"
@@ -102,7 +104,9 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         cls.output_lens = _parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "16")
 
     def test_vlm_models_mmmu_performance(self):
-        full_report = "## Nightly VLM Performance (bench_one_batch_server)\n"
+        full_report = (
+            "## TestNightlyVLMModelsPerformance (with bench_one_batch_server)\n"
+        )
         for model in self.models:
             with self.subTest(model=model):
                 process = popen_launch_server_wrapper(self.base_url, model)
@@ -157,6 +161,9 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         with open(REPORT_MD_FILENAME, "w") as f:
             print(f"results written to {REPORT_MD_FILENAME=}")
             f.write(full_report)
+
+        if is_in_ci():
+            write_github_step_summary(full_report)
 
 
 if __name__ == "__main__":

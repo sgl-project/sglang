@@ -19,7 +19,7 @@ import multiprocessing
 import os
 import random
 import time
-from typing import List, Tuple
+from typing import Tuple
 
 import numpy as np
 import requests
@@ -33,7 +33,6 @@ from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
-from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 
@@ -274,7 +273,7 @@ def run_one_case(
             if "error" in data:
                 raise RuntimeError(f"Request has failed. {data}.")
 
-            if dataset_name == "mmmu":
+            if dataset_name == "mmmu1":
                 if data["choices"][0]["text"]:
                     # First token
                     if ttft == 0.0:

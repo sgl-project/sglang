@@ -128,7 +128,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
         )
         is_first = True
         all_results = []
-        print(f"{self.models=}")
+
         for model in self.models:
             with self.subTest(model=model):
                 process = popen_launch_server_wrapper(self.base_url, model)

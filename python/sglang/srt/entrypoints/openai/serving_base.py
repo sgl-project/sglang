@@ -40,7 +40,6 @@ class OpenAIServingBase(ABC):
         """Handle the specific request type with common pattern"""
         try:
             # Validate request
-            print(f"{request=}")
             error_msg = self._validate_request(request)
             if error_msg:
                 return self.create_error_response(error_msg)
