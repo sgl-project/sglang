@@ -331,13 +331,15 @@ inline bool getEnvEnablePDL() {
 #ifndef USE_ROCM
 #define WARP_SIZE 32
 #else
-#define WARP_SIZE warpSize  // 64
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/macros/Macros.h>
+#define WARP_SIZE C10_WARP_SIZE
 #endif
 
-#if defined(__HIP_PLATFORM_AMD__)
+#ifdef USE_ROCM
 
-#include "hip_math_def.h"
-#include "hip_vec_dtypes.h"
+#include "hip/hip_math_def.h"
+#include "hip/hip_vec_dtypes.h"
 
 #else
 
@@ -354,14 +356,11 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 #endif
 
 // add FP8 support
-
 #ifndef USE_ROCM
 #include <c10/util/Float8_e4m3fn.h>
 using FP8_TYPE = c10::Float8_e4m3fn;
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
-
 #else  // USE_ROCM
-
 #if HIP_FP8_TYPE_FNUZ
 #include <c10/util/Float8_e4m3fnuz.h>
 using FP8_TYPE = c10::Float8_e4m3fnuz;
