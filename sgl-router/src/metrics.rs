@@ -36,6 +36,28 @@ pub fn init_metrics() {
         "sgl_router_retries_total",
         "Total number of request retries by route"
     );
+    describe_histogram!(
+        "sgl_router_retry_backoff_duration_seconds",
+        "Backoff duration in seconds by attempt index"
+    );
+    describe_counter!(
+        "sgl_router_retries_exhausted_total",
+        "Total number of requests that exhausted retries by route"
+    );
+
+    // Circuit breaker metrics
+    describe_gauge!(
+        "sgl_router_cb_state",
+        "Circuit breaker state per worker (0=closed, 1=open, 2=half_open)"
+    );
+    describe_counter!(
+        "sgl_router_cb_state_transitions_total",
+        "Total number of circuit breaker state transitions by worker"
+    );
+    describe_counter!(
+        "sgl_router_cb_outcomes_total",
+        "Total number of circuit breaker outcomes by worker and outcome type (success/failure)"
+    );
 
     // Worker metrics
     describe_gauge!(
@@ -186,6 +208,20 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    pub fn record_retry_backoff_duration(duration: Duration, attempt: u32) {
+        histogram!("sgl_router_retry_backoff_duration_seconds",
+            "attempt" => attempt.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn record_retries_exhausted(route: &str) {
+        counter!("sgl_router_retries_exhausted_total",
+            "route" => route.to_string()
+        )
+        .increment(1);
+    }
+
     // Worker metrics
     pub fn set_active_workers(count: usize) {
         gauge!("sgl_router_active_workers").set(count as f64);
@@ -321,6 +357,31 @@ impl RouterMetrics {
         )
         .set(count as f64);
     }
+
+    // Circuit breaker metrics
+    pub fn set_cb_state(worker: &str, state_code: u8) {
+        gauge!("sgl_router_cb_state",
+            "worker" => worker.to_string()
+        )
+        .set(state_code as f64);
+    }
+
+    pub fn record_cb_state_transition(worker: &str, from: &str, to: &str) {
+        counter!("sgl_router_cb_state_transitions_total",
+            "worker" => worker.to_string(),
+            "from" => from.to_string(),
+            "to" => to.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_cb_outcome(worker: &str, outcome: &str) {
+        counter!("sgl_router_cb_outcomes_total",
+            "worker" => worker.to_string(),
+            "outcome" => outcome.to_string()
+        )
+        .increment(1);
+    }
 }
 
 #[cfg(test)]
@@ -450,24 +511,8 @@ mod tests {
     // ============= Duration Bucket Tests =============
 
     #[test]
-    fn test_duration_bucket_values() {
-        let expected_buckets = vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
-            60.0, 90.0, 120.0, 180.0, 240.0,
-        ];
-
-        // The buckets are defined in start_prometheus function
-        assert_eq!(expected_buckets.len(), 20);
-
-        // Verify proper ordering
-        for i in 1..expected_buckets.len() {
-            assert!(expected_buckets[i] > expected_buckets[i - 1]);
-        }
-    }
-
-    #[test]
     fn test_duration_bucket_coverage() {
-        let test_cases = vec![
+        let test_cases: [(f64, &str); 7] = [
             (0.0005, "sub-millisecond"),
             (0.005, "5ms"),
             (0.05, "50ms"),
@@ -477,7 +522,7 @@ mod tests {
             (240.0, "4m"),
         ];
 
-        let buckets = vec![
+        let buckets: [f64; 20] = [
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
             60.0, 90.0, 120.0, 180.0, 240.0,
         ];
@@ -485,7 +530,7 @@ mod tests {
         for (duration, label) in test_cases {
             let bucket_found = buckets
                 .iter()
-                .any(|&b| ((b - duration) as f64).abs() < 0.0001 || b > duration);
+                .any(|&b| (b - duration).abs() < 0.0001 || b > duration);
             assert!(bucket_found, "No bucket found for {} ({})", duration, label);
         }
     }
@@ -497,14 +542,13 @@ mod tests {
         let matcher = Matcher::Suffix(String::from("duration_seconds"));
 
         // Test matching behavior
-        let _matching_metrics = vec![
+        let _matching_metrics = [
             "request_duration_seconds",
             "response_duration_seconds",
             "sgl_router_request_duration_seconds",
         ];
 
-        let _non_matching_metrics =
-            vec!["duration_total", "duration_seconds_total", "other_metric"];
+        let _non_matching_metrics = ["duration_total", "duration_seconds_total", "other_metric"];
 
         // Note: We can't directly test Matcher matching without the internals,
         // but we can verify the matcher is created correctly
@@ -550,8 +594,8 @@ mod tests {
     #[test]
     fn test_custom_buckets_for_different_metrics() {
         // Test that we can create different bucket configurations
-        let request_buckets = vec![0.001, 0.01, 0.1, 1.0, 10.0];
-        let generate_buckets = vec![0.1, 0.5, 1.0, 5.0, 30.0, 60.0];
+        let request_buckets = [0.001, 0.01, 0.1, 1.0, 10.0];
+        let generate_buckets = [0.1, 0.5, 1.0, 5.0, 30.0, 60.0];
 
         assert_eq!(request_buckets.len(), 5);
         assert_eq!(generate_buckets.len(), 6);
@@ -669,9 +713,6 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-
-        // If we get here without panic, concurrent access works
-        assert!(true);
     }
 
     // ============= Edge Cases Tests =============
@@ -682,9 +723,6 @@ mod tests {
         RouterMetrics::record_request("");
         RouterMetrics::set_worker_health("", true);
         RouterMetrics::record_policy_decision("", "");
-
-        // If we get here without panic, empty strings are handled
-        assert!(true);
     }
 
     #[test]
@@ -693,14 +731,11 @@ mod tests {
 
         RouterMetrics::record_request(&long_label);
         RouterMetrics::set_worker_health(&long_label, false);
-
-        // If we get here without panic, long labels are handled
-        assert!(true);
     }
 
     #[test]
     fn test_special_characters_in_labels() {
-        let special_labels = vec![
+        let special_labels = [
             "test/with/slashes",
             "test-with-dashes",
             "test_with_underscores",
@@ -712,9 +747,6 @@ mod tests {
             RouterMetrics::record_request(label);
             RouterMetrics::set_worker_health(label, true);
         }
-
-        // If we get here without panic, special characters are handled
-        assert!(true);
     }
 
     #[test]
@@ -727,9 +759,7 @@ mod tests {
         RouterMetrics::set_worker_load("worker", usize::MAX);
 
         RouterMetrics::record_request_duration("route", Duration::from_nanos(1));
-        RouterMetrics::record_request_duration("route", Duration::from_secs(86400)); // 24 hours
-
-        // If we get here without panic, extreme values are handled
-        assert!(true);
+        // 24 hours
+        RouterMetrics::record_request_duration("route", Duration::from_secs(86400));
     }
 }
