@@ -11,6 +11,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -40,6 +41,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
 
         config.moe_layer_freq = 1
         self.config = config
+        vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts("Glm4MoeForCausalLM")
@@ -385,6 +387,10 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
+                        if "visual" in name:
+                            loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                                self.config, name, loaded_weight
+                            )
                         weight_loader(param, loaded_weight)
 
 
