@@ -199,6 +199,10 @@ class PrefetchOperation(StorageOperation):
 
         self.start_time = time.monotonic()
 
+        self.storage_hit_count = 0
+        self.min_completed_tokens = 0
+        self.matched_length = 0
+
         super().__init__(host_indices, token_ids, last_hash)
 
     def increment(self, num_tokens: int):
@@ -352,6 +356,8 @@ class HiCacheController:
             self.prefetch_revoke_queue = Queue()
             self.ack_backup_queue = Queue()
 
+            self.prefetch_free_queue = Queue()
+
             self.prefetch_thread.start()
             self.backup_thread.start()
 
@@ -373,6 +379,8 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+
+            self.prefetch_free_queue.queue.clear()
 
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
@@ -556,6 +564,7 @@ class HiCacheController:
         return operation.completed_tokens, operation.hash_value
 
     def generic_page_transfer(self, operation, batch_size=8):
+        operation_host_indices = operation.host_indices[: operation.storage_hit_count]
         for i in range(0, len(operation.hash_value), batch_size):
             page_hashes = operation.hash_value[i : i + batch_size]
             # todo: zero copy
@@ -572,7 +581,7 @@ class HiCacheController:
             if operation.increment(self.page_size * len(page_hashes)):
                 for i in range(len(page_hashes)):
                     self.mem_pool_host.set_from_flat_data_page(
-                        operation.host_indices[completed_tokens],
+                        operation_host_indices[completed_tokens],
                         page_data[i],
                     )
                     completed_tokens += self.page_size
@@ -580,8 +589,9 @@ class HiCacheController:
                 break
 
     def mooncake_page_transfer(self, operation):
+        operation_host_indices = operation.host_indices[: operation.storage_hit_count]
         key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-            operation.hash_value, operation.host_indices
+            operation.hash_value, operation_host_indices
         )
         self.storage_backend.batch_get(key_strs, buffer_ptrs, buffer_sizes)
         operation.increment(len(operation.hash_value) * self.page_size)
@@ -607,9 +617,7 @@ class HiCacheController:
                     # to ensure all TP workers release the host memory at the same time
                     torch.distributed.barrier(group=self.prefetch_io_tp_group)
                 # operation terminated by controller, release pre-allocated memory
-                self.mem_pool_host.free(
-                    operation.host_indices[operation.completed_tokens :]
-                )
+                self.prefetch_free_queue.put(operation)
             except Empty:
                 continue
 
@@ -684,7 +692,7 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     if operation.host_indices is not None:
-                        self.mem_pool_host.free(operation.host_indices)
+                        self.prefetch_free_queue.put(operation)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
@@ -692,9 +700,7 @@ class HiCacheController:
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
-                    # free the pre-allocated memory for pages that are not hit
-                    self.mem_pool_host.free(operation.host_indices[storage_hit_count:])
-                    operation.host_indices = operation.host_indices[:storage_hit_count]
+                    operation.storage_hit_count = storage_hit_count
                     logger.debug(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )

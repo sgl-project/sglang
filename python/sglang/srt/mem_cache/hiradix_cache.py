@@ -75,6 +75,7 @@ class HiRadixCache(RadixCache):
         self.prefetch_threshold = 256
         self.prefetch_timeout = 3  # seconds
         self.prefetch_stop_policy = hicache_storage_prefetch_policy
+        self.last_free_operation = None
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -112,6 +113,7 @@ class HiRadixCache(RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
+        self.last_free_operation = None
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -374,6 +376,7 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.check_revoked_prefetch()
             self.check_backup_progress()
+            self.check_free_prefetch()
 
     def check_revoked_prefetch(self):
         queue_size = torch.tensor(
@@ -423,6 +426,40 @@ class HiRadixCache(RadixCache):
                     host_node.backuped_storage = True
             host_node.release_host()
             del self.ongoing_backup[ack_id]
+
+    def free_operation(self, operation):
+        self.cache_controller.mem_pool_host.free(
+            operation.host_indices[: operation.matched_length]
+        )
+        self.cache_controller.mem_pool_host.free(
+            operation.host_indices[operation.min_completed_tokens :]
+        )
+
+    def check_free_prefetch(self):
+        if self.last_free_operation is not None:
+            if self.last_free_operation.request_id in self.ongoing_prefetch:
+                return
+            else:
+                self.free_operation(self.last_free_operation)
+                self.last_free_operation = None
+
+        queue_size = self.cache_controller.prefetch_free_queue.qsize()
+        if self.tp_world_size > 1:
+            queue_size = torch.tensor(queue_size, dtype=torch.int)
+            # synchrnoize TP workers to make the same update to hiradix cache
+            torch.distributed.all_reduce(
+                queue_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            queue_size = queue_size.item()
+
+        for _ in range(queue_size):
+            operation = self.cache_controller.prefetch_free_queue.get()
+            if operation.request_id in self.ongoing_prefetch:
+                self.last_free_operation = operation
+                break
+            self.free_operation(operation)
 
     def can_terminate_prefetch(self, operation: PrefetchOperation):
         can_terminate = True
@@ -501,10 +538,8 @@ class HiRadixCache(RadixCache):
         if len(written_indices):
             self.cache_controller.mem_pool_host.update_prefetch(written_indices)
 
-        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.mem_pool_host.free(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
+        operation.matched_length = matched_length
+        operation.min_completed_tokens = min_completed_tokens
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
