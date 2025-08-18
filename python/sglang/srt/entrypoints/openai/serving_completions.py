@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Union, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
