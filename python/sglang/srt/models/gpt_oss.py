@@ -1131,9 +1131,6 @@ class GptOssForCausalLM(nn.Module):
                             attn_tp_rank = get_attention_tp_rank()
                             start = attn_tp_rank * param.numel()
 
-                            # from remote_pdb import set_trace
-                            # set_trace()
-
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )

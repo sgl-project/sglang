@@ -94,10 +94,6 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
-
-    # from remote_pdb import set_trace
-    # set_trace()
-
     quant_tensor = convert_layout(
         wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
     )
@@ -295,9 +291,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         self.with_bias = with_bias
         mxfp4_block = 32
-
-        # from remote_pdb import set_trace
-        # set_trace()
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
@@ -551,9 +544,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
 
             num_warps = 8
-
-            # from remote_pdb import set_trace
-            # set_trace()
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight, layer.w13_weight_scale, num_warps
