@@ -88,7 +88,7 @@ class OpenAIServingChat(OpenAIServingBase):
         max_num_images = self.tokenizer_manager.server_args.max_num_images
         if max_num_images is None:
             return
-        
+
         num_images = len(image_data)
         if num_images > max_num_images:
             raise ValueError(
