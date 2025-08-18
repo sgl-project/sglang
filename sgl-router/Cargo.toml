@@ -3,6 +3,10 @@ name = "sglang_router_rs"
 version = "0.0.0"
 edition = "2021"
 
+[features]
+default = ["huggingface"]
+huggingface = ["tokenizers"]
+
 [lib]
 name = "sglang_router_rs"
 # Pure Rust library: Just omit crate-type (defaults to rlib)
@@ -44,7 +48,7 @@ thiserror = "2.0.12"
 url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
-tokenizers = "0.21.4"
+tokenizers = { version = "0.21.4", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
