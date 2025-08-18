@@ -43,7 +43,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
     def _validate_request(self, request: CompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
-        if len(request.prompt) == 0:
+        prompt = request.prompt
+        if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
             return "prompt cannot be empty."
 
         return None
