@@ -96,8 +96,8 @@ class _StageExecutor:
             set_dp_buffer_len(
                 self._global_dp_buffer_len,
                 self._local_dp_buffer_len,
-                self._global_num_tokens,
                 self._is_max_padding,
+                self._global_num_tokens,
             )
 
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):

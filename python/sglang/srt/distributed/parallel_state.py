@@ -768,9 +768,11 @@ class GroupCoordinator:
                 else:
                     output_size = (input_size[0] * world_size,) + input_size[1:]
                 # Allocate output tensor.
-                output_tensor = torch.empty(
-                    output_size, dtype=input_.dtype, device=input_.device
-                )
+                with self.use_symmetric_memory(self, disabled=sizes is not None) as sm:
+                    output_tensor = torch.empty(
+                        output_size, dtype=input_.dtype, device=input_.device
+                    )
+                    sm.tag(output_tensor)
                 pynccl_comm.all_gather(output_tensor, input_, sizes=sizes)
                 return output_tensor
 
