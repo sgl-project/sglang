@@ -469,6 +469,10 @@ class VisionAttention(nn.Module):
         """
         override_backend = global_server_args_dict["mm_attention_backend"]
         if override_backend is not None:
+            if override_backend == "fa3" and is_blackwell():
+                raise ValueError(
+                    "flash_attn at sgl-kernel is only supported on sm90 and above"
+                )
             return override_backend
         if passed_backend is not None:
             return passed_backend
