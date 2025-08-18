@@ -157,6 +157,18 @@ void apply_rope_pos_ids_cos_sin_cache(
     const std::optional<at::Tensor>& v_buffer,
     const std::optional<at::Tensor>& kv_cache_loc);
 
+void downcast_fp8(
+    at::Tensor& k,
+    at::Tensor& v,
+    at::Tensor& k_out,
+    at::Tensor& v_out,
+    at::Tensor& k_scale,
+    at::Tensor& v_scale,
+    at::Tensor& loc,
+    int64_t mult,
+    int64_t offset,
+    int64_t cuda_stream);
+
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
