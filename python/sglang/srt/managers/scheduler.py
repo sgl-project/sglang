@@ -177,7 +177,7 @@ class GenerationBatchResult:
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
     bid: int
-    can_run_cuda_graph: bool
+    can_run_graph: bool
 
 
 @dataclass
@@ -394,7 +394,7 @@ class Scheduler(
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
-                f"available_gpu_mem={avail_mem:.2f} GB"
+                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
         # Init memory pool and cache
@@ -922,7 +922,7 @@ class Scheduler(
                             "extend_logprob_start_len_per_req", None
                         ),
                         bid=bids[next_mb_id],
-                        can_run_cuda_graph=result.can_run_cuda_graph,
+                        can_run_graph=result.can_run_graph,
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
@@ -1735,11 +1735,11 @@ class Scheduler(
                     model_worker_batch.hicache_consumer_index
                 )
                 if self.pp_group.is_last_rank:
-                    logits_output, next_token_ids, can_run_cuda_graph = (
+                    logits_output, next_token_ids, can_run_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 else:
-                    pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
+                    pp_hidden_states_proxy_tensors, _, can_run_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 bid = model_worker_batch.bid
@@ -1749,7 +1749,7 @@ class Scheduler(
                     next_token_ids,
                     bid,
                     num_accepted_tokens,
-                    can_run_cuda_graph,
+                    can_run_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
                 bs = batch.batch_size()
                 self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
@@ -1784,7 +1784,7 @@ class Scheduler(
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 bid=bid,
-                can_run_cuda_graph=can_run_cuda_graph,
+                can_run_graph=can_run_graph,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
@@ -2245,10 +2245,9 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
         }
 
-        if not _is_cpu:
-            ret["memory_usage"]["cuda_graph"] = round(
-                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
-            )
+        ret["memory_usage"]["graph"] = round(
+            self.tp_worker.worker.model_runner.graph_mem_usage, 2
+        )
 
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
             ret["avg_spec_accept_length"] = (
