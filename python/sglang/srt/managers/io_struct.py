@@ -612,6 +612,8 @@ class EmbeddingReqInput:
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
+            elif isinstance(self.sampling_params, dict):
+                self.sampling_params = [self.sampling_params] * self.batch_size
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
@@ -660,6 +662,8 @@ class TokenizedEmbeddingReqInput:
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
 
