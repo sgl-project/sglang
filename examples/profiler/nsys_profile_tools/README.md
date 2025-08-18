@@ -137,7 +137,7 @@ To create a new engine DEF with model ABC, just add another json file in the sam
 gputrc2graph.py with the same format as the other json files. The script will automatically pick up all the json files in the same directory as engine/model specifications.
 
 Then, for this new model, suppose there are 4 kernels to be classified into
-"gemm" and "attn", where the gemm kernelshave names with "*H*" or "*I*" in
+"gemm" and "attn", where the gemm kernels have names with "*H*" or "*I*" in
 them, and attn kernels have names with "*J*" or "*K*" in them, just add another
  .json file in the same directory as gputrc2graph.py with the same format as
  the other json files, like the following:
