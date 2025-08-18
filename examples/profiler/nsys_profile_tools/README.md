@@ -144,12 +144,12 @@ them, and attn kernels have names with "*J*" or "*K*" in them, just add another
 
 ```json
 {
-  'DEF': {
-      'ABC': {
-          'H|I': 'gemm',
-          'J|K': 'attn',
-          'CUDA mem': 'non-gpu-H_D_memops',
-          '.*': 'misc'
+  "DEF": {
+      "ABC": {
+          "H|I": "gemm",
+          "J|K": "attn",
+          "CUDA mem": "non-gpu-H_D_memops",
+          ".*": "misc"
       }
   }
 }
