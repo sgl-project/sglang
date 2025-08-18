@@ -2,30 +2,28 @@
 set -euo pipefail
 
 # Get version from SGLang version.py file
-FALLBACK_SGLANG_VERSION="v0.4.10.post2"
 SGLANG_VERSION_FILE="$(dirname "$0")/../../python/sglang/version.py"
+SGLANG_VERSION="v0.5.0rc0"  # Default version, will be overridden if version.py is found
 
 if [ -f "$SGLANG_VERSION_FILE" ]; then
-  SGLANG_VERSION=$(python3 -c '
+  VERSION_FROM_FILE=$(python3 -c '
 import re, sys
 with open(sys.argv[1], "r") as f:
     content = f.read()
     match = re.search(r"__version__\s*=\s*[\"'"'"'](.*?)[\"'"'"']", content)
     if match:
         print("v" + match.group(1))
-' "$SGLANG_VERSION_FILE")
+' "$SGLANG_VERSION_FILE" 2>/dev/null || echo "")
 
-  if [ -z "$SGLANG_VERSION" ]; then
-      SGLANG_VERSION="$FALLBACK_SGLANG_VERSION"
-      echo "Warning: Could not parse version from $SGLANG_VERSION_FILE, using fallback version: $SGLANG_VERSION" >&2
+  if [ -n "$VERSION_FROM_FILE" ]; then
+      SGLANG_VERSION="$VERSION_FROM_FILE"
+      echo "Using SGLang version from version.py: $SGLANG_VERSION"
+  else
+      echo "Warning: Could not parse version from $SGLANG_VERSION_FILE, using default: $SGLANG_VERSION" >&2
   fi
 else
-  # Fallback version if file is not found
-  SGLANG_VERSION="$FALLBACK_SGLANG_VERSION"
-  echo "Warning: version.py not found, using fallback version: $SGLANG_VERSION" >&2
+  echo "Warning: version.py not found, using default version: $SGLANG_VERSION" >&2
 fi
-
-echo "Using SGLang version: $SGLANG_VERSION"
 
 # Default base tags (can be overridden by command line arguments)
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-rocm630-mi30x"
@@ -66,6 +64,8 @@ else
   DEVICE_FLAG="--device /dev/dri"
 fi
 
+
+
 # Function to find latest available image for a given GPU architecture
 find_latest_image() {
   local gpu_arch=$1
@@ -82,7 +82,7 @@ find_latest_image() {
 
   local days_back=0
 
-  while [ $days_back -lt 30 ]; do
+  while [ $days_back -lt 7 ]; do
     local check_date=$(date -d "$days_back days ago" +%Y%m%d)
     local image_tag="${base_tag}-${check_date}"
 
@@ -98,8 +98,19 @@ find_latest_image() {
     days_back=$((days_back + 1))
   done
 
-  echo "Error: No ${gpu_arch} image found in the last 30 days" >&2
-  return 1
+  echo "Error: No ${gpu_arch} image found in the last 7 days for version ${base_tag}" >&2
+
+  # Final fallback to specific hardcoded images
+  echo "Using final fallback images..." >&2
+  if [ "$gpu_arch" == "mi30x" ]; then
+    echo "rocm/sgl-dev:v0.5.0rc0-rocm630-mi30x-20250812"
+  elif [ "$gpu_arch" == "mi35x" ]; then
+    echo "rocm/sgl-dev:v0.5.0rc0-rocm700-mi35x-20250812"
+  else
+    echo "rocm/sgl-dev:v0.5.0rc0-rocm630-mi30x-20250812"  # Default to mi30x
+  fi
+
+  return 0
 }
 
 # Determine image finder and fallback based on runner
@@ -117,15 +128,11 @@ fi
 
 echo "The runner is: ${RUNNER_NAME}"
 GPU_ARCH="mi30x"
-FALLBACK_IMAGE="rocm/sgl-dev:${MI30X_BASE_TAG}-20250715"
-FALLBACK_MSG="No mi30x image found in last 30 days, using fallback image"
 
 # Check for mi350/mi355 runners
 if [[ "${RUNNER_NAME}" =~ ^linux-mi350-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi355-gpu-[0-9]+$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi35x image."
   GPU_ARCH="mi35x"
-  FALLBACK_IMAGE="rocm/sgl-dev:${MI35X_BASE_TAG}-20250715"
-  FALLBACK_MSG="No mi35x image found in last 30 days, using fallback image"
 # Check for mi300/mi325 runners
 elif [[ "${RUNNER_NAME}" =~ ^linux-mi300-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi325-gpu-[0-9]+$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi30x image."
@@ -135,13 +142,8 @@ else
 fi
 
 # Find and pull the latest image
-if IMAGE=$(find_latest_image "${GPU_ARCH}"); then
-  echo "Pulling Docker image: $IMAGE"
-else
-  echo "$FALLBACK_MSG" >&2
-  IMAGE="$FALLBACK_IMAGE"
-  echo "Pulling fallback Docker image: $IMAGE"
-fi
+IMAGE=$(find_latest_image "${GPU_ARCH}")
+echo "Pulling Docker image: $IMAGE"
 docker pull "$IMAGE"
 
 # Run the container

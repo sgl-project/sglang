@@ -11,11 +11,37 @@ import numpy
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+
+def get_scalar_types():
+    """
+    Returns:
+        tuple: (ScalarType, scalar_types)
+    """
+    try:
+        from sgl_kernel.scalar_type import ScalarType, scalar_types
+
+        return ScalarType, scalar_types
+    except ImportError:
+
+        class MockScalarType:
+            pass
+
+        class MockScalarTypes:
+            uint4b8 = "uint4b8"
+            uint8b128 = "uint8b128"
+
+            def __getattr__(self, name):
+                return f"mock_{name}"
+
+        return MockScalarType, MockScalarTypes()
+
+
+ScalarType, scalar_types = get_scalar_types()
 
 
 def is_layer_skipped(
@@ -118,6 +144,10 @@ def requantize_with_max_scale(
             start = end
 
     return max_w_scale, weight
+
+
+def update_tensor_inplace(old: torch.Tensor, new: torch.Tensor) -> None:
+    old.copy_(new)
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/layer_utils.py
@@ -292,6 +322,30 @@ def pack_cols(
     q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
     q_res = q_res.contiguous()
 
+    return q_res
+
+
+def pack_rows(
+    q_w: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+):
+    assert q_w.shape == (size_k, size_n)
+
+    pack_factor = get_pack_factor(num_bits)
+    assert size_k % pack_factor == 0
+
+    orig_device = q_w.device
+
+    q_w = q_w.cpu().numpy().astype(numpy.uint32)
+
+    q_res = numpy.zeros((size_k // pack_factor, size_n), dtype=numpy.uint32)
+
+    for i in range(pack_factor):
+        q_res |= q_w[i::pack_factor, :] << num_bits * i
+
+    q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
     return q_res
 
 

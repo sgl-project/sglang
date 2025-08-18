@@ -213,7 +213,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 add_generation_prompt=True,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
-                builtin_tools=[],
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
@@ -233,7 +232,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 add_generation_prompt=True,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
-                builtin_tools=[],
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
@@ -725,6 +723,7 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
+            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
         )
 
     def _process_logprobs_tokens(
