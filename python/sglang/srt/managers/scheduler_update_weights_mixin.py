@@ -79,33 +79,34 @@ class SchedulerUpdateWeightsMixin:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            if self.server_args.attention_backend == "ascend":
-                self.stashed_kv_dynamic_state = []
-                self.k_storage_size = self.tp_worker.worker.model_runner.token_to_kv_pool.k_buffer.untyped_storage().size()
-                self.v_storage_size = self.tp_worker.worker.model_runner.token_to_kv_pool.v_buffer.untyped_storage().size()
-                self.tp_worker.worker.model_runner.token_to_kv_pool.k_buffer.untyped_storage().resize_(0)
-                self.tp_worker.worker.model_runner.token_to_kv_pool.v_buffer.untyped_storage().resize_(0)
+            # if self.server_args.attention_backend == "ascend":
+            #     self.stashed_kv_dynamic_state = []
+            #     self.k_storage_size = self.tp_worker.worker.model_runner.token_to_kv_pool.k_buffer.untyped_storage().size()
+            #     self.v_storage_size = self.tp_worker.worker.model_runner.token_to_kv_pool.v_buffer.untyped_storage().size()
+            #     self.tp_worker.worker.model_runner.token_to_kv_pool.k_buffer.untyped_storage().resize_(0)
+            #     self.tp_worker.worker.model_runner.token_to_kv_pool.v_buffer.untyped_storage().resize_(0)
 
-                self.stashed_kv_dynamic_state = [(self.tp_worker.worker.model_runner.token_to_kv_pool.k_buffer, self.k_storage_size), (self.tp_worker.worker.model_runner.token_to_kv_pool.v_buffer, self.v_storage_size)]
-            else:
-                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            #     self.stashed_kv_dynamic_state = [(self.tp_worker.worker.model_runner.token_to_kv_pool.k_buffer, self.k_storage_size), (self.tp_worker.worker.model_runner.token_to_kv_pool.v_buffer, self.v_storage_size)]
+            # else:
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
-
+            print(f"release kv 111111111111", flush=True)
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.worker.model_runner.model
             )
             torch.distributed.barrier(self.tp_cpu_group)
 
-            if self.server_args.attention_backend == "ascend":
-                self.stashed_model_dynamic_state = []
-                for name, param in self.tp_worker.worker.model_runner.model.named_parameters():
-                    storage_size = param.untyped_storage().size()
-                    param.untyped_storage().resize_(0)
+            # if self.server_args.attention_backend == "ascend":
+            #     self.stashed_model_dynamic_state = []
+            #     for name, param in self.tp_worker.worker.model_runner.model.named_parameters():
+            #         storage_size = param.untyped_storage().size()
+            #         param.untyped_storage().resize_(0)
 
-                    self.stashed_model_dynamic_state.append((name, param, storage_size))
-            else:
-                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+            #         self.stashed_model_dynamic_state.append((name, param, storage_size))
+            # else:
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+            print(f"release model 111111111111", flush=True)
 
         torch.npu.empty_cache()
 
@@ -118,11 +119,11 @@ class SchedulerUpdateWeightsMixin:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
-            if self.server_args.attention_backend == "ascend":
-                for name, param, storage_size in self.stashed_model_dynamic_state:
-                    param.untyped_storage().resize_(storage_size)
-            else:
-                self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
+            # if self.server_args.attention_backend == "ascend":
+            #     for name, param, storage_size in self.stashed_model_dynamic_state:
+            #         param.untyped_storage().resize_(storage_size)
+            # else:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
 
             torch.distributed.barrier(self.tp_cpu_group)
             _import_static_state(
@@ -132,11 +133,11 @@ class SchedulerUpdateWeightsMixin:
             del self.stashed_model_static_state
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            if self.server_args.attention_backend == "ascend":
-                for param, storage_size in self.stashed_kv_dynamic_state:
-                    param.untyped_storage().resize_(storage_size)
-            else:
-                self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            # if self.server_args.attention_backend == "ascend":
+            #     for param, storage_size in self.stashed_kv_dynamic_state:
+            #         param.untyped_storage().resize_(storage_size)
+            # else:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
         torch.npu.empty_cache()
 
         return ResumeMemoryOccupationReqOutput()

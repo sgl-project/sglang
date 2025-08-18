@@ -8,6 +8,7 @@ try:
     import torch_memory_saver
 
     _memory_saver = torch_memory_saver.torch_memory_saver
+    _memory_saver.hook_mode = "torch"
     import_error = None
 except ImportError as e:
     import_error = e
