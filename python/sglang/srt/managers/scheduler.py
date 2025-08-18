@@ -1141,7 +1141,7 @@ class Scheduler(
                         f"boostrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    prepare_abort(req, error_msg)
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.stream_output([req], req.return_logprob)
                     return
 
@@ -2579,7 +2579,10 @@ def run_scheduler_process(
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_prefill()
             else:
-                scheduler.event_loop_normal_disagg_prefill()
+                if server_args.pp_size > 1:
+                    scheduler.event_loop_pp_disagg_prefill()
+                else:
+                    scheduler.event_loop_normal_disagg_prefill()
 
         elif disaggregation_mode == DisaggregationMode.DECODE:
             if scheduler.enable_overlap:
