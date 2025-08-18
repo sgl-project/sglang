@@ -31,11 +31,11 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
-from sgl_kernel.fused_moe import fused_marlin_moe
 
 if torch.version.hip is not None:
     from sgl_kernel.elementwise import gelu_quick
 
+from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -114,7 +114,3 @@ from sgl_kernel.speculative import (
 )
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__
-
-build_tree_kernel = (
-    None  # TODO(ying): remove this after updating the sglang python code.
-)
