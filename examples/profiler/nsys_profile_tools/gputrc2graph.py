@@ -108,7 +108,7 @@ class GPUTrace2Graph:
 
         if df.empty:
             return
-        output_name = output_dir + "/result"
+        output_name = os.path.join(output_dir, "result")
         if not title:
             title = "Model_Engine"
         x = "Model_Engine"
