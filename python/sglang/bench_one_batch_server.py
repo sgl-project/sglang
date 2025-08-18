@@ -398,7 +398,9 @@ def get_report_summary(
     return summary
 
 
-def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
+def run_benchmark(
+    server_args: ServerArgs, bench_args: BenchArgs, append_to_summary: bool = True
+):
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
     else:
@@ -503,7 +505,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     summary = get_report_summary(result, server_args, bench_args)
     print(summary)
 
-    if is_in_ci():
+    if is_in_ci() and append_to_summary:
         write_github_step_summary(summary)
 
 
@@ -519,7 +521,7 @@ def main():
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 
-    run_benchmark(server_args, bench_args)
+    run_benchmark(server_args, bench_args, append_to_summary=False)
 
 
 if __name__ == "__main__":

@@ -84,7 +84,6 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
-                    full_report += f"### {model}\n"
 
                     process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
                     model_results = []
