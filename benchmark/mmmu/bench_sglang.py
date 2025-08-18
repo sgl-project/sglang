@@ -148,7 +148,7 @@ async def eval_mmmu(args) -> None:
             )
             sample["original_response"] = response
             if "</think>" in response:
-                response = response.split("</think>")[1]
+                response = response.split("</think>")[1].strip()
             answer = (
                 re.search(args.response_answer_regex, response)
                 if response is not None
@@ -173,7 +173,7 @@ async def eval_mmmu(args) -> None:
             sample, response = await coro
             sample["original_response"] = response
             if "</think>" in response:
-                response = response.split("</think>")[1]
+                response = response.split("</think>")[1].strip()
             answer = (
                 re.search(args.response_answer_regex, response)
                 if response is not None
