@@ -73,6 +73,7 @@ class EAGLEWorker(TpModelWorker):
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        moe_ep_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -127,6 +128,7 @@ class EAGLEWorker(TpModelWorker):
                 tp_rank=tp_rank,
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
+                moe_ep_rank=moe_ep_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
@@ -224,6 +226,22 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner,
                 skip_prefill=False,
             )
+        elif self.server_args.attention_backend == "aiter":
+            from sglang.srt.layers.attention.aiter_backend import (
+                AiterAttnBackend,
+                AiterMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = AiterMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = AiterAttnBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
+            self.has_prefill_wrapper_verify = False
         elif self.server_args.attention_backend == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
@@ -818,6 +836,21 @@ class EAGLEWorker(TpModelWorker):
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
+        has_finished, unfinished_req_index = False, []
+        for i, req in enumerate(batch.reqs):
+            if req.finished():
+                has_finished = True
+            else:
+                unfinished_req_index.append(i)
+        if has_finished:
+            unfinished_index_device = torch.tensor(
+                unfinished_req_index,
+                dtype=torch.int64,
+                device=batch.spec_info.topk_p.device,
+            )
+            batch.spec_info.filter_batch(
+                unfinished_index_device, has_been_filtered=False
+            )
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
