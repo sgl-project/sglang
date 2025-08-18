@@ -23,6 +23,7 @@ import sys
 import tempfile
 from typing import List, Literal, Optional, Union
 
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.lora.lora_registry import LoRARef
@@ -1234,20 +1235,9 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=[  # TODO: use FunctionCallParser.DetectorMap.keys()
-                "qwen25",
-                "mistral",
-                "llama3",
-                "deepseekv3",
-                "pythonic",
-                "kimi_k2",
-                "qwen3_coder",
-                "glm45",
-                "step3",
-                "gpt-oss",
-            ],
+            choices=list(FunctionCallParser.ToolCallParserEnum.keys()),
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
+            help=f"Specify the parser for handling tool-call interactions. Options include: {list(FunctionCallParser.ToolCallParserEnum.keys())}.",
         )
         parser.add_argument(
             "--tool-server",
