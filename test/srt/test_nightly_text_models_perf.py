@@ -1,5 +1,4 @@
 import os
-import re
 import subprocess
 import time
 import unittest
@@ -8,6 +7,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    _parse_int_list_env,
     generate_markdown_report,
     is_in_ci,
     parse_models,
@@ -52,8 +52,8 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 32, 64, 160, 256, 384]
         cls.batch_sizes = [1, 1, 8, 32]
-        cls.input_len = 4096
-        cls.output_len = 1024
+        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
+        cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "1024"))
         os.makedirs(PROFILE_DIR, exist_ok=True)
 
     def test_bench_one_batch(self, batch_sizes: tuple = None):
@@ -83,9 +83,9 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                             "--batch-size",
                             str(batch_size),
                             "--input-len",
-                            str(self.input_len),
+                            *[str(x) for x in self.input_lens],
                             "--output-len",
-                            str(self.output_len),
+                            *[str(x) for x in self.output_lens],
                             "--show-report",
                             "--profile",
                             "--profile-by-stage",
@@ -118,7 +118,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
 
                     if model_results:
                         report_part = generate_markdown_report(
-                            model, model_results, self.input_len, self.output_len
+                            model, model_results, self.input_lens, self.output_lens
                         )
                         full_report += report_part + "\n"
 

@@ -10,6 +10,7 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    check_model_scores,
     is_in_ci,
     parse_models,
     popen_launch_server,
@@ -23,7 +24,6 @@ MODEL_SCORE_THRESHOLDS = {
     "OpenGVLab/InternVL2_5-2B": 0.22,
     "google/gemma-3-4b-it": 0.18,
 }
-
 
 DEFAULT_VLM_MODELS = ",".join(
     [
@@ -78,38 +78,6 @@ def write_results_to_json(model, metrics, mode="a"):
         json.dump(existing_results, f, indent=2)
 
 
-def check_model_scores(results):
-    failed_models = []
-    summary = " | model | score | threshold | status |\n"
-    summary += "| ----- | ----- | --------- | ------ |\n"
-
-    for model, score in results:
-        threshold = MODEL_SCORE_THRESHOLDS.get(model)
-        if threshold is None:
-            print(f"Warning: No threshold defined for model {model}")
-            continue
-
-        is_success = score >= threshold
-        status_emoji = "✅" if is_success else "❌"
-
-        if not is_success:
-            failed_models.append(
-                f"\nScore Check Failed: {model}\n"
-                f"Model {model} score ({score:.4f}) is below threshold ({threshold:.4f})"
-            )
-
-        line = f"| {model} | {score} | {threshold} | {status_emoji} |\n"
-        summary += line
-
-    print(summary)
-
-    if is_in_ci():
-        write_github_step_summary(f"### TestNightlyVLMMmmuEval\n{summary}")
-
-    if failed_models:
-        raise AssertionError("\n".join(failed_models))
-
-
 class TestNightlyVLMMmmuEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -141,6 +109,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                     )
 
                     metrics = run_eval(args)
+                    metrics["score"] = round(metrics["score"], 2)
                     print(
                         f"{'=' * 42}\n{model} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
                     )
@@ -159,7 +128,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
         except Exception as e:
             print(f"Error reading results_vlm_mmmu.json: {e}")
 
-        check_model_scores(all_results)
+        check_model_scores(all_results, MODEL_SCORE_THRESHOLDS)
 
 
 if __name__ == "__main__":

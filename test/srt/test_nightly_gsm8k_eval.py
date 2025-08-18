@@ -8,16 +8,11 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    is_in_ci,
+    check_model_scores,
     parse_models,
     popen_launch_server,
-    write_github_step_summary,
 )
 
 MODEL_SCORE_THRESHOLDS = {
@@ -81,38 +76,6 @@ def write_results_to_json(model, metrics, mode="a"):
         json.dump(existing_results, f, indent=2)
 
 
-def check_model_scores(results):
-    failed_models = []
-    summary = " | model | score | threshold | status |\n"
-    summary += "| ----- | ----- | --------- | ------ |\n"
-
-    for model, score in results:
-        threshold = MODEL_SCORE_THRESHOLDS.get(model)
-        if threshold is None:
-            print(f"Warning: No threshold defined for model {model}")
-            continue
-
-        is_success = score >= threshold
-        status_emoji = "✅" if is_success else "❌"
-
-        if not is_success:
-            failed_models.append(
-                f"\nScore Check Failed: {model}\n"
-                f"Model {model} score ({score:.4f}) is below threshold ({threshold:.4f})"
-            )
-
-        line = f"| {model} | {score} | {threshold} | {status_emoji} |\n"
-        summary += line
-
-    print(summary)
-
-    if is_in_ci():
-        write_github_step_summary(f"### TestNightlyGsm8KEval\n{summary}")
-
-    if failed_models:
-        raise AssertionError("\n".join(failed_models))
-
-
 # Do not use `CustomTestCase` since `test_mgsm_en_all_models` does not want retry
 class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
@@ -165,7 +128,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             print(f"Error reading results.json: {e}")
 
         # Check all scores after collecting all results
-        check_model_scores(all_results)
+        check_model_scores(all_results, MODEL_SCORE_THRESHOLDS)
 
 
 if __name__ == "__main__":

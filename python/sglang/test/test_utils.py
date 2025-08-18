@@ -1493,3 +1493,41 @@ def generate_markdown_report(model, results, input_len, output_len):
 
 def parse_models(model_string: str):
     return [model.strip() for model in model_string.split(",") if model.strip()]
+
+
+def check_model_scores(results, model_score_thresholds):
+    failed_models = []
+    summary = " | model | score | threshold | status |\n"
+    summary += "| ----- | ----- | --------- | ------ |\n"
+
+    for model, score in results:
+        threshold = model_score_thresholds.get(model)
+        if threshold is None:
+            print(f"Warning: No threshold defined for model {model}")
+            continue
+
+        is_success = score >= threshold
+        status_emoji = "✅" if is_success else "❌"
+
+        if not is_success:
+            failed_models.append(
+                f"\nScore Check Failed: {model}\n"
+                f"Model {model} score ({score:.4f}) is below threshold ({threshold:.4f})"
+            )
+
+        line = f"| {model} | {score} | {threshold} | {status_emoji} |\n"
+        summary += line
+
+    print(summary)
+
+    if is_in_ci():
+        write_github_step_summary(f"### TestNightlyVLMMmmuEval\n{summary}")
+
+    if failed_models:
+        raise AssertionError("\n".join(failed_models))
+
+
+# Bench knobs for bench_one_batch_server (override by env)
+def _parse_int_list_env(name: str, default_val: str):
+    val = os.environ.get(name, default_val)
+    return [int(x) for x in val.split(",") if x]
