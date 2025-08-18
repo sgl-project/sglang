@@ -5,6 +5,11 @@
 [![PyPI](https://img.shields.io/pypi/v/sgl-kernel)](https://pypi.org/project/sgl-kernel)
 
 ## Installation
+For CUDA 12.1 and above:
+
+```bash
+pip3 install sgl-kernel
+```
 
 For CUDA 11.8:
 
@@ -12,11 +17,6 @@ For CUDA 11.8:
 pip3 install sgl-kernel -i https://docs.sglang.ai/whl/cu118
 ```
 
-For CUDA 12.1 or CUDA 12.4:
-
-```bash
-pip3 install sgl-kernel
-```
 ## Build from source
 
 Development build:
@@ -58,7 +58,15 @@ And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLE
 CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .
 ```
 
-### FlashAttention on Hopper
+### ⚠️ Compilation Issue with `sgl-kernel` and CUDA 12.6
+
+When compiling `sgl-kernel` with FlashAttention on a Hopper GPU using CUDA 12.6, you may encounter a segmentation fault:
+
+```bash
+kernel/build/_deps/repo-flash-attention-src/hopper/instantiations/flash_fwd_hdimall_bf16_paged_softcap_sm90.cu -o CMakeFiles/flash_ops.dir/_deps/repo-flash-attention-src/hopper/instantiations/flash_fwd_hdimall_bf16_paged_softcap_sm90.cu.o
+Segmentation fault (core dumped)
+```
+
 ⚠️ **Note**: To ensure that FlashAttention compiles correctly on Hopper GPU Architecture(sm90), it is strongly [recommended](https://github.com/Dao-AILab/flash-attention/issues/1453) to use:
 - nvcc version: 12.6
 - ptxas version: 12.8
