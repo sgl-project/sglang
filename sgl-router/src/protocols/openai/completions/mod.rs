@@ -5,4 +5,6 @@ pub mod response;
 
 // Re-export main types for convenience
 pub use request::CompletionRequest;
-pub use response::{CompletionChoice, CompletionResponse, CompletionStreamChoice, CompletionStreamResponse};
+pub use response::{
+    CompletionChoice, CompletionResponse, CompletionStreamChoice, CompletionStreamResponse,
+};
