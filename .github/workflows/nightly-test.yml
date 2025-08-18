@@ -48,7 +48,7 @@ jobs:
         run: |
           rm -rf test/srt/performance_profiles_text_models/
           cd test/srt
-          python3 test_nightly_gsm8k_eval.py
+          python3 test_nightly_text_models_perf.py
 
       - name: Upload profile traces' artifacts
         id: upload_profiles

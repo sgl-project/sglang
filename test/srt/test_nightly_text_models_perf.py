@@ -8,7 +8,9 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    popen_launch_server, is_in_ci, write_github_step_summary,
+    is_in_ci,
+    popen_launch_server,
+    write_github_step_summary,
 )
 
 PROFILE_DIR = "performance_profiles_text_models"
@@ -77,7 +79,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         os.makedirs(PROFILE_DIR, exist_ok=True)
 
     def test_bench_one_batch(self, batch_sizes: tuple = None):
-        full_report = "## Nightly Performance Test Summary\n"
+        full_report = "## Nightly Text Models Performance Test Summary\n"
 
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
