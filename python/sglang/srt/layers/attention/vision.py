@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.utils import is_cuda, is_blackwell, print_info_once
+from sglang.srt.utils import is_blackwell, is_cuda, print_info_once
 
 _is_cuda = is_cuda()
 
@@ -154,37 +154,7 @@ class VisionSdpaAttention(nn.Module):
 
         cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
 
-        seq_ids = torch.searchsorted(cu_seqlens, positions, right=False) - 1  # (s,)
-
-        valid = positions < cu_seqlens[-1]  # (s,)
-
-        same_block = (seq_ids.view(1, s, 1) == seq_ids.view(1, 1, s)) & (
-            valid.view(1, s, 1) & valid.view(1, 1, s)
-        )
-
-        mask = same_block if same_sequence_fill_value else ~same_block
-
-        return mask
-
-    @staticmethod
-    def _generate_key_padding_mask(
-        seq_lens: torch.Tensor,
-        max_seqlen: int,
-        device: torch.device,
-    ) -> torch.BoolTensor:
-        """
-        Build key-padding mask with shape [b, 1, 1, s]. True means valid.
-        """
-        seq_lens = seq_lens.to(device=device, dtype=torch.int32)
-        s = int(max_seqlen)
-        if s == 0:
-            return torch.zeros(
-                (seq_lens.numel(), 1, 1, 0), dtype=torch.bool, device=device
-            )
-        positions = torch.arange(s, device=device, dtype=torch.int32)
-        # True indicates masked (padding) positions
-        masked = positions.unsqueeze(0) >= seq_lens.view(-1, 1)
-        return masked.view(-1, 1, 1, s)
+        return self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple)
 
     def forward(
         self,
@@ -435,7 +405,10 @@ class VisionAttention(nn.Module):
         # Select attention backend via a unified method
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
-        if global_server_args_dict["mm_attention_backend"] is None and _passed_backend is None:
+        if (
+            global_server_args_dict["mm_attention_backend"] is None
+            and _passed_backend is None
+        ):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
