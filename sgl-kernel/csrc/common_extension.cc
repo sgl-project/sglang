@@ -245,7 +245,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! topk_weights, int moe_block_size, int top_k, "
       "bool mul_topk_weights, bool is_ep, int b_q_type_id,"
       "int size_m, int size_n, int size_k,"
-      "bool is_full_k, bool use_atomic_add,"
+      "bool is_k_full, bool use_atomic_add,"
       "bool use_fp32_reduce, bool is_zp_float) -> Tensor");
   m.impl("moe_wna16_marlin_gemm", torch::kCUDA, &moe_wna16_marlin_gemm);
 
