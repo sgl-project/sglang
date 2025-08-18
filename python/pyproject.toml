@@ -42,7 +42,6 @@ runtime_common = [
     "pydantic",
     "pynvml",
     "pybase64",
-	"py-libnuma",
     "python-multipart",
     "pyzmq>=25.1.2",
     "sentencepiece",
@@ -87,7 +86,7 @@ srt_hip = [
 ]
 
 # CPU: torch wheel for CPU needs to be installed from https://download.pytorch.org/whl/cpu
-srt_cpu = ["sglang[runtime_common]", "intel-openmp"]
+srt_cpu = ["sglang[runtime_common]", "intel-openmp", "py-libnuma"]
 
 # xpu is not enabled in public vllm and torch whl,
 # need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm

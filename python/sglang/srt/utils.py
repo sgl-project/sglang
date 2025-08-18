@@ -77,7 +77,6 @@ import torch.distributed as dist
 import triton
 import zmq
 from fastapi.responses import ORJSONResponse
-from numa import memory as numa_memory
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -413,6 +412,7 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
+        from numa import memory as numa_memory
         if gpu_id in numa_memory.get_allocation_allowed_nodes():
             _, free_gpu_memory = numa_memory.node_memory_info(gpu_id)
         else:
