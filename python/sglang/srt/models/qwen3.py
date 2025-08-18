@@ -327,7 +327,7 @@ class Qwen3ForCausalLM(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def get_input_embeddings(self) -> torch.Tensor:
+    def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
 
     @torch.no_grad()
