@@ -76,7 +76,10 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tok
         }
         _ => {
             // Try to auto-detect by reading file content
-            auto_detect_tokenizer(file_path)
+            auto_detect_tokenizer(file_path).inspect(|tokenizer| {
+                TokenizerMetrics::record_factory_load("auto_detected");
+                TokenizerMetrics::set_vocab_size("auto_detected", tokenizer.vocab_size());
+            })
         }
     };
 

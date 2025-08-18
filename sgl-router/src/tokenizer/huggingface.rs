@@ -97,22 +97,19 @@ impl Encoder for HuggingFaceTokenizer {
         let start = Instant::now();
 
         TokenizerMetrics::record_encode_request("huggingface");
-
         TokenizerMetrics::record_chars_per_encode(input.len());
 
-        let result = self.tokenizer.encode(input, false).map_err(|e| {
-            TokenizerMetrics::record_encode_error("encoding_failed");
-            Error::msg(format!("Encoding failed: {}", e))
-        });
-
-        match result {
-            Ok(encoding) => {
+        self.tokenizer
+            .encode(input, false)
+            .map_err(|e| {
+                TokenizerMetrics::record_encode_error("encoding_failed");
+                Error::msg(format!("Encoding failed: {}", e))
+            })
+            .map(|encoding| {
                 TokenizerMetrics::record_tokens_per_encode(encoding.get_ids().len());
                 TokenizerMetrics::record_encode_duration(start.elapsed());
-                Ok(Encoding::Hf(Box::new(encoding)))
-            }
-            Err(e) => Err(e),
-        }
+                Encoding::Hf(Box::new(encoding))
+            })
     }
 
     fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
@@ -142,19 +139,15 @@ impl Decoder for HuggingFaceTokenizer {
         TokenizerMetrics::record_decode_request("huggingface");
         TokenizerMetrics::record_tokens_per_decode(token_ids.len());
 
-        let result = self
-            .tokenizer
+        self.tokenizer
             .decode(token_ids, skip_special_tokens)
             .map_err(|e| {
                 TokenizerMetrics::record_decode_error("decoding_failed");
                 Error::msg(format!("Decoding failed: {}", e))
-            });
-
-        if result.is_ok() {
-            TokenizerMetrics::record_decode_duration(start.elapsed());
-        }
-
-        result
+            })
+            .inspect(|_| {
+                TokenizerMetrics::record_decode_duration(start.elapsed());
+            })
     }
 }
 
