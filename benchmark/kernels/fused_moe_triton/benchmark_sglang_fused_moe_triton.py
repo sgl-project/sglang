@@ -82,19 +82,19 @@ def fused_moe_triton_api(
     input_gating,
     topk,
 ):
-    topk_output = TopK(
+    topk_op = TopK(
         top_k=topk,
         renormalize=False,
         use_grouped_topk=False,
     )
-    topk_output.use_triton_kernels = True
-    triton_topk_output = topk_output.forward_cuda(
+    topk_op.use_triton_kernels = True
+    triton_topk_output = topk_op.forward_cuda(
         hidden_states=x,
         router_logits=input_gating,
     )
 
     moe_runner_config = MoeRunnerConfig(
-        inplace=True,
+        inplace=False,
     )
     return triton_kernel_moe_forward(
         x,
@@ -133,6 +133,7 @@ def fused_moe_sglang_api(
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
+        block_shape=block_shape,
     )
 
 

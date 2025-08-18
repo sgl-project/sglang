@@ -94,19 +94,19 @@ class TestFusedMOE(CustomTestCase):
         w2_tri = w2_tri.transpose(-2, -1).contiguous()
         score = self.create_random_cuda_tensor((m, e), dtype)
 
-        topk_output = TopK(
+        topk_op = TopK(
             top_k=topk,
             renormalize=False,
             use_grouped_topk=False,
         )
-        topk_output.use_triton_kernels = True
-        triton_topk_output = topk_output.forward_cuda(
+        topk_op.use_triton_kernels = True
+        triton_topk_output = topk_op.forward_cuda(
             hidden_states=a,
             router_logits=score,
         )
 
         moe_runner_config = MoeRunnerConfig(
-            inplace=True,
+            inplace=False,
         )
         triton_output = triton_kernel_moe_forward(
             a, w1_tri, w2_tri, triton_topk_output, moe_runner_config
