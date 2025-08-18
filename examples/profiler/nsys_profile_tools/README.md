@@ -167,7 +167,7 @@ When invoking gputrc2graph.py, specify a trace file with this new model/engine
 like the following:
 
 ```bash
---infile new.nsys-rep,DEF,ABC,<runtime>
+--in_file new.nsys-rep,DEF,ABC,<runtime>
 ```
 
 If the engine_DEF.json file already exists, just add the model as a new node in
