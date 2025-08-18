@@ -73,7 +73,6 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
-    FreezeGCReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -2454,10 +2453,8 @@ class Scheduler(
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
         freeze_gc("Scheduler")
-
         self.send_to_detokenizer.send_pyobj(recv_req)
-        
-        return FreezeGCReqOutput(success=True, message="Scheduler GC frozen and request forwarded to detokenizer")
+        return None
 
 
 class IdleSleeper:

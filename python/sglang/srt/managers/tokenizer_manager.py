@@ -79,7 +79,6 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
-    FreezeGCReqOutput,
     GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -388,9 +387,6 @@ class TokenizerManager:
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.freeze_gc_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -457,10 +453,7 @@ class TokenizerManager:
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
-                (
-                    FreezeGCReqOutput,
-                    self.freeze_gc_communicator.handle_recv,
-                ),
+                (FreezeGCReq, lambda x: None), # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
@@ -1354,11 +1347,9 @@ class TokenizerManager:
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        req = FreezeGCReq()
-        result = (await self.freeze_gc_communicator(req))[0]
-
+        self.send_to_scheduler.send_pyobj(FreezeGCReq())
         freeze_gc("Tokenizer Manager")
-        return result
+        return None
         
 
     def create_abort_task(self, obj: GenerateReqInput):

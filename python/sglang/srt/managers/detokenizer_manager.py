@@ -32,7 +32,6 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
     FreezeGCReq,
-    FreezeGCReqOutput,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
