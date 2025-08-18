@@ -106,6 +106,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_symm_mem",
     "quantization",
     "enable_custom_logit_processor",
+    "enable_dp_attention"
 ]
 
 # Put some global args for easy access
