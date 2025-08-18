@@ -817,7 +817,6 @@ def sample_mmmu_requests(
         import io
 
         import pybase64
-
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
