@@ -85,8 +85,8 @@ if _is_npu:
 class TopKConfig:
     top_k: int
     use_grouped_topk: bool = False
-    topk_group: int = 0
-    num_expert_group: int = 0
+    topk_group: Optional[int] = None
+    num_expert_group: Optional[int] = None
     renormalize: bool = True
     num_fused_shared_experts: int = 0
     custom_routing_function: Optional[Callable] = None
@@ -189,8 +189,8 @@ class TopK(CustomOp):
         top_k: int,
         *,
         use_grouped_topk: bool = False,
-        topk_group: int = 0,
-        num_expert_group: int = 0,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
         renormalize: bool = True,
         num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
