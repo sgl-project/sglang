@@ -259,6 +259,22 @@ class GemmaRMSNorm(CustomOp):
         out = gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
 
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _is_cpu_amx_available:
+            if residual is not None:
+                torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+                return x, residual
+            return torch.ops.sgl_kernel.gemma_rmsnorm_cpu(
+                x, self.weight.data, self.variance_epsilon
+            )
+        return self.forward_native(x, residual)
+
 
 class Gemma3RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
