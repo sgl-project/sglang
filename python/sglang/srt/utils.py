@@ -449,8 +449,10 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
 
 
 def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
-    device = next(module.parameters()).device
+    if (params := next(module.parameters(), None)) is None:
+        return module
 
+    device = params.device
     if device == torch.device("cpu"):
         return module
 
@@ -2343,6 +2345,7 @@ def is_fa3_default_architecture(hf_config):
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
     return architectures[0] in default_archs
@@ -2872,6 +2875,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_proj",
     "up_proj",
     "down_proj",
+    "qkv_proj",
+    "gate_up_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

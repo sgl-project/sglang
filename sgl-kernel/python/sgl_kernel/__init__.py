@@ -31,11 +31,11 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
-from sgl_kernel.fused_moe import fused_marlin_moe
 
 if torch.version.hip is not None:
     from sgl_kernel.elementwise import gelu_quick
 
+from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -92,7 +92,20 @@ from sgl_kernel.sampling import (
     top_p_renorm_prob,
     top_p_sampling_from_probs,
 )
-from sgl_kernel.spatial import create_greenctx_stream_by_value, get_sm_available
+
+
+def create_greenctx_stream_by_value(*args, **kwargs):
+    from sgl_kernel.spatial import create_greenctx_stream_by_value as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def get_sm_available(*args, **kwargs):
+    from sgl_kernel.spatial import get_sm_available as _impl
+
+    return _impl(*args, **kwargs)
+
+
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,
     segment_packbits,
@@ -101,7 +114,3 @@ from sgl_kernel.speculative import (
 )
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__
-
-build_tree_kernel = (
-    None  # TODO(ying): remove this after updating the sglang python code.
-)
