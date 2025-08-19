@@ -2642,12 +2642,14 @@ def start_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs):
                 scheduler.event_loop_pp_disagg_prefill()
             else:
                 scheduler.event_loop_normal_disagg_prefill()
+        scheduler.flush_prefill_resources()
 
     elif disaggregation_mode == DisaggregationMode.DECODE:
         if scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_decode()
         else:
             scheduler.event_loop_normal_disagg_decode()
+        scheduler.flush_decode_resources()
 
 
 def run_scheduler_process(
