@@ -750,7 +750,7 @@ class GroupCoordinator:
                 pynccl_comm is not None and not pynccl_comm.disabled
             ), "pynccl is required for all_gatherv"
 
-            def _all_gather_single(
+            def _all_gather_allocate_output(
                 input_: torch.Tensor, sizes: Optional[List[int]] = None
             ):
                 input_size = input_.size()
@@ -764,19 +764,26 @@ class GroupCoordinator:
                 else:
                     output_size = (input_size[0] * world_size,) + input_size[1:]
                 # Allocate output tensor.
-                output_tensor = torch.empty(
-                    output_size, dtype=input_.dtype, device=input_.device
-                )
-                pynccl_comm.all_gather(output_tensor, input_, sizes=sizes)
-                return output_tensor
+                with self.use_symmetric_memory(self, disabled=sizes is not None) as sm:
+                    output_tensor = torch.empty(
+                        output_size, dtype=input_.dtype, device=input_.device
+                    )
+                    sm.tag(output_tensor)
+                return output_tensor, sizes
 
             if isinstance(input_, torch.Tensor):
-                return _all_gather_single(input_, sizes)
+                input_ = [input_]
 
             output_list = []
-            pynccl_comm.group_start()
+            size_list = []
             for inp in input_:
-                output_list.append(_all_gather_single(inp, sizes=sizes))
+                output_tensor, s = _all_gather_allocate_output(inp, sizes=sizes)
+                output_list.append(output_tensor)
+                size_list.append(s)
+
+            pynccl_comm.group_start()
+            for i, inp in enumerate(input_):
+                pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
             pynccl_comm.group_end()
 
             return output_list
