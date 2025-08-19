@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import torch
-
+from typing import Optional
 
 # https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/modelopt/torch/quantization/qtensor/mxfp4_tensor.py
 class MXFP4QuantizeUtil:
@@ -24,7 +24,7 @@ class MXFP4QuantizeUtil:
     E2M1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
 
     @classmethod
-    def quantize(cls, input: torch.Tensor, block_size: int | None) -> tuple:
+    def quantize(cls, input: torch.Tensor, block_size: Optional[int]) -> tuple:
         """Converting a tensor to a quantized format based on MXFP4 quantization. Only E4M3 is supported.
         Args:
             input (torch.Tensor): The input tensor to be quantized.
