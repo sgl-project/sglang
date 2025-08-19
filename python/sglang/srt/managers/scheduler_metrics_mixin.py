@@ -90,7 +90,7 @@ class SchedulerMetricsMixin:
 
         num_new_seq = len(can_run_list)
         f = (
-            f"Prefill batch. iter: {self.forward_ct}, "
+            f"Prefill batch. iter: {self.forward_ct + 1}, "
             f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
