@@ -73,7 +73,7 @@ def bmm_fp8(
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is None:
-        out = torch.empty(
+        out = torch.zeros(
             (A.shape[0], A.shape[1], B.shape[2]),
             device=A.device,
             dtype=dtype,
@@ -89,7 +89,7 @@ def dsv3_fused_a_gemm(
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if output is None:
-        output = torch.empty(
+        output = torch.zeros(
             (mat_a.shape[0], mat_b.shape[1]),
             device=mat_a.device,
             dtype=mat_a.dtype,
@@ -156,7 +156,7 @@ def cutlass_scaled_fp4_mm(
 ) -> torch.Tensor:
     assert a.ndim == 2 and b.ndim == 2
     m, n = a.shape[0], b.shape[0]
-    out = torch.empty((m, n), dtype=out_dtype, device=a.device)
+    out = torch.zeros((m, n), dtype=out_dtype, device=a.device)
     torch.ops.sgl_kernel.cutlass_scaled_fp4_mm.default(
         out, a, b, block_scale_a, block_scale_b, alpha
     )
@@ -198,14 +198,14 @@ def scaled_fp4_quant(
     ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
 
     # Two fp4 values will be packed into an uint8.
-    output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
+    output = torch.zeros((m, n // 2), device=device, dtype=torch.uint8)
 
     # We use the rounded values to store the swizzled values. Then, the scaling
     # factors in float8_e4m3fn are packed into an int32 for every 4 values.
     rounded_m = ((m + 128 - 1) // 128) * 128
     scale_n = n // block_size
     rounded_n = ((scale_n + 4 - 1) // 4) * 4
-    output_scale = torch.empty(
+    output_scale = torch.zeros(
         (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
     )
 
@@ -227,7 +227,7 @@ def qserve_w4a8_per_chn_gemm(
 ) -> torch.Tensor:
     if out_feats is None:
         # NOTE(HandH1998): qserve_w4a8_per_chn_gemm only supports out dtype=torch.float16 now
-        out_feats = torch.empty(
+        out_feats = torch.zeros(
             (in_feats.shape[0], kernel.shape[0]),
             device=in_feats.device,
             dtype=torch.float16,
@@ -249,7 +249,7 @@ def qserve_w4a8_per_group_gemm(
 ) -> torch.Tensor:
     if out_feats is None:
         # NOTE(HandH1998): qserve_w4a8_per_group_gemm only supports out dtype=torch.float16 now
-        out_feats = torch.empty(
+        out_feats = torch.zeros(
             (in_feats.shape[0], kernel.shape[0]),
             device=in_feats.device,
             dtype=torch.float16,
@@ -265,7 +265,7 @@ def dsv3_router_gemm(
     router_weights: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    output = torch.empty(
+    output = torch.zeros(
         hidden_states.shape[0],
         router_weights.shape[0],
         device=hidden_states.device,
@@ -280,7 +280,7 @@ def dsv3_router_gemm(
 
 
 def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
-    output_tensor = torch.empty(
+    output_tensor = torch.zeros(
         output_tensor_shape,
         device=input_tensor.device,
         dtype=input_tensor.dtype,
@@ -335,10 +335,10 @@ def scaled_fp4_experts_quant(
     padded_k = (scales_k + (4 - 1)) // 4
 
     # output is uint8 and packed fp4 values
-    output = torch.empty(
+    output = torch.zeros(
         m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
     )
-    output_scales = torch.empty(
+    output_scales = torch.zeros(
         MAX_TOKENS_PER_EXPERT * topk,
         padded_k,
         dtype=torch.int32,

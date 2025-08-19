@@ -241,7 +241,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.register_parameter(
             "weight",
             ModelWeightParameter(
-                data=torch.empty(
+                data=torch.zeros(
                     output_size_per_partition,
                     input_size_per_partition,
                     dtype=weight_dtype,
@@ -337,7 +337,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
 
         w13_weight = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 num_experts, 2 * intermediate_size, hidden_size, dtype=weight_dtype
             ),
             input_dim=2,
@@ -347,7 +347,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight", w13_weight)
 
         w2_weight = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 num_experts, hidden_size, intermediate_size, dtype=weight_dtype
             ),
             input_dim=2,
@@ -681,7 +681,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
 
         weight = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 # 2 fp4 data is packed in one uint8 in the input dimension
                 output_size_per_partition,
                 input_size_per_partition // 2,
@@ -694,20 +694,20 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         input_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            data=torch.zeros(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
 
         layer.register_parameter("input_scale", input_scale)
 
         weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            data=torch.zeros(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight_scale_2", weight_scale_2)
 
         weight_scale = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 output_size_per_partition,
                 input_size_per_partition // self.quant_config.group_size,
                 dtype=weight_dtype,
@@ -844,7 +844,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         # GEMM 1
         w13_weight = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 layer.num_local_experts,
                 2 * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
@@ -859,7 +859,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # GEMM 2
         w2_weight = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 layer.num_local_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
@@ -873,7 +873,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
 
         w13_weight_scale = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 layer.num_local_experts,
                 2 * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
@@ -892,7 +892,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         w2_weight_scale = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 layer.num_local_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
@@ -916,13 +916,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         w13_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, 2, dtype=torch.float32),
+            data=torch.zeros(layer.num_local_experts, 2, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            data=torch.zeros(layer.num_local_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -932,13 +932,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, 2, dtype=torch.float32),
+            data=torch.zeros(layer.num_local_experts, 2, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            data=torch.zeros(layer.num_local_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
