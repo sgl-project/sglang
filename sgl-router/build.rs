@@ -1,13 +1,13 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only regenerate if the proto file changes
     println!("cargo:rerun-if-changed=src/proto/sglang_scheduler.proto");
-    
+
     // Configure protobuf compilation with custom settings
     let config = prost_build::Config::new();
-    
+
     // Skip serde for types that use prost_types::Struct
     // These cause conflicts and we don't need serde for all generated types
-    
+
     // Configure tonic-build for gRPC code generation
     tonic_build::configure()
         // Generate both client and server code
@@ -22,8 +22,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["src/proto/sglang_scheduler.proto"],
             &["src/proto"],
         )?;
-    
+
     println!("cargo:warning=Protobuf compilation completed successfully");
-    
+
     Ok(())
 }
