@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.internvl import InternVisionModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.utils import logger
 
@@ -68,6 +69,10 @@ class InternS1ForConditionalGeneration(nn.Module):
             )
         elif config.text_config.architectures[0] == "Qwen3MoeForCausalLM":
             self.language_model = Qwen3MoeForCausalLM(
+                config=config.text_config, quant_config=quant_config
+            )
+        elif config.text_config.architectures[0] == "Qwen3ForCausalLM":
+            self.language_model = Qwen3ForCausalLM(
                 config=config.text_config, quant_config=quant_config
             )
         else:
