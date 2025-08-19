@@ -68,6 +68,8 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
+
         reqs = batch.reqs
         device = batch.device
         temperatures = (
@@ -97,10 +99,11 @@ class SamplingBatchInfo:
                         logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            batch.enable_custom_logit_processor  # check the flag first.
-            and any(r.custom_logit_processor for r in reqs)  # then check the requests.
-        )
+        has_custom_logit_processor = global_server_args_dict[
+            "enable_custom_logit_processor"
+        ] and any(  # check the flag first.
+            r.custom_logit_processor for r in reqs
+        )  # then check the requests.
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
