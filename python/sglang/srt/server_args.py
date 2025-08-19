@@ -487,6 +487,15 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.disable_radix_cache = True
 
+        if (
+            self.attention_backend == "fa4"
+            or self.prefill_attention_backend == "fa4"
+        ):
+            logger.warning(
+                "FA4 only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
+
         # Set page size
         if self.page_size is None:
             self.page_size = 1

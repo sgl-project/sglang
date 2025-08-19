@@ -60,10 +60,13 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
             max_seqlen_q = max_seqlen_k
             cu_seqlens_q = cu_seqlens_k
 
-        page_table = page_table.view(-1)
-        page_table = page_table[page_table > 0]
+        # page_table = page_table.view(-1)
+        # page_table = page_table[page_table > 0]
 
-        self.forward_metadata = ForwardMetaData(cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, page_table=page_table)
+        self.forward_metadata = ForwardMetaData(
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            page_table=page_table)
 
         # # Sliding window
         # if self.sliding_window_size is not None and self.sliding_window_size > 0:
@@ -115,6 +118,7 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
 
         metadata = self.forward_metadata
+        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         k = k_cache[metadata.page_table, :, :, :].reshape(-1, layer.tp_k_head_num, layer.head_dim)
         v = v_cache[metadata.page_table, :, :, :].reshape(-1, layer.tp_v_head_num, layer.head_dim)
 
@@ -124,16 +128,19 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         print(f"{v_cache.shape=}")
         print(f"{k.shape=}")
         print(f"{v.shape=}")
-        print("=" * 120, flush=True)
+        print("-" * 120, flush=True)
 
         out = self.flash_attn_func(
-            q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            k=k,
-            v=v,
+            q=q,
+            k=k_cache,
+            v=v_cache,
             cu_seqlens_q=metadata.cu_seqlens_q,
-            cu_seqlens_k=metadata.cu_seqlens_k,
+            page_table=metadata.page_table,
             causal=True,
         )[0]
+
+        print(f"{out.shape=}")
+        print("=" * 120, flush=True)
 
         return out
 
