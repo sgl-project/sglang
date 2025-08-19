@@ -2472,10 +2472,10 @@ class Scheduler(
                 )
             else:
                 return ConvertDisaggregationRoleReqOutput(
-                success=True,
-                message="this server is idle and can convert disaggregation role.",
+                    success=True,
+                    message="this server is idle and can convert disaggregation role.",
                 )
-        
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # disaggregation
             self.server_args.disaggregation_bootstrap_port = None
@@ -2527,7 +2527,9 @@ class Scheduler(
                 self.server_args.hicache_size = recv_req.hicache_size
                 self.server_args.hicache_write_policy = recv_req.hicache_write_policy
                 self.server_args.hicache_io_backend = recv_req.hicache_io_backend
-                self.enable_hicache_storage = recv_req.hicache_storage_backend is not None
+                self.enable_hicache_storage = (
+                    recv_req.hicache_storage_backend is not None
+                )
                 self.server_args.hicache_storage_backend = (
                     recv_req.hicache_storage_backend
                 )
@@ -2537,7 +2539,7 @@ class Scheduler(
                 self.server_args.hicache_mem_layout = recv_req.hicache_mem_layout
             # cuda graph
             self.server_args.disable_cuda_graph = True
-            
+
             self.server_args.disaggregation_mode = "prefill"
             self.server_args.__post_init__()
             # stop decode event loop
@@ -2558,7 +2560,7 @@ class Scheduler(
             pass
         else:
             return False
-        
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             return (
                 len(self.disagg_prefill_bootstrap_queue.queue) == 0

@@ -1275,7 +1275,7 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         if not self.server_args.enable_pd_convert:
             return False, "PD role conversion is not enabled.", None
-        
+
         if obj.check_idle:
             req = obj
         elif self.disaggregation_mode == DisaggregationMode.DECODE:

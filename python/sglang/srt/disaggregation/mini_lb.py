@@ -450,7 +450,9 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
     async with aiohttp.ClientSession() as session:
         try:
             while max_tries > 0:
-                response = await session.post(f"{server_url}/convert_pd_role",json=dataclasses.asdict(obj))
+                response = await session.post(
+                    f"{server_url}/convert_pd_role", json=dataclasses.asdict(obj)
+                )
                 content = await response.json()
                 if content["success"]:
                     break
@@ -466,13 +468,15 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
                 detail=f"Wait 100s for server: {server_url} to finish all reqs. "
                 f"May be caused by: 1. Server is stuck or shut down, 2. 60s is not enough for server to finish all reqs.",
             )
-    
+
     async with aiohttp.ClientSession() as session:
         response = await session.post(f"{server_url}/flush_cache")
-    
+
     obj.check_idle = False
     async with aiohttp.ClientSession() as session:
-        response = await session.post(f"{server_url}/convert_pd_role",json=dataclasses.asdict(obj))
+        response = await session.post(
+            f"{server_url}/convert_pd_role", json=dataclasses.asdict(obj)
+        )
         content = await response.json()
 
     # wait scheduler event loop ready
