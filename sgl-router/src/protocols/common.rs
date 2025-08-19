@@ -26,6 +26,23 @@ pub enum StringOrArray {
     String(String),
     Array(Vec<String>),
 }
+impl StringOrArray {
+    /// Get the number of items in the StringOrArray
+    pub fn len(&self) -> usize {
+        match self {
+            StringOrArray::String(_) => 1,
+            StringOrArray::Array(arr) => arr.len(),
+        }
+    }
+
+    /// Convert to a vector of strings
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            StringOrArray::String(s) => vec![s.clone()],
+            StringOrArray::Array(arr) => arr.clone(),
+        }
+    }
+}
 
 /// LoRA adapter path - can be single path or batch of paths (SGLang extension)
 #[derive(Debug, Clone, Deserialize, Serialize)]
