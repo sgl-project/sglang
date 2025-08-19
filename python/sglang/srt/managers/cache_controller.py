@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +265,6 @@ class HiCacheController:
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":
-                from sglang.srt.distributed import get_tensor_model_parallel_rank
                 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
                     HiCacheHF3FS,
                 )
@@ -400,7 +400,7 @@ class HiCacheController:
     def backup_skip(self):
         return (
             self.is_mla
-            and torch.cuda.current_device() != 0
+            and get_tensor_model_parallel_rank() != 0
             # todo: only support file and mooncake
             and self.storage_backend_type in ["file", "mooncake"]
         )
