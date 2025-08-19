@@ -223,7 +223,7 @@ class MooncakeStore(HiCacheStorage):
 
     def exists(self, keys) -> bool | dict:
         _keys = []
-        local_rank = torch.cuda.current_device()
+        local_rank = get_tensor_model_parallel_rank()
         for key in keys:
             if key is None:
                 return None
