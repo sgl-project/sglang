@@ -24,8 +24,9 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
+from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
 
