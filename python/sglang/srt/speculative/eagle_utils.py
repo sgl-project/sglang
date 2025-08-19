@@ -163,7 +163,7 @@ class EagleDraftInput:
             paged_kernel_lens_sum = cum_kv_seq_len[-1]
 
         kv_indices = torch.empty(
-            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+            paged_kernel_lens_sum, dtype=torch.int64, device="cuda"
         )
 
         create_flashinfer_kv_indices_triton[(bs,)](
@@ -326,7 +326,7 @@ class EagleVerifyInput:
 
         kv_indices = torch.empty(
             paged_kernel_lens_sum + self.draft_token_num * batch_size,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device="cuda",
         )
         create_flashinfer_kv_indices_triton[(batch_size,)](
