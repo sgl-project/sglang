@@ -783,9 +783,10 @@ impl PDRouter {
                             .await;
 
                         // Record outcomes for circuit breakers
-                        let is_success = response.status().is_success();
-                        prefill.record_outcome(is_success);
-                        decode.record_outcome(is_success);
+                        let _status = response.status();
+                        let not_error = _status.is_success() || _status.is_client_error();
+                        prefill.record_outcome(not_error);
+                        decode.record_outcome(not_error);
 
                         response
                     }
