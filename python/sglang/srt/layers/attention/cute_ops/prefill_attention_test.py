@@ -60,18 +60,23 @@ def _ref_impl(
             kv_start = 0
             kv_final = k.shape[0]
 
-        curr_q = q[qo_start : qo_final, :, :]
-        curr_k = k[kv_start : kv_final, :, :]
-        curr_v = v[kv_start : kv_final, :, :]
+        curr_q = q[qo_start:qo_final, :, :]
+        curr_k = k[kv_start:kv_final, :, :]
+        curr_v = v[kv_start:kv_final, :, :]
 
         qo_len = qo_final - qo_start
         kv_len = kv_final - kv_start
 
-        logits = torch.einsum("qhd,khd->qhk", curr_q, curr_k).to(torch.float32) * softmax_scale
+        logits = (
+            torch.einsum("qhd,khd->qhk", curr_q, curr_k).to(torch.float32)
+            * softmax_scale
+        )
 
         if causal:
             mask = (
-                torch.arange(kv_len - qo_len, kv_len, dtype=torch.int32, device=logits.device)[:, None]
+                torch.arange(
+                    kv_len - qo_len, kv_len, dtype=torch.int32, device=logits.device
+                )[:, None]
                 >= torch.arange(kv_len, dtype=torch.int32, device=logits.device)[
                     None, :
                 ]
@@ -87,7 +92,7 @@ def _ref_impl(
             )
 
         scores = F.softmax(logits, dim=-1).to(curr_v.dtype)
-        out[qo_start : qo_final, :, :] = torch.einsum("qhv,vhd->qhd", scores, curr_v)
+        out[qo_start:qo_final, :, :] = torch.einsum("qhv,vhd->qhd", scores, curr_v)
 
     return out
 
@@ -220,7 +225,12 @@ def test_paged(
 
     page_table = torch.where(
         torch.arange(max_num_pages, dtype=torch.int32, device="cuda")[None, :]
-        < (torch.tensor(list(kv_lens), dtype=torch.int32, device="cuda")[:, None] + page_size - 1) // page_size,
+        < (
+            torch.tensor(list(kv_lens), dtype=torch.int32, device="cuda")[:, None]
+            + page_size
+            - 1
+        )
+        // page_size,
         page_table,
         0,
     )
@@ -237,10 +247,15 @@ def test_paged(
     def _extract_kv(cache: torch.Tensor, should_print: bool = False):
         out = []
         for i, kv_len in enumerate(kv_lens):
-            out.append(cache[page_table[i], :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len])
+            out.append(
+                cache[page_table[i], :, :, :].reshape(-1, num_kv_heads, head_dim)[
+                    :kv_len
+                ]
+            )
             if should_print:
                 print(_red(f"--> DEBUG: {i=} "), page_table[i], flush=True)
         return torch.concat(out, axis=0)
+
     k = _extract_kv(k_cache)
     v = _extract_kv(v_cache)
     ref = _ref_impl(
