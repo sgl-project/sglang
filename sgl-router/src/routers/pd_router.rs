@@ -825,8 +825,8 @@ impl PDRouter {
     ) -> Response {
         // Update load tracking for both workers
         let _guard = WorkerLoadGuard::new_multi(vec![prefill, decode]);
-        let safe_dispatch: bool = env::var("SGL_ROUTER_SAFE_DISPATCH")
-            .is_ok_and(|v| v.parse::<bool>().unwrap_or(false));
+        let safe_dispatch: bool =
+            env::var("SGL_ROUTER_SAFE_DISPATCH").is_ok_and(|v| v.parse::<bool>().unwrap_or(false));
         // Build decode request with shared client
         let decode_request = self.build_post_with_headers(
             &self.client,
