@@ -60,7 +60,6 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.layers.quantization import (
     deep_gemm_wrapper,
     monkey_patch_isinstance_for_vllm_base_layer,
@@ -219,8 +218,6 @@ class ModelRunner:
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
                 "speculative_algorithm": self.spec_algorithm,
-                "moe_a2a_backend": MoeA2ABackend(server_args.moe_a2a_backend),
-                "deepep_mode": DeepEPMode(server_args.deepep_mode),
             }
         )
 
@@ -309,8 +306,13 @@ class ModelRunner:
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
-        assert (not model_has_mtp_layers) or (
-            self.num_effective_layers == model_num_layers
+        assert (
+            (not model_has_mtp_layers)
+            or (self.spec_algorithm.is_none())
+            or (
+                (not self.spec_algorithm.is_none())
+                and (self.num_effective_layers == model_num_layers)
+            )
         ), "PP is not compatible with MTP models."
 
         # Apply torchao quantization
@@ -603,12 +605,8 @@ class ModelRunner:
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(
-                enable_dp_attention=self.server_args.enable_dp_attention,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                dp_size=self.server_args.dp_size,
-                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
-                pp_size=self.server_args.pp_size,
+                server_args=self.server_args,
+                model_config=self.model_config,
             )
 
         min_per_gpu_memory = get_available_gpu_memory(
@@ -1050,8 +1048,6 @@ class ModelRunner:
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
-            # FIXME: pipeline parallelism is not compatible with mla backend
-            assert self.pp_size == 1
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
@@ -1352,11 +1348,6 @@ class ModelRunner:
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
-        max_num_extend_tokens = (
-            self.server_args.chunked_prefill_size
-            if self.server_args.chunked_prefill_size > 0
-            else self.server_args.max_prefill_tokens
-        )
         if self.token_to_kv_pool_allocator is None:
             if self.server_args.attention_backend == "ascend":
                 self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
@@ -1395,7 +1386,6 @@ class ModelRunner:
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
                         need_sort=need_sort,
-                        max_num_extend_tokens=max_num_extend_tokens,
                     )
         else:
             assert self.is_draft_worker
