@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import bisect
 import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -34,7 +33,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
-    enable_num_token_non_padded,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -96,7 +94,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     # cpu torch compile only speeds up decoding by
     # reducing python overhead when bs is small
-    capture_bs = list(range(1, 9)) + list(range(10, 17, 2))
+    capture_bs = list(range(1, 17))
     capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
@@ -446,13 +444,7 @@ class CPUGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
-        cpu_graph_bs = forward_batch.batch_size
-
-        is_bs_supported = (
-            cpu_graph_bs in self.graphs
-            if self.disable_padding
-            else cpu_graph_bs <= self.max_bs
-        )
+        is_bs_supported = forward_batch.batch_size in self.graphs
 
         requested_capture_hidden_mode = max(
             forward_batch.capture_hidden_mode,
@@ -593,78 +585,24 @@ class CPUGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
-    def replay_prepare(
-        self,
-        forward_batch: ForwardBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ):
-        self.recapture_if_needed(forward_batch)
-
-        raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
-
-        # Pad
-        index = bisect.bisect_left(self.capture_bs, raw_bs)
-        bs = self.capture_bs[index]
-        if bs != raw_bs:
-            self.seq_lens.fill_(self.seq_len_fill_value)
-            self.out_cache_loc.zero_()
-
-        # Common inputs
-        self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
-        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
-        self.positions[:raw_num_token].copy_(forward_batch.positions)
-
-        if pp_proxy_tensors:
-            for key in self.pp_proxy_tensors.keys():
-                dim = pp_proxy_tensors[key].shape[0]
-                self.pp_proxy_tensors[key][:dim].copy_(pp_proxy_tensors[key])
-
-        if forward_batch.mrope_positions is not None:
-            self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
-        if enable_num_token_non_padded(self.model_runner.server_args):
-            self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
-        if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
-            forward_batch.spec_info.custom_mask = self.custom_mask
-
-        # Store fields
-        self.raw_bs = raw_bs
-        self.raw_num_token = raw_num_token
-        self.bs = bs
-
+    # TODO add padding support for CPUGraphRunner
     def replay(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if not skip_attn_backend_init:
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
-        else:
-            # In speculative decoding, these two fields are still needed.
-            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.positions[: self.raw_num_token].copy_(forward_batch.positions)
-
+        assert (
+            pp_proxy_tensors is None
+        ), "PPProxyTensors is not supported in CPUGraphRunner yet."
+        self.recapture_if_needed(forward_batch)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        output = self.graphs[self.bs](
+        output = self.graphs[forward_batch.batch_size](
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
         )
-        if isinstance(output, LogitsProcessorOutput):
-            return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_token],
-                hidden_states=(
-                    output.hidden_states[: self.raw_num_token]
-                    if output.hidden_states is not None
-                    else None
-                ),
-            )
-        else:
-            assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+        return output
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
