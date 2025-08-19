@@ -1855,7 +1855,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             is_last_layer=(
                 is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
-            is_nextn=self.is_nextn,
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:

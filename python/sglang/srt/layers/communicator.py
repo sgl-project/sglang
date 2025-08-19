@@ -166,14 +166,12 @@ class LayerCommunicator:
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
-        is_nextn: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
-        self.is_nextn = is_nextn
 
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -274,10 +272,6 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        if self.is_nextn:
-            return False
-
-        # dynamic blockers
         try:
             speculative_algo = global_server_args_dict.get(
                 "speculative_algorithm", None

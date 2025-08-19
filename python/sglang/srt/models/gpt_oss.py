@@ -453,8 +453,9 @@ class GptOssDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
-            is_nextn=self.is_nextn,
+            is_last_layer=(
+                self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+            ),
         )
 
     def forward(
