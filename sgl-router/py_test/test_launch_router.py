@@ -43,14 +43,27 @@ class TestLaunchRouter(unittest.TestCase):
             selector=None,
             service_discovery_port=80,
             service_discovery_namespace=None,
+            dp_aware=False,
             prometheus_port=None,
             prometheus_host=None,
-            # PD-specific attributes
+            request_timeout_secs=60,
+            max_concurrent_requests=64,
+            cors_allowed_origins=[],
             pd_disaggregation=False,
             prefill=None,
             decode=None,
-            # Keep worker_urls for regular mode
             worker_urls=[],
+            retry_max_retries=3,
+            retry_initial_backoff_ms=100,
+            retry_max_backoff_ms=10_000,
+            retry_backoff_multiplier=2.0,
+            retry_jitter_factor=0.1,
+            cb_failure_threshold=5,
+            cb_success_threshold=2,
+            cb_timeout_duration_secs=30,
+            cb_window_duration_secs=60,
+            disable_retries=False,
+            disable_circuit_breaker=False,
         )
 
     def create_router_args(self, **kwargs):
@@ -110,6 +123,52 @@ class TestLaunchRouter(unittest.TestCase):
             service_discovery_namespace="test-namespace",
         )
         self.run_router_process(args)
+
+    def test_launch_router_common_with_dp_aware(self):
+        args = self.create_router_args(
+            worker_urls=["http://localhost:8000"],
+            dp_aware=True,
+        )
+        self.run_router_process(args)
+
+    def test_launch_router_with_empty_worker_urls_with_dp_aware(self):
+        args = self.create_router_args(
+            worker_urls=[],
+            dp_aware=True,
+        )
+        self.run_router_process(args)
+
+    def test_launch_router_common_with_dp_aware_service_discovery(self):
+        # Test launch router with bot srevice_discovery and dp_aware enabled
+        # Should fail since service_discovery and dp_aware is conflict
+        args = self.create_router_args(
+            worker_urls=["http://localhost:8000"],
+            dp_aware=True,
+            service_discovery=True,
+            selector=["app=test-worker"],
+        )
+
+        def run_router():
+            try:
+                from sglang_router.launch_router import launch_router
+
+                router = launch_router(args)
+                if router is None:
+                    return 1
+                return 0
+            except Exception as e:
+                print(e)
+                return 1
+
+        process = multiprocessing.Process(target=run_router)
+        try:
+            process.start()
+            # Wait 3 seconds
+            time.sleep(3)
+            # Should fail since service_discovery and dp_aware is conflict
+            self.assertFalse(process.is_alive())
+        finally:
+            terminate_process(process)
 
     def test_launch_router_pd_mode_basic(self):
         """Test basic PD router functionality without actually starting servers."""
