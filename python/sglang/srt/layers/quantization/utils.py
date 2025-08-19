@@ -146,6 +146,10 @@ def requantize_with_max_scale(
     return max_w_scale, weight
 
 
+def update_tensor_inplace(old: torch.Tensor, new: torch.Tensor) -> None:
+    old.copy_(new)
+
+
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/layer_utils.py
 # Newly generated tensors need to replace existing tensors that are
 # already registered as parameters by vLLM (and won't be freed)
@@ -318,6 +322,30 @@ def pack_cols(
     q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
     q_res = q_res.contiguous()
 
+    return q_res
+
+
+def pack_rows(
+    q_w: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+):
+    assert q_w.shape == (size_k, size_n)
+
+    pack_factor = get_pack_factor(num_bits)
+    assert size_k % pack_factor == 0
+
+    orig_device = q_w.device
+
+    q_w = q_w.cpu().numpy().astype(numpy.uint32)
+
+    q_res = numpy.zeros((size_k // pack_factor, size_n), dtype=numpy.uint32)
+
+    for i in range(pack_factor):
+        q_res |= q_w[i::pack_factor, :] << num_bits * i
+
+    q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
     return q_res
 
 

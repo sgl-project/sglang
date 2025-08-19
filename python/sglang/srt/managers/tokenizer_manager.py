@@ -782,15 +782,17 @@ class TokenizerManager:
                     ):
                         raise ValueError(finish_reason["message"])
 
-                    if (
-                        finish_reason.get("type") == "abort"
-                        and finish_reason.get("status_code")
-                        == HTTPStatus.SERVICE_UNAVAILABLE
+                    if finish_reason.get("type") == "abort" and finish_reason.get(
+                        "status_code"
+                    ) in (
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
                     ):
                         # This is an abort request initiated by scheduler.
                         # Delete the key to prevent resending abort request to the scheduler and
                         # to ensure aborted request state is cleaned up.
-                        del self.rid_to_state[state.obj.rid]
+                        if state.obj.rid in self.rid_to_state:
+                            del self.rid_to_state[state.obj.rid]
 
                         # Mark ongoing LoRA request as finished.
                         if self.server_args.enable_lora and state.obj.lora_path:
@@ -1529,6 +1531,7 @@ class TokenizerManager:
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
+                "weight_version": self.server_args.weight_version,
             }
 
             if getattr(state.obj, "return_logprob", False):
