@@ -462,21 +462,21 @@ class VisionAttention(nn.Module):
         Priority: server args override > constructor arg > platform default.
 
         Platform defaults:
-        - CUDA: "triton"
+        - CUDA: "triton_attn"
         - Non-CUDA: "sdpa"
         """
         override_backend = global_server_args_dict["mm_attention_backend"]
         if override_backend is not None:
-            if override_backend == "fa3" and is_blackwell():
-                raise ValueError(
-                    "flash_attn at sgl-kernel is only supported on sm90 and above"
-                )
-            return override_backend
-        if passed_backend is not None:
-            return passed_backend
-        if is_cuda():
-            return "triton_attn"
-        return "sdpa"
+            backend = override_backend
+        elif passed_backend is not None:
+            backend = passed_backend
+        elif is_cuda():
+            backend = "triton_attn"
+        else:
+            backend = "sdpa"
+        if backend == "fa3" and is_blackwell():
+            raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
+        return backend
 
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
         """apply qk norm for internvl vit attn"""
