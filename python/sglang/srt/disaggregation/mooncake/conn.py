@@ -139,6 +139,26 @@ class KVArgsRegisterInfo:
         )
 
 
+class AuxDataCodec:
+    """Handles serialization and deserialization of auxiliary data buffers"""
+
+    @staticmethod
+    def serialize_data_from_buffer(src_addr, data_length):
+        """Serialize data from memory buffer to bytes"""
+        buffer = (ctypes.c_byte * data_length).from_address(src_addr)
+        return bytes(buffer)
+
+    @staticmethod
+    def deserialize_data_to_buffer(kv_args, buffer_index, aux_index, data):
+        """Deserialize bytes into target memory buffer"""
+        dst_aux_ptr = kv_args.aux_data_ptrs[buffer_index]
+        item_len = kv_args.aux_item_lens[buffer_index]
+        dst_addr = dst_aux_ptr + item_len * aux_index
+        buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
+        buffer[:] = data
+        return
+
+
 class MooncakeKVManager(BaseKVManager):
     def __init__(
         self,
@@ -592,8 +612,7 @@ class MooncakeKVManager(BaseKVManager):
         for i in range(len(prefill_aux_ptrs)):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            buffer = (ctypes.c_byte * length).from_address(src_addr)
-            data = bytes(buffer)
+            data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
 
             self.send_aux_data_to_endpoint(
                 remote=req.endpoint,
@@ -835,18 +854,17 @@ class MooncakeKVManager(BaseKVManager):
                     data = msg[5]
 
                     if len(data) != data_length:
-                        logger.error(f"AUX_DATA length mismatch for room {room}")
+                        logger.error(
+                            f"AUX_DATA length mismatch for bootstrap_room {room}"
+                        )
                         continue
 
-                    dst_aux_ptr = self.kv_args.aux_data_ptrs[buffer_index]
-                    item_len = self.kv_args.aux_item_lens[buffer_index]
-                    dst_addr = dst_aux_ptr + item_len * aux_index
-
-                    buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
-                    buffer[:] = data
+                    AuxDataCodec.deserialize_data_to_buffer(
+                        self.kv_args, buffer_index, aux_index, data
+                    )
 
                     logger.debug(
-                        f"Received AUX_DATA for room {room} with length:{len(data)}"
+                        f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
                     )
                     continue
 
