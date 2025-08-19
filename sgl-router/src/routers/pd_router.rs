@@ -11,8 +11,15 @@ use crate::core::{
     RetryExecutor, Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
 use crate::metrics::RouterMetrics;
-use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
+use crate::protocols::{
+    common::StringOrArray,
+    generate::GenerateRequest,
+    openai::{
+        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        completions::CompletionRequest,
+    },
+};
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -616,7 +623,7 @@ impl PDRouter {
     // Helper to determine batch size from a GenerateRequest
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
         // Check prompt array
-        if let Some(crate::openai_api_types::StringOrArray::Array(arr)) = &req.prompt {
+        if let Some(StringOrArray::Array(arr)) = &req.prompt {
             if !arr.is_empty() {
                 return Some(arr.len());
             }
@@ -645,7 +652,7 @@ impl PDRouter {
     // Helper to determine batch size from a CompletionRequest
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
         // Check prompt array
-        if let crate::openai_api_types::StringOrArray::Array(arr) = &req.prompt {
+        if let StringOrArray::Array(arr) = &req.prompt {
             if !arr.is_empty() {
                 return Some(arr.len());
             }
@@ -1724,10 +1731,8 @@ impl RouterTrait for PDRouter {
                 .as_deref()
                 .or_else(|| {
                     body.prompt.as_ref().and_then(|p| match p {
-                        crate::openai_api_types::StringOrArray::String(s) => Some(s.as_str()),
-                        crate::openai_api_types::StringOrArray::Array(v) => {
-                            v.first().map(|s| s.as_str())
-                        }
+                        StringOrArray::String(s) => Some(s.as_str()),
+                        StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
                     })
                 })
                 .map(|s| s.to_string())
@@ -1763,13 +1768,11 @@ impl RouterTrait for PDRouter {
         // Extract text for cache-aware routing
         let request_text = if self.policies_need_request_text() {
             body.messages.first().and_then(|msg| match msg {
-                crate::openai_api_types::ChatMessage::User { content, .. } => match content {
-                    crate::openai_api_types::UserMessageContent::Text(text) => Some(text.clone()),
-                    crate::openai_api_types::UserMessageContent::Parts(_) => None,
+                ChatMessage::User { content, .. } => match content {
+                    UserMessageContent::Text(text) => Some(text.clone()),
+                    UserMessageContent::Parts(_) => None,
                 },
-                crate::openai_api_types::ChatMessage::System { content, .. } => {
-                    Some(content.clone())
-                }
+                ChatMessage::System { content, .. } => Some(content.clone()),
                 _ => None,
             })
         } else {
@@ -1804,10 +1807,8 @@ impl RouterTrait for PDRouter {
         // Extract text for cache-aware routing
         let request_text = if self.policies_need_request_text() {
             match &body.prompt {
-                crate::openai_api_types::StringOrArray::String(s) => Some(s.clone()),
-                crate::openai_api_types::StringOrArray::Array(v) => {
-                    v.first().map(|s| s.to_string())
-                }
+                StringOrArray::String(s) => Some(s.clone()),
+                StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
             }
         } else {
             None
