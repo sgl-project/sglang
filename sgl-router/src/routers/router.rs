@@ -12,7 +12,9 @@ use crate::policies::LoadBalancingPolicy;
 use crate::protocols::{
     common::GenerationRequest,
     generate::GenerateRequest,
-    openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
+    openai::{
+        chat::ChatCompletionRequest, completions::CompletionRequest,
+    },
 };
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::{
@@ -1167,6 +1169,7 @@ impl RouterTrait for Router {
         self.route_typed_request(headers, body, "/v1/completions")
             .await
     }
+
 
     async fn flush_cache(&self) -> Response {
         // Get all worker URLs
