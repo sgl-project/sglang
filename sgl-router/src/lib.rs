@@ -13,6 +13,8 @@ pub mod server;
 pub mod service_discovery;
 pub mod tokenizer;
 pub mod tree;
+#[cfg(feature = "grpc-client")]
+pub mod grpc;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
