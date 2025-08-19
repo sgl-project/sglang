@@ -31,7 +31,7 @@ runtime_common = [
     "msgspec",
     "ninja",
     "openai==1.99.1",
-    "openai-harmony==0.0.3",
+    "openai-harmony==0.0.4",
     "orjson",
     "outlines==0.1.11",
     "packaging",
@@ -39,9 +39,9 @@ runtime_common = [
     "pillow",
     "prometheus-client>=0.20.0",
     "psutil",
+    "pybase64",
     "pydantic",
     "pynvml",
-    "pybase64",
     "python-multipart",
     "pyzmq>=25.1.2",
     "sentencepiece",
@@ -53,7 +53,7 @@ runtime_common = [
     "transformers==4.55.2",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.22",
+    "xgrammar==0.1.23",
 ]
 
 srt = [

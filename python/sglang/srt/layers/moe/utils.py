@@ -7,6 +7,11 @@ from typing import TYPE_CHECKING, Optional
 
 from packaging import version as pkg_version
 
+from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_dp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.utils import logger
 
 if TYPE_CHECKING:
@@ -99,6 +104,7 @@ DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
+DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -108,6 +114,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
+    global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -115,6 +122,9 @@ def initialize_moe_config(server_args: ServerArgs):
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
+    DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
+        server_args.disable_flashinfer_cutlass_moe_fp4_allgather
+    )
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -175,3 +185,16 @@ def should_use_flashinfer_trtllm_moe():
         >= pkg_version.parse("0.2.9rc1")
     )
     return result
+
+
+@lru_cache(maxsize=1)
+def should_use_flashinfer_cutlass_moe_fp4_allgather():
+    """
+    Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
+    """
+    return (
+        not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+        and get_moe_runner_backend().is_flashinfer_cutlass()
+        and is_dp_attention_enabled()
+        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+    )
