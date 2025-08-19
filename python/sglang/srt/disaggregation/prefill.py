@@ -683,7 +683,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         ENABLE_RELEASE = True  # For debug
 
-        while not self.stop_prefill_event.is_set():
+        while True:
             server_is_idle = True
 
             for mb_id in range(self.pp_size):

@@ -2085,6 +2085,9 @@ class ServerArgs:
         ) or self.disaggregation_mode == "null", (
             "enable_pd_convert should be set only when disaggregation_mode is not null"
         )
+        assert (
+            self.enable_pd_convert and self.pp_size == 1
+        ), "Pipeline parallelism is not supported in enable_pd_convert mode"
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
