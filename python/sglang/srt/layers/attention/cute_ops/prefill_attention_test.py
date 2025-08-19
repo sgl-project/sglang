@@ -47,15 +47,15 @@ def _ref_impl(
 
     for i in range(num_seqs):
         if cu_seqlens_q is not None:
-            qo_start = cu_seqlens_q[i]
-            qo_final = cu_seqlens_q[i + 1]
+            qo_start = cu_seqlens_q[i].item()
+            qo_final = cu_seqlens_q[i + 1].item()
         else:
             qo_start = 0
             qo_final = q.shape[0]
 
         if cu_seqlens_k is not None:
-            kv_start = cu_seqlens_k[i]
-            kv_final = cu_seqlens_k[i + 1]
+            kv_start = cu_seqlens_k[i].item()
+            kv_final = cu_seqlens_k[i + 1].item()
         else:
             kv_start = 0
             kv_final = k.shape[0]
@@ -71,11 +71,14 @@ def _ref_impl(
 
         if causal:
             mask = (
-                torch.arange(qo_len, dtype=torch.int32, device=logits.device)[:, None]
+                torch.arange(kv_len - qo_len, kv_len, dtype=torch.int32, device=logits.device)[:, None]
                 >= torch.arange(kv_len, dtype=torch.int32, device=logits.device)[
                     None, :
                 ]
             )
+
+            # TODO(hieu): continue here. why is the result wrong whenever qo_len, kv_len are not all the same number??
+            # print(_green("--> DEBUG:"), f"{i=} {kv_start=:<4d} {kv_final=} {qo_len=} {kv_len=} {curr_q.shape=} {curr_k.shape=} {mask[:, None, :].shape=} {logits.shape=} {cu_seqlens_k=}")
 
             logits = torch.where(
                 mask[:, None, :],
@@ -217,7 +220,7 @@ def test_paged(
 
     page_table = torch.where(
         torch.arange(max_num_pages, dtype=torch.int32, device="cuda")[None, :]
-        < torch.tensor(list(kv_lens), dtype=torch.int32, device="cuda")[:, None],
+        < (torch.tensor(list(kv_lens), dtype=torch.int32, device="cuda")[:, None] + page_size - 1) // page_size,
         page_table,
         0,
     )
@@ -227,14 +230,19 @@ def test_paged(
         k=k_cache,
         v=v_cache,
         cu_seqlens_q=cu_seqlens_q,
+        seqused_k=torch.tensor(list(seqlens_k), dtype=torch.int32, device="cuda"),
         page_table=page_table,
     )[0]
 
-    page_table = page_table.reshape(-1)
-    page_table = page_table[page_table > 0]
-    k = k_cache[page_table, :, :, :].reshape(-1, num_kv_heads, head_dim)
-    v = v_cache[page_table, :, :, :].reshape(-1, num_kv_heads, head_dim)
-
+    def _extract_kv(cache: torch.Tensor, should_print: bool = False):
+        out = []
+        for i, kv_len in enumerate(kv_lens):
+            out.append(cache[page_table[i], :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len])
+            if should_print:
+                print(_red(f"--> DEBUG: {i=} "), page_table[i], flush=True)
+        return torch.concat(out, axis=0)
+    k = _extract_kv(k_cache)
+    v = _extract_kv(v_cache)
     ref = _ref_impl(
         q=q,
         k=k,
@@ -243,9 +251,18 @@ def test_paged(
         cu_seqlens_k=cu_seqlens_k,
         softmax_scale=softmax_scale,
     )
-    max_diff = (out - ref).abs_().max().item()
-    print(_yellow("max_diff: "), f"{max_diff:<.5f}", flush=True)
-    assert max_diff <= 0.02
+
+    out = torch.split(out, list(qo_lens), dim=0)
+    ref = torch.split(ref, list(qo_lens), dim=0)
+
+    okay = True
+    for i in range(len(qo_lens)):
+        max_diff = (out[i] - ref[i]).abs_().max().item()
+        print(_yellow(f"max_diff_{i}: "), f"{max_diff:<.5f}", flush=True)
+        if max_diff > 0.02:
+            okay = False
+
+    assert okay
 
 
 if __name__ == "__main__":
@@ -268,10 +285,21 @@ if __name__ == "__main__":
     # )
 
     test_paged(
-        qo_lens=(128,),
-        kv_lens=(128,),
+        qo_lens=(8,),
+        kv_lens=(11,),
         num_qo_heads=2,
         num_kv_heads=2,
+        num_pages=32,
+        page_size=128,
+        head_dim=128,
+        softmax_scale=None,
+    )
+
+    test_paged(
+        qo_lens=(21, 12, 11, 19),
+        kv_lens=(33, 71, 18, 31),
+        num_qo_heads=4,
+        num_kv_heads=4,
         num_pages=32,
         page_size=128,
         head_dim=128,

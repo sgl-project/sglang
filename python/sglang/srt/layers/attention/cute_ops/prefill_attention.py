@@ -251,13 +251,13 @@ def flash_attn_varlen_func(
     ), "window_size is not supported."
 
     out, lse = _flash_attn_fwd(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
         page_table=page_table,
         softmax_scale=softmax_scale,
         causal=causal,
