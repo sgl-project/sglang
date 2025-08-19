@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 #pragma once
-#if defined(__HIP_PLATFORM_AMD__)
+#ifdef USE_ROCM
 #include <hip/hip_fp16.h>
 #else
 #include <cuda_bf16.h>
