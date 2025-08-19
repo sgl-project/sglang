@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
+    triton_scaled_mm,
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
@@ -112,6 +113,7 @@ def normalize_e4m3fn_to_e4m3fnuz(
     return weight, weight_scale, input_scale
 
 
+# TODO(ch-wan): define these backends in --moe-runner-backend
 def cutlass_block_fp8_supported() -> bool:
     if not get_bool_env_var("SGLANG_SUPPORT_CUTLASS_BLOCK_FP8"):
         return False
@@ -161,16 +163,16 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=False
+        input_2d, block_size[1], column_major_scales=True
     )
-
+    # TRTLLM requires column-major scaling factors
     output = gemm_fp8_nt_groupwise(
         q_input,
         weight,
         x_scale,
         weight_scale,
-        scale_major_mode="K",
         out_dtype=input_2d.dtype,
+        backend="trtllm",
     )
 
     if bias is not None:
@@ -586,14 +588,25 @@ def apply_fp8_linear(
                 assert (
                     weight_scale.numel() == weight.shape[1]
                 ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
-                output = fp8_scaled_mm(
-                    qinput,
-                    weight,
-                    x_scale,
-                    weight_scale,
-                    out_dtype=input.dtype,
-                    bias=bias,
+
+                cutlass_compatible_b = (
+                    weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
                 )
+                if not cutlass_compatible_b:
+                    # Massage the input to be 2D
+                    qinput = qinput.view(-1, qinput.shape[-1])
+                    output = triton_scaled_mm(
+                        qinput, weight, x_scale, weight_scale, input.dtype, bias
+                    )
+                else:
+                    output = fp8_scaled_mm(
+                        qinput,
+                        weight,
+                        x_scale,
+                        weight_scale,
+                        out_dtype=input.dtype,
+                        bias=bias,
+                    )
             return output.view(*output_shape)
 
         # torch.scaled_mm supports per tensor weights + activations only
@@ -776,3 +789,12 @@ def apply_fp8_linear(
                 bias,
                 input.dtype,
             )
+
+
+def can_auto_enable_marlin_fp8() -> bool:
+    try:
+        major, minor = get_device_capability()
+        sm = major * 10 + minor
+        return 80 <= sm < 89
+    except Exception:
+        return False
