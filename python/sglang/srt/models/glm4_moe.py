@@ -24,6 +24,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -719,6 +720,9 @@ class Glm4MoeModel(DeepseekV2Model):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
+        self.pp_group = get_pp_group()
+        self.start_layer = 0
+        self.end_layer = config.num_hidden_layers
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
@@ -735,6 +739,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("Glm4MoeForCausalLM")
         self.model = Glm4MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)

@@ -85,8 +85,8 @@ if _is_npu:
 class TopKConfig:
     top_k: int
     use_grouped_topk: bool = False
-    topk_group: int = 0
-    num_expert_group: int = 0
+    topk_group: Optional[int] = None
+    num_expert_group: Optional[int] = None
     renormalize: bool = True
     num_fused_shared_experts: int = 0
     custom_routing_function: Optional[Callable] = None
@@ -189,8 +189,8 @@ class TopK(CustomOp):
         top_k: int,
         *,
         use_grouped_topk: bool = False,
-        topk_group: int = 0,
-        num_expert_group: int = 0,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
         renormalize: bool = True,
         num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
@@ -327,6 +327,13 @@ class TopK(CustomOp):
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
 
+    def empty_topk_output(self, device: torch.device) -> TopKOutput:
+        topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
+        topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
+        topk_idx = torch.full((0, topk), -1, dtype=torch.int32, device=device)
+        router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
+        return StandardTopKOutput(topk_weights, topk_idx, router_logits)
+
 
 # ------------------------------- TopK implementation -------------------------------------
 
@@ -420,8 +427,8 @@ def grouped_topk_gpu(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    num_expert_group: int = 0,
-    topk_group: int = 0,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -485,8 +492,8 @@ def grouped_topk_cpu(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    num_expert_group: int = 0,
-    topk_group: int = 0,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -515,8 +522,8 @@ def biased_grouped_topk_impl(
     correction_bias: torch.Tensor,
     topk: int,
     renormalize: bool,
-    num_expert_group: int = 0,
-    topk_group: int = 0,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -608,8 +615,8 @@ def biased_grouped_topk_gpu(
     correction_bias: torch.Tensor,
     topk: int,
     renormalize: bool,
-    num_expert_group: int = 0,
-    topk_group: int = 0,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -683,8 +690,8 @@ def biased_grouped_topk_cpu(
     correction_bias: torch.Tensor,
     topk: int,
     renormalize: bool,
-    num_expert_group: int = 0,
-    topk_group: int = 0,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
     compiled: bool = True,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
