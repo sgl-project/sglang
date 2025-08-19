@@ -272,19 +272,14 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        try:
-            speculative_algo = global_server_args_dict.get(
-                "speculative_algorithm", None
-            )
-            if (
-                is_dp_attention_enabled()
-                and speculative_algo is not None
-                and hasattr(speculative_algo, "is_eagle")
-                and speculative_algo.is_eagle()
-            ):
-                return False
-        except Exception:
-            pass
+        speculative_algo = global_server_args_dict.get("speculative_algorithm", None)
+        if (
+            is_dp_attention_enabled()
+            and speculative_algo is not None
+            and hasattr(speculative_algo, "is_eagle")
+            and speculative_algo.is_eagle()
+        ):
+            return False
 
         batch_size = (
             forward_batch.input_ids.shape[0]
