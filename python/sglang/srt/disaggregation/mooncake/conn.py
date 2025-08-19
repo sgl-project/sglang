@@ -160,6 +160,8 @@ class AuxDataCodec:
 
 
 class MooncakeKVManager(BaseKVManager):
+    AUX_DATA_HEADER = b"AUX_DATA"
+
     def __init__(
         self,
         args: KVArgs,
@@ -640,7 +642,7 @@ class MooncakeKVManager(BaseKVManager):
 
         socket.send_multipart(
             [
-                b"AUX_DATA",
+                MooncakeKVManager.AUX_DATA_HEADER,
                 str(room).encode("ascii"),
                 str(buffer_index).encode("ascii"),
                 str(aux_index).encode("ascii"),
@@ -839,6 +841,26 @@ class MooncakeKVManager(BaseKVManager):
 
         threading.Thread(target=bootstrap_thread).start()
 
+    def _handle_aux_data(self, msg: List[bytes]):
+        """Handle AUX_DATA messages received by the decode thread."""
+        room = int(msg[1].decode("ascii"))
+        buffer_index = int(msg[2].decode("ascii"))
+        aux_index = int(msg[3].decode("ascii"))
+        data_length = struct.unpack(">I", msg[4])[0]
+        data = msg[5]
+
+        if len(data) != data_length:
+            logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
+            return
+
+        AuxDataCodec.deserialize_data_to_buffer(
+            self.kv_args, buffer_index, aux_index, data
+        )
+
+        logger.debug(
+            f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
+        )
+
     def start_decode_thread(self):
         self.rank_port = get_free_port()
         self._bind_server_socket()
@@ -846,26 +868,8 @@ class MooncakeKVManager(BaseKVManager):
         def decode_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
-                if msg[0] == b"AUX_DATA":
-                    room = int(msg[1].decode("ascii"))
-                    buffer_index = int(msg[2].decode("ascii"))
-                    aux_index = int(msg[3].decode("ascii"))
-                    data_length = struct.unpack(">I", msg[4])[0]
-                    data = msg[5]
-
-                    if len(data) != data_length:
-                        logger.error(
-                            f"AUX_DATA length mismatch for bootstrap_room {room}"
-                        )
-                        continue
-
-                    AuxDataCodec.deserialize_data_to_buffer(
-                        self.kv_args, buffer_index, aux_index, data
-                    )
-
-                    logger.debug(
-                        f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
-                    )
+                if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
+                    self._handle_aux_data(msg)
                     continue
 
                 (bootstrap_room, status, prefill_rank) = msg
