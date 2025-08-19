@@ -230,7 +230,8 @@ def rocm_aiter_fused_experts(
             activation_method=activation_method,
         )
     else:
-        # TODO (Hubert): This should not be called for now...
+        # TODO: replace this with "rocm_aiter_fused_experts" for ROCm
+        assert False, "This should not be called for now..."
         quant_method = QuantMethod.NO.value
 
         # w8a8 block-scaled

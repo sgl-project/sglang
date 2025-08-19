@@ -1154,7 +1154,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."
-            # TODO (Hubert): replace this with "rocm_aiter_fused_experts"
+            # TODO: replace this with "rocm_aiter_fused_experts" for ROCm
             return fused_moe(
                 x,
                 layer.w13_weight,
@@ -1172,7 +1172,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if _use_aiter:
             assert not no_combine, f"{no_combine=} is not supported."
             if self.block_quant:
-                # TODO (Hubert): replace this with "rocm_aiter_fused_experts"
+                # TODO: replace this with "rocm_aiter_fused_experts" for ROCm
                 return fused_moe(
                     x,
                     layer.w13_weight,
@@ -1190,7 +1190,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     expert_mask=None,
                 )
             else:
-                # TODO (Hubert): replace this with "rocm_aiter_fused_experts"
+                # TODO: replace this with "rocm_aiter_fused_experts" for ROCm
                 return fused_moe(
                     x,
                     layer.w13_weight,

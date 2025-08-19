@@ -510,7 +510,7 @@ class DeepEPMoE(EPMoE):
         topk_idx_copy = topk_idx.to(torch.int32)
         topk_idx_copy[topk_idx_copy == -1] = self.num_local_experts
 
-        # TODO (Hubert): replace this with "rocm_aiter_fused_experts"
+        # TODO: replace this with "rocm_aiter_fused_experts" for ROCm
         return fused_moe(
             hidden_states,
             self.w13_weight,
