@@ -412,11 +412,30 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        from numa import memory as numa_memory
-        if gpu_id in numa_memory.get_allocation_allowed_nodes():
-            _, free_gpu_memory = numa_memory.node_memory_info(gpu_id)
-        else:
+        if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
+            logger.warning(
+                f"With SGLANG_CPU_OMP_THREADS_BIND set, the available memory amounts of the ranks cannot be determined in prior. "
+                f"Please set proper `--mem-fraction-static` or `--max-total-tokens` to eliminate the out-of-memory risk."
+            )
             free_gpu_memory = psutil.virtual_memory().available
+        else:
+            libnuma = ctypes.CDLL(
+                "libnuma" + (
+                    ".dylib" if platform.system() == "Darwin" else ".so"
+                ), use_errno=True
+            )
+            libnuma.numa_max_node.restype = ctypes.c_int
+            libnuma.numa_node_size64.argtypes = [
+                ctypes.c_int, ctypes.POINTER(ctypes.c_longlong)
+            ]
+            libnuma.numa_node_size64.restype = ctypes.c_longlong
+            if gpu_id < 0 or gpu_id > libnuma.numa_max_node():
+                free_gpu_memory = psutil.virtual_memory().available
+            else:
+                free_size = ctypes.c_longlong()
+                libnuma.numa_node_size64(gpu_id, ctypes.byref(free_size))
+                free_gpu_memory = free_size.value
+
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus

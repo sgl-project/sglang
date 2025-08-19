@@ -163,7 +163,7 @@ python -m sglang.bench_serving -h
 ```
 
 Additionally, the requests can be formed with
-[OpenAI Completions API](https://docs.sglang.ai/backend/openai_api_completions.html)
+[OpenAI Completions API](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
 and sent via the command line (e.g. using `curl`) or via your own script.
 
 ## Example: Running DeepSeek-R1
@@ -179,7 +179,7 @@ python -m sglang.launch_server                 \
     --quantization w8a8_int8                   \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 65536                    \
+    --max-total-token 524288                   \
     --tp 6
 ```
 
@@ -193,7 +193,7 @@ python -m sglang.launch_server                 \
     --device cpu                               \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 65536                    \
+    --max-total-token 524288                   \
     --tp 6
 ```
 
