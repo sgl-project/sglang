@@ -1,9 +1,11 @@
-use super::traits;
+use super::{traits, TokenizerTrait};
+use crate::metrics::TokenizerMetrics;
 use anyhow::{Error, Result};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[cfg(feature = "huggingface")]
 use super::huggingface::HuggingFaceTokenizer;
@@ -22,6 +24,8 @@ pub enum TokenizerType {
 /// - json: HuggingFace tokenizer
 /// - For testing: can return mock tokenizer
 pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
+    let start_time = Instant::now();
+
     // Special case for testing
     if file_path == "mock" || file_path == "test" {
         return Ok(Arc::new(super::mock::MockTokenizer::new()));
@@ -31,6 +35,7 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tok
 
     // Check if file exists
     if !path.exists() {
+        TokenizerMetrics::record_factory_error("file_not_found");
         return Err(Error::msg(format!("File not found: {}", file_path)));
     }
 
@@ -40,15 +45,20 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tok
         .and_then(std::ffi::OsStr::to_str)
         .map(|s| s.to_lowercase());
 
-    match extension.as_deref() {
+    let result = match extension.as_deref() {
         Some("json") => {
             #[cfg(feature = "huggingface")]
             {
                 let tokenizer = HuggingFaceTokenizer::from_file(file_path)?;
-                Ok(Arc::new(tokenizer))
+
+                TokenizerMetrics::record_factory_load("json");
+                TokenizerMetrics::set_vocab_size("huggingface", tokenizer.vocab_size());
+
+                Ok(Arc::new(tokenizer) as Arc<dyn traits::Tokenizer>)
             }
             #[cfg(not(feature = "huggingface"))]
             {
+                TokenizerMetrics::record_factory_error("huggingface_disabled");
                 Err(Error::msg(
                     "HuggingFace support not enabled. Enable the 'huggingface' feature.",
                 ))
@@ -56,17 +66,27 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tok
         }
         Some("model") => {
             // SentencePiece model file
+            TokenizerMetrics::record_factory_error("unsupported_sentencepiece");
             Err(Error::msg("SentencePiece models not yet supported"))
         }
         Some("gguf") => {
             // GGUF format
+            TokenizerMetrics::record_factory_error("unsupported_gguf");
             Err(Error::msg("GGUF format not yet supported"))
         }
         _ => {
             // Try to auto-detect by reading file content
-            auto_detect_tokenizer(file_path)
+            auto_detect_tokenizer(file_path).inspect(|tokenizer| {
+                TokenizerMetrics::record_factory_load("auto_detected");
+                TokenizerMetrics::set_vocab_size("auto_detected", tokenizer.vocab_size());
+            })
         }
+    };
+
+    if result.is_ok() {
+        TokenizerMetrics::record_factory_load_duration(start_time.elapsed());
     }
+    result
 }
 
 /// Auto-detect tokenizer type by examining file content
