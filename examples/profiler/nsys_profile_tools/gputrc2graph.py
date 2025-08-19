@@ -211,8 +211,8 @@ class GPUTrace2Graph:
         if not file_dir:
             file_dir = "."
         # Walk through trace and get the total non-overlapped time
-        nsys_stats_file = f"{file_dir}/{file_name}_cuda_gpu_trace.csv"
-        sum_file = f"{file_dir}/{file_name}_cuda_gpu_kernel_tracesum.csv"
+        nsys_stats_file = os.path.join(file_dir, f"{file_name}_cuda_gpu_trace.csv")
+        sum_file = os.path.join(file_dir, f"{file_name}_cuda_gpu_kernel_tracesum.csv")
         if self.should_gen_file(nsys_stats_file, file):
             cmd = [
                 nsys_cmd,
@@ -233,9 +233,11 @@ class GPUTrace2Graph:
                 file_size_mb / 240,
             )
             try:
-                subprocess.run(cmd)
-            except Exception:
-                logger.error("%s failed; Use --nsys_cmd to specify nsys path", cmd_str)
+                subprocess.run(cmd, check=True)
+            except (FileNotFoundError, subprocess.CalledProcessError) as e:
+                logger.error(
+                    "'%s' failed: %s. Use --nsys_cmd to specify nsys path", cmd_str, e
+                )
                 exit(1)
             logger.info("generating non-overalapped sum %s", sum_file)
             self.gen_nonoverlapped_sum_from_gputrace(nsys_stats_file, sum_file)
