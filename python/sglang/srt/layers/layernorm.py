@@ -52,7 +52,7 @@ elif _is_hip:
 
 logger = logging.getLogger(__name__)
 
-if is_npu():
+if _is_npu:
     import torch_npu
 
 
@@ -283,8 +283,6 @@ class Gemma3RMSNorm(CustomOp):
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
         # Re-dispatch
-        if not _is_npu:
-            self._forward_method = self.forward_native
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -295,6 +293,9 @@ class Gemma3RMSNorm(CustomOp):
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
+
+    def forward_cuda(slef, x):
+        return self.forward_native(x)
 
     def forward_npu(self, x):
         output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
