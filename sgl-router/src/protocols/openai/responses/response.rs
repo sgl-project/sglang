@@ -95,7 +95,7 @@ impl ResponsesResponse {
             output,
             status,
             usage,
-            parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+            parallel_tool_calls: request.parallel_tool_calls,
             tool_choice: match request.tool_choice {
                 ToolChoice::Auto => "auto".to_string(),
                 ToolChoice::Required => "required".to_string(),

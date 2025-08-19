@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseTool {
     #[serde(rename = "type")]
-    pub tool_type: ResponseToolType,
+    pub r#type: ResponseToolType,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -23,11 +23,11 @@ pub enum ResponseToolType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseReasoningParam {
     #[serde(default = "default_reasoning_effort")]
-    pub effort: ReasoningEffort,
+    pub effort: Option<ReasoningEffort>,
 }
 
-fn default_reasoning_effort() -> ReasoningEffort {
-    ReasoningEffort::Medium
+fn default_reasoning_effort() -> Option<ReasoningEffort> {
+    Some(ReasoningEffort::Medium)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

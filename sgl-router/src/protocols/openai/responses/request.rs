@@ -1,7 +1,6 @@
 // Responses API request types
 
 use crate::protocols::common::{GenerationRequest, StringOrArray};
-use crate::protocols::openai::common::StreamOptions;
 use crate::protocols::openai::responses::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,8 +44,8 @@ pub struct ResponsesRequest {
     pub model: Option<String>,
 
     /// Whether to enable parallel tool calls
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parallel_tool_calls: Option<bool>,
+    #[serde(default = "default_true")]
+    pub parallel_tool_calls: bool,
 
     /// ID of previous response to continue from
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,8 +60,8 @@ pub struct ResponsesRequest {
     pub service_tier: ServiceTier,
 
     /// Whether to store the response
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub store: Option<bool>,
+    #[serde(default = "default_true")]
+    pub store: bool,
 
     /// Whether to stream the response
     #[serde(default)]
@@ -81,8 +80,8 @@ pub struct ResponsesRequest {
     pub tools: Vec<ResponseTool>,
 
     /// Number of top logprobs to return
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_logprobs: Option<u32>,
+    #[serde(default)]
+    pub top_logprobs: u32,
 
     /// Top-p sampling parameter
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,10 +127,6 @@ pub struct ResponsesRequest {
     /// Repetition penalty
     #[serde(default = "default_repetition_penalty")]
     pub repetition_penalty: f32,
-
-    /// Options for streaming response
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream_options: Option<StreamOptions>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -147,6 +142,10 @@ fn default_top_k() -> i32 {
 
 fn default_repetition_penalty() -> f32 {
     1.0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ResponsesRequest {

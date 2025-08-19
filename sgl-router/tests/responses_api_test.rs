@@ -15,20 +15,20 @@ fn test_responses_request_creation() {
         max_tool_calls: None,
         metadata: None,
         model: Some("test-model".to_string()),
-        parallel_tool_calls: Some(true),
+        parallel_tool_calls: true,
         previous_response_id: None,
         reasoning: Some(ResponseReasoningParam {
-            effort: ReasoningEffort::Medium,
+            effort: Some(ReasoningEffort::Medium),
         }),
         service_tier: ServiceTier::Auto,
-        store: Some(true),
+        store: true,
         stream: false,
         temperature: Some(0.7),
         tool_choice: ToolChoice::Auto,
         tools: vec![ResponseTool {
-            tool_type: ResponseToolType::WebSearchPreview,
+            r#type: ResponseToolType::WebSearchPreview,
         }],
-        top_logprobs: Some(5),
+        top_logprobs: 5,
         top_p: Some(0.9),
         truncation: Truncation::Disabled,
         user: Some("test-user".to_string()),
@@ -40,7 +40,6 @@ fn test_responses_request_creation() {
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
-        stream_options: None,
     };
 
     // Test GenerationRequest trait implementation
@@ -61,16 +60,16 @@ fn test_sampling_params_conversion() {
         max_tool_calls: None,
         metadata: None,
         model: Some("test-model".to_string()),
-        parallel_tool_calls: None,
+        parallel_tool_calls: true, // Use default true
         previous_response_id: None,
         reasoning: None,
         service_tier: ServiceTier::Auto,
-        store: None,
+        store: true, // Use default true
         stream: false,
         temperature: Some(0.8),
         tool_choice: ToolChoice::Auto,
         tools: vec![],
-        top_logprobs: None,
+        top_logprobs: 0, // Use default 0
         top_p: Some(0.95),
         truncation: Truncation::Auto,
         user: None,
@@ -82,7 +81,6 @@ fn test_sampling_params_conversion() {
         top_k: 10,
         min_p: 0.05,
         repetition_penalty: 1.1,
-        stream_options: None,
     };
 
     let params = request.to_sampling_params(1000, None);
@@ -162,14 +160,14 @@ fn test_usage_conversion() {
 #[test]
 fn test_reasoning_param_default() {
     let param = ResponseReasoningParam {
-        effort: ReasoningEffort::Medium,
+        effort: Some(ReasoningEffort::Medium),
     };
 
     // Test JSON serialization/deserialization preserves default
     let json = serde_json::to_string(&param).unwrap();
     let parsed: ResponseReasoningParam = serde_json::from_str(&json).unwrap();
 
-    assert!(matches!(parsed.effort, ReasoningEffort::Medium));
+    assert!(matches!(parsed.effort, Some(ReasoningEffort::Medium)));
 }
 
 #[test]
@@ -183,20 +181,20 @@ fn test_json_serialization() {
         max_tool_calls: Some(5),
         metadata: None,
         model: Some("gpt-4".to_string()),
-        parallel_tool_calls: Some(false),
+        parallel_tool_calls: false,
         previous_response_id: None,
         reasoning: Some(ResponseReasoningParam {
-            effort: ReasoningEffort::High,
+            effort: Some(ReasoningEffort::High),
         }),
         service_tier: ServiceTier::Priority,
-        store: Some(false),
+        store: false,
         stream: true,
         temperature: Some(0.9),
         tool_choice: ToolChoice::Required,
         tools: vec![ResponseTool {
-            tool_type: ResponseToolType::CodeInterpreter,
+            r#type: ResponseToolType::CodeInterpreter,
         }],
-        top_logprobs: Some(10),
+        top_logprobs: 10,
         top_p: Some(0.8),
         truncation: Truncation::Auto,
         user: Some("test_user".to_string()),
@@ -208,7 +206,6 @@ fn test_json_serialization() {
         top_k: 50,
         min_p: 0.1,
         repetition_penalty: 1.2,
-        stream_options: None,
     };
 
     // Test that everything can be serialized to JSON and back
