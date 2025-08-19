@@ -35,8 +35,9 @@ pub mod constants {
         /// Top-k minimum value: -1 to disable, otherwise positive
         pub const TOP_K_MIN: i32 = -1;
 
-        /// Repetition penalty minimum: must be positive
-        pub const REPETITION_PENALTY_MIN: f32 = 0.0;
+        /// Repetition penalty range: 0.0 to 2.0 (SGLang extension)
+        /// 1.0 = no penalty, >1.0 = discourage repetition, <1.0 = encourage repetition
+        pub const REPETITION_PENALTY_RANGE: (f32, f32) = (0.0, 2.0);
     }
 }
 
@@ -346,7 +347,7 @@ pub mod utils {
     pub fn validate_conflicting_parameters(
         param1_name: &str,
         param1_value: bool,
-        param2_name: &str, 
+        param2_name: &str,
         param2_value: bool,
         reason: &str,
     ) -> Result<(), ValidationError> {
@@ -371,6 +372,72 @@ pub mod utils {
         }
         Ok(())
     }
+
+    /// Generic validation for SGLang extensions
+    pub fn validate_sglang_extensions<T: SGLangExtensionsProvider + ?Sized>(
+        request: &T,
+    ) -> Result<(), ValidationError> {
+        // Validate top_k (-1 to disable, or positive)
+        if let Some(top_k) = request.get_top_k() {
+            validate_top_k(top_k)?;
+        }
+
+        // Validate min_p (0.0 to 1.0)
+        if let Some(min_p) = request.get_min_p() {
+            validate_range(min_p, &constants::sglang::MIN_P_RANGE, "min_p")?;
+        }
+
+        // Validate repetition_penalty (0.0 to 2.0)
+        if let Some(rep_penalty) = request.get_repetition_penalty() {
+            validate_range(
+                rep_penalty,
+                &constants::sglang::REPETITION_PENALTY_RANGE,
+                "repetition_penalty",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Generic validation for n parameter (number of completions)
+    pub fn validate_completion_count<T: CompletionCountProvider + ?Sized>(
+        request: &T,
+    ) -> Result<(), ValidationError> {
+        const MAX_N: u32 = 10;
+
+        if let Some(n) = request.get_n() {
+            if n == 0 {
+                return Err(ValidationError::InvalidValue {
+                    parameter: "n".to_string(),
+                    value: "0".to_string(),
+                    reason: "must be at least 1".to_string(),
+                });
+            }
+
+            if n > MAX_N {
+                return Err(ValidationError::InvalidValue {
+                    parameter: "n".to_string(),
+                    value: n.to_string(),
+                    reason: format!("cannot exceed {}", MAX_N),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate that an array is not empty
+    pub fn validate_non_empty_array<T>(
+        items: &[T],
+        param_name: &str,
+    ) -> Result<(), ValidationError> {
+        if items.is_empty() {
+            return Err(ValidationError::MissingRequired {
+                parameter: param_name.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Core validation traits for different parameter categories
@@ -378,7 +445,7 @@ pub trait SamplingOptionsProvider {
     /// Get temperature parameter
     fn get_temperature(&self) -> Option<f32>;
 
-    /// Get top_p parameter  
+    /// Get top_p parameter
     fn get_top_p(&self) -> Option<f32>;
 
     /// Get frequency penalty parameter
@@ -412,9 +479,40 @@ pub trait LogProbsProvider {
     fn get_top_logprobs(&self) -> Option<u32>;
 }
 
+/// Trait for SGLang-specific extensions
+pub trait SGLangExtensionsProvider {
+    /// Get top_k parameter
+    fn get_top_k(&self) -> Option<i32> {
+        None
+    }
+
+    /// Get min_p parameter
+    fn get_min_p(&self) -> Option<f32> {
+        None
+    }
+
+    /// Get repetition_penalty parameter
+    fn get_repetition_penalty(&self) -> Option<f32> {
+        None
+    }
+}
+
+/// Trait for n parameter (number of completions)
+pub trait CompletionCountProvider {
+    /// Get n parameter
+    fn get_n(&self) -> Option<u32> {
+        None
+    }
+}
+
 /// Comprehensive validation trait that combines all validation aspects
 pub trait ValidatableRequest:
-    SamplingOptionsProvider + StopConditionsProvider + TokenLimitsProvider + LogProbsProvider
+    SamplingOptionsProvider
+    + StopConditionsProvider
+    + TokenLimitsProvider
+    + LogProbsProvider
+    + SGLangExtensionsProvider
+    + CompletionCountProvider
 {
     /// Perform comprehensive validation of the entire request
     fn validate(&self) -> Result<(), ValidationError> {
@@ -423,6 +521,10 @@ pub trait ValidatableRequest:
         utils::validate_stop_conditions(self)?;
         utils::validate_token_limits(self)?;
         utils::validate_logprobs(self)?;
+
+        // Validate SGLang extensions and completion count
+        utils::validate_sglang_extensions(self)?;
+        utils::validate_completion_count(self)?;
 
         // Perform cross-parameter validation
         utils::validate_cross_parameters(self)?;
@@ -489,6 +591,14 @@ mod tests {
         fn get_top_logprobs(&self) -> Option<u32> {
             self.top_logprobs
         }
+    }
+
+    impl SGLangExtensionsProvider for MockRequest {
+        // Default implementations return None, so no custom logic needed
+    }
+
+    impl CompletionCountProvider for MockRequest {
+        // Default implementation returns None, so no custom logic needed
     }
 
     impl ValidatableRequest for MockRequest {}

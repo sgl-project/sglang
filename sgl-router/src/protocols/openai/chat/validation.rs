@@ -4,14 +4,14 @@ use crate::protocols::common::StringOrArray;
 use crate::protocols::openai::chat::request::ChatCompletionRequest;
 use crate::protocols::openai::chat::types::{ChatMessage, ResponseFormat, UserMessageContent};
 use crate::protocols::validation::{
-    constants::*,
     utils::{
-        validate_conflicting_parameters, validate_cross_parameters, validate_logprobs,
-        validate_mutually_exclusive_options, validate_range, validate_sampling_options,
-        validate_stop_conditions, validate_token_limits, validate_top_k,
+        validate_completion_count, validate_conflicting_parameters, validate_cross_parameters,
+        validate_logprobs, validate_mutually_exclusive_options, validate_non_empty_array,
+        validate_sampling_options, validate_sglang_extensions, validate_stop_conditions,
+        validate_token_limits,
     },
-    LogProbsProvider, SamplingOptionsProvider, StopConditionsProvider, TokenLimitsProvider,
-    ValidatableRequest, ValidationError,
+    CompletionCountProvider, LogProbsProvider, SGLangExtensionsProvider, SamplingOptionsProvider,
+    StopConditionsProvider, TokenLimitsProvider, ValidatableRequest, ValidationError,
 };
 
 impl SamplingOptionsProvider for ChatCompletionRequest {
@@ -61,41 +61,31 @@ impl LogProbsProvider for ChatCompletionRequest {
     }
 }
 
-impl ChatCompletionRequest {
-    /// Validate SGLang-specific extensions
-    pub fn validate_sglang_extensions(&self) -> Result<(), ValidationError> {
-        // Validate top_k (-1 to disable, or positive)
-        if let Some(top_k) = self.top_k {
-            validate_top_k(top_k)?;
-        }
-
-        // Validate min_p (0.0 to 1.0)
-        if let Some(min_p) = self.min_p {
-            validate_range(min_p, &sglang::MIN_P_RANGE, "min_p")?;
-        }
-
-        // Validate repetition_penalty (must be positive)
-        if let Some(rep_penalty) = self.repetition_penalty {
-            if rep_penalty <= sglang::REPETITION_PENALTY_MIN {
-                return Err(ValidationError::InvalidValue {
-                    parameter: "repetition_penalty".to_string(),
-                    value: rep_penalty.to_string(),
-                    reason: "must be positive".to_string(),
-                });
-            }
-        }
-
-        Ok(())
+impl SGLangExtensionsProvider for ChatCompletionRequest {
+    fn get_top_k(&self) -> Option<i32> {
+        self.top_k
     }
 
+    fn get_min_p(&self) -> Option<f32> {
+        self.min_p
+    }
+
+    fn get_repetition_penalty(&self) -> Option<f32> {
+        self.repetition_penalty
+    }
+}
+
+impl CompletionCountProvider for ChatCompletionRequest {
+    fn get_n(&self) -> Option<u32> {
+        self.n
+    }
+}
+
+impl ChatCompletionRequest {
     /// Validate message-specific requirements
     pub fn validate_messages(&self) -> Result<(), ValidationError> {
         // Ensure messages array is not empty
-        if self.messages.is_empty() {
-            return Err(ValidationError::MissingRequired {
-                parameter: "messages".to_string(),
-            });
-        }
+        validate_non_empty_array(&self.messages, "messages")?;
 
         // Validate message content is not empty
         for (i, msg) in self.messages.iter().enumerate() {
@@ -157,55 +147,23 @@ impl ChatCompletionRequest {
 
         Ok(())
     }
-
-    /// Validate n parameter
-    pub fn validate_n_parameter(&self) -> Result<(), ValidationError> {
-        if let Some(n) = self.n {
-            if n == 0 {
-                return Err(ValidationError::InvalidValue {
-                    parameter: "n".to_string(),
-                    value: "0".to_string(),
-                    reason: "must be at least 1".to_string(),
-                });
-            }
-
-            const MAX_N: u32 = 10;
-            if n > MAX_N {
-                return Err(ValidationError::InvalidValue {
-                    parameter: "n".to_string(),
-                    value: n.to_string(),
-                    reason: format!("cannot exceed {}", MAX_N),
-                });
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl ValidatableRequest for ChatCompletionRequest {
     fn validate(&self) -> Result<(), ValidationError> {
-        // Validate all standard parameters using generic functions
+        // First run all the generic validation using the functions directly
         validate_sampling_options(self)?;
         validate_stop_conditions(self)?;
         validate_token_limits(self)?;
         validate_logprobs(self)?;
+        validate_sglang_extensions(self)?;
+        validate_completion_count(self)?;
+        validate_cross_parameters(self)?;
 
-        // Validate chat-specific parameters
+        // Then validate chat-specific parameters
         self.validate_messages()?;
         self.validate_response_format()?;
-        self.validate_n_parameter()?;
-
-        // Validate SGLang extensions
-        self.validate_sglang_extensions()?;
-
-        // Chat API specific logprobs validation
         self.validate_chat_logprobs()?;
-
-        // Cross-parameter validation (generic)
-        validate_cross_parameters(self)?;
-        
-        // Chat-specific cross-parameter validation
         self.validate_chat_cross_parameters()?;
 
         Ok(())
@@ -228,7 +186,7 @@ impl ChatCompletionRequest {
         validate_conflicting_parameters(
             "tools",
             self.tools.is_some(),
-            "functions", 
+            "functions",
             self.functions.is_some(),
             "functions is deprecated, use tools instead",
         )?;
@@ -238,7 +196,7 @@ impl ChatCompletionRequest {
             self.response_format,
             Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
         );
-        
+
         validate_conflicting_parameters(
             "response_format",
             has_json_format,
@@ -248,7 +206,7 @@ impl ChatCompletionRequest {
         )?;
 
         validate_conflicting_parameters(
-            "response_format", 
+            "response_format",
             has_json_format,
             "ebnf",
             self.ebnf.is_some(),
@@ -259,9 +217,15 @@ impl ChatCompletionRequest {
         let structured_constraints = [
             ("regex", self.regex.is_some()),
             ("ebnf", self.ebnf.is_some()),
-            ("json_schema", matches!(self.response_format, Some(ResponseFormat::JsonSchema { .. }))),
+            (
+                "json_schema",
+                matches!(
+                    self.response_format,
+                    Some(ResponseFormat::JsonSchema { .. })
+                ),
+            ),
         ];
-        
+
         validate_mutually_exclusive_options(
             &structured_constraints,
             "Only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
@@ -472,7 +436,16 @@ mod tests {
         request.repetition_penalty = Some(1.2);
         assert!(request.validate().is_ok());
 
-        request.repetition_penalty = Some(0.0); // Invalid
+        request.repetition_penalty = Some(0.0); // Valid - minimum value
+        assert!(request.validate().is_ok());
+
+        request.repetition_penalty = Some(2.0); // Valid - maximum value
+        assert!(request.validate().is_ok());
+
+        request.repetition_penalty = Some(2.1); // Invalid - too high
+        assert!(request.validate().is_err());
+
+        request.repetition_penalty = Some(-0.1); // Invalid - negative
         assert!(request.validate().is_err());
     }
 
