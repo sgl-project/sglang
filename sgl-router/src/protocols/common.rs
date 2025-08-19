@@ -35,6 +35,14 @@ impl StringOrArray {
         }
     }
 
+    /// Check if the StringOrArray is empty
+    pub fn is_empty(&self) -> bool {
+        match self {
+            StringOrArray::String(s) => s.is_empty(),
+            StringOrArray::Array(arr) => arr.is_empty(),
+        }
+    }
+
     /// Convert to a vector of strings
     pub fn to_vec(&self) -> Vec<String> {
         match self {

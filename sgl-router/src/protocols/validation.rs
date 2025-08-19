@@ -8,33 +8,33 @@ use std::fmt::Display;
 pub mod constants {
     /// Temperature range: 0.0 to 2.0 (OpenAI spec)
     pub const TEMPERATURE_RANGE: (f32, f32) = (0.0, 2.0);
-    
+
     /// Top-p range: 0.0 to 1.0 (exclusive of 0.0)
     pub const TOP_P_RANGE: (f32, f32) = (0.0, 1.0);
-    
+
     /// Presence penalty range: -2.0 to 2.0 (OpenAI spec)
     pub const PRESENCE_PENALTY_RANGE: (f32, f32) = (-2.0, 2.0);
-    
+
     /// Frequency penalty range: -2.0 to 2.0 (OpenAI spec)
     pub const FREQUENCY_PENALTY_RANGE: (f32, f32) = (-2.0, 2.0);
-    
+
     /// Logprobs range for completions API: 0 to 5
     pub const LOGPROBS_RANGE: (u32, u32) = (0, 5);
-    
+
     /// Top logprobs range for chat completions: 0 to 20
     pub const TOP_LOGPROBS_RANGE: (u32, u32) = (0, 20);
-    
+
     /// Maximum number of stop sequences allowed
     pub const MAX_STOP_SEQUENCES: usize = 4;
-    
+
     /// SGLang-specific validation constants
     pub mod sglang {
         /// Min-p range: 0.0 to 1.0 (SGLang extension)
         pub const MIN_P_RANGE: (f32, f32) = (0.0, 1.0);
-        
+
         /// Top-k minimum value: -1 to disable, otherwise positive
         pub const TOP_K_MIN: i32 = -1;
-        
+
         /// Repetition penalty minimum: must be positive
         pub const REPETITION_PENALTY_MIN: f32 = 0.0;
     }
@@ -63,9 +63,7 @@ pub enum ValidationError {
         reason: String,
     },
     /// Required parameter missing
-    MissingRequired {
-        parameter: String,
-    },
+    MissingRequired { parameter: String },
     /// Too many items in array parameter
     TooManyItems {
         parameter: String,
@@ -79,20 +77,53 @@ pub enum ValidationError {
 impl Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ValidationError::OutOfRange { parameter, value, min, max } => {
-                write!(f, "Parameter '{}' must be between {} and {}, got {}", parameter, min, max, value)
+            ValidationError::OutOfRange {
+                parameter,
+                value,
+                min,
+                max,
+            } => {
+                write!(
+                    f,
+                    "Parameter '{}' must be between {} and {}, got {}",
+                    parameter, min, max, value
+                )
             }
-            ValidationError::InvalidValue { parameter, value, reason } => {
-                write!(f, "Invalid value for parameter '{}': {} ({})", parameter, value, reason)
+            ValidationError::InvalidValue {
+                parameter,
+                value,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "Invalid value for parameter '{}': {} ({})",
+                    parameter, value, reason
+                )
             }
-            ValidationError::ConflictingParameters { parameter1, parameter2, reason } => {
-                write!(f, "Conflicting parameters '{}' and '{}': {}", parameter1, parameter2, reason)
+            ValidationError::ConflictingParameters {
+                parameter1,
+                parameter2,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "Conflicting parameters '{}' and '{}': {}",
+                    parameter1, parameter2, reason
+                )
             }
             ValidationError::MissingRequired { parameter } => {
                 write!(f, "Required parameter '{}' is missing", parameter)
             }
-            ValidationError::TooManyItems { parameter, count, max } => {
-                write!(f, "Parameter '{}' has too many items: {} (maximum: {})", parameter, count, max)
+            ValidationError::TooManyItems {
+                parameter,
+                count,
+                max,
+            } => {
+                write!(
+                    f,
+                    "Parameter '{}' has too many items: {} (maximum: {})",
+                    parameter, count, max
+                )
             }
             ValidationError::Custom(msg) => write!(f, "{}", msg),
         }
@@ -164,9 +195,11 @@ pub mod utils {
         value: &'a Option<T>,
         param_name: &str,
     ) -> Result<&'a T, ValidationError> {
-        value.as_ref().ok_or_else(|| ValidationError::MissingRequired {
-            parameter: param_name.to_string(),
-        })
+        value
+            .as_ref()
+            .ok_or_else(|| ValidationError::MissingRequired {
+                parameter: param_name.to_string(),
+            })
     }
 
     /// Validate top_k parameter (SGLang extension)
@@ -181,100 +214,198 @@ pub mod utils {
             })
         }
     }
+
+    /// Generic validation function for sampling options
+    pub fn validate_sampling_options<T: SamplingOptionsProvider + ?Sized>(
+        request: &T,
+    ) -> Result<(), ValidationError> {
+        // Validate temperature (0.0 to 2.0)
+        if let Some(temp) = request.get_temperature() {
+            validate_range(temp, &constants::TEMPERATURE_RANGE, "temperature")?;
+        }
+
+        // Validate top_p (0.0 to 1.0)
+        if let Some(top_p) = request.get_top_p() {
+            validate_range(top_p, &constants::TOP_P_RANGE, "top_p")?;
+        }
+
+        // Validate frequency_penalty (-2.0 to 2.0)
+        if let Some(freq_penalty) = request.get_frequency_penalty() {
+            validate_range(
+                freq_penalty,
+                &constants::FREQUENCY_PENALTY_RANGE,
+                "frequency_penalty",
+            )?;
+        }
+
+        // Validate presence_penalty (-2.0 to 2.0)
+        if let Some(pres_penalty) = request.get_presence_penalty() {
+            validate_range(
+                pres_penalty,
+                &constants::PRESENCE_PENALTY_RANGE,
+                "presence_penalty",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Generic validation function for stop conditions
+    pub fn validate_stop_conditions<T: StopConditionsProvider + ?Sized>(
+        request: &T,
+    ) -> Result<(), ValidationError> {
+        // Validate stop sequences (max 4)
+        if let Some(stop) = request.get_stop_sequences() {
+            validate_max_items(&stop.to_vec(), constants::MAX_STOP_SEQUENCES, "stop")?;
+
+            // Ensure no empty stop sequences
+            match stop {
+                crate::protocols::common::StringOrArray::String(s) if s.is_empty() => {
+                    return Err(ValidationError::InvalidValue {
+                        parameter: "stop".to_string(),
+                        value: "empty string".to_string(),
+                        reason: "stop sequences cannot be empty".to_string(),
+                    });
+                }
+                crate::protocols::common::StringOrArray::Array(arr) => {
+                    for (i, s) in arr.iter().enumerate() {
+                        if s.is_empty() {
+                            return Err(ValidationError::InvalidValue {
+                                parameter: format!("stop[{}]", i),
+                                value: "empty string".to_string(),
+                                reason: "stop sequences cannot be empty".to_string(),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Generic validation function for token limits
+    pub fn validate_token_limits<T: TokenLimitsProvider + ?Sized>(
+        request: &T,
+    ) -> Result<(), ValidationError> {
+        // Validate max_tokens if provided
+        if let Some(max_tokens) = request.get_max_tokens() {
+            validate_positive(max_tokens, "max_tokens")?;
+        }
+
+        // Validate min_tokens if provided (SGLang extension)
+        if let Some(min_tokens) = request.get_min_tokens() {
+            validate_positive(min_tokens, "min_tokens")?;
+        }
+
+        Ok(())
+    }
+
+    /// Generic validation function for logprobs
+    pub fn validate_logprobs<T: LogProbsProvider + ?Sized>(
+        request: &T,
+    ) -> Result<(), ValidationError> {
+        // Validate logprobs (completions API - 0 to 5)
+        if let Some(logprobs) = request.get_logprobs() {
+            validate_range(logprobs, &constants::LOGPROBS_RANGE, "logprobs")?;
+        }
+
+        // Validate top_logprobs (chat API - 0 to 20)
+        if let Some(top_logprobs) = request.get_top_logprobs() {
+            validate_range(top_logprobs, &constants::TOP_LOGPROBS_RANGE, "top_logprobs")?;
+        }
+
+        Ok(())
+    }
+
+    /// Generic cross-parameter validation
+    pub fn validate_cross_parameters<T: TokenLimitsProvider + ?Sized>(
+        request: &T,
+    ) -> Result<(), ValidationError> {
+        // Check min_tokens <= max_tokens if both are specified
+        if let (Some(min_tokens), Some(max_tokens)) =
+            (request.get_min_tokens(), request.get_max_tokens())
+        {
+            if min_tokens > max_tokens {
+                return Err(ValidationError::ConflictingParameters {
+                    parameter1: "min_tokens".to_string(),
+                    parameter2: "max_tokens".to_string(),
+                    reason: format!(
+                        "min_tokens ({}) cannot be greater than max_tokens ({})",
+                        min_tokens, max_tokens
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Core validation traits for different parameter categories
 pub trait SamplingOptionsProvider {
-    /// Validate all sampling-related parameters
-    fn validate_sampling_options(&self) -> Result<(), ValidationError>;
-    
     /// Get temperature parameter
     fn get_temperature(&self) -> Option<f32>;
-    
+
     /// Get top_p parameter  
     fn get_top_p(&self) -> Option<f32>;
-    
+
     /// Get frequency penalty parameter
     fn get_frequency_penalty(&self) -> Option<f32>;
-    
+
     /// Get presence penalty parameter
     fn get_presence_penalty(&self) -> Option<f32>;
 }
 
 /// Trait for validating stop conditions
 pub trait StopConditionsProvider {
-    /// Validate stop sequences and related parameters
-    fn validate_stop_conditions(&self) -> Result<(), ValidationError>;
-    
     /// Get stop sequences
     fn get_stop_sequences(&self) -> Option<&crate::protocols::common::StringOrArray>;
 }
 
 /// Trait for validating token limits
 pub trait TokenLimitsProvider {
-    /// Validate token-related parameters
-    fn validate_token_limits(&self) -> Result<(), ValidationError>;
-    
     /// Get maximum tokens parameter
     fn get_max_tokens(&self) -> Option<u32>;
-    
+
     /// Get minimum tokens parameter (SGLang extension)
     fn get_min_tokens(&self) -> Option<u32>;
 }
 
 /// Trait for validating logprobs parameters
 pub trait LogProbsProvider {
-    /// Validate logprobs-related parameters
-    fn validate_logprobs(&self) -> Result<(), ValidationError>;
-    
     /// Get logprobs parameter (completions API)
     fn get_logprobs(&self) -> Option<u32>;
-    
+
     /// Get top_logprobs parameter (chat API)
     fn get_top_logprobs(&self) -> Option<u32>;
 }
 
 /// Comprehensive validation trait that combines all validation aspects
-pub trait ValidatableRequest: 
-    SamplingOptionsProvider + StopConditionsProvider + TokenLimitsProvider + LogProbsProvider 
+pub trait ValidatableRequest:
+    SamplingOptionsProvider + StopConditionsProvider + TokenLimitsProvider + LogProbsProvider
 {
     /// Perform comprehensive validation of the entire request
     fn validate(&self) -> Result<(), ValidationError> {
-        // Validate each category of parameters
-        self.validate_sampling_options()?;
-        self.validate_stop_conditions()?;
-        self.validate_token_limits()?;
-        self.validate_logprobs()?;
-        
+        // Use generic validation functions
+        utils::validate_sampling_options(self)?;
+        utils::validate_stop_conditions(self)?;
+        utils::validate_token_limits(self)?;
+        utils::validate_logprobs(self)?;
+
         // Perform cross-parameter validation
-        self.validate_cross_parameters()?;
-        
-        Ok(())
-    }
-    
-    /// Validate relationships between parameters
-    fn validate_cross_parameters(&self) -> Result<(), ValidationError> {
-        // Check min_tokens <= max_tokens if both are specified
-        if let (Some(min_tokens), Some(max_tokens)) = (self.get_min_tokens(), self.get_max_tokens()) {
-            if min_tokens > max_tokens {
-                return Err(ValidationError::ConflictingParameters {
-                    parameter1: "min_tokens".to_string(),
-                    parameter2: "max_tokens".to_string(),
-                    reason: format!("min_tokens ({}) cannot be greater than max_tokens ({})", min_tokens, max_tokens),
-                });
-            }
-        }
-        
-        // Add more cross-parameter validations as needed
+        utils::validate_cross_parameters(self)?;
+
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::constants::*;
     use super::utils::*;
+    use super::*;
     use crate::protocols::common::StringOrArray;
 
     // Mock request type for testing validation traits
@@ -292,69 +423,42 @@ mod tests {
     }
 
     impl SamplingOptionsProvider for MockRequest {
-        fn validate_sampling_options(&self) -> Result<(), ValidationError> {
-            if let Some(temp) = self.temperature {
-                validate_range(temp, &TEMPERATURE_RANGE, "temperature")?;
-            }
-            if let Some(top_p) = self.top_p {
-                validate_range(top_p, &TOP_P_RANGE, "top_p")?;
-            }
-            if let Some(freq_penalty) = self.frequency_penalty {
-                validate_range(freq_penalty, &FREQUENCY_PENALTY_RANGE, "frequency_penalty")?;
-            }
-            if let Some(pres_penalty) = self.presence_penalty {
-                validate_range(pres_penalty, &PRESENCE_PENALTY_RANGE, "presence_penalty")?;
-            }
-            Ok(())
+        fn get_temperature(&self) -> Option<f32> {
+            self.temperature
         }
-
-        fn get_temperature(&self) -> Option<f32> { self.temperature }
-        fn get_top_p(&self) -> Option<f32> { self.top_p }
-        fn get_frequency_penalty(&self) -> Option<f32> { self.frequency_penalty }
-        fn get_presence_penalty(&self) -> Option<f32> { self.presence_penalty }
+        fn get_top_p(&self) -> Option<f32> {
+            self.top_p
+        }
+        fn get_frequency_penalty(&self) -> Option<f32> {
+            self.frequency_penalty
+        }
+        fn get_presence_penalty(&self) -> Option<f32> {
+            self.presence_penalty
+        }
     }
 
     impl StopConditionsProvider for MockRequest {
-        fn validate_stop_conditions(&self) -> Result<(), ValidationError> {
-            if let Some(ref stop) = self.stop {
-                validate_max_items(&stop.to_vec(), MAX_STOP_SEQUENCES, "stop")?;
-            }
-            Ok(())
-        }
-
         fn get_stop_sequences(&self) -> Option<&StringOrArray> {
             self.stop.as_ref()
         }
     }
 
     impl TokenLimitsProvider for MockRequest {
-        fn validate_token_limits(&self) -> Result<(), ValidationError> {
-            if let Some(max_tokens) = self.max_tokens {
-                validate_positive(max_tokens, "max_tokens")?;
-            }
-            if let Some(min_tokens) = self.min_tokens {
-                validate_positive(min_tokens, "min_tokens")?;
-            }
-            Ok(())
+        fn get_max_tokens(&self) -> Option<u32> {
+            self.max_tokens
         }
-
-        fn get_max_tokens(&self) -> Option<u32> { self.max_tokens }
-        fn get_min_tokens(&self) -> Option<u32> { self.min_tokens }
+        fn get_min_tokens(&self) -> Option<u32> {
+            self.min_tokens
+        }
     }
 
     impl LogProbsProvider for MockRequest {
-        fn validate_logprobs(&self) -> Result<(), ValidationError> {
-            if let Some(logprobs) = self.logprobs {
-                validate_range(logprobs, &LOGPROBS_RANGE, "logprobs")?;
-            }
-            if let Some(top_logprobs) = self.top_logprobs {
-                validate_range(top_logprobs, &TOP_LOGPROBS_RANGE, "top_logprobs")?;
-            }
-            Ok(())
+        fn get_logprobs(&self) -> Option<u32> {
+            self.logprobs
         }
-
-        fn get_logprobs(&self) -> Option<u32> { self.logprobs }
-        fn get_top_logprobs(&self) -> Option<u32> { self.top_logprobs }
+        fn get_top_logprobs(&self) -> Option<u32> {
+            self.top_logprobs
+        }
     }
 
     impl ValidatableRequest for MockRequest {}
@@ -407,7 +511,10 @@ mod tests {
             top_p: Some(0.9),
             frequency_penalty: Some(0.5),
             presence_penalty: Some(-0.5),
-            stop: Some(StringOrArray::Array(vec!["stop1".to_string(), "stop2".to_string()])),
+            stop: Some(StringOrArray::Array(vec![
+                "stop1".to_string(),
+                "stop2".to_string(),
+            ])),
             max_tokens: Some(100),
             min_tokens: Some(10),
             logprobs: Some(3),
@@ -444,7 +551,11 @@ mod tests {
         let result = request.validate();
         assert!(result.is_err());
         match result.unwrap_err() {
-            ValidationError::TooManyItems { parameter, count, max } => {
+            ValidationError::TooManyItems {
+                parameter,
+                count,
+                max,
+            } => {
                 assert_eq!(parameter, "stop");
                 assert_eq!(count, 5);
                 assert_eq!(max, MAX_STOP_SEQUENCES);
@@ -464,7 +575,11 @@ mod tests {
         let result = request.validate();
         assert!(result.is_err());
         match result.unwrap_err() {
-            ValidationError::ConflictingParameters { parameter1, parameter2, .. } => {
+            ValidationError::ConflictingParameters {
+                parameter1,
+                parameter2,
+                ..
+            } => {
                 assert_eq!(parameter1, "min_tokens");
                 assert_eq!(parameter2, "max_tokens");
             }
@@ -475,12 +590,12 @@ mod tests {
     #[test]
     fn test_boundary_values() {
         let request = MockRequest {
-            temperature: Some(0.0), // Boundary: minimum
-            top_p: Some(1.0),       // Boundary: maximum
+            temperature: Some(0.0),        // Boundary: minimum
+            top_p: Some(1.0),              // Boundary: maximum
             frequency_penalty: Some(-2.0), // Boundary: minimum
             presence_penalty: Some(2.0),   // Boundary: maximum
-            logprobs: Some(0),      // Boundary: minimum
-            top_logprobs: Some(20), // Boundary: maximum
+            logprobs: Some(0),             // Boundary: minimum
+            top_logprobs: Some(20),        // Boundary: maximum
             ..Default::default()
         };
 
@@ -495,7 +610,7 @@ mod tests {
             min: "0.0".to_string(),
             max: "2.0".to_string(),
         };
-        
+
         let message = format!("{}", error);
         assert!(message.contains("temperature"));
         assert!(message.contains("3.0"));
