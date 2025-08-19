@@ -6,19 +6,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 fn generate_response_id() -> String {
-    format!(
-        "resp_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    )
+    format!("resp_{}", uuid::Uuid::new_v4().simple())
 }
 
 fn current_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_secs() as i64
 }
 
@@ -170,11 +164,13 @@ impl ResponsesResponse {
 
     /// Get the response as a JSON value with usage in response format
     pub fn to_response_format(&self) -> serde_json::Value {
-        let mut response = serde_json::to_value(self).unwrap();
+        let mut response = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
 
         // Convert usage to response format if present
         if let Some(usage) = &self.usage {
-            response["usage"] = serde_json::to_value(usage.to_response_usage()).unwrap();
+            if let Ok(usage_value) = serde_json::to_value(usage.to_response_usage()) {
+                response["usage"] = usage_value;
+            }
         }
 
         response

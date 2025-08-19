@@ -231,7 +231,10 @@ impl ResponsesRequest {
         );
 
         if let Some(ref stop) = self.stop {
-            params.insert("stop".to_string(), serde_json::to_value(stop).unwrap());
+            match serde_json::to_value(stop) {
+                Ok(value) => params.insert("stop".to_string(), value),
+                Err(_) => params.insert("stop".to_string(), serde_json::Value::Null),
+            };
         }
 
         // Apply any additional default parameters

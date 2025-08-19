@@ -94,19 +94,6 @@ fn test_sampling_params_conversion() {
 
 #[test]
 fn test_responses_response_creation() {
-    let _usage = UsageInfo::new(10, 20, Some(5));
-
-    let _output_item = ResponseOutputItem::new_message(
-        "msg_123".to_string(),
-        "assistant".to_string(),
-        vec![ResponseContentPart::new_text(
-            "Hello back!".to_string(),
-            vec![],
-            None,
-        )],
-        "completed".to_string(),
-    );
-
     let response = ResponsesResponse::new(
         "resp_test789".to_string(),
         "test-model".to_string(),
