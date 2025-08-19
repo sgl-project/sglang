@@ -1807,12 +1807,13 @@ def triton_scaled_mm(
 
 shuffle_autotune = triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": block_m, "GROUP_M": group_m}, num_warps=num_warps)
+        triton.Config({"BLOCK_M": block_m, "GROUP_M": group_m, "M_ALIGNMENT": m_alignment}, num_warps=num_warps)
         for block_m in [16, 32, 64, 128]
         for group_m in [2, 4, 8]
         for num_warps in [4, 8]
+        for m_alignment in [8, 16, 32]
     ],
-    key=["K", "M_ALIGNMENT"],
+    key=["K"],
 )
 
 @triton.jit
@@ -1839,12 +1840,11 @@ def _shuffle_map_fp8_scale_hopper_moe_mn_major(
 
     m = tl.load(problem_sizes + expert_id * 3)
     current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
-    tl.multiple_of(m, M_ALIGNMENT)
-    tl.multiple_of(current_expert_offset, M_ALIGNMENT)
 
     for i in tl.range(tl.cdiv(m, BLOCK_M)):
         coord_m = i * BLOCK_M + tl.arange(0, BLOCK_M)
         m_dst_offset = current_expert_offset + coord_m
+        m_dst_offset = tl.multiple_of(m_dst_offset, M_ALIGNMENT)
         m_dst_mask = coord_m < m
         m_src_offset = tl.load(shuffle_map + m_dst_offset, mask=m_dst_mask).to(tl.int64)
 
@@ -1853,8 +1853,10 @@ def _shuffle_map_fp8_scale_hopper_moe_mn_major(
         as_val = tl.load(as_ptrs, mask=as_mask).to(tl.float32)
 
         # Store sfa
+        sfa_offset = current_expert_offset * K + k_offset * m + coord_m
+        sfa_offset = tl.multiple_of(sfa_offset, M_ALIGNMENT)
         sfa_ptrs = (
-            sfa + current_expert_offset * K + k_offset * m + coord_m
+            sfa + sfa_offset
         )  # MN-Major with sfa
         tl.store(sfa_ptrs, as_val, mask=coord_m < m)
 
@@ -1881,18 +1883,19 @@ def _shuffle_fp8_scale_hopper_moe_mn_major(
 
     m = tl.load(problem_sizes + expert_id * 3)
     current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
-    tl.multiple_of(m, M_ALIGNMENT)
-    tl.multiple_of(current_expert_offset, M_ALIGNMENT)
 
     for i in tl.range(tl.cdiv(m, BLOCK_M)):
         coord_m = i * BLOCK_M + tl.arange(0, BLOCK_M)
-        as_ptrs = a_s + current_expert_offset * K + coord_m * K + k_offset
+        as_offset = current_expert_offset * K + coord_m * K + k_offset
+        as_offset = tl.multiple_of(as_offset, M_ALIGNMENT)
         as_mask = (coord_m < m) & (k_offset < K)
-        as_val = tl.load(as_ptrs, mask=as_mask).to(tl.float32)
+        as_val = tl.load(a_s + as_offset, mask=as_mask).to(tl.float32)
 
         # Store sfa
+        sfa_offset = current_expert_offset * K + k_offset * m + coord_m
+        sfa_offset = tl.multiple_of(sfa_offset, M_ALIGNMENT)
         sfa_ptrs = (
-            sfa + current_expert_offset * K + k_offset * m + coord_m
+            sfa + sfa_offset
         )  # MN-Major with sfa
         tl.store(sfa_ptrs, as_val, mask=coord_m < m)
 
@@ -1918,7 +1921,6 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
     k = a_s.shape[1]
     sfa = torch.empty((output_m, k), device=a_s.device, dtype=a_s.dtype)
     num_experts = problem_sizes.shape[0]
-    expert_tokens_alignment = a_s.element_size() * 8
 
     grid = (k * num_experts, )
     if shuffle_map is not None:
@@ -1930,7 +1932,6 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
             shuffle_map,
             num_experts,
             k,
-            expert_tokens_alignment,
         )
     else:
         _shuffle_fp8_scale_hopper_moe_mn_major[grid](
@@ -1940,7 +1941,6 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
             sfa,
             num_experts,
             k,
-            expert_tokens_alignment,
         )
 
     return sfa
