@@ -122,23 +122,20 @@ class TemplateManager:
                     # override the chat template
                     if tokenizer_manager.tokenizer:
                         tokenizer_manager.tokenizer.chat_template = hf_template
+                    # Detect reasoning pattern from chat template
+                    self._force_reasoning = self._detect_reasoning_pattern(hf_template)
                     self._jinja_template_content_format = (
                         detect_jinja_template_content_format(hf_template)
                     )
                     logger.info(
                         f"Using default HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
                     )
-                    return
-
-            # Default to string content format if no template was found
-            self._jinja_template_content_format = "string"
-            logger.info("No chat template found, defaulting to 'string' content format")
-
-        # Detect reasoning pattern from chat template
-        if tokenizer_manager.tokenizer:
-            self._force_reasoning = self._detect_reasoning_pattern(
-                tokenizer_manager.tokenizer.chat_template
-            )
+                else:
+                    # Default to string content format if no template was found
+                    self._jinja_template_content_format = "string"
+                    logger.info(
+                        "No chat template found, defaulting to 'string' content format"
+                    )
 
     def _load_explicit_chat_template(
         self, tokenizer_manager, chat_template_arg: str
