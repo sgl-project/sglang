@@ -137,9 +137,10 @@ class TemplateManager:
                     )
 
         # Detect reasoning pattern from chat template
-        self._force_reasoning = self._detect_reasoning_pattern(
-            tokenizer_manager.tokenizer.chat_template
-        )
+        if tokenizer_manager.tokenizer:
+            self._force_reasoning = self._detect_reasoning_pattern(
+                tokenizer_manager.tokenizer.chat_template
+            )
 
     def _load_explicit_chat_template(
         self, tokenizer_manager, chat_template_arg: str
