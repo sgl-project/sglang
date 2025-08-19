@@ -24,6 +24,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -67,8 +68,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.graph_runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2DecoderLayer,
@@ -509,9 +510,8 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            kwargs = {"hidden_states": hidden_states}
-            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
-            final_hidden_states = self.experts(**kwargs)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
@@ -552,9 +552,8 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        kwargs = {"hidden_states": hidden_states}
-        kwargs["topk_output"] = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(**kwargs)
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
@@ -721,6 +720,9 @@ class Glm4MoeModel(DeepseekV2Model):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
+        self.pp_group = get_pp_group()
+        self.start_layer = 0
+        self.end_layer = config.num_hidden_layers
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
@@ -737,6 +739,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("Glm4MoeForCausalLM")
         self.model = Glm4MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
