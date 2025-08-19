@@ -147,10 +147,8 @@ async def eval_mmmu(args) -> None:
                 client, sample, sampling_params, lora_path
             )
             sample["original_response"] = response
-            if "</think>" in response:
-                response = response.split("</think>")[1].strip()
             answer = (
-                re.search(args.response_answer_regex, response)
+                re.search(args.response_answer_regex, response).strip()
                 if response is not None
                 else None
             )
@@ -172,10 +170,8 @@ async def eval_mmmu(args) -> None:
         for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
             sample, response = await coro
             sample["original_response"] = response
-            if "</think>" in response:
-                response = response.split("</think>")[1].strip()
             answer = (
-                re.search(args.response_answer_regex, response)
+                re.search(args.response_answer_regex, response).strip()
                 if response is not None
                 else None
             )
