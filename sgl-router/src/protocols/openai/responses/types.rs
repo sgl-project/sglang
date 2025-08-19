@@ -1,5 +1,6 @@
 // Supporting types for Responses API
 
+use crate::protocols::openai::common::ChatLogProbs;
 use serde::{Deserialize, Serialize};
 
 // ============= Tool Definitions =============
@@ -21,8 +22,12 @@ pub enum ResponseToolType {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseReasoningParam {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<ReasoningEffort>,
+    #[serde(default = "default_reasoning_effort")]
+    pub effort: ReasoningEffort,
+}
+
+fn default_reasoning_effort() -> ReasoningEffort {
+    ReasoningEffort::Medium
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -78,7 +83,7 @@ pub enum ResponseContentPart {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         annotations: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        logprobs: Option<serde_json::Value>,
+        logprobs: Option<ChatLogProbs>,
     },
 }
 
@@ -219,4 +224,74 @@ pub struct UsageInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PromptTokenUsageInfo {
     pub cached_tokens: u32,
+}
+
+// ============= Response Usage Format =============
+
+/// OpenAI Responses API usage format (different from standard UsageInfo)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ResponseUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens_details: Option<InputTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<OutputTokensDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InputTokensDetails {
+    pub cached_tokens: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OutputTokensDetails {
+    pub reasoning_tokens: u32,
+}
+
+impl UsageInfo {
+    /// Convert to OpenAI Responses API format
+    pub fn to_response_usage(&self) -> ResponseUsage {
+        ResponseUsage {
+            input_tokens: self.prompt_tokens,
+            output_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            input_tokens_details: self.prompt_tokens_details.as_ref().map(|details| {
+                InputTokensDetails {
+                    cached_tokens: details.cached_tokens,
+                }
+            }),
+            output_tokens_details: self.reasoning_tokens.map(|tokens| {
+                OutputTokensDetails {
+                    reasoning_tokens: tokens,
+                }
+            }),
+        }
+    }
+}
+
+impl From<UsageInfo> for ResponseUsage {
+    fn from(usage: UsageInfo) -> Self {
+        usage.to_response_usage()
+    }
+}
+
+impl ResponseUsage {
+    /// Convert back to standard UsageInfo format
+    pub fn to_usage_info(&self) -> UsageInfo {
+        UsageInfo {
+            prompt_tokens: self.input_tokens,
+            completion_tokens: self.output_tokens,
+            total_tokens: self.total_tokens,
+            reasoning_tokens: self.output_tokens_details.as_ref().map(|details| {
+                details.reasoning_tokens
+            }),
+            prompt_tokens_details: self.input_tokens_details.as_ref().map(|details| {
+                PromptTokenUsageInfo {
+                    cached_tokens: details.cached_tokens,
+                }
+            }),
+        }
+    }
 }

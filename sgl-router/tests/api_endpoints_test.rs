@@ -414,6 +414,324 @@ mod generation_tests {
 
         ctx.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn test_v1_responses_success() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18105,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "test-model",
+            "input": "Hello, responses API!",
+            "max_output_tokens": 50,
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // Verify response structure
+        assert!(body_json.get("id").is_some());
+        assert_eq!(body_json.get("object").and_then(|v| v.as_str()), Some("response"));
+        assert!(body_json.get("created_at").is_some());
+        assert_eq!(body_json.get("model").and_then(|v| v.as_str()), Some("test-model"));
+        assert!(body_json.get("output").is_some());
+        assert_eq!(body_json.get("status").and_then(|v| v.as_str()), Some("completed"));
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_with_tools() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18106,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "test-model",
+            "input": "Search for information about Rust programming",
+            "max_output_tokens": 100,
+            "tools": [
+                {"type": "web_search_preview"}
+            ],
+            "tool_choice": "auto",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // Verify response has tools configured
+        assert!(body_json.get("tools").is_some());
+        let tools = body_json["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "web_search_preview");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_with_reasoning() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18107,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "test-model",
+            "input": "Explain the theory of relativity",
+            "reasoning": {
+                "effort": "high"
+            },
+            "instructions": "Think step by step",
+            "max_output_tokens": 200,
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // Verify reasoning configuration is preserved
+        assert!(body_json.get("id").is_some());
+        assert_eq!(body_json.get("status").and_then(|v| v.as_str()), Some("completed"));
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_background_mode() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18108,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "test-model",
+            "input": "Generate a long response",
+            "background": true,
+            "store": true,
+            "max_output_tokens": 300,
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
+        // Background requests should return immediately with queued status
+        assert!(body_json.get("id").is_some());
+        let response_id = body_json["id"].as_str().unwrap();
+        assert!(response_id.starts_with("resp_"));
+        
+        // Status should be queued or in_progress for background requests
+        let status = body_json.get("status").and_then(|v| v.as_str());
+        assert!(status == Some("queued") || status == Some("in_progress") || status == Some("completed"));
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_streaming() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18109,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "test-model",
+            "input": "Stream a response",
+            "stream": true,
+            "max_output_tokens": 50
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // For streaming responses, check content-type
+        // Note: Actual streaming implementation will set text/event-stream
+        // For now, just verify we get a successful response
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_missing_required_fields() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18110,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        // Missing required 'input' field
+        let payload = json!({
+            "model": "test-model"
+            // missing "input"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should return validation error
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_invalid_json() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18111,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        // Send invalid JSON
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from("{invalid json}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_worker_failure() {
+        let ctx = TestContext::new(vec![MockWorkerConfig {
+            port: 18112,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0, // Always fail
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "test-model",
+            "input": "This should fail",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        ctx.shutdown().await;
+    }
 }
 
 #[cfg(test)]

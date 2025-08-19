@@ -12,11 +12,11 @@ fn generate_response_id() -> String {
         .as_secs())
 }
 
-fn current_timestamp() -> u64 {
+fn current_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs()
+        .as_secs() as i64
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -31,7 +31,7 @@ pub struct ResponsesResponse {
 
     /// Creation timestamp
     #[serde(default = "current_timestamp")]
-    pub created_at: u64,
+    pub created_at: i64,
 
     /// Model name
     pub model: String,
@@ -79,7 +79,7 @@ impl ResponsesResponse {
         request: &ResponsesRequest,
         _sampling_params: &HashMap<String, serde_json::Value>,
         model_name: String,
-        created_time: u64,
+        created_time: i64,
         output: Vec<ResponseOutputItem>,
         status: ResponseStatus,
         usage: Option<UsageInfo>,
@@ -161,6 +161,23 @@ impl ResponsesResponse {
     pub fn is_queued(&self) -> bool {
         matches!(self.status, ResponseStatus::Queued)
     }
+
+    /// Convert usage to OpenAI Responses API format
+    pub fn usage_in_response_format(&self) -> Option<crate::protocols::openai::responses::types::ResponseUsage> {
+        self.usage.as_ref().map(|usage| usage.to_response_usage())
+    }
+
+    /// Get the response as a JSON value with usage in response format
+    pub fn to_response_format(&self) -> serde_json::Value {
+        let mut response = serde_json::to_value(self).unwrap();
+        
+        // Convert usage to response format if present
+        if let Some(usage) = &self.usage {
+            response["usage"] = serde_json::to_value(usage.to_response_usage()).unwrap();
+        }
+        
+        response
+    }
 }
 
 // ============= Helper Functions =============
@@ -219,7 +236,7 @@ impl ResponseContentPart {
     pub fn new_text(
         text: String,
         annotations: Vec<String>,
-        logprobs: Option<serde_json::Value>,
+        logprobs: Option<crate::protocols::openai::common::ChatLogProbs>,
     ) -> Self {
         Self::OutputText {
             text,
