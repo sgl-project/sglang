@@ -7,10 +7,10 @@ use serde_json::{from_str, to_string, to_value};
 use sglang_router_rs::core::{BasicWorker, WorkerType};
 use sglang_router_rs::protocols::{
     common::StringOrArray,
-    generate::{GenerateParameters, GenerateRequest},
+    generate::{GenerateParameters, GenerateRequest, SamplingParams},
     openai::{
         chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
-        completions::{CompletionRequest, SamplingParams},
+        completions::CompletionRequest,
     },
 };
 
