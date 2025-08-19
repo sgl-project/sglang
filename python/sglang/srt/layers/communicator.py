@@ -276,7 +276,6 @@ class LayerCommunicator:
         if (
             is_dp_attention_enabled()
             and speculative_algo is not None
-            and hasattr(speculative_algo, "is_eagle")
             and speculative_algo.is_eagle()
         ):
             return False
