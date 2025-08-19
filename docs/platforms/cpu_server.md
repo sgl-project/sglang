@@ -136,7 +136,7 @@ Notes:
     Please beware that with SGLANG_CPU_OMP_THREADS_BIND set,
     the available memory amounts of the ranks cannot be determined in prior.
     You may need to set proper `--mem-fraction-static` or `--max-total-tokens`
-    to eliminate the out-of-memory risk.
+    to avoid out-of-memory error.
 
 3. A warmup step is automatically triggered when the service is started.
 The server is ready when you see the log `The server is fired up and ready to roll!`.
@@ -179,7 +179,6 @@ python -m sglang.launch_server                 \
     --quantization w8a8_int8                   \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 524288                   \
     --tp 6
 ```
 
@@ -193,7 +192,6 @@ python -m sglang.launch_server                 \
     --device cpu                               \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 524288                   \
     --tp 6
 ```
 
