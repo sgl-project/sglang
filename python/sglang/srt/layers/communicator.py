@@ -284,7 +284,6 @@ class LayerCommunicator:
         batch_size = (
             forward_batch.input_ids.shape[0]
             if hasattr(forward_batch, "input_ids")
-            and hasattr(forward_batch.input_ids, "shape")
             else 0
         )
         if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
