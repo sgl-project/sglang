@@ -87,6 +87,7 @@ at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
   int64_t num_tokens = input.numel() / input.size(-1);
   at::Tensor out = at::empty(sizes, input.options());
   const float sqrt_2_div_pi = std::sqrt(2.f / M_PI);
+
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
     using Vec = at::vec::Vectorized<float>;
     act_and_mul_kernel_impl(
