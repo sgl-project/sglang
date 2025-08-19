@@ -1028,9 +1028,8 @@ class MRotaryEmbedding(RotaryEmbedding):
                 print(
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
-        self.forward = self.mrope_dispatch_forward()
 
-    def forward(
+    def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1099,11 +1098,11 @@ class MRotaryEmbedding(RotaryEmbedding):
         )
         return query, key
 
-    def mrope_dispatch_forward(self):
+    def dispatch_forward(self):
         if _is_npu:
             return self.forward_npu
         else:
-            return self.forward
+            return self.forward_native
 
     # Copied from https://github.com/huggingface/transformers/blob/c8e0e603de9b3d49161a15fe6e8ea84badfb5d02/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L1439
     @staticmethod
