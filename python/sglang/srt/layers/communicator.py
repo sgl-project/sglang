@@ -201,9 +201,6 @@ class LayerCommunicator:
             )
         )
 
-        # Precompute lookup table for allreduce+add_rmsnorm fusion decision
-        self._fuse_allreduce_lookup_table = self._build_fuse_allreduce_lookup_table()
-
     def prepare_attn(
         self,
         hidden_states: torch.Tensor,
@@ -276,28 +273,6 @@ class LayerCommunicator:
             and forward_batch.dp_padding_mode.is_max_len()
         )
 
-    def _build_fuse_allreduce_lookup_table(self):
-        static_conditions_met = (
-            (not self.is_last_layer)
-            and (self._context.tp_size > 1)
-            and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
-            and _is_sm100_supported
-            and _is_flashinfer_available
-        )
-
-        if not static_conditions_met:
-            return {}
-
-        lookup_table = {}
-        for batch_size in range(FUSE_ALLREDUCE_MAX_BATCH_SIZE + 1):
-            should_fuse = (
-                batch_size > 0
-                and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
-                and (not self.is_last_layer)
-            )
-            lookup_table[batch_size] = should_fuse
-        return lookup_table
-
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
@@ -327,7 +302,24 @@ class LayerCommunicator:
         )
         if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
             return False
-        return self._fuse_allreduce_lookup_table.get(batch_size, False)
+
+        # 直接计算是否应该fuse而不是使用查找表
+        static_conditions_met = (
+            (not self.is_last_layer)
+            and (self._context.tp_size > 1)
+            and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
+            and _is_sm100_supported
+            and _is_flashinfer_available
+        )
+
+        if not static_conditions_met:
+            return False
+
+        return (
+            batch_size > 0
+            and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
+            and (not self.is_last_layer)
+        )
 
 
 @dataclass
