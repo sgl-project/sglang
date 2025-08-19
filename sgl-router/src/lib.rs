@@ -5,9 +5,8 @@ use std::collections::HashMap;
 pub mod core;
 pub mod metrics;
 pub mod middleware;
-pub mod openai_api_types; // Keep for backward compatibility temporarily
 pub mod policies;
-pub mod protocols; // New protocols module
+pub mod protocols;
 pub mod reasoning_parser;
 pub mod routers;
 pub mod server;
