@@ -1000,7 +1000,7 @@ def sample_mmmu_requests(
 
                 # Construct the prompt
                 prompt = f"Question: {question}\n\nAnswer: "
-                print(f"{prompt=}")
+                # print(f"{prompt=}")
                 if apply_chat_template:
                     try:
                         is_phi4_multimodal = (
@@ -1745,7 +1745,6 @@ async def benchmark(
             extra_request_body=extra_request_body,
             timestamp=request.timestamp,
         )
-        print(f"{request_func_input.image_data=}")
 
         tasks.append(
             asyncio.create_task(
