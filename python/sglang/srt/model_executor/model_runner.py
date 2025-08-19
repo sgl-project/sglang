@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -1619,16 +1620,13 @@ class ModelRunner:
         logger.info(
             f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        graph_runners = {
-            "cuda": CudaGraphRunner,
-            "npu": CudaGraphRunner if not _is_npu else NPUGraphRunner,
-            "cpu": CPUGraphRunner,
-        }
-        assert self.device in [
-            "cuda",
-            "npu",
-            "cpu",
-        ], "Only cuda, npu and cpu are supported for graph capture."
+        graph_runners = defaultdict(
+            lambda: CudaGraphRunner,
+            {
+                "npu": CudaGraphRunner if not _is_npu else NPUGraphRunner,
+                "cpu": CPUGraphRunner,
+            },
+        )
         self.graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
