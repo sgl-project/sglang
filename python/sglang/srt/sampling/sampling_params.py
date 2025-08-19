@@ -177,5 +177,6 @@ class SamplingParams:
         input_dict = self.__dict__.copy()
         if "stop_strs" in input_dict:
             input_dict["stop"] = input_dict.pop("stop_strs")
-        input_dict.pop("stop_str_max_len")
+        if "stop_str_max_len" in input_dict:
+            input_dict.pop("stop_str_max_len")
         return input_dict
