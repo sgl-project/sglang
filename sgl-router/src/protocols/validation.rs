@@ -438,6 +438,27 @@ pub mod utils {
         }
         Ok(())
     }
+
+    /// Validate common request parameters that are shared across all API types
+    pub fn validate_common_request_params<T>(request: &T) -> Result<(), ValidationError>
+    where
+        T: SamplingOptionsProvider + StopConditionsProvider + TokenLimitsProvider + LogProbsProvider + SGLangExtensionsProvider + CompletionCountProvider + ?Sized,
+    {
+        // Validate all standard parameters
+        validate_sampling_options(request)?;
+        validate_stop_conditions(request)?;
+        validate_token_limits(request)?;
+        validate_logprobs(request)?;
+        
+        // Validate SGLang extensions and completion count
+        validate_sglang_extensions(request)?;
+        validate_completion_count(request)?;
+
+        // Perform cross-parameter validation
+        validate_cross_parameters(request)?;
+
+        Ok(())
+    }
 }
 
 /// Core validation traits for different parameter categories
@@ -516,20 +537,8 @@ pub trait ValidatableRequest:
 {
     /// Perform comprehensive validation of the entire request
     fn validate(&self) -> Result<(), ValidationError> {
-        // Use generic validation functions
-        utils::validate_sampling_options(self)?;
-        utils::validate_stop_conditions(self)?;
-        utils::validate_token_limits(self)?;
-        utils::validate_logprobs(self)?;
-
-        // Validate SGLang extensions and completion count
-        utils::validate_sglang_extensions(self)?;
-        utils::validate_completion_count(self)?;
-
-        // Perform cross-parameter validation
-        utils::validate_cross_parameters(self)?;
-
-        Ok(())
+        // Use the common validation function
+        utils::validate_common_request_params(self)
     }
 }
 

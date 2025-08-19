@@ -5,10 +5,8 @@ use crate::protocols::openai::chat::request::ChatCompletionRequest;
 use crate::protocols::openai::chat::types::{ChatMessage, ResponseFormat, UserMessageContent};
 use crate::protocols::validation::{
     utils::{
-        validate_completion_count, validate_conflicting_parameters, validate_cross_parameters,
-        validate_logprobs, validate_mutually_exclusive_options, validate_non_empty_array,
-        validate_sampling_options, validate_sglang_extensions, validate_stop_conditions,
-        validate_token_limits,
+        validate_common_request_params, validate_conflicting_parameters,
+        validate_mutually_exclusive_options, validate_non_empty_array,
     },
     CompletionCountProvider, LogProbsProvider, SGLangExtensionsProvider, SamplingOptionsProvider,
     StopConditionsProvider, TokenLimitsProvider, ValidatableRequest, ValidationError,
@@ -214,14 +212,8 @@ impl ChatCompletionRequest {
 
 impl ValidatableRequest for ChatCompletionRequest {
     fn validate(&self) -> Result<(), ValidationError> {
-        // First run all the generic validation using the functions directly
-        validate_sampling_options(self)?;
-        validate_stop_conditions(self)?;
-        validate_token_limits(self)?;
-        validate_logprobs(self)?;
-        validate_sglang_extensions(self)?;
-        validate_completion_count(self)?;
-        validate_cross_parameters(self)?;
+        // Call the common validation function from the validation module
+        validate_common_request_params(self)?;
 
         // Then validate chat-specific parameters
         self.validate_messages()?;
