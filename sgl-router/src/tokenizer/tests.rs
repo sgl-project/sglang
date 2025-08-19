@@ -129,7 +129,9 @@ fn test_thread_safety() {
             thread::spawn(move || {
                 let text = "Hello test".to_string();
                 let encoding = tokenizer_clone.encode(&text).unwrap();
-                let decoded = tokenizer_clone.decode(encoding.token_ids(), false).unwrap();
+                let decoded = tokenizer_clone
+                    .decode(&encoding.token_ids(), false)
+                    .unwrap();
                 assert!(decoded.contains("Hello") || decoded.contains("test"));
                 i
             })
