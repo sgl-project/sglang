@@ -744,8 +744,7 @@ class AscendQwen2_5_VisionTransformer(Qwen2_5_VisionTransformer):
         # compute cu_seqlens
         cu_seqlens = (
             torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
-            .to(torch.int32)
-        )
+        ).to(torch.int32)
 
         # transformers
         x = x.unsqueeze(1)
