@@ -23,6 +23,7 @@ from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_
 from sgl_kernel.elementwise import (
     FusedSetKVBufferArg,
     apply_rope_with_cos_sin_cache_inplace,
+    downcast_fp8,
     fused_add_rmsnorm,
     gelu_and_mul,
     gelu_tanh_and_mul,
@@ -92,6 +93,14 @@ from sgl_kernel.sampling import (
     top_p_renorm_prob,
     top_p_sampling_from_probs,
 )
+from sgl_kernel.speculative import (
+    build_tree_kernel_efficient,
+    segment_packbits,
+    tree_speculative_sampling_target_only,
+    verify_tree_greedy,
+)
+from sgl_kernel.top_k import fast_topk
+from sgl_kernel.version import __version__
 
 
 def create_greenctx_stream_by_value(*args, **kwargs):
@@ -104,13 +113,3 @@ def get_sm_available(*args, **kwargs):
     from sgl_kernel.spatial import get_sm_available as _impl
 
     return _impl(*args, **kwargs)
-
-
-from sgl_kernel.speculative import (
-    build_tree_kernel_efficient,
-    segment_packbits,
-    tree_speculative_sampling_target_only,
-    verify_tree_greedy,
-)
-from sgl_kernel.top_k import fast_topk
-from sgl_kernel.version import __version__
