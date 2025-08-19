@@ -124,7 +124,9 @@ operations = [
 for operation in operations:
     operation.hash_value = [
         f"{j}"
-        for j in range(int(operation.last_hash), int(operation.last_hash) + op_size, page_size)
+        for j in range(
+            int(operation.last_hash), int(operation.last_hash) + op_size, page_size
+        )
     ]
 
 tik = time.monotonic()
