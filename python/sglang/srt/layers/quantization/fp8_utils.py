@@ -736,7 +736,7 @@ def apply_fp8_linear(
                     assert (
                         weight_scale.numel() == weight.shape[1]
                     ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
-                    
+
                     cutlass_compatible_b = (
                         weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
                     )
