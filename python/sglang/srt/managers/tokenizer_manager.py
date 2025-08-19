@@ -636,7 +636,7 @@ class TokenizerManager:
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
         if isinstance(obj.sampling_params, SamplingParams):
-            sampling_kwargs = obj.sampling_params.__dict__.copy()
+            sampling_kwargs = obj.sampling_params.to_input_dict()
         elif isinstance(obj.sampling_params, dict):
             sampling_kwargs = obj.sampling_params.copy()
         else:

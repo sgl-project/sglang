@@ -166,3 +166,13 @@ class SamplingParams:
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
+
+    def to_input_dict(self) -> Dict[str, Any]:
+        """
+        Convert the sampling parameters to a dictionary format.
+        Should only be used for downstream to construct a new SamplingParams object.
+        """
+        input_dict = self.__dict__.copy()
+        if "stop_strs" in input_dict:
+            input_dict["stop"] = input_dict.pop("stop_strs")
+        return input_dict
