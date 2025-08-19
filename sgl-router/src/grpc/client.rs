@@ -35,7 +35,7 @@ impl SglangSchedulerClient {
         let request = Request::new(proto::InitializeRequest {
             client_id,
             client_version: "0.1.0".to_string(),
-            mode: 0, // Regular mode
+            mode: proto::initialize_request::Mode::Regular as i32,
         });
 
         let response = self.client.initialize(request).await?;
@@ -76,7 +76,7 @@ impl SglangSchedulerClient {
             flush_all,
             session_ids: session_ids.to_vec(),
         });
-        
+
         let response = self.client.flush_cache(request).await?;
         Ok(response.into_inner())
     }
