@@ -12,7 +12,12 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.utils import is_blackwell, is_cuda, print_info_once
+from sglang.srt.utils import (
+    get_device_capability,
+    is_blackwell,
+    is_cuda,
+    print_info_once,
+)
 
 _is_cuda = is_cuda()
 
@@ -471,11 +476,16 @@ class VisionAttention(nn.Module):
         elif passed_backend is not None:
             backend = passed_backend
         elif is_cuda():
-            backend = "triton_attn"
+            major, minor = get_device_capability()
+            if major == 9:
+                backend = "fa3"
+            else:
+                backend = "triton_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell():
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
+
         return backend
 
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
