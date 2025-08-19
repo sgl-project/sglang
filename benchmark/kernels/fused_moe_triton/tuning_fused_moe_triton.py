@@ -2,8 +2,8 @@
 import argparse
 import json
 import time
-from datetime import datetime
 from contextlib import nullcontext
+from datetime import datetime
 from typing import Any, Dict, List, Tuple, TypedDict
 
 import ray
