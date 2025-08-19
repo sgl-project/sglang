@@ -31,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLVisionConfig,
@@ -43,7 +44,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from sglang.srt.distributed import utils as dist_utils
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -262,8 +262,8 @@ class Qwen2_5_VisionBlock(nn.Module):
         super().__init__()
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm1 = RMSNorm(dim, eps=1e-6)
-        self.norm2 = RMSNorm(dim, eps=1e-6)
+        self.norm1 = Qwen2RMSNorm(dim, eps=1e-6)
+        self.norm2 = Qwen2RMSNorm(dim, eps=1e-6)
 
         if attn_implementation is None:
             softmax_in_single_precision = False
@@ -345,7 +345,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = RMSNorm(context_dim, eps=1e-6)
+        self.ln_q = Qwen2RMSNorm(context_dim, eps=1e-6)
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
