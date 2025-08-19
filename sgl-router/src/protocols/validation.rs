@@ -341,6 +341,36 @@ pub mod utils {
 
         Ok(())
     }
+
+    /// Validate conflicting structured output constraints
+    pub fn validate_conflicting_parameters(
+        param1_name: &str,
+        param1_value: bool,
+        param2_name: &str, 
+        param2_value: bool,
+        reason: &str,
+    ) -> Result<(), ValidationError> {
+        if param1_value && param2_value {
+            return Err(ValidationError::ConflictingParameters {
+                parameter1: param1_name.to_string(),
+                parameter2: param2_name.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate that only one option from a set is active
+    pub fn validate_mutually_exclusive_options(
+        options: &[(&str, bool)],
+        error_msg: &str,
+    ) -> Result<(), ValidationError> {
+        let active_count = options.iter().filter(|(_, is_active)| *is_active).count();
+        if active_count > 1 {
+            return Err(ValidationError::Custom(error_msg.to_string()));
+        }
+        Ok(())
+    }
 }
 
 /// Core validation traits for different parameter categories

@@ -6,8 +6,9 @@ use crate::protocols::openai::chat::types::{ChatMessage, ResponseFormat, UserMes
 use crate::protocols::validation::{
     constants::*,
     utils::{
-        validate_logprobs, validate_range, validate_sampling_options, validate_stop_conditions,
-        validate_token_limits, validate_top_k,
+        validate_conflicting_parameters, validate_cross_parameters, validate_logprobs,
+        validate_mutually_exclusive_options, validate_range, validate_sampling_options,
+        validate_stop_conditions, validate_token_limits, validate_top_k,
     },
     LogProbsProvider, SamplingOptionsProvider, StopConditionsProvider, TokenLimitsProvider,
     ValidatableRequest, ValidationError,
@@ -96,41 +97,27 @@ impl ChatCompletionRequest {
             });
         }
 
-        // Validate message sequence (optional but recommended)
-        // System messages should come first, followed by user/assistant alternation
-        let mut _last_role = None;
+        // Validate message content is not empty
         for (i, msg) in self.messages.iter().enumerate() {
-            match msg {
-                ChatMessage::System { .. } => {
-                    // System messages should typically be at the beginning
-                    if i > 0 && !matches!(self.messages[i - 1], ChatMessage::System { .. }) {
-                        // This is a warning, not an error - some use cases may need this
+            if let ChatMessage::User { content, .. } = msg {
+                match content {
+                    UserMessageContent::Text(text) if text.is_empty() => {
+                        return Err(ValidationError::InvalidValue {
+                            parameter: format!("messages[{}].content", i),
+                            value: "empty".to_string(),
+                            reason: "message content cannot be empty".to_string(),
+                        });
                     }
-                }
-                ChatMessage::User { content, .. } => {
-                    // Validate user message content is not empty
-                    match content {
-                        UserMessageContent::Text(text) if text.is_empty() => {
-                            return Err(ValidationError::InvalidValue {
-                                parameter: format!("messages[{}].content", i),
-                                value: "empty".to_string(),
-                                reason: "message content cannot be empty".to_string(),
-                            });
-                        }
-                        UserMessageContent::Parts(parts) if parts.is_empty() => {
-                            return Err(ValidationError::InvalidValue {
-                                parameter: format!("messages[{}].content", i),
-                                value: "empty array".to_string(),
-                                reason: "message content parts cannot be empty".to_string(),
-                            });
-                        }
-                        _ => {}
+                    UserMessageContent::Parts(parts) if parts.is_empty() => {
+                        return Err(ValidationError::InvalidValue {
+                            parameter: format!("messages[{}].content", i),
+                            value: "empty array".to_string(),
+                            reason: "message content parts cannot be empty".to_string(),
+                        });
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-
-            _last_role = Some(msg);
         }
 
         Ok(())
@@ -138,31 +125,15 @@ impl ChatCompletionRequest {
 
     /// Validate response format if specified
     pub fn validate_response_format(&self) -> Result<(), ValidationError> {
-        if let Some(ref format) = self.response_format {
-            match format {
-                ResponseFormat::JsonObject => {
-                    // JSON mode requires compatible model
-                    // This is a runtime check, not a static validation
-                }
-                ResponseFormat::JsonSchema { json_schema } => {
-                    // Validate JSON schema has required fields
-                    if json_schema.name.is_empty() {
-                        return Err(ValidationError::InvalidValue {
-                            parameter: "response_format.json_schema.name".to_string(),
-                            value: "empty".to_string(),
-                            reason: "JSON schema name cannot be empty".to_string(),
-                        });
-                    }
-
-                    // Schema should be a valid JSON schema object
-                    // This would require deeper validation in production
-                }
-                ResponseFormat::Text => {
-                    // Text format has no special requirements
-                }
+        if let Some(ResponseFormat::JsonSchema { json_schema }) = &self.response_format {
+            if json_schema.name.is_empty() {
+                return Err(ValidationError::InvalidValue {
+                    parameter: "response_format.json_schema.name".to_string(),
+                    value: "empty".to_string(),
+                    reason: "JSON schema name cannot be empty".to_string(),
+                });
             }
         }
-
         Ok(())
     }
 
@@ -198,7 +169,6 @@ impl ChatCompletionRequest {
                 });
             }
 
-            // Most providers limit n to a reasonable number (e.g., 10)
             const MAX_N: u32 = 10;
             if n > MAX_N {
                 return Err(ValidationError::InvalidValue {
@@ -232,8 +202,11 @@ impl ValidatableRequest for ChatCompletionRequest {
         // Chat API specific logprobs validation
         self.validate_chat_logprobs()?;
 
-        // Cross-parameter validation
-        self.validate_cross_parameters()?;
+        // Cross-parameter validation (generic)
+        validate_cross_parameters(self)?;
+        
+        // Chat-specific cross-parameter validation
+        self.validate_chat_cross_parameters()?;
 
         Ok(())
     }
@@ -241,86 +214,58 @@ impl ValidatableRequest for ChatCompletionRequest {
 
 impl ChatCompletionRequest {
     /// Validate cross-parameter relationships specific to chat completions
-    pub fn validate_cross_parameters(&self) -> Result<(), ValidationError> {
-        // Check min_tokens <= max_tokens if both are specified
-        if let (Some(min_tokens), Some(max_tokens)) = (self.min_tokens, self.get_max_tokens()) {
-            if min_tokens > max_tokens {
-                return Err(ValidationError::ConflictingParameters {
-                    parameter1: "min_tokens".to_string(),
-                    parameter2: "max_tokens/max_completion_tokens".to_string(),
-                    reason: format!(
-                        "min_tokens ({}) cannot be greater than max_tokens ({})",
-                        min_tokens, max_tokens
-                    ),
-                });
-            }
-        }
-
-        // Warn about conflicting parameters (temperature vs deterministic settings)
-        if let Some(temp) = self.temperature {
-            if temp == 0.0 && self.top_p.is_some() && self.top_p != Some(1.0) {
-                // This is a warning - temperature=0 makes sampling deterministic,
-                // so top_p has no effect
-            }
-        }
-
+    pub fn validate_chat_cross_parameters(&self) -> Result<(), ValidationError> {
         // Validate that both max_tokens and max_completion_tokens aren't set
-        if self.max_tokens.is_some() && self.max_completion_tokens.is_some() {
-            return Err(ValidationError::ConflictingParameters {
-                parameter1: "max_tokens".to_string(),
-                parameter2: "max_completion_tokens".to_string(),
-                reason: "cannot specify both max_tokens and max_completion_tokens".to_string(),
-            });
-        }
+        validate_conflicting_parameters(
+            "max_tokens",
+            self.max_tokens.is_some(),
+            "max_completion_tokens",
+            self.max_completion_tokens.is_some(),
+            "cannot specify both max_tokens and max_completion_tokens",
+        )?;
 
         // Validate that tools and functions aren't both specified (deprecated)
-        if self.tools.is_some() && self.functions.is_some() {
-            return Err(ValidationError::ConflictingParameters {
-                parameter1: "tools".to_string(),
-                parameter2: "functions".to_string(),
-                reason: "functions is deprecated, use tools instead".to_string(),
-            });
-        }
+        validate_conflicting_parameters(
+            "tools",
+            self.tools.is_some(),
+            "functions", 
+            self.functions.is_some(),
+            "functions is deprecated, use tools instead",
+        )?;
 
-        // Validate structured output constraints don't conflict
-        if let Some(ref response_format) = self.response_format {
-            // Can't have both response_format JSON and regex/ebnf constraints
-            if matches!(
-                response_format,
-                ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. }
-            ) {
-                if self.regex.is_some() {
-                    return Err(ValidationError::ConflictingParameters {
-                        parameter1: "response_format".to_string(),
-                        parameter2: "regex".to_string(),
-                        reason: "cannot use regex constraint with JSON response format".to_string(),
-                    });
-                }
-                if self.ebnf.is_some() {
-                    return Err(ValidationError::ConflictingParameters {
-                        parameter1: "response_format".to_string(),
-                        parameter2: "ebnf".to_string(),
-                        reason: "cannot use EBNF constraint with JSON response format".to_string(),
-                    });
-                }
-            }
-        }
+        // Validate structured output constraints don't conflict with JSON response format
+        let has_json_format = matches!(
+            self.response_format,
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        );
+        
+        validate_conflicting_parameters(
+            "response_format",
+            has_json_format,
+            "regex",
+            self.regex.is_some(),
+            "cannot use regex constraint with JSON response format",
+        )?;
+
+        validate_conflicting_parameters(
+            "response_format", 
+            has_json_format,
+            "ebnf",
+            self.ebnf.is_some(),
+            "cannot use EBNF constraint with JSON response format",
+        )?;
 
         // Only one structured output constraint should be active
         let structured_constraints = [
-            self.regex.is_some(),
-            self.ebnf.is_some(),
-            matches!(
-                self.response_format,
-                Some(ResponseFormat::JsonSchema { .. })
-            ),
+            ("regex", self.regex.is_some()),
+            ("ebnf", self.ebnf.is_some()),
+            ("json_schema", matches!(self.response_format, Some(ResponseFormat::JsonSchema { .. }))),
         ];
-        let active_count = structured_constraints.iter().filter(|&&x| x).count();
-        if active_count > 1 {
-            return Err(ValidationError::Custom(
-                "Only one structured output constraint (regex, ebnf, or json_schema) can be active at a time".to_string()
-            ));
-        }
+        
+        validate_mutually_exclusive_options(
+            &structured_constraints,
+            "Only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
+        )?;
 
         Ok(())
     }
