@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::reasoning_parser::parsers::BaseReasoningParser;
+use crate::reasoning_parser::parsers::{
+    BaseReasoningParser, DeepSeekR1Parser, KimiParser, Qwen3Parser, QwenThinkingParser,
+};
 use crate::reasoning_parser::traits::{ParseError, ParserConfig, ReasoningParser};
 
 /// Type alias for parser creator functions.
@@ -82,53 +84,17 @@ impl ParserFactory {
             Box::new(BaseReasoningParser::new(ParserConfig::default()))
         });
 
-        // Register DeepSeek-R1 parser
-        registry.register_parser("deepseek_r1", || {
-            let config = ParserConfig {
-                think_start_token: "<think>".to_string(),
-                think_end_token: "</think>".to_string(),
-                force_reasoning: true,
-                stream_reasoning: true,
-                max_buffer_size: 65536,
-            };
-            Box::new(BaseReasoningParser::new(config).with_model_type("deepseek_r1".to_string()))
-        });
+        // Register DeepSeek-R1 parser (starts with in_reasoning=true)
+        registry.register_parser("deepseek_r1", || Box::new(DeepSeekR1Parser::new()));
 
-        // Register Qwen3 parser
-        registry.register_parser("qwen3", || {
-            let config = ParserConfig {
-                think_start_token: "<think>".to_string(),
-                think_end_token: "</think>".to_string(),
-                force_reasoning: false,
-                stream_reasoning: true,
-                max_buffer_size: 65536,
-            };
-            Box::new(BaseReasoningParser::new(config).with_model_type("qwen3".to_string()))
-        });
+        // Register Qwen3 parser (starts with in_reasoning=false)
+        registry.register_parser("qwen3", || Box::new(Qwen3Parser::new()));
 
-        // Register Qwen3-thinking parser (forced reasoning)
-        registry.register_parser("qwen3_thinking", || {
-            let config = ParserConfig {
-                think_start_token: "<think>".to_string(),
-                think_end_token: "</think>".to_string(),
-                force_reasoning: true,
-                stream_reasoning: true,
-                max_buffer_size: 65536,
-            };
-            Box::new(BaseReasoningParser::new(config).with_model_type("qwen3_thinking".to_string()))
-        });
+        // Register Qwen3-thinking parser (starts with in_reasoning=true)
+        registry.register_parser("qwen3_thinking", || Box::new(QwenThinkingParser::new()));
 
-        // Register Kimi parser with Unicode tokens
-        registry.register_parser("kimi", || {
-            let config = ParserConfig {
-                think_start_token: "◁think▷".to_string(),
-                think_end_token: "◁/think▷".to_string(),
-                force_reasoning: false,
-                stream_reasoning: true,
-                max_buffer_size: 65536,
-            };
-            Box::new(BaseReasoningParser::new(config).with_model_type("kimi".to_string()))
-        });
+        // Register Kimi parser with Unicode tokens (starts with in_reasoning=false)
+        registry.register_parser("kimi", || Box::new(KimiParser::new()));
 
         // Register model patterns
         registry.register_pattern("deepseek-r1", "deepseek_r1");
@@ -155,9 +121,9 @@ impl ParserFactory {
         let config = ParserConfig {
             think_start_token: "".to_string(),
             think_end_token: "".to_string(),
-            force_reasoning: false,
             stream_reasoning: true,
             max_buffer_size: 65536,
+            initial_in_reasoning: false,
         };
         Ok(Box::new(
             BaseReasoningParser::new(config).with_model_type("passthrough".to_string()),
