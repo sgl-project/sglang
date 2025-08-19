@@ -20,7 +20,6 @@ if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 from sglang.srt.distributed import (
-    parallel_state,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
@@ -463,8 +462,7 @@ class VisionAttention(nn.Module):
         Priority: server args override > constructor arg > platform default.
 
         Platform defaults:
-        - Blackwell: "triton_attn"
-        - Other CUDA: "fa3"
+        - CUDA: "triton"
         - Non-CUDA: "sdpa"
         """
         override_backend = global_server_args_dict["mm_attention_backend"]
@@ -477,7 +475,7 @@ class VisionAttention(nn.Module):
         if passed_backend is not None:
             return passed_backend
         if is_cuda():
-            return "triton_attn" if is_blackwell() else "fa3"
+            return "triton_attn"
         return "sdpa"
 
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
