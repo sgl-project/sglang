@@ -1,8 +1,8 @@
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import torch
-from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
+from sgl_kernel.utils import get_cuda_stream, is_arch_support_pdl
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -41,7 +41,7 @@ def rmsnorm(
     if out is None:
         out = torch.empty_like(input)
     if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
@@ -77,7 +77,7 @@ def fused_add_rmsnorm(
         If None, will be automatically enabled on Hopper architecture.
     """
     if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.fused_add_rmsnorm.default(
         input, residual, weight, eps, enable_pdl
     )
@@ -117,7 +117,7 @@ def gemma_rmsnorm(
     if out is None:
         out = torch.empty_like(input)
     if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
@@ -153,7 +153,7 @@ def gemma_fused_add_rmsnorm(
         If None, will be automatically enabled on Hopper architecture.
     """
     if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
+        enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
         input, residual, weight, eps, enable_pdl
     )
@@ -344,4 +344,20 @@ def apply_rope_with_cos_sin_cache_inplace(
             if fused_set_kv_buffer_arg is not None
             else None
         ),
+    )
+
+
+def downcast_fp8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    loc: torch.Tensor,
+    mult: int = 1,
+    offset: int = 0,
+) -> None:
+    torch.ops.sgl_kernel.downcast_fp8(
+        k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset, get_cuda_stream()
     )
