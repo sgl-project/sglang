@@ -23,6 +23,7 @@ import sys
 import tempfile
 from typing import List, Literal, Optional, Union
 
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.lora.lora_registry import LoRARef
@@ -33,6 +34,7 @@ from sglang.srt.utils import (
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
+    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -1230,23 +1232,13 @@ class ServerArgs:
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
+        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=[  # TODO: use FunctionCallParser.DetectorMap.keys()
-                "qwen25",
-                "mistral",
-                "llama3",
-                "deepseekv3",
-                "pythonic",
-                "kimi_k2",
-                "qwen3_coder",
-                "glm45",
-                "step3",
-                "gpt-oss",
-            ],
+            choices=tool_call_parser_choices,
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
+            help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
         )
         parser.add_argument(
             "--tool-server",
@@ -2165,9 +2157,9 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
             if self.attention_backend is None:
-                if is_sm100_supported():
+                if is_cuda() and is_sm100_supported():
                     self.attention_backend = "trtllm_mha"
-                elif is_sm90_supported():
+                elif is_cuda() and is_sm90_supported():
                     self.attention_backend = "fa3"
                 else:
                     self.attention_backend = "triton"
