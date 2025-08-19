@@ -40,8 +40,9 @@ compile:
 
 # Serve documentation with auto-build and live reload
 serve:
-	@echo "Starting auto-build server at http://localhost:$(PORT)"
+	@echo "Starting auto-build server at http://0.0.0.0:$(PORT)"
 	@$(SPHINXAUTOBUILD) "$(SOURCEDIR)" "$(BUILDDIR)/html" \
+		--host 0.0.0.0 \
 		--port $(PORT) \
 		--watch $(SOURCEDIR) \
 		--re-ignore ".*\.(ipynb_checkpoints|pyc|pyo|pyd|git)"

@@ -11,29 +11,32 @@ pub struct RouterFactory;
 
 impl RouterFactory {
     /// Create a router instance from application context
-    pub fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+    pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
         match &ctx.router_config.mode {
             RoutingMode::Regular { worker_urls } => {
-                Self::create_regular_router(worker_urls, &ctx.router_config.policy, ctx)
+                Self::create_regular_router(worker_urls, &ctx.router_config.policy, ctx).await
             }
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
                 prefill_policy,
                 decode_policy,
-            } => Self::create_pd_router(
-                prefill_urls,
-                decode_urls,
-                prefill_policy.as_ref(),
-                decode_policy.as_ref(),
-                &ctx.router_config.policy,
-                ctx,
-            ),
+            } => {
+                Self::create_pd_router(
+                    prefill_urls,
+                    decode_urls,
+                    prefill_policy.as_ref(),
+                    decode_policy.as_ref(),
+                    &ctx.router_config.policy,
+                    ctx,
+                )
+                .await
+            }
         }
     }
 
     /// Create a regular router with injected policy
-    fn create_regular_router(
+    async fn create_regular_router(
         worker_urls: &[String],
         policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
@@ -51,13 +54,15 @@ impl RouterFactory {
             ctx.router_config.dp_aware,
             ctx.router_config.api_key.clone(),
             ctx.router_config.retry.clone(),
-        )?;
+            ctx.router_config.circuit_breaker.clone(),
+        )
+        .await?;
 
         Ok(Box::new(router))
     }
 
     /// Create a PD router with injected policy
-    fn create_pd_router(
+    async fn create_pd_router(
         prefill_urls: &[(String, Option<u16>)],
         decode_urls: &[String],
         prefill_policy_config: Option<&PolicyConfig>,
@@ -81,7 +86,9 @@ impl RouterFactory {
             ctx.router_config.worker_startup_timeout_secs,
             ctx.router_config.worker_startup_check_interval_secs,
             ctx.router_config.retry.clone(),
-        )?;
+            ctx.router_config.circuit_breaker.clone(),
+        )
+        .await?;
 
         Ok(Box::new(router))
     }
