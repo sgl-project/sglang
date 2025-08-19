@@ -26,13 +26,28 @@ pub enum Encoding {
     Hf(Box<tokenizers::tokenizer::Encoding>),
     /// Sentence Piece
     Sp(Vec<u32>),
+    /// Tiktoken (for GPT models)
+    Tiktoken(Vec<usize>),
 }
 
 impl Encoding {
-    pub fn token_ids(&self) -> &[u32] {
+    pub fn token_ids(&self) -> Vec<u32> {
+        match self {
+            Encoding::Hf(inner) => inner.get_ids().to_vec(),
+            Encoding::Sp(inner) => inner.clone(),
+            Encoding::Tiktoken(inner) => inner.iter().map(|&id| id as u32).collect(),
+        }
+    }
+
+    pub fn token_ids_ref(&self) -> &[u32] {
         match self {
             Encoding::Hf(inner) => inner.get_ids(),
             Encoding::Sp(inner) => inner,
+            Encoding::Tiktoken(_) => {
+                // Tiktoken uses usize, we can't return a reference to u32
+                // This is a limitation - callers should use token_ids() for Tiktoken
+                &[]
+            }
         }
     }
 }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub mod factory;
 pub mod mock;
+pub mod sequence;
 pub mod stop;
 pub mod stream;
 pub mod traits;
@@ -12,17 +13,24 @@ pub mod traits;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
 
+#[cfg(feature = "tiktoken")]
+pub mod tiktoken;
+
 #[cfg(test)]
 mod tests;
 
 // Re-exports
 pub use factory::{create_tokenizer, create_tokenizer_from_file, TokenizerType};
+pub use sequence::Sequence;
 pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 pub use stream::DecodeStream;
 pub use traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as TokenizerTrait};
 
 #[cfg(feature = "huggingface")]
 pub use huggingface::{ChatMessage, HuggingFaceTokenizer};
+
+#[cfg(feature = "tiktoken")]
+pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
 
 /// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations
 #[derive(Clone)]
