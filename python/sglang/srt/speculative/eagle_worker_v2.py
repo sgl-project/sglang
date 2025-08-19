@@ -402,7 +402,7 @@ class EAGLEWorker(TpModelWorker):
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 spec_info,
                 (
-                    self.target_worker.model_runner.cuda_graph_runner.bs
+                    self.target_worker.model_runner.graph_runner.bs
                     if can_run_cuda_graph
                     else None
                 ),

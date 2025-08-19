@@ -231,15 +231,11 @@ class EagleVerifyInput:
 
         # Run attention backend plan and cuda graph preparation
         can_run_cuda_graph = bool(
-            target_worker.model_runner.cuda_graph_runner
-            and target_worker.model_runner.cuda_graph_runner.can_run(
-                verify_forward_batch
-            )
+            target_worker.model_runner.graph_runner
+            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
         )
         if can_run_cuda_graph:
-            target_worker.model_runner.cuda_graph_runner.replay_prepare(
-                verify_forward_batch
-            )
+            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
         else:
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch
