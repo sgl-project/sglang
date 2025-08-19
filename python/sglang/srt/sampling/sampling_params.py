@@ -171,8 +171,11 @@ class SamplingParams:
         """
         Convert the sampling parameters to a dictionary format.
         Should only be used for downstream to construct a new SamplingParams object.
+        Note greedy sampling(temperature=0) will be passed as temperature=1.0, top_k=1,
+        which is equivalent to greedy sampling.
         """
         input_dict = self.__dict__.copy()
         if "stop_strs" in input_dict:
             input_dict["stop"] = input_dict.pop("stop_strs")
+        input_dict.pop("stop_str_max_len")
         return input_dict
