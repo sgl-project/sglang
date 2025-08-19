@@ -12,7 +12,6 @@ from dataclasses import dataclass
 import httpx
 import numpy as np
 import openai
-import transformers
 from datasets import load_dataset
 from openai import AsyncOpenAI
 from tqdm import tqdm
