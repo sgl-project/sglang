@@ -13,9 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Generate both client and server code
         .build_server(true)
         .build_client(true)
-        // Add a module-level attribute for documentation
-        .server_mod_attribute("sglang.grpc.scheduler", "#[allow(unused)]")
-        .client_mod_attribute("sglang.grpc.scheduler", "#[allow(unused)]")
+        // Add a module-level attribute for documentation and clippy warnings
+        .server_mod_attribute("sglang.grpc.scheduler", "#[allow(unused, clippy::mixed_attributes_style)]")
+        .client_mod_attribute("sglang.grpc.scheduler", "#[allow(unused, clippy::mixed_attributes_style)]")
         // Compile the proto file with the custom config
         .compile_protos_with_config(
             config,
