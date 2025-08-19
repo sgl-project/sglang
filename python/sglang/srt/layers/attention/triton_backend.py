@@ -289,6 +289,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.req_to_token,
                 )
             )
+            kv_indices = kv_indices.to(torch.int64)
             mask_indptr = None
             # TODO(FIXME): This will trigger an invalid Eagle tree when using
             # `max(spec_info.accept_length_cpu)`.
