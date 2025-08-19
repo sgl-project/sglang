@@ -13,11 +13,12 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
 use crate::protocols::{
-    common::StringOrArray,
+    common::{GenerationRequest, StringOrArray},
     generate::GenerateRequest,
     openai::{
         chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
         completions::CompletionRequest,
+        responses::ResponsesRequest,
     },
 };
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1820,6 +1821,43 @@ impl RouterTrait for PDRouter {
         // Create context
         let context = PDRequestContext {
             route: "/v1/completions",
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+        };
+
+        // Execute with retry and bootstrap injection
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+    ) -> Response {
+        // Extract parameters
+        let is_stream = body.stream;
+        let return_logprob = body.top_logprobs.is_some();
+        
+        // Extract text for cache-aware routing
+        let request_text = if self.policies_need_request_text() {
+            body.extract_text_for_routing()
+        } else {
+            String::new()
+        };
+        let request_text = if request_text.is_empty() {
+            None
+        } else {
+            Some(request_text)
+        };
+
+        // Calculate batch size (responses are typically single requests)
+        let batch_size = Some(1);
+
+        // Create context
+        let context = PDRequestContext {
+            route: "/v1/responses",
             batch_size,
             is_stream,
             return_logprob,

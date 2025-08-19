@@ -12,7 +12,7 @@ use crate::policies::LoadBalancingPolicy;
 use crate::protocols::{
     common::GenerationRequest,
     generate::GenerateRequest,
-    openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
+    openai::{chat::ChatCompletionRequest, completions::CompletionRequest, responses::ResponsesRequest},
 };
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::{
@@ -1165,6 +1165,15 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/completions")
+            .await
+    }
+
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/responses")
             .await
     }
 

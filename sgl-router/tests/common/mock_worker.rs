@@ -80,6 +80,7 @@ impl MockWorker {
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
+            .route("/v1/responses", post(responses_handler))
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
@@ -542,6 +543,123 @@ async fn completions_handler(
                 "completion_tokens": 5,
                 "total_tokens": 15
             }
+        }))
+        .into_response()
+    }
+}
+
+async fn responses_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "Random failure for testing",
+                    "type": "internal_error", 
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    let is_stream = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let request_id = format!("resp_{}", Uuid::new_v4());
+    let model = payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mock-model")
+        .to_string();
+    
+    let tools = payload
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if is_stream {
+        // Return streaming response format
+        let stream_request_id = request_id.clone();
+        let stream_model = model.clone();
+        let stream_tools = tools.clone();
+        let stream = stream::once(async move {
+            let chunk = json!({
+                "id": stream_request_id,
+                "object": "response",
+                "created_at": timestamp,
+                "model": stream_model,
+                "output": [
+                    {
+                        "type": "message",
+                        "id": format!("msg-{}", Uuid::new_v4()),
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "This is a mock response.",
+                            "annotations": []
+                        }],
+                        "status": "completed"
+                    }
+                ],
+                "status": "completed",
+                "parallel_tool_calls": true,
+                "tool_choice": "auto",
+                "tools": stream_tools
+            });
+            Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
+        })
+        .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+        
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        // Return non-streaming response
+        Json(json!({
+            "id": request_id,
+            "object": "response",
+            "created_at": timestamp,
+            "model": model,
+            "output": [
+                {
+                    "type": "message",
+                    "id": format!("msg-{}", Uuid::new_v4()),
+                    "role": "assistant", 
+                    "content": [{
+                        "type": "output_text",
+                        "text": "This is a mock response.",
+                        "annotations": []
+                    }],
+                    "status": "completed"
+                }
+            ],
+            "status": "completed",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5, 
+                "total_tokens": 15
+            },
+            "parallel_tool_calls": true,
+            "tool_choice": "auto",
+            "tools": tools
         }))
         .into_response()
     }

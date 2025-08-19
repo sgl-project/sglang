@@ -3,7 +3,7 @@ use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::protocols::{
     generate::GenerateRequest,
-    openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
+    openai::{chat::ChatCompletionRequest, completions::CompletionRequest, responses::ResponsesRequest},
 };
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
@@ -113,6 +113,14 @@ async fn v1_completions(
     state.router.route_completion(Some(&headers), &body).await
 }
 
+async fn v1_responses(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<ResponsesRequest>,
+) -> Response {
+    state.router.route_responses(Some(&headers), &body).await
+}
+
 // Worker management endpoints
 async fn add_worker(
     State(state): State<Arc<AppState>>,
@@ -189,7 +197,8 @@ pub fn build_app(
     let protected_routes = Router::new()
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
-        .route("/v1/completions", post(v1_completions));
+        .route("/v1/completions", post(v1_completions))
+        .route("/v1/responses", post(v1_responses));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))

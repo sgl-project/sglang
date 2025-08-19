@@ -11,7 +11,7 @@ use std::fmt::Debug;
 
 use crate::protocols::{
     generate::GenerateRequest,
-    openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
+    openai::{chat::ChatCompletionRequest, completions::CompletionRequest, responses::ResponsesRequest},
 };
 
 pub mod factory;
@@ -78,6 +78,13 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         &self,
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
+    ) -> Response;
+
+    /// Route a responses request
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
     ) -> Response;
 
     /// Flush cache on all workers
