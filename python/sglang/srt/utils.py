@@ -421,12 +421,13 @@ def get_available_gpu_memory(
         else:
             libnuma = ctypes.CDLL(
                 "libnuma" + (
-                    ".dylib" if platform.system() == "Darwin" else ".so"
-                ), use_errno=True
+                    ".dylib" if platform.system() == "Darwin" else ".so"),
+                    use_errno=True,
             )
             libnuma.numa_max_node.restype = ctypes.c_int
             libnuma.numa_node_size64.argtypes = [
-                ctypes.c_int, ctypes.POINTER(ctypes.c_longlong)
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_longlong),
             ]
             libnuma.numa_node_size64.restype = ctypes.c_longlong
             if gpu_id < 0 or gpu_id > libnuma.numa_max_node():
