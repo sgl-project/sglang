@@ -1,7 +1,10 @@
 use crate::config::RouterConfig;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
-use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
+use crate::protocols::{
+    generate::GenerateRequest,
+    openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
+};
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use axum::{
@@ -285,7 +288,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     ));
 
     // Create router with the context
-    let router = RouterFactory::create_router(&app_context)?;
+    let router = RouterFactory::create_router(&app_context).await?;
 
     // Create app state with router and context
     let app_state = Arc::new(AppState {

@@ -260,6 +260,7 @@ class HiCacheController:
                 self.storage_backend = MooncakeStore()
                 self.get_hash_str = get_hash_str_mooncake
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
+                assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
                 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
@@ -298,6 +299,9 @@ class HiCacheController:
             if self.tp_world_size > 1:
                 group_ranks = torch.distributed.get_process_group_ranks(tp_group)
                 self.prefetch_tp_group = torch.distributed.new_group(
+                    group_ranks, backend="gloo"
+                )
+                self.prefetch_io_tp_group = torch.distributed.new_group(
                     group_ranks, backend="gloo"
                 )
                 self.backup_tp_group = torch.distributed.new_group(
@@ -630,7 +634,7 @@ class HiCacheController:
 
                 if self.tp_world_size > 1:
                     # to ensure all TP workers release the host memory at the same time
-                    torch.distributed.barrier(group=self.prefetch_tp_group)
+                    torch.distributed.barrier(group=self.prefetch_io_tp_group)
                 # operation terminated by controller, release pre-allocated memory
                 self.mem_pool_host.free(
                     operation.host_indices[operation.completed_tokens :]
