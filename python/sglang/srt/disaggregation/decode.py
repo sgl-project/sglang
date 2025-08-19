@@ -932,19 +932,6 @@ class SchedulerDisaggregationDecodeMixin:
         model_runner.init_cuda_graphs()
         self.req_to_token_pool.set_prealloc_size(0)
 
-        # same code in ServerArgs
-        if self.server_args.disaggregation_decode_dp is None:
-            self.server_args.disaggregation_decode_dp = self.dp_size
-        if self.server_args.disaggregation_decode_tp is None:
-            self.server_args.disaggregation_decode_tp = self.tp_size
-
-        self.server_args.validate_disagg_tp_size(
-            self.tp_size, self.server_args.disaggregation_decode_tp
-        )
-
-        if self.server_args.disaggregation_prefill_pp is None:
-            self.server_args.disaggregation_prefill_pp = self.pp_size
-
         self.disaggregation_mode = DisaggregationMode.PREFILL
 
         # reinitialize the tree cache for prefill, as prefill may use radix_cache or hiradix_cache

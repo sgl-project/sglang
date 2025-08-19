@@ -2481,7 +2481,6 @@ class Scheduler(
             self.server_args.disaggregation_bootstrap_port = None
             self.server_args.disaggregation_decode_dp = None
             self.server_args.disaggregation_decode_tp = None
-            self.server_args.disaggregation_prefill_pp = 1
             # tree cache
             self.server_args.disable_radix_cache = True
             self.enable_hierarchical_cache = False
@@ -2497,6 +2496,8 @@ class Scheduler(
             self.server_args.enable_profile_cuda_graph = (
                 recv_req.enable_profile_cuda_graph
             )
+            self.server_args.disaggregation_mode = "decode"
+            self.server_args.__post_init__()
             # stop prefill event loop
             self.stop_prefill_event.set()
             return ConvertDisaggregationRoleReqOutput(
@@ -2526,7 +2527,7 @@ class Scheduler(
                 self.server_args.hicache_size = recv_req.hicache_size
                 self.server_args.hicache_write_policy = recv_req.hicache_write_policy
                 self.server_args.hicache_io_backend = recv_req.hicache_io_backend
-                self.enable_hicache_storage = recv_req.hicache_storage_backend
+                self.enable_hicache_storage = recv_req.hicache_storage_backend is not None
                 self.server_args.hicache_storage_backend = (
                     recv_req.hicache_storage_backend
                 )
@@ -2536,6 +2537,9 @@ class Scheduler(
                 self.server_args.hicache_mem_layout = recv_req.hicache_mem_layout
             # cuda graph
             self.server_args.disable_cuda_graph = True
+            
+            self.server_args.disaggregation_mode = "prefill"
+            self.server_args.__post_init__()
             # stop decode event loop
             self.stop_decode_event.set()
             return ConvertDisaggregationRoleReqOutput(
