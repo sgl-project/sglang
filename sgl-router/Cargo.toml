@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = ["huggingface"]
 huggingface = ["tokenizers"]
+tiktoken = ["tiktoken-rs"]
 
 [lib]
 name = "sglang_router_rs"
@@ -49,6 +50,7 @@ url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
 tokenizers = { version = "0.21.4", optional = true }
+tiktoken-rs = { version = "0.5", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
