@@ -10,9 +10,9 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
-from sglang.srt.distributed import parallel_state
+from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
@@ -412,7 +412,7 @@ class InternVLChatModel(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self._update_vision_config()
+        vision_utils.update_vit_attn_dummy_heads_config(self.config)
         image_size = config.force_image_size or config.vision_config.image_size
         patch_size = config.vision_config.patch_size
         self.patch_size = patch_size
@@ -461,21 +461,6 @@ class InternVLChatModel(nn.Module):
             nn.GELU(),
             nn.Linear(llm_hidden_size, llm_hidden_size),
         )
-
-    def _update_vision_config(self):
-        """update vision config to support tp"""
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-        num_heads = self.config.vision_config.num_attention_heads
-        head_dim = self.config.vision_config.hidden_size // num_heads
-        num_dummy_heads = 0
-
-        if num_heads % world_size != 0:
-            num_dummy_heads = (
-                (num_heads + world_size) // world_size
-            ) * world_size - num_heads
-
-        setattr(self.config.vision_config, "head_dim", head_dim)
-        setattr(self.config.vision_config, "num_dummy_heads", num_dummy_heads)
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
@@ -559,36 +544,6 @@ class InternVLChatModel(nn.Module):
 
         return helper.pad_input_tokens(input_ids, mm_inputs)
 
-    def _pad_vit_attn_dummy_heads(self, name: str, loaded_weight: torch.Tensor):
-        """pad attn qkv weights for dummy heads"""
-        num_dummy_heads = self.config.vision_config.num_dummy_heads
-        if num_dummy_heads == 0:
-            return loaded_weight
-        head_dim = self.config.vision_config.head_dim
-
-        if "attn.qkv_proj" in name:
-            wq, wk, wv = loaded_weight.chunk(3, dim=0)
-            if name.endswith(".weight"):
-                dummy_shape = [num_dummy_heads, head_dim, wq.shape[-1]]
-            elif name.endswith(".bias"):
-                dummy_shape = [num_dummy_heads, head_dim]
-            else:
-                raise RuntimeError(f"Unsupported weight with name={name}")
-            pad_func = lambda x: torch.cat(
-                [x.unflatten(0, (-1, head_dim)), x.new_zeros(dummy_shape)], dim=0
-            ).flatten(0, 1)
-            wq, wk, wv = pad_func(wq), pad_func(wk), pad_func(wv)
-            loaded_weight = torch.cat([wq, wk, wv], dim=0)
-        if "attn.proj.weight" in name:
-            padded_weight = loaded_weight.new_zeros(
-                loaded_weight.shape[0], head_dim * num_dummy_heads
-            )
-            loaded_weight = torch.cat([loaded_weight, padded_weight], dim=-1)
-        if "attn.q_norm.weight" in name or "attn.k_norm.weight" in name:
-            padded_weight = loaded_weight.new_zeros(head_dim * num_dummy_heads)
-            loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
-        return loaded_weight
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = []
         if "InternLM2ForCausalLM" in self.config.llm_config.architectures:
@@ -616,7 +571,7 @@ class InternVLChatModel(nn.Module):
                 ("gate_up_proj", "up_proj", 1),
             ]
 
-            expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
@@ -699,8 +654,8 @@ class InternVLChatModel(nn.Module):
                             param, "weight_loader", default_weight_loader
                         )
                         if "vision_model" in name:
-                            loaded_weight = self._pad_vit_attn_dummy_heads(
-                                name, loaded_weight
+                            loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                                self.config, name, loaded_weight
                             )
                         weight_loader(param, loaded_weight)
 

@@ -449,8 +449,10 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
 
 
 def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
-    device = next(module.parameters()).device
+    if (params := next(module.parameters(), None)) is None:
+        return module
 
+    device = params.device
     if device == torch.device("cpu"):
         return module
 
@@ -815,7 +817,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 vr = VideoReader(tmp_file.name, ctx=ctx)
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
-                video_bytes = base64.b64decode(encoded)
+                video_bytes = pybase64.b64decode(encoded)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
@@ -823,7 +825,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             elif os.path.isfile(video_file):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
-                video_bytes = base64.b64decode(video_file)
+                video_bytes = pybase64.b64decode(video_file)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
@@ -2343,6 +2345,7 @@ def is_fa3_default_architecture(hf_config):
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
     return architectures[0] in default_archs
@@ -2413,7 +2416,7 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif server_args.moe_a2a_backend is None:
+        elif server_args.moe_a2a_backend == "none":
             return True
         else:
             return (
@@ -2429,7 +2432,7 @@ def require_attn_tp_gather(server_args):
     Check if the input of attention is scattered.
     """
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.moe_a2a_backend is not None or server_args.moe_dense_tp_size == 1:
+    if server_args.moe_a2a_backend != "none" or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -2872,6 +2875,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_proj",
     "up_proj",
     "down_proj",
+    "qkv_proj",
+    "gate_up_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
@@ -2960,4 +2965,9 @@ class ConcurrentCounter:
         This suspends the calling coroutine without blocking the thread, allowing
         other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
         """
-        self.wait_for(lambda count: count == 0)
+        await self.wait_for(lambda count: count == 0)
+
+
+@lru_cache(maxsize=1)
+def is_triton_kernels_available() -> bool:
+    return importlib.util.find_spec("triton_kernels") is not None

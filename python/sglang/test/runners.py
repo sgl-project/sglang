@@ -231,11 +231,14 @@ class HFRunner:
 
         # Load the model and tokenizer
         if self.model_type == "generation":
-            config = AutoConfig.from_pretrained(model_path)
-            if model_archs := getattr(config, "architectures"):
-                model_cls = getattr(transformers, model_archs[0])
-            else:
+            config = AutoConfig.from_pretrained(
+                model_path, trust_remote_code=self.trust_remote_code
+            )
+            if self.trust_remote_code:
                 model_cls = AutoModelForCausalLM
+            else:
+                model_arch = getattr(config, "architectures")[0]
+                model_cls = getattr(transformers, model_arch)
             self.base_model = model_cls.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
@@ -568,8 +571,8 @@ class SRTRunner:
         else:
             self.tokenizer = None
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str):
-        return self.engine.load_lora_adapter(lora_name, lora_path)
+    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
+        return self.engine.load_lora_adapter(lora_name, lora_path, pinned)
 
     def unload_lora_adapter(self, lora_name: str):
         return self.engine.unload_lora_adapter(lora_name)

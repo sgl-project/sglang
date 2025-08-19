@@ -269,10 +269,9 @@ class TokenizerManager:
         self.asyncio_tasks = set()
 
         # Health check
-        self.health_check_failed = False
+        self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
-        self.server_status = ServerStatus.Starting
 
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
@@ -291,8 +290,8 @@ class TokenizerManager:
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
-        self._is_updating = False
-        self._is_updating_cond = asyncio.Condition()
+        self.is_pause = False
+        self.is_pause_cond = asyncio.Condition()
 
         # LoRA
         # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.
@@ -476,16 +475,20 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        async with self._is_updating_cond:
-            await self._is_updating_cond.wait_for(lambda: not self._is_updating)
-
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
         async with self.model_update_lock.reader_lock:
+            if self.server_args.enable_lora and obj.lora_path:
+                # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
+                obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
@@ -552,11 +555,6 @@ class TokenizerManager:
                 input_ids = mm_inputs["input_ids"]
         else:
             mm_inputs = None
-
-        if self.server_args.enable_lora and obj.lora_path:
-            # Start tracking ongoing requests for LoRA adapters and replace the user-friendly LoRA names in
-            # `lora_path` with their corresponding unique LoRA IDs, as required for internal processing.
-            obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
@@ -701,7 +699,7 @@ class TokenizerManager:
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
-            self._validate_token_len(obj[i], input_ids_list[i])
+            self._validate_one_request(obj[i], input_ids_list[i])
             tokenized_objs.append(
                 self._create_tokenized_object(
                     req, req.text, input_ids_list[i], None, None
@@ -775,10 +773,6 @@ class TokenizerManager:
                         msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                     logger.info(msg)
 
-                # Mark ongoing LoRA request as finished.
-                if self.server_args.enable_lora and obj.lora_path:
-                    await self.lora_registry.release(obj.lora_id)
-
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     finish_reason = out["meta_info"]["finish_reason"]
@@ -788,15 +782,22 @@ class TokenizerManager:
                     ):
                         raise ValueError(finish_reason["message"])
 
-                    if (
-                        finish_reason.get("type") == "abort"
-                        and finish_reason.get("status_code")
-                        == HTTPStatus.SERVICE_UNAVAILABLE
+                    if finish_reason.get("type") == "abort" and finish_reason.get(
+                        "status_code"
+                    ) in (
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
                     ):
                         # This is an abort request initiated by scheduler.
                         # Delete the key to prevent resending abort request to the scheduler and
                         # to ensure aborted request state is cleaned up.
-                        del self.rid_to_state[state.obj.rid]
+                        if state.obj.rid in self.rid_to_state:
+                            del self.rid_to_state[state.obj.rid]
+
+                        # Mark ongoing LoRA request as finished.
+                        if self.server_args.enable_lora and state.obj.lora_path:
+                            await self.lora_registry.release(state.obj.lora_id)
+
                         raise fastapi.HTTPException(
                             status_code=finish_reason["status_code"],
                             detail=finish_reason["message"],
@@ -982,14 +983,14 @@ class TokenizerManager:
         await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
 
     async def pause_generation(self):
-        async with self._is_updating_cond:
-            self._is_updating = True
+        async with self.is_pause_cond:
+            self.is_pause = True
             self.abort_request(abort_all=True)
 
     async def continue_generation(self):
-        async with self._is_updating_cond:
-            self._is_updating = False
-            self._is_updating_cond.notify_all()
+        async with self.is_pause_cond:
+            self.is_pause = False
+            self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
         self,
@@ -1129,6 +1130,7 @@ class TokenizerManager:
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path=obj.lora_path,
+                    pinned=obj.pinned,
                 )
 
                 # Trigger the actual loading operation at the backend processes.
@@ -1186,7 +1188,7 @@ class TokenizerManager:
 
                 return result
         except ValueError as e:
-            return UnloadLoRAAdapterReqOutput(success=False, rror_message=str(e))
+            return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
@@ -1473,7 +1475,7 @@ class TokenizerManager:
         while True:
             remain_num_req = len(self.rid_to_state)
 
-            if self.health_check_failed:
+            if self.server_status == ServerStatus.UnHealthy:
                 # if health check failed, we should exit immediately
                 logger.error(
                     "Signal SIGTERM received while health check failed. Exiting... remaining number of requests: %d",
@@ -1529,6 +1531,7 @@ class TokenizerManager:
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
+                "weight_version": self.server_args.weight_version,
             }
 
             if getattr(state.obj, "return_logprob", False):
@@ -1598,6 +1601,10 @@ class TokenizerManager:
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
                 del self.rid_to_state[rid]
+
+                # Mark ongoing LoRA request as finished.
+                if self.server_args.enable_lora and state.obj.lora_path:
+                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             state.out_list.append(out_dict)
             state.event.set()
@@ -1888,6 +1895,13 @@ class TokenizerManager:
                         f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
                     )
 
+        batch_request = GenerateReqInput(
+            token_ids_logprob=label_token_ids,
+            return_logprob=True,
+            stream=False,
+            sampling_params={"max_new_tokens": 0},
+        )
+
         # Handle string or tokenized query/items
         if isinstance(query, str) and (
             isinstance(items, str)
@@ -1899,13 +1913,9 @@ class TokenizerManager:
                 prompts = [f"{item}{query}" for item in items_list]
             else:
                 prompts = [f"{query}{item}" for item in items_list]
-            batch_request = GenerateReqInput(
-                text=prompts,
-                return_logprob=True,
-                token_ids_logprob=label_token_ids,
-                stream=False,
-                sampling_params={"max_new_tokens": 1},
-            )
+
+            batch_request.text = prompts
+
         elif (
             isinstance(query, list)
             and isinstance(items, list)
@@ -1917,13 +1927,8 @@ class TokenizerManager:
                 input_ids_list = [item + query for item in items]
             else:
                 input_ids_list = [query + item for item in items]
-            batch_request = GenerateReqInput(
-                input_ids=input_ids_list,
-                return_logprob=True,
-                token_ids_logprob=label_token_ids,
-                stream=False,
-                sampling_params={"max_new_tokens": 1},
-            )
+
+            batch_request.input_ids = input_ids_list
         else:
             raise ValueError(
                 "Invalid combination of query/items types for score_request."
@@ -1935,9 +1940,20 @@ class TokenizerManager:
         for result in results:
             # Get logprobs for each token
             logprobs = {}
-            for logprob, token_id, _ in result["meta_info"].get(
-                "output_token_ids_logprobs", []
-            )[0]:
+
+            # For scoring requests, we read from output_token_ids_logprobs since we want
+            # the logprobs for specific tokens mentioned in the label_token_ids at
+            # the next position after the last token in the prompt
+            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+
+            # Throw an error here if output_logprobs is None
+            if output_logprobs is None:
+                raise RuntimeError(
+                    f"output_logprobs is None for request {result['meta_info'].get('id', '<unknown>')}. "
+                    "This usually indicates a problem with the scoring request or the backend output."
+                )
+
+            for logprob, token_id, _ in output_logprobs[0]:
                 if token_id in label_token_ids:
                     logprobs[token_id] = logprob
 
@@ -1964,10 +1980,6 @@ class ServerStatus(Enum):
     Up = "Up"
     Starting = "Starting"
     UnHealthy = "UnHealthy"
-    Crashed = "Crashed"
-
-    def is_healthy(self) -> bool:
-        return self == ServerStatus.Up
 
 
 def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:

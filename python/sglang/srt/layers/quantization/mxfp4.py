@@ -1,45 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/mxfp4.py
 
 from __future__ import annotations
 
-import importlib
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
 
-# from vllm.model_executor.layers.fused_moe import (
-#     FusedMoE, FusedMoEActivationFormat, FusedMoEConfig, FusedMoEMethodBase,
-#     FusedMoEPermuteExpertsUnpermute, FusedMoEPrepareAndFinalize)
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_triton_kernels_available,
+    log_info_on_rank0,
+    mxfp_supported,
     next_power_of_2,
     round_up,
     set_weight_attrs,
 )
 
-has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
+_is_sm100_supported = is_cuda() and is_sm100_supported()
+has_triton_kernels = is_triton_kernels_available()
 
-# Environment variables for FlashInfer MXFP4 MoE backend
-USE_FLASHINFER_MXFP4_MOE = get_bool_env_var("SGLANG_USE_FLASHINFER_MXFP4_MOE", "false")
-USE_FLASHINFER_MXFP4_BF16_MOE = get_bool_env_var(
-    "SGLANG_USE_FLASHINFER_MXFP4_BF16_MOE", "false"
-)
 
 if is_flashinfer_available():
-    # from flashinfer.fused_moe import cutlass_fused_moe
     from flashinfer import (
         mxfp8_quantize,
         shuffle_matrix_a,
@@ -50,9 +59,17 @@ if is_flashinfer_available():
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
-OCP_MX_BLOCK_SIZE = 32
+_is_hip = is_hip()
+
+if _is_hip:
+    # import aiter
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.fused_moe import fused_moe
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    from aiter.utility.fp4_utils import e8m0_shuffle
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -68,7 +85,7 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
         mx_axis=1, num_warps=num_warps
     )
-    if is_cuda() and torch.cuda.get_device_capability()[0] == 10:
+    if _is_sm100_supported:
         constraints = {
             "is_persistent": True,
             "epilogue_subtile": 1,
@@ -153,13 +170,34 @@ except AttributeError as error:
 
 class Mxfp4Config(QuantizationConfig):
 
-    def __init__(self, ignored_layers: Optional[list[str]] = None):
+    def __init__(
+        self,
+        ignored_layers: Optional[list[str]] = None,
+        is_checkpoint_mxfp4_serialized: bool = False,
+    ):
         super().__init__()
+        self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
 
     @classmethod
     def from_config(cls, config):
-        return cls()
+
+        quant_method = cls.get_from_keys(config, ["quant_method"])
+        is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
+
+        if _is_hip:
+            if mxfp_supported():
+                return cls(
+                    is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
+                )
+            else:
+
+                platform = torch.cuda.get_device_properties(0).gcnArchName
+                raise ValueError(
+                    f"Current platform {platform} not support mxfp4 computation"
+                )
+
+        return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -177,6 +215,9 @@ class Mxfp4Config(QuantizationConfig):
     def get_config_filenames(cls) -> list[str]:
         return []
 
+    def is_static_cfg(self):
+        return self.is_checkpoint_mxfp4_serialized
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
@@ -192,10 +233,16 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
+            elif _is_hip:
+                return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
-            return Mxfp4MoEMethod(use_triton_kernels=True, with_bias=True)
+            if self.is_checkpoint_mxfp4_serialized:
+                return Mxfp4MoEMethod(prefix=prefix)
+            else:
+                return Mxfp4DynamicQuantMoEMethod()
         else:
-            raise NotImplementedError("Mxfp4 attention layer is not implemented")
+            if self.is_checkpoint_mxfp4_serialized:
+                raise NotImplementedError("Mxfp4 attention layer is not implemented")
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -204,11 +251,18 @@ class Mxfp4Config(QuantizationConfig):
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
-    def __init__(self, use_triton_kernels: bool = True, with_bias: bool = True):
+    def __init__(
+        self,
+        prefix: str,
+    ):
         super().__init__()
+
+        self.prefix = prefix
         self.topk_indices_dtype = None
-        self.use_triton_kernels = use_triton_kernels
-        self.with_bias = with_bias
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        self.with_bias = False
+        self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
         if torch.cuda.is_available() and has_triton_kernels:
@@ -229,23 +283,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
+        with_bias: bool = False,
         **extra_weight_attrs,
     ):
-        # print(f"hi {self=} create_weights {layer=}")
         self.num_experts = num_experts
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
+        self.with_bias = with_bias
         mxfp4_block = 32
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
-        if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
-            intermediate_size_per_partition_after_pad = round_up(intermediate_size, 256)
-            hidden_size = round_up(hidden_size, 256)
-        elif is_hip():
-            intermediate_size_per_partition_after_pad = round_up(intermediate_size, 128)
-        else:
-            intermediate_size_per_partition_after_pad = round_up(intermediate_size, 64)
+        intermediate_size_per_partition_after_pad = intermediate_size
+        if _is_sm100_supported:
+            if self.use_flashinfer:
+                intermediate_size_per_partition_after_pad = round_up(
+                    intermediate_size, 256
+                )
+                hidden_size = round_up(hidden_size, 256)
+            else:
+                intermediate_size_per_partition_after_pad = round_up(
+                    intermediate_size, 64
+                )
 
         self.intermediate_size = intermediate_size_per_partition_after_pad
 
@@ -253,7 +312,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
+                layer.num_local_experts,
                 2 * intermediate_size_per_partition_after_pad,
                 hidden_size // 2,
                 dtype=weight_dtype,
@@ -265,7 +324,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
+                layer.num_local_experts,
                 2 * intermediate_size_per_partition_after_pad,
                 hidden_size // mxfp4_block,
                 dtype=scale_dtype,
@@ -277,7 +336,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         w13_weight_bias = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
+                layer.num_local_experts,
                 2 * intermediate_size_per_partition_after_pad,
                 dtype=torch.bfloat16,
             ),
@@ -289,7 +348,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
+                layer.num_local_experts,
                 hidden_size,
                 intermediate_size_per_partition_after_pad // 2,
                 dtype=weight_dtype,
@@ -301,7 +360,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
+                layer.num_local_experts,
                 hidden_size,
                 intermediate_size_per_partition_after_pad // mxfp4_block,
                 dtype=scale_dtype,
@@ -312,17 +371,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         w2_weight_bias = torch.nn.Parameter(
-            torch.zeros(num_experts, hidden_size, dtype=torch.bfloat16),
+            torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_bias", w2_weight_bias)
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
-        if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
-            logger.info(
-                "Shuffling MoE weights for FlashInfer, it might take a while..."
+        if self.use_flashinfer:
+            log_info_on_rank0(
+                logger,
+                f"Shuffling MoE weights for FlashInfer MXFP4 moe kernel (layer: {self.prefix}), it might take a while...",
             )
+            # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
                 requires_grad=False,
@@ -472,38 +533,51 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             return
 
-        from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+        if self.use_triton_kernels:
 
-        w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
-        w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
+            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
-        layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
-        layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
+            w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
+            w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
 
-        num_warps = 8
+            layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
+            layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
 
-        w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-            layer.w13_weight, layer.w13_weight_scale, num_warps
-        )
-        w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-            layer.w2_weight, layer.w2_weight_scale, num_warps
-        )
+            num_warps = 8
 
-        self.w13_precision_config = PrecisionConfig(
-            weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
-        )
-        self.w2_precision_config = PrecisionConfig(
-            weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
-        )
+            w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
+                layer.w13_weight, layer.w13_weight_scale, num_warps
+            )
+            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
+                layer.w2_weight, layer.w2_weight_scale, num_warps
+            )
 
-        self.w13_weight_triton_tensor = w13_weight
-        self.w2_weight_triton_tensor = w2_weight
+            self.w13_precision_config = PrecisionConfig(
+                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+            )
+            self.w2_precision_config = PrecisionConfig(
+                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+            )
 
-        # need to delete the original weights to save memory on single GPU
-        del layer.w13_weight
-        del layer.w2_weight
-        layer.w13_weight = None
-        layer.w2_weight = None
+            self.w13_weight_triton_tensor = w13_weight
+            self.w2_weight_triton_tensor = w2_weight
+            del layer.w13_weight
+            del layer.w2_weight
+        else:
+            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+
+            w13_weight = upcast_from_mxfp(
+                layer.w13_weight, layer.w13_weight_scale, dtype=torch.bfloat16, axis=-1
+            )
+            w2_weight = upcast_from_mxfp(
+                layer.w2_weight, layer.w2_weight_scale, dtype=torch.bfloat16, axis=-1
+            )
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
+            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
     def _get_tile_tokens_dim(self, x: torch.Tensor, top_k: int):
@@ -535,29 +609,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-        activation_alpha: Optional[float] = None,
-        swiglu_limit: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
-        if USE_FLASHINFER_MXFP4_MOE or USE_FLASHINFER_MXFP4_BF16_MOE:
-            # When USE_FLASHINFER_MXFP4_BF16_MOE is enabled, we don't need to quantize the input,
-            # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
-            # which can theoretically improve performance
-            if USE_FLASHINFER_MXFP4_BF16_MOE:
-                assert x.dtype == torch.bfloat16
-                x_quant = x
-                x_scale = None
-            else:
-                x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
-                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
 
-            topk_weights, topk_ids, router_logits = topk_output
-            top_k = topk_weights.shape[-1]
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        if self.use_flashinfer:
+            # Based on profiling results, we need to quantize x to mxfp8 here to achieve better performance
+            x_quant, x_scale = mxfp8_quantize(
+                x, False, alignment=self.hidden_size
+            )  # to mxfp8
+            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            assert x_quant.shape[-1] == self.hidden_size
+            assert TopKOutputChecker.format_is_bypassed(topk_output)
+
+            top_k = topk_output.topk_config.top_k
+            router_logits = topk_output.router_logits
 
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
@@ -576,13 +643,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 None,  # output1_scale_scalar
                 None,  # output1_scale_gate_scalar
                 None,  # output2_scale_scalar
-                self.num_experts,
+                layer.num_experts,
                 top_k,
-                None,  # n_group
-                None,  # topk_group
+                None,  # n_group      # TODO: support n_group
+                None,  # topk_group   # TODO: support topk_group
                 self.intermediate_size,  # padded to multiple of 256
-                0,  # local_expert_offset
-                self.num_experts,  # local num experts
+                layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
+                layer.num_local_experts,  # local num experts
                 None,
                 self._get_tile_tokens_dim(x, top_k),
                 1,  # routing_method_type, renormalize
@@ -591,10 +658,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return trtllm_gen_output
 
         if self.use_triton_kernels:
+            assert (
+                layer.moe_ep_size == 1
+            ), "Expert parallel is not supported when using triton kernels"
             if self.with_bias:
-                # TODO why we do not put weights on layer?
-                assert layer.w13_weight is None
-                assert layer.w2_weight is None
                 return self.triton_kernel_moe_with_bias_forward(
                     hidden_states=x,
                     w1=self.w13_weight_triton_tensor,
@@ -604,9 +671,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     b1=layer.w13_weight_bias,
                     b2=layer.w2_weight_bias,
                     topk_output=topk_output,
-                    activation=activation,
-                    activation_alpha=activation_alpha,
-                    swiglu_limit=swiglu_limit,
+                    moe_runner_config=moe_runner_config,
                 )
             else:
                 return self.triton_kernel_moe_forward(
@@ -614,6 +679,130 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w1=layer.w13_weight,
                     w2=layer.w2_weight,
                     topk_output=topk_output,
+                    moe_runner_config=moe_runner_config,
                 )
         else:
-            raise NotImplementedError()
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+
+            return fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_output=topk_output,
+                moe_runner_config=moe_runner_config,
+                b1=layer.w13_weight_bias,
+                b2=layer.w2_weight_bias,
+            )
+
+
+class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # Allocate 2 scales for w1 and w3 respectively.
+        # They will be combined to a single scale after weight loading.
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+        )
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        # Add the quantization method used (per tensor/grouped/channel)
+        # to ensure the weight scales are loaded in properly
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+        )
+
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+    def mxfp4_quantize(self, w):
+        w_shape = w.shape
+        w_need_reshape = True if w.dim() != 2 else False
+
+        if w_need_reshape:
+            w_last_dim_size = w_shape[-1]
+            w = w.view(-1, w_last_dim_size)
+
+        w, mx_scales = dynamic_mxfp4_quant(w)
+
+        if w_need_reshape:
+            w_new_shape = w_shape[:-1] + (w.shape[-1],)
+            w = w.view(w_new_shape)
+
+        mx_scales = e8m0_shuffle(mx_scales)
+
+        return w, mx_scales
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        w13, w13_mx_scales = self.mxfp4_quantize(layer.w13_weight.data)
+        w2, w2_mx_scales = self.mxfp4_quantize(layer.w2_weight.data)
+
+        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(w13_mx_scales, requires_grad=False)
+
+        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(w2_mx_scales, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_output: TopKOutput,
+        moe_runner_config: MoeRunnerConfig,
+    ) -> torch.Tensor:
+        topk_weights, topk_ids, _ = topk_output
+
+        return fused_moe(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            quant_type=QuantType.per_1x32,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            activation=(
+                ActivationType.Silu
+                if moe_runner_config.activation == "silu"
+                else ActivationType.Gelu
+            ),
+            doweight_stage1=False,
+        )
