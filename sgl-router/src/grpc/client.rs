@@ -71,12 +71,12 @@ impl SglangSchedulerClient {
     }
 
     /// Flush cache
-    pub async fn flush_cache(&mut self, flush_all: bool) -> Result<proto::FlushCacheResponse, Box<dyn std::error::Error>> {
+    pub async fn flush_cache(&mut self, flush_all: bool, session_ids: &[String]) -> Result<proto::FlushCacheResponse, Box<dyn std::error::Error>> {
         let request = Request::new(proto::FlushCacheRequest {
             flush_all,
-            session_ids: vec![],
+            session_ids: session_ids.to_vec(),
         });
-
+        
         let response = self.client.flush_cache(request).await?;
         Ok(response.into_inner())
     }
