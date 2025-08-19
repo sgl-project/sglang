@@ -98,6 +98,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
+
     from sglang.srt.layers.moe.rocm_aiter_fused_moe import (
         rocm_aiter_fused_experts,
         shuffle_weights,
