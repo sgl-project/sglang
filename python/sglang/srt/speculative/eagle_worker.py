@@ -96,6 +96,9 @@ class EAGLEWorker(TpModelWorker):
         self.all_cold_probs_data = []
         self.log_stats_call_count = 0
 
+        self.total_accepted_tokens = 0
+        self.total_requests_verified = 0
+
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
@@ -718,6 +721,18 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
+
+        # Calculate and print the average number of accepted draft tokens
+        if res.accept_length_per_req_cpu:
+            self.total_accepted_tokens += sum(res.accept_length_per_req_cpu)
+            self.total_requests_verified += len(res.accept_length_per_req_cpu)
+            average_accepted_tokens = (
+                self.total_accepted_tokens / self.total_requests_verified
+            )
+            print(
+                f"Accepted drafts per request: {res.accept_length_per_req_cpu} | "
+                f"Average accepted drafts: {average_accepted_tokens:.2f}"
+            )
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
