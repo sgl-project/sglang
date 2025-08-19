@@ -165,9 +165,7 @@ class LayerCommunicator:
         post_attention_layernorm: torch.nn.Module,
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
-        # Whether current layer is the last layer of the model (or logical segment). If true, fusion is disabled.
         is_last_layer: bool = False,
-        # Whether this layer is used as a nextn layer. If true, fusion is disabled.
         is_nextn: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
@@ -303,7 +301,6 @@ class LayerCommunicator:
         if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
             return False
 
-        # 直接计算是否应该fuse而不是使用查找表
         static_conditions_met = (
             (not self.is_last_layer)
             and (self._context.tp_size > 1)
