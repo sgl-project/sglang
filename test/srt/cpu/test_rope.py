@@ -118,10 +118,7 @@ class TestROPE(CustomTestCase):
                 dtype=dtype,
                 device=device,
             )
-            if dims == 3:
-                query = query.view(batch_size * seq_len, num_q_heads, head_size)
-                key = key.view(batch_size * seq_len, num_kv_heads, head_size)
-            elif dims == 4:
+            if dims == 4:
                 query = query.view(batch_size, seq_len, num_q_heads, head_size)
                 key = key.view(batch_size, seq_len, num_kv_heads, head_size)
             query_ref, key_ref = query.clone(), key.clone()
