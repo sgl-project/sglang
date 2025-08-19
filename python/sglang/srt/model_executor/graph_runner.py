@@ -268,6 +268,7 @@ class GraphRunner:
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         rank0_log(f"Capture graph bs {self.capture_bs}")
+        self.capture_hidden_mode = CaptureHiddenMode.FULL
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1

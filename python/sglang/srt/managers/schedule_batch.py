@@ -67,12 +67,17 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, support_triton
+from sglang.srt.utils import (
+    alloc_len_per_eagle_decode,
+    flatten_nested_list,
+    next_power_of_2,
+    support_triton,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -898,6 +903,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Device
     device: str = "cuda"
 
+    # Enable custom logit processor
+    enable_custom_logit_processor: bool = False
+
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
@@ -911,6 +919,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
 
+    # Speculative decoding
+    spec_algorithm: Optional[SpeculativeAlgorithm] = None
+    spec_info: Optional[SpecInfo] = None
+    verify_done: Optional[torch.cuda.Event] = None
+    draft_worker: Optional["EagleWorker"] = None
+
     @classmethod
     def init_new(
         cls,
@@ -920,7 +934,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
+        enable_custom_logit_processor: bool,
         spec_algorithm: SpeculativeAlgorithm,
+        draft_worker: Optional["EagleWorker"] = None,
         chunked_req: Optional[Req] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -946,7 +962,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
+            enable_custom_logit_processor=enable_custom_logit_processor,
             spec_algorithm=spec_algorithm,
+            draft_worker=draft_worker,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(
                 req.sampling_params.max_new_tokens == 0 for req in reqs
@@ -1057,6 +1075,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return out_cache_loc, state
         else:
             return out_cache_loc
+
+    def allocate_for_eagle(self):
+        from sglang.srt.speculative.eagle_utils import assign_req_to_token_pool
+
+        worker = self.draft_worker
+        bs = self.batch_size()
+
+        # We need this to get the correct self.seq_lens
+        if self.verify_done is not None:
+            self.verify_done.synchronize()
+
+        self.seq_lens_sum = self.seq_lens.sum().item()
+        new_allocate_lens = self.seq_lens + alloc_len_per_eagle_decode(worker)
+        # TODO: remove assert
+        assert torch.all(
+            new_allocate_lens > self.spec_info.allocate_lens
+        ), f"new_allocate_lens={new_allocate_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
+        assert torch.all(
+            self.seq_lens <= self.spec_info.allocate_lens
+        ), f"self.seq_lens={self.seq_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
+        num_needed_tokens = (
+            (new_allocate_lens - self.spec_info.allocate_lens).sum().item()
+        )
+        out_cache_loc = self.alloc_token_slots(num_needed_tokens)
+
+        assign_req_to_token_pool[(bs,)](
+            self.req_pool_indices,
+            self.req_to_token_pool.req_to_token,
+            self.spec_info.allocate_lens,
+            new_allocate_lens,
+            out_cache_loc,
+            self.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+        self.spec_info.allocate_lens = new_allocate_lens
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
@@ -1539,8 +1592,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         bs = len(self.reqs)
 
         if self.spec_algorithm.is_eagle():
-            # if spec decoding is used, the decode batch is prepared inside
-            # `forward_batch_speculative_generation` after running draft models.
+            self.allocate_for_eagle()
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
@@ -1613,6 +1665,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        if self.verify_done is not None:
+            self.verify_done.synchronize()
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -1670,6 +1725,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
+
         self.sampling_info.merge_batch(other.sampling_info)
 
         # Encoder-decoder infos
@@ -1738,7 +1794,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens=self.seq_lens,
             orig_seq_lens=self.orig_seq_lens,
             out_cache_loc=self.out_cache_loc,
-            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu=self.seq_lens.cpu(),
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
@@ -1768,16 +1824,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
-                else (
-                    getattr(
-                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-                    )
-                    if self.spec_info
-                    else CaptureHiddenMode.NULL
-                )
+                else CaptureHiddenMode.NULL
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            req_to_token_pool=self.req_to_token_pool,
         )
 
     def copy(self):
@@ -1919,6 +1970,9 @@ class ModelWorkerBatch:
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
+
+    # Other scheduling info (TODO: remove or reorganize them after finish spec refactor)
+    req_to_token_pool: ReqToTokenPool = None
 
 
 @triton.jit

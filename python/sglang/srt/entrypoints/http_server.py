@@ -1220,7 +1220,7 @@ def _execute_server_warmup(
         return False
 
     # Debug print
-    # logger.info(f"warmup request returns: {res.json()=}")
+    logger.info(f"warmup request returns: {res.json()=}")
     return success
 
 

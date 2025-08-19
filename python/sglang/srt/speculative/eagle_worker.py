@@ -9,7 +9,6 @@ from huggingface_hub import snapshot_download
 
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     patch_tensor_parallel_group,
 )
