@@ -255,20 +255,19 @@ pub mod utils {
     pub fn validate_stop_conditions<T: StopConditionsProvider + ?Sized>(
         request: &T,
     ) -> Result<(), ValidationError> {
-        // Validate stop sequences (max 4)
         if let Some(stop) = request.get_stop_sequences() {
-            validate_max_items(&stop.to_vec(), constants::MAX_STOP_SEQUENCES, "stop")?;
-
-            // Ensure no empty stop sequences
             match stop {
-                crate::protocols::common::StringOrArray::String(s) if s.is_empty() => {
-                    return Err(ValidationError::InvalidValue {
-                        parameter: "stop".to_string(),
-                        value: "empty string".to_string(),
-                        reason: "stop sequences cannot be empty".to_string(),
-                    });
+                crate::protocols::common::StringOrArray::String(s) => {
+                    if s.is_empty() {
+                        return Err(ValidationError::InvalidValue {
+                            parameter: "stop".to_string(),
+                            value: "empty string".to_string(),
+                            reason: "stop sequences cannot be empty".to_string(),
+                        });
+                    }
                 }
                 crate::protocols::common::StringOrArray::Array(arr) => {
+                    validate_max_items(arr, constants::MAX_STOP_SEQUENCES, "stop")?;
                     for (i, s) in arr.iter().enumerate() {
                         if s.is_empty() {
                             return Err(ValidationError::InvalidValue {
@@ -279,7 +278,6 @@ pub mod utils {
                         }
                     }
                 }
-                _ => {}
             }
         }
 
@@ -403,24 +401,10 @@ pub mod utils {
     pub fn validate_completion_count<T: CompletionCountProvider + ?Sized>(
         request: &T,
     ) -> Result<(), ValidationError> {
-        const MAX_N: u32 = 10;
+        const N_RANGE: (u32, u32) = (1, 10);
 
         if let Some(n) = request.get_n() {
-            if n == 0 {
-                return Err(ValidationError::InvalidValue {
-                    parameter: "n".to_string(),
-                    value: "0".to_string(),
-                    reason: "must be at least 1".to_string(),
-                });
-            }
-
-            if n > MAX_N {
-                return Err(ValidationError::InvalidValue {
-                    parameter: "n".to_string(),
-                    value: n.to_string(),
-                    reason: format!("cannot exceed {}", MAX_N),
-                });
-            }
+            validate_range(n, &N_RANGE, "n")?;
         }
 
         Ok(())
@@ -442,14 +426,20 @@ pub mod utils {
     /// Validate common request parameters that are shared across all API types
     pub fn validate_common_request_params<T>(request: &T) -> Result<(), ValidationError>
     where
-        T: SamplingOptionsProvider + StopConditionsProvider + TokenLimitsProvider + LogProbsProvider + SGLangExtensionsProvider + CompletionCountProvider + ?Sized,
+        T: SamplingOptionsProvider
+            + StopConditionsProvider
+            + TokenLimitsProvider
+            + LogProbsProvider
+            + SGLangExtensionsProvider
+            + CompletionCountProvider
+            + ?Sized,
     {
         // Validate all standard parameters
         validate_sampling_options(request)?;
         validate_stop_conditions(request)?;
         validate_token_limits(request)?;
         validate_logprobs(request)?;
-        
+
         // Validate SGLang extensions and completion count
         validate_sglang_extensions(request)?;
         validate_completion_count(request)?;
