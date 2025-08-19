@@ -656,7 +656,7 @@ class Scheduler(
                     rank=self.tp_rank,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
-                    self.tree_cache.cache_controller.layer_done_counter
+                    self.tree_cache.layer_done_counter
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -1657,7 +1657,7 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
-        elif self.enable_lmcache:
+        elif self.server_args.enable_lmcache:
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )

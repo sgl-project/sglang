@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, List, Optional
 from queue import Queue, Empty
 import threading
 from dataclasses import dataclass
+import traceback
 
 import torch
 
@@ -38,12 +39,15 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from lmcache.integration.sglang.sglang_adapter import LMCacheLayerwiseConnector, StoreMetadata, LoadMetadata
+from lmcache.integration.sglang.sglang_adapter import LMCacheLayerwiseConnector, StoreMetadata, LoadMetadata, LMCacheConnector
 from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.configs.model_config import ModelConfig
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 class TreeNode:
@@ -156,6 +160,14 @@ class LMCRadixCache(BasePrefixCache):
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = lambda key: tuple(key[:page_size])
 
+        # self.lmcache_connector = LMCacheLayerwiseConnector(
+        #     sgl_config=model_config,
+        #     tp_size=tp_size,
+        #     rank=rank,
+        #     k_pool=self.token_to_kv_pool_allocator._kvcache.k_buffer,
+        #     v_pool=self.token_to_kv_pool_allocator._kvcache.v_buffer,
+        # )
+
         self.lmcache_connector = LMCacheLayerwiseConnector(
             sgl_config=model_config,
             tp_size=tp_size,
@@ -182,8 +194,8 @@ class LMCRadixCache(BasePrefixCache):
         self.load_thread.start()
         self.store_thread.start()
 
-        # self.layer_done_counter = LayerDoneCounter(model_config.num_hidden_layers)
-        # self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_counter(self.layer_done_counter)
+        self.layer_done_counter = LayerDoneCounter(model_config.num_hidden_layers)
+        self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_counter(self.layer_done_counter)
         self.reset()
     
     ##### Public API #####
@@ -199,7 +211,7 @@ class LMCRadixCache(BasePrefixCache):
 
         # For LMCache
         self.stop_event.set()
-        # self.load_thread.join()
+        self.load_thread.join()
         self.store_thread.join()
         self.load_queue.queue.clear()
         self.store_queue.queue.clear()
@@ -273,13 +285,28 @@ class LMCRadixCache(BasePrefixCache):
         slop_mapping = torch.cat([torch.tensor([-1] * prefix_padding_len, dtype=torch.int64, device=self.device), 
             token_prealloc_indices.detach().clone().to(torch.int64).to(self.device)])
         
-        num_retrieved_tokens = self.lmcache_connector.begin_load_kv(
+        num_retrieved_tokens = self.lmcache_connector.start_load_kv(
             LoadMetadata(
                 token_ids=key,
                 slot_mapping=slop_mapping,
                 offset=len(value) - prefix_padding_len,
             )
         )
+        # import time
+        # start_time = time.time()
+        # num_retrieved_tokens = self.lmcache_connector.load_kv(
+        #     LoadMetadata(
+        #         token_ids=key,
+        #         slot_mapping=slop_mapping,
+        #         offset=len(value) - prefix_padding_len,
+        #     )
+        # )
+        # print(f"Line 304: num_retrieved_tokens: {num_retrieved_tokens}")
+        # current_stream = torch.cuda.current_stream()
+        # current_stream.synchronize()
+        # end_time = time.time()
+        # print(f"Line 308: Time taken: {end_time - start_time}")
+        # logger.info(f"num_retrieved_tokens: {num_retrieved_tokens}")
         
         if num_retrieved_tokens > 0:
             self.token_to_kv_pool_allocator.free(token_prealloc_indices[(num_retrieved_tokens - prefix_padding_len):])
@@ -338,6 +365,15 @@ class LMCRadixCache(BasePrefixCache):
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
+        self.lmcache_connector.store_kv(
+            StoreMetadata(
+                last_node=req.last_node,
+                token_ids=token_ids,
+                kv_indices=kv_indices,
+                offset=0,
+            )
+        )
+
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
             token_ids[:page_aligned_len], page_aligned_kv_indices
@@ -351,14 +387,14 @@ class LMCRadixCache(BasePrefixCache):
         self.dec_lock_ref(req.last_node)
 
         # Store to LMCache
-        self.inc_lock_ref(req.last_node)
-        store_metadata = StoreMetadata(
-            last_node=req.last_node,
-            token_ids=token_ids,
-            kv_indices=kv_indices,
-            offset=0,
-        )
-        self.store_queue.put(store_metadata)
+        # self.inc_lock_ref(req.last_node)
+        # store_metadata = StoreMetadata(
+        #     last_node=req.last_node,
+        #     token_ids=token_ids,
+        #     kv_indices=kv_indices,
+        #     offset=0,
+        # )
+        # self.store_queue.put(store_metadata)
 
     def cache_unfinished_req(self, req: Req):
         """Cache request when it is unfinished."""
@@ -676,7 +712,8 @@ class LMCRadixCache(BasePrefixCache):
             except Empty:
                 continue
             except Exception as e:
-                print(e)
+                print("Error in store thread: ", e)
+                traceback.print_exc()
 
     def _load_thread_func(self):
         torch.cuda.set_stream(self.load_stream)
@@ -689,16 +726,20 @@ class LMCRadixCache(BasePrefixCache):
                 self.layer_done_counter.update_producer()
 
                 self.layer_done_counter.reset()
-
-                for _ in range(self.lmcache_connector.num_layers):
+                
+                import time
+                start_time = time.time()
+                for _ in range(self.lmcache_connector.num_layer):
                     self.lmcache_connector.load_kv_layerwise()
                     self.load_stream.synchronize()
                     self.layer_done_counter.increment()
+                end_time = time.time()
+                print(f"In thread: Time taken: {end_time - start_time}")
 
             except Empty:
                 continue
             except Exception as e:
-                print(e)
+                print("Error in load thread: ", e)
 
     def take_events(self):
         """Atomically takes all events and clears the queue.
