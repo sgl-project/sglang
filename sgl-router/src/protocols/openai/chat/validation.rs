@@ -147,30 +147,7 @@ impl ChatCompletionRequest {
 
         Ok(())
     }
-}
 
-impl ValidatableRequest for ChatCompletionRequest {
-    fn validate(&self) -> Result<(), ValidationError> {
-        // First run all the generic validation using the functions directly
-        validate_sampling_options(self)?;
-        validate_stop_conditions(self)?;
-        validate_token_limits(self)?;
-        validate_logprobs(self)?;
-        validate_sglang_extensions(self)?;
-        validate_completion_count(self)?;
-        validate_cross_parameters(self)?;
-
-        // Then validate chat-specific parameters
-        self.validate_messages()?;
-        self.validate_response_format()?;
-        self.validate_chat_logprobs()?;
-        self.validate_chat_cross_parameters()?;
-
-        Ok(())
-    }
-}
-
-impl ChatCompletionRequest {
     /// Validate cross-parameter relationships specific to chat completions
     pub fn validate_chat_cross_parameters(&self) -> Result<(), ValidationError> {
         // Validate that both max_tokens and max_completion_tokens aren't set
@@ -230,6 +207,27 @@ impl ChatCompletionRequest {
             &structured_constraints,
             "Only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
         )?;
+
+        Ok(())
+    }
+}
+
+impl ValidatableRequest for ChatCompletionRequest {
+    fn validate(&self) -> Result<(), ValidationError> {
+        // First run all the generic validation using the functions directly
+        validate_sampling_options(self)?;
+        validate_stop_conditions(self)?;
+        validate_token_limits(self)?;
+        validate_logprobs(self)?;
+        validate_sglang_extensions(self)?;
+        validate_completion_count(self)?;
+        validate_cross_parameters(self)?;
+
+        // Then validate chat-specific parameters
+        self.validate_messages()?;
+        self.validate_response_format()?;
+        self.validate_chat_logprobs()?;
+        self.validate_chat_cross_parameters()?;
 
         Ok(())
     }
