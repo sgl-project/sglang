@@ -178,6 +178,27 @@ if supports_custom_op():
         fake_impl=reg_all_gather_into_tensor_fake,
     )
 
+    def reg_reduce_scatter_tensor(
+        output: torch.Tensor, input: torch.Tensor, group_name: str
+    ) -> None:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        group._reduce_scatter_tensor(output, input)
+
+    def reg_reduce_scatter_tensor_fake(
+        output: torch.Tensor, input: torch.Tensor, group_name: str
+    ) -> None:
+        pass
+
+    direct_register_custom_op(
+        op_name="reg_reduce_scatter_tensor",
+        op_func=reg_reduce_scatter_tensor,
+        mutates_args=["output"],
+        fake_impl=reg_reduce_scatter_tensor_fake,
+    )
+
 
 class GroupCoordinator:
     """
@@ -578,7 +599,7 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
-    def reduce_scatter_tensor(
+    def _reduce_scatter_tensor(
         self,
         output: torch.Tensor,
         input: torch.Tensor,
@@ -600,6 +621,14 @@ class GroupCoordinator:
                 output, input, group=self.device_group
             )
         return output
+
+    def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if _is_npu or not supports_custom_op():
+            self._reduce_scatter_tensor(output, input)
+        else:
+            torch.ops.sglang.reg_reduce_scatter_tensor(
+                output, input, group_name=self.unique_name
+            )
 
     def reduce_scatter(
         self,
@@ -760,7 +789,7 @@ class GroupCoordinator:
                 pynccl_comm is not None and not pynccl_comm.disabled
             ), "pynccl is required for all_gatherv"
 
-            def _all_gather_single(
+            def _all_gather_allocate_output(
                 input_: torch.Tensor, sizes: Optional[List[int]] = None
             ):
                 input_size = input_.size()
@@ -774,19 +803,25 @@ class GroupCoordinator:
                 else:
                     output_size = (input_size[0] * world_size,) + input_size[1:]
                 # Allocate output tensor.
-                output_tensor = torch.empty(
-                    output_size, dtype=input_.dtype, device=input_.device
-                )
-                pynccl_comm.all_gather(output_tensor, input_, sizes=sizes)
-                return output_tensor
+                with self.use_symmetric_memory(self, disabled=sizes is not None):
+                    output_tensor = torch.empty(
+                        output_size, dtype=input_.dtype, device=input_.device
+                    )
+                return output_tensor, sizes
 
             if isinstance(input_, torch.Tensor):
-                return _all_gather_single(input_, sizes)
+                input_ = [input_]
 
             output_list = []
-            pynccl_comm.group_start()
+            size_list = []
             for inp in input_:
-                output_list.append(_all_gather_single(inp, sizes=sizes))
+                output_tensor, s = _all_gather_allocate_output(inp, sizes=sizes)
+                output_list.append(output_tensor)
+                size_list.append(s)
+
+            pynccl_comm.group_start()
+            for i, inp in enumerate(input_):
+                pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
             pynccl_comm.group_end()
 
             return output_list

@@ -1384,16 +1384,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
 
                 # Quantize before comm, swizzle after.
-                if x.shape[0] > 0:
-                    x, x_sf = fp4_quantize(
-                        x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
-                    )
-                else:
-                    x_col = x.shape[1]
-                    x = torch.zeros(0, x_col // 2, dtype=torch.uint8, device=x.device)
-                    x_sf = torch.zeros(
-                        0, x_col // 16, dtype=torch.uint8, device=x.device
-                    )
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not is_dp_max_padding()
+                ):
+                    if x.shape[0] > 0:
+                        x, x_sf = fp4_quantize(
+                            x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
+                        )
+                    else:
+                        x_col = x.shape[1]
+                        x = torch.zeros(
+                            0, x_col // 2, dtype=torch.uint8, device=x.device
+                        )
+                        x_sf = torch.zeros(
+                            0, x_col // 16, dtype=torch.uint8, device=x.device
+                        )
                 topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
                     [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
                 )
