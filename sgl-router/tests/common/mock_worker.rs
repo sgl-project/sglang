@@ -560,7 +560,7 @@ async fn responses_handler(
             Json(json!({
                 "error": {
                     "message": "Random failure for testing",
-                    "type": "internal_error", 
+                    "type": "internal_error",
                     "code": "internal_error"
                 }
             })),
@@ -576,7 +576,7 @@ async fn responses_handler(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    
+
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -588,7 +588,7 @@ async fn responses_handler(
         .and_then(|v| v.as_str())
         .unwrap_or("mock-model")
         .to_string();
-    
+
     let tools = payload
         .get("tools")
         .and_then(|v| v.as_array())
@@ -627,7 +627,7 @@ async fn responses_handler(
             Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
         })
         .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
-        
+
         Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response()
@@ -642,7 +642,7 @@ async fn responses_handler(
                 {
                     "type": "message",
                     "id": format!("msg-{}", Uuid::new_v4()),
-                    "role": "assistant", 
+                    "role": "assistant",
                     "content": [{
                         "type": "output_text",
                         "text": "This is a mock response.",
@@ -654,7 +654,7 @@ async fn responses_handler(
             "status": "completed",
             "usage": {
                 "input_tokens": 10,
-                "output_tokens": 5, 
+                "output_tokens": 5,
                 "total_tokens": 15
             },
             "parallel_tool_calls": true,

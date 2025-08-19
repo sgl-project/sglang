@@ -1839,7 +1839,7 @@ impl RouterTrait for PDRouter {
         // Extract parameters
         let is_stream = body.stream;
         let return_logprob = body.top_logprobs.is_some();
-        
+
         // Extract text for cache-aware routing
         let request_text = if self.policies_need_request_text() {
             body.extract_text_for_routing()

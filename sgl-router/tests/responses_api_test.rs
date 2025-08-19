@@ -1,8 +1,8 @@
 // Integration test for Responses API
 
 use sglang_router_rs::protocols::common::GenerationRequest;
-use sglang_router_rs::protocols::openai::responses::*;
 use sglang_router_rs::protocols::openai::responses::request::ResponseInput;
+use sglang_router_rs::protocols::openai::responses::*;
 
 #[test]
 fn test_responses_request_creation() {
@@ -86,7 +86,7 @@ fn test_sampling_params_conversion() {
     };
 
     let params = request.to_sampling_params(1000, None);
-    
+
     // Check that parameters are converted correctly
     assert!(params.contains_key("temperature"));
     assert!(params.contains_key("top_p"));
@@ -97,7 +97,7 @@ fn test_sampling_params_conversion() {
 #[test]
 fn test_responses_response_creation() {
     let _usage = UsageInfo::new(10, 20, Some(5));
-    
+
     let _output_item = ResponseOutputItem::new_message(
         "msg_123".to_string(),
         "assistant".to_string(),
@@ -108,7 +108,7 @@ fn test_responses_response_creation() {
         )],
         "completed".to_string(),
     );
-    
+
     let response = ResponsesResponse::new(
         "resp_test789".to_string(),
         "test-model".to_string(),
@@ -126,18 +126,32 @@ fn test_responses_response_creation() {
 fn test_usage_conversion() {
     let usage_info = UsageInfo::new_with_cached(15, 25, Some(8), 3);
     let response_usage = usage_info.to_response_usage();
-    
+
     assert_eq!(response_usage.input_tokens, 15);
     assert_eq!(response_usage.output_tokens, 25);
     assert_eq!(response_usage.total_tokens, 40);
-    
+
     // Check details are converted correctly
     assert!(response_usage.input_tokens_details.is_some());
-    assert_eq!(response_usage.input_tokens_details.as_ref().unwrap().cached_tokens, 3);
-    
+    assert_eq!(
+        response_usage
+            .input_tokens_details
+            .as_ref()
+            .unwrap()
+            .cached_tokens,
+        3
+    );
+
     assert!(response_usage.output_tokens_details.is_some());
-    assert_eq!(response_usage.output_tokens_details.as_ref().unwrap().reasoning_tokens, 8);
-    
+    assert_eq!(
+        response_usage
+            .output_tokens_details
+            .as_ref()
+            .unwrap()
+            .reasoning_tokens,
+        8
+    );
+
     // Test reverse conversion
     let back_to_usage = response_usage.to_usage_info();
     assert_eq!(back_to_usage.prompt_tokens, 15);
@@ -150,11 +164,11 @@ fn test_reasoning_param_default() {
     let param = ResponseReasoningParam {
         effort: ReasoningEffort::Medium,
     };
-    
+
     // Test JSON serialization/deserialization preserves default
     let json = serde_json::to_string(&param).unwrap();
     let parsed: ResponseReasoningParam = serde_json::from_str(&json).unwrap();
-    
+
     assert!(matches!(parsed.effort, ReasoningEffort::Medium));
 }
 
@@ -179,11 +193,9 @@ fn test_json_serialization() {
         stream: true,
         temperature: Some(0.9),
         tool_choice: ToolChoice::Required,
-        tools: vec![
-            ResponseTool {
-                tool_type: ResponseToolType::CodeInterpreter,
-            }
-        ],
+        tools: vec![ResponseTool {
+            tool_type: ResponseToolType::CodeInterpreter,
+        }],
         top_logprobs: Some(10),
         top_p: Some(0.8),
         truncation: Truncation::Auto,
@@ -201,8 +213,9 @@ fn test_json_serialization() {
 
     // Test that everything can be serialized to JSON and back
     let json = serde_json::to_string(&request).expect("Serialization should work");
-    let parsed: ResponsesRequest = serde_json::from_str(&json).expect("Deserialization should work");
-    
+    let parsed: ResponsesRequest =
+        serde_json::from_str(&json).expect("Deserialization should work");
+
     assert_eq!(parsed.request_id, "resp_comprehensive_test");
     assert_eq!(parsed.model, Some("gpt-4".to_string()));
     assert!(parsed.background);

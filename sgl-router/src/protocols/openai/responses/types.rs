@@ -262,10 +262,8 @@ impl UsageInfo {
                     cached_tokens: details.cached_tokens,
                 }
             }),
-            output_tokens_details: self.reasoning_tokens.map(|tokens| {
-                OutputTokensDetails {
-                    reasoning_tokens: tokens,
-                }
+            output_tokens_details: self.reasoning_tokens.map(|tokens| OutputTokensDetails {
+                reasoning_tokens: tokens,
             }),
         }
     }
@@ -284,9 +282,10 @@ impl ResponseUsage {
             prompt_tokens: self.input_tokens,
             completion_tokens: self.output_tokens,
             total_tokens: self.total_tokens,
-            reasoning_tokens: self.output_tokens_details.as_ref().map(|details| {
-                details.reasoning_tokens
-            }),
+            reasoning_tokens: self
+                .output_tokens_details
+                .as_ref()
+                .map(|details| details.reasoning_tokens),
             prompt_tokens_details: self.input_tokens_details.as_ref().map(|details| {
                 PromptTokenUsageInfo {
                     cached_tokens: details.cached_tokens,

@@ -3,7 +3,9 @@ use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::protocols::{
     generate::GenerateRequest,
-    openai::{chat::ChatCompletionRequest, completions::CompletionRequest, responses::ResponsesRequest},
+    openai::{
+        chat::ChatCompletionRequest, completions::CompletionRequest, responses::ResponsesRequest,
+    },
 };
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};

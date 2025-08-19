@@ -192,14 +192,44 @@ impl ResponsesRequest {
                 .unwrap_or(Self::DEFAULT_TOP_P)
         });
 
-        params.insert("max_new_tokens".to_string(), serde_json::Value::Number(serde_json::Number::from(max_tokens)));
-        params.insert("temperature".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(temperature as f64).unwrap()));
-        params.insert("top_p".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(top_p as f64).unwrap()));
-        params.insert("frequency_penalty".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(self.frequency_penalty as f64).unwrap()));
-        params.insert("presence_penalty".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(self.presence_penalty as f64).unwrap()));
-        params.insert("top_k".to_string(), serde_json::Value::Number(serde_json::Number::from(self.top_k)));
-        params.insert("min_p".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(self.min_p as f64).unwrap()));
-        params.insert("repetition_penalty".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(self.repetition_penalty as f64).unwrap()));
+        params.insert(
+            "max_new_tokens".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(max_tokens)),
+        );
+        params.insert(
+            "temperature".to_string(),
+            serde_json::Value::Number(serde_json::Number::from_f64(temperature as f64).unwrap()),
+        );
+        params.insert(
+            "top_p".to_string(),
+            serde_json::Value::Number(serde_json::Number::from_f64(top_p as f64).unwrap()),
+        );
+        params.insert(
+            "frequency_penalty".to_string(),
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(self.frequency_penalty as f64).unwrap(),
+            ),
+        );
+        params.insert(
+            "presence_penalty".to_string(),
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(self.presence_penalty as f64).unwrap(),
+            ),
+        );
+        params.insert(
+            "top_k".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(self.top_k)),
+        );
+        params.insert(
+            "min_p".to_string(),
+            serde_json::Value::Number(serde_json::Number::from_f64(self.min_p as f64).unwrap()),
+        );
+        params.insert(
+            "repetition_penalty".to_string(),
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(self.repetition_penalty as f64).unwrap(),
+            ),
+        );
 
         if let Some(ref stop) = self.stop {
             params.insert("stop".to_string(), serde_json::to_value(stop).unwrap());
@@ -208,9 +238,7 @@ impl ResponsesRequest {
         // Apply any additional default parameters
         if let Some(default_params) = default_params {
             for (key, value) in default_params {
-                if !params.contains_key(&key) {
-                    params.insert(key, value);
-                }
+                params.entry(key).or_insert(value);
             }
         }
 
@@ -230,43 +258,41 @@ impl GenerationRequest for ResponsesRequest {
     fn extract_text_for_routing(&self) -> String {
         match &self.input {
             ResponseInput::Text(text) => text.clone(),
-            ResponseInput::Items(items) => {
-                items
-                    .iter()
-                    .filter_map(|item| match item {
-                        ResponseInputOutputItem::Message { content, .. } => {
-                            let texts: Vec<String> = content
-                                .iter()
-                                .filter_map(|part| match part {
-                                    ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                                })
-                                .collect();
-                            if texts.is_empty() {
-                                None
-                            } else {
-                                Some(texts.join(" "))
-                            }
-                        },
-                        ResponseInputOutputItem::Reasoning { content, .. } => {
-                            let texts: Vec<String> = content
-                                .iter()
-                                .filter_map(|part| match part {
-                                    ResponseReasoningContent::ReasoningText { text } => Some(text.clone()),
-                                })
-                                .collect();
-                            if texts.is_empty() {
-                                None
-                            } else {
-                                Some(texts.join(" "))
-                            }
-                        },
-                        ResponseInputOutputItem::FunctionToolCall { arguments, .. } => {
-                            Some(arguments.clone())
-                        },
-                    })
-                    .collect::<Vec<String>>()
-                    .join(" ")
-            }
+            ResponseInput::Items(items) => items
+                .iter()
+                .filter_map(|item| match item {
+                    ResponseInputOutputItem::Message { content, .. } => {
+                        let texts: Vec<String> = content
+                            .iter()
+                            .map(|part| match part {
+                                ResponseContentPart::OutputText { text, .. } => text.clone(),
+                            })
+                            .collect();
+                        if texts.is_empty() {
+                            None
+                        } else {
+                            Some(texts.join(" "))
+                        }
+                    }
+                    ResponseInputOutputItem::Reasoning { content, .. } => {
+                        let texts: Vec<String> = content
+                            .iter()
+                            .map(|part| match part {
+                                ResponseReasoningContent::ReasoningText { text } => text.clone(),
+                            })
+                            .collect();
+                        if texts.is_empty() {
+                            None
+                        } else {
+                            Some(texts.join(" "))
+                        }
+                    }
+                    ResponseInputOutputItem::FunctionToolCall { arguments, .. } => {
+                        Some(arguments.clone())
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join(" "),
         }
     }
 }

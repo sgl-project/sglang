@@ -6,10 +6,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 fn generate_response_id() -> String {
-    format!("resp_{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs())
+    format!(
+        "resp_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    )
 }
 
 fn current_timestamp() -> i64 {
@@ -103,11 +106,7 @@ impl ResponsesResponse {
     }
 
     /// Create a new response with default values
-    pub fn new(
-        request_id: String,
-        model: String,
-        status: ResponseStatus,
-    ) -> Self {
+    pub fn new(request_id: String, model: String, status: ResponseStatus) -> Self {
         Self {
             id: request_id,
             object: "response".to_string(),
@@ -163,19 +162,21 @@ impl ResponsesResponse {
     }
 
     /// Convert usage to OpenAI Responses API format
-    pub fn usage_in_response_format(&self) -> Option<crate::protocols::openai::responses::types::ResponseUsage> {
+    pub fn usage_in_response_format(
+        &self,
+    ) -> Option<crate::protocols::openai::responses::types::ResponseUsage> {
         self.usage.as_ref().map(|usage| usage.to_response_usage())
     }
 
     /// Get the response as a JSON value with usage in response format
     pub fn to_response_format(&self) -> serde_json::Value {
         let mut response = serde_json::to_value(self).unwrap();
-        
+
         // Convert usage to response format if present
         if let Some(usage) = &self.usage {
             response["usage"] = serde_json::to_value(usage.to_response_usage()).unwrap();
         }
-        
+
         response
     }
 }
@@ -255,11 +256,7 @@ impl ResponseReasoningContent {
 
 impl UsageInfo {
     /// Create a new usage info with token counts
-    pub fn new(
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        reasoning_tokens: Option<u32>,
-    ) -> Self {
+    pub fn new(prompt_tokens: u32, completion_tokens: u32, reasoning_tokens: Option<u32>) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,

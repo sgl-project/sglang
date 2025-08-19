@@ -12,7 +12,9 @@ use crate::policies::LoadBalancingPolicy;
 use crate::protocols::{
     common::GenerationRequest,
     generate::GenerateRequest,
-    openai::{chat::ChatCompletionRequest, completions::CompletionRequest, responses::ResponsesRequest},
+    openai::{
+        chat::ChatCompletionRequest, completions::CompletionRequest, responses::ResponsesRequest,
+    },
 };
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::{

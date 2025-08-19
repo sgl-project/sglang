@@ -449,14 +449,23 @@ mod generation_tests {
             .await
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        
+
         // Verify response structure
         assert!(body_json.get("id").is_some());
-        assert_eq!(body_json.get("object").and_then(|v| v.as_str()), Some("response"));
+        assert_eq!(
+            body_json.get("object").and_then(|v| v.as_str()),
+            Some("response")
+        );
         assert!(body_json.get("created_at").is_some());
-        assert_eq!(body_json.get("model").and_then(|v| v.as_str()), Some("test-model"));
+        assert_eq!(
+            body_json.get("model").and_then(|v| v.as_str()),
+            Some("test-model")
+        );
         assert!(body_json.get("output").is_some());
-        assert_eq!(body_json.get("status").and_then(|v| v.as_str()), Some("completed"));
+        assert_eq!(
+            body_json.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
 
         ctx.shutdown().await;
     }
@@ -499,7 +508,7 @@ mod generation_tests {
             .await
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        
+
         // Verify response has tools configured
         assert!(body_json.get("tools").is_some());
         let tools = body_json["tools"].as_array().unwrap();
@@ -547,10 +556,13 @@ mod generation_tests {
             .await
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        
+
         // Verify reasoning configuration is preserved
         assert!(body_json.get("id").is_some());
-        assert_eq!(body_json.get("status").and_then(|v| v.as_str()), Some("completed"));
+        assert_eq!(
+            body_json.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
 
         ctx.shutdown().await;
     }
@@ -591,15 +603,19 @@ mod generation_tests {
             .await
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        
+
         // Background requests should return immediately with queued status
         assert!(body_json.get("id").is_some());
         let response_id = body_json["id"].as_str().unwrap();
         assert!(response_id.starts_with("resp_"));
-        
+
         // Status should be queued or in_progress for background requests
         let status = body_json.get("status").and_then(|v| v.as_str());
-        assert!(status == Some("queued") || status == Some("in_progress") || status == Some("completed"));
+        assert!(
+            status == Some("queued")
+                || status == Some("in_progress")
+                || status == Some("completed")
+        );
 
         ctx.shutdown().await;
     }

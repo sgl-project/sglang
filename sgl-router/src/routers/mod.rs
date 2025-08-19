@@ -11,7 +11,9 @@ use std::fmt::Debug;
 
 use crate::protocols::{
     generate::GenerateRequest,
-    openai::{chat::ChatCompletionRequest, completions::CompletionRequest, responses::ResponsesRequest},
+    openai::{
+        chat::ChatCompletionRequest, completions::CompletionRequest, responses::ResponsesRequest,
+    },
 };
 
 pub mod factory;
