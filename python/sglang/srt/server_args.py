@@ -2032,7 +2032,7 @@ class ServerArgs:
         if self.chunked_prefill_size > 0:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
-            ), "chunked_prefill_size must be divisible by page_size"
+            ), f"{chunked_prefill_size=} must be divisible by {page_size=}"
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
@@ -2124,7 +2124,7 @@ class ServerArgs:
                     self.attention_backend = "fa3"
                 else:
                     self.attention_backend = "triton"
-            supported_backends = ["triton", "trtllm_mha", "fa3"]
+            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4"]
             logger.info(
                 f"Use {self.attention_backend} as attention backend for GptOssForCausalLM"
             )

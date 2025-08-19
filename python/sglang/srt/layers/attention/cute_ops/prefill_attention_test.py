@@ -281,27 +281,27 @@ def test_paged(
 
 
 if __name__ == "__main__":
-    # test_ragged(
-    #     qo_lens=(8,),
-    #     kv_lens=(8,),
-    #     num_qo_heads=1,
-    #     num_kv_heads=1,
-    #     head_dim=128,
-    #     softmax_scale=None,
-    # )
+    test_ragged(
+        qo_lens=(8,),
+        kv_lens=(8,),
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim=128,
+        softmax_scale=None,
+    )
 
-    # test_ragged(
-    #     qo_lens=(11, 12, 32),
-    #     kv_lens=(256, 128, 64),
-    #     num_qo_heads=4,
-    #     num_kv_heads=4,
-    #     head_dim=128,
-    #     softmax_scale=None,
-    # )
+    test_ragged(
+        qo_lens=(11, 12, 32),
+        kv_lens=(256, 128, 64),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=128,
+        softmax_scale=None,
+    )
 
     test_paged(
-        qo_lens=(8,),
-        kv_lens=(11,),
+        qo_lens=(8, 17),
+        kv_lens=(11, 19),
         num_qo_heads=2,
         num_kv_heads=2,
         num_pages=32,
