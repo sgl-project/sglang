@@ -31,7 +31,10 @@ impl SglangSchedulerClient {
     }
 
     /// Initialize the connection
-    pub async fn initialize(&mut self, client_id: String) -> Result<proto::InitializeResponse, Box<dyn std::error::Error>> {
+    pub async fn initialize(
+        &mut self,
+        client_id: String,
+    ) -> Result<proto::InitializeResponse, Box<dyn std::error::Error>> {
         let request = Request::new(proto::InitializeRequest {
             client_id,
             client_version: "0.1.0".to_string(),
@@ -43,14 +46,19 @@ impl SglangSchedulerClient {
     }
 
     /// Submit a generation request (returns streaming response)
-    pub async fn generate_stream(&mut self, req: proto::GenerateRequest) -> Result<tonic::Streaming<proto::GenerateResponse>, Box<dyn std::error::Error>> {
+    pub async fn generate_stream(
+        &mut self,
+        req: proto::GenerateRequest,
+    ) -> Result<tonic::Streaming<proto::GenerateResponse>, Box<dyn std::error::Error>> {
         let request = Request::new(req);
         let response = self.client.generate(request).await?;
         Ok(response.into_inner())
     }
 
     /// Perform health check
-    pub async fn health_check(&mut self) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error>> {
+    pub async fn health_check(
+        &mut self,
+    ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error>> {
         let request = Request::new(proto::HealthCheckRequest {
             include_detailed_metrics: false,
         });
@@ -60,18 +68,23 @@ impl SglangSchedulerClient {
     }
 
     /// Abort a request
-    pub async fn abort_request(&mut self, request_id: String, reason: String) -> Result<(), Box<dyn std::error::Error>> {
-        let request = Request::new(proto::AbortRequest {
-            request_id,
-            reason,
-        });
+    pub async fn abort_request(
+        &mut self,
+        request_id: String,
+        reason: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let request = Request::new(proto::AbortRequest { request_id, reason });
 
         self.client.abort(request).await?;
         Ok(())
     }
 
     /// Flush cache
-    pub async fn flush_cache(&mut self, flush_all: bool, session_ids: &[String]) -> Result<proto::FlushCacheResponse, Box<dyn std::error::Error>> {
+    pub async fn flush_cache(
+        &mut self,
+        flush_all: bool,
+        session_ids: &[String],
+    ) -> Result<proto::FlushCacheResponse, Box<dyn std::error::Error>> {
         let request = Request::new(proto::FlushCacheRequest {
             flush_all,
             session_ids: session_ids.to_vec(),
@@ -112,7 +125,9 @@ mod tests {
 
         let gen_req = proto::GenerateRequest {
             request_id: "test-req-123".to_string(),
-            input: Some(proto::generate_request::Input::Text("Hello world".to_string())),
+            input: Some(proto::generate_request::Input::Text(
+                "Hello world".to_string(),
+            )),
             sampling_params: Some(sampling_params),
             return_logprob: true,
             logprob_start_len: 0,
@@ -211,7 +226,9 @@ mod tests {
     fn test_embed_request() {
         let embed_req = proto::EmbedRequest {
             request_id: "embed-req-202".to_string(),
-            input: Some(proto::embed_request::Input::Text("This is a test sentence for embedding".to_string())),
+            input: Some(proto::embed_request::Input::Text(
+                "This is a test sentence for embedding".to_string(),
+            )),
             log_metrics: true,
             data_parallel_rank: 0,
             ..Default::default()
@@ -274,7 +291,10 @@ mod tests {
             vocab_size: 128256,
             supports_tool_calling: true,
             supports_vision: false,
-            special_tokens: vec!["<|begin_of_text|>".to_string(), "<|end_of_text|>".to_string()],
+            special_tokens: vec![
+                "<|begin_of_text|>".to_string(),
+                "<|end_of_text|>".to_string(),
+            ],
             model_type: "llama".to_string(),
             num_layers: 32,
             hidden_size: 4096,

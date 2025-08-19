@@ -5,4 +5,4 @@
 pub mod client;
 
 // Re-export the client
-pub use client::{SglangSchedulerClient, proto};
+pub use client::{proto, SglangSchedulerClient};

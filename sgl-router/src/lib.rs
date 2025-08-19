@@ -3,6 +3,8 @@ pub mod config;
 pub mod logging;
 use std::collections::HashMap;
 pub mod core;
+#[cfg(feature = "grpc-client")]
+pub mod grpc;
 pub mod metrics;
 pub mod middleware;
 pub mod policies;
@@ -13,8 +15,6 @@ pub mod server;
 pub mod service_discovery;
 pub mod tokenizer;
 pub mod tree;
-#[cfg(feature = "grpc-client")]
-pub mod grpc;
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
