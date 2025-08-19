@@ -506,9 +506,10 @@ class ServerArgs:
                 self.page_size = 64
 
             if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "trtllm_mha backend does not support speculative decoding yet."
-                )
+                if self.speculative_eagle_topk > 1:
+                    raise ValueError(
+                        "trtllm_mha backend only supports topk = 1 for speculative decoding."
+                    )
 
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(

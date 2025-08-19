@@ -267,6 +267,22 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
             )
+        elif self.server_args.attention_backend == "trtllm_mha":
+            from sglang.srt.layers.attention.trtllm_mha_backend import (
+                TRTLLMHAAttnBackend,
+                TRTLLMHAAttnMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = TRTLLMHAAttnMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = TRTLLMHAAttnBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
+            self.has_prefill_wrapper_verify = True
         else:
             raise ValueError(
                 f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
