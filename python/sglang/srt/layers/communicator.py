@@ -292,7 +292,6 @@ class LayerCommunicator:
             (not self.is_last_layer)
             and (self._context.tp_size > 1)
             and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
-            and _is_sm100_supported
             and _is_flashinfer_available
         )
 
