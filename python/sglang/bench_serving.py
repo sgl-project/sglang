@@ -814,9 +814,9 @@ def sample_mmmu_requests(
         List of tuples (prompt, prompt_token_len, output_token_len).
     """
     try:
+        import base64
         import io
 
-        import pybase64
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
