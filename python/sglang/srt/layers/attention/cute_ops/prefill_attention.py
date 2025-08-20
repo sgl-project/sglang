@@ -246,9 +246,6 @@ def flash_attn_varlen_func(
         pack_gqa:
     """
     assert causal, "Only support causal."
-    assert (
-        window_size[0] is None and window_size[1] is None
-    ), "window_size is not supported."
 
     out, lse = _flash_attn_fwd(
         q=q,
