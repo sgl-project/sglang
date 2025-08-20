@@ -218,13 +218,18 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
 
         pixel_values = torch.cat(pixel_values, dim=0)
 
+        original_placeholder = "<<<__IMG_CONTEXT_PLACEHOLDER__>>>"
+        input_text = input_text.replace(self.IMG_CONTEXT_TOKEN, original_placeholder)
+
         for idx, num_patches in enumerate(num_patches_list):
             image_tokens = (
                 self.IMG_START_TOKEN
                 + self.IMG_CONTEXT_TOKEN * self.num_image_token * num_patches
                 + self.IMG_END_TOKEN
             )
-            input_text = input_text.replace("<IMG_CONTEXT>", image_tokens, 1)
+            input_text = input_text.replace(original_placeholder, image_tokens, 1)
+
+        input_text = input_text.replace(original_placeholder, self.IMG_CONTEXT_TOKEN)
 
         input_ids = self.tokenizer(input_text, return_tensors="pt")[
             "input_ids"
