@@ -142,6 +142,7 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
         if offsets is not None:

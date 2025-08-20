@@ -351,6 +351,9 @@ class DeepEPMoE(EPMoE):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         activation: str = "silu",
+        activation_alpha: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
+        with_bias: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ):
         super().__init__(
@@ -364,6 +367,9 @@ class DeepEPMoE(EPMoE):
             quant_config=quant_config,
             prefix=prefix,
             activation=activation,
+            activation_alpha=activation_alpha,
+            swiglu_limit=swiglu_limit,
+            with_bias=with_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = get_deepep_mode()
