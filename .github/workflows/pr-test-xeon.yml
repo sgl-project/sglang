@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-test:
+  build-sglang-image:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
     runs-on: xeon-gnr
@@ -86,6 +86,9 @@ jobs:
 
       - name: Force fail if any step failed
         if: always() && (steps.check_amx.outcome == 'failure' || steps.run_ut_cases.outcome == 'failure')
+        run: |
+          echo "At least one step failed, failing the job..."
+          exit 1
 
       - name: Change permission
         timeout-minutes: 20

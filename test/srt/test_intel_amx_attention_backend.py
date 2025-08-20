@@ -25,6 +25,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
+
 class TestIntelAMXAttnBackend(CustomTestCase):
     def test_latency_mla_model(self):
         prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
