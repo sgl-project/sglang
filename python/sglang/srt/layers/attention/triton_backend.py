@@ -303,7 +303,7 @@ class TritonAttnBackend(AttentionBackend):
             )
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
-                forward_batch.extend_prefix_lens.sum().item(),
+                sum(forward_batch.extend_prefix_lens_cpu),
                 dtype=torch.int32,
                 device=self.device,
             )
