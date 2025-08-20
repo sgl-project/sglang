@@ -3,6 +3,8 @@ pub mod config;
 pub mod logging;
 use std::collections::HashMap;
 pub mod core;
+#[cfg(feature = "grpc-client")]
+pub mod grpc;
 pub mod metrics;
 pub mod middleware;
 pub mod policies;
