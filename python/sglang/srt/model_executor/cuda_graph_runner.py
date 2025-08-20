@@ -234,7 +234,7 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
-class GraphRunner:
+class CudaGraphRunner:
     """A GraphRunner is a base class to run the forward pass of a model with device graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
