@@ -557,7 +557,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         **fast_decode_kwargs,
     ):
         bs = len(req_pool_indices)
-        q_indptr = torch.arange(0, bs + 1, dtype=torch.int32, device=q_indptr.device)
+        # q_indptr = torch.arange(0, bs + 1, dtype=torch.int32, device=q_indptr.device)
         kv_lens = paged_kernel_lens.to(torch.int32)
         sm_scale = self.scaling
         if spec_info is None:
