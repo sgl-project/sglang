@@ -128,7 +128,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
         except Exception as e:
             print(f"Error reading results_vlm_mmmu.json: {e}")
 
-        check_model_scores(all_results, MODEL_SCORE_THRESHOLDS)
+        check_model_scores(all_results, MODEL_SCORE_THRESHOLDS, self.__class__.__name__)
 
 
 if __name__ == "__main__":

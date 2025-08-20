@@ -128,7 +128,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             print(f"Error reading results.json: {e}")
 
         # Check all scores after collecting all results
-        check_model_scores(all_results, MODEL_SCORE_THRESHOLDS)
+        check_model_scores(all_results, MODEL_SCORE_THRESHOLDS, self.__class__.__name__)
 
 
 if __name__ == "__main__":

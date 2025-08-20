@@ -1495,7 +1495,7 @@ def parse_models(model_string: str):
     return [model.strip() for model in model_string.split(",") if model.strip()]
 
 
-def check_model_scores(results, model_score_thresholds):
+def check_model_scores(results, model_score_thresholds, test_name):
     failed_models = []
     summary = " | model | score | threshold | status |\n"
     summary += "| ----- | ----- | --------- | ------ |\n"
@@ -1521,7 +1521,7 @@ def check_model_scores(results, model_score_thresholds):
     print(summary)
 
     if is_in_ci():
-        write_github_step_summary(f"### TestNightlyVLMMmmuEval\n{summary}")
+        write_github_step_summary(f"## {test_name}\n{summary}")
 
     if failed_models:
         raise AssertionError("\n".join(failed_models))
