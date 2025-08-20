@@ -50,7 +50,6 @@ DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
-DEFAULT_MODEL_NAME_FOR_TEST_DSR1_NEXTN = "lmsys/DeepSeek-R1-NextN"
 
 # FP8 models
 DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
@@ -63,12 +62,6 @@ DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
 )
 DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8 = "Qwen/Qwen3-1.7B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
-DEFAULT_MODEL_NAME_FOR_TEST_FP8_DS_R1 = "MollyHexapotato/custom-deepseek-r1-4L"
-
-# INT8 models
-DEFAULT_MODEL_NAME_FOR_TEST_INT8_DS_R1 = (
-    "MollyHexapotato/custom_DeepSeek-R1-Channel-INT8_4L"
-)
 
 # W8A8 models
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
