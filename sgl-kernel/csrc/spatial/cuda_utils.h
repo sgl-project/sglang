@@ -1,6 +1,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <iostream>
+
 #define CUDA_RT(call)                                                                                        \
   do {                                                                                                       \
     cudaError_t _status = (call);                                                                            \

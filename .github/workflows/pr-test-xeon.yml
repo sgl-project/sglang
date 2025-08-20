@@ -1,18 +1,33 @@
 name: PR Test (Xeon)
+
 on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-xeon.yml"
   pull_request:
-    branches:
-      - main
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-xeon.yml"
   workflow_dispatch:
 
 concurrency:
-  group: pr-test-xeon
+  group: pr-test-xeon-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build-sglang-image:
-    if: github.event_name == 'pull_request'
-    runs-on: sglang-pvc
+  build-test:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false
+    runs-on: xeon-gnr
     strategy:
       matrix:
         build_type: ['all']
@@ -30,7 +45,7 @@ jobs:
   env-prepare:
     if: always()
     needs: [build-sglang-image]
-    runs-on: sglang-pvc
+    runs-on: xeon-gnr
     steps:
       - name: Run container
         run: |
@@ -40,19 +55,18 @@ jobs:
             --name ci_sglang_xeon \
             sglang_xeon
 
-      - name: Install Dependency
+      - name: Install dependencies
         timeout-minutes: 20
         run: |
           docker exec ci_sglang_xeon bash -c "python3 -m pip install --upgrade pip"
           docker exec ci_sglang_xeon pip uninstall sgl-kernel -y || true
           docker exec -w /sglang-checkout/sgl-kernel ci_sglang_xeon bash -c "cp pyproject_cpu.toml pyproject.toml && pip install -v ."
-          docker exec -w /sglang-checkout/ ci_sglang_xeon bash -c "pip install -e "python[all_cpu]""
-          docker exec ci_sglang_xeon bash -c "python3 -m pip install pytest expecttest"
+          docker exec -w /sglang-checkout/ ci_sglang_xeon bash -c "pip install -e "python[dev_cpu]""
 
   sglang-xeon-test:
     if: always()
     needs: [env-prepare]
-    runs-on: sglang-pvc
+    runs-on: xeon-gnr
     steps:
       - name: Check AMX Support
         id: check_amx
@@ -72,14 +86,25 @@ jobs:
 
       - name: Force fail if any step failed
         if: always() && (steps.check_amx.outcome == 'failure' || steps.run_ut_cases.outcome == 'failure')
+
+      - name: Change permission
+        timeout-minutes: 20
+        run: |
+          docker exec -u root ci_sglang_xeon bash -c "
+            rm -rf /tmp/ci-home  &&
+            chown -R  $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true
+          "
+
+      - name: Cleanup container
+        if: always()
         run: |
           echo "At least one step failed, failing the job..."
           exit 1
 
-  finish:
+  pr-test-xeon-finish:
     if: always()
     needs: [build-sglang-image, env-prepare, sglang-xeon-test]
-    runs-on: sglang-pvc
+    runs-on: xeon-gnr
     steps:
       - name: Cleanup container
         if: always()

@@ -40,14 +40,18 @@ class RouterArgs:
 
     # Routing policy
     policy: str = "cache_aware"
-    worker_startup_timeout_secs: int = 300
-    worker_startup_check_interval: int = 10
-    cache_threshold: float = 0.5
-    balance_abs_threshold: int = 32
-    balance_rel_threshold: float = 1.0001
-    eviction_interval: int = 60
-    max_tree_size: int = 2**24
-    max_payload_size: int = 256 * 1024 * 1024  # 256MB default for large batches
+    prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
+    decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
+    worker_startup_timeout_secs: int = 600
+    worker_startup_check_interval: int = 30
+    cache_threshold: float = 0.3
+    balance_abs_threshold: int = 64
+    balance_rel_threshold: float = 1.5
+    eviction_interval: int = 120
+    max_tree_size: int = 2**26
+    max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
+    dp_aware: bool = False
+    api_key: Optional[str] = None
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
     # Service discovery configuration
@@ -62,6 +66,33 @@ class RouterArgs:
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
+    # Request ID headers configuration
+    request_id_headers: Optional[List[str]] = None
+    # Request timeout in seconds
+    request_timeout_secs: int = 1800
+    # Max concurrent requests for rate limiting
+    max_concurrent_requests: int = 256
+    # CORS allowed origins
+    cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
+    # Retry configuration
+    retry_max_retries: int = 5
+    retry_initial_backoff_ms: int = 50
+    retry_max_backoff_ms: int = 30_000
+    retry_backoff_multiplier: float = 1.5
+    retry_jitter_factor: float = 0.2
+    disable_retries: bool = False
+    # Health check configuration
+    health_failure_threshold: int = 3
+    health_success_threshold: int = 2
+    health_check_timeout_secs: int = 5
+    health_check_interval_secs: int = 60
+    health_check_endpoint: str = "/health"
+    # Circuit breaker configuration
+    cb_failure_threshold: int = 10
+    cb_success_threshold: int = 3
+    cb_timeout_duration_secs: int = 60
+    cb_window_duration_secs: int = 120
+    disable_circuit_breaker: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -108,7 +139,21 @@ class RouterArgs:
             type=str,
             default=RouterArgs.policy,
             choices=["random", "round_robin", "cache_aware", "power_of_two"],
-            help="Load balancing policy to use. Note: power_of_two is only available in PD disaggregated mode",
+            help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
+        )
+        parser.add_argument(
+            f"--{prefix}prefill-policy",
+            type=str,
+            default=None,
+            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
+        )
+        parser.add_argument(
+            f"--{prefix}decode-policy",
+            type=str,
+            default=None,
+            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
 
         # PD-specific arguments
@@ -119,10 +164,11 @@ class RouterArgs:
         )
         parser.add_argument(
             f"--{prefix}prefill",
-            nargs=2,
+            nargs="+",
             action="append",
-            metavar=("URL", "BOOTSTRAP_PORT"),
-            help="Prefill server URL and bootstrap port. Can be specified multiple times. BOOTSTRAP_PORT can be 'none' for no bootstrap port.",
+            help="Prefill server URL and optional bootstrap port. Can be specified multiple times. "
+            "Format: --prefill URL [BOOTSTRAP_PORT]. "
+            "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
         )
         parser.add_argument(
             f"--{prefix}decode",
@@ -178,6 +224,17 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_payload_size,
             help="Maximum payload size in bytes",
+        )
+        parser.add_argument(
+            f"--{prefix}dp-aware",
+            action="store_true",
+            help="Enable data parallelism aware schedule",
+        )
+        parser.add_argument(
+            f"--{prefix}api-key",
+            type=str,
+            default=None,
+            help="The api key used for the authorization with the worker.  Useful when the dp aware scheduling strategy is enaled.",
         )
         parser.add_argument(
             f"--{prefix}log-dir",
@@ -239,6 +296,119 @@ class RouterArgs:
             default="127.0.0.1",
             help="Host address to bind the Prometheus metrics server",
         )
+        parser.add_argument(
+            f"--{prefix}request-id-headers",
+            type=str,
+            nargs="*",
+            help="Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id). If not specified, uses common defaults.",
+        )
+        parser.add_argument(
+            f"--{prefix}request-timeout-secs",
+            type=int,
+            default=RouterArgs.request_timeout_secs,
+            help="Request timeout in seconds",
+        )
+        # Retry configuration
+        parser.add_argument(
+            f"--{prefix}retry-max-retries",
+            type=int,
+            default=RouterArgs.retry_max_retries,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-initial-backoff-ms",
+            type=int,
+            default=RouterArgs.retry_initial_backoff_ms,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-max-backoff-ms",
+            type=int,
+            default=RouterArgs.retry_max_backoff_ms,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-backoff-multiplier",
+            type=float,
+            default=RouterArgs.retry_backoff_multiplier,
+        )
+        parser.add_argument(
+            f"--{prefix}retry-jitter-factor",
+            type=float,
+            default=RouterArgs.retry_jitter_factor,
+        )
+        parser.add_argument(
+            f"--{prefix}disable-retries",
+            action="store_true",
+            help="Disable retries (equivalent to setting retry_max_retries=1)",
+        )
+        # Circuit breaker configuration
+        parser.add_argument(
+            f"--{prefix}cb-failure-threshold",
+            type=int,
+            default=RouterArgs.cb_failure_threshold,
+        )
+        parser.add_argument(
+            f"--{prefix}cb-success-threshold",
+            type=int,
+            default=RouterArgs.cb_success_threshold,
+        )
+        parser.add_argument(
+            f"--{prefix}cb-timeout-duration-secs",
+            type=int,
+            default=RouterArgs.cb_timeout_duration_secs,
+        )
+        parser.add_argument(
+            f"--{prefix}cb-window-duration-secs",
+            type=int,
+            default=RouterArgs.cb_window_duration_secs,
+        )
+        parser.add_argument(
+            f"--{prefix}disable-circuit-breaker",
+            action="store_true",
+            help="Disable circuit breaker (equivalent to setting cb_failure_threshold to u32::MAX)",
+        )
+        # Health check configuration
+        parser.add_argument(
+            f"--{prefix}health-failure-threshold",
+            type=int,
+            default=RouterArgs.health_failure_threshold,
+            help="Number of consecutive health check failures before marking worker unhealthy",
+        )
+        parser.add_argument(
+            f"--{prefix}health-success-threshold",
+            type=int,
+            default=RouterArgs.health_success_threshold,
+            help="Number of consecutive health check successes before marking worker healthy",
+        )
+        parser.add_argument(
+            f"--{prefix}health-check-timeout-secs",
+            type=int,
+            default=RouterArgs.health_check_timeout_secs,
+            help="Timeout in seconds for health check requests",
+        )
+        parser.add_argument(
+            f"--{prefix}health-check-interval-secs",
+            type=int,
+            default=RouterArgs.health_check_interval_secs,
+            help="Interval in seconds between runtime health checks",
+        )
+        parser.add_argument(
+            f"--{prefix}health-check-endpoint",
+            type=str,
+            default=RouterArgs.health_check_endpoint,
+            help="Health check endpoint path",
+        )
+        parser.add_argument(
+            f"--{prefix}max-concurrent-requests",
+            type=int,
+            default=RouterArgs.max_concurrent_requests,
+            help="Maximum number of concurrent requests allowed (for rate limiting)",
+        )
+        parser.add_argument(
+            f"--{prefix}cors-allowed-origins",
+            type=str,
+            nargs="*",
+            default=[],
+            help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+        )
 
     @classmethod
     def from_cli_args(
@@ -266,6 +436,8 @@ class RouterArgs:
             prefill_urls=prefill_urls,
             decode_urls=decode_urls,
             policy=getattr(args, f"{prefix}policy"),
+            prefill_policy=getattr(args, f"{prefix}prefill_policy", None),
+            decode_policy=getattr(args, f"{prefix}decode_policy", None),
             worker_startup_timeout_secs=getattr(
                 args, f"{prefix}worker_startup_timeout_secs"
             ),
@@ -278,6 +450,8 @@ class RouterArgs:
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
+            dp_aware=getattr(args, f"{prefix}dp_aware", False),
+            api_key=getattr(args, f"{prefix}api_key", None),
             log_dir=getattr(args, f"{prefix}log_dir", None),
             log_level=getattr(args, f"{prefix}log_level", None),
             service_discovery=getattr(args, f"{prefix}service_discovery", False),
@@ -295,6 +469,52 @@ class RouterArgs:
             bootstrap_port_annotation="sglang.ai/bootstrap-port",  # Mooncake-specific annotation
             prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
             prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
+            request_id_headers=getattr(args, f"{prefix}request_id_headers", None),
+            request_timeout_secs=getattr(
+                args, f"{prefix}request_timeout_secs", RouterArgs.request_timeout_secs
+            ),
+            max_concurrent_requests=getattr(
+                args,
+                f"{prefix}max_concurrent_requests",
+                RouterArgs.max_concurrent_requests,
+            ),
+            cors_allowed_origins=getattr(args, f"{prefix}cors_allowed_origins", []),
+            retry_max_retries=getattr(args, f"{prefix}retry_max_retries"),
+            retry_initial_backoff_ms=getattr(args, f"{prefix}retry_initial_backoff_ms"),
+            retry_max_backoff_ms=getattr(args, f"{prefix}retry_max_backoff_ms"),
+            retry_backoff_multiplier=getattr(args, f"{prefix}retry_backoff_multiplier"),
+            retry_jitter_factor=getattr(args, f"{prefix}retry_jitter_factor"),
+            cb_failure_threshold=getattr(args, f"{prefix}cb_failure_threshold"),
+            cb_success_threshold=getattr(args, f"{prefix}cb_success_threshold"),
+            cb_timeout_duration_secs=getattr(args, f"{prefix}cb_timeout_duration_secs"),
+            cb_window_duration_secs=getattr(args, f"{prefix}cb_window_duration_secs"),
+            disable_retries=getattr(args, f"{prefix}disable_retries", False),
+            disable_circuit_breaker=getattr(
+                args, f"{prefix}disable_circuit_breaker", False
+            ),
+            health_failure_threshold=getattr(
+                args,
+                f"{prefix}health_failure_threshold",
+                RouterArgs.health_failure_threshold,
+            ),
+            health_success_threshold=getattr(
+                args,
+                f"{prefix}health_success_threshold",
+                RouterArgs.health_success_threshold,
+            ),
+            health_check_timeout_secs=getattr(
+                args,
+                f"{prefix}health_check_timeout_secs",
+                RouterArgs.health_check_timeout_secs,
+            ),
+            health_check_interval_secs=getattr(
+                args,
+                f"{prefix}health_check_interval_secs",
+                RouterArgs.health_check_interval_secs,
+            ),
+            health_check_endpoint=getattr(
+                args, f"{prefix}health_check_endpoint", RouterArgs.health_check_endpoint
+            ),
         )
 
     @staticmethod
@@ -313,24 +533,36 @@ class RouterArgs:
     def _parse_prefill_urls(prefill_list):
         """Parse prefill URLs from --prefill arguments.
 
-        Format: --prefill URL BOOTSTRAP_PORT
-        Example: --prefill http://prefill1:8080 9000 --prefill http://prefill2:8080 none
+        Format: --prefill URL [BOOTSTRAP_PORT]
+        Example:
+            --prefill http://prefill1:8080 9000  # With bootstrap port
+            --prefill http://prefill2:8080 none  # Explicitly no bootstrap port
+            --prefill http://prefill3:8080       # Defaults to no bootstrap port
         """
         if not prefill_list:
             return []
 
         prefill_urls = []
-        for url, bootstrap_port_str in prefill_list:
-            # Handle 'none' as None
-            if bootstrap_port_str.lower() == "none":
-                bootstrap_port = None
+        for prefill_args in prefill_list:
+
+            url = prefill_args[0]
+
+            # Handle optional bootstrap port
+            if len(prefill_args) >= 2:
+                bootstrap_port_str = prefill_args[1]
+                # Handle 'none' as None
+                if bootstrap_port_str.lower() == "none":
+                    bootstrap_port = None
+                else:
+                    try:
+                        bootstrap_port = int(bootstrap_port_str)
+                    except ValueError:
+                        raise ValueError(
+                            f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
+                        )
             else:
-                try:
-                    bootstrap_port = int(bootstrap_port_str)
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
-                    )
+                # No bootstrap port specified, default to None
+                bootstrap_port = None
 
             prefill_urls.append((url, bootstrap_port))
 
@@ -389,6 +621,35 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
                 if not router_args.decode_urls:
                     raise ValueError("PD disaggregation mode requires --decode")
 
+            # Warn about policy usage in PD mode
+            if (
+                router_args.prefill_policy
+                and router_args.decode_policy
+                and router_args.policy
+            ):
+                logger.warning(
+                    "Both --prefill-policy and --decode-policy are specified. "
+                    "The main --policy flag will be ignored for PD mode."
+                )
+            elif (
+                router_args.prefill_policy
+                and not router_args.decode_policy
+                and router_args.policy
+            ):
+                logger.info(
+                    f"Using --prefill-policy '{router_args.prefill_policy}' for prefill nodes "
+                    f"and --policy '{router_args.policy}' for decode nodes."
+                )
+            elif (
+                router_args.decode_policy
+                and not router_args.prefill_policy
+                and router_args.policy
+            ):
+                logger.info(
+                    f"Using --policy '{router_args.policy}' for prefill nodes "
+                    f"and --decode-policy '{router_args.decode_policy}' for decode nodes."
+                )
+
         # Create router with unified constructor
         router = Router(
             worker_urls=(
@@ -407,6 +668,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
             max_payload_size=router_args.max_payload_size,
+            dp_aware=router_args.dp_aware,
+            api_key=router_args.api_key,
             log_dir=router_args.log_dir,
             log_level=router_args.log_level,
             service_discovery=router_args.service_discovery,
@@ -417,6 +680,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             decode_selector=router_args.decode_selector,
             prometheus_port=router_args.prometheus_port,
             prometheus_host=router_args.prometheus_host,
+            request_timeout_secs=router_args.request_timeout_secs,
             pd_disaggregation=router_args.pd_disaggregation,
             prefill_urls=(
                 router_args.prefill_urls if router_args.pd_disaggregation else None
@@ -424,6 +688,35 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             decode_urls=(
                 router_args.decode_urls if router_args.pd_disaggregation else None
             ),
+            prefill_policy=(
+                policy_from_str(router_args.prefill_policy)
+                if router_args.prefill_policy
+                else None
+            ),
+            decode_policy=(
+                policy_from_str(router_args.decode_policy)
+                if router_args.decode_policy
+                else None
+            ),
+            request_id_headers=router_args.request_id_headers,
+            max_concurrent_requests=router_args.max_concurrent_requests,
+            cors_allowed_origins=router_args.cors_allowed_origins,
+            retry_max_retries=router_args.retry_max_retries,
+            retry_initial_backoff_ms=router_args.retry_initial_backoff_ms,
+            retry_max_backoff_ms=router_args.retry_max_backoff_ms,
+            retry_backoff_multiplier=router_args.retry_backoff_multiplier,
+            retry_jitter_factor=router_args.retry_jitter_factor,
+            cb_failure_threshold=router_args.cb_failure_threshold,
+            cb_success_threshold=router_args.cb_success_threshold,
+            cb_timeout_duration_secs=router_args.cb_timeout_duration_secs,
+            cb_window_duration_secs=router_args.cb_window_duration_secs,
+            disable_retries=router_args.disable_retries,
+            disable_circuit_breaker=router_args.disable_circuit_breaker,
+            health_failure_threshold=router_args.health_failure_threshold,
+            health_success_threshold=router_args.health_success_threshold,
+            health_check_timeout_secs=router_args.health_check_timeout_secs,
+            health_check_interval_secs=router_args.health_check_interval_secs,
+            health_check_endpoint=router_args.health_check_endpoint,
         )
 
         router.start()
@@ -455,11 +748,24 @@ Examples:
   # Regular mode
   python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
 
-  # PD disaggregated mode
+  # PD disaggregated mode with same policy for both
   python -m sglang_router.launch_router --pd-disaggregation \\
-    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 none \\
+    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 \\
     --decode http://decode1:8001 --decode http://decode2:8001 \\
     --policy cache_aware
+
+  # PD mode with optional bootstrap ports
+  python -m sglang_router.launch_router --pd-disaggregation \\
+    --prefill http://prefill1:8000 9000 \\    # With bootstrap port
+    --prefill http://prefill2:8000 none \\    # Explicitly no bootstrap port
+    --prefill http://prefill3:8000 \\         # Defaults to no bootstrap port
+    --decode http://decode1:8001 --decode http://decode2:8001
+
+  # PD mode with different policies for prefill and decode
+  python -m sglang_router.launch_router --pd-disaggregation \\
+    --prefill http://prefill1:8000 --prefill http://prefill2:8000 \\
+    --decode http://decode1:8001 --decode http://decode2:8001 \\
+    --prefill-policy cache_aware --decode-policy power_of_two
 
     """,
         formatter_class=CustomHelpFormatter,

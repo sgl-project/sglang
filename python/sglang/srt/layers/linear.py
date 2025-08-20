@@ -13,9 +13,13 @@ from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    parallel_state,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -104,6 +108,20 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
         loaded_weight = loaded_weight[0]
 
     return param[shard_id], loaded_weight
+
+
+def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
+    actual_weight_size = loaded_weight.size(dim)
+    target_weight_size = shard_offsets[-1][-1] + shard_offsets[-1][-2]
+    if actual_weight_size != target_weight_size:
+        new_shard_offsets = []
+        new_offset = 0
+        for shard_id, shard_offset, shard_size in shard_offsets:
+            actual_shard_size = actual_weight_size * shard_size // target_weight_size
+            new_shard_offsets.append((shard_id, new_offset, actual_shard_size))
+            new_offset += actual_shard_size
+        return new_shard_offsets
+    return shard_offsets
 
 
 class LinearBase(torch.nn.Module):
@@ -531,6 +549,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             packed_dim = getattr(param, "packed_dim", None)
 
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+            if _is_cpu:
+                shard_offsets = adjust_shard_offsets(
+                    shard_offsets, loaded_weight, output_dim
+                )
+
             for shard_id, shard_offset, shard_size in shard_offsets:
                 # Special case for Quantization.
                 # If quantized, we need to adjust the offset and size to account
@@ -973,6 +996,11 @@ class QKVParallelLinear(ColumnParallelLinear):
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
 
             packed_dim = getattr(param, "packed_dim", None)
+            if _is_cpu:
+                shard_offsets = adjust_shard_offsets(
+                    shard_offsets, loaded_weight, output_dim
+                )
+
             for shard_id, shard_offset, shard_size in shard_offsets:
                 # Special case for Quantized Weights.
                 # If quantized, we need to adjust the offset and size to account
@@ -1187,11 +1215,6 @@ class RowParallelLinear(LinearBase):
                 else self.weight_loader
             ),
         )
-        if not reduce_results and (bias and not skip_bias_add):
-            raise ValueError(
-                "When not reduce the results, adding bias to the "
-                "results can lead to incorrect results"
-            )
 
         if bias:
             self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
@@ -1278,7 +1301,7 @@ class RowParallelLinear(LinearBase):
             # It does not support additional parameters.
             param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, can_fuse_mlp_allreduce=False):
+    def forward(self, input_, skip_all_reduce=False):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1292,8 +1315,11 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
-        if self.reduce_results and self.tp_size > 1 and not can_fuse_mlp_allreduce:
+        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            sm.tag(output_parallel)
+
+        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel

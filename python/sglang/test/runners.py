@@ -231,11 +231,14 @@ class HFRunner:
 
         # Load the model and tokenizer
         if self.model_type == "generation":
-            config = AutoConfig.from_pretrained(model_path)
-            if model_archs := getattr(config, "architectures"):
-                model_cls = getattr(transformers, model_archs[0])
-            else:
+            config = AutoConfig.from_pretrained(
+                model_path, trust_remote_code=self.trust_remote_code
+            )
+            if self.trust_remote_code:
                 model_cls = AutoModelForCausalLM
+            else:
+                model_arch = getattr(config, "architectures")[0]
+                model_cls = getattr(transformers, model_arch)
             self.base_model = model_cls.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
@@ -491,13 +494,14 @@ class SRTRunner:
         lora_paths: List[str] = None,
         max_loras_per_batch: int = 4,
         attention_backend: Optional[str] = None,
+        prefill_attention_backend: Optional[str] = None,
+        decode_attention_backend: Optional[str] = None,
         lora_backend: str = "triton",
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
         chunked_prefill_size: Optional[int] = None,
         dp_size: int = 1,
         tokenizer_path: Optional[str] = None,
-        enable_ep_moe: bool = False,
         mem_fraction_static: float = 0.65,
         trust_remote_code: bool = False,
         speculative_draft_model_path: Optional[str] = None,
@@ -513,6 +517,7 @@ class SRTRunner:
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
+        max_loaded_loras: Optional[int] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -540,13 +545,14 @@ class SRTRunner:
             max_loras_per_batch=max_loras_per_batch,
             lora_backend=lora_backend,
             attention_backend=attention_backend,
+            prefill_attention_backend=prefill_attention_backend,
+            decode_attention_backend=decode_attention_backend,
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
             chunked_prefill_size=chunked_prefill_size,
             enable_dp_attention=enable_dp_attention,
             dp_size=dp_size,
             tokenizer_path=tokenizer_path,
-            enable_ep_moe=enable_ep_moe,
             disable_overlap_schedule=disable_overlap_schedule,
             cuda_graph_max_bs=cuda_graph_max_bs,
             disable_custom_all_reduce=disable_custom_all_reduce,
@@ -554,6 +560,7 @@ class SRTRunner:
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
+            max_loaded_loras=max_loaded_loras,
             **spec_kwargs,
         )
 
@@ -564,8 +571,8 @@ class SRTRunner:
         else:
             self.tokenizer = None
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str):
-        return self.engine.load_lora_adapter(lora_name, lora_path)
+    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
+        return self.engine.load_lora_adapter(lora_name, lora_path, pinned)
 
     def unload_lora_adapter(self, lora_name: str):
         return self.engine.unload_lora_adapter(lora_name)
