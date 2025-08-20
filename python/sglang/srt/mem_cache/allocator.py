@@ -434,15 +434,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
-        max_num_extend_tokens: int,
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
-        self.max_num_extend_tokens_next_power_of_2 = next_power_of_2(
-            max_num_extend_tokens
-        )
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
+        self.seen_max_num_extend_tokens_next_power_of_2 = 1
         self.clear()
 
     def alloc(self, need_size: int):
@@ -480,6 +477,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
             )
 
+        self.seen_max_num_extend_tokens_next_power_of_2 = max(
+            self.seen_max_num_extend_tokens_next_power_of_2,
+            next_power_of_2(extend_num_tokens),
+        )
+
         bs = len(prefix_lens)
         if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
             self.free_pages
@@ -498,7 +500,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.ret_values,
             next_power_of_2(bs),
             self.page_size,
-            self.max_num_extend_tokens_next_power_of_2,
+            self.seen_max_num_extend_tokens_next_power_of_2,
         )
 
         if self.debug_mode:

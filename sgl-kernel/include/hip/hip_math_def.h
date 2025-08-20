@@ -15,7 +15,7 @@ limitations under the License.
 
 #pragma once
 
-#if defined(__HIP_PLATFORM_AMD__)
+#ifdef USE_ROCM
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_common.h>
