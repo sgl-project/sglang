@@ -1807,11 +1807,10 @@ def triton_scaled_mm(
 
 shuffle_autotune = triton.autotune(
     configs=[
-        triton.Config({"BLOCK_M": block_m, "GROUP_M": group_m, "M_ALIGNMENT": m_alignment}, num_warps=num_warps)
+        triton.Config({"BLOCK_M": block_m, "GROUP_M": group_m}, num_warps=num_warps)
         for block_m in [16, 32, 64, 128]
         for group_m in [2, 4, 8]
         for num_warps in [4, 8]
-        for m_alignment in [8, 16, 32]
     ],
     key=["K"],
 )
@@ -1921,6 +1920,7 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
     k = a_s.shape[1]
     sfa = torch.empty((output_m, k), device=a_s.device, dtype=a_s.dtype)
     num_experts = problem_sizes.shape[0]
+    M_ALIGNMENT = a_s.element_size() * 8 # alignment to dtype can be independent to tensor shape
 
     grid = (k * num_experts, )
     if shuffle_map is not None:
@@ -1932,6 +1932,7 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
             shuffle_map,
             num_experts,
             k,
+            M_ALIGNMENT,
         )
     else:
         _shuffle_fp8_scale_hopper_moe_mn_major[grid](
@@ -1941,6 +1942,7 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
             sfa,
             num_experts,
             k,
+            M_ALIGNMENT,
         )
 
     return sfa
