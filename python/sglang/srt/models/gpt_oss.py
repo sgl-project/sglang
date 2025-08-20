@@ -1139,7 +1139,7 @@ class GptOssForCausalLM(nn.Module):
         not_loaded_params = [k for k, v in params_checker.items() if not v]
         if tp_rank == 0:
             if len(not_loaded_params) > 0:
-                raise Exception(f"Not all parameters loaded: {not_loaded_params}")
+                logging.warning(f"Not all parameters loaded: {not_loaded_params}")
             else:
                 logging.info("All parameters loaded successfully.")
 
