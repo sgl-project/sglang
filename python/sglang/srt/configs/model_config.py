@@ -277,8 +277,8 @@ class ModelConfig:
         # For multi-channel and delay-pattern models
         self.channels = getattr(self.hf_text_config, "channels", None)
         if self.channels is not None:
-            self.vocab_size = self.hf_text_config.vocab_size[0]
-            self.vocab_size_list = self.hf_text_config.vocab_size
+            self.vocab_size = self.hf_text_config.vocab_size
+            self.vocab_size_list = getattr(self.hf_text_config, "vocab_size_list", None)
             self.pad_token = getattr(self.hf_text_config, "pad_token", None)
         else:
             self.vocab_size = self.hf_text_config.vocab_size

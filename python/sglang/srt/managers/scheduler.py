@@ -1114,6 +1114,16 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            if self.server_args.delay_pattern:
+                truncated_input_ids = recv_req.input_ids[
+                    1 - self.model_config.channels :
+                ]
+                recv_req.input_ids = recv_req.input_ids[
+                    : 1 - self.model_config.channels
+                ]
+            else:
+                truncated_input_ids = None
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1133,6 +1143,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
+                truncated_input_ids=truncated_input_ids,
             )
             req.tokenizer = self.tokenizer
 

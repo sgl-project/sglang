@@ -24,14 +24,16 @@ class MossTTSDConfig(Qwen3Config):
     def __init__(
         self,
         channels=8,
-        speech_pad_token=1024,
+        pad_token=[],
         speech_token_range=[],
+        vocab_size_list=[],
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.channels = channels
-        self.speech_pad_token = speech_pad_token
+        self.pad_token = pad_token
         self.speech_token_range = speech_token_range
+        self.vocab_size_list = vocab_size_list
 
 
 class MossTTSDForCausalLM(torch.nn.Module):
@@ -103,10 +105,10 @@ class MossTTSDForCausalLM(torch.nn.Module):
                 self.lm_heads.append(PPMissingLayer())
 
         # 多通道logits处理器
-        for i in range(self.config.channels):
-            self.logits_processors.append(
-                LogitsProcessor(self.config, self.config.vocab_size_list[i], channel=i)
-            )
+        self.logits_processors = [
+            LogitsProcessor(self.config, self.config.vocab_size_list, channel=i)
+            for i in range(self.config.channels)
+        ]
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         input_embed = torch.sum(

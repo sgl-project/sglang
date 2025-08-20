@@ -436,6 +436,7 @@ class Req:
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        truncated_input_ids: Optional[Union[List[List[int]], List[int]]] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -486,6 +487,9 @@ class Req:
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
+
+        # For delay-pattern model
+        self.truncated_input_ids = truncated_input_ids
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -712,7 +716,7 @@ class Req:
                 return
 
         if global_server_args_dict["multi_channel"]:
-            last_token_id = self.output_ids[0][-1]
+            last_token_id = self.output_ids[-1][0]
         else:
             last_token_id = self.output_ids[-1]
 
@@ -1167,10 +1171,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         if global_server_args_dict["delay_pattern"]:
-            truncated_input_ids = [
-                input[1 - self.model_config.channels :] for input in input_ids
-            ]
-            input_ids = [input[: 1 - self.model_config.channels] for input in input_ids]
+            truncated_input_ids = [r.truncated_input_ids for r in reqs]
             truncated_input_ids_tensor = torch.tensor(
                 sum(truncated_input_ids, []), dtype=torch.int64
             ).to(self.device, non_blocking=True)
@@ -1699,7 +1700,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.filter_batch(keep_indices_device)
 
-        if global_server_args_dict["multi_channel_input"]:
+        if global_server_args_dict["delay_pattern"]:
             self.truncated_input_ids = self.truncated_input_ids[keep_indices_device]
             self.needs_additional_steps = self.needs_additional_steps[
                 keep_indices_device

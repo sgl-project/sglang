@@ -835,7 +835,7 @@ class CudaGraphRunner:
                     else None
                 ),
             )
-        elif isinstance(output, List[LogitsProcessorOutput]):
+        elif isinstance(output, List) and self.model_runner.server_args.multi_channel:
             return [
                 LogitsProcessorOutput(
                     next_token_logits=out.next_token_logits[: self.raw_num_token],
