@@ -97,7 +97,6 @@ class TestLoRAEviction(CustomTestCase):
             lora_paths=initial_lora_paths,
             max_loras_per_batch=1,
             lora_backend=backend,
-            disable_radix_cache=True,
             enable_lora=True,
             max_lora_rank=256,
             lora_target_modules=["all"],

@@ -39,6 +39,9 @@ impl TestContext {
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
         };
 
         let mut workers = Vec::new();
@@ -58,11 +61,7 @@ impl TestContext {
         config.mode = RoutingMode::Regular { worker_urls };
 
         let app_context = common::create_test_context(config);
-        let router =
-            tokio::task::spawn_blocking(move || RouterFactory::create_router(&app_context))
-                .await
-                .unwrap()
-                .unwrap();
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
 
         if !workers.is_empty() {
@@ -100,7 +99,7 @@ impl TestContext {
         let worker_url = &worker_urls[0];
 
         let response = client
-            .post(&format!("{}{}", worker_url, endpoint))
+            .post(format!("{}{}", worker_url, endpoint))
             .json(&body)
             .send()
             .await

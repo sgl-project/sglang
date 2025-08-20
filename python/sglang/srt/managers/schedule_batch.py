@@ -52,12 +52,14 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.layers.moe import is_tbo_enabled
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+from sglang.srt.mem_cache.lora_radix_cache import LoRAKey, LoRARadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import TimeStats
@@ -82,19 +84,12 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "chunked_prefill_size",
     "device",
     "disable_chunked_prefix_cache",
+    "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_radix_cache",
-    "enable_dp_attention",
-    "enable_two_batch_overlap",
-    "tbo_token_distribution_threshold",
     "enable_dp_lm_head",
-    "moe_a2a_backend",
-    "deepep_mode",
-    "enable_flashinfer_cutlass_moe",
-    "enable_flashinfer_trtllm_moe",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
-    "deepep_config",
     "ep_num_redundant_experts",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
@@ -107,11 +102,10 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
     "weight_loader_disable_mmap",
-    "enable_triton_kernel_moe",
-    "enable_flashinfer_mxfp4_moe",
     "enable_multimodal",
     "enable_symm_mem",
     "quantization",
+    "enable_custom_logit_processor",
 ]
 
 # Put some global args for easy access
@@ -639,14 +633,26 @@ class Req:
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
-                key=self.adjust_max_prefix_ids(),
-            )
+            if isinstance(tree_cache, LoRARadixCache):
+                (
+                    self.prefix_indices,
+                    self.last_node,
+                    self.last_host_node,
+                    self.host_hit_length,
+                ) = tree_cache.match_prefix_with_lora_id(
+                    key=LoRAKey(
+                        lora_id=self.lora_id, token_ids=self.adjust_max_prefix_ids()
+                    ),
+                )
+            else:
+                (
+                    self.prefix_indices,
+                    self.last_node,
+                    self.last_host_node,
+                    self.host_hit_length,
+                ) = tree_cache.match_prefix(
+                    key=self.adjust_max_prefix_ids(),
+                )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -896,11 +902,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
 
-    # Enable custom logit processor
-    enable_custom_logit_processor: bool = False
-
     # Whether to return hidden states
     return_hidden_states: bool = False
+
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
@@ -915,7 +921,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
-        enable_custom_logit_processor: bool,
         chunked_req: Optional[Req] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -942,8 +947,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
-            enable_custom_logit_processor=enable_custom_logit_processor,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            is_prefill_only=all(
+                req.sampling_params.max_new_tokens == 0 for req in reqs
+            ),
             chunked_req=chunked_req,
         )
 
@@ -996,6 +1003,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_num_tokens: int,
         backup_state: bool = False,
     ):
+        # Over estimate the number of tokens: assume each request needs a new page.
         num_tokens = (
             extend_num_tokens
             + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
@@ -1028,8 +1036,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         last_loc: torch.Tensor,
         backup_state: bool = False,
     ):
+        # Over estimate the number of tokens: assume each request needs a new page.
         num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-
         self._evict_tree_cache_if_needed(num_tokens)
 
         if backup_state:
@@ -1708,37 +1716,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        if self.forward_mode.is_decode_or_idle():
-            attention_backend_str = global_server_args_dict["decode_attention_backend"]
-        else:
-            attention_backend_str = global_server_args_dict["prefill_attention_backend"]
-        # Create seq_lens_cpu when needed
-        if (
-            attention_backend_str
-            in [
-                "fa3",
-                "flashinfer",
-                "flashmla",
-                "cutlass_mla",
-                "ascend",
-                "trtllm_mha",
-                "aiter",
-            ]
-            or global_server_args_dict["enable_two_batch_overlap"]
-        ):
-            seq_lens_cpu = (
-                seq_lens_cpu_cache
-                if seq_lens_cpu_cache is not None
-                else self.seq_lens.cpu()
-            )
-        else:
-            seq_lens_cpu = None
-
         if self.sampling_info:
             if self.has_grammar:
                 self.sampling_info.grammars = [req.grammar for req in self.reqs]
             else:
                 self.sampling_info.grammars = None
+
+        seq_lens_cpu = (
+            seq_lens_cpu_cache
+            if seq_lens_cpu_cache is not None
+            else self.seq_lens.cpu()
+        )
 
         global bid
         bid += 1
@@ -1802,18 +1790,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
-            enable_custom_logit_processor=self.enable_custom_logit_processor,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
+            is_prefill_only=self.is_prefill_only,
         )
 
-    def _evict_tree_cache_if_needed(
-        self,
-        num_tokens: int,
-    ) -> None:
-        if isinstance(self.tree_cache, SWAChunkCache):
+    def _evict_tree_cache_if_needed(self, num_tokens: int):
+        if isinstance(self.tree_cache, (SWAChunkCache, ChunkCache)):
             return
 
         if self.is_hybrid:
