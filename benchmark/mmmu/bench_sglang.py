@@ -148,12 +148,12 @@ async def eval_mmmu(args) -> None:
             )
             sample["original_response"] = response
             answer = (
-                re.search(args.response_answer_regex, response).strip()
+                re.search(args.response_answer_regex, response)
                 if response is not None
                 else None
             )
             process_result(
-                answer.group(1) if answer else response,
+                answer.group(1).strip() if answer else response.strip(),
                 sample,
                 answer_dict,
                 out_samples,
@@ -171,12 +171,12 @@ async def eval_mmmu(args) -> None:
             sample, response = await coro
             sample["original_response"] = response
             answer = (
-                re.search(args.response_answer_regex, response).strip()
+                re.search(args.response_answer_regex, response)
                 if response is not None
                 else None
             )
             process_result(
-                answer.group(1) if answer else response,
+                answer.group(1).strip() if answer else response.strip(),
                 sample,
                 answer_dict,
                 out_samples,
