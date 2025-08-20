@@ -1,65 +1,96 @@
 //! Factory for creating router instances
 
 use super::{pd_router::PDRouter, router::Router, RouterTrait};
-use crate::config::{PolicyConfig, RouterConfig, RoutingMode};
+use crate::config::{PolicyConfig, RoutingMode};
 use crate::policies::PolicyFactory;
+use crate::server::AppContext;
+use std::sync::Arc;
 
 /// Factory for creating router instances based on configuration
 pub struct RouterFactory;
 
 impl RouterFactory {
-    /// Create a router instance from configuration
-    pub fn create_router(config: &RouterConfig) -> Result<Box<dyn RouterTrait>, String> {
-        match &config.mode {
+    /// Create a router instance from application context
+    pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        match &ctx.router_config.mode {
             RoutingMode::Regular { worker_urls } => {
-                Self::create_regular_router(worker_urls, &config.policy, config)
+                Self::create_regular_router(worker_urls, &ctx.router_config.policy, ctx).await
             }
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
-            } => Self::create_pd_router(prefill_urls, decode_urls, &config.policy, config),
+                prefill_policy,
+                decode_policy,
+            } => {
+                Self::create_pd_router(
+                    prefill_urls,
+                    decode_urls,
+                    prefill_policy.as_ref(),
+                    decode_policy.as_ref(),
+                    &ctx.router_config.policy,
+                    ctx,
+                )
+                .await
+            }
         }
     }
 
     /// Create a regular router with injected policy
-    fn create_regular_router(
+    async fn create_regular_router(
         worker_urls: &[String],
         policy_config: &PolicyConfig,
-        router_config: &RouterConfig,
+        ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         // Create policy
         let policy = PolicyFactory::create_from_config(policy_config);
 
-        // Create regular router with injected policy
+        // Create regular router with injected policy and client
         let router = Router::new(
             worker_urls.to_vec(),
             policy,
-            router_config.worker_startup_timeout_secs,
-            router_config.worker_startup_check_interval_secs,
-        )?;
+            ctx.client.clone(),
+            ctx.router_config.worker_startup_timeout_secs,
+            ctx.router_config.worker_startup_check_interval_secs,
+            ctx.router_config.dp_aware,
+            ctx.router_config.api_key.clone(),
+            ctx.router_config.retry.clone(),
+            ctx.router_config.circuit_breaker.clone(),
+            ctx.router_config.health_check.clone(),
+        )
+        .await?;
 
         Ok(Box::new(router))
     }
 
     /// Create a PD router with injected policy
-    fn create_pd_router(
+    async fn create_pd_router(
         prefill_urls: &[(String, Option<u16>)],
         decode_urls: &[String],
-        policy_config: &PolicyConfig,
-        router_config: &RouterConfig,
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // Create policy directly from PolicyConfig
-        // All policies now support PD mode through the select_worker_pair method
-        let policy = PolicyFactory::create_from_config(policy_config);
+        // Create policies - use specific policies if provided, otherwise fall back to main policy
+        let prefill_policy =
+            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
+        let decode_policy =
+            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
 
-        // Create PD router with injected policy
+        // Create PD router with separate policies and client
         let router = PDRouter::new(
             prefill_urls.to_vec(),
             decode_urls.to_vec(),
-            policy,
-            router_config.worker_startup_timeout_secs,
-            router_config.worker_startup_check_interval_secs,
-        )?;
+            prefill_policy,
+            decode_policy,
+            ctx.client.clone(),
+            ctx.router_config.worker_startup_timeout_secs,
+            ctx.router_config.worker_startup_check_interval_secs,
+            ctx.router_config.retry.clone(),
+            ctx.router_config.circuit_breaker.clone(),
+            ctx.router_config.health_check.clone(),
+        )
+        .await?;
 
         Ok(Box::new(router))
     }

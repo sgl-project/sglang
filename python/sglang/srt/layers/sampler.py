@@ -6,7 +6,10 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import get_attention_tp_group
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -32,7 +35,7 @@ class Sampler(nn.Module):
         self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
         self.tp_sync_group = get_tp_group().device_group
 
-        if global_server_args_dict["enable_dp_attention"]:
+        if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
 
     def forward(

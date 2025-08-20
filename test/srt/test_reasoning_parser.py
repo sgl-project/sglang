@@ -180,6 +180,14 @@ class TestDeepSeekR1Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "I think this is the answer")
         self.assertEqual(result.normal_text, "The final answer is 42.")
 
+    def test_detect_and_parse_with_start_token(self):
+        """Test parsing deepseek-ai/DeepSeek-R1-0528 format, which generates the <think> token."""
+        text = "<think>I need to think about this.</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        # Should be treated as reasoning because force_reasoning=True
+        self.assertEqual(result.reasoning_text, "I need to think about this.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
 
 class TestQwen3Detector(CustomTestCase):
     def setUp(self):
@@ -205,6 +213,52 @@ class TestQwen3Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
+
+
+class TestQwen3ForcedReasoningDetector(CustomTestCase):
+    def setUp(self):
+        self.detector = Qwen3Detector(force_reasoning=True)
+
+    def test_init(self):
+        """Test Qwen3ForcedReasoningDetector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertTrue(self.detector._in_reasoning)  # force_reasoning=True
+        self.assertTrue(self.detector.stream_reasoning)
+
+    def test_detect_and_parse_qwen3_forced_reasoning_format(self):
+        """Test parsing Qwen3-ForcedReasoning format (no <think> start tag)."""
+        text = "I need to think about this step by step.</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(
+            result.reasoning_text, "I need to think about this step by step."
+        )
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_with_start_token(self):
+        """Test parsing Qwen3-ForcedReasoning with optional <think> start tag."""
+        text = "<think>I need to think about this.</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        # Should work because base class logic handles both force_reasoning=True OR start token
+        self.assertEqual(result.reasoning_text, "I need to think about this.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_streaming_qwen3_forced_reasoning_format(self):
+        """Test streaming parse of Qwen3-ForcedReasoning format."""
+        # First chunk without <think> start
+        result = self.detector.parse_streaming_increment("I need to")
+        self.assertEqual(result.reasoning_text, "I need to")
+        self.assertEqual(result.normal_text, "")
+
+        # More reasoning content
+        result = self.detector.parse_streaming_increment(" think about this.")
+        self.assertEqual(result.reasoning_text, " think about this.")
+        self.assertEqual(result.normal_text, "")
+
+        # End token with normal text
+        result = self.detector.parse_streaming_increment("</think>The answer is 42.")
+        self.assertEqual(result.reasoning_text, "")  # Buffer cleared
+        self.assertEqual(result.normal_text, "The answer is 42.")
 
 
 class TestKimiDetector(CustomTestCase):
@@ -397,6 +451,152 @@ class TestIntegrationScenarios(CustomTestCase):
         reasoning, normal = parser.parse_non_stream(text)
         self.assertEqual(reasoning, "")
         self.assertEqual(normal, "Just the answer.")
+
+    def test_qwen3_forced_reasoning_complete_response(self):
+        """Test complete Qwen3-ForcedReasoning response parsing."""
+        parser = ReasoningParser("qwen3", force_reasoning=True)
+        text = "Let me solve this step by step. The equation is x + 2 = 5. Subtracting 2 from both sides gives x = 3.</think>The solution is x = 3."
+
+        reasoning, normal = parser.parse_non_stream(text)
+        self.assertIn("step by step", reasoning)
+        self.assertIn("x = 3", reasoning)
+        self.assertEqual(normal, "The solution is x = 3.")
+
+    def test_qwen3_forced_reasoning_streaming_scenario(self):
+        """Test Qwen3-ForcedReasoning streaming scenario."""
+        parser = ReasoningParser("qwen3", force_reasoning=True)
+
+        chunks = [
+            "I need to analyze",
+            " this problem carefully.",
+            " Let me break it down.",
+            "</think>",
+            "The final answer is 42.",
+        ]
+
+        all_reasoning = ""
+        all_normal = ""
+
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertIn("analyze", all_reasoning)
+        self.assertIn("break it down", all_reasoning)
+        self.assertIn("final answer", all_normal)
+
+
+class TestBufferLossBugFix(CustomTestCase):
+    """Test cases for the buffer loss bug fix in parse_streaming_increment."""
+
+    def test_partial_end_tag_buffer_loss_bug(self):
+        """
+        Test the bug where partial end tag fragments are lost when followed by normal text.
+
+        Bug scenario:
+        1. _in_reasoning is False
+        2. new_text is "</" (part of closing thinking tag)
+        3. Fragment is stored in buffer and empty string is returned
+        4. Next step: new_text is "answer", _in_reasoning still False
+        5. Buffer is cleared and "answer" is returned directly
+        6. The "</" from previous step is lost
+
+        This test verifies the fix where line 108 was changed from:
+        return StreamingParseResult(normal_text=new_text)
+        to:
+        return StreamingParseResult(normal_text=current_text)
+        """
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+
+        # Step 1: Send partial end tag when not in reasoning mode
+        # This should be buffered since it could be start of "</think>"
+        result1 = detector.parse_streaming_increment("</")
+        self.assertEqual(result1.normal_text, "")
+        self.assertEqual(result1.reasoning_text, "")
+
+        # Step 2: Send normal text that doesn't complete the end tag
+        # Before fix: would return only "answer", losing the "</"
+        # After fix: should return the complete buffered content "</answer"
+        result2 = detector.parse_streaming_increment("answer")
+        self.assertEqual(result2.normal_text, "</answer")
+        self.assertEqual(result2.reasoning_text, "")
+
+    def test_partial_start_tag_buffer_preservation(self):
+        """
+        Test that partial start tag fragments are properly preserved.
+        """
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+
+        # Send partial start tag
+        result1 = detector.parse_streaming_increment("<th")
+        self.assertEqual(result1.normal_text, "")
+        self.assertEqual(result1.reasoning_text, "")
+
+        # Complete with non-matching text
+        result2 = detector.parse_streaming_increment("is is text")
+        self.assertEqual(result2.normal_text, "<this is text")
+        self.assertEqual(result2.reasoning_text, "")
+
+    def test_partial_end_tag_in_reasoning_mode(self):
+        """
+        Test partial end tag handling when already in reasoning mode.
+        """
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+
+        # Enter reasoning mode
+        detector.parse_streaming_increment("<think>")
+        detector.parse_streaming_increment("some reasoning")
+
+        # Send partial end tag
+        result1 = detector.parse_streaming_increment("</")
+        self.assertEqual(result1.normal_text, "")
+        self.assertEqual(result1.reasoning_text, "")
+
+        # Complete the end tag with normal text
+        result2 = detector.parse_streaming_increment("think>normal text")
+        self.assertEqual(result2.normal_text, "normal text")
+        # The reasoning text should be empty since buffer was cleared when end tag was processed
+        self.assertEqual(result2.reasoning_text, "")
+
+    def test_multiple_partial_fragments(self):
+        """
+        Test handling of multiple partial fragments that don't match any tokens.
+        """
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+
+        # Send multiple partial fragments
+        result1 = detector.parse_streaming_increment("<")
+        self.assertEqual(result1.normal_text, "")
+        self.assertEqual(result1.reasoning_text, "")
+
+        result2 = detector.parse_streaming_increment("/")
+        self.assertEqual(result2.normal_text, "")
+        self.assertEqual(result2.reasoning_text, "")
+
+        result3 = detector.parse_streaming_increment("random>")
+        self.assertEqual(result3.normal_text, "</random>")
+        self.assertEqual(result3.reasoning_text, "")
+
+    def test_edge_case_exact_token_match(self):
+        """
+        Test edge case where buffer content exactly matches a token.
+        """
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+
+        # Build up the exact start token character by character
+        detector.parse_streaming_increment("<")
+        detector.parse_streaming_increment("t")
+        detector.parse_streaming_increment("h")
+        detector.parse_streaming_increment("i")
+        detector.parse_streaming_increment("n")
+        result = detector.parse_streaming_increment("k>")
+
+        # Should enter reasoning mode
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertTrue(detector._in_reasoning)
+        self.assertTrue(detector.stripped_think_start)
 
 
 if __name__ == "__main__":

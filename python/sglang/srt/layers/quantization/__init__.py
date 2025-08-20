@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import builtins
 import inspect
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Type, Union
+from typing import TYPE_CHECKING, Dict, Optional, Type
 
 import torch
 
@@ -26,8 +26,9 @@ try:
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
     VLLM_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     VLLM_AVAILABLE = False
+    VLLM_IMPORT_ERROR = e
 
     # Define empty classes as placeholders when vllm is not available
     class DummyConfig:
@@ -48,24 +49,21 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.gptq import (
-    GPTQConfig,
-    GPTQLinearMethod,
-    GPTQMarlinConfig,
-    GPTQMarlinLinearMethod,
-    GPTQMarlinMoEMethod,
-)
+from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
-from sglang.srt.layers.quantization.utils import get_linear_quant_method
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+from sglang.srt.utils import is_cuda, is_hip, mxfp_supported
+
+_is_mxfp_supported = mxfp_supported()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -78,6 +76,10 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "modelopt_fp4": ModelOptFp4Config,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
+    "awq": AWQConfig,
+    "awq_marlin": AWQMarlinConfig,
+    "gptq": GPTQConfig,
+    "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
@@ -85,22 +87,35 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "petit_nvfp4": PetitNvFp4Config,
 }
 
+
+if is_cuda():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "quark": Mxfp4Config,
+            "mxfp4": Mxfp4Config,
+        }
+    )
+elif _is_mxfp_supported and is_hip():
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "quark": QuarkConfig,
+            "mxfp4": Mxfp4Config,
+        }
+    )
 # VLLM-dependent quantization methods
 VLLM_QUANTIZATION_METHODS = {
     "aqlm": AQLMConfig,
-    "awq": AWQConfig,
     "deepspeedfp": DeepSpeedFPConfig,
     "tpu_int8": Int8TpuConfig,
     "fbgemm_fp8": FBGEMMFp8Config,
     "marlin": MarlinConfig,
     "gguf": GGUFConfig,
     "gptq_marlin_24": GPTQMarlin24Config,
-    "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "qqq": QQQConfig,
     "experts_int8": ExpertsInt8Config,
-    "gptq_marlin": GPTQMarlinConfig,
-    "gptq": GPTQConfig,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS, **VLLM_QUANTIZATION_METHODS}
@@ -115,27 +130,11 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
-            "Please install vllm by `pip install vllm==0.9.0.1`"
+            f"Please install vllm by `pip install vllm==0.9.0.1`\n"
+            f"Import error: {VLLM_IMPORT_ERROR}"
         )
 
     return QUANTIZATION_METHODS[quantization]
-
-
-def gptq_get_quant_method(self, layer, prefix):
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
-    if isinstance(layer, FusedMoE):
-        return GPTQMarlinMoEMethod(self)
-
-    if isinstance(self, GPTQConfig):
-        return get_linear_quant_method(
-            self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
-        )
-    elif isinstance(self, GPTQMarlinConfig):
-        return get_linear_quant_method(
-            self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod
-        )
-    return None
 
 
 original_isinstance = builtins.isinstance
@@ -215,10 +214,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
 
 def monkey_patch_quant_configs():
     """Apply all monkey patches in one place."""
-    setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
-    setattr(GPTQConfig, "get_quant_method", gptq_get_quant_method)
 
-    monkey_patch_moe_apply(GPTQMarlinMoEMethod)
     monkey_patch_moe_apply(CompressedTensorsW8A8Fp8MoEMethod)
     monkey_patch_moe_apply(CompressedTensorsWNA16MoEMethod)
 

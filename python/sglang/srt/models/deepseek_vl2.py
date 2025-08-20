@@ -260,7 +260,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
     def get_image_feature(self, items: List[MultimodalDataItem]):
 
         images_spatial_crop = torch.cat(
-            [item.image_spatial_crop for item in items], dim=0
+            [item.images_spatial_crop for item in items], dim=0
         )
 
         assert images_spatial_crop.dim() == 3
@@ -278,8 +278,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
             _, hw, n_dim = images_embeds.shape
             h = w = int(hw**0.5)
             tile_index = 0
-            for jdx in range(item.image_spatial_crop.shape[1]):
-                num_width_tiles, num_height_tiles = item.image_spatial_crop[0, jdx]
+            for jdx in range(item.images_spatial_crop.shape[1]):
+                num_width_tiles, num_height_tiles = item.images_spatial_crop[0, jdx]
                 if num_width_tiles == 0 or num_height_tiles == 0:
                     break
                 num_tiles_in_image = num_width_tiles * num_height_tiles
