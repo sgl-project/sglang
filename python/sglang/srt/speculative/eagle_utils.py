@@ -453,7 +453,7 @@ class EagleVerifyInput:
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
-            if not torch.all(sampling_info.top_ps==1.0):
+            if not torch.all(sampling_info.top_ps == 1.0):
                 target_probs = top_p_renorm_prob(
                     target_probs,
                     torch.repeat_interleave(
