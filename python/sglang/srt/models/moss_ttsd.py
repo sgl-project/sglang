@@ -20,7 +20,7 @@ from sglang.srt.utils import add_prefix, remove_prefix
 logger = logging.getLogger(__name__)
 
 
-class MOSSTTSDConfig(Qwen3Config):
+class MossTTSDConfig(Qwen3Config):
     def __init__(
         self,
         channels=8,
@@ -34,7 +34,7 @@ class MOSSTTSDConfig(Qwen3Config):
         self.speech_token_range = speech_token_range
 
 
-class MOSSTTSD(torch.nn.Module):
+class MossTTSDForCausalLM(torch.nn.Module):
     # BitandBytes specific attributes
     packed_modules_mapping = {
         "qkv_proj": [
@@ -50,7 +50,7 @@ class MOSSTTSD(torch.nn.Module):
 
     def __init__(
         self,
-        config: MOSSTTSDConfig,
+        config: MossTTSDConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "model",
     ) -> None:
@@ -388,4 +388,4 @@ class MOSSTTSD(torch.nn.Module):
         self.language_model.load_kv_cache_scales(quantization_param_path)
 
 
-EntryClass = MOSSTTSD
+EntryClass = MossTTSDForCausalLM
