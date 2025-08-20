@@ -478,9 +478,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not forward_batch.dp_padding_mode.is_max_len(),
-                ) as sm:
+                ):
                     hidden_states = layernorm(hidden_states)
-                    sm.tag(hidden_states)
 
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(),

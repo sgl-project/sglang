@@ -27,7 +27,6 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
 _allocator = None
 _mem_pool = None
 _registered_base_addrs = set()
-_registered_tensor_addrs = set()
 _graph_pool_id = None
 
 
@@ -39,7 +38,13 @@ def is_symmetric_memory_enabled():
 
 
 def is_symmetric_memory_tensor(tensor: torch.Tensor):
-    return tensor.untyped_storage().data_ptr() in _registered_tensor_addrs
+    if not is_symmetric_memory_enabled():
+        return False
+    for segment in get_nccl_mem_pool().snapshot():
+        for block in segment["blocks"]:
+            if block["address"] == tensor.untyped_storage().data_ptr():
+                return True
+    return False
 
 
 def set_graph_pool_id(graph_pool_id):
@@ -116,12 +121,6 @@ class use_symmetric_memory:
                 torch._C._cuda_endAllocateToPool(self.device, _graph_pool_id)
         self._mem_pool_ctx.__enter__()
         return self
-
-    def tag(self, tensor: torch.Tensor):
-        if self.disabled:
-            return
-        global _registered_tensor_addrs
-        _registered_tensor_addrs.add(tensor.untyped_storage().data_ptr())
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.disabled:

@@ -706,11 +706,10 @@ class GroupCoordinator:
         # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
         output_size = (input_size[0] * world_size,) + input_size[1:]
         # Allocate output tensor.
-        with self.use_symmetric_memory(self) as sm:
+        with self.use_symmetric_memory(self):
             output_tensor = torch.empty(
                 output_size, dtype=input_.dtype, device=input_.device
             )
-            sm.tag(output_tensor)
 
         # All-gather.
         if input_.is_cpu and is_shm_available(

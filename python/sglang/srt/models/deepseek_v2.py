@@ -35,9 +35,6 @@ from sglang.srt.distributed import (
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -52,7 +49,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
-    is_dp_max_padding,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -479,13 +475,8 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(
-            parallel_state.get_tp_group(), disabled=not is_dp_max_padding()
-        ) as sm:
-            final_hidden_states_out = torch.empty_like(final_hidden_states)
-            sm.tag(final_hidden_states_out)
-        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-        final_hidden_states = final_hidden_states_out
+        final_hidden_states += shared_output
+
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -520,13 +511,7 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
-            with use_symmetric_memory(
-                parallel_state.get_tp_group(), disabled=not is_dp_max_padding()
-            ) as sm:
-                final_hidden_states_out = torch.empty_like(final_hidden_states)
-                sm.tag(final_hidden_states_out)
-            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-            final_hidden_states = final_hidden_states_out
+            final_hidden_states += shared_output
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
