@@ -51,6 +51,7 @@ from sglang.srt.hf_transformers_utils import (
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
+from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
