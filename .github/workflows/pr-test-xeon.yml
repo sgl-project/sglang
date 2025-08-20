@@ -24,10 +24,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-sglang-image:
+  build-test:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
     runs-on: xeon-gnr
+    env:
+      HF_HOME: /home/sdp/.cache/huggingface
     strategy:
       matrix:
         build_type: ['all']
@@ -42,12 +44,6 @@ jobs:
 
           docker build . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
 
-  env-prepare:
-    needs: [build-sglang-image]
-    runs-on: xeon-gnr
-    env:
-      HF_HOME: /home/sdp/.cache/huggingface
-    steps:
       - name: Run container
         run: |
           docker run -dt \
@@ -56,11 +52,7 @@ jobs:
             --name ci_sglang_xeon \
             sglang_xeon
 
-  sglang-xeon-test:
-    needs: [env-prepare]
-    runs-on: xeon-gnr
-    steps:
-      - name: Check AMX Support
+      - name: Check AMX support
         id: check_amx
         timeout-minutes: 5
         run: |
@@ -68,10 +60,9 @@ jobs:
             bash -c "python3 -c 'import torch; import sgl_kernel; assert torch._C._cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
         continue-on-error: true
 
-      - name: Run UT Cases
-        id: run_ut_cases
+      - name: Run unit tests
         if: steps.check_amx.outcome == 'success'
-        timeout-minutes: 30
+        timeout-minutes: 20
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_xeon \
             bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-cpu"
@@ -89,18 +80,11 @@ jobs:
         run: |
           docker rm -f ci_sglang_xeon || true
 
-      - name: Force fail if any step failed
-        if: always() && (steps.check_amx.outcome == 'failure' || steps.run_ut_cases.outcome == 'failure')
-        run: |
-          echo "At least one step failed, failing the job..."
-          exit 1
-
   pr-test-xeon-finish:
     if: always()
-    needs: [build-sglang-image, env-prepare, sglang-xeon-test]
-    runs-on: xeon-gnr
+    needs: [build-test]
+    runs-on: ubuntu-latest
     steps:
-
       - name: Check all dependent job statuses
         run: |
           results=(${{ join(needs.*.result, ' ') }})
