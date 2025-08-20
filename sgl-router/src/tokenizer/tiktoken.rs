@@ -1,4 +1,6 @@
-use super::traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as TokenizerTrait};
+use super::traits::{
+    Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
+};
 use anyhow::{Error, Result};
 use tiktoken_rs::{cl100k_base, p50k_base, p50k_edit, r50k_base, CoreBPE};
 
@@ -140,12 +142,10 @@ impl Encoder for TiktokenTokenizer {
 }
 
 impl Decoder for TiktokenTokenizer {
-    fn decode(&self, token_ids: &[u32], _skip_special_tokens: bool) -> Result<String> {
-        // Convert u32 to usize for tiktoken-rs
-        let tokens: Vec<usize> = token_ids.iter().map(|&id| id as usize).collect();
-
+    fn decode(&self, token_ids: &[TokenIdType], _skip_special_tokens: bool) -> Result<String> {
+        // tiktoken-rs 0.7.0 now uses u32 (Rank type)
         self.tokenizer
-            .decode(tokens)
+            .decode(token_ids.to_vec())
             .map_err(|e| Error::msg(format!("Decoding failed: {}", e)))
     }
 }
@@ -159,13 +159,13 @@ impl TokenizerTrait for TiktokenTokenizer {
         &self.special_tokens
     }
 
-    fn token_to_id(&self, _token: &str) -> Option<u32> {
+    fn token_to_id(&self, _token: &str) -> Option<TokenIdType> {
         // Tiktoken doesn't provide direct token-to-id mapping
         // We'd need to encode the token and check if it produces a single ID
         None
     }
 
-    fn id_to_token(&self, _id: u32) -> Option<String> {
+    fn id_to_token(&self, _id: TokenIdType) -> Option<String> {
         // Tiktoken doesn't provide direct id-to-token mapping
         // We can only decode IDs to text
         None
