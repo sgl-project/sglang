@@ -420,9 +420,8 @@ def get_available_gpu_memory(
             free_gpu_memory = psutil.virtual_memory().available
         else:
             libnuma = ctypes.CDLL(
-                "libnuma" + (
-                    ".dylib" if platform.system() == "Darwin" else ".so"),
-                    use_errno=True,
+                "libnuma" + (".dylib" if platform.system() == "Darwin" else ".so"),
+                use_errno=True,
             )
             libnuma.numa_max_node.restype = ctypes.c_int
             libnuma.numa_node_size64.argtypes = [
