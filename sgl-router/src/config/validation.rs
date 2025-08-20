@@ -743,8 +743,10 @@ mod tests {
 
     #[test]
     fn test_validate_igw_enabled_without_config() {
-        let mut config = RouterConfig::default();
-        config.enable_igw = true;
+        let config = RouterConfig {
+            enable_igw: true,
+            ..Default::default()
+        };
         // No IGW config provided
 
         let result = ConfigValidator::validate(&config);
@@ -757,11 +759,13 @@ mod tests {
 
     #[test]
     fn test_validate_igw_enabled_with_config() {
-        let mut config = RouterConfig::default();
-        config.enable_igw = true;
-        config.igw = Some(types::IGWConfig {
-            scheduler_endpoints: vec!["grpc://scheduler:50051".to_string()],
-        });
+        let config = RouterConfig {
+            enable_igw: true,
+            igw: Some(types::IGWConfig {
+                scheduler_endpoints: vec!["grpc://scheduler:50051".to_string()],
+            }),
+            ..Default::default()
+        };
 
         assert!(ConfigValidator::validate(&config).is_ok());
     }
