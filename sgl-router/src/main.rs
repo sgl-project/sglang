@@ -1,7 +1,7 @@
 use clap::{ArgAction, Parser};
 use sglang_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    IGWConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
@@ -70,6 +70,11 @@ Examples:
     --decode http://127.0.0.3:30003 \
     --decode http://127.0.0.4:30004 \
     --prefill-policy cache_aware --decode-policy power_of_two
+
+  # IGW (Inference Gateway) mode
+  sglang-router --enable-igw \
+    --igw-scheduler-endpoints grpc://scheduler1:50051 \
+    --igw-scheduler-endpoints grpc://scheduler2:50051
 "#)]
 struct CliArgs {
     /// Host address to bind the router server
@@ -266,6 +271,15 @@ struct CliArgs {
     /// Health check endpoint path
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
+
+    // IGW (Inference Gateway) configuration
+    /// Enable Inference Gateway mode
+    #[arg(long, default_value_t = false)]
+    enable_igw: bool,
+
+    /// IGW scheduler endpoints (can be specified multiple times)
+    #[arg(long, action = ArgAction::Append)]
+    igw_scheduler_endpoints: Vec<String>,
 }
 
 impl CliArgs {
@@ -306,8 +320,22 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
+        // Validate IGW configuration if enabled
+        if self.enable_igw {
+            if self.igw_scheduler_endpoints.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "IGW mode requires at least one --igw-scheduler-endpoints".to_string(),
+                });
+            }
+        }
+
         // Determine routing mode
-        let mode = if self.pd_disaggregation {
+        let mode = if self.enable_igw {
+            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            }
+        } else if self.pd_disaggregation {
             let decode_urls = self.decode.clone();
 
             // Validate PD configuration if not using service discovery
@@ -406,6 +434,14 @@ impl CliArgs {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
             },
+            enable_igw: self.enable_igw,
+            igw: if self.enable_igw {
+                Some(IGWConfig {
+                    scheduler_endpoints: self.igw_scheduler_endpoints.clone(),
+                })
+            } else {
+                None
+            },
         })
     }
 
@@ -487,17 +523,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Host: {}:{}", cli_args.host, cli_args.port);
     println!(
         "Mode: {}",
-        if cli_args.pd_disaggregation {
+        if cli_args.enable_igw {
+            "IGW (Inference Gateway)"
+        } else if cli_args.pd_disaggregation {
             "PD Disaggregated"
         } else {
             "Regular"
         }
     );
-    println!("Policy: {}", cli_args.policy);
+    
+    if cli_args.enable_igw {
+        println!("IGW Scheduler Endpoints: {:?}", cli_args.igw_scheduler_endpoints);
+    } else {
+        println!("Policy: {}", cli_args.policy);
 
-    if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
-        println!("Prefill nodes: {:?}", prefill_urls);
-        println!("Decode nodes: {:?}", cli_args.decode);
+        if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
+            println!("Prefill nodes: {:?}", prefill_urls);
+            println!("Decode nodes: {:?}", cli_args.decode);
+        }
     }
 
     // Convert to RouterConfig
