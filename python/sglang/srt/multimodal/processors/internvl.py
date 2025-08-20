@@ -184,14 +184,12 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
     ):
-        print(f"DEBUG: input_text: {input_text}")
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
             discard_alpha_channel=True,
         )
-        print(f"DEBUG: base_output: {base_output}")
 
         def process_image_internvl(image, input_size=448, max_num=12):
             transform = InternVLImageProcessor.build_transform(input_size=input_size)
