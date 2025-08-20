@@ -154,6 +154,38 @@ class Sampler(nn.Module):
         return batch_next_token_ids
 
 
+# Multi-channel architecture overview (MossTTSD example)
+# - Channels (C):
+#   - The model is organized into C parallel token streams.
+#   - Each channel can have its own vocabulary size (vocab_size_list[i]) and its
+#     own embedding and lm head parameters (heterogeneous token spaces like text/speech).
+#
+# - Inputs:
+#   - Accept IDs in shape [T, C] (or a flattened 1D form that can be reshaped).
+#   - Convention: channel 0 carries text+speech tokens; channels 1..C-1 carry speech
+#     tokens and may be padded with a speech pad token when absent.
+#
+# - Embeddings fusion:
+#   - Compute per-position embeddings for each channel independently.
+#   - Sum embeddings across channels to form a single hidden representation.
+#   - Feed the fused representation into a shared backbone (e.g., Qwen3Model) so
+#     cross-channel interactions happen in the backbone.
+#
+# - Outputs:
+#   - Each channel has its own lm head to produce per-channel logits.
+#   - The model forward returns a List[LogitsProcessorOutput] of length C, one per channel.
+#
+# - Downstream implication:
+#   - Consumers should expect per-channel logits and typically produce one next-token
+#     ID per channel.
+#
+# - Application features:
+#   - Text-to-Speech: use channel 0 for text, and use the remaining channels for
+#     speech units (e.g., phoneme, pitch, duration, style) with their own vocabularies.
+#   - Token-level fusion: sum per-channel embeddings and model them jointly in the
+#     shared backbone to capture cross-channel interactions.
+#   - Control and extensibility: decode or constrain channels independently, and
+#     fall back to single-channel by padding when multi-channel inputs are absent.
 class MultiChannelSampler(nn.Module):
     def __init__(self):
         super().__init__()

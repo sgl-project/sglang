@@ -274,7 +274,9 @@ class ModelConfig:
             self.hf_text_config, "num_nextn_predict_layers", None
         )
 
-        # For multi-channel and delay-pattern models
+        # For multi-channel models
+        # A model can define C (channels) parallel token channels, each with its own
+        # vocabulary (vocab_size_list) and optional paddings.
         self.channels = getattr(self.hf_text_config, "channels", None)
         if self.channels is not None:
             self.vocab_size = self.hf_text_config.vocab_size
@@ -282,9 +284,6 @@ class ModelConfig:
             self.pad_token = getattr(self.hf_text_config, "pad_token", None)
         else:
             self.vocab_size = self.hf_text_config.vocab_size
-        self.speech_token_range = getattr(
-            self.hf_text_config, "speech_token_range", None
-        )
 
         # Verify quantization
         self._verify_quantization()

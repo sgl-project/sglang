@@ -1850,8 +1850,8 @@ class ModelRunner:
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
     def is_speech_token(self, token_id: torch.Tensor) -> torch.Tensor:
-        return (token_id <= self.model_config.speech_token_range[1]) & (
-            token_id >= self.model_config.speech_token_range[0]
+        return (token_id <= self.model_config.hf_text_config.speech_token_range[1]) & (
+            token_id >= self.model_config.hf_text_config.speech_token_range[0]
         )
 
     def _postprocess_tokens(
@@ -1950,7 +1950,26 @@ class ModelRunner:
             batch.token_ids_logprobs,
         )
 
-        # Current delay pattern postprocessing is designed for MOSS-TTSD
+        # Current delay pattern postprocessing is designed specifically for MOSS-TTSD
+
+        # Delay pattern (TTS and multi-codebook audio)
+        # - Meaning:
+        #   - TTS: context-dependent timing between phonemes/characters (non-fixed, model-predicted).
+        #   - Audio tokens (RVQ): offsets (delays) between parallel codebooks to model cross-codebook deps.
+        #
+        # - Why it matters (TTS):
+        #   - Pauses: natural punctuation- and structure-aware breaks improve intelligibility.
+        #   - Prosody: tempo/pauses vary with emotion and emphasis for expressive speech.
+        #   - Speaker style: captures individual rhythm and pace.
+        #
+        # - Typical implementations (TTS):
+        #   - Duration prediction: per-phoneme/character duration as conditioning.
+        #   - Alignment learning: end-to-end mapping from text steps to acoustic frames.
+        #
+        # - Codebook interleaving (audio tokens):
+        #   - Introduces staggered offsets across codebooks to expose dependencies to AR decoding.
+        #   - Balances modeling power and efficiency by reducing AR steps vs. full flattening.
+        #   - Key for efficient, high-quality music/audio generation.
         if (
             global_server_args_dict["delay_pattern"]
             and self.model_config.hf_config.model_type == "moss_ttsd"

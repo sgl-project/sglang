@@ -61,7 +61,7 @@ class MossTTSDForCausalLM(torch.nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        # 创建多通道嵌入层
+        # Create multi-channel embedding layers
         self.embedding_list = torch.nn.ModuleList([])
         if self.pp_group.is_first_rank or (
             self.config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -79,14 +79,14 @@ class MossTTSDForCausalLM(torch.nn.Module):
             for _ in range(self.config.channels):
                 self.embedding_list.append(PPMissingLayer())
 
-        # 核心语言模型
+        # Core language model
         self.language_model = Qwen3Model(
             config=self.config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
 
-        # 多通道语言模型头
+        # Multi-channel language model heads
         self.lm_heads = torch.nn.ModuleList([])
         if self.pp_group.is_last_rank:
             if self.config.tie_word_embeddings:
@@ -104,7 +104,7 @@ class MossTTSDForCausalLM(torch.nn.Module):
             for _ in range(self.config.channels):
                 self.lm_heads.append(PPMissingLayer())
 
-        # 多通道logits处理器
+        # Multi-channel logits processors
         self.logits_processors = [
             LogitsProcessor(self.config, self.config.vocab_size_list, channel=i)
             for i in range(self.config.channels)
@@ -210,19 +210,19 @@ class MossTTSDForCausalLM(torch.nn.Module):
         if input_ids is not None:
             input_embeds = self._prepare_multi_modal_inputs(input_ids)
 
-        # 步骤1: 获取输入嵌入
+        # Step 1: Get input embeddings
         if input_embeds is not None:
-            # 直接使用提供的嵌入
+            # Use provided embeddings directly
             hidden_states = input_embeds
         elif self.pp_group.is_first_rank:
-            # 第一个rank：从input_ids计算嵌入
+            # First rank: compute embeddings from input_ids
             hidden_states = self.get_input_embeddings(input_ids)
         else:
-            # 非第一个rank：嵌入将通过pp_proxy_tensors从上一个rank传递
-            # 这里设置为None，让language_model处理
+            # Non-first rank: embeddings will be passed from previous rank through pp_proxy_tensors
+            # Set to None here, let language_model handle it
             hidden_states = None
 
-        # 步骤2: 通过语言模型进行前向传播
+        # Step 2: Forward through language model
         hidden_states = self.language_model(
             input_ids=None,
             positions=positions,
@@ -231,12 +231,12 @@ class MossTTSDForCausalLM(torch.nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # 步骤3: 在最后一个rank上计算多通道输出
+        # Step 3: Compute multi-channel outputs on the last rank
         if self.pp_group.is_last_rank:
-            # 多通道输出处理
+            # Multi-channel output processing
             channel_outputs = []
             for i in range(self.config.channels):
-                # 为每个通道计算logits
+                # Compute logits for each channel
                 channel_logits = self.logits_processors[i](
                     None,
                     hidden_states=hidden_states,
@@ -247,7 +247,7 @@ class MossTTSDForCausalLM(torch.nn.Module):
 
             return channel_outputs
         else:
-            # 非最后一个rank，返回隐藏状态供下一个rank使用
+            # Non-last rank, return hidden states for next rank to use
             return hidden_states
 
     @property
@@ -335,11 +335,11 @@ class MossTTSDForCausalLM(torch.nn.Module):
                     logger.warning(f"Parameter {name} not found in params_dict")
 
     def get_embed_and_head(self):
-        # 返回所有通道的嵌入层和头部权重
+        # Return embedding layers and head weights for all channels
         embed_weights = []
         head_weights = []
 
-        # 获取所有嵌入层权重
+        # Get all embedding layer weights
         if self.pp_group.is_first_rank or (
             self.config.tie_word_embeddings and self.pp_group.is_last_rank
         ):
@@ -351,7 +351,7 @@ class MossTTSDForCausalLM(torch.nn.Module):
         else:
             embed_weights = [None] * self.config.channels
 
-        # 获取所有头部权重
+        # Get all head weights
         if self.pp_group.is_last_rank:
             for i in range(self.config.channels):
                 if hasattr(self.lm_heads[i], "weight"):
@@ -364,7 +364,7 @@ class MossTTSDForCausalLM(torch.nn.Module):
         return embed_weights, head_weights
 
     def set_embed_and_head(self, embed_list, head_list):
-        # 设置所有通道的嵌入层和头部权重
+        # Set embedding layers and head weights for all channels
         if embed_list is not None and len(embed_list) == self.config.channels:
             if self.pp_group.is_first_rank or (
                 self.config.tie_word_embeddings and self.pp_group.is_last_rank
