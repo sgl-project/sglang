@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
-    GRAPH_CAPTURE_FAILED_MSG,
+    CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
     LogitsProcessorOutput,
     get_batch_sizes_to_capture,
@@ -149,7 +149,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n{GRAPH_CAPTURE_FAILED_MSG}"
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def can_run(self, forward_batch: ForwardBatch):
