@@ -1746,6 +1746,12 @@ class Scheduler(
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 bid = model_worker_batch.bid
+                # For delay-pattern sampling
+                if self.server_args.delay_pattern:
+                    batch.needs_additional_steps = (
+                        model_worker_batch.needs_additional_steps
+                    )
+                    batch.unfinished_sequences = model_worker_batch.unfinished_sequences
             else:
                 (
                     logits_output,
@@ -1761,6 +1767,9 @@ class Scheduler(
 
             if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids
+                # For delay-pattern sampling
+                if self.server_args.delay_pattern:
+                    batch.current_generation_step += 1
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that

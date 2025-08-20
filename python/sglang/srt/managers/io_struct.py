@@ -129,7 +129,7 @@ class GenerateReqInput:
     background: bool = False
 
     # Multi-channel input support
-    multi_channels: Optional[bool] = None
+    multi_channel: Optional[bool] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -187,7 +187,7 @@ class GenerateReqInput:
             if len(self.input_ids) == 0:
                 raise ValueError("input_ids cannot be empty.")
             if isinstance(self.input_ids[0], int) or (
-                self.multi_channels and isinstance(self.input_ids[0][0], int)
+                self.multi_channel and isinstance(self.input_ids[0][0], int)
             ):
                 self.is_single = True
                 self.batch_size = 1

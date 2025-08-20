@@ -273,12 +273,18 @@ class ModelConfig:
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
+
+        # For multi-channel and delay-pattern models
         self.channels = getattr(self.hf_text_config, "channels", None)
         if self.channels is not None:
             self.vocab_size = self.hf_text_config.vocab_size[0]
             self.vocab_size_list = self.hf_text_config.vocab_size
+            self.pad_token = getattr(self.hf_text_config, "pad_token", None)
         else:
             self.vocab_size = self.hf_text_config.vocab_size
+        self.speech_token_range = getattr(
+            self.hf_text_config, "speech_token_range", None
+        )
 
         # Verify quantization
         self._verify_quantization()

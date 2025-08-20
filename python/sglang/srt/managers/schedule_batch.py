@@ -108,7 +108,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "quantization",
     "enable_custom_logit_processor",
     "disaggregation_mode",
-    "multi_channels",
+    "multi_channel",
+    "delay_pattern",
 ]
 
 # Put some global args for easy access
@@ -689,7 +690,7 @@ class Req:
         all_ids = self.origin_input_ids_unpadded + self.output_ids
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
-    def check_finished(self):
+    def check_finished(self, this_peer_finished: Optional[bool] = None):
         if self.finished():
             return
 
@@ -710,7 +711,7 @@ class Req:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
                 return
 
-        if global_server_args_dict["multi_channels"]:
+        if global_server_args_dict["multi_channel"]:
             last_token_id = self.output_ids[0][-1]
         else:
             last_token_id = self.output_ids[-1]
@@ -729,6 +730,8 @@ class Req:
                     matched_eos |= (
                         last_token_id in self.tokenizer.additional_stop_token_ids
                     )
+            if this_peer_finished is not None:
+                matched_eos = matched_eos and this_peer_finished
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
                 return
@@ -844,6 +847,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Sampling info
     sampling_info: SamplingBatchInfo = None
     next_batch_sampling_info: SamplingBatchInfo = None
+
+    # For delay-pattern sampling
+    current_generation_step: int = 0
+    truncated_input_ids: Optional[Union[List[List[int]], List[List[List[int]]]]] = None
+    needs_additional_steps: torch.Tensor = None
+    unfinished_sequences: torch.Tensor = None
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
@@ -1157,6 +1166,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             r.token_type_ids for r in reqs if r.token_type_ids is not None
         ]
 
+        if global_server_args_dict["delay_pattern"]:
+            truncated_input_ids = [
+                input[1 - self.model_config.channels :] for input in input_ids
+            ]
+            input_ids = [input[: 1 - self.model_config.channels] for input in input_ids]
+            truncated_input_ids_tensor = torch.tensor(
+                sum(truncated_input_ids, []), dtype=torch.int64
+            ).to(self.device, non_blocking=True)
+            self.needs_additional_steps = -1 * torch.ones(
+                len(truncated_input_ids), dtype=torch.int64
+            ).to(self.device, non_blocking=True)
+            self.unfinished_sequences = torch.ones(
+                len(truncated_input_ids), dtype=torch.long
+            ).to(self.device, non_blocking=True)
+
         req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
@@ -1309,6 +1333,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+
+        if global_server_args_dict["delay_pattern"]:
+            self.truncated_input_ids = truncated_input_ids_tensor
 
         # Write to req_to_token_pool
         if support_triton(global_server_args_dict.get("attention_backend")):
@@ -1672,6 +1699,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.filter_batch(keep_indices_device)
 
+        if global_server_args_dict["multi_channel_input"]:
+            self.truncated_input_ids = self.truncated_input_ids[keep_indices_device]
+            self.needs_additional_steps = self.needs_additional_steps[
+                keep_indices_device
+            ]
+            self.unfinished_sequences = self.unfinished_sequences[keep_indices_device]
+
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -1712,6 +1746,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
+        if global_server_args_dict["delay_pattern"]:
+            self.truncated_input_ids = torch.cat(
+                [self.truncated_input_ids, other.truncated_input_ids]
+            )
+            self.needs_additional_steps = torch.cat(
+                [self.needs_additional_steps, other.needs_additional_steps]
+            )
+            self.unfinished_sequences = torch.cat(
+                [self.unfinished_sequences, other.unfinished_sequences]
+            )
+
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
@@ -1733,6 +1778,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if seq_lens_cpu_cache is not None
             else self.seq_lens.cpu()
         )
+
+        if global_server_args_dict["delay_pattern"]:
+            delay_pattern = True
+        else:
+            delay_pattern = False
 
         global bid
         bid += 1
@@ -1784,6 +1834,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            # For delay-pattern sampling
+            current_generation_step=(
+                self.current_generation_step if delay_pattern else None
+            ),
+            truncated_input_ids=self.truncated_input_ids if delay_pattern else None,
+            needs_additional_steps=(
+                self.needs_additional_steps if delay_pattern else None
+            ),
+            unfinished_sequences=self.unfinished_sequences if delay_pattern else None,
         )
 
     def copy(self):
@@ -1925,6 +1984,12 @@ class ModelWorkerBatch:
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
+
+    # For delay-pattern sampling
+    current_generation_step: int = 0
+    truncated_input_ids: Optional[Union[List[List[int]], List[List[List[int]]]]] = None
+    needs_additional_steps: torch.Tensor = None
+    unfinished_sequences: torch.Tensor = None
 
 
 @triton.jit

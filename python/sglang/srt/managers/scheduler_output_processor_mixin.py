@@ -84,7 +84,10 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
-                    req.check_finished()
+                    if self.server_args.delay_pattern:
+                        req.check_finished(batch.unfinished_sequences[i] == 0)
+                    else:
+                        req.check_finished()
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
@@ -179,7 +182,10 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
-                    req.check_finished()
+                    if self.server_args.delay_pattern:
+                        req.check_finished(batch.unfinished_sequences[i] == 0)
+                    else:
+                        req.check_finished()
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
@@ -208,7 +214,7 @@ class SchedulerOutputProcessorMixin:
             logits_output, next_token_ids, can_run_cuda_graph = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )
-            if self.server_args.multi_channels:
+            if self.server_args.multi_channel:
                 next_token_logprobs = [
                     output.next_token_logprobs for output in logits_output
                 ]
@@ -218,7 +224,7 @@ class SchedulerOutputProcessorMixin:
             # spec decoding handles output logprobs inside verify process.
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
-                if self.server_args.multi_channels:
+                if self.server_args.multi_channel:
                     next_token_logprobs = [
                         output.next_token_logprobs for output in logits_output
                     ]
@@ -252,7 +258,10 @@ class SchedulerOutputProcessorMixin:
                 # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
 
-            req.check_finished()
+            if self.server_args.delay_pattern:
+                req.check_finished(batch.unfinished_sequences[i] == 0)
+            else:
+                req.check_finished()
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
                 req.time_stats.completion_time = time.time()
