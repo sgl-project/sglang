@@ -47,7 +47,7 @@ jobs:
     needs: [build-sglang-image]
     runs-on: xeon-gnr
     env:
-      HF_HOME: ~/.cache/huggingface
+      HF_HOME: /home/sdp/.cache/huggingface
     steps:
       - name: Run container
         run: |
