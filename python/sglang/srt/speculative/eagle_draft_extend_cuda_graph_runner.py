@@ -6,20 +6,20 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
-from sglang.srt.model_executor.graph_runner import (
-    GRAPH_CAPTURE_FAILED_MSG,
+from sglang.srt.model_executor.cuda_graph_runner import (
+    CUDA_GRAPH_CAPTURE_FAILED_MSG,
+    CudaGraphRunner,
     LogitsProcessorOutput,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
     model_capture_mode,
     set_global_graph_memory_pool,
     set_torch_compile_config,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
 )
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, fast_topk
 from sglang.srt.utils import (
@@ -149,7 +149,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n{GRAPH_CAPTURE_FAILED_MSG}"
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def can_run(self, forward_batch: ForwardBatch):
