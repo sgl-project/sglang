@@ -43,6 +43,7 @@ ASSISTANT_SUFFIX = "Assistant:"
 
 global args
 
+MOONCAKE_TRACE_URL = "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl"
 
 # don't want to import sglang package here
 def _get_bool_env_var(name: str, default: str = "false") -> bool:
@@ -73,6 +74,7 @@ class RequestFuncInput:
     lora_name: str
     image_data: str
     extra_request_body: Dict[str, Any]
+    timestamp: Optional[float] = None
 
 
 @dataclass
@@ -634,7 +636,6 @@ def get_tokenizer(
         pretrained_model_name_or_path, trust_remote_code=True
     )
 
-
 def get_dataset(args, tokenizer):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
@@ -802,6 +803,7 @@ class DatasetRow:
     prompt_len: int
     output_len: int
     image_data: Optional[str] = None
+    timestamp: Optional[float] = None
 
 
 def sample_mmmu_requests(
@@ -1132,15 +1134,47 @@ def sample_mooncake_requests(
     prompt_suffix: Optional[str] = "",
     apply_chat_template=False,
 ) -> List[DatasetRow]:
-    input_requests: List[DatasetRow] = []
-    input_requests.append(
-        DatasetRow(
-            prompt="test",
-            prompt_len=4,
-            output_len=4,
-        )
-    )
-    return input_requests
+    # Use default path if none is provided
+    if not dataset_path:
+        dataset_path = "conversation_trace.jsonl"
+
+    # Download the file if it does not exist.
+    if not os.path.exists(dataset_path):
+        print(f"Dataset file '{dataset_path}' not found.")
+        download_and_cache_file(MOONCAKE_TRACE_URL, dataset_path)
+
+    print(f"Loading Mooncake dataset from {dataset_path}...")
+
+    requests = []
+    with open(dataset_path, "r") as f:
+        for i, line in enumerate(f):
+            if len(requests) == num_requests:
+                break
+            try:
+                row = json.loads(line)
+                prompt = ""
+                for hash_id in row["hash_ids"]:
+                    prompt += f"{hash_id}" + " ".join(["hi"] * 512)
+                prompt += "Can you tell me a detailed story in 1000 words?"
+
+                prompt_token_ids = tokenizer.encode(prompt)
+                prompt_len = len(prompt_token_ids)
+                output_len = row["output_length"]
+
+                requests.append(
+                    DatasetRow(
+                        prompt=prompt,
+                        prompt_len=prompt_len,
+                        output_len=output_len,
+                        timestamp=row["timestamp"],
+                    )
+                )
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"Skipping malformed line {i+1} in {dataset_path}: {e}")
+
+    requests.sort(key=lambda r: r.timestamp)
+    print(f"Loaded and processed {len(requests)} requests from {dataset_path}.")
+    return requests
 
 
 def gen_prompt(tokenizer, token_num):
@@ -1246,19 +1280,39 @@ def sample_generated_shared_prefix_requests(
 async def get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
+    use_trace_timestamps: bool = False,
+    slowdown_factor: float = 1.0,
 ) -> AsyncGenerator[DatasetRow, None]:
-    input_requests = iter(input_requests)
-    for request in input_requests:
-        yield request
+    if use_trace_timestamps:
+        print(f"Using trace timestamps for request generation with slowdown factor {slowdown_factor}.")
+        # Sort requests by timestamp for correct replay
+        input_requests.sort(key=lambda r: r.timestamp)
 
-        if request_rate == float("inf"):
-            # If the request rate is infinity, then we don't need to wait.
-            continue
+        start_time = time.perf_counter()
+        trace_start_time_ms = input_requests[0].timestamp if input_requests else 0
 
-        # Sample the request interval from the exponential distribution.
-        interval = np.random.exponential(1.0 / request_rate)
-        # The next request will be sent after the interval.
-        await asyncio.sleep(interval)
+        for request in input_requests:
+            trace_time_s = (request.timestamp - trace_start_time_ms) / 1000.0
+            target_arrival_time = start_time + (trace_time_s * slowdown_factor)
+
+            sleep_duration = target_arrival_time - time.perf_counter()
+            if sleep_duration > 0:
+                await asyncio.sleep(sleep_duration)
+
+            yield request
+    else:
+        input_requests_iter = iter(input_requests)
+        for request in input_requests_iter:
+            yield request
+
+            if request_rate == float("inf"):
+                # If the request rate is infinity, then we don't need to wait.
+                continue
+
+            # Sample the request interval from the exponential distribution.
+            interval = np.random.exponential(1.0 / request_rate)
+            # The next request will be sent after the interval.
+            await asyncio.sleep(interval)
 
 
 def calculate_metrics(
@@ -1356,6 +1410,8 @@ async def benchmark(
     pd_separated: bool = False,
     flush_cache: bool = False,
     warmup_requests: int = 1,
+    use_trace_timestamps: bool = False,
+    slowdown_factor: float = 1.0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1435,7 +1491,7 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate):
+    async for request in get_request(input_requests, request_rate, use_trace_timestamps, slowdown_factor):
         if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
@@ -1451,6 +1507,7 @@ async def benchmark(
             lora_name=lora_name,
             image_data=request.image_data,
             extra_request_body=extra_request_body,
+            timestamp=request.timestamp,
         )
 
         tasks.append(
@@ -1496,7 +1553,7 @@ async def benchmark(
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
-    print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
+    print("{:<40} {:<10}".format("Traffic request rate:", "trace" if use_trace_timestamps else request_rate))
     print(
         "{:<40} {:<10}".format(
             "Max request concurrency:",
@@ -1565,7 +1622,7 @@ async def benchmark(
             # Arguments
             "backend": args.backend,
             "dataset_name": args.dataset_name,
-            "request_rate": request_rate,
+            "request_rate": "trace" if use_trace_timestamps else request_rate,
             "max_concurrency": max_concurrency,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
@@ -1612,7 +1669,7 @@ async def benchmark(
         if args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
-            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
+            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
 
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
@@ -1666,6 +1723,11 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "tokenize_prompt"):
         args.tokenize_prompt = False
+
+    if not hasattr(args, "use_trace_timestamps"):
+        args.use_trace_timestamps = False
+    if not hasattr(args, "slowdown_factor"):
+        args.slowdown_factor = 1.0
 
     print(f"benchmark_args={args}")
 
@@ -1800,6 +1862,8 @@ def run_benchmark(args_: argparse.Namespace):
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
             warmup_requests=args.warmup_requests,
+            use_trace_timestamps=args.use_trace_timestamps,
+            slowdown_factor=args.slowdown_factor,
         )
     )
 
@@ -1908,6 +1972,17 @@ if __name__ == "__main__":
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
+    )
+    parser.add_argument(
+        '--use-trace-timestamps',
+        action="store_true",
+        help="Use timestamps from the trace file for request scheduling. Only valid for 'mooncake' dataset."
+    )
+    parser.add_argument(
+        "--slowdown-factor",
+        type=float,
+        default=1.0,
+        help="A factor to slow down the trace replay. Only used with --use-trace-timestamps. (Default: 1.0)",
     )
     parser.add_argument(
         "--max-concurrency",
