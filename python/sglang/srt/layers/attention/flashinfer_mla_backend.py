@@ -330,7 +330,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert seq_lens_cpu is not None
             kv_len_arr_cpu = seq_lens_cpu[:bs]
             num_pages_per_req = (seq_lens_cpu + self.page_size - 1) // self.page_size
-            self.cuda_graph_kv_indptr_cpu = torch.zeros((bs + 1,), dtype=torch.int32)
             self.cuda_graph_kv_indptr_cpu[1:] = torch.cumsum(num_pages_per_req, dim=0)
             self.fast_decode_kwargs.update(
                 {
@@ -565,11 +564,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             num_pages_per_req = (
                 paged_kernel_lens + self.page_size - 1
             ) // self.page_size
-            kv_indptr = torch.zeros(
-                (bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device
-            )
-            kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(num_pages_per_req, dim=0)
             kv_indices = (
                 torch.empty(kv_indptr[-1], dtype=torch.int32, device=q_indptr.device)
                 if not init_metadata_replay
