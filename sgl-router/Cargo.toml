@@ -4,8 +4,11 @@ version = "0.0.0"
 edition = "2021"
 
 [features]
-default = ["huggingface"]
-huggingface = ["tokenizers"]
+default = ["huggingface", "grpc-client"]
+huggingface = ["tokenizers", "minijinja"]
+tiktoken = ["tiktoken-rs"]
+grpc-client = []
+grpc-server = []
 
 [lib]
 name = "sglang_router_rs"
@@ -49,12 +52,27 @@ url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
 tokenizers = { version = "0.21.4", optional = true }
+tiktoken-rs = { version = "0.7.0", optional = true }
+minijinja = { version = "2.0", optional = true }
+
+# gRPC and Protobuf dependencies
+tonic = { version = "0.12", features = ["tls", "gzip", "transport"] }
+prost = "0.13"
+prost-types = "0.13"
+deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
+backoff = { version = "0.4", features = ["tokio"] }
+strum = { version = "0.26", features = ["derive"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 portpicker = "0.1"
+tempfile = "3.8"
 
 [[bench]]
 name = "request_processing"
