@@ -79,6 +79,10 @@ name = "request_processing"
 harness = false
 path = "benches/request_processing.rs"
 
+[[bench]]
+name = "tokenizer_benchmark"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
