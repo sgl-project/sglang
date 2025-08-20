@@ -75,7 +75,7 @@ class _DpGatheredBufferWrapper:
     _device: torch.device
     _global_dp_buffer_len: int
     _local_dp_buffer_len: int
-    _dp_max_padding: bool
+    _dp_max_padding: bool = True
     _global_num_tokens: Optional[List[int]]
 
     @classmethod
