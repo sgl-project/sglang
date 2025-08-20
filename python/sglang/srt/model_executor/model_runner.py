@@ -89,7 +89,9 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+
+# TODO(iforgetmyname): Renaming on the way
+from sglang.srt.model_executor.cuda_graph_runner_impl import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
