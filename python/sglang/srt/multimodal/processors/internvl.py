@@ -44,7 +44,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         self.img_start_token_id = tokenizer.convert_tokens_to_ids(self.IMG_START_TOKEN)
         self.img_end_token_id = tokenizer.convert_tokens_to_ids(self.IMG_END_TOKEN)
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token="<image>",
+            image_token="<IMG_CONTEXT>",
             image_token_id=tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT_TOKEN),
         ).build(_image_processor)
 
@@ -184,12 +184,14 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
     ):
+        print(f"DEBUG: input_text: {input_text}")
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
             discard_alpha_channel=True,
         )
+        print(f"DEBUG: base_output: {base_output}")
 
         def process_image_internvl(image, input_size=448, max_num=12):
             transform = InternVLImageProcessor.build_transform(input_size=input_size)
@@ -224,7 +226,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
                 + self.IMG_CONTEXT_TOKEN * self.num_image_token * num_patches
                 + self.IMG_END_TOKEN
             )
-            input_text = input_text.replace("<image>", image_tokens, 1)
+            input_text = input_text.replace("<IMG_CONTEXT>", image_tokens, 1)
 
         input_ids = self.tokenizer(input_text, return_tensors="pt")[
             "input_ids"
