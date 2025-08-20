@@ -635,6 +635,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    # flashinfer uses this environment variable for various kernels from MoE to quant kernels
+    os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
     # Set prometheus env vars
     if server_args.enable_metrics:

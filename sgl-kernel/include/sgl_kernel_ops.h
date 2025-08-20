@@ -151,6 +151,7 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor cos_sin_cache,
     at::Tensor pos_ids,
     bool interleave,
+    bool enable_pdl,
     int64_t cuda_stream,
     const std::optional<at::Tensor>& v,
     const std::optional<at::Tensor>& k_buffer,
