@@ -31,6 +31,10 @@ class Router:
             routing. Default: 60
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
+        dp_aware: Enable data parallelism aware schedule. Default: False
+        api_key: The api key used for the authorization with the worker.
+            Useful when the dp aware scheduling strategy is enabled.
+            Default: None
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
         log_level: Logging level. Options: 'debug', 'info', 'warning', 'error', 'critical'.
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
@@ -50,6 +54,23 @@ class Router:
         pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default: False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD mode only)
         decode_urls: List of URLs for decode servers (PD mode only)
+        prefill_policy: Specific load balancing policy for prefill nodes (PD mode only).
+            If not specified, uses the main policy. Default: None
+        decode_policy: Specific load balancing policy for decode nodes (PD mode only).
+            If not specified, uses the main policy. Default: None
+        request_id_headers: List of HTTP headers to check for request IDs. If not specified,
+            uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
+            Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
+        bootstrap_port_annotation: Kubernetes annotation name for bootstrap port (PD mode).
+            Default: 'sglang.ai/bootstrap-port'
+        request_timeout_secs: Request timeout in seconds. Default: 600
+        max_concurrent_requests: Maximum number of concurrent requests allowed for rate limiting. Default: 64
+        cors_allowed_origins: List of allowed origins for CORS. Empty list allows all origins. Default: []
+        health_failure_threshold: Number of consecutive health check failures before marking worker unhealthy. Default: 3
+        health_success_threshold: Number of consecutive health check successes before marking worker healthy. Default: 2
+        health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
+        health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
+        health_check_endpoint: Health check endpoint path. Default: '/health'
     """
 
     def __init__(
@@ -58,14 +79,16 @@ class Router:
         policy: PolicyType = PolicyType.RoundRobin,
         host: str = "127.0.0.1",
         port: int = 3001,
-        worker_startup_timeout_secs: int = 300,
-        worker_startup_check_interval: int = 10,
-        cache_threshold: float = 0.50,
-        balance_abs_threshold: int = 32,
-        balance_rel_threshold: float = 1.0001,
-        eviction_interval_secs: int = 60,
-        max_tree_size: int = 2**24,
-        max_payload_size: int = 256 * 1024 * 1024,  # 256MB
+        worker_startup_timeout_secs: int = 600,
+        worker_startup_check_interval: int = 30,
+        cache_threshold: float = 0.3,
+        balance_abs_threshold: int = 64,
+        balance_rel_threshold: float = 1.5,
+        eviction_interval_secs: int = 120,
+        max_tree_size: int = 2**26,
+        max_payload_size: int = 512 * 1024 * 1024,  # 512MB
+        dp_aware: bool = False,
+        api_key: Optional[str] = None,
         log_dir: Optional[str] = None,
         log_level: Optional[str] = None,
         service_discovery: bool = False,
@@ -74,11 +97,34 @@ class Router:
         service_discovery_namespace: Optional[str] = None,
         prefill_selector: Dict[str, str] = None,
         decode_selector: Dict[str, str] = None,
+        bootstrap_port_annotation: str = "sglang.ai/bootstrap-port",
         prometheus_port: Optional[int] = None,
         prometheus_host: Optional[str] = None,
+        request_timeout_secs: int = 1800,
+        request_id_headers: Optional[List[str]] = None,
         pd_disaggregation: bool = False,
         prefill_urls: Optional[List[tuple]] = None,
         decode_urls: Optional[List[str]] = None,
+        prefill_policy: Optional[PolicyType] = None,
+        decode_policy: Optional[PolicyType] = None,
+        max_concurrent_requests: int = 256,
+        cors_allowed_origins: List[str] = None,
+        retry_max_retries: int = 5,
+        retry_initial_backoff_ms: int = 50,
+        retry_max_backoff_ms: int = 30_000,
+        retry_backoff_multiplier: float = 1.5,
+        retry_jitter_factor: float = 0.2,
+        cb_failure_threshold: int = 10,
+        cb_success_threshold: int = 3,
+        cb_timeout_duration_secs: int = 60,
+        cb_window_duration_secs: int = 120,
+        disable_retries: bool = False,
+        disable_circuit_breaker: bool = False,
+        health_failure_threshold: int = 3,
+        health_success_threshold: int = 2,
+        health_check_timeout_secs: int = 5,
+        health_check_interval_secs: int = 60,
+        health_check_endpoint: str = "/health",
     ):
         if selector is None:
             selector = {}
@@ -86,6 +132,8 @@ class Router:
             prefill_selector = {}
         if decode_selector is None:
             decode_selector = {}
+        if cors_allowed_origins is None:
+            cors_allowed_origins = []
 
         self._router = _Router(
             worker_urls=worker_urls,
@@ -100,6 +148,8 @@ class Router:
             eviction_interval_secs=eviction_interval_secs,
             max_tree_size=max_tree_size,
             max_payload_size=max_payload_size,
+            dp_aware=dp_aware,
+            api_key=api_key,
             log_dir=log_dir,
             log_level=log_level,
             service_discovery=service_discovery,
@@ -108,11 +158,34 @@ class Router:
             service_discovery_namespace=service_discovery_namespace,
             prefill_selector=prefill_selector,
             decode_selector=decode_selector,
+            bootstrap_port_annotation=bootstrap_port_annotation,
             prometheus_port=prometheus_port,
             prometheus_host=prometheus_host,
+            request_timeout_secs=request_timeout_secs,
+            request_id_headers=request_id_headers,
             pd_disaggregation=pd_disaggregation,
             prefill_urls=prefill_urls,
             decode_urls=decode_urls,
+            prefill_policy=prefill_policy,
+            decode_policy=decode_policy,
+            max_concurrent_requests=max_concurrent_requests,
+            cors_allowed_origins=cors_allowed_origins,
+            retry_max_retries=retry_max_retries,
+            retry_initial_backoff_ms=retry_initial_backoff_ms,
+            retry_max_backoff_ms=retry_max_backoff_ms,
+            retry_backoff_multiplier=retry_backoff_multiplier,
+            retry_jitter_factor=retry_jitter_factor,
+            cb_failure_threshold=cb_failure_threshold,
+            cb_success_threshold=cb_success_threshold,
+            cb_timeout_duration_secs=cb_timeout_duration_secs,
+            cb_window_duration_secs=cb_window_duration_secs,
+            disable_retries=disable_retries,
+            disable_circuit_breaker=disable_circuit_breaker,
+            health_failure_threshold=health_failure_threshold,
+            health_success_threshold=health_success_threshold,
+            health_check_timeout_secs=health_check_timeout_secs,
+            health_check_interval_secs=health_check_interval_secs,
+            health_check_endpoint=health_check_endpoint,
         )
 
     def start(self) -> None:

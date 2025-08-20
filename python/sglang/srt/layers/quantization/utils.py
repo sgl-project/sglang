@@ -11,19 +11,37 @@ import numpy
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.layers.quantization.scalar_type import ScalarType
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
-_is_cuda = is_cuda()
-_is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
 
-if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
-    from vllm._custom_ops import scaled_fp8_quant
+def get_scalar_types():
+    """
+    Returns:
+        tuple: (ScalarType, scalar_types)
+    """
+    try:
+        from sgl_kernel.scalar_type import ScalarType, scalar_types
+
+        return ScalarType, scalar_types
+    except ImportError:
+
+        class MockScalarType:
+            pass
+
+        class MockScalarTypes:
+            uint4b8 = "uint4b8"
+            uint8b128 = "uint8b128"
+
+            def __getattr__(self, name):
+                return f"mock_{name}"
+
+        return MockScalarType, MockScalarTypes()
+
+
+ScalarType, scalar_types = get_scalar_types()
 
 
 def is_layer_skipped(
@@ -126,6 +144,10 @@ def requantize_with_max_scale(
             start = end
 
     return max_w_scale, weight
+
+
+def update_tensor_inplace(old: torch.Tensor, new: torch.Tensor) -> None:
+    old.copy_(new)
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/layer_utils.py
@@ -247,6 +269,36 @@ def get_pack_factor(num_bits):
     return 32 // num_bits
 
 
+def permute_rows(
+    q_w: torch.Tensor,
+    w_ref: torch.Tensor,
+    group_size: int,
+    test_perm: Optional[torch.Tensor] = None,
+):
+    assert q_w.shape == w_ref.shape
+
+    orig_device = q_w.device
+    k_size, _ = q_w.shape
+
+    g_idx = torch.zeros((k_size,), dtype=torch.int32)
+    for i in range(k_size):
+        g_idx[i] = i // group_size
+
+    # Simulate act_order by doing a random permutation on K
+    rand_perm = test_perm if test_perm is not None else torch.randperm(k_size)
+
+    g_idx = g_idx[rand_perm].contiguous()
+    q_w = q_w[rand_perm, :].contiguous()
+    w_ref = w_ref[rand_perm, :].contiguous()
+
+    return (
+        w_ref.to(device=orig_device),
+        q_w.to(device=orig_device),
+        g_idx.to(device=orig_device),
+        rand_perm.to(device=orig_device),
+    )
+
+
 def pack_cols(
     q_w: torch.Tensor,
     num_bits: int,
@@ -270,6 +322,30 @@ def pack_cols(
     q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
     q_res = q_res.contiguous()
 
+    return q_res
+
+
+def pack_rows(
+    q_w: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+):
+    assert q_w.shape == (size_k, size_n)
+
+    pack_factor = get_pack_factor(num_bits)
+    assert size_k % pack_factor == 0
+
+    orig_device = q_w.device
+
+    q_w = q_w.cpu().numpy().astype(numpy.uint32)
+
+    q_res = numpy.zeros((size_k // pack_factor, size_n), dtype=numpy.uint32)
+
+    for i in range(pack_factor):
+        q_res |= q_w[i::pack_factor, :] << num_bits * i
+
+    q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
     return q_res
 
 
@@ -398,4 +474,57 @@ def quantize_weights(
         w_q.to(device=orig_device),
         w_s if group_size is not None else None,
         maybe_w_zp,
+    )
+
+
+SUPPORTED_GPTQ_QUANT_TYPES = [scalar_types.uint4b8, scalar_types.uint8b128]
+SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
+
+
+def gptq_quantize_weights(
+    w: torch.Tensor,
+    quant_type: ScalarType,
+    group_size: int,
+    act_order: bool,
+    test_perm: Optional[torch.Tensor] = None,
+):
+    size_k, _ = w.shape
+
+    assert w.is_floating_point(), "w must be float"
+    assert (
+        quant_type in SUPPORTED_GPTQ_QUANT_TYPES
+    ), f"Unsupported gptq type = {quant_type}"
+    assert group_size in SUPPORTED_GROUP_SIZES + [
+        size_k
+    ], f"Unsupported groupsize = {group_size}"
+
+    w_ref, w_q, w_s, _ = quantize_weights(w, quant_type, group_size)
+
+    # Apply act_order
+    g_idx = torch.empty(0, dtype=torch.int, device=w.device)
+    rand_perm = torch.empty(0, dtype=torch.int, device=w.device)
+    if act_order:
+        assert (
+            group_size < size_k
+        ), "For act_order, groupsize = {} must be less than size_k = {}".format(
+            group_size, size_k
+        )
+
+        w_ref, w_q, g_idx, rand_perm = permute_rows(w_q, w_ref, group_size, test_perm)
+
+    return w_ref, w_q, w_s, g_idx, rand_perm
+
+
+def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
+    orig_device = q_w.device
+
+    sort_indices = torch.argsort(g_idx).to(dtype=torch.int32)  # Sort based on g_idx
+
+    g_idx = g_idx[sort_indices].contiguous()
+    q_w = q_w[sort_indices, :].contiguous()
+
+    return (
+        q_w.to(device=orig_device),
+        g_idx.to(device=orig_device),
+        sort_indices.to(device=orig_device),
     )

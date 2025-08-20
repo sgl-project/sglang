@@ -3,7 +3,7 @@
 #   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx950 -t v0.4.9.post1-rocm700-mi35x -f Dockerfile.rocm .
 
 # Default base images
-ARG BASE_IMAGE_950="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.8.5_mi35X_prealpha"
+ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7.0_preview_ubuntu_22.04_vllm_0.9.2_mi35X_prealpha"
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 
 # This is necessary for scope purpose
@@ -14,8 +14,10 @@ ARG GPU_ARCH=gfx950
 FROM $BASE_IMAGE_942 AS gfx942
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV AITER_COMMIT="v0.1.4"
+ENV NO_DEPS_FLAG=""
 
 # ===============================
 # Base image 950 and args
@@ -23,7 +25,10 @@ FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_AITER_ALL="1"
+ENV BUILD_LLVM="1"
 ENV AITER_COMMIT="v0.1.4"
+ENV HIP_CLANG_PATH="/sgl-workspace/llvm-project/build/bin/"
+ENV NO_DEPS_FLAG="--no-deps"
 
 # ===============================
 # Chosen arch and args
@@ -42,6 +47,10 @@ ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
+ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
+ARG LLVM_BRANCH="MainOpSelV2"
+ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
+
 USER root
 
 # Install some basic utilities
@@ -51,6 +60,20 @@ RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which
 WORKDIR /sgl-workspace
 
 # -----------------------
+# llvm
+RUN if [ "$BUILD_LLVM" = "1" ]; then \
+     git clone --single-branch ${LLVM_REPO} -b ${LLVM_BRANCH} \
+     && cd llvm-project \
+     && git checkout ${LLVM_COMMIT} \
+     && mkdir build \
+     && cd build \
+     && cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=1 -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" -DLLVM_ENABLE_PROJECTS="clang;lld;" -DLLVM_ENABLE_RUNTIMES="compiler-rt" ../llvm \
+     && make -j$(nproc); \
+    fi
+
+# -----------------------
+
+# -----------------------
 # AITER
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
@@ -58,7 +81,9 @@ RUN git clone ${AITER_REPO} \
  && git checkout ${AITER_COMMIT} \
  && git submodule update --init --recursive
 RUN cd aiter \
-     && if [ "$BUILD_AITER_ALL" = "1" ]; then \
+     && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
+          HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+        elif [ "$BUILD_AITER_ALL" = "1" ]; then \
           PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
         else \
           GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
@@ -114,9 +139,9 @@ RUN git clone ${SGL_REPO} \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
     && cd .. \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip]"; \
+         python -m pip --no-cache-dir install -e "python[srt_hip]" ${NO_DEPS_FLAG}; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip]"; \
+         python -m pip --no-cache-dir install -e "python[all_hip]" ${NO_DEPS_FLAG}; \
        fi
 
 RUN python -m pip cache purge
