@@ -19,6 +19,25 @@ pub enum WorkerError {
     WorkerAtCapacity { url: String },
     /// Invalid URL format
     InvalidUrl { url: String },
+    /// OpenAI API error
+    OpenAIApiError {
+        url: String,
+        error_code: Option<String>,
+        message: String,
+    },
+    /// OpenAI authentication error
+    OpenAIAuthError { url: String, message: String },
+    /// OpenAI rate limit error
+    OpenAIRateLimitError {
+        url: String,
+        retry_after: Option<u64>,
+    },
+    /// OpenAI model not found or not available
+    OpenAIModelError {
+        url: String,
+        model: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for WorkerError {
@@ -42,6 +61,50 @@ impl fmt::Display for WorkerError {
             WorkerError::InvalidUrl { url } => {
                 write!(f, "Invalid URL format: {}", url)
             }
+            WorkerError::OpenAIApiError {
+                url,
+                error_code,
+                message,
+            } => {
+                if let Some(code) = error_code {
+                    write!(
+                        f,
+                        "OpenAI API error for worker {}: {} ({})",
+                        url, message, code
+                    )
+                } else {
+                    write!(f, "OpenAI API error for worker {}: {}", url, message)
+                }
+            }
+            WorkerError::OpenAIAuthError { url, message } => {
+                write!(
+                    f,
+                    "OpenAI authentication error for worker {}: {}",
+                    url, message
+                )
+            }
+            WorkerError::OpenAIRateLimitError { url, retry_after } => {
+                if let Some(retry) = retry_after {
+                    write!(
+                        f,
+                        "OpenAI rate limit exceeded for worker {}: retry after {} seconds",
+                        url, retry
+                    )
+                } else {
+                    write!(f, "OpenAI rate limit exceeded for worker {}", url)
+                }
+            }
+            WorkerError::OpenAIModelError {
+                url,
+                model,
+                message,
+            } => {
+                write!(
+                    f,
+                    "OpenAI model error for worker {} (model: {}): {}",
+                    url, model, message
+                )
+            }
         }
     }
 }
@@ -57,6 +120,81 @@ impl From<reqwest::Error> for WorkerError {
         WorkerError::NetworkError {
             url: err.url().map(|u| u.to_string()).unwrap_or_default(),
             error: err.to_string(),
+        }
+    }
+}
+
+/// Convert from async-openai errors to worker errors
+impl From<async_openai::error::OpenAIError> for WorkerError {
+    fn from(err: async_openai::error::OpenAIError) -> Self {
+        match err {
+            async_openai::error::OpenAIError::ApiError(api_err) => {
+                // Check for specific error types based on error codes or messages
+                let message = api_err.message.clone();
+                let error_type = api_err.r#type.as_deref();
+                let error_code = api_err.code.clone();
+
+                match error_type {
+                    Some("insufficient_quota") | Some("billing_hard_limit_reached") => {
+                        WorkerError::OpenAIApiError {
+                            url: "".to_string(), // URL will be filled in by caller
+                            error_code,
+                            message,
+                        }
+                    }
+                    Some("invalid_api_key") | Some("invalid_organization") => {
+                        WorkerError::OpenAIAuthError {
+                            url: "".to_string(),
+                            message,
+                        }
+                    }
+                    Some("rate_limit_exceeded") => {
+                        WorkerError::OpenAIRateLimitError {
+                            url: "".to_string(),
+                            retry_after: None, // Could extract from headers if available
+                        }
+                    }
+                    Some("model_not_found") | Some("model_overloaded") => {
+                        WorkerError::OpenAIModelError {
+                            url: "".to_string(),
+                            model: "".to_string(), // Model will be filled in by caller
+                            message,
+                        }
+                    }
+                    _ => WorkerError::OpenAIApiError {
+                        url: "".to_string(),
+                        error_code,
+                        message,
+                    },
+                }
+            }
+            async_openai::error::OpenAIError::Reqwest(reqwest_err) => WorkerError::NetworkError {
+                url: reqwest_err.url().map(|u| u.to_string()).unwrap_or_default(),
+                error: reqwest_err.to_string(),
+            },
+            async_openai::error::OpenAIError::StreamError(stream_err) => {
+                WorkerError::NetworkError {
+                    url: "".to_string(),
+                    error: format!("OpenAI stream error: {}", stream_err),
+                }
+            }
+            async_openai::error::OpenAIError::JSONDeserialize(json_err) => {
+                WorkerError::OpenAIApiError {
+                    url: "".to_string(),
+                    error_code: None,
+                    message: format!("JSON deserialization error: {}", json_err),
+                }
+            }
+            async_openai::error::OpenAIError::InvalidArgument(arg_err) => {
+                WorkerError::InvalidConfiguration {
+                    message: format!("Invalid OpenAI argument: {}", arg_err),
+                }
+            }
+            _ => WorkerError::OpenAIApiError {
+                url: "".to_string(),
+                error_code: None,
+                message: format!("Unhandled OpenAI error: {}", err),
+            },
         }
     }
 }
@@ -236,5 +374,75 @@ mod tests {
             url: "http://test".to_string(),
         };
         assert_eq!(error1.to_string(), error2.to_string());
+    }
+
+    // Tests for OpenAI-specific errors
+    #[test]
+    fn test_openai_api_error_display() {
+        let error = WorkerError::OpenAIApiError {
+            url: "https://api.openai.com".to_string(),
+            error_code: Some("rate_limit_exceeded".to_string()),
+            message: "API rate limit exceeded".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "OpenAI API error for worker https://api.openai.com: API rate limit exceeded (rate_limit_exceeded)"
+        );
+
+        let error_no_code = WorkerError::OpenAIApiError {
+            url: "https://api.openai.com".to_string(),
+            error_code: None,
+            message: "Unknown API error".to_string(),
+        };
+        assert_eq!(
+            error_no_code.to_string(),
+            "OpenAI API error for worker https://api.openai.com: Unknown API error"
+        );
+    }
+
+    #[test]
+    fn test_openai_auth_error_display() {
+        let error = WorkerError::OpenAIAuthError {
+            url: "https://api.openai.com".to_string(),
+            message: "Invalid API key provided".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "OpenAI authentication error for worker https://api.openai.com: Invalid API key provided"
+        );
+    }
+
+    #[test]
+    fn test_openai_rate_limit_error_display() {
+        let error_with_retry = WorkerError::OpenAIRateLimitError {
+            url: "https://api.openai.com".to_string(),
+            retry_after: Some(60),
+        };
+        assert_eq!(
+            error_with_retry.to_string(),
+            "OpenAI rate limit exceeded for worker https://api.openai.com: retry after 60 seconds"
+        );
+
+        let error_no_retry = WorkerError::OpenAIRateLimitError {
+            url: "https://api.openai.com".to_string(),
+            retry_after: None,
+        };
+        assert_eq!(
+            error_no_retry.to_string(),
+            "OpenAI rate limit exceeded for worker https://api.openai.com"
+        );
+    }
+
+    #[test]
+    fn test_openai_model_error_display() {
+        let error = WorkerError::OpenAIModelError {
+            url: "https://api.openai.com".to_string(),
+            model: "gpt-4".to_string(),
+            message: "Model not found".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "OpenAI model error for worker https://api.openai.com (model: gpt-4): Model not found"
+        );
     }
 }
