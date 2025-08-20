@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.model_executor.graph_runner import GraphRunner
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +32,14 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 
-class NPUGraphRunner(GraphRunner):
+class NPUGraphRunner(CudaGraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+
+    def _create_device_graph(self):
+        return torch.npu.NPUGraph()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         with torch.npu.graph(
@@ -53,8 +56,8 @@ class NPUGraphRunner(GraphRunner):
             cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
         )
 
-    def _zero_tensor_with_dtype(self, tshape):
-        return torch.zeros(tshape, dtype=torch.int32)
+    def _cache_loc_dtype(self):
+        return torch.int32
 
     def replay(
         self,

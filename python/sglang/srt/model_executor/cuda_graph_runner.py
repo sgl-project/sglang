@@ -51,12 +51,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
-    create_device_graph,
-    device_graph_func,
-    device_synchronize,
     empty_context,
     get_available_gpu_memory,
-    get_device_graph_pool_handle,
     get_device_memory_capacity,
     rank0_log,
     require_attn_tp_gather,
@@ -238,13 +234,14 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
-class GraphRunner:
+class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
+        self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -310,13 +307,15 @@ class GraphRunner:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
 
         # Graph inputs
-        with torch.device(model_runner.device):
+        with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.out_cache_loc = self._zero_tensor_with_dtype((self.max_num_token,))
+            self.out_cache_loc = torch.zeros(
+                (self.max_num_token,), dtype=self._cache_loc_dtype()
+            )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -371,12 +370,12 @@ class GraphRunner:
                     * self.num_tokens_per_bs
                 ),
                 dtype=torch.bool,
-                device=model_runner.device,
+                device=self.device,
             )
             self.next_token_logits_buffer = torch.zeros(
                 (self.max_num_token, self.model_runner.model_config.vocab_size),
                 dtype=torch.float,
-                device=model_runner.device,
+                device=self.device,
             )
 
         # Capture
@@ -388,8 +387,8 @@ class GraphRunner:
                 f"Capture device graph failed: {e}\n{GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-    def _zero_tensor_with_dtype(self, tshape):
-        return torch.zeros(tshape, dtype=torch.int64)
+    def _cache_loc_dtype(self):
+        return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -511,12 +510,15 @@ class GraphRunner:
             logger.info(log_message)
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with device_graph_func(self.device)(graph, pool=pool, stream=stream):
+        with self.device_module.graph(graph, pool=pool, stream=stream):
             out = run_once_fn()
         return out
 
+    def _create_device_graph(self):
+        return torch.cuda.CUDAGraph()
+
     def capture_one_batch_size(self, bs: int, forward: Callable):
-        graph = create_device_graph()
+        graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -656,12 +658,12 @@ class GraphRunner:
             return logits_output_or_pp_proxy_tensors
 
         for _ in range(2):
-            device_synchronize(self.device)
+            self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
 
         if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(get_device_graph_pool_handle(self.device))
+            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
         out = self._capture_graph(
