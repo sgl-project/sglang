@@ -40,9 +40,10 @@ import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
-    DPPaddingMode,
+    DpPaddingMode,
     get_attention_dp_rank,
     get_attention_tp_size,
+    set_dp_buffer_len,
 )
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import (
@@ -274,13 +275,13 @@ class ForwardBatch:
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The padding mode for DP attention
-    dp_padding_mode: Optional[DPPaddingMode] = None
+    dp_padding_mode: Optional[DpPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
     # this will be recomputed in LogitsMetadata.from_forward_batch
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
-    gathered_buffer: Optional[torch.Tensor] = None
+    global_dp_buffer_len: Optional[int] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -628,7 +629,7 @@ class ForwardBatch:
                 (global_num_tokens[i] - 1) // attn_tp_size + 1
             ) * attn_tp_size
 
-        dp_padding_mode = DPPaddingMode.get_dp_padding_mode(global_num_tokens)
+        dp_padding_mode = DpPaddingMode.get_dp_padding_mode(global_num_tokens)
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -642,16 +643,13 @@ class ForwardBatch:
         else:
             buffer_len = sum(global_num_tokens)
 
-        self.gathered_buffer = torch.zeros(
-            (buffer_len, model_runner.model_config.hidden_size),
-            dtype=model_runner.dtype,
-            device=model_runner.device,
-        )
-
         if len(global_num_tokens) > 1:
             num_tokens = global_num_tokens[get_attention_dp_rank()]
         else:
             num_tokens = global_num_tokens[0]
+
+        self.global_dp_buffer_len = buffer_len
+        set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
 
         bs = self.batch_size
 

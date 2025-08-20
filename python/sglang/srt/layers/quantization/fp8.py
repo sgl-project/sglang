@@ -49,6 +49,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
@@ -79,6 +80,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 
@@ -208,17 +210,13 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
-        self.use_marlin = (
-            get_bool_env_var("SGLANG_FORCE_FP8_MARLIN") and MARLIN_FP8_AVAILABLE
-        )
-        # Disable marlin for ROCm
-        if _is_hip:
-            self.use_marlin = False
+        self.use_marlin = False
+        if _is_cuda and MARLIN_FP8_AVAILABLE:
+            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            auto_enable = can_auto_enable_marlin_fp8()
+            self.use_marlin = force_marlin or auto_enable
 
         self.block_quant = self.quant_config.weight_block_size is not None
-        if self.block_quant:
-            # Marlin doesn't support block-wise fp8
-            self.use_marlin = False
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
@@ -331,7 +329,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        # Block quant doesn't need to process weights after loading
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
@@ -341,7 +338,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=layer.weight_scale_inv,
                     input_scale=None,
                 )
-
                 layer.input_scale = None
             elif _is_cpu:
                 assert (
@@ -351,90 +347,94 @@ class Fp8LinearMethod(LinearMethodBase):
                 return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
-            layer.weight = torch.nn.Parameter(weight, requires_grad=False)
-            layer.weight_scale_inv = torch.nn.Parameter(
-                weight_scale, requires_grad=False
-            )
-            return
-
-        layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
-
-        # If checkpoint not serialized fp8, quantize the weights.
-        if not self.quant_config.is_checkpoint_fp8_serialized:
-            if self.cutlass_fp8_supported or self.use_marlin:
-                # apply per-channel quantization default, as cutlass sgl-kernel and marlin only support per-channel scale
-                qweight, weight_scale = per_token_group_quant_fp8(
-                    layer.weight, layer.weight.shape[-1]
-                )
-                weight_scale = weight_scale.t().contiguous()
-            else:
-                # per-tensor quantization
-                qweight, weight_scale = input_to_float8(layer.weight)
-
-            # Update the layer with the new values.
-            layer.weight = Parameter(qweight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-            layer.input_scale = None
-
-        # If checkpoint is fp8, handle that there are N scales for N
-        # shards in a fused module
+            layer.weight = Parameter(weight, requires_grad=False)
+            layer.weight_scale_inv = Parameter(weight_scale, requires_grad=False)
         else:
-            layer.weight_scale = torch.nn.Parameter(
-                layer.weight_scale.data, requires_grad=False
-            )
-            if (
-                hasattr(self.quant_config, "activation_scheme")
-                and self.quant_config.activation_scheme == "static"
-            ) or (
-                hasattr(self.quant_config, "linear_activation_scheme")
-                and self.quant_config.linear_activation_scheme == "static"
-            ):
-                layer.input_scale = torch.nn.Parameter(
-                    layer.input_scale.data, requires_grad=False
-                )
+            layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
-            # cutlass sgl-kernel and marlin only support per-channel scale
-            if self.cutlass_fp8_supported or self.use_marlin:
-                weight = layer.weight
-                weight_scale = convert_to_channelwise(
-                    layer.weight_scale, layer.logical_widths
-                )
+            # If checkpoint not serialized fp8, quantize the weights.
+            if not self.quant_config.is_checkpoint_fp8_serialized:
+                if self.cutlass_fp8_supported or self.use_marlin:
+                    # apply per-channel quantization default as
+                    # cutlass sgl-kernel and marlin only support per-channel scale
+                    qweight, weight_scale = per_token_group_quant_fp8(
+                        layer.weight, layer.weight.shape[-1]
+                    )
+                    weight_scale = weight_scale.t().contiguous()
+                else:
+                    # per-tensor quantization
+                    qweight, weight_scale = input_to_float8(layer.weight)
+
+                # Update the layer with the new values.
+                layer.weight = Parameter(qweight.t(), requires_grad=False)
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                layer.input_scale = None
+
+            # If checkpoint is fp8, handle that there are N scales for N
+            # shards in a fused module
             else:
-                # Dequant -> Quant with max scale so we can run per tensor.
-                weight = layer.weight
-                weight_scale = layer.weight_scale
-                # If ROCm, normalize the weights and scales to e4m3fnuz
-                if _is_fp8_fnuz:
-                    weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                layer.weight_scale = Parameter(
+                    layer.weight_scale.data, requires_grad=False
+                )
+                if (
+                    hasattr(self.quant_config, "activation_scheme")
+                    and self.quant_config.activation_scheme == "static"
+                ) or (
+                    hasattr(self.quant_config, "linear_activation_scheme")
+                    and self.quant_config.linear_activation_scheme == "static"
+                ):
+                    layer.input_scale = Parameter(
+                        layer.input_scale.data, requires_grad=False
+                    )
+
+                # cutlass sgl-kernel and marlin only support per-channel scale
+                if self.cutlass_fp8_supported or self.use_marlin:
+                    weight = layer.weight
+                    weight_scale = convert_to_channelwise(
+                        layer.weight_scale, layer.logical_widths
+                    )
+                else:
+                    # Dequant -> Quant with max scale so we can run per tensor.
+                    weight = layer.weight
+                    weight_scale = layer.weight_scale
+                    # If ROCm, normalize the weights and scales to e4m3fnuz
+                    if _is_fp8_fnuz:
+                        weight, weight_scale, input_scale = (
+                            normalize_e4m3fn_to_e4m3fnuz(
+                                weight=weight,
+                                weight_scale=weight_scale,
+                                input_scale=layer.input_scale,
+                            )
+                        )
+                        if input_scale is not None:
+                            layer.input_scale = Parameter(
+                                input_scale, requires_grad=False
+                            )
+
+                    weight_scale, weight = requantize_with_max_scale(
                         weight=weight,
                         weight_scale=weight_scale,
-                        input_scale=layer.input_scale,
+                        logical_widths=layer.logical_widths,
                     )
-                    if input_scale is not None:
-                        layer.input_scale = Parameter(input_scale, requires_grad=False)
 
-                weight_scale, weight = requantize_with_max_scale(
-                    weight=weight,
-                    weight_scale=weight_scale,
-                    logical_widths=layer.logical_widths,
-                )
-
-            # Update layer with new values.
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-            if (
-                hasattr(self.quant_config, "activation_scheme")
-                and self.quant_config.activation_scheme == "static"
-            ) or (
-                hasattr(self.quant_config, "linear_activation_scheme")
-                and self.quant_config.linear_activation_scheme == "static"
-            ):
-                layer.input_scale = Parameter(
-                    layer.input_scale.max(), requires_grad=False
-                )
+                # Update layer with new values.
+                layer.weight = Parameter(weight.t(), requires_grad=False)
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                if (
+                    hasattr(self.quant_config, "activation_scheme")
+                    and self.quant_config.activation_scheme == "static"
+                ) or (
+                    hasattr(self.quant_config, "linear_activation_scheme")
+                    and self.quant_config.linear_activation_scheme == "static"
+                ):
+                    layer.input_scale = Parameter(
+                        layer.input_scale.max(), requires_grad=False
+                    )
 
         if self.use_marlin:
-            prepare_fp8_layer_for_marlin(layer)
+            if self.block_quant:
+                layer.weight_block_size = self.quant_config.weight_block_size
+            prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
 
@@ -444,7 +444,6 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         if self.use_marlin:
             return apply_fp8_marlin_linear(
                 input=x,
@@ -982,12 +981,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
@@ -996,7 +990,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
-                apply_router_weight_on_input, topk_weights, x
+                moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
 
             return torch.ops.sgl_kernel.fused_experts_cpu(
@@ -1021,8 +1015,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer,
                 x,
                 topk_output,
-                activation,
-                no_combine,
+                moe_runner_config.activation,
+                moe_runner_config.no_combine,
             )
             if ret is not None:
                 return ret
@@ -1060,8 +1054,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8_blockscale=True,
             )
             # TODO: Fuse into select_experts
-            if routed_scaling_factor is not None:
-                output *= routed_scaling_factor
+            if moe_runner_config.routed_scaling_factor is not None:
+                output *= moe_runner_config.routed_scaling_factor
             return output
         # Expert fusion with FP8 quantization
         return fused_experts(
@@ -1069,9 +1063,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            inplace=inplace and not no_combine,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
+            moe_runner_config=moe_runner_config,
             use_fp8_w8a8=True,
             w1_scale=(
                 layer.w13_weight_scale_inv
@@ -1084,30 +1076,44 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )
 
     def apply_with_router_logits(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        *,
-        activation: str = "silu",
-        routed_scaling_factor: Optional[float] = None,
+        topk_output: TopKOutput,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
+        activation = moe_runner_config.activation
+        routed_scaling_factor = moe_runner_config.routed_scaling_factor
+
+        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
         assert (
             activation == "silu"
         ), "Only silu is supported for flashinfer blockscale fp8 moe"
         a_q, a_sf = per_token_group_quant_fp8(x, self.quant_config.weight_block_size[1])
         # NOTE: scales of hidden states have to be transposed!
         a_sf_t = a_sf.t().contiguous()
-        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
 
+        assert (
+            topk_config.num_expert_group is not None
+            and topk_config.topk_group is not None
+        ), "Current trtllm_fp8_block_scale_moe kernel does not support these two arguments as None"
+
+        if topk_config.correction_bias is None:
+            correction_bias = topk_config.correction_bias.to(x.dtype)
+        else:
+            correction_bias = None
         return trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
-            routing_bias=layer.correction_bias.to(x.dtype),
+            routing_bias=correction_bias,
             hidden_states=a_q,
             hidden_states_scale=a_sf_t,
             gemm1_weights=layer.w13_weight,
@@ -1115,15 +1121,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             gemm2_weights=layer.w2_weight,
             gemm2_weights_scale=layer.w2_weight_scale_inv,
             num_experts=layer.num_experts,
-            top_k=layer.top_k,
-            n_group=layer.num_expert_group,
-            topk_group=layer.topk_group,
+            top_k=topk_config.top_k,
+            n_group=topk_config.num_expert_group,
+            topk_group=topk_config.topk_group,
             intermediate_size=layer.w2_weight.shape[2],
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             local_num_experts=layer.num_local_experts,
-            routed_scaling_factor=routed_scaling_factor,
+            routed_scaling_factor=(
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            ),
             tile_tokens_dim=get_tile_tokens_dim(
-                x.shape[0], layer.top_k, layer.num_experts
+                x.shape[0], topk_config.top_k, layer.num_experts
             ),
             routing_method_type=2,  # DeepSeek-styled routing method
             use_shuffled_weight=False,
