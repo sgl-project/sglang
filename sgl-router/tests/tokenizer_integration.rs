@@ -1,13 +1,15 @@
 //! Integration tests for tokenizers using real tokenizer data
 //!
-//! These tests use the TinyLlama tokenizer to verify our tokenizer implementation
-//! works correctly with real-world tokenizer files.
+//! These tests download the TinyLlama tokenizer from HuggingFace to verify our tokenizer
+//! implementation works correctly with real-world tokenizer files.
 
 use sglang_router_rs::tokenizer::{
     factory, huggingface::HuggingFaceTokenizer, sequence::Sequence, stop::*, stream::DecodeStream,
     traits::*,
 };
-use std::sync::Arc;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const TEST_PROMPTS: [&str; 4] = [
     "deep learning is",
@@ -32,7 +34,13 @@ const LONG_TEST_PROMPTS: [(&str, &str); 6] = [
     ("Tell me about the following text.", "😀😃😄😁😆🥹😅😂🤣🥲☺️😊😇🙂🙃😉🤩😎 🤪🥳🤓🙄🤪😵👻")
 ];
 
-const TINYLLAMA_TOKENIZER_PATH: &str = "tests/data/TinyLlama_v1.1/tokenizer.json";
+const TINYLLAMA_TOKENIZER_URL: &str =
+    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
+const CACHE_DIR: &str = ".tokenizer_cache";
+const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
+
+// Global mutex to prevent concurrent downloads
+static DOWNLOAD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 // Pre-computed hashes for verification
 const EXPECTED_HASHES: [u64; 4] = [
@@ -41,6 +49,54 @@ const EXPECTED_HASHES: [u64; 4] = [
     6245658446118930933,
     5097285695902185237,
 ];
+
+/// Downloads the tokenizer from HuggingFace if not already cached
+fn ensure_tokenizer_cached() -> PathBuf {
+    // Get or initialize the mutex
+    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
+
+    // Lock to ensure only one thread downloads at a time
+    let _guard = mutex.lock().unwrap();
+
+    let cache_dir = PathBuf::from(CACHE_DIR);
+    let tokenizer_path = cache_dir.join(TINYLLAMA_TOKENIZER_FILENAME);
+
+    // Create cache directory if it doesn't exist
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
+    }
+
+    // Download tokenizer if not already cached
+    if !tokenizer_path.exists() {
+        println!("Downloading TinyLlama tokenizer from HuggingFace...");
+
+        // Use blocking reqwest client since we're in tests
+        let client = reqwest::blocking::Client::new();
+        let response = client
+            .get(TINYLLAMA_TOKENIZER_URL)
+            .send()
+            .expect("Failed to download tokenizer");
+
+        if !response.status().is_success() {
+            panic!("Failed to download tokenizer: HTTP {}", response.status());
+        }
+
+        let content = response.bytes().expect("Failed to read tokenizer content");
+
+        // Verify we got actual JSON content
+        if content.len() < 100 {
+            panic!("Downloaded content too small: {} bytes", content.len());
+        }
+
+        fs::write(&tokenizer_path, content).expect("Failed to write tokenizer to cache");
+        println!(
+            "Tokenizer downloaded and cached successfully ({} bytes)",
+            tokenizer_path.metadata().unwrap().len()
+        );
+    }
+
+    tokenizer_path
+}
 
 fn compute_hashes_for_tokenizer<E: Encoder>(tokenizer: &E, prompts: &[&str]) -> Vec<u64> {
     prompts
@@ -56,14 +112,15 @@ fn compute_hashes_for_tokenizer<E: Encoder>(tokenizer: &E, prompts: &[&str]) -> 
 
 #[test]
 fn test_huggingface_tokenizer_hashes() {
-    let tokenizer = HuggingFaceTokenizer::from_file(TINYLLAMA_TOKENIZER_PATH)
+    let tokenizer_path = ensure_tokenizer_cached();
+    let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Failed to load HuggingFace tokenizer");
 
     let prompt_hashes = compute_hashes_for_tokenizer(&tokenizer, &TEST_PROMPTS);
 
     println!(
         "HF Tokenizer: {:?}\nComputed Hashes: {:?}\nExpected Hashes: {:?}",
-        TINYLLAMA_TOKENIZER_PATH, prompt_hashes, EXPECTED_HASHES
+        tokenizer_path, prompt_hashes, EXPECTED_HASHES
     );
 
     assert_eq!(prompt_hashes, EXPECTED_HASHES);
@@ -71,7 +128,8 @@ fn test_huggingface_tokenizer_hashes() {
 
 #[test]
 fn test_tokenizer_encode_decode_lifecycle() {
-    let tokenizer = HuggingFaceTokenizer::from_file(TINYLLAMA_TOKENIZER_PATH)
+    let tokenizer_path = ensure_tokenizer_cached();
+    let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Failed to load HuggingFace tokenizer");
 
     for prompt in TEST_PROMPTS.iter() {
@@ -87,8 +145,9 @@ fn test_tokenizer_encode_decode_lifecycle() {
 
 #[test]
 fn test_sequence_operations() {
+    let tokenizer_path = ensure_tokenizer_cached();
     let tokenizer = Arc::new(
-        HuggingFaceTokenizer::from_file(TINYLLAMA_TOKENIZER_PATH)
+        HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
     );
 
@@ -129,8 +188,9 @@ fn test_sequence_operations() {
 
 #[test]
 fn test_decode_stream() {
+    let tokenizer_path = ensure_tokenizer_cached();
     let tokenizer = Arc::new(
-        HuggingFaceTokenizer::from_file(TINYLLAMA_TOKENIZER_PATH)
+        HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
     );
 
@@ -152,8 +212,9 @@ fn test_decode_stream() {
 
 #[test]
 fn test_long_sequence_incremental_decode_with_prefill() {
+    let tokenizer_path = ensure_tokenizer_cached();
     let tokenizer = Arc::new(
-        HuggingFaceTokenizer::from_file(TINYLLAMA_TOKENIZER_PATH)
+        HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
     );
 
@@ -181,8 +242,9 @@ fn test_long_sequence_incremental_decode_with_prefill() {
 
 #[test]
 fn test_stop_sequence_decoder() {
+    let tokenizer_path = ensure_tokenizer_cached();
     let tokenizer = Arc::new(
-        HuggingFaceTokenizer::from_file(TINYLLAMA_TOKENIZER_PATH)
+        HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
     );
 
@@ -246,7 +308,8 @@ fn test_stop_sequence_decoder() {
 #[test]
 fn test_factory_creation() {
     // Test factory creation method
-    let tokenizer = factory::create_tokenizer(TINYLLAMA_TOKENIZER_PATH)
+    let tokenizer_path = ensure_tokenizer_cached();
+    let tokenizer = factory::create_tokenizer(tokenizer_path.to_str().unwrap())
         .expect("Failed to create tokenizer via factory");
 
     let encoding = tokenizer.encode(TEST_PROMPTS[0]).expect("Failed to encode");
@@ -260,7 +323,8 @@ fn test_factory_creation() {
 
 #[test]
 fn test_batch_encoding() {
-    let tokenizer = HuggingFaceTokenizer::from_file(TINYLLAMA_TOKENIZER_PATH)
+    let tokenizer_path = ensure_tokenizer_cached();
+    let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Failed to load tokenizer");
 
     let encodings = tokenizer
@@ -281,7 +345,8 @@ fn test_batch_encoding() {
 fn test_special_tokens() {
     use sglang_router_rs::tokenizer::traits::Tokenizer as TokenizerTrait;
 
-    let tokenizer = HuggingFaceTokenizer::from_file(TINYLLAMA_TOKENIZER_PATH)
+    let tokenizer_path = ensure_tokenizer_cached();
+    let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Failed to load tokenizer");
 
     let special_tokens = tokenizer.get_special_tokens();
@@ -297,8 +362,9 @@ fn test_special_tokens() {
 fn test_thread_safety() {
     use std::thread;
 
+    let tokenizer_path = ensure_tokenizer_cached();
     let tokenizer = Arc::new(
-        HuggingFaceTokenizer::from_file(TINYLLAMA_TOKENIZER_PATH)
+        HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
     );
 
