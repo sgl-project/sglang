@@ -473,12 +473,22 @@ mod tests {
             request_timeout_secs: 30,
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
+            dp_aware: false,
+            api_key: None,
             discovery: Some(DiscoveryConfig::default()),
             metrics: Some(MetricsConfig::default()),
             log_dir: Some("/var/log".to_string()),
             log_level: Some("debug".to_string()),
+            request_id_headers: None,
             max_concurrent_requests: 64,
-            ..Default::default()
+            cors_allowed_origins: vec![],
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            disable_retries: false,
+            disable_circuit_breaker: false,
+            health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            igw: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
