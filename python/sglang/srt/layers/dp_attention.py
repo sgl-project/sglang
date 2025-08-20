@@ -75,7 +75,7 @@ class _DpGatheredBufferWrapper:
     _device: torch.device
     _global_dp_buffer_len: int
     _local_dp_buffer_len: int
-    _is_dp_max_padding: bool
+    _dp_max_padding: bool
     _global_num_tokens: Optional[List[int]]
 
     @classmethod
@@ -89,12 +89,12 @@ class _DpGatheredBufferWrapper:
         cls,
         global_dp_buffer_len: int,
         local_dp_buffer_len: int,
-        is_dp_max_padding: bool,
+        dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
     ):
         cls._global_dp_buffer_len = global_dp_buffer_len
         cls._local_dp_buffer_len = local_dp_buffer_len
-        cls._is_dp_max_padding = is_dp_max_padding
+        cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
@@ -109,7 +109,7 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_local_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._is_dp_max_padding):
+        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._local_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -131,17 +131,17 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def is_dp_max_padding(cls) -> bool:
-        return cls._is_dp_max_padding
+        return cls._dp_max_padding
 
 
 def set_dp_buffer_len(
     global_dp_buffer_len: int,
     local_dp_buffer_len: int,
-    is_dp_max_padding: bool,
+    dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
 ):
     _DpGatheredBufferWrapper.set_dp_buffer_len(
-        global_dp_buffer_len, local_dp_buffer_len, is_dp_max_padding, global_num_tokens
+        global_dp_buffer_len, local_dp_buffer_len, dp_max_padding, global_num_tokens
     )
 
 

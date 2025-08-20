@@ -28,6 +28,7 @@ _allocator = None
 _mem_pool = None
 _registered_base_addrs = set()
 _graph_pool_id = None
+_cached_pool_snapshot = None
 
 
 def is_symmetric_memory_enabled():
@@ -38,9 +39,9 @@ def is_symmetric_memory_enabled():
 
 
 def is_symmetric_memory_tensor(tensor: torch.Tensor):
-    if not is_symmetric_memory_enabled():
+    if not is_symmetric_memory_enabled() or _cached_pool_snapshot is None:
         return False
-    for segment in get_nccl_mem_pool().snapshot():
+    for segment in _cached_pool_snapshot:
         for block in segment["blocks"]:
             if block["address"] == tensor.untyped_storage().data_ptr():
                 return True
@@ -125,9 +126,11 @@ class use_symmetric_memory:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.disabled:
             return
+        global _cached_pool_snapshot
         global _registered_base_addrs
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
-        for segment in get_nccl_mem_pool().snapshot():
+        _cached_pool_snapshot = get_nccl_mem_pool().snapshot()
+        for segment in _cached_pool_snapshot:
             if segment["address"] not in _registered_base_addrs:
                 if segment["stream"] == 0 and self.pre_2_8_0:
                     # PyTorch version < 2.8.0 has a multi-thread MemPool bug

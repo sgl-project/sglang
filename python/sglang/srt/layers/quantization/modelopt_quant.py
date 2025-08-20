@@ -1273,9 +1273,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             output_col = x.shape[1]
             x_sf = None
 
-            with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
-                symm_output = torch.empty_like(x)
-
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
 
