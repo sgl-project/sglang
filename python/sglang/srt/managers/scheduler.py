@@ -1534,6 +1534,7 @@ class Scheduler(
             recv_req.sampling_params,
             token_type_ids=recv_req.token_type_ids,
             priority=recv_req.priority,
+            dimensions=recv_req.dimensions,
         )
         req.tokenizer = self.tokenizer
 

@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+import torch
 
 import torch
 
@@ -174,7 +175,11 @@ class SchedulerOutputProcessorMixin:
 
         else:  # embedding or reward model
             embeddings, bid = result.embeddings, result.bid
-            embeddings = embeddings.tolist()
+
+            if isinstance(embeddings, torch.Tensor):
+                embeddings = embeddings.tolist()
+            else:
+                embeddings = [tensor.tolist() for tensor in embeddings]
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):

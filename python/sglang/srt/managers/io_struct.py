@@ -679,6 +679,8 @@ class EmbeddingReqInput:
 
     # tracing context
     trace_context: Optional[Dict] = None
+    # The number of dimensions the resulting output embeddings should have.
+    dimensions: Optional[int] = None
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -759,6 +761,7 @@ class EmbeddingReqInput:
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            dimensions=self.dimensions
         )
 
 
@@ -797,6 +800,8 @@ class BatchTokenizedEmbeddingReqInput:
 
     def __iter__(self):
         return iter(self.batch)
+    # For Matryoshka Embeddings
+    dimensions: Optional[int] = None
 
 
 @dataclass

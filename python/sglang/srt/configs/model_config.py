@@ -167,6 +167,10 @@ class ModelConfig:
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
 
+        # matryoshka embeddings
+        self.is_matryoshka = hasattr(self.hf_config, "matryoshka_dimensions") or getattr(self.hf_config, "is_matryoshka", False)
+        self.matryoshka_dimensions = getattr(self.hf_config, "matryoshka_dimensions", None)
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
