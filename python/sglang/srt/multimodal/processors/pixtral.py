@@ -42,8 +42,8 @@ class PixtralProcessor(BaseMultimodalProcessor):
 
         return ncols, nrows
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.IM_TOKEN_ID = getattr(
             hf_config, "image_token_index", PixtralVisionModel.DEFAULT_IMAGE_TOKEN_ID
         )

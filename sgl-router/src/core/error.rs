@@ -17,6 +17,8 @@ pub enum WorkerError {
     NetworkError { url: String, error: String },
     /// Worker is at capacity
     WorkerAtCapacity { url: String },
+    /// Invalid URL format
+    InvalidUrl { url: String },
 }
 
 impl fmt::Display for WorkerError {
@@ -36,6 +38,9 @@ impl fmt::Display for WorkerError {
             }
             WorkerError::WorkerAtCapacity { url } => {
                 write!(f, "Worker at capacity: {}", url)
+            }
+            WorkerError::InvalidUrl { url } => {
+                write!(f, "Invalid URL format: {}", url)
             }
         }
     }
@@ -132,8 +137,7 @@ mod tests {
     fn test_worker_result_type_alias() {
         // Test Ok variant
         let result: WorkerResult<i32> = Ok(42);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
+        assert!(matches!(result, Ok(42)));
 
         // Test Err variant
         let error = WorkerError::WorkerNotFound {

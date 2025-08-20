@@ -7,7 +7,7 @@ impl ConfigValidator {
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
         // Check if service discovery is enabled
-        let has_service_discovery = config.discovery.as_ref().map_or(false, |d| d.enabled);
+        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
 
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
@@ -22,6 +22,12 @@ impl ConfigValidator {
         }
 
         Self::validate_compatibility(config)?;
+
+        // Validate effective retry/CB configs (respect disable flags)
+        let retry_cfg = config.effective_retry_config();
+        let cb_cfg = config.effective_circuit_breaker_config();
+        Self::validate_retry(&retry_cfg)?;
+        Self::validate_circuit_breaker(&cb_cfg)?;
 
         Ok(())
     }
@@ -41,6 +47,8 @@ impl ConfigValidator {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
+                prefill_policy,
+                decode_policy,
             } => {
                 // Only require URLs if service discovery is disabled
                 if !has_service_discovery {
@@ -77,6 +85,14 @@ impl ConfigValidator {
                             });
                         }
                     }
+                }
+
+                // Validate optional prefill and decode policies
+                if let Some(p_policy) = prefill_policy {
+                    Self::validate_policy(p_policy)?;
+                }
+                if let Some(d_policy) = decode_policy {
+                    Self::validate_policy(d_policy)?;
                 }
             }
         }
@@ -253,13 +269,86 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Validate retry configuration
+    fn validate_retry(retry: &RetryConfig) -> ConfigResult<()> {
+        if retry.max_retries < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.max_retries".to_string(),
+                value: retry.max_retries.to_string(),
+                reason: "Must be >= 1 (set to 1 to effectively disable retries)".to_string(),
+            });
+        }
+        if retry.initial_backoff_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.initial_backoff_ms".to_string(),
+                value: retry.initial_backoff_ms.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        if retry.max_backoff_ms < retry.initial_backoff_ms {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.max_backoff_ms".to_string(),
+                value: retry.max_backoff_ms.to_string(),
+                reason: "Must be >= initial_backoff_ms".to_string(),
+            });
+        }
+        if retry.backoff_multiplier < 1.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.backoff_multiplier".to_string(),
+                value: retry.backoff_multiplier.to_string(),
+                reason: "Must be >= 1.0".to_string(),
+            });
+        }
+        if !(0.0..=1.0).contains(&retry.jitter_factor) {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.jitter_factor".to_string(),
+                value: retry.jitter_factor.to_string(),
+                reason: "Must be between 0.0 and 1.0".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate circuit breaker configuration
+    fn validate_circuit_breaker(cb: &CircuitBreakerConfig) -> ConfigResult<()> {
+        if cb.failure_threshold < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "circuit_breaker.failure_threshold".to_string(),
+                value: cb.failure_threshold.to_string(),
+                reason: "Must be >= 1 (set to u32::MAX to effectively disable CB)".to_string(),
+            });
+        }
+        if cb.success_threshold < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "circuit_breaker.success_threshold".to_string(),
+                value: cb.success_threshold.to_string(),
+                reason: "Must be >= 1".to_string(),
+            });
+        }
+        if cb.timeout_duration_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "circuit_breaker.timeout_duration_secs".to_string(),
+                value: cb.timeout_duration_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        if cb.window_duration_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "circuit_breaker.window_duration_secs".to_string(),
+                value: cb.window_duration_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
         // All policies are now supported for both router types thanks to the unified trait design
         // No mode/policy restrictions needed anymore
 
         // Check if service discovery is enabled for worker count validation
-        let has_service_discovery = config.discovery.as_ref().map_or(false, |d| d.enabled);
+        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
 
         // Only validate worker counts if service discovery is disabled
         if !has_service_discovery {
@@ -272,6 +361,43 @@ impl ConfigValidator {
                     });
                 }
             }
+
+            // For PD mode, validate that policies have sufficient workers
+            if let RoutingMode::PrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+            } = &config.mode
+            {
+                // Check power-of-two for prefill
+                if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
+                    if prefill_urls.len() < 2 {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: "Power-of-two policy for prefill requires at least 2 prefill workers".to_string(),
+                        });
+                    }
+                }
+
+                // Check power-of-two for decode
+                if let Some(PolicyConfig::PowerOfTwo { .. }) = decode_policy {
+                    if decode_urls.len() < 2 {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason:
+                                "Power-of-two policy for decode requires at least 2 decode workers"
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Service discovery is conflict with dp_aware routing for now
+        // since it's not fully supported yet
+        if has_service_discovery && config.dp_aware {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "DP-aware routing is not compatible with service discovery".to_string(),
+            });
         }
 
         Ok(())
@@ -430,6 +556,8 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
                 decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
             },
             PolicyConfig::Random,
         );
@@ -444,6 +572,8 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
             },
             PolicyConfig::RoundRobin,
         );
@@ -459,6 +589,8 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
             },
             PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
@@ -490,5 +622,61 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_pd_mode_with_separate_policies() {
+        // Test PD mode with different policies for prefill and decode
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![
+                    ("http://prefill1:8000".to_string(), None),
+                    ("http://prefill2:8000".to_string(), None),
+                ],
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: Some(PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                }),
+                decode_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 60,
+                }),
+            },
+            PolicyConfig::Random, // Main policy as fallback
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_pd_mode_power_of_two_insufficient_workers() {
+        // Test that power-of-two policy requires at least 2 workers
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 60,
+                }), // Requires 2+ workers
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("prefill requires at least 2"));
+        }
     }
 }
