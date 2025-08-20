@@ -636,6 +636,9 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
+        self.dual_stream_token_threshold = get_int_env_var(
+            "SGLANG_DUAL_STREAM_TOKEN_THRESHOLD", 1024
+        )
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -780,12 +783,11 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
-            DUAL_STREAM_TOKEN_THRESHOLD = 1024
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
-                and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+                and hidden_states.shape[0] <= self.dual_stream_token_threshold
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
