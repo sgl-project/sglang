@@ -304,19 +304,11 @@ impl Default for MetricsConfig {
 
 /// IGW (Inference Gateway) configuration
 /// This is a placeholder for future IGW features
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IGWConfig {
     /// Backend scheduler endpoints (for future use)
     #[serde(default)]
     pub scheduler_endpoints: Vec<String>,
-}
-
-impl Default for IGWConfig {
-    fn default() -> Self {
-        Self {
-            scheduler_endpoints: vec![],
-        }
-    }
 }
 
 impl Default for RouterConfig {
@@ -919,6 +911,8 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            igw: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -975,6 +969,8 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            igw: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1027,6 +1023,8 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            igw: None,
         };
 
         assert!(config.has_service_discovery());
@@ -1218,7 +1216,7 @@ mod tests {
 
         assert!(config.is_igw_mode());
         assert!(config.get_igw_config().is_some());
-        
+
         let igw = config.get_igw_config().unwrap();
         assert_eq!(igw.scheduler_endpoints.len(), 1);
     }
@@ -1238,10 +1236,10 @@ mod tests {
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
-        
+
         assert!(deserialized.enable_igw);
         assert!(deserialized.igw.is_some());
-        
+
         let igw = deserialized.igw.unwrap();
         assert_eq!(igw.scheduler_endpoints.len(), 2);
     }
@@ -1263,7 +1261,7 @@ mod tests {
         // IGW mode should take precedence when enabled
         assert!(config.is_igw_mode());
         assert!(config.get_igw_config().is_some());
-        
+
         // Regular mode config still exists but should be ignored when IGW is enabled
         match config.mode {
             RoutingMode::Regular { ref worker_urls } => {

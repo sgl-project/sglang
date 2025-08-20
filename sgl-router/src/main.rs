@@ -1,7 +1,7 @@
 use clap::{ArgAction, Parser};
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    IGWConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig, IGWConfig,
+    MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
@@ -321,12 +321,10 @@ impl CliArgs {
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         // Validate IGW configuration if enabled
-        if self.enable_igw {
-            if self.igw_scheduler_endpoints.is_empty() {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "IGW mode requires at least one --igw-scheduler-endpoints".to_string(),
-                });
-            }
+        if self.enable_igw && self.igw_scheduler_endpoints.is_empty() {
+            return Err(ConfigError::ValidationFailed {
+                reason: "IGW mode requires at least one --igw-scheduler-endpoints".to_string(),
+            });
         }
 
         // Determine routing mode
@@ -531,9 +529,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Regular"
         }
     );
-    
+
     if cli_args.enable_igw {
-        println!("IGW Scheduler Endpoints: {:?}", cli_args.igw_scheduler_endpoints);
+        println!(
+            "IGW Scheduler Endpoints: {:?}",
+            cli_args.igw_scheduler_endpoints
+        );
     } else {
         println!("Policy: {}", cli_args.policy);
 

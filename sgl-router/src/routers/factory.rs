@@ -103,11 +103,17 @@ impl RouterFactory {
 
     /// Create an IGW router (placeholder for future implementation)
     async fn create_igw_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
-        let _igw_config = ctx.router_config.igw.as_ref()
+        let igw_config = ctx
+            .router_config
+            .igw
+            .as_ref()
             .ok_or("IGW mode enabled but no IGW configuration provided")?;
 
         // For now, return an error indicating IGW is not yet implemented
-        // This allows the feature flag to be tested without full implementation
-        Err("IGW mode is not yet implemented. Please disable enable_igw flag.".to_string())
+
+        Err(format!(
+            "IGW mode is not yet implemented (configured with {} endpoint(s))",
+            igw_config.scheduler_endpoints.len()
+        ))
     }
 }

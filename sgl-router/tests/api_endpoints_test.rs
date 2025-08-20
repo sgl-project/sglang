@@ -51,6 +51,8 @@ impl TestContext {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            igw: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1093,6 +1095,8 @@ mod error_tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            igw: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1444,6 +1448,8 @@ mod pd_mode_tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            igw: None,
         };
 
         // Create app context
@@ -1599,6 +1605,8 @@ mod request_id_tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
+            igw: None,
         };
 
         let ctx = TestContext::new_with_config(

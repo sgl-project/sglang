@@ -184,6 +184,8 @@ mod test_pd_routing {
                 disable_retries: false,
                 disable_circuit_breaker: false,
                 health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+                enable_igw: false,
+                igw: None,
             };
 
             // Router creation will fail due to health checks, but config should be valid

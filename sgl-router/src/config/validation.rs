@@ -25,7 +25,7 @@ impl ConfigValidator {
 
         // Validate IGW configuration if enabled
         if config.enable_igw {
-            Self::validate_igw_basic(config)?;
+            Self::validate_igw(config)?;
         }
 
         // Validate effective retry/CB configs (respect disable flags)
@@ -349,18 +349,21 @@ impl ConfigValidator {
 
     /// Validate IGW configuration
     fn validate_igw(config: &RouterConfig) -> ConfigResult<()> {
-        let igw = config.igw.as_ref().ok_or_else(|| ConfigError::ValidationFailed {
-            reason: "IGW mode enabled but no IGW configuration provided".to_string(),
-        })?;
+        let igw = config
+            .igw
+            .as_ref()
+            .ok_or_else(|| ConfigError::ValidationFailed {
+                reason: "IGW mode enabled but no IGW configuration provided".to_string(),
+            })?;
 
-        // Validate scheduler endpoints
+        // Validate scheduler endpoints exist
         if igw.scheduler_endpoints.is_empty() {
             return Err(ConfigError::ValidationFailed {
                 reason: "IGW mode requires at least one scheduler endpoint".to_string(),
             });
         }
 
-        // Validate scheduler endpoint URLs
+        // Basic validation for each endpoint
         for endpoint in &igw.scheduler_endpoints {
             if endpoint.is_empty() {
                 return Err(ConfigError::InvalidValue {
@@ -370,8 +373,11 @@ impl ConfigValidator {
                 });
             }
 
-            // Check for valid protocol prefix
-            if !endpoint.starts_with("grpc://") && !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+            // Just check it starts with a valid protocol
+            if !endpoint.starts_with("grpc://")
+                && !endpoint.starts_with("http://")
+                && !endpoint.starts_with("https://")
+            {
                 return Err(ConfigError::InvalidValue {
                     field: "scheduler_endpoint".to_string(),
                     value: endpoint.clone(),
@@ -380,23 +386,16 @@ impl ConfigValidator {
             }
         }
 
-        // Future validation can be added here as IGW features are implemented
-
-        Ok(())
-    }
-
-    /// Basic IGW validation - just check that config exists when IGW is enabled
-    fn validate_igw_basic(config: &RouterConfig) -> ConfigResult<()> {
-        if config.igw.is_none() {
-            return Err(ConfigError::ValidationFailed {
-                reason: "IGW mode enabled but no IGW configuration provided".to_string(),
-            });
-        }
         Ok(())
     }
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        // IGW mode is independent - skip other compatibility checks when enabled
+        if config.enable_igw {
+            return Ok(());
+        }
+
         // All policies are now supported for both router types thanks to the unified trait design
         // No mode/policy restrictions needed anymore
 
@@ -747,18 +746,23 @@ mod tests {
         let mut config = RouterConfig::default();
         config.enable_igw = true;
         // No IGW config provided
-        
+
         let result = ConfigValidator::validate(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no IGW configuration provided"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no IGW configuration provided"));
     }
 
     #[test]
     fn test_validate_igw_enabled_with_config() {
         let mut config = RouterConfig::default();
         config.enable_igw = true;
-        config.igw = Some(types::IGWConfig::default());
-        
+        config.igw = Some(types::IGWConfig {
+            scheduler_endpoints: vec!["grpc://scheduler:50051".to_string()],
+        });
+
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 }
