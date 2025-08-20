@@ -927,7 +927,7 @@ class FusedMoE(torch.nn.Module):
     def should_fuse_routed_scaling_factor_in_topk(self):
         return isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod) or (
             isinstance(self.quant_method, Fp8MoEMethod)
-            and self.quant_method.should_use_cutlass_fused_experts_fp8()
+            and self.quant_method.use_cutlass_fused_experts_fp8
         )
 
 
