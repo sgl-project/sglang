@@ -13,7 +13,10 @@ from unittest.mock import Mock, patch
 
 from fastapi import Request
 
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    MessageProcessingResult,
+)
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.managers.io_struct import GenerateReqInput
 
@@ -104,7 +107,7 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins.stop_str = ["</s>"]
             conv_mock.return_value = conv_ins
 
-            proc_mock.return_value = (
+            proc_mock.return_value = MessageProcessingResult(
                 "Test prompt",
                 [1, 2, 3],
                 None,
@@ -118,6 +121,59 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
+
+    def test_stop_str_isolation_between_requests(self):
+        """Test that stop strings from one request don't affect subsequent requests.
+
+        This tests the fix for the bug where conv.stop_str was being mutated globally,
+        causing stop strings from one request to persist in subsequent requests.
+        """
+        # Mock conversation template with initial stop_str
+        initial_stop_str = ["\n"]
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            # Create a mock conversation object that will be returned by generate_chat_conv
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_ins.image_data = None
+            conv_ins.audio_data = None
+            conv_ins.modalities = []
+            conv_ins.stop_str = (
+                initial_stop_str.copy()
+            )  # Template's default stop strings
+            conv_mock.return_value = conv_ins
+
+            # First request with additional stop string
+            req1 = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "First request"}],
+                stop=["CUSTOM_STOP"],
+            )
+
+            # Call the actual _apply_conversation_template method (not mocked)
+            result1 = self.chat._apply_conversation_template(req1, is_multimodal=False)
+
+            # Verify first request has both stop strings
+            expected_stop1 = initial_stop_str + ["CUSTOM_STOP"]
+            self.assertEqual(result1.stop, expected_stop1)
+
+            # Verify the original template's stop_str wasn't mutated after first request
+            self.assertEqual(conv_ins.stop_str, initial_stop_str)
+
+            # Second request without additional stop string
+            req2 = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Second request"}],
+                # No custom stop strings
+            )
+            result2 = self.chat._apply_conversation_template(req2, is_multimodal=False)
+
+            # Verify second request only has original stop strings (no CUSTOM_STOP from req1)
+            self.assertEqual(result2.stop, initial_stop_str)
+            self.assertNotIn("CUSTOM_STOP", result2.stop)
+            self.assertEqual(conv_ins.stop_str, initial_stop_str)
 
     # ------------- sampling-params -------------
     def test_sampling_param_build(self):
@@ -140,6 +196,134 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(params["max_new_tokens"], 150)
             self.assertEqual(params["min_new_tokens"], 5)
             self.assertEqual(params["stop"], ["</s>"])
+
+    async def test_unstreamed_tool_args_completion(self):
+        """Test that remaining tool call arguments are sent when generation finishes."""
+
+        # Mock FunctionCallParser with detector that has partial tool call data
+        mock_parser = Mock()
+        mock_detector = Mock()
+
+        # Simulate a tool call that was partially streamed
+        mock_detector.prev_tool_call_arr = [
+            {
+                "name": "get_weather",
+                "arguments": {"location": "San Francisco", "unit": "celsius"},
+            }
+        ]
+        mock_detector.streamed_args_for_tool = [
+            '{"location": "San Francisco"'  # Partial arguments streamed so far
+        ]
+        mock_parser.detector = mock_detector
+
+        content = {
+            "meta_info": {
+                "id": "chatcmpl-test123",
+            }
+        }
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        # Test the completion method
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content=content,
+            request=request,
+            finish_reason_type="stop",
+            index=0,
+        )
+
+        # Should return a chunk with remaining arguments
+        self.assertIsNotNone(result, "Should return chunk with remaining arguments")
+        self.assertIn('"arguments":', result, "Should contain arguments field")
+        self.assertIn(
+            ', "unit": "celsius"}', result, "Should contain remaining arguments"
+        )
+        self.assertIn(
+            '"finish_reason":null',
+            result,
+            "Should not include finish_reason in completion chunk",
+        )
+
+    async def test_unstreamed_tool_args_no_completion_needed(self):
+        """Test that no completion chunk is sent when all arguments were already streamed."""
+
+        # Mock FunctionCallParser with detector that has complete tool call data
+        mock_parser = Mock()
+        mock_detector = Mock()
+
+        # Simulate a tool call that was completely streamed
+        mock_detector.prev_tool_call_arr = [
+            {"name": "get_weather", "arguments": {"location": "San Francisco"}}
+        ]
+        mock_detector.streamed_args_for_tool = [
+            '{"location": "San Francisco"}'  # All arguments already streamed
+        ]
+        mock_parser.detector = mock_detector
+
+        content = {
+            "meta_info": {
+                "id": "chatcmpl-test123",
+            }
+        }
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        # Test the completion method
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content=content,
+            request=request,
+            finish_reason_type="stop",
+            index=0,
+        )
+
+        # Should return None since no completion is needed
+        self.assertIsNone(result, "Should return None when no completion is needed")
+
+    async def test_unstreamed_tool_args_no_parser_data(self):
+        """Test that no completion chunk is sent when parser has no tool call data."""
+
+        # Mock FunctionCallParser with empty detector
+        mock_parser = Mock()
+        mock_detector = Mock()
+        mock_detector.prev_tool_call_arr = []
+        mock_detector.streamed_args_for_tool = []
+        mock_parser.detector = mock_detector
+
+        content = {
+            "meta_info": {
+                "id": "chatcmpl-test123",
+            }
+        }
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        # Test the completion method
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content=content,
+            request=request,
+            finish_reason_type="stop",
+            index=0,
+        )
+
+        # Should return None since there's no parser data
+        self.assertIsNone(
+            result, "Should return None when parser has no tool call data"
+        )
 
 
 if __name__ == "__main__":
