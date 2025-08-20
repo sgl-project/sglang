@@ -189,6 +189,8 @@ impl Router {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
             },
+            enable_igw: false,  // Default to disabled
+            igw: None,
         })
     }
 }

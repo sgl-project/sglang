@@ -51,6 +51,12 @@ pub struct RouterConfig {
     pub disable_circuit_breaker: bool,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
+    /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
+    #[serde(default)]
+    pub enable_igw: bool,
+    /// IGW-specific configuration (only used when enable_igw is true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub igw: Option<IGWConfig>,
 }
 
 /// Routing mode configuration
@@ -296,6 +302,23 @@ impl Default for MetricsConfig {
     }
 }
 
+/// IGW (Inference Gateway) configuration
+/// This is a placeholder for future IGW features
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IGWConfig {
+    /// Backend scheduler endpoints (for future use)
+    #[serde(default)]
+    pub scheduler_endpoints: Vec<String>,
+}
+
+impl Default for IGWConfig {
+    fn default() -> Self {
+        Self {
+            scheduler_endpoints: vec![],
+        }
+    }
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -323,6 +346,8 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
+            igw: None,
         }
     }
 }
@@ -376,6 +401,20 @@ impl RouterConfig {
             cfg.failure_threshold = u32::MAX;
         }
         cfg
+    }
+
+    /// Check if running in IGW (Inference Gateway) mode
+    pub fn is_igw_mode(&self) -> bool {
+        self.enable_igw
+    }
+
+    /// Get IGW configuration if enabled
+    pub fn get_igw_config(&self) -> Option<&IGWConfig> {
+        if self.enable_igw {
+            self.igw.as_ref()
+        } else {
+            None
+        }
     }
 }
 
@@ -442,20 +481,12 @@ mod tests {
             request_timeout_secs: 30,
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
-            dp_aware: false,
-            api_key: None,
             discovery: Some(DiscoveryConfig::default()),
             metrics: Some(MetricsConfig::default()),
             log_dir: Some("/var/log".to_string()),
             log_level: Some("debug".to_string()),
-            request_id_headers: None,
             max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: HealthCheckConfig::default(),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1162,6 +1193,83 @@ mod tests {
         match regular.get_decode_policy(&main_policy) {
             PolicyConfig::RoundRobin => {} // Success
             _ => panic!("Expected RoundRobin for regular mode"),
+        }
+    }
+
+    // ============= IGW Configuration Tests =============
+
+    #[test]
+    fn test_igw_disabled_by_default() {
+        let config = RouterConfig::default();
+        assert!(!config.enable_igw);
+        assert!(config.igw.is_none());
+        assert!(!config.is_igw_mode());
+    }
+
+    #[test]
+    fn test_igw_config_basic() {
+        let config = RouterConfig {
+            enable_igw: true,
+            igw: Some(IGWConfig {
+                scheduler_endpoints: vec!["grpc://localhost:50051".to_string()],
+            }),
+            ..Default::default()
+        };
+
+        assert!(config.is_igw_mode());
+        assert!(config.get_igw_config().is_some());
+        
+        let igw = config.get_igw_config().unwrap();
+        assert_eq!(igw.scheduler_endpoints.len(), 1);
+    }
+
+    #[test]
+    fn test_igw_config_serialization() {
+        let config = RouterConfig {
+            enable_igw: true,
+            igw: Some(IGWConfig {
+                scheduler_endpoints: vec![
+                    "grpc://scheduler1:50051".to_string(),
+                    "grpc://scheduler2:50051".to_string(),
+                ],
+            }),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
+        
+        assert!(deserialized.enable_igw);
+        assert!(deserialized.igw.is_some());
+        
+        let igw = deserialized.igw.unwrap();
+        assert_eq!(igw.scheduler_endpoints.len(), 2);
+    }
+
+    #[test]
+    fn test_igw_mode_with_proxy_config() {
+        // Test that IGW mode can coexist with regular routing config
+        let config = RouterConfig {
+            enable_igw: true,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker1".to_string()],
+            },
+            igw: Some(IGWConfig {
+                scheduler_endpoints: vec!["grpc://scheduler1:50051".to_string()],
+            }),
+            ..Default::default()
+        };
+
+        // IGW mode should take precedence when enabled
+        assert!(config.is_igw_mode());
+        assert!(config.get_igw_config().is_some());
+        
+        // Regular mode config still exists but should be ignored when IGW is enabled
+        match config.mode {
+            RoutingMode::Regular { ref worker_urls } => {
+                assert_eq!(worker_urls.len(), 1);
+            }
+            _ => panic!("Expected Regular mode"),
         }
     }
 }

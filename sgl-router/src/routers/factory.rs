@@ -12,6 +12,12 @@ pub struct RouterFactory;
 impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        // Check if IGW mode is enabled
+        if ctx.router_config.enable_igw {
+            return Self::create_igw_router(ctx).await;
+        }
+
+        // Default to proxy mode
         match &ctx.router_config.mode {
             RoutingMode::Regular { worker_urls } => {
                 Self::create_regular_router(worker_urls, &ctx.router_config.policy, ctx).await
@@ -93,5 +99,15 @@ impl RouterFactory {
         .await?;
 
         Ok(Box::new(router))
+    }
+
+    /// Create an IGW router (placeholder for future implementation)
+    async fn create_igw_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        let _igw_config = ctx.router_config.igw.as_ref()
+            .ok_or("IGW mode enabled but no IGW configuration provided")?;
+
+        // For now, return an error indicating IGW is not yet implemented
+        // This allows the feature flag to be tested without full implementation
+        Err("IGW mode is not yet implemented. Please disable enable_igw flag.".to_string())
     }
 }
