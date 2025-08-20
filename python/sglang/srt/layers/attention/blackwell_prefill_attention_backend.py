@@ -11,8 +11,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 # from sglang.srt.managers.schedule_batch import global_server_args_dict
 # from sglang.srt.mem_cache.memory_pool import SWAKVPool
-# from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-# from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -22,8 +21,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class ForwardMetaData:
-    cu_seqlens_q: torch.Tensor
-    cu_seqlens_k: torch.Tensor
+    cu_seqlens_q: Optional[torch.Tensor] = None
+    cu_seqlens_k: Optional[torch.Tensor] = None
     page_table: Optional[torch.Tensor] = None
 
 class BlackwellPrefillAttentionBackend(AttentionBackend):
@@ -53,6 +52,36 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table=page_table)
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        metadata = ForwardMetaData()
+        self.forward_metadata = metadata
+        print(f"---> DEBUG: {forward_mode.is_decode_or_idle()=} {forward_mode.is_target_verify()=} {forward_mode.is_draft_extend()}", flush=True)
+        assert False, "this should fail not does not"
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
+    ):
+        print(f"---> DEBUG: {forward_mode.is_decode_or_idle()=} {forward_mode.is_target_verify()=} {forward_mode.is_draft_extend()}", flush=True)
+        assert False, "this should fail not does not"
 
     def forward_extend(
         self,
