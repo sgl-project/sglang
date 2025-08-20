@@ -90,6 +90,11 @@ jobs:
           echo "At least one step failed, failing the job..."
           exit 1
 
+  pr-test-xeon-finish:
+    if: always()
+    needs: [build-sglang-image, env-prepare, sglang-xeon-test]
+    runs-on: xeon-gnr
+    steps:
       - name: Change permission
         timeout-minutes: 20
         run: |
@@ -98,17 +103,6 @@ jobs:
             chown -R  $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true
           "
 
-      - name: Cleanup container
-        if: always()
-        run: |
-          echo "At least one step failed, failing the job..."
-          exit 1
-
-  pr-test-xeon-finish:
-    if: always()
-    needs: [build-sglang-image, env-prepare, sglang-xeon-test]
-    runs-on: xeon-gnr
-    steps:
       - name: Cleanup container
         if: always()
         run: |
