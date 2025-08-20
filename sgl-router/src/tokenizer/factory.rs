@@ -26,6 +26,14 @@ pub enum TokenizerType {
 /// - json: HuggingFace tokenizer
 /// - For testing: can return mock tokenizer
 pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
+    create_tokenizer_with_chat_template(file_path, None)
+}
+
+/// Create a tokenizer from a file path with an optional chat template
+pub fn create_tokenizer_with_chat_template(
+    file_path: &str,
+    chat_template_path: Option<&str>,
+) -> Result<Arc<dyn traits::Tokenizer>> {
     let start_time = Instant::now();
 
     // Special case for testing
@@ -51,7 +59,10 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tok
         Some("json") => {
             #[cfg(feature = "huggingface")]
             {
-                let tokenizer = HuggingFaceTokenizer::from_file(file_path)?;
+                let tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
+                    file_path,
+                    chat_template_path,
+                )?;
 
                 TokenizerMetrics::record_factory_load("json");
                 TokenizerMetrics::set_vocab_size("huggingface", tokenizer.vocab_size());
