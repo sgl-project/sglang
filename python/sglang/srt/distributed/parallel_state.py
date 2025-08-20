@@ -256,6 +256,7 @@ class GroupCoordinator:
             self.device = torch.device(f"npu:{local_rank}")
         else:
             self.device = torch.device("cpu")
+        self.device_module = torch.get_device_module(self.device)
 
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
