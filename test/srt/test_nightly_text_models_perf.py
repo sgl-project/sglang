@@ -8,7 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     _parse_int_list_env,
-    generate_markdown_report,
+    generate_markdown_report_nightly,
     is_in_ci,
     parse_models,
     popen_launch_server,
@@ -117,7 +117,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                     kill_process_tree(process.pid)
 
                     if model_results:
-                        report_part = generate_markdown_report(
+                        report_part = generate_markdown_report_nightly(
                             model, model_results, self.input_lens, self.output_lens
                         )
                         full_report += report_part + "\n"

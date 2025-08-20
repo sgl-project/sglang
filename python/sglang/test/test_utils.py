@@ -1470,7 +1470,7 @@ def _ensure_remove_suffix(text: str, suffix: str):
 
 
 # results are from `bench_one_batch_server.py`
-def generate_markdown_report(model, results, input_len, output_len):
+def generate_markdown_report_nightly(model, results, input_len, output_len):
     summary = f"### {model}\n"
     summary += f"Input lens: {input_len}. Output lens: {output_len}.\n"
     summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profiled trace |\n"
@@ -1486,7 +1486,7 @@ def generate_markdown_report(model, results, input_len, output_len):
             # Reconstruct the row and append a placeholder artifact link for profile
             parts = [part.strip() for part in m.group(0).split("|") if part.strip()]
             PROFILE_URL_PLACEHOLDER = "PROFILE_URL_PLACEHOLDER"
-            row = f"| {' | '.join(parts)} | [Profile]({PROFILE_URL_PLACEHOLDER}) |\n"
+            row = f"| {' | '.join(parts)} | [trace]({PROFILE_URL_PLACEHOLDER}) |\n"
             summary += row
     return summary
 
