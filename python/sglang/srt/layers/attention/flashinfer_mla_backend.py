@@ -358,6 +358,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
+        extend_prefix_lens: Optional[torch.Tensor] = None,
     ):
 
         if forward_mode.is_decode_or_idle():
@@ -439,6 +440,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
         seq_lens_cpu: Optional[torch.Tensor],
+        extend_prefix_lens: Optional[torch.Tensor] = None,
     ):
 
         if forward_mode.is_decode_or_idle():
