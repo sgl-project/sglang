@@ -11,6 +11,9 @@ pub mod traits;
 
 // Feature-gated modules
 #[cfg(feature = "huggingface")]
+pub mod chat_template;
+
+#[cfg(feature = "huggingface")]
 pub mod huggingface;
 
 #[cfg(feature = "tiktoken")]
@@ -20,14 +23,20 @@ pub mod tiktoken;
 mod tests;
 
 // Re-exports
-pub use factory::{create_tokenizer, create_tokenizer_from_file, TokenizerType};
+pub use factory::{
+    create_tokenizer, create_tokenizer_from_file, create_tokenizer_with_chat_template,
+    TokenizerType,
+};
 pub use sequence::Sequence;
 pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 pub use stream::DecodeStream;
 pub use traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as TokenizerTrait};
 
 #[cfg(feature = "huggingface")]
-pub use huggingface::{ChatMessage, HuggingFaceTokenizer};
+pub use huggingface::HuggingFaceTokenizer;
+
+#[cfg(feature = "huggingface")]
+pub use chat_template::ChatMessage;
 
 #[cfg(feature = "tiktoken")]
 pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
@@ -40,6 +49,17 @@ impl Tokenizer {
     /// Create a tokenizer from a file path
     pub fn from_file(file_path: &str) -> Result<Tokenizer> {
         Ok(Tokenizer(factory::create_tokenizer_from_file(file_path)?))
+    }
+
+    /// Create a tokenizer from a file path with an optional chat template
+    pub fn from_file_with_chat_template(
+        file_path: &str,
+        chat_template_path: Option<&str>,
+    ) -> Result<Tokenizer> {
+        Ok(Tokenizer(factory::create_tokenizer_with_chat_template(
+            file_path,
+            chat_template_path,
+        )?))
     }
 
     /// Create a tokenizer from an Arc<dyn Tokenizer>
