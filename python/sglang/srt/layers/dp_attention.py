@@ -75,7 +75,7 @@ class _DpGatheredBufferWrapper:
     _device: torch.device
     _global_dp_buffer_len: int
     _local_dp_buffer_len: int
-    _is_max_padding: bool
+    _is_dp_max_padding: bool
     _global_num_tokens: Optional[List[int]]
 
     @classmethod
@@ -89,12 +89,12 @@ class _DpGatheredBufferWrapper:
         cls,
         global_dp_buffer_len: int,
         local_dp_buffer_len: int,
-        is_max_padding: bool,
+        is_dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
     ):
         cls._global_dp_buffer_len = global_dp_buffer_len
         cls._local_dp_buffer_len = local_dp_buffer_len
-        cls._is_max_padding = is_max_padding
+        cls._is_dp_max_padding = is_dp_max_padding
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
@@ -111,7 +111,7 @@ class _DpGatheredBufferWrapper:
     @classmethod
     def get_local_dp_buffer(cls) -> torch.Tensor:
         with use_symmetric_memory(
-            get_tp_group(), disabled=not cls._is_max_padding
+            get_tp_group(), disabled=not cls._is_dp_max_padding
         ) as sm:
             buffer = torch.empty(
                 (cls._local_dp_buffer_len, cls._hidden_size),
@@ -134,18 +134,18 @@ class _DpGatheredBufferWrapper:
         return cls._global_num_tokens
 
     @classmethod
-    def is_max_padding(cls) -> bool:
-        return cls._is_max_padding
+    def is_dp_max_padding(cls) -> bool:
+        return cls._is_dp_max_padding
 
 
 def set_dp_buffer_len(
     global_dp_buffer_len: int,
     local_dp_buffer_len: int,
-    is_max_padding: bool,
+    is_dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
 ):
     _DpGatheredBufferWrapper.set_dp_buffer_len(
-        global_dp_buffer_len, local_dp_buffer_len, is_max_padding, global_num_tokens
+        global_dp_buffer_len, local_dp_buffer_len, is_dp_max_padding, global_num_tokens
     )
 
 
@@ -169,8 +169,8 @@ def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
 
 
-def is_max_padding() -> bool:
-    return _DpGatheredBufferWrapper.is_max_padding()
+def is_dp_max_padding() -> bool:
+    return _DpGatheredBufferWrapper.is_dp_max_padding()
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
