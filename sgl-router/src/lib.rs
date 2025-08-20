@@ -3,10 +3,12 @@ pub mod config;
 pub mod logging;
 use std::collections::HashMap;
 pub mod core;
+#[cfg(feature = "grpc-client")]
+pub mod grpc;
 pub mod metrics;
 pub mod middleware;
-pub mod openai_api_types;
 pub mod policies;
+pub mod protocols;
 pub mod reasoning_parser;
 pub mod routers;
 pub mod server;
