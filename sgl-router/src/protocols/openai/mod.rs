@@ -5,3 +5,4 @@ pub mod chat;
 pub mod common;
 pub mod completions;
 pub mod errors;
+pub mod responses;
