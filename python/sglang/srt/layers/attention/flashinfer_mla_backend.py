@@ -101,9 +101,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
 
         if q_indptr_decode_buf is None:
+            # A hack to pre-initialize large batch size for dp attention
+            if model_runner.server_args.enable_dp_attention:
+                max_bs = model_runner.server_args.dp_size * max_bs
             self.q_indptr_decode = torch.arange(
                 0, max_bs + 1, dtype=torch.int32, device=model_runner.device
             )
+
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
@@ -330,7 +334,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert seq_lens_cpu is not None
             kv_len_arr_cpu = seq_lens_cpu[:bs]
             num_pages_per_req = (seq_lens_cpu + self.page_size - 1) // self.page_size
-            self.cuda_graph_kv_indptr_cpu[1:] = torch.cumsum(num_pages_per_req, dim=0)
+            self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                num_pages_per_req, dim=0
+            )
             self.fast_decode_kwargs.update(
                 {
                     "qo_indptr_cpu": self.cuda_graph_qo_indptr_cpu[: bs + 1],
@@ -557,7 +563,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         **fast_decode_kwargs,
     ):
         bs = len(req_pool_indices)
-        # q_indptr = torch.arange(0, bs + 1, dtype=torch.int32, device=q_indptr.device)
+        q_indptr = q_indptr[: bs + 1]
         kv_lens = paged_kernel_lens.to(torch.int32)
         sm_scale = self.scaling
         if spec_info is None:
@@ -565,6 +571,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 paged_kernel_lens + self.page_size - 1
             ) // self.page_size
             kv_indptr[1 : bs + 1] = torch.cumsum(num_pages_per_req, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
             kv_indices = (
                 torch.empty(kv_indptr[-1], dtype=torch.int32, device=q_indptr.device)
                 if not init_metadata_replay
