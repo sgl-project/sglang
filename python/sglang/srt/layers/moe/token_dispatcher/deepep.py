@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled
+from sglang.srt.layers.moe import (
+    DeepEPMode,
+    get_deepep_config,
+    get_moe_runner_backend,
+    is_tbo_enabled,
+)
 from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -316,8 +321,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not get_bool_env_var(
-            "SGLANG_USE_W4A8"
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and get_moe_runner_backend() != "cutlass_w4afp8"
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -389,7 +395,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             expert_alignment=(
                 128
                 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and not get_bool_env_var("SGLANG_USE_W4A8")
+                and get_moe_runner_backend() != "cutlass_w4afp8"
                 else 1
             ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,

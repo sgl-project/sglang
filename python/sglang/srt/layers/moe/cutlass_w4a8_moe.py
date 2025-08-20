@@ -15,7 +15,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
-    post_reorder_triton_kernel,
+    post_reorder_triton_kernel_for_cutlass_moe,
     pre_reorder_triton_kernel_for_cutlass_moe,
     run_cutlass_moe_ep_preproess,
 )
@@ -108,7 +108,7 @@ def cutlass_w4a8_moe(
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1) if not deepep_mode else 8
+    topk = topk_ids_.size(1)
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
@@ -240,14 +240,13 @@ def cutlass_w4a8_moe(
 
     if not deepep_mode:
         output = torch.empty_like(a)
-        post_reorder_triton_kernel[(m,)](
+        post_reorder_triton_kernel_for_cutlass_moe[(m,)](
             c2,
             output,
             src2dst,
             local_topk_ids,
             topk_weights,
-            start_expert_id,
-            end_expert_id,
+            num_experts,
             topk,
             k,
             0,
