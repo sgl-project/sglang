@@ -598,9 +598,9 @@ class TokenizerManager:
         ):
             if self.server_args.allow_auto_truncate:
                 logger.warning(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens). "
-                    "Truncating the input."
+                    f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
+                    f"exceeds the model's context length ({self.context_len} tokens). "
+                    "Truncating max_new_tokens."
                 )
                 obj.sampling_params["max_new_tokens"] = max(
                     0, _max_req_len - input_token_num
