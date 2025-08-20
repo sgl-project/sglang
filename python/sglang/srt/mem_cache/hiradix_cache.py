@@ -75,7 +75,6 @@ class HiRadixCache(RadixCache):
         self.prefetch_threshold = 256
         self.prefetch_timeout = 3  # seconds
         self.prefetch_stop_policy = hicache_storage_prefetch_policy
-        self.last_free_operation = None
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -113,7 +112,6 @@ class HiRadixCache(RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
-        self.last_free_operation = None
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -436,29 +434,52 @@ class HiRadixCache(RadixCache):
         )
 
     def check_free_prefetch(self):
-        if self.last_free_operation is not None:
-            if self.last_free_operation.request_id in self.ongoing_prefetch:
-                return
-            else:
-                self.free_operation(self.last_free_operation)
-                self.last_free_operation = None
+        with self.cache_controller.prefetch_free_dict_lock:
+            free_request_ids = list(self.cache_controller.prefetch_free_dict.keys())
+        free_request_ids = [
+            request_id
+            for request_id in free_request_ids
+            if request_id not in self.ongoing_prefetch
+        ]
 
-        queue_size = self.cache_controller.prefetch_free_queue.qsize()
         if self.tp_world_size > 1:
-            queue_size = torch.tensor(queue_size, dtype=torch.int)
-            # synchrnoize TP workers to make the same update to hiradix cache
-            torch.distributed.all_reduce(
-                queue_size,
-                op=torch.distributed.ReduceOp.MIN,
+            list_size = torch.tensor(len(free_request_ids), dtype=torch.int)
+            list_sizes = [torch.zeros_like(list_size) for _ in self.tp_world_size]
+            torch.distributed.all_gather(
+                list_sizes,
+                list_size,
                 group=self.tp_group,
             )
-            queue_size = queue_size.item()
+            list_size = list_size.item()
+            list_sizes = [s.item() for s in list_sizes]
 
-        for _ in range(queue_size):
-            operation = self.cache_controller.prefetch_free_queue.get()
-            if operation.request_id in self.ongoing_prefetch:
-                self.last_free_operation = operation
-                break
+            max_list_size = max(list_sizes)
+            min_list_size = min(list_sizes)
+            if min_list_size == 0:
+                free_request_ids.clear()
+            else:
+                list_value = torch.tensor(
+                    free_request_ids + [0] * (max_list_size - list_size),
+                    dtype=torch.int,
+                )
+                list_values = [torch.zeros_like(list_value) for _ in self.tp_world_size]
+                torch.distributed.all_gather(
+                    list_values,
+                    list_value,
+                    group=self.tp_group,
+                )
+                list_values = [v.tolist() for v in list_values]
+                set_values = [set(v[:s]) for s, v in zip(list_sizes, list_values)]
+                intersection = set.intersection(*set_values)
+                free_request_ids = list(intersection)
+
+        with self.cache_controller.prefetch_free_dict_lock:
+            free_operations = [
+                self.cache_controller.prefetch_free_dict.pop(free_request_id)
+                for free_request_id in free_request_ids
+            ]
+
+        for operation in free_operations:
             self.free_operation(operation)
 
     def can_terminate_prefetch(self, operation: PrefetchOperation):

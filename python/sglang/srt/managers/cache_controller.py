@@ -356,7 +356,8 @@ class HiCacheController:
             self.prefetch_revoke_queue = Queue()
             self.ack_backup_queue = Queue()
 
-            self.prefetch_free_queue = Queue()
+            self.prefetch_free_dict_lock = threading.Lock()
+            self.prefetch_free_dict = {}
 
             self.prefetch_thread.start()
             self.backup_thread.start()
@@ -380,7 +381,8 @@ class HiCacheController:
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
 
-            self.prefetch_free_queue.queue.clear()
+            with self.prefetch_free_dict_lock:
+                self.prefetch_free_dict = {}
 
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
@@ -616,8 +618,8 @@ class HiCacheController:
                 if self.tp_world_size > 1:
                     # to ensure all TP workers release the host memory at the same time
                     torch.distributed.barrier(group=self.prefetch_io_tp_group)
-                # operation terminated by controller, release pre-allocated memory
-                self.prefetch_free_queue.put(operation)
+                with self.prefetch_free_dict_lock:
+                    self.prefetch_free_dict[operation.request_id] = operation
             except Empty:
                 continue
 
@@ -692,7 +694,8 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     if operation.host_indices is not None:
-                        self.prefetch_free_queue.put(operation)
+                        with self.prefetch_free_dict_lock:
+                            self.prefetch_free_dict[operation.request_id] = operation
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
