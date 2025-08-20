@@ -297,9 +297,6 @@ class ServerArgs:
 
     def __post_init__(self):
         # Check deprecated arguments
-        def print_deprecated_warning(message: str):
-            logger.warning(f"\033[33m{message}\033[0m")
-
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
             print_deprecated_warning(
@@ -1956,22 +1953,23 @@ class ServerArgs:
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
         parser.add_argument(
+            "--weight-loader-disable-mmap",
+            action="store_true",
+            help="Disable mmap while loading weight using safetensors.",
+        )
+
+        # For PD-Multiplexing
+        parser.add_argument(
             "--enable-pdmux",
             action="store_true",
             help="Enable PD-Multiplexing, PD running on greenctx stream.",
         )
 
-        # For PD-Multiplexing
         parser.add_argument(
             "--sm-group-num",
             type=int,
             default=ServerArgs.sm_group_num,
             help="Number of sm partition groups.",
-        )
-        parser.add_argument(
-            "--weight-loader-disable-mmap",
-            action="store_true",
-            help="Disable mmap while loading weight using safetensors.",
         )
 
         # Deprecated arguments
@@ -2377,6 +2375,10 @@ class DeprecatedAction(argparse.Action):
 
     def __call__(self, parser, namespace, values, option_string=None):
         raise ValueError(self.help)
+
+
+def print_deprecated_warning(message: str):
+    logger.warning(f"\033[33m{message}\033[0m")
 
 
 def auto_choose_speculative_params(self: ServerArgs):
