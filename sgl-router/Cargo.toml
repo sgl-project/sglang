@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = ["huggingface"]
-huggingface = ["tokenizers"]
+huggingface = ["tokenizers", "minijinja"]
 tiktoken = ["tiktoken-rs"]
 
 [lib]
@@ -50,13 +50,15 @@ url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
 tokenizers = { version = "0.21.4", optional = true }
-tiktoken-rs = { version = "0.5", optional = true }
+tiktoken-rs = { version = "0.5.0", optional = true }
+minijinja = { version = "2.0", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 portpicker = "0.1"
+tempfile = "3.8"
 
 [[bench]]
 name = "request_processing"
