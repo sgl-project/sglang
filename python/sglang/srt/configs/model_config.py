@@ -273,7 +273,12 @@ class ModelConfig:
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
-        self.vocab_size = self.hf_text_config.vocab_size
+        self.channels = getattr(self.hf_text_config, "channels", None)
+        if self.channels is not None:
+            self.vocab_size = self.hf_text_config.vocab_size[0]
+            self.vocab_size_list = self.hf_text_config.vocab_size
+        else:
+            self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization
         self._verify_quantization()

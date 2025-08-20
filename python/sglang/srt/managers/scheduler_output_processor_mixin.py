@@ -208,12 +208,22 @@ class SchedulerOutputProcessorMixin:
             logits_output, next_token_ids, can_run_cuda_graph = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )
-            next_token_logprobs = logits_output.next_token_logprobs
+            if self.server_args.multi_channels:
+                next_token_logprobs = [
+                    output.next_token_logprobs for output in logits_output
+                ]
+            else:
+                next_token_logprobs = logits_output.next_token_logprobs
         elif batch.spec_algorithm.is_none():
             # spec decoding handles output logprobs inside verify process.
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs.tolist()
+                if self.server_args.multi_channels:
+                    next_token_logprobs = [
+                        output.next_token_logprobs for output in logits_output
+                    ]
+                else:
+                    next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
         self.token_to_kv_pool_allocator.free_group_begin()
 

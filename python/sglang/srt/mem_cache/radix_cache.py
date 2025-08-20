@@ -367,6 +367,8 @@ class RadixCache(BasePrefixCache):
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()
 
+        if isinstance(key[0], list):
+            key = [tuple(x) for x in key]
         child_key = self.get_child_key_fn(key)
 
         value = []
@@ -412,6 +414,8 @@ class RadixCache(BasePrefixCache):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
+        elif isinstance(key[0], list):
+            key = [tuple(x) for x in key]
 
         child_key = self.get_child_key_fn(key)
 

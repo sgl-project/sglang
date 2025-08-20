@@ -64,7 +64,7 @@ from sglang.srt.layers.quantization import (
     deep_gemm_wrapper,
     monkey_patch_isinstance_for_vllm_base_layer,
 )
-from sglang.srt.layers.sampler import Sampler
+from sglang.srt.layers.sampler import MultiChannelSampler, Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -287,7 +287,10 @@ class ModelRunner:
         self.expert_location_updater = ExpertLocationUpdater()
 
         # Load the model
-        self.sampler = Sampler()
+        if self.server_args.multi_channels:
+            self.sampler = MultiChannelSampler()
+        else:
+            self.sampler = Sampler()
         self.load_model()
 
         # Check if the model is using hybrid SWA
