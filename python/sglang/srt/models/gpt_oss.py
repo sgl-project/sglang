@@ -1091,7 +1091,7 @@ class GptOssForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "sinks" in name:
-                            start = tp_rank * param.numel()
+                            start = get_attention_tp_rank() * param.numel()
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )

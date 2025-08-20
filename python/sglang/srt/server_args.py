@@ -2183,10 +2183,11 @@ class ServerArgs:
             ), f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got '{self.attention_backend}'"
 
             if is_sm100_supported():
-                self.enable_flashinfer_allreduce_fusion = True
-                logger.info(
-                    "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
-                )
+                if not self.enable_dp_attention:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
+                    )
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
