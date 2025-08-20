@@ -287,7 +287,7 @@ class ModelRunner:
         self.expert_location_updater = ExpertLocationUpdater()
 
         # Load the model
-        if self.server_args.multi_channels:
+        if self.server_args.multi_channel:
             self.sampler = MultiChannelSampler()
         else:
             self.sampler = Sampler()
@@ -1819,8 +1819,13 @@ class ModelRunner:
         return ret, can_run_cuda_graph
 
     def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
+        self,
+        logits_output: Union[LogitsProcessorOutput, List[LogitsProcessorOutput]],
+        sampling_info: SamplingBatchInfo,
     ):
+        # Multi-channel models are not compatible with the current logit bias.
+        if self.server_args.multi_channel:
+            return
         # Apply logit bias
         if sampling_info.sampling_info_done:
             # Overlap mode: the function update_regex_vocab_mask was executed
