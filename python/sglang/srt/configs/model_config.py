@@ -341,6 +341,19 @@ class ModelConfig:
                 "kv_n_heads",
                 self.hf_config.num_attention_heads,
             )
+        if self.hf_config.model_type in ["nemotron-nas"]:
+            nkvh = {
+                self.hf_config.num_attention_heads // block.attention.n_heads_in_group
+                for block in self.hf_config.block_configs
+                if not block.attention.no_op
+            }
+            if len(nkvh) == 0:
+                raise RuntimeError("Couldn't determine number of kv heads")
+            if len(nkvh) > 1:
+                raise ValueError(
+                    "Variable GQA (VGQA) is not yet supported for nemotron-nas in sglang"
+                )
+            return next(iter(nkvh))
 
         attributes = [
             # For Falcon:
@@ -642,6 +655,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
+        or "Qwen3ForSequenceClassification" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
         or "Contriever" in model_architectures
