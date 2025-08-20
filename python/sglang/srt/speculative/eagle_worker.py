@@ -91,6 +91,11 @@ class EAGLEWorker(TpModelWorker):
         )
         self.padded_static_len = -1
 
+        if server_args.context_length is None:
+            server_args.context_length = (
+                target_worker.model_runner.model_config.context_len
+            )
+
         if (
             server_args.context_length
             < target_worker.model_runner.model_config.context_len
