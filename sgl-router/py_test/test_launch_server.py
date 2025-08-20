@@ -464,7 +464,7 @@ class TestLaunchServer(unittest.TestCase):
             )
 
     def test_6_add_and_remove_worker_with_dp_aware(self):
-        print("Running test_7_add_and_remove_worker_with_dp_aware...")
+        print("Running test_6_add_and_remove_worker_with_dp_aware...")
 
         # Set dp_size = 1
         self.process = popen_launch_router(
