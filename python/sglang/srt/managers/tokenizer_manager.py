@@ -49,6 +49,7 @@ from sglang.srt.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -216,6 +217,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
+        # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
+        if (
+            server_args.enable_dynamic_batch_tokenizer
+            and not server_args.skip_tokenizer_init
+        ):
+            self.async_dynamic_batch_tokenizer = AsyncDynamicbatchTokenizer(
+                self.tokenizer,
+                max_batch_size=server_args.dynamic_batch_tokenizer_batch_size,
+                batch_wait_timeout_s=server_args.dynamic_batch_tokenizer_batch_timeout,
+            )
+        else:
+            self.async_dynamic_batch_tokenizer = None
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -370,6 +383,82 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ):
                     yield response
 
+    async def _tokenize_texts(
+        self, texts: Union[str, List[str]], is_cross_encoder: bool = False
+    ) -> Union[
+        Tuple[List[int], Optional[List[int]]],
+        Tuple[List[List[int]], Optional[List[List[int]]]],
+    ]:
+        """
+        Tokenize text(s) using the appropriate tokenizer strategy.
+
+        This method chooses between async dynamic batch tokenizer (for single texts only)
+        and regular tokenizer (for batch texts or fallback).
+
+        Args:
+            texts: Single string or list of strings to tokenize.
+            is_cross_encoder: Whether to return token_type_ids for cross-encoder models.
+                             Used for tasks like sentence similarity where token types matter.
+
+        Returns:
+            For single text input:
+                Tuple[List[int], Optional[List[int]]]: (input_ids, token_type_ids)
+            For batch text input:
+                Tuple[List[List[int]], Optional[List[List[int]]]]: (input_ids_batch, token_type_ids_batch)
+
+            token_type_ids is None unless is_cross_encoder=True.
+        """
+        if not texts or self.tokenizer is None:
+            raise ValueError("texts cannot be empty and tokenizer must be initialized")
+
+        is_single: bool = isinstance(texts, str)
+        # normalized to list format
+        text_list: List[str] = [texts] if is_single else texts
+        kwargs: Dict[str, Any] = (
+            {"return_token_type_ids": is_cross_encoder} if is_cross_encoder else {}
+        )
+
+        # Use async dynamic batch tokenizer only for single texts
+        # For multiple texts in a batch, use regular tokenizer which is efficient
+        if self.async_dynamic_batch_tokenizer is not None and is_single:
+            logger.debug("Using async dynamic batch tokenizer for single text")
+            result: Dict[str, Any] = await self.async_dynamic_batch_tokenizer.encode(
+                text_list[0], **kwargs
+            )
+
+            # Extract and wrap in batch format for consistency
+            input_ids: List[List[int]] = [result["input_ids"]]
+            token_type_ids: Optional[List[List[int]]] = (
+                [result["token_type_ids"]]
+                if is_cross_encoder and result.get("token_type_ids")
+                else None
+            )
+        else:
+            # Use regular tokenizer - much more efficient for batch requests
+            logger.debug(f"Using regular tokenizer for {len(text_list)} texts")
+            encoded: Dict[str, Any] = self.tokenizer(text_list, **kwargs)
+
+            # input_ids is nested since we pass List[str] to tokenizer
+            # Example: [[101, 7592, 102]] or [[101, 7592, 102], [101, 2088, 102]]
+            input_ids: List[List[int]] = encoded["input_ids"]
+
+            # token_type_ids is nested as well
+            # Example: [[0, 0, 0]] or [[0, 0, 0], [0, 0, 0]] or None
+            token_type_ids: Optional[List[List[int]]] = (
+                encoded.get("token_type_ids") if is_cross_encoder else None
+            )
+
+        # Return in the expected format
+        if is_single:
+            # Extract single sequence from batch format
+            single_input_ids: List[int] = input_ids[0]
+            single_token_type_ids: Optional[List[int]] = (
+                token_type_ids[0] if token_type_ids else None
+            )
+            return single_input_ids, single_token_type_ids
+        else:
+            return input_ids, token_type_ids
+
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -400,14 +489,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "accept text prompts. Please provide input_ids or re-initialize "
                     "the engine with skip_tokenizer_init=False."
                 )
-            encoded = self.tokenizer(
-                input_text, return_token_type_ids=is_cross_encoder_request
-            )
 
-            input_ids = encoded["input_ids"]
-            if is_cross_encoder_request:
-                input_ids = encoded["input_ids"][0]
-                token_type_ids = encoded.get("token_type_ids", [None])[0]
+            input_ids, token_type_ids = await self._tokenize_texts(
+                input_text, is_cross_encoder_request
+            )
 
         if self.mm_processor and obj.contains_mm_input():
             if not isinstance(obj.image_data, list):
@@ -582,17 +667,27 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         requests = [obj[i] for i in range(batch_size)]
         texts = [req.text for req in requests]
 
-        # Batch tokenize all texts
-        encoded = self.tokenizer(texts)
-        input_ids_list = encoded["input_ids"]
+        # Check if any request is a cross-encoder request
+        is_cross_encoder_request = any(
+            isinstance(req, EmbeddingReqInput) and req.is_cross_encoder_request
+            for req in requests
+        )
+
+        # Batch tokenize all texts using unified method
+        input_ids_list, token_type_ids_list = await self._tokenize_texts(
+            texts, is_cross_encoder_request
+        )
 
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
             self._validate_one_request(obj[i], input_ids_list[i])
+            token_type_ids = (
+                token_type_ids_list[i] if token_type_ids_list is not None else None
+            )
             tokenized_objs.append(
                 self._create_tokenized_object(
-                    req, req.text, input_ids_list[i], None, None
+                    req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )
         logger.debug(f"Completed batch processing for {batch_size} requests")
