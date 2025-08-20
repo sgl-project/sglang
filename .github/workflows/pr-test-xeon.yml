@@ -43,7 +43,6 @@ jobs:
           docker build . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
 
   env-prepare:
-    if: always()
     needs: [build-sglang-image]
     runs-on: xeon-gnr
     env:
@@ -57,16 +56,7 @@ jobs:
             --name ci_sglang_xeon \
             sglang_xeon
 
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          docker exec ci_sglang_xeon bash -c "python3 -m pip install --upgrade pip"
-          docker exec ci_sglang_xeon pip uninstall sgl-kernel -y || true
-          docker exec -w /sglang-checkout/sgl-kernel ci_sglang_xeon bash -c "cp pyproject_cpu.toml pyproject.toml && pip install -v ."
-          docker exec -w /sglang-checkout/ ci_sglang_xeon bash -c "pip install -e "python[dev_cpu]""
-
   sglang-xeon-test:
-    if: always()
     needs: [env-prepare]
     runs-on: xeon-gnr
     steps:
@@ -86,17 +76,6 @@ jobs:
           docker exec -w /sglang-checkout/ ci_sglang_xeon \
             bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-cpu"
 
-      - name: Force fail if any step failed
-        if: always() && (steps.check_amx.outcome == 'failure' || steps.run_ut_cases.outcome == 'failure')
-        run: |
-          echo "At least one step failed, failing the job..."
-          exit 1
-
-  pr-test-xeon-finish:
-    if: always()
-    needs: [build-sglang-image, env-prepare, sglang-xeon-test]
-    runs-on: xeon-gnr
-    steps:
       - name: Change permission
         timeout-minutes: 20
         run: |
@@ -109,6 +88,18 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglang_xeon || true
+
+      - name: Force fail if any step failed
+        if: always() && (steps.check_amx.outcome == 'failure' || steps.run_ut_cases.outcome == 'failure')
+        run: |
+          echo "At least one step failed, failing the job..."
+          exit 1
+
+  pr-test-xeon-finish:
+    if: always()
+    needs: [build-sglang-image, env-prepare, sglang-xeon-test]
+    runs-on: xeon-gnr
+    steps:
 
       - name: Check all dependent job statuses
         run: |
