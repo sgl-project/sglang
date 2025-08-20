@@ -8,22 +8,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-        check_marlin_supported,
-        check_moe_marlin_supports_layer,
-    )
-    from vllm.scalar_type import scalar_types
 
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
-
-    class scalar_types:
-        uint4 = "uint4"
-        uint8 = "uint8"
-        uint4b8 = "uint4b8"
-        uint8b128 = "uint8b128"
+from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
+ScalarType, scalar_types = get_scalar_types()
 
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -117,7 +104,7 @@ class AutoRoundConfig(QuantizationConfig):
             group_size=cls.get_from_keys(config, ["group_size"]),
             sym=cls.get_from_keys(config, ["sym"]),
             packing_format=cls.get_from_keys_or(
-                config, ["packing_format"], "auto_round:auto_gptq"
+                config, ["packing_format"], "auto_round:auto_gptq",
             ),
             block_name_to_quantize=cls.get_from_keys_or(
                 config, ["block_name_to_quantize", "to_quant_block_names"], None
@@ -164,20 +151,18 @@ class AutoRoundConfig(QuantizationConfig):
         return weight_bits < 16
 
     def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.marlin_utils import (
             check_marlin_supported,
+            check_marlin_supports_layer,
             check_moe_marlin_supports_layer,
         )
-
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             else:
                 return None
-
         logger.debug(
             "[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
             prefix,
@@ -194,7 +179,6 @@ class AutoRoundConfig(QuantizationConfig):
             use_marlin = (weight_bits in AWQ_TYPE_MAP) and check_marlin_supported(
                 AWQ_TYPE_MAP[weight_bits], group_size, not sym
             )
-
             if isinstance(layer, FusedMoE):
                 use_marlin = use_marlin and check_moe_marlin_supports_layer(
                     layer, group_size
@@ -203,7 +187,7 @@ class AutoRoundConfig(QuantizationConfig):
         else:
             use_marlin = False
         if use_marlin:
-            from vllm.model_executor.layers.quantization.awq_marlin import (
+            from sglang.srt.layers.quantization.awq import (
                 AWQMarlinConfig,
                 AWQMarlinLinearMethod,
                 AWQMoEMethod,
@@ -248,13 +232,11 @@ class AutoRoundConfig(QuantizationConfig):
         return None
 
     def apply_gptq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
-        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.marlin_utils import (
             check_marlin_supported,
             check_moe_marlin_supports_layer,
         )
-
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
             if isinstance(layer, (LinearBase, ParallelLMHead)):

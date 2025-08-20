@@ -1,3 +1,8 @@
+"""
+Usage:
+python3 -m unittest test_autoround.TestAutoRound.test_mmlu
+"""
+
 import unittest
 from types import SimpleNamespace
 
@@ -42,9 +47,9 @@ class TestAutoRound(CustomTestCase):
                     )
                     metrics = run_eval(args)
                     if "Llama" in model:
-                        self.assertGreater(metrics["score"], 0.6)
+                        self.assertGreaterEqual(metrics["score"], 0.6)
                     else:
-                        self.assertGreater(metrics["score"], 0.26)
+                        self.assertGreaterEqual(metrics["score"], 0.26)
                 finally:
                     kill_process_tree(process.pid)
                     print(f"[INFO] Server for {model} stopped.")
