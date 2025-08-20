@@ -1805,6 +1805,7 @@ def triton_scaled_mm(
 
     return result.to(out_dtype)
 
+
 shuffle_autotune = triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": block_m, "GROUP_M": group_m}, num_warps=num_warps)
@@ -1815,13 +1816,14 @@ shuffle_autotune = triton.autotune(
     key=["K"],
 )
 
+
 @triton.jit
 def _shuffle_map_fp8_scale_hopper_moe_mn_major(
     a_s,  # (M, k):(k, 1)
     expert_offsets,  # (num_experts,)
     problem_sizes,  # (num_experts, 3)
     sfa,  # (M, k)
-    shuffle_map, # (topk * M,)
+    shuffle_map,  # (topk * M,)
     E: tl.constexpr,
     K: tl.constexpr,
     M_ALIGNMENT: tl.constexpr,
@@ -1854,10 +1856,9 @@ def _shuffle_map_fp8_scale_hopper_moe_mn_major(
         # Store sfa
         sfa_offset = current_expert_offset * K + k_offset * m + coord_m
         sfa_offset = tl.multiple_of(sfa_offset, M_ALIGNMENT)
-        sfa_ptrs = (
-            sfa + sfa_offset
-        )  # MN-Major with sfa
+        sfa_ptrs = sfa + sfa_offset  # MN-Major with sfa
         tl.store(sfa_ptrs, as_val, mask=coord_m < m)
+
 
 @triton.jit
 def _shuffle_fp8_scale_hopper_moe_mn_major(
@@ -1893,10 +1894,9 @@ def _shuffle_fp8_scale_hopper_moe_mn_major(
         # Store sfa
         sfa_offset = current_expert_offset * K + k_offset * m + coord_m
         sfa_offset = tl.multiple_of(sfa_offset, M_ALIGNMENT)
-        sfa_ptrs = (
-            sfa + sfa_offset
-        )  # MN-Major with sfa
+        sfa_ptrs = sfa + sfa_offset  # MN-Major with sfa
         tl.store(sfa_ptrs, as_val, mask=coord_m < m)
+
 
 if not _is_cpu:
     _shuffle_fp8_scale_hopper_moe_mn_major = shuffle_autotune(
@@ -1905,6 +1905,7 @@ if not _is_cpu:
     _shuffle_map_fp8_scale_hopper_moe_mn_major = shuffle_autotune(
         _shuffle_map_fp8_scale_hopper_moe_mn_major
     )
+
 
 def shuffle_fp8_scale_hopper_moe_mn_major(
     a_s: torch.Tensor,
@@ -1920,9 +1921,11 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
     k = a_s.shape[1]
     sfa = torch.empty((output_m, k), device=a_s.device, dtype=a_s.dtype)
     num_experts = problem_sizes.shape[0]
-    M_ALIGNMENT = a_s.element_size() * 8 # alignment to dtype can be independent to tensor shape
+    M_ALIGNMENT = (
+        a_s.element_size() * 8
+    )  # alignment to dtype can be independent to tensor shape
 
-    grid = (k * num_experts, )
+    grid = (k * num_experts,)
     if shuffle_map is not None:
         _shuffle_map_fp8_scale_hopper_moe_mn_major[grid](
             a_s,

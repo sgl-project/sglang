@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
-from sglang.srt.layers.utils import is_sm100_supported, is_sm90_supported
+from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -245,6 +245,7 @@ def cutlass_fused_experts_fp8(
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = 448.0
+
 
 def cutlass_moe_fp4(
     a: torch.Tensor,

@@ -276,7 +276,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 expert_offsets,
                 problem_sizes1,
                 problem_sizes2,
-                use_shuffle=True
+                use_shuffle=True,
             )
 
             # Run Triton version (requires original shape weights, use inplace=False)
@@ -305,7 +305,12 @@ def run_test(tp_size, batch_size, model_config, check=False):
         print("Correctness check passed.")
 
 
-def main(tp_size=8, batch_sizes=[1, 4, 8, 16, 32, 64, 128, 256, 512, 32768], check=False, prof=False):
+def main(
+    tp_size=8,
+    batch_sizes=[1, 4, 8, 16, 32, 64, 128, 256, 512, 32768],
+    check=False,
+    prof=False,
+):
     model_config = get_model_config(tp_size)
     print("Model Config:", model_config)
     for batch_size in batch_sizes:
