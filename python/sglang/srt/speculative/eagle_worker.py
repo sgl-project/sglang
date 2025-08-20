@@ -91,20 +91,8 @@ class EAGLEWorker(TpModelWorker):
         )
         self.padded_static_len = -1
 
-        if server_args.context_length is None:
-            server_args.context_length = (
-                target_worker.model_runner.model_config.context_len
-            )
-
-        if (
-            server_args.context_length
-            < target_worker.model_runner.model_config.context_len
-        ):
-            target_context_len = target_worker.model_runner.model_config.context_len
-            logger.warning(
-                f"Context length of the draft model ({server_args.context_length}) is smaller than the target model ({target_context_len}), overriding the context length to {target_context_len}."
-            )
-            server_args.context_length = target_context_len
+        # Specify the context length of the draft model to be the same as the target model.
+        server_args.context_length = target_worker.model_runner.model_config.context_len
 
         # Do not capture cuda graph in `super().__init__()`
         # It will be captured later.
