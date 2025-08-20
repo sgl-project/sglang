@@ -1626,7 +1626,7 @@ class ModelRunner:
             lambda: CudaGraphRunner,
             {
                 "cpu": CPUGraphRunner,
-                "npu": CudaGraphRunner if not _is_npu else NPUGraphRunner,
+                "npu": NPUGraphRunner,
             },
         )
         self.graph_runner = graph_runners[self.device](self)
