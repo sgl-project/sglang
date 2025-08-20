@@ -1200,7 +1200,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        from sglang.srt.model_executor.graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
             if hidden_states.shape[0] <= 16 and self.use_min_latency_fused_a_gemm:

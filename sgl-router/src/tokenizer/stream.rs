@@ -1,6 +1,6 @@
 // src/tokenizer/stream.rs
 
-use super::traits;
+use super::traits::{self, TokenIdType};
 use crate::metrics::TokenizerMetrics;
 use anyhow::Result;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ pub struct DecodeStream {
 
     /// A temporary buffer of the necessary token_ids needed
     /// to produce valid string chunks
-    all_token_ids: Vec<u32>,
+    all_token_ids: Vec<TokenIdType>,
 
     prefix_offset: usize,
     read_offset: usize,
@@ -27,7 +27,7 @@ pub struct DecodeStream {
 impl DecodeStream {
     pub fn new(
         tokenizer: Arc<dyn traits::Tokenizer>,
-        prompt_token_ids: &[u32],
+        prompt_token_ids: &[TokenIdType],
         skip_special_tokens: bool,
     ) -> Self {
         let num_input_tokens = prompt_token_ids.len();
@@ -44,7 +44,7 @@ impl DecodeStream {
 
     /// Step appends a token_id to the internal state and tries to produce a text chunk.
     /// Returning `None` means the given id is not enough to produce a chunk.
-    pub fn step(&mut self, id: u32) -> Result<Option<String>> {
+    pub fn step(&mut self, id: TokenIdType) -> Result<Option<String>> {
         let start = Instant::now();
 
         self.all_token_ids.push(id);

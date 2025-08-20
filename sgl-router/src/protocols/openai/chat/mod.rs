@@ -3,6 +3,7 @@
 pub mod request;
 pub mod response;
 pub mod types;
+pub mod validation;
 
 // Re-export main types for convenience
 pub use request::ChatCompletionRequest;
