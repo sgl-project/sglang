@@ -166,7 +166,7 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                reason = "Draft model's" if is_draft_model else "User-specified"
+                reason = "Target model's" if is_draft_model else "User-specified"
                 msg = (
                     f"Warning: {reason} context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                     f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config."
