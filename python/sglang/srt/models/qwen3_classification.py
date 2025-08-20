@@ -47,7 +47,7 @@ class Qwen3ForSequenceClassification(nn.Module):
         # We don't want to normalize the embedding if we have a classification head
         if config.id2label is not None or config.label2id is not None:
             normalize = False
-        
+
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=normalize)
 
         self.eos_token_id = config.eos_token_id
