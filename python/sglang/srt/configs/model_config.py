@@ -166,17 +166,17 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
+                reason = "Draft model's" if is_draft_model else "User-specified"
+                msg = (
+                    f"Warning: {reason} context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
+                    f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config."
+                )
                 if get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"):
-                    logger.warning(
-                        f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
-                        f"This may lead to incorrect model outputs or CUDA errors."
-                    )
+                    logger.warning(msg)
                     self.context_len = context_length
                 else:
                     raise ValueError(
-                        f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
-                        f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
-                        f"To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+                        f"{msg} To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
                     )
             else:
                 self.context_len = context_length
