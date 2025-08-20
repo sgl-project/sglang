@@ -1763,13 +1763,11 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
-        print(f"Line 1758: forward_batch.forward_mode: {forward_batch.forward_mode}")
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )
-        print(f"Line 1764: can_run_cuda_graph: {can_run_cuda_graph}")
         if can_run_cuda_graph:
             ret = self.cuda_graph_runner.replay(
                 forward_batch,

@@ -40,7 +40,6 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from lmcache.integration.sglang.sglang_adapter import LMCacheLayerwiseConnector, StoreMetadata, LoadMetadata, LMCacheConnector
-from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -116,7 +115,6 @@ def _key_match_page_size1(key0: List, key1: List):
         i += 1
     return i
 
-
 def _key_match_paged(key0: List, key1: List, page_size: int):
     min_len = min(len(key0), len(key1))
 
@@ -127,8 +125,18 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
         i += page_size
 
     return i
-        
 
+class LayerTransferExecutor:
+    def __init__(self, num_layers, load_stream, lmc_connector):
+        self.num_layers = num_layers
+        self.load_stream = load_stream
+        self.lmc_connector = lmc_connector
+
+    def wait_until(self, layer_id):
+        self.load_stream.synchronize()
+        with self.load_stream:
+            self.lmc_connector.load_kv_layerwise()
+        
 class LMCRadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -194,8 +202,8 @@ class LMCRadixCache(BasePrefixCache):
         self.load_thread.start()
         self.store_thread.start()
 
-        self.layer_done_counter = LayerDoneCounter(model_config.num_hidden_layers)
-        self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_counter(self.layer_done_counter)
+        self.layer_transfer_executor = LayerTransferExecutor(model_config.num_hidden_layers, self.load_stream, self.lmcache_connector)
+        self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_executor(self.layer_transfer_executor)
         self.reset()
     
     ##### Public API #####
@@ -285,13 +293,14 @@ class LMCRadixCache(BasePrefixCache):
         slop_mapping = torch.cat([torch.tensor([-1] * prefix_padding_len, dtype=torch.int64, device=self.device), 
             token_prealloc_indices.detach().clone().to(torch.int64).to(self.device)])
         
-        num_retrieved_tokens = self.lmcache_connector.start_load_kv(
-            LoadMetadata(
-                token_ids=key,
-                slot_mapping=slop_mapping,
-                offset=len(value) - prefix_padding_len,
+        with torch.cuda.stream(self.load_stream):
+            num_retrieved_tokens = self.lmcache_connector.start_load_kv(
+                LoadMetadata(
+                    token_ids=key,
+                    slot_mapping=slop_mapping,
+                    offset=len(value) - prefix_padding_len,
+                )
             )
-        )
         # import time
         # start_time = time.time()
         # num_retrieved_tokens = self.lmcache_connector.load_kv(
@@ -304,9 +313,7 @@ class LMCRadixCache(BasePrefixCache):
         # print(f"Line 304: num_retrieved_tokens: {num_retrieved_tokens}")
         # current_stream = torch.cuda.current_stream()
         # current_stream.synchronize()
-        # end_time = time.time()
-        # print(f"Line 308: Time taken: {end_time - start_time}")
-        # logger.info(f"num_retrieved_tokens: {num_retrieved_tokens}")
+        logger.info(f"num_retrieved_tokens: {num_retrieved_tokens}")
         
         if num_retrieved_tokens > 0:
             self.token_to_kv_pool_allocator.free(token_prealloc_indices[(num_retrieved_tokens - prefix_padding_len):])
@@ -731,7 +738,7 @@ class LMCRadixCache(BasePrefixCache):
                 start_time = time.time()
                 for _ in range(self.lmcache_connector.num_layer):
                     self.lmcache_connector.load_kv_layerwise()
-                    self.load_stream.synchronize()
+                    # self.load_stream.synchronize()
                     self.layer_done_counter.increment()
                 end_time = time.time()
                 print(f"In thread: Time taken: {end_time - start_time}")
