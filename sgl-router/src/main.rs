@@ -1,6 +1,6 @@
 use clap::{ArgAction, Parser};
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig, IGWConfig,
+    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
     MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
@@ -71,10 +71,6 @@ Examples:
     --decode http://127.0.0.4:30004 \
     --prefill-policy cache_aware --decode-policy power_of_two
 
-  # IGW (Inference Gateway) mode
-  sglang-router --enable-igw \
-    --igw-scheduler-endpoints grpc://scheduler1:50051 \
-    --igw-scheduler-endpoints grpc://scheduler2:50051
 "#)]
 struct CliArgs {
     /// Host address to bind the router server
@@ -276,10 +272,6 @@ struct CliArgs {
     /// Enable Inference Gateway mode
     #[arg(long, default_value_t = false)]
     enable_igw: bool,
-
-    /// IGW scheduler endpoints (can be specified multiple times)
-    #[arg(long, action = ArgAction::Append)]
-    igw_scheduler_endpoints: Vec<String>,
 }
 
 impl CliArgs {
@@ -320,13 +312,6 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        // Validate IGW configuration if enabled
-        if self.enable_igw && self.igw_scheduler_endpoints.is_empty() {
-            return Err(ConfigError::ValidationFailed {
-                reason: "IGW mode requires at least one --igw-scheduler-endpoints".to_string(),
-            });
-        }
-
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
@@ -433,13 +418,6 @@ impl CliArgs {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
-            igw: if self.enable_igw {
-                Some(IGWConfig {
-                    scheduler_endpoints: self.igw_scheduler_endpoints.clone(),
-                })
-            } else {
-                None
-            },
         })
     }
 
@@ -530,12 +508,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    if cli_args.enable_igw {
-        println!(
-            "IGW Scheduler Endpoints: {:?}",
-            cli_args.igw_scheduler_endpoints
-        );
-    } else {
+    if !cli_args.enable_igw {
         println!("Policy: {}", cli_args.policy);
 
         if cli_args.pd_disaggregation && !prefill_urls.is_empty() {

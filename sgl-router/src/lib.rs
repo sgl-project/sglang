@@ -84,7 +84,6 @@ struct Router {
     health_check_endpoint: String,
     // IGW (Inference Gateway) configuration
     enable_igw: bool,
-    igw_scheduler_endpoints: Vec<String>,
 }
 
 impl Router {
@@ -200,13 +199,6 @@ impl Router {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
-            igw: if self.enable_igw {
-                Some(config::IGWConfig {
-                    scheduler_endpoints: self.igw_scheduler_endpoints.clone(),
-                })
-            } else {
-                None
-            },
         })
     }
 }
@@ -270,7 +262,6 @@ impl Router {
         health_check_endpoint = String::from("/health"),
         // IGW defaults
         enable_igw = false,
-        igw_scheduler_endpoints = vec![],
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -325,7 +316,6 @@ impl Router {
         health_check_interval_secs: u64,
         health_check_endpoint: String,
         enable_igw: bool,
-        igw_scheduler_endpoints: Vec<String>,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -379,7 +369,6 @@ impl Router {
             health_check_interval_secs,
             health_check_endpoint,
             enable_igw,
-            igw_scheduler_endpoints,
         })
     }
 
