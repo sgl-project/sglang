@@ -99,7 +99,7 @@ impl TestContext {
         let worker_url = &worker_urls[0];
 
         let response = client
-            .post(&format!("{}{}", worker_url, endpoint))
+            .post(format!("{}{}", worker_url, endpoint))
             .json(&body)
             .send()
             .await
