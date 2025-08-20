@@ -50,7 +50,12 @@ class PrefillConfig:
 
 
 class MiniLoadBalancer:
-    def __init__(self, prefill_configs: List[PrefillConfig], decode_servers: List[str], timeout: int):
+    def __init__(
+        self,
+        prefill_configs: List[PrefillConfig],
+        decode_servers: List[str],
+        timeout: int,
+    ):
         self.prefill_configs = prefill_configs
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
