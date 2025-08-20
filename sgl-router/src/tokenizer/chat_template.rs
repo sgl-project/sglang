@@ -145,7 +145,7 @@ mod tests {
 {{ message.role }}: {{ message.content }}
 {% endfor -%}
 {%- if add_generation_prompt -%}
-assistant: 
+assistant:
 {%- endif -%}
 "#;
 

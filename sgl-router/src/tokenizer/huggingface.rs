@@ -1,4 +1,6 @@
-use super::traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as TokenizerTrait};
+use super::traits::{
+    Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
+};
 use crate::metrics::TokenizerMetrics;
 use anyhow::{Error, Result};
 use std::collections::HashMap;
@@ -12,8 +14,8 @@ use super::chat_template::{ChatMessage, ChatTemplateProcessor};
 pub struct HuggingFaceTokenizer {
     tokenizer: HfTokenizer,
     special_tokens: SpecialTokens,
-    vocab: HashMap<String, u32>,
-    reverse_vocab: HashMap<u32, String>,
+    vocab: HashMap<String, TokenIdType>,
+    reverse_vocab: HashMap<TokenIdType, String>,
     #[cfg(feature = "minijinja")]
     chat_template: Option<String>,
 }
@@ -37,7 +39,7 @@ impl HuggingFaceTokenizer {
 
         // Build vocab mappings
         let vocab = tokenizer.get_vocab(false);
-        let reverse_vocab: HashMap<u32, String> = vocab
+        let reverse_vocab: HashMap<TokenIdType, String> = vocab
             .iter()
             .map(|(token, &id)| (id, token.clone()))
             .collect();
@@ -66,7 +68,7 @@ impl HuggingFaceTokenizer {
     pub fn from_tokenizer(tokenizer: HfTokenizer) -> Self {
         let special_tokens = Self::extract_special_tokens(&tokenizer);
         let vocab = tokenizer.get_vocab(false);
-        let reverse_vocab: HashMap<u32, String> = vocab
+        let reverse_vocab: HashMap<TokenIdType, String> = vocab
             .iter()
             .map(|(token, &id)| (id, token.clone()))
             .collect();
@@ -233,7 +235,7 @@ impl Encoder for HuggingFaceTokenizer {
 }
 
 impl Decoder for HuggingFaceTokenizer {
-    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+    fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         let start = Instant::now();
 
         TokenizerMetrics::record_decode_request("huggingface");
@@ -260,11 +262,11 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         &self.special_tokens
     }
 
-    fn token_to_id(&self, token: &str) -> Option<u32> {
+    fn token_to_id(&self, token: &str) -> Option<TokenIdType> {
         self.vocab.get(token).copied()
     }
 
-    fn id_to_token(&self, id: u32) -> Option<String> {
+    fn id_to_token(&self, id: TokenIdType) -> Option<String> {
         self.reverse_vocab.get(&id).cloned()
     }
 }
