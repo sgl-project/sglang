@@ -113,6 +113,7 @@ def normalize_e4m3fn_to_e4m3fnuz(
     return weight, weight_scale, input_scale
 
 
+# TODO(ch-wan): define these backends in --moe-runner-backend
 def cutlass_block_fp8_supported() -> bool:
     if not get_bool_env_var("SGLANG_SUPPORT_CUTLASS_BLOCK_FP8"):
         return False
@@ -788,3 +789,12 @@ def apply_fp8_linear(
                 bias,
                 input.dtype,
             )
+
+
+def can_auto_enable_marlin_fp8() -> bool:
+    try:
+        major, minor = get_device_capability()
+        sm = major * 10 + minor
+        return 80 <= sm < 89
+    except Exception:
+        return False

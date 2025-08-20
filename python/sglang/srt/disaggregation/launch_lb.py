@@ -118,7 +118,13 @@ def main():
     lb_args = LBArgs.from_cli_args(args)
 
     prefill_configs = [PrefillConfig(url, port) for url, port in lb_args.prefill_infos]
-    run(prefill_configs, lb_args.decode_infos, lb_args.host, lb_args.port)
+    run(
+        prefill_configs,
+        lb_args.decode_infos,
+        lb_args.host,
+        lb_args.port,
+        lb_args.timeout,
+    )
 
 
 if __name__ == "__main__":

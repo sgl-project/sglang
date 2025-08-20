@@ -141,7 +141,7 @@ mod tests {
             vec![Box::new(worker1), Box::new(worker2), Box::new(worker3)];
 
         // Run multiple selections
-        let mut selected_counts = vec![0; 3];
+        let mut selected_counts = [0; 3];
         for _ in 0..100 {
             if let Some(idx) = policy.select_worker(&workers, None) {
                 selected_counts[idx] += 1;

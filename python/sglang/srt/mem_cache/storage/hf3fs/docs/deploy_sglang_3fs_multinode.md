@@ -20,7 +20,7 @@ vim /sgl-workspace/sglang/benchmark/hf3fs/hf3fs_config.json
 ## node1
 ```bash
 export SGLANG_HICACHE_HF3FS_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hf3fs/hf3fs_config.json
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.10/dist-packages
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/dist-packages
 rm -rf instance1.out && \
 nohup python3 -m sglang.launch_server \
     --model-path /code/models/Qwen3-32B/ \
@@ -35,7 +35,7 @@ nohup python3 -m sglang.launch_server \
 ## node2
 ```bash
 export SGLANG_HICACHE_HF3FS_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hf3fs/hf3fs_config.json
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.10/dist-packages
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/dist-packages
 rm -rf instance2.out && \
 nohup python3 -m sglang.launch_server \
     --model-path /code/models/Qwen3-32B/ \
