@@ -47,6 +47,7 @@ class TboAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: "ForwardMode",
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        extend_prefix_lens: Optional[torch.Tensor] = None,
     ):
         self.primary.init_forward_metadata_capture_cuda_graph(
             bs=bs,
@@ -79,6 +80,7 @@ class TboAttnBackend(AttentionBackend):
         forward_mode: "ForwardMode",
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        extend_prefix_lens: Optional[torch.Tensor] = None,
     ):
         self.primary.init_forward_metadata_replay_cuda_graph(
             bs=bs,

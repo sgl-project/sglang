@@ -89,7 +89,11 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
@@ -1771,8 +1775,19 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
-        can_run_cuda_graph = bool(
-            forward_batch.forward_mode.is_cuda_graph()
+        mode_check = (
+            forward_batch.forward_mode.is_cpu_graph
+            if self.device == "cpu"
+            else (
+                forward_batch.forward_mode.is_cuda_graph
+                or (
+                    forward_batch.forward_mode == ForwardMode.EXTEND
+                    and self.graph_runner.enable_prefill_cuda_graph
+                )
+            )
+        )
+        can_run_graph = bool(
+            mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
