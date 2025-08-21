@@ -1141,7 +1141,7 @@ class Scheduler(
                         f"boostrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    prepare_abort(req, error_msg)
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.stream_output([req], req.return_logprob)
                     return
 
