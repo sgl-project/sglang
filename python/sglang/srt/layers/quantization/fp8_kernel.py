@@ -900,7 +900,7 @@ def w8a8_block_fp8_matmul_triton(
     if configs:
         # If an optimal configuration map has been found, look up the
         # optimal config
-        config = configs[min([(abs(k - M), k) for k in configs])[1]]
+        config = configs[min((abs(k - M), k) for k in configs)[1]]
     else:
         # Default config
         # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
