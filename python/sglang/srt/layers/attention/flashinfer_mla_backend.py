@@ -95,6 +95,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.kv_indptr = kv_indptr_buf
 
+        self.kv_indices = torch.empty(
+            (max_bs * (self.max_context_len + self.page_size - 1) // self.page_size,),
+            dtype=torch.int32,
+            device=model_runner.device,
+        )
+
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -208,21 +214,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        if kv_indices_buf is None:
-            cuda_graph_kv_indices = torch.zeros(
-                (
-                    max_bs
-                    * (self.max_context_len + self.page_size - 1)
-                    // self.page_size
-                ),
-                dtype=torch.int32,
-                device="cuda",
-            )
-
-        else:
-            cuda_graph_kv_indices = kv_indices_buf
-
-        self.cuda_graph_kv_indices = cuda_graph_kv_indices
+        self.cuda_graph_kv_indices = (
+            self.kv_indices.clone() if kv_indices_buf is None else kv_indices_buf
+        )
         self.cuda_graph_qo_indptr = self.q_indptr_decode.clone()
         self.cuda_graph_kv_indptr = self.kv_indptr.clone()
         self.cuda_graph_kv_lens = torch.ones(
@@ -524,6 +518,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.page_size = model_runner.page_size
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
+        self.kv_indices = attn_backend.kv_indices
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.q_indptr = attn_backend.q_indptr_decode
 
@@ -573,7 +568,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             kv_indptr[1 : bs + 1] = torch.cumsum(num_pages_per_req, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = (
-                torch.empty(kv_indptr[-1], dtype=torch.int32, device=q_indptr.device)
+                self.kv_indices[: kv_indptr[-1]]
                 if not init_metadata_replay
                 else fast_decode_kwargs["kv_indices"]
             )
@@ -641,6 +636,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.qo_indptr = attn_backend.qo_indptr
+        self.kv_indices = attn_backend.kv_indices
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
         self.page_size = model_runner.page_size
@@ -697,15 +693,9 @@ class FlashInferMLAIndicesUpdaterPrefill:
             num_pages_per_req = (
                 paged_kernel_lens + self.page_size - 1
             ) // self.page_size
-            kv_indptr = torch.zeros(
-                (bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device
-            )
-            kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)
-            kv_indices = torch.empty(
-                kv_indptr[-1],
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
+            kv_indptr[1 : bs + 1] = torch.cumsum(num_pages_per_req, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = self.kv_indices[: kv_indptr[-1]]
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
