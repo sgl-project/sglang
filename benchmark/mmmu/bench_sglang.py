@@ -124,7 +124,7 @@ async def eval_mmmu(args) -> None:
     answer_dict = {}
     out_samples = {}
     client = openai.AsyncOpenAI(
-        api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1"
+        api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1", timeout=20 * 60 * 60,
     )
     start = time.perf_counter()
     base_url = f"http://127.0.0.1:{args.port}"
@@ -146,13 +146,14 @@ async def eval_mmmu(args) -> None:
             _, response = await process_sample(
                 client, sample, sampling_params, lora_path
             )
+            sample["original_response"] = response
             answer = (
                 re.search(args.response_answer_regex, response)
                 if response is not None
                 else None
             )
             process_result(
-                answer.group(1) if answer else response,
+                answer.group(1).strip() if answer else response,
                 sample,
                 answer_dict,
                 out_samples,
@@ -168,13 +169,14 @@ async def eval_mmmu(args) -> None:
 
         for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
             sample, response = await coro
+            sample["original_response"] = response
             answer = (
                 re.search(args.response_answer_regex, response)
                 if response is not None
                 else None
             )
             process_result(
-                answer.group(1) if answer else response,
+                answer.group(1).strip() if answer else response,
                 sample,
                 answer_dict,
                 out_samples,
@@ -187,9 +189,8 @@ async def eval_mmmu(args) -> None:
             print("Profiler stopped")
 
     print(f"Benchmark time: {time.perf_counter() - start}")
-    args.output_path = f"./val_sglang.json"
-    save_json(args.output_path, out_samples)
-    eval_result(model_answer_path=args.output_path, answer_dict=answer_dict)
+    save_json(args.result_filename, out_samples)
+    eval_result(model_answer_path=args.result_filename, answer_dict=answer_dict)
 
 
 def parse_args():
