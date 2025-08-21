@@ -37,6 +37,7 @@ import triton.language as tl
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
+from sglang.srt.utils.memory_utils import handle_cuda_oom_gracefully, log_memory_usage
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,7 @@ class MHATokenToKVPool(KVCache):
         )
         self.mem_usage = (k_size + v_size) / GB
 
+    @handle_cuda_oom_gracefully
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -237,6 +239,9 @@ class MHATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+        
+        # Log memory usage after buffer creation
+        log_memory_usage(context="KV cache buffer creation")
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],

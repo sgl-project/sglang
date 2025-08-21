@@ -23,6 +23,8 @@ import sys
 import tempfile
 from typing import List, Literal, Optional, Union
 
+import torch
+
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
@@ -2051,6 +2053,9 @@ class ServerArgs:
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
 
+        # Check memory-related parameters for OOM prevention
+        self.check_memory_args()
+
         # Check LoRA
         self.check_lora_server_args()
 
@@ -2066,6 +2071,74 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+    def check_memory_args(self):
+        """Check and validate memory-related arguments to prevent OOM issues."""
+        try:
+            from sglang.srt.utils.memory_utils import (
+                get_gpu_memory_usage,
+                get_memory_pressure_level,
+                suggest_memory_optimizations,
+            )
+        except ImportError:
+            # If memory utils are not available, skip memory checks
+            return
+
+        if not torch.cuda.is_available():
+            return
+
+        # Get current memory status
+        used_memory, total_memory = get_gpu_memory_usage()
+        memory_pressure = get_memory_pressure_level()
+
+        # Validate mem_fraction_static
+        if self.mem_fraction_static is not None:
+            if self.mem_fraction_static > 0.95:
+                logger.warning(
+                    f"mem_fraction_static ({self.mem_fraction_static}) is very high. "
+                    "This may cause OOM errors. Consider using 0.8-0.9 for better stability."
+                )
+            elif self.mem_fraction_static < 0.5:
+                logger.warning(
+                    f"mem_fraction_static ({self.mem_fraction_static}) is very low. "
+                    "This may limit performance. Consider using 0.7-0.9 for better throughput."
+                )
+
+        # Check if current memory pressure is already high
+        if memory_pressure in ["high", "critical"] and total_memory > 0:
+            current_config = {
+                'mem_fraction_static': self.mem_fraction_static,
+                'max_running_requests': self.max_running_requests,
+                'chunked_prefill_size': self.chunked_prefill_size,
+                'max_prefill_tokens': self.max_prefill_tokens,
+            }
+            
+            suggestions = suggest_memory_optimizations(
+                current_config, memory_pressure, "server_startup"
+            )
+            
+            if suggestions:
+                logger.warning(
+                    f"GPU memory pressure is {memory_pressure} "
+                    f"({used_memory:.1f}GB/{total_memory:.1f}GB). "
+                    "Consider the following optimizations:"
+                )
+                for param, value in suggestions.items():
+                    logger.warning(f"  --{param.replace('_', '-')} {value}")
+
+        # Validate max_running_requests for the available memory
+        if self.max_running_requests is not None and self.max_running_requests > 256:
+            logger.warning(
+                f"max_running_requests ({self.max_running_requests}) is very high. "
+                "This may cause OOM errors with large models. Consider reducing it if you encounter memory issues."
+            )
+
+        # Suggest chunked prefill for large context lengths
+        if self.context_length and self.context_length > 32768 and self.chunked_prefill_size is None:
+            logger.info(
+                f"Large context length ({self.context_length}) detected. "
+                "Consider enabling chunked prefill (--chunked-prefill-size 8192) to prevent OOM on long sequences."
+            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

@@ -5,12 +5,36 @@
 This page lists common errors and tips for resolving them.
 
 ### CUDA Out of Memory
-If you encounter out-of-memory (OOM) errors, you can adjust the following parameters:
+If you encounter out-of-memory (OOM) errors, SGLang now provides enhanced error messages with specific suggestions. The system automatically detects memory pressure and suggests optimal parameters.
 
+**Automatic OOM Detection and Recovery:**
+- Enhanced error messages show current memory usage and pressure level
+- Automatic parameter suggestions based on the type of OOM (prefill vs decode)
+- Memory monitoring during server startup with warnings for risky configurations
+
+**Manual OOM Prevention:**
 - If OOM occurs during prefill, try reducing `--chunked-prefill-size` to `4096` or `2048`. This saves memory but slows down the prefill speed for long prompts.
 - If OOM occurs during decoding, try lowering `--max-running-requests`.
 - You can also reduce `--mem-fraction-static` to a smaller value, such as 0.8 or 0.7. This decreases the memory usage of the KV cache memory pool and helps prevent OOM errors during both prefill and decoding. However, it limits maximum concurrency and reduces peak throughput.
 - Another common case for OOM is requesting input logprobs for a long prompt as it requires significant memory. To address this, set `logprob_start_len` in your sampling parameters to include only the necessary parts. If you do need input logprobs for a long prompt, try reducing `--mem-fraction-static`.
+
+**Advanced OOM Handling:**
+- The system now catches CUDA OOM exceptions and provides detailed recovery guidance
+- Memory pressure monitoring helps prevent OOM before it occurs
+- Server startup validation warns about potentially problematic configurations
+- Automatic suggestions for memory optimization based on current usage patterns
+
+**Quick Recovery Commands:**
+```bash
+# For general OOM issues
+python -m sglang.launch_server --model-path MODEL_PATH --mem-fraction-static 0.7
+
+# For long sequence OOM
+python -m sglang.launch_server --model-path MODEL_PATH --chunked-prefill-size 4096
+
+# For high concurrency OOM
+python -m sglang.launch_server --model-path MODEL_PATH --max-running-requests 32
+```
 
 ### CUDA Error: Illegal Memory Access Encountered
 This error may result from kernel errors or out-of-memory issues:

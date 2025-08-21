@@ -48,6 +48,12 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
+from sglang.srt.utils.memory_utils import (
+    create_oom_error_message,
+    get_memory_pressure_level,
+    log_memory_usage,
+    handle_cuda_oom_gracefully,
+)
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
@@ -971,6 +977,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         return req_pool_indices
 
+    @handle_cuda_oom_gracefully
     def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
         self._evict_tree_cache_if_needed(num_tokens)
 
@@ -980,14 +987,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
         if out_cache_loc is None:
             phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
-            error_msg = (
-                f"{phase_str} out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {num_tokens} tokens.\n"
-                f"{self._available_and_evictable_str()}"
+            
+            # Get current server configuration for better error messages
+            current_config = {}
+            if hasattr(self, 'server_args'):
+                current_config = {
+                    'mem_fraction_static': getattr(self.server_args, 'mem_fraction_static', None),
+                    'max_running_requests': getattr(self.server_args, 'max_running_requests', None),
+                    'chunked_prefill_size': getattr(self.server_args, 'chunked_prefill_size', None),
+                    'max_prefill_tokens': getattr(self.server_args, 'max_prefill_tokens', 16384),
+                }
+            
+            available_tokens = self.token_to_kv_pool_allocator.available_size()
+            
+            # Create enhanced error message with specific suggestions
+            error_msg = create_oom_error_message(
+                error_context=phase_str,
+                tokens_requested=num_tokens,
+                available_tokens=available_tokens,
+                current_config=current_config
             )
+            
+            # Add existing detailed information
+            error_msg += f"\n\nDetailed Status:\n{self._available_and_evictable_str()}"
+            
             logger.error(error_msg)
             if self.tree_cache is not None:
                 self.tree_cache.pretty_print()
+                
+            # Log current memory usage for debugging
+            log_memory_usage(context="Token allocation failure")
+            
             raise RuntimeError(error_msg)
 
         if backup_state:
@@ -995,6 +1025,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             return out_cache_loc
 
+    @handle_cuda_oom_gracefully
     def alloc_paged_token_slots_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -1017,12 +1048,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefix_lens, seq_lens, last_loc, extend_num_tokens
         )
         if out_cache_loc is None:
-            error_msg = (
-                f"Prefill out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {extend_num_tokens} tokens.\n"
-                f"{self._available_and_evictable_str()}"
+            # Get current server configuration for better error messages
+            current_config = {}
+            if hasattr(self, 'server_args'):
+                current_config = {
+                    'mem_fraction_static': getattr(self.server_args, 'mem_fraction_static', None),
+                    'max_running_requests': getattr(self.server_args, 'max_running_requests', None),
+                    'chunked_prefill_size': getattr(self.server_args, 'chunked_prefill_size', None),
+                    'max_prefill_tokens': getattr(self.server_args, 'max_prefill_tokens', 16384),
+                }
+            
+            available_tokens = self.token_to_kv_pool_allocator.available_size()
+            
+            error_msg = create_oom_error_message(
+                error_context="Prefill",
+                tokens_requested=extend_num_tokens,
+                available_tokens=available_tokens,
+                current_config=current_config
             )
+            
+            # Add existing detailed information
+            error_msg += f"\n\nDetailed Status:\n{self._available_and_evictable_str()}"
+            
             logger.error(error_msg)
+            log_memory_usage(context="Prefill extend allocation failure")
             raise RuntimeError(error_msg)
 
         if backup_state:
@@ -1030,6 +1079,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             return out_cache_loc
 
+    @handle_cuda_oom_gracefully
     def alloc_paged_token_slots_decode(
         self,
         seq_lens: torch.Tensor,
@@ -1045,12 +1095,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(seq_lens, last_loc)
         if out_cache_loc is None:
-            error_msg = (
-                f"Decode out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {len(seq_lens)} tokens.\n"
-                f"{self._available_and_evictable_str()}"
+            # Get current server configuration for better error messages
+            current_config = {}
+            if hasattr(self, 'server_args'):
+                current_config = {
+                    'mem_fraction_static': getattr(self.server_args, 'mem_fraction_static', None),
+                    'max_running_requests': getattr(self.server_args, 'max_running_requests', None),
+                    'chunked_prefill_size': getattr(self.server_args, 'chunked_prefill_size', None),
+                    'max_prefill_tokens': getattr(self.server_args, 'max_prefill_tokens', 16384),
+                }
+            
+            available_tokens = self.token_to_kv_pool_allocator.available_size()
+            
+            error_msg = create_oom_error_message(
+                error_context="Decode",
+                tokens_requested=len(seq_lens),
+                available_tokens=available_tokens,
+                current_config=current_config
             )
+            
+            # Add existing detailed information
+            error_msg += f"\n\nDetailed Status:\n{self._available_and_evictable_str()}"
+            
             logger.error(error_msg)
+            log_memory_usage(context="Decode allocation failure")
             raise RuntimeError(error_msg)
 
         if backup_state:
