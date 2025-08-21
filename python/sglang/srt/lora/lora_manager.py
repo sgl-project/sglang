@@ -422,6 +422,28 @@ class LoRAManager:
 
         if target_modules is not None:
             self.target_modules = set(target_modules)
+            user_normalized_modules = get_normalized_target_modules(self.target_modules)
+            for lora_id, config in self.configs.items():
+                if not isinstance(config.target_modules, list):
+                    raise ValueError(
+                        f"SGLang currently only supports inferring LoRA target modules when a list of "
+                        "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
+                        "specify `--lora-target-modules` during server startup. You can specify `all` to "
+                        "enable all support modules types. "
+                    )
+                config_normalized_modules = get_normalized_target_modules(
+                    config.target_modules
+                )
+                if not config_normalized_modules.issubset(user_normalized_modules):
+                    unsupported_modules = (
+                        config_normalized_modules - user_normalized_modules
+                    )
+                    raise ValueError(
+                        f"LoRA adapter '{lora_id}' contains target modules {sorted(unsupported_modules)} "
+                        f"that are not included in the specified --lora-target-modules {sorted(user_normalized_modules)}. "
+                        f"Please update --lora-target-modules to include all required modules: "
+                        f"{sorted(user_normalized_modules | config_normalized_modules)}, or use 'all' to enable all supported modules."
+                    )
         else:
             self.target_modules = set()
             for config in self.configs.values():
