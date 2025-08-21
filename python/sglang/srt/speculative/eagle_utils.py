@@ -152,36 +152,30 @@ class EagleDraftInput:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
-        page_size: int = 1,
     ):
         bs = self.accept_length.numel()
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
-        num_pages_per_req = (paged_kernel_lens + page_size - 1) // page_size
-        kv_indptr = torch.zeros(
-            (bs + 1,), dtype=torch.int32, device=paged_kernel_lens.device
-        )
-        kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)
+        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         if paged_kernel_lens_sum is None:
             paged_kernel_lens_sum = cum_kv_seq_len[-1]
 
         kv_indices = torch.empty(
-            (kv_indptr[-1],), dtype=torch.int32, device=paged_kernel_lens.device
+            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
         )
 
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
-            kv_indptr,
+            cum_kv_seq_len,
             None,
             kv_indices,
             req_to_token.size(1),
-            page_size,
         )
-        return kv_indices.to(torch.int32), kv_indptr, qo_indptr, None
+        return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if has_been_filtered:
@@ -314,7 +308,6 @@ class EagleVerifyInput:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
-        page_size: int = 1,
     ):
         batch_size = len(req_pool_indices)
         qo_indptr = torch.arange(
