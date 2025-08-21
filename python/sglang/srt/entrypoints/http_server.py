@@ -1463,76 +1463,64 @@ def _execute_server_warmup(
     model_info = res.json()
 
     is_vlm = bool(model_info.get("has_vision_understanding"))
-
     # Send a warmup request
     if model_info["is_generation"]:
-        if is_vlm:
+        if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
         else:
             request_name = "/generate"
     else:
         request_name = "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
-    json_data = {
-        "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": max_new_tokens,
-        },
-    }
 
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
+        json_data = {
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": max_new_tokens,
+            },
+            "input_ids": [[10, 11, 12] for _ in range(server_args.dp_size)],
+        }
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
+    elif is_vlm and request_name == "/v1/chat/completions":
+        # Minimal 1x1 PNG (base64)
+        tiny_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        json_data = {
+            "model": _global_state.tokenizer_manager.served_model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{tiny_png_b64}"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the image.",
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": max_new_tokens,
+            "stream": False,
+            "temperature": 0.0,
+        }
     else:
-        # Detect VLM and prepare a minimal image warmup when possible
-        print(f"{is_vlm=}")
-        image_token_for_prompt = None
-        if is_vlm:
-            try:
-                # Prefer chat template image token
-                from sglang.srt.conversation import chat_templates
-
-                template_name = getattr(
-                    _global_state.template_manager, "chat_template_name", None
-                )
-                print(f"{template_name=}")
-                if template_name and template_name in chat_templates:
-                    image_token_for_prompt = chat_templates[template_name].image_token
-                else:
-                    # Fallback: derive token string from tokenizer + image_token_id
-                    tm = _global_state.tokenizer_manager
-                    tok = getattr(tm, "tokenizer", None)
-                    image_token_id = getattr(tm.model_config, "image_token_id", None)
-                    if tok is not None and image_token_id is not None:
-                        image_token_for_prompt = tok.convert_ids_to_tokens(
-                            [image_token_id]
-                        )[0]
-                print(f"{image_token_for_prompt=}")
-
-            except Exception:
-                image_token_for_prompt = None
-
-        if is_vlm and image_token_for_prompt:
-            # Minimal 1x1 PNG (base64)
-            tiny_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
-            # Some templates expect a newline after the image token
-            template_name = (
-                getattr(_global_state.template_manager, "chat_template_name", "") or ""
-            )
-            sep = "\n" if template_name != "qwen2-vl" else ""
-            text_item = f"{image_token_for_prompt}{sep}Describe the image."
-            json_data["text"] = [text_item] * server_args.dp_size
-            json_data["image_data"] = tiny_png_b64
-            # TODO Workaround the bug that embedding errors for list of size 1
-            if server_args.dp_size == 1:
-                json_data["text"] = json_data["text"][0]
-        else:
-            json_data["text"] = ["The capital city of France is"] * server_args.dp_size
-            # TODO Workaround the bug that embedding errors for list of size 1
-            if server_args.dp_size == 1:
-                json_data["text"] = json_data["text"][0]
+        json_data = {
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": max_new_tokens,
+            },
+            "text": ["The capital city of France is"] * server_args.dp_size,
+        }
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["text"] = json_data["text"][0]
 
     # Debug dumping
     if server_args.debug_tensor_dump_input_file:
@@ -1550,51 +1538,27 @@ def _execute_server_warmup(
                 headers=headers,
                 timeout=600,
             )
+            print(f"{res=}")
             assert res.status_code == 200, f"{res}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
-            if use_vlm_warmup and image_token_for_prompt:
-                # Use text + image for VLM warmup in disaggregation mode as well
-                tiny_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
-                template_name = (
-                    getattr(_global_state.template_manager, "chat_template_name", "")
-                    or ""
-                )
-                sep = "\n" if template_name != "qwen2-vl" else ""
-                text_item = f"{image_token_for_prompt}{sep}Describe the image."
-                json_data = {
-                    "sampling_params": {
-                        "temperature": 0.0,
-                        "max_new_tokens": 8,
-                        "ignore_eos": True,
-                    },
-                    "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
-                    # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                    "bootstrap_room": [
-                        i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
-                        for i in range(server_args.dp_size)
-                    ],
-                    "text": [text_item] * server_args.dp_size,
-                    "image_data": tiny_png_b64,
-                }
-            else:
-                json_data = {
-                    "sampling_params": {
-                        "temperature": 0.0,
-                        "max_new_tokens": 8,
-                        "ignore_eos": True,
-                    },
-                    "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
-                    # This is a hack to ensure fake transfer is enabled during prefill warmup
-                    # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                    "bootstrap_room": [
-                        i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
-                        for i in range(server_args.dp_size)
-                    ],
-                    "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
-                }
+            json_data = {
+                "sampling_params": {
+                    "temperature": 0.0,
+                    "max_new_tokens": 8,
+                    "ignore_eos": True,
+                },
+                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
+                # This is a hack to ensure fake transfer is enabled during prefill warmup
+                # ensure each dp rank has a unique bootstrap_room during prefill warmup
+                "bootstrap_room": [
+                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    for i in range(server_args.dp_size)
+                ],
+                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
+            }
             res = requests.post(
                 url + request_name,
                 json=json_data,
