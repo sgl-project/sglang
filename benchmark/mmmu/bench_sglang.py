@@ -191,8 +191,13 @@ async def eval_mmmu(args) -> None:
             print("Profiler stopped")
 
     print(f"Benchmark time: {time.perf_counter() - start}")
-    save_json(args.result_filename, out_samples)
-    eval_result(model_answer_path=args.result_filename, answer_dict=answer_dict)
+    args.output_path = "./answer_sglang.json"
+    save_json(args.output_path, out_samples)
+    eval_result(
+        model_answer_path=args.output_path,
+        answer_dict=answer_dict,
+        eval_output_path="./val_sglang.json",
+    )
 
 
 def parse_args():
