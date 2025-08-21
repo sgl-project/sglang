@@ -76,7 +76,7 @@ jobs:
             bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-cpu"
 
       - name: Change permission
-        timeout-minutes: 20
+        timeout-minutes: 2
         run: |
           docker exec -u root ci_sglang_xeon bash -c "
             rm -rf /tmp/ci-home  &&
