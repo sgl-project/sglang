@@ -298,11 +298,6 @@ class ServerArgs:
     enable_flashinfer_mxfp4_moe: bool = False
 
     def __post_init__(self):
-        if self.enable_hierarchical_cache and self.disable_radix_cache:
-            raise ValueError(
-                "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
-                "and cannot be used at the same time. Please use only one of them."
-            )
         # Check deprecated arguments
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
@@ -710,6 +705,12 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        if self.enable_hierarchical_cache and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
