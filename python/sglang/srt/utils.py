@@ -2566,6 +2566,8 @@ def configure_gc_warning(warn_threshold_secs):
                     f"This may cause latency jitter. Consider calling the freeze_gc API after sending a few warmup requests."
                 )
 
+    gc.callbacks.append(gc_callback)
+
 def freeze_gc(context: str):
     import gc
 
