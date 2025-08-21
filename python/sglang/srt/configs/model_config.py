@@ -407,6 +407,17 @@ class ModelConfig:
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             is_local = os.path.exists(self.model_path)
+            if is_local is not True:
+                from huggingface_hub import snapshot_download
+
+                try:
+                    self.model_path = snapshot_download(
+                        self.model_path, local_files_only=True
+                    )
+                    is_local = True
+                except Exception:
+                    is_local = False
+
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
                 from huggingface_hub import HfApi
