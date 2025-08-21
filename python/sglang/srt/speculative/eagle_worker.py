@@ -179,7 +179,10 @@ class EAGLEWorker(TpModelWorker):
         self.has_prefill_wrapper_verify = False
         self.draft_extend_attn_backend = None
 
-        draft_attention_backend = self.server_args.draft_attention_backend or self.server_args.attention_backend
+        draft_attention_backend = (
+            self.server_args.draft_attention_backend
+            or self.server_args.attention_backend
+        )
 
         if draft_attention_backend == "flashinfer":
             if not global_server_args_dict["use_mla_backend"]:
