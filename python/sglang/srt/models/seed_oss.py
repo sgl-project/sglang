@@ -6,7 +6,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
-
 from transformers import SeedOssConfig
 
 from sglang.srt.distributed import (
@@ -15,6 +14,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -38,7 +38,6 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.utils import add_prefix, make_layers
-
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +69,8 @@ class SeedOssMLP(nn.Module):
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now.")
+                "Only silu is supported for now."
+            )
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -118,7 +118,7 @@ class SeedOssAttention(nn.Module):
             self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -258,7 +258,7 @@ class SeedOssModel(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                enable_tp=not global_server_args_dict["enable_dp_attention"],
+                enable_tp=not is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -584,5 +584,6 @@ class SeedOssForCausalLM(nn.Module):
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
+
 
 EntryClass = SeedOssForCausalLM
