@@ -453,43 +453,10 @@ class GptOssDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            is_last_layer=(
+                self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+            ),
         )
-
-        self._fuse_allreduce_lookup_table = self._build_fuse_allreduce_lookup_table()
-
-    def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
-        """Check if MLP allreduce can be fused with next layer's residual_rmsnorm"""
-
-        batch_size = (
-            forward_batch.input_ids.shape[0]
-            if hasattr(forward_batch, "input_ids")
-            else 0
-        )
-
-        if batch_size > 128:
-            return False
-
-        return self._fuse_allreduce_lookup_table.get(batch_size, False)
-
-    def _build_fuse_allreduce_lookup_table(self):
-        static_conditions_met = (
-            self.layer_id != self.config.num_hidden_layers - 1
-            and get_tensor_model_parallel_world_size() > 1
-            and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
-            and _is_sm100_supported
-            and _is_flashinfer_available
-        )
-
-        if not static_conditions_met:
-            return {}
-
-        lookup_table = {}
-        for batch_size in range(129):  # 0 to 128
-            is_last_layer = self.layer_id == self.config.num_hidden_layers - 1
-            should_fuse = batch_size > 0 and batch_size <= 128 and not is_last_layer
-            lookup_table[batch_size] = should_fuse
-
-        return lookup_table
 
     def forward(
         self,
@@ -514,8 +481,9 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         should_allreduce_fusion = (
-            self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
-            and not self.is_nextn
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
         )
 
         hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
@@ -1123,7 +1091,7 @@ class GptOssForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "sinks" in name:
-                            start = tp_rank * param.numel()
+                            start = get_attention_tp_rank() * param.numel()
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
