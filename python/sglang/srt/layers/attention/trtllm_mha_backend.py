@@ -360,7 +360,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
             metadata.max_seq_len_k = (
-                self.max_context_len + self.speculative_num_draft_tokens
+                seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
             )
             max_len = seq_lens_cpu.max().item()
             metadata.cu_seqlens_k[1:].copy_(
@@ -559,7 +559,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             workspace_buffer=self.workspace_buffer,
             block_tables=self.forward_metadata.page_table,
             seq_lens=self.forward_metadata.cache_seqlens_int32,
-            max_seq_len=self.forward_metadata.max_seq_len_k,
+            max_seq_len=self.max_context_len,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
@@ -614,7 +614,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             block_tables=self.forward_metadata.page_table,
             seq_lens=self.forward_metadata.cache_seqlens_int32,
             max_q_len=self.forward_metadata.max_seq_len_q,
-            max_kv_len=self.forward_metadata.max_seq_len_k,
+            max_kv_len=self.max_context_len,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             batch_size=forward_batch.batch_size,

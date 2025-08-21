@@ -59,9 +59,9 @@ class LoRARegistry:
     update / eventual consistency model between the tokenizer manager process and the scheduler processes.
     """
 
-    def __init__(self, lora_paths: Optional[Dict[str, LoRARef]] = None):
+    def __init__(self, lora_paths: Optional[List[LoRARef]] = None):
         assert lora_paths is None or all(
-            isinstance(lora, LoRARef) for lora in lora_paths.values()
+            isinstance(lora, LoRARef) for lora in lora_paths
         ), (
             "server_args.lora_paths should have been normalized to LoRARef objects during server initialization. "
             "Please file an issue if you see this error."
@@ -78,7 +78,7 @@ class LoRARegistry:
 
         # Initialize the registry with provided LoRA paths, if present.
         if lora_paths:
-            for lora_ref in lora_paths.values():
+            for lora_ref in lora_paths:
                 self._register_adapter(lora_ref)
 
     async def register(self, lora_ref: LoRARef):
