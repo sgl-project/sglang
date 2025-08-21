@@ -1665,10 +1665,6 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
-        elif self.server_args.enable_lmcache:
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
-            )
 
         new_batch.prepare_for_extend()
 

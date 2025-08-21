@@ -127,15 +127,18 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
     return i
 
 class LayerTransferExecutor:
-    def __init__(self, num_layers, load_stream, lmc_connector):
+    def __init__(self, num_layers, load_stream, lmc_connector, printable=False):
         self.num_layers = num_layers
         self.load_stream = load_stream
         self.lmc_connector = lmc_connector
+        self.printable = printable
 
     def wait_until(self, layer_id):
+        # if self.printable:
+        #     print(f"Waiting for layer {layer_id}")
         self.load_stream.synchronize()
         with self.load_stream:
-            self.lmc_connector.load_kv_layerwise()
+            self.lmc_connector.load_kv_layerwise(layer_id)
         
 class LMCRadixCache(BasePrefixCache):
     def __init__(
@@ -202,8 +205,8 @@ class LMCRadixCache(BasePrefixCache):
         self.load_thread.start()
         self.store_thread.start()
 
-        self.layer_transfer_executor = LayerTransferExecutor(model_config.num_hidden_layers, self.load_stream, self.lmcache_connector)
-        self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_executor(self.layer_transfer_executor)
+        self.layer_done_executor = LayerTransferExecutor(model_config.num_hidden_layers, self.load_stream, self.lmcache_connector, printable=(rank == 0))
+        self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_executor(self.layer_done_executor)
         self.reset()
     
     ##### Public API #####
@@ -525,11 +528,6 @@ class LMCRadixCache(BasePrefixCache):
 
         _dfs_helper(self.root_node)
         return torch.cat(values)
-
-    def ready_to_load_host_cache(self):
-        producer_index = self.layer_done_counter.next_producer()
-        self.load_cache_event.set()
-        return producer_index
 
     ##### Internal Helper Functions #####
 
