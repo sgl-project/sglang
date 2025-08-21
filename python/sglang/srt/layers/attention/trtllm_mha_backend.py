@@ -320,7 +320,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        device = seq_lens.device
         metadata = None
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -333,6 +332,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 max_seq_pages = (
                     metadata.max_seq_len_k + self.page_size - 1
                 ) // self.page_size
+
+                metadata.cache_seqlens_int32.copy_(seq_lens + self.speculative_step_id + 1)
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
