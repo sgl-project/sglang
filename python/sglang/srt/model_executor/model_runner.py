@@ -93,6 +93,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -344,7 +345,7 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             self.init_device_graphs()
-        elif self.device == "cpu":
+        elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
         else:
@@ -927,7 +928,8 @@ class ModelRunner:
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        infered_device = torch.cuda.current_device()
+        self.device_module = torch.get_device_module(self.device)
+        infered_device = self.device_module.current_device()
 
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
@@ -1246,6 +1248,11 @@ class ModelRunner:
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
+            # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
+            extra_max_context_len = 4
+            if self.server_args.speculative_num_draft_tokens is not None:
+                extra_max_context_len += self.server_args.speculative_num_draft_tokens
+
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 
@@ -1254,7 +1261,8 @@ class ModelRunner:
                 pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
                 self.req_to_token_pool = DecodeReqToTokenPool(
                     size=max_num_reqs,
-                    max_context_len=self.model_config.context_len + 4,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     pre_alloc_size=pre_alloc_size,
@@ -1262,7 +1270,8 @@ class ModelRunner:
             else:
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
-                    max_context_len=self.model_config.context_len + 4,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                 )
@@ -1619,6 +1628,7 @@ class ModelRunner:
             lambda: CudaGraphRunner,
             {
                 "cpu": CPUGraphRunner,
+                "npu": NPUGraphRunner,
             },
         )
         self.graph_runner = graph_runners[self.device](self)
