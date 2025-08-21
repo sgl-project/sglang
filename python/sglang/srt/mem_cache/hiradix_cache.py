@@ -444,7 +444,7 @@ class HiRadixCache(RadixCache):
 
         if self.tp_world_size > 1:
             list_size = torch.tensor(len(free_request_ids), dtype=torch.int)
-            list_sizes = [torch.zeros_like(list_size) for _ in self.tp_world_size]
+            list_sizes = [torch.zeros_like(list_size) for _ in range(self.tp_world_size)]
             torch.distributed.all_gather(
                 list_sizes,
                 list_size,
