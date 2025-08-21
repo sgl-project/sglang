@@ -142,7 +142,7 @@ class DeepEPMoE(FusedMoE):
                 (
                     self.w13_weight_scale_inv
                     if self.use_block_quant
-                    or get_moe_runner_backend() == "cutlass_w4afp8"
+                    or get_moe_runner_backend().is_cutlass_w4afp8()
                     else self.w13_weight_scale
                 ),
             )
@@ -151,7 +151,7 @@ class DeepEPMoE(FusedMoE):
                 (
                     self.w2_weight_scale_inv
                     if self.use_block_quant
-                    or get_moe_runner_backend() == "cutlass_w4afp8"
+                    or get_moe_runner_backend().is_cutlass_w4afp8()
                     else self.w2_weight_scale
                 ),
             )
@@ -211,7 +211,7 @@ class DeepEPMoE(FusedMoE):
             assert DispatchOutputChecker.format_is_ascent_ll(dispatch_output)
             return self.forward_npu(dispatch_output)
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
-            if get_moe_runner_backend() == "cutlass_w4afp8":
+            if get_moe_runner_backend().is_cutlass_w4afp8():
                 return self.forward_cutlass_w4a8(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
@@ -552,7 +552,7 @@ class DeepEPMoE(FusedMoE):
                 self.quant_method.problem_sizes2,
                 self.w13_input_scale,
                 self.w2_input_scale,
-                deepep_mode=self.deepep_mode,
+                deepep_mode=dispatch_output.format,
             )
             return output
         else:
