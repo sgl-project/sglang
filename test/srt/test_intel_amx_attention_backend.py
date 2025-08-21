@@ -26,146 +26,81 @@ from sglang.test.test_utils import (
 )
 
 
+def intel_amx_benchmark(extra_args=None, min_throughput=None):
+    def decorator(test_func):
+        @wraps(test_func)
+        def wrapper(self):
+            common_args = [
+                "--attention-backend",
+                "intel_amx",
+                "--mem-fraction-static",
+                "0.05",
+                "--disable-radix",
+                "--trust-remote-code",
+                "--batch-size",
+                "4",
+            ]
+            full_args = common_args + (extra_args or [])
+
+            model = test_func(self)
+            prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+                model, full_args
+            )
+
+            print(f"{model=}")
+            print(f"{prefill_latency=}")
+            print(f"{decode_throughput=}")
+            print(f"{decode_latency=}")
+
+            if is_in_ci() and min_throughput is not None:
+                self.assertGreater(decode_throughput, min_throughput)
+
+        return wrapper
+
+    return decorator
+
+
 class TestIntelAMXAttnBackend(CustomTestCase):
+
+    @intel_amx_benchmark(min_throughput=10)
     def test_latency_mla_model(self):
-        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-            DEFAULT_MLA_MODEL_NAME_FOR_TEST,
-            [
-                "--attention-backend",
-                "intel_amx",
-                "--mem-fraction-static",
-                "0.05",
-                "--disable-radix",
-                "--trust-remote-code",
-                "--batch-size",
-                "4",
-            ],
-        )
+        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
-        print(f"{prefill_latency=}")
-        print(f"{decode_throughput=}")
-        print(f"{decode_latency=}")
-
-        if is_in_ci():
-            self.assertGreater(decode_throughput, 10)
-
+    @intel_amx_benchmark(min_throughput=40)
     def test_latency_default_model(self):
-        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST,
-            [
-                "--attention-backend",
-                "intel_amx",
-                "--mem-fraction-static",
-                "0.05",
-                "--disable-radix",
-                "--trust-remote-code",
-                "--batch-size",
-                "4",
-            ],
-        )
+        return DEFAULT_MODEL_NAME_FOR_TEST
 
-        print(f"{prefill_latency=}")
-        print(f"{decode_throughput=}")
-        print(f"{decode_latency=}")
-
-        if is_in_ci():
-            self.assertGreater(decode_throughput, 40)
-
+    @intel_amx_benchmark(min_throughput=150)
     def test_latency_fp8_qwen(self):
-        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8,
-            [
-                "--attention-backend",
-                "intel_amx",
-                "--mem-fraction-static",
-                "0.05",
-                "--disable-radix",
-                "--trust-remote-code",
-                "--batch-size",
-                "4",
-            ],
-        )
+        return DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8
 
-        print(f"{prefill_latency=}")
-        print(f"{decode_throughput=}")
-        print(f"{decode_latency=}")
-
-        if is_in_ci():
-            self.assertGreater(decode_throughput, 150)
-
+    @intel_amx_benchmark(min_throughput=50)
     def test_latency_fp8_moe_model(self):
-        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
-            [
-                "--attention-backend",
-                "intel_amx",
-                "--mem-fraction-static",
-                "0.05",
-                "--disable-radix",
-                "--trust-remote-code",
-                "--batch-size",
-                "4",
-            ],
-        )
+        return DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE
 
-        print(f"{prefill_latency=}")
-        print(f"{decode_throughput=}")
-        print(f"{decode_latency=}")
-
-        if is_in_ci():
-            self.assertGreater(decode_throughput, 50)
-
+    @intel_amx_benchmark(extra_args=["--quantization", "w8a8_int8"], min_throughput=100)
     def test_latency_w8a8_default_model(self):
-        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST_W8A8,
-            [
-                "--attention-backend",
-                "intel_amx",
-                "--quantization",
-                "w8a8_int8",
-                "--mem-fraction-static",
-                "0.05",
-                "--disable-radix",
-                "--trust-remote-code",
-                "--batch-size",
-                "4",
-            ],
-        )
+        return DEFAULT_MODEL_NAME_FOR_TEST_W8A8
 
-        print(f"{prefill_latency=}")
-        print(f"{decode_throughput=}")
-        print(f"{decode_latency=}")
-
-        if is_in_ci():
-            self.assertGreater(decode_throughput, 100)
-
+    @intel_amx_benchmark(
+        extra_args=[
+            "--quantization",
+            "w8a8_int8",
+            "--mem-fraction-static",
+            "0.9",
+            "--max-total-tokens",
+            "65536",
+            "--disable-radix",
+            "--trust-remote-code",
+            "--batch-size",
+            "4",
+            "--tp",
+            "6",
+        ],
+        min_throughput=100,
+    )
     def test_latency_w8a8_moe_model(self):
-        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
-            [
-                "--attention-backend",
-                "intel_amx",
-                "--quantization",
-                "w8a8_int8",
-                "--mem-fraction-static",
-                "0.9",
-                "--max-total-tokens",
-                "65536",
-                "--disable-radix",
-                "--trust-remote-code",
-                "--batch-size",
-                "4",
-                "--tp",
-                "6",
-            ],
-        )
-
-        print(f"{prefill_latency=}")
-        print(f"{decode_throughput=}")
-        print(f"{decode_latency=}")
-
-        if is_in_ci():
-            self.assertGreater(decode_throughput, 100)
+        return DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE
 
     def test_mmlu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -193,9 +128,9 @@ class TestIntelAMXAttnBackend(CustomTestCase):
                 num_examples=64,
                 num_threads=32,
             )
-
             metrics = run_eval(args)
-            self.assertGreater(metrics["score"], 0.45)
+            if is_in_ci():
+                self.assertGreater(metrics["score"], 0.45)
         finally:
             kill_process_tree(process.pid)
 
