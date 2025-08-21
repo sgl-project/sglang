@@ -1,4 +1,4 @@
-use super::traits::Tokenizer as TokenizerTrait;
+use super::traits::{TokenIdType, Tokenizer as TokenizerTrait};
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ pub struct Sequence {
     tokenizer: Arc<dyn TokenizerTrait>,
 
     /// The current sequence of token ids
-    token_ids: Vec<u32>,
+    token_ids: Vec<TokenIdType>,
 
     /// The position in the current sequence the last decoded token completed
     prefix_offset: usize,
@@ -54,7 +54,7 @@ impl Sequence {
     }
 
     /// Create a sequence with initial tokens
-    pub fn with_tokens(tokenizer: Arc<dyn TokenizerTrait>, token_ids: Vec<u32>) -> Self {
+    pub fn with_tokens(tokenizer: Arc<dyn TokenizerTrait>, token_ids: Vec<TokenIdType>) -> Self {
         let len = token_ids.len();
         Self {
             tokenizer,
@@ -90,7 +90,7 @@ impl Sequence {
 
     /// Append a single token to the sequence and return newly decoded text
     /// Based on HuggingFace TGI incremental decoding
-    pub fn append_token(&mut self, token_id: u32) -> Result<String> {
+    pub fn append_token(&mut self, token_id: TokenIdType) -> Result<String> {
         // Store the old read offset before adding the new token
         let old_read_offset = self.read_offset;
 
@@ -145,7 +145,7 @@ impl Sequence {
     }
 
     /// Get the current token ids
-    pub fn token_ids(&self) -> &[u32] {
+    pub fn token_ids(&self) -> &[TokenIdType] {
         &self.token_ids
     }
 
