@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 # from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+
 # from sglang.srt.managers.schedule_batch import global_server_args_dict
 # from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -25,9 +26,12 @@ class ForwardMetaData:
     cu_seqlens_k: Optional[torch.Tensor] = None
     page_table: Optional[torch.Tensor] = None
 
+
 class BlackwellPrefillAttentionBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
-        from sglang.srt.layers.attention.cute_ops.prefill_attention import flash_attn_varlen_func
+        from sglang.srt.layers.attention.cute_ops.prefill_attention import (
+            flash_attn_varlen_func,
+        )
 
         super().__init__()
         self.flash_attn_func = flash_attn_varlen_func
@@ -36,22 +40,29 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         self.forward_metadata: Optional[ForwardMetaData] = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        assert forward_batch.forward_mode.is_extend(), "Only support extend (i.e., prefill) batches."
+        assert (
+            forward_batch.forward_mode.is_extend()
+        ), "Only support extend (i.e., prefill) batches."
 
         max_seqlen_k = forward_batch.seq_lens_cpu.max().item()
-        cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(forward_batch.seq_lens, dim=0, dtype=torch.int32), pad=(1, 0))
-        page_table = forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, :max_seqlen_k]
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(forward_batch.seq_lens, dim=0, dtype=torch.int32), pad=(1, 0)
+        )
+        page_table = forward_batch.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices, :max_seqlen_k
+        ]
 
         if any(forward_batch.extend_prefix_lens_cpu):
             extend_seq_lens = forward_batch.extend_seq_lens
-            cu_seqlens_q = F.pad(torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), pad=(1, 0))
+            cu_seqlens_q = F.pad(
+                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), pad=(1, 0)
+            )
         else:
             cu_seqlens_q = cu_seqlens_k
 
         self.forward_metadata = ForwardMetaData(
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            page_table=page_table)
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, page_table=page_table
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -63,7 +74,7 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        raise RuntimeError("Prefill attention should not be captured in CUDA graphs.")
+        raise RuntimeError("Prefill attention should not be captured in a CUDA graph.")
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -77,7 +88,7 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
-        raise RuntimeError("Prefill attention should not be replayed in CUDA graphs.")
+        raise RuntimeError("Prefill attention should not be replayed in a CUDA graph.")
 
     def forward_extend(
         self,
@@ -99,12 +110,8 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
 
         metadata = self.forward_metadata
-        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        k = k_cache[metadata.page_table, :, :, :].reshape(-1, layer.tp_k_head_num, layer.head_dim)
-        v = v_cache[metadata.page_table, :, :, :].reshape(-1, layer.tp_v_head_num, layer.head_dim)
-
         out = self.flash_attn_func(
-            q=q,
+            q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
             k=k_cache,
             v=v_cache,
             cu_seqlens_q=metadata.cu_seqlens_q,
@@ -127,7 +134,9 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        raise NotImplementedError("BlackwellPrefillAttentionBackend does not support forward_decode")
+        raise NotImplementedError(
+            "BlackwellPrefillAttentionBackend does not support forward_decode"
+        )
 
     forward = forward_extend
 

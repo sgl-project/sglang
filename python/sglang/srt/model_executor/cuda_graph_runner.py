@@ -609,7 +609,6 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
-        print(f"---------> HERE ||| {type(self.model_runner.attn_backend)} {dir(self.model_runner.attn_backend)}", flush=True)
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
