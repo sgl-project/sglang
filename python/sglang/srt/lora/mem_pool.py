@@ -14,9 +14,9 @@ from sglang.srt.lora.utils import (
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     get_hidden_dim,
-    get_normalized_lora_weight_names,
+    get_normalized_target_modules,
     get_stacked_multiply,
-    get_weight_name,
+    get_target_module_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ class LoRAMemoryPool:
         tp_rank: int,
         lora_extra_vocab_size: int,
         max_lora_rank: int,
-        lora_weight_names: Set[str],
+        target_modules: Set[str],
         base_model: torch.nn.Module,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
@@ -66,7 +66,7 @@ class LoRAMemoryPool:
 
         self.max_extra_vocab_size: int = lora_extra_vocab_size
         self.max_lora_rank: int = max_lora_rank
-        self.lora_weight_names: Set[str] = lora_weight_names
+        self.target_modules: Set[str] = target_modules
 
         # Both A_buffer and B_buffer maps lora weight names to its buffer space.
         # A_buffer contains num_layer number of row-major tensors with shape
@@ -107,8 +107,8 @@ class LoRAMemoryPool:
                 return False
             if config.extra_vocab_size > self.max_extra_vocab_size:
                 return False
-            weights = get_normalized_lora_weight_names(config.target_modules)
-            return weights.issubset(self.lora_weight_names)
+            target_module_names = get_normalized_target_modules(config.target_modules)
+            return target_module_names.issubset(self.target_modules)
 
         if isinstance(config, LoRAConfig):
             return _can_support(config)
@@ -168,11 +168,10 @@ class LoRAMemoryPool:
 
         def init_buffer(
             buffer: Dict[str, List[torch.Tensor]],
-            lora_weight_names: Set[str],
+            target_modules: Set[str],
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int], Tuple[int]],
         ):
-            lora_linear_weight_names = lora_weight_names - EMBEDDING_NAMES
-            for module_name in lora_linear_weight_names:
+            for module_name in target_modules:
                 lora_shape = get_lora_shape_fn(
                     module_name, base_model, self.max_lora_rank
                 )
@@ -224,13 +223,13 @@ class LoRAMemoryPool:
 
         init_buffer(
             self.A_buffer,
-            self.lora_weight_names,
+            self.target_modules,
             self.get_lora_A_shape,
         )
 
         init_buffer(
             self.B_buffer,
-            self.lora_weight_names,
+            self.target_modules,
             self.get_lora_B_shape,
         )
 
@@ -313,32 +312,34 @@ class LoRAMemoryPool:
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
             temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
-                weight_name: None for weight_name in self.A_buffer
+                target_module: None for target_module in self.A_buffer
             }
             temp_B_buffer: Dict[str, Optional[torch.Tensor]] = {
-                weight_name: None for weight_name in self.B_buffer
+                target_module: None for target_module in self.B_buffer
             }
             for name, weights in layer_weights.items():
-                lora_weight_name = get_weight_name(name, self.lora_weight_names)
+                target_module = get_target_module_name(name, self.target_modules)
                 if "lora_A" in name:
-                    temp_A_buffer[lora_weight_name] = weights
+                    temp_A_buffer[target_module] = weights
                 else:
-                    temp_B_buffer[lora_weight_name] = weights
+                    temp_B_buffer[target_module] = weights
 
             if self.tp_size > 1:
                 cur_layer_modules = lora_modules[layer_id]
                 for module_name, module in cur_layer_modules.items():
-                    weight_name = get_weight_name(module_name, self.lora_weight_names)
+                    target_module = get_target_module_name(
+                        module_name, self.target_modules
+                    )
 
-                    if temp_A_buffer[weight_name] is None:
+                    if temp_A_buffer[target_module] is None:
                         # Skip weight slicing if the weight is not present in the adapter
                         continue
 
-                    temp_A_buffer[weight_name] = module.slice_lora_a_weights(
-                        temp_A_buffer[weight_name], self.tp_rank
+                    temp_A_buffer[target_module] = module.slice_lora_a_weights(
+                        temp_A_buffer[target_module], self.tp_rank
                     )
-                    temp_B_buffer[weight_name] = module.slice_lora_b_weights(
-                        temp_B_buffer[weight_name], self.tp_rank
+                    temp_B_buffer[target_module] = module.slice_lora_b_weights(
+                        temp_B_buffer[target_module], self.tp_rank
                     )
 
             for name, weights in temp_A_buffer.items():
@@ -391,12 +392,12 @@ class LoRAMemoryPool:
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
 
     def get_tensor(
-        self, weight_name: str, layer_id: int, lora_type: LoRAType
+        self, target_module: str, layer_id: int, lora_type: LoRAType
     ) -> torch.Tensor:
         if lora_type == LoRAType.LORA_A:
-            return self.A_buffer[weight_name][layer_id]
+            return self.A_buffer[target_module][layer_id]
 
-        return self.B_buffer[weight_name][layer_id]
+        return self.B_buffer[target_module][layer_id]
 
     def get_embedding_tensor(
         self, weight_name: str, lora_type: Optional[LoRAType] = None

@@ -32,8 +32,8 @@ from sglang.srt.lora.utils import (
     LoRABatchInfo,
     LoRAType,
     get_layer_id,
-    get_normalized_lora_weight_names,
-    get_weight_name,
+    get_normalized_target_modules,
+    get_target_module_name,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -56,7 +56,7 @@ class LoRAManager:
         lora_extra_vocab_size: int = 0,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
-        lora_paths: Optional[Dict[str, LoRARef]] = None,
+        lora_paths: Optional[List[LoRARef]] = None,
         enable_cuda_graph: bool = True,
     ):
         self.base_model: torch.nn.Module = base_model
@@ -366,12 +366,20 @@ class LoRAManager:
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
-                weight_name = get_weight_name(
-                    module_name, self.memory_pool.lora_weight_names
+                target_module = get_target_module_name(
+                    module_name, self.memory_pool.target_modules
                 )
                 module.set_lora_info(
-                    self.memory_pool.get_tensor(weight_name, layer_id, LoRAType.LORA_A),
-                    self.memory_pool.get_tensor(weight_name, layer_id, LoRAType.LORA_B),
+                    self.memory_pool.get_tensor(
+                        target_module=target_module,
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_A,
+                    ),
+                    self.memory_pool.get_tensor(
+                        target_module=target_module,
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_B,
+                    ),
                 )
         # call set_lora_info for embeddings
         new_embeddings_buffer = None
@@ -390,7 +398,7 @@ class LoRAManager:
         self,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
-        lora_paths: Optional[Dict[str, LoRARef]] = None,
+        lora_paths: Optional[List[LoRARef]] = None,
     ):
         """
         Initialize the internal (mutable) state of the LoRAManager.
@@ -408,12 +416,11 @@ class LoRAManager:
             max_lora_rank=max_lora_rank,
             target_modules=target_modules,
         )
-        self.init_lora_weight_names()
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
 
-    def init_lora_adapters(self, lora_paths: Optional[Dict[str, LoRARef]] = None):
+    def init_lora_adapters(self, lora_paths: Optional[List[LoRARef]] = None):
         # Configs of all active LoRA adapters, indexed by LoRA ID.
         self.configs: Dict[str, LoRAConfig] = {}
 
@@ -427,7 +434,7 @@ class LoRAManager:
         self.num_pinned_loras: int = 0
 
         if lora_paths:
-            for lora_ref in lora_paths.values():
+            for lora_ref in lora_paths:
                 result = self.load_lora_adapter(lora_ref)
                 if not result.success:
                     raise RuntimeError(
@@ -454,6 +461,7 @@ class LoRAManager:
                         "enable all support modules types. "
                     )
                 self.target_modules.update(config.target_modules)
+        self.target_modules = get_normalized_target_modules(self.target_modules)
 
         if max_lora_rank is not None:
             self.max_lora_rank = max_lora_rank
@@ -462,15 +470,6 @@ class LoRAManager:
                 [x.r for x in self.configs.values()],
                 default=0,
             )
-
-    def init_lora_weight_names(self):
-        """
-        Add new LoRA weight names if needed based on the current `self.configs`.
-        """
-
-        self.lora_weight_names: Set[str] = get_normalized_lora_weight_names(
-            self.target_modules
-        )
 
     def load_lora_weights(self, lora_ref: LoRARef):
         """
@@ -500,7 +499,7 @@ class LoRAManager:
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             max_lora_rank=self.max_lora_rank,
-            lora_weight_names=self.lora_weight_names,
+            target_modules=self.target_modules,
             base_model=self.base_model,
             lora_extra_vocab_size=self.lora_extra_vocab_size,
         )
@@ -530,7 +529,7 @@ class LoRAManager:
                 continue
 
             # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.lora_weight_names:
+            if module_name.split(".")[-1] in self.target_modules:
                 if "embed_tokens" in module_name:
                     self.lora_embeddings_modules["embed_tokens"] = self.set_lora_module(
                         module_name, module
