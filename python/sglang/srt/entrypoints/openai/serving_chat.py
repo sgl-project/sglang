@@ -141,6 +141,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
         )
 
+        # GptOss model needs to keep special tokens for harmony parsing
         if is_gpt_oss:
             request.skip_special_tokens = False
 
