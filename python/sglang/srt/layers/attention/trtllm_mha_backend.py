@@ -333,7 +333,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     metadata.max_seq_len_k + self.page_size - 1
                 ) // self.page_size
 
-                metadata.cache_seqlens_int32.copy_(seq_lens + self.speculative_step_id + 1)
+                metadata.cache_seqlens_int32.copy_(
+                    seq_lens + self.speculative_step_id + 1
+                )
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
