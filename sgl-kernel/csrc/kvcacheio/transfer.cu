@@ -210,6 +210,7 @@ void transfer_kv_per_layer_pf_lf(
     at::Tensor dst_v,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
+    int64_t layer_id,
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
@@ -222,7 +223,7 @@ void transfer_kv_per_layer_pf_lf(
       dst_v,
       src_indices,
       dst_indices,
-      0,
+      layer_id,
       1,
       item_size,
       src_layout_dim,
@@ -336,6 +337,7 @@ void transfer_kv_per_layer_mla_pf_lf(
     at::Tensor dst,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
+    int64_t layer_id,
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
@@ -348,7 +350,7 @@ void transfer_kv_per_layer_mla_pf_lf(
       empty,
       src_indices,
       dst_indices,
-      0,
+      layer_id,
       1,
       item_size,
       src_layout_dim,
@@ -451,15 +453,33 @@ void transfer_kv_direct(
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
 
-  const int64_t num_pages = src_indices_cpu.size(0) / page_size;
+  const auto num_indices = src_indices_cpu.numel();
   const int64_t num_layers = src_layers.size();
+  int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
+  int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
 
-  for (int64_t i = 0; i < num_pages; ++i) {
-    auto src_index = src_indices_cpu[i * page_size].item<int64_t>();
-    auto dst_index = dst_indices_cpu[i * page_size].item<int64_t>();
+  int64_t start_index = 0;
+  int64_t end_index = 0;
+
+  for (int64_t i = 0; i < num_indices; ++i) {
+    if (i < num_indices - 1) {
+      auto src_diff = src_indices_ptr[i + 1] - src_indices_ptr[i];
+      auto dst_diff = dst_indices_ptr[i + 1] - dst_indices_ptr[i];
+
+      if (src_diff == 1 && dst_diff == 1) {
+        continue;
+      }
+      end_index = i + 1;
+    } else {  // last batch
+      end_index = num_indices;
+    }
+    auto src_index = src_indices_ptr[start_index];
+    auto dst_index = dst_indices_ptr[start_index];
+    auto num_tokens = end_index - start_index;
 
     for (int64_t j = 0; j < num_layers; ++j) {
-      transfer_page_direct(src_layers[j], dst_layers[j], src_index, dst_index, page_size);
+      transfer_page_direct(src_layers[j], dst_layers[j], src_index, dst_index, num_tokens);
     }
+    start_index = end_index;
   }
 }

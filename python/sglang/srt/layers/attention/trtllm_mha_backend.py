@@ -23,7 +23,12 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInfo
 
 # Constants
-DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
+DEFAULT_WORKSPACE_SIZE_MB = (
+    512  # Memory workspace size in MB, todo(Yingyi): read from config
+)
+
+# Reuse this workspace buffer across all TRTLLM MHA wrappers
+global_zero_init_workspace_buffer = None
 
 
 @dataclass
@@ -69,9 +74,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        self.workspace_buffer = torch.empty(
-            self.workspace_size, dtype=torch.int8, device=self.device
-        )
+        # Allocate buffers
+        global global_zero_init_workspace_buffer
+        if global_zero_init_workspace_buffer is None:
+            global_zero_init_workspace_buffer = torch.zeros(
+                self.workspace_size,
+                dtype=torch.uint8,
+                device=model_runner.device,
+            )
+        self.workspace_buffer = global_zero_init_workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -116,7 +127,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         metadata.cache_seqlens_int32 = seq_lens[:bs].to(torch.int32)
 
         # Precompute maximum sequence length
-        metadata.max_seq_len_k = self.max_context_len
+        metadata.max_seq_len_k = seq_lens[:bs].max().item()
 
         # Precompute page table
         metadata.page_table = self.decode_cuda_graph_metadata["page_table"][:bs, :]
@@ -145,7 +156,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
         max_len = seq_lens_cpu.max().item()
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-        metadata.max_seq_len_k = self.max_context_len
+        metadata.max_seq_len_k = max_len
 
         metadata.cache_seqlens_int32.copy_(seq_lens)
         page_indices = self.req_to_token[
@@ -254,7 +265,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             workspace_buffer=self.workspace_buffer,
             block_tables=self.forward_metadata.page_table,
             seq_lens=self.forward_metadata.cache_seqlens_int32,
-            max_seq_len=self.forward_metadata.max_seq_len_k,
+            max_seq_len=self.max_context_len,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
@@ -309,7 +320,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             block_tables=self.forward_metadata.page_table,
             seq_lens=self.forward_metadata.cache_seqlens_int32,
             max_q_len=self.forward_metadata.max_seq_len_q,
-            max_kv_len=self.forward_metadata.max_seq_len_k,
+            max_kv_len=self.max_context_len,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             batch_size=forward_batch.batch_size,
