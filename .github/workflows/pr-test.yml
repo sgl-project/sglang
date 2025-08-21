@@ -3,18 +3,8 @@ name: PR Test
 on:
   push:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
   pull_request:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -31,9 +21,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            src:
+              - "python/**"
+              - "scripts/**"
+              - "test/**"
+              - ".github/workflows/pr-test.yml"
+
   unit-test-frontend:
+    needs: check-changes
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -41,7 +52,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
@@ -50,8 +61,10 @@ jobs:
           python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
+    needs: [check-changes, unit-test-frontend]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
@@ -63,7 +76,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -72,8 +85,10 @@ jobs:
           python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 10
 
   unit-test-backend-2-gpu:
+    needs: [check-changes]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -81,7 +96,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -90,28 +105,34 @@ jobs:
           python3 run_suite.py --suite per-commit-2-gpu
 
   unit-test-backend-4-gpu:
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    needs: [unit-test-frontend, unit-test-backend-2-gpu]
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 4-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu
+          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-8-gpu:
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    needs: [unit-test-frontend, unit-test-backend-2-gpu]
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 8-gpu-runner
     strategy:
       fail-fast: false
@@ -123,7 +144,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -132,8 +153,10 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   performance-test-1-gpu-part-1:
+    needs: check-changes
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -141,7 +164,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark single latency
         timeout-minutes: 10
@@ -174,9 +197,18 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
 
+      - name: Benchmark online latency (LoRA)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency
+          python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
+
   performance-test-1-gpu-part-2:
+    needs: check-changes
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -184,7 +216,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark offline throughput (w/o RadixAttention)
         timeout-minutes: 10
@@ -217,8 +249,10 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
   performance-test-2-gpu:
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -226,7 +260,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark single latency (TP=2)
         timeout-minutes: 10
@@ -252,21 +286,23 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
-      - name: Benchmark offline decode throughput (PP=2)
+      - name: Benchmark offline PP decode throughput (PP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_offline_throughput_default_decode
 
-      - name: Benchmark offline prefill throughput (PP=2)
+      - name: Benchmark offline PP prefill throughput (PP=2)
         timeout-minutes: 10
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
   accuracy-test-1-gpu:
+    needs: check-changes
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
@@ -274,7 +310,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -286,8 +322,10 @@ jobs:
           python3 test_eval_accuracy_large.py
 
   accuracy-test-2-gpu:
+    needs: [check-changes, accuracy-test-1-gpu]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -295,7 +333,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
@@ -307,8 +345,10 @@ jobs:
           python3 test_moe_eval_accuracy_large.py
 
   unit-test-deepep-4-gpu:
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 4-gpu-runner
     steps:
       - name: Checkout code
@@ -316,7 +356,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_deepep.sh
+          bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -325,19 +365,18 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-deepep
 
   unit-test-deepep-8-gpu:
+    needs: [check-changes, unit-test-backend-2-gpu]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
     runs-on: 8-gpu-runner
-    needs: [
-      unit-test-deepep-4-gpu,
-    ]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_deepep.sh
+          bash scripts/ci/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 20
@@ -345,13 +384,40 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-deepep
 
-  finish:
-    if: always()
+  unit-test-backend-8-gpu-b200:
+    needs: [check-changes, unit-test-backend-2-gpu]
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false &&
+      needs.check-changes.outputs.src == 'true'
+    runs-on: b200-runner
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
+
+
+  pr-test-finish:
     needs: [
-      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu, unit-test-backend-4-gpu,
-      unit-test-backend-8-gpu, performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu, unit-test-deepep-4-gpu, unit-test-deepep-8-gpu,
+      check-changes,
+      unit-test-frontend, unit-test-backend-1-gpu,
+      unit-test-backend-2-gpu, unit-test-backend-4-gpu, unit-test-backend-8-gpu,
+      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
+      accuracy-test-1-gpu, accuracy-test-2-gpu,
+      unit-test-deepep-4-gpu, unit-test-deepep-8-gpu,
+      unit-test-backend-8-gpu-b200,
     ]
+    if: needs.check-changes.outputs.src == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

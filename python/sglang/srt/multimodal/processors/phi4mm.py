@@ -31,6 +31,7 @@ class Phi4MMProcessorAdapter(ProcessorMixin):
         for hf_key, sglang_key in key_mapping.items():
             if hf_key in result:
                 result[sglang_key] = result[hf_key]
+                del result[hf_key]
 
         # Filter out None or empty tensors from the result.
         # This prevents the sglang function base_processor.collect_mm_items_from_processor_output()
@@ -46,9 +47,9 @@ class Phi4MMProcessorAdapter(ProcessorMixin):
 class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
     models = [Phi4MMForCausalLM]
 
-    def __init__(self, hf_config, server_args, _processor):
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.processor = Phi4MMProcessorAdapter(_processor)
-        super().__init__(hf_config, server_args, self.processor)
+        super().__init__(hf_config, server_args, self.processor, *args, **kwargs)
 
         # the following CONSTANTS come from hugging-face microsoft/Phi-4-multimodal-instruct's processing_phi4mm.py file
         # ref: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py
@@ -58,7 +59,7 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
         self.AUDIO_TOKEN_ID = 200011
         self.AUDIO_SAMPLE_RATE = 16000
 
-        self.multimodal_tokens = MultimodalSpecialTokens(
+        self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
             image_token_id=self.IM_TOKEN_ID,
             audio_token=self.AUDIO_TOKEN,
@@ -71,15 +72,13 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
         audio_data,
         input_text,
         request_obj,
-        max_req_input_len,
         **kwargs,
     ):
         base_output = self.load_mm_data(
             prompt=input_text,
-            max_req_input_len=max_req_input_len,
             audio_data=audio_data,
             image_data=image_data,
-            multimodal_tokens=self.multimodal_tokens,
+            multimodal_tokens=self.mm_tokens,
             audio_sample_rate=self.AUDIO_SAMPLE_RATE,
         )
 
@@ -91,12 +90,12 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
             ]
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
-            base_output, self.multimodal_tokens
+            base_output, self.mm_tokens
         )
 
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
-            "im_token_id": self.IM_TOKEN_ID,
-            "audio_token_id": self.AUDIO_TOKEN_ID,
+            "im_token_id": self.mm_tokens.image_token_id,
+            "audio_token_id": self.mm_tokens.audio_token_id,
         }
