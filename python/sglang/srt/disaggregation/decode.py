@@ -415,7 +415,7 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(
                 page_indices,
                 decode_req.metadata_buffer_index,
-                len(decode_req.req.prefix_indices) // self.scheduler.page_size,
+                len(decode_req.req.prefix_indices),
             )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -660,6 +660,7 @@ class DecodeTransferQueue:
                     self.scheduler.stream_output(
                         [decode_req.req], decode_req.req.return_logprob
                     )
+                    self.tree_cache.cache_finished_req(decode_req.req)
                 else:
                     transferred_reqs.append(decode_req.req)
 
