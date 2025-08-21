@@ -1398,8 +1398,8 @@ void sm120_fp8_dispatch_bias(
   using CTAShapeDefault = Shape<_256, _128, _64>;
   using ClusterShapeDefault = Shape<_1, _1, _1>;
 
-  using CTAShape256 = Shape<_128, _128, _128>;
-  using ClusterShape256 = Shape<_1, _1, _1>;
+  using CTAShape128 = Shape<_128, _128, _128>;
+  using ClusterShape128 = Shape<_1, _1, _1>;
 
   using CTAShape64 = Shape<_128, _64, _128>;
   using ClusterShape64 = Shape<_1, _1, _1>;
@@ -1422,12 +1422,12 @@ void sm120_fp8_dispatch_bias(
       EpilogueScheduleType,
       TileSchedulerType,
       true>;
-  using BiasGemm256 = DeviceGemmFp8RowwiseSm120<
+  using BiasGemm128 = DeviceGemmFp8RowwiseSm120<
       ElementInput,
       ElementOutput,
       AccumElementType,
-      CTAShape256,
-      ClusterShape256,
+      CTAShape128,
+      ClusterShape128,
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
@@ -1453,12 +1453,12 @@ void sm120_fp8_dispatch_bias(
       EpilogueScheduleType,
       TileSchedulerType,
       false>;
-  using Gemm256 = DeviceGemmFp8RowwiseSm120<
+  using Gemm128 = DeviceGemmFp8RowwiseSm120<
       ElementInput,
       ElementOutput,
       AccumElementType,
-      CTAShape256,
-      ClusterShape256,
+      CTAShape128,
+      ClusterShape128,
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
@@ -1475,21 +1475,27 @@ void sm120_fp8_dispatch_bias(
       false>;
 
   uint32_t const m = a.size(0);
-  uint32_t const mp2 = std::max(static_cast<uint32_t>(16), next_pow_2(m));
+  uint32_t const mp2 = next_pow_2(m);
+  uint32_t const n = b.size(1);
+  uint32_t const np2 = next_pow_2(n);
 
   if (bias) {
-    if (mp2 <= 64) {
-      return launch_sm120_fp8_scaled_mm<BiasGemm64, true>(out, a, b, scales_a, scales_b, bias);
-    } else if (mp2 <= 256) {
-      return launch_sm120_fp8_scaled_mm<BiasGemm256, true>(out, a, b, scales_a, scales_b, bias);
+    if (mp2 <= 128) {
+      if (np2 <= 64) {
+        return launch_sm120_fp8_scaled_mm<BiasGemm64, true>(out, a, b, scales_a, scales_b, bias);
+      } else {
+        return launch_sm120_fp8_scaled_mm<BiasGemm128, true>(out, a, b, scales_a, scales_b, bias);
+      }
     } else {
       return launch_sm120_fp8_scaled_mm<BiasGemmDefault, true>(out, a, b, scales_a, scales_b, bias);
     }
   } else {
-    if (mp2 <= 64) {
-      return launch_sm120_fp8_scaled_mm<Gemm64, false>(out, a, b, scales_a, scales_b, bias);
-    } else if (mp2 <= 256) {
-      return launch_sm120_fp8_scaled_mm<Gemm256, false>(out, a, b, scales_a, scales_b, bias);
+    if (mp2 <= 128) {
+      if (np2 <= 64) {
+        return launch_sm120_fp8_scaled_mm<Gemm64, false>(out, a, b, scales_a, scales_b, bias);
+      } else {
+        return launch_sm120_fp8_scaled_mm<Gemm128, false>(out, a, b, scales_a, scales_b, bias);
+      }
     } else {
       return launch_sm120_fp8_scaled_mm<GemmDefault, false>(out, a, b, scales_a, scales_b, bias);
     }
