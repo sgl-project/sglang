@@ -25,14 +25,14 @@ import torch.nn.functional as F
 import torch.nn.utils.parametrize as P
 import torch.types
 from torch import nn
-from torch.nn.utils import weight_norm
+from torch.nn.utils import parametrizations
 from tqdm import tqdm
 from transformers import LlamaConfig, LlamaModel, PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers.models.whisper.modeling_whisper import (
-    WHISPER_ATTENTION_CLASSES,
+    WhisperAttention,
     WhisperConfig,
     WhisperEncoder,
 )
@@ -43,6 +43,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
+    Modality,
     MultimodalDataItem,
     MultimodalInputs,
     flatten_nested_list,
@@ -50,11 +51,8 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.minicpmv import (
-    Idefics2VisionTransformer,
-    MiniCPMBaseModel,
-    Resampler2_5,
-)
+from sglang.srt.models.idefics2 import Idefics2VisionTransformer
+from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import logger
 
@@ -585,7 +583,7 @@ class ConditionalChatTTS(PreTrainedModel):
         self.emb_text = nn.Embedding(config.num_text_tokens, config.hidden_size)
         self.head_code = nn.ModuleList(
             [
-                weight_norm(
+                parametrizations.weight_norm(
                     nn.Linear(config.hidden_size, config.num_audio_tokens, bias=False),
                     name="weight",
                 )
@@ -1092,7 +1090,7 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
     def __init__(self, config: WhisperConfig, layer_idx: int = None):
         super().__init__()
         self.embed_dim = config.d_model
-        self.self_attn = WHISPER_ATTENTION_CLASSES[config._attn_implementation](
+        self.self_attn = WhisperAttention(
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
             dropout=config.attention_dropout,
@@ -1136,7 +1134,10 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states, attn_weights, past_key_values = self.self_attn(
+        # TODO (lifuhuang): confirmed with Mick that the logic for past_key_values is copied from minicpmo official code,
+        # currently we are not using past_key_values at all. We need to redesign the caching logic when we support streaming
+        # in the future.
+        hidden_states, attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
@@ -1519,12 +1520,15 @@ class MiniCPMO(MiniCPMBaseModel):
         slice_start_id: int = mm_input.slice_start_id
         slice_end_id: int = mm_input.slice_end_id
 
-        media_token_pairs = [
+        data_token_pairs = [
             (im_start_id, im_end_id),
             (slice_start_id, slice_end_id),
             (mm_input.audio_start_id, mm_input.audio_end_id),
         ]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        data_start_token_ids = [im_start_id, mm_input.audio_start_id]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(
+            data_token_pairs=data_token_pairs, data_start_token_ids=data_start_token_ids
+        )
 
         return pattern.pad_input_tokens(input_ids, mm_input)
 
@@ -1551,9 +1555,7 @@ class MiniCPMO(MiniCPMBaseModel):
         Returns:
             List[List[torch.Tensor]]: audio embeddings
         """
-        wavforms = flatten_nested_list(
-            [item.audio_features for item in items if item.audio_features]
-        )
+        wavforms = flatten_nested_list([item.feature for item in items if item.feature])
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = flatten_nested_list(
             [item.audio_feature_lens for item in items if item.audio_feature_lens]
@@ -1658,9 +1660,7 @@ class MiniCPMO(MiniCPMBaseModel):
             List[List[torch.Tensor]]: audio embeddings
         """
         # (bs, 80, frames) or [], multi audios need filled in advance
-        wavforms = flatten_nested_list(
-            [item.audio_features for item in items if item.audio_features]
-        )
+        wavforms = flatten_nested_list([item.feature for item in items if item.feature])
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = flatten_nested_list(
             [item.audio_feature_lens for item in items if item.audio_feature_lens]
@@ -1777,7 +1777,7 @@ class MiniCPMO(MiniCPMBaseModel):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # list of tensors
-        pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(
             flatten_nested_list([item.tgt_size for item in items]), dim=0
         )
@@ -1822,19 +1822,11 @@ class MiniCPMO(MiniCPMBaseModel):
         **kwargs: Any,
     ) -> torch.Tensor:
 
-        mm_input = forward_batch.merge_mm_inputs()
-        placeholder_token_ids = (
-            ([mm_input.im_token_id] + [item.pad_value for item in mm_input.mm_items])
-            if forward_batch.contains_mm_inputs()
-            else []
-        )
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.llm,
-            image_data_embedding_func=self.get_image_feature,
-            audio_data_embedding_func=self.get_audio_feature,
-            placeholder_token_ids=placeholder_token_ids,
+            multimodal_model=self,
             positions=positions,
         )
         return hidden_states
@@ -1859,11 +1851,22 @@ class MiniCPMO(MiniCPMBaseModel):
                 # the checkpoint. Skip them.
                 continue
 
-            # adapt to parametrization
+            # For weight_norm parametrization, handle both old and new formats
             if self.config.init_tts and "tts" in name:
-                name = name.replace(".parametrizations", "")
-                name = name.replace(".weight.original0", ".weight_g")
-                name = name.replace(".weight.original1", ".weight_v")
+                # Handle loading from older checkpoints with weight_g/weight_v format
+                if ".weight_g" in name or ".weight_v" in name:
+                    name = name.replace(
+                        ".weight_g", ".parametrizations.weight.original0"
+                    )
+                    name = name.replace(
+                        ".weight_v", ".parametrizations.weight.original1"
+                    )
+                elif ".weight" in name and name not in params_dict:
+                    param_name = name.replace(
+                        ".weight", ".parametrizations.weight.original0"
+                    )
+                    if param_name in params_dict:
+                        name = param_name
 
             # adapt to VisionAttention
             if "vpm" in name:

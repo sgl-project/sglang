@@ -28,15 +28,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        env:
-          FLASHINFER_REPO: 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python'
         run: |
-          bash scripts/ci_install_dependency.sh
-          pip install "vllm>=0.6.4.post1,<=0.7.2"
+          bash scripts/ci/ci_install_dependency.sh
           pip install "bitsandbytes>=0.44.0"
 
-      - name: Run VLLM dependency tests
+          pip install "sgl-kernel==0.3.5"
+
+      - name: Run vLLM dependency tests
         timeout-minutes: 60
         run: |
+          export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+
           cd test/srt
           python3 run_suite.py --suite vllm_dependency_test --timeout-per-file 3600

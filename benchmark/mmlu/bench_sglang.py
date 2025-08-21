@@ -9,6 +9,7 @@ import tiktoken
 
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
+    dump_bench_raw_result,
     select_sglang_backend,
 )
 
@@ -116,7 +117,7 @@ def main(args):
     backend = select_sglang_backend(args)
 
     # Run
-    tic = time.time()
+    tic = time.perf_counter()
     states = few_shot_mmlu.run_batch(
         arguments,
         temperature=0,
@@ -128,7 +129,7 @@ def main(args):
     preds = [
         s["answer"].strip()[0] if len(s["answer"].strip()) > 0 else "" for s in states
     ]
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     cors = [pred == label for pred, label in zip(preds, labels)]
@@ -141,6 +142,13 @@ def main(args):
         pt += num_qs
     assert pt == len(cors)
     weighted_acc = np.mean(cors)
+
+    dump_bench_raw_result(
+        path=args.raw_result_file,
+        states=states,
+        preds=preds,
+        labels=labels,
+    )
 
     # Print results
     print("Total latency: {:.3f}".format(latency))

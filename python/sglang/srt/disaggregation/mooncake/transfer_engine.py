@@ -1,45 +1,14 @@
-import json
 import logging
-import os
-import uuid
-from dataclasses import dataclass
+from typing import List, Optional
+
+from sglang.srt.utils import get_bool_env_var, get_free_port, maybe_wrap_ipv6_address
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class MooncakeTransferEngineConfig:
-    local_hostname: str
-    metadata_server: str
-    protocol: str
-    device_name: str
-
-    @staticmethod
-    def from_file(file_path: str) -> "MooncakeTransferEngineConfig":
-        """Load the config from a JSON file."""
-        with open(file_path) as fin:
-            config = json.load(fin)
-        return MooncakeTransferEngineConfig(
-            local_hostname=config.get("local_hostname", None),
-            metadata_server=config.get("metadata_server"),
-            protocol=config.get("protocol", "rdma"),
-            device_name=config.get("device_name", ""),
-        )
-
-    @staticmethod
-    def load_from_env() -> "MooncakeTransferEngineConfig":
-        """Load config from a file specified in the environment variable."""
-        config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
-        if config_file_path is None:
-            raise ValueError(
-                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
-            )
-        return MooncakeTransferEngineConfig.from_file(config_file_path)
-
-
 class MooncakeTransferEngine:
 
-    def __init__(self):
+    def __init__(self, hostname: str, gpu_id: int, ib_device: Optional[str] = None):
         try:
             from mooncake.engine import TransferEngine
         except ImportError as e:
@@ -50,59 +19,146 @@ class MooncakeTransferEngine:
             ) from e
 
         self.engine = TransferEngine()
+        self.hostname = hostname
+        self.gpu_id = gpu_id
+        self.ib_device = ib_device
 
-        try:
-            self.config = MooncakeTransferEngineConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded successfully.")
-        except ValueError as e:
-            logger.error(e)
-            raise
-        except Exception as exc:
-            logger.error("An error occurred while loading the configuration: %s", exc)
-            raise
-
-        self.config = MooncakeTransferEngineConfig.load_from_env()
-
-        session_suffix = "_" + str(uuid.uuid4())
-        self.session_id = self.config.local_hostname + session_suffix
         self.initialize(
-            self.session_id,
-            self.config.metadata_server,
-            self.config.protocol,
-            self.config.device_name,
+            hostname=self.hostname,
+            device_name=self.ib_device,
+        )
+        self.session_id = (
+            f"{maybe_wrap_ipv6_address(self.hostname)}:{self.engine.get_rpc_port()}"
         )
 
     def register(self, ptr, length):
-        self.engine.register_memory(ptr, length)
+        try:
+            ret_value = self.engine.register_memory(ptr, length)
+        except Exception:
+            # Mark register as failed
+            ret_value = -1
+
+        if ret_value != 0:
+            logger.debug("Mooncake memory registration %s failed.", ptr)
 
     def deregister(self, ptr):
-        self.engine.unregister_memory(ptr)
+        try:
+            ret_value = self.engine.unregister_memory(ptr)
+        except Exception:
+            # Mark deregister as failed
+            ret_value = -1
+
+        if ret_value != 0:
+            logger.debug("Mooncake memory deregistration %s failed.", ptr)
+
+    def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
+        """Batch register multiple memory regions."""
+        try:
+            ret_value = self.engine.batch_register_memory(ptrs, lengths)
+        except Exception:
+            # Mark batch register as failed
+            ret_value = -1
+            if not hasattr(self.engine, "batch_register_memory"):
+                raise RuntimeError(
+                    "Mooncake's batch register requires a newer version of mooncake-transfer-engine. "
+                    "Please upgrade Mooncake."
+                )
+
+        if ret_value != 0:
+            logger.debug("Mooncake batch memory registration failed.")
+        return ret_value
+
+    def batch_deregister(self, ptrs: List[int]) -> int:
+        """Batch deregister multiple memory regions."""
+        try:
+            ret_value = self.engine.batch_unregister_memory(ptrs)
+        except Exception:
+            # Mark batch deregister as failed
+            ret_value = -1
+
+        if ret_value != 0:
+            logger.debug("Mooncake batch memory deregistration failed.")
+        return ret_value
 
     def initialize(
         self,
-        local_hostname: str,
-        metadata_server: str,
-        protocol: str,
-        device_name: str,
+        hostname: str,
+        device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
-        self.engine.initialize(local_hostname, metadata_server, protocol, device_name)
+        if get_bool_env_var("ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE", "false"):
+            hostname += f":{get_free_port()}:npu_{self.gpu_id}"
+            ret_value = self.engine.initialize(
+                hostname,
+                "P2PHANDSHAKE",
+                "ascend",
+                device_name if device_name is not None else "",
+            )
+        else:
+            ret_value = self.engine.initialize(
+                hostname,
+                "P2PHANDSHAKE",
+                "rdma",
+                device_name if device_name is not None else "",
+            )
+        if ret_value != 0:
+            logger.error("Mooncake Transfer Engine initialization failed.")
+            raise RuntimeError("Mooncake Transfer Engine initialization failed.")
 
     def transfer_sync(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
+        try:
+            # the first time: based on session_id (which contains remote_ip) to construct a queue pair, and cache the queue pair
+            # later: based on the cached queue pair to send data
+            ret = self.engine.transfer_sync_write(
+                session_id, buffer, peer_buffer_address, length
+            )
+        except Exception:
+            # Mark transfer request as failed
+            ret = -1
 
-        ret = self.engine.transfer_sync_write(
-            session_id, buffer, peer_buffer_address, length
-        )
         if ret < 0:
-            logger.error("Transfer Return Error")
-            raise Exception("Transfer Return Error")
+            # Do not raise an exception here, since some transfer requests fail should be accepted and the execution thread should not be stopped.
+            logger.debug(
+                "Failed to transfer data from %s to %s - %s.",
+                buffer,
+                session_id,
+                peer_buffer_address,
+            )
+
         return ret
 
-    def get_localhost(self):
-        return self.config.local_hostname
+    def batch_transfer_sync(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        """Synchronously transfer data to the specified addresses in batches."""
+        try:
+            ret = self.engine.batch_transfer_sync_write(
+                session_id, buffers, peer_buffer_addresses, lengths
+            )
+        except Exception:
+            ret = -1
+            # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
+            if not hasattr(self.engine, "batch_transfer_sync_write"):
+                raise RuntimeError(
+                    "Mooncake's batch transfer requires mooncake-transfer-engine >= 0.3.4.post2. "
+                    "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'"
+                )
+
+        if ret < 0:
+            logger.debug(
+                "Failed to batch transfer data. Buffers: %s, Session: %s, Peer addresses: %s",
+                buffers,
+                session_id,
+                peer_buffer_addresses,
+            )
+        return ret
 
     def get_session_id(self):
         return self.session_id

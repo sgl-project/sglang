@@ -16,7 +16,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_VLM_MODEL_NAME,
+    DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -54,21 +54,17 @@ class TestSkipTokenizerInit(CustomTestCase):
     ):
         input_ids = self.get_input_ids(prompt_text)
 
+        request = self.get_request_json(
+            input_ids=input_ids,
+            return_logprob=return_logprob,
+            top_logprobs_num=top_logprobs_num,
+            max_new_tokens=max_new_tokens,
+            stream=False,
+            n=n,
+        )
         response = requests.post(
             self.base_url + "/generate",
-            json={
-                "input_ids": input_ids,
-                "sampling_params": {
-                    "temperature": 0 if n == 1 else 0.5,
-                    "max_new_tokens": max_new_tokens,
-                    "n": n,
-                    "stop_token_ids": [self.tokenizer.eos_token_id],
-                },
-                "stream": False,
-                "return_logprob": return_logprob,
-                "top_logprobs_num": top_logprobs_num,
-                "logprob_start_len": 0,
-            },
+            json=request,
         )
         ret = response.json()
         print(json.dumps(ret, indent=2))
@@ -87,9 +83,12 @@ class TestSkipTokenizerInit(CustomTestCase):
                 self.assertEqual(item["meta_info"]["prompt_tokens"], len(input_ids))
 
                 if return_logprob:
+                    num_input_logprobs = len(input_ids) - request["logprob_start_len"]
+                    if num_input_logprobs > len(input_ids):
+                        num_input_logprobs -= len(input_ids)
                     self.assertEqual(
                         len(item["meta_info"]["input_token_logprobs"]),
-                        len(input_ids),
+                        num_input_logprobs,
                         f'{len(item["meta_info"]["input_token_logprobs"])} mismatch with {len(input_ids)}',
                     )
                     self.assertEqual(
@@ -113,19 +112,14 @@ class TestSkipTokenizerInit(CustomTestCase):
         requests.post(self.base_url + "/flush_cache")
         response = requests.post(
             self.base_url + "/generate",
-            json={
-                "input_ids": input_ids,
-                "sampling_params": {
-                    "temperature": 0 if n == 1 else 0.5,
-                    "max_new_tokens": max_new_tokens,
-                    "n": n,
-                    "stop_token_ids": self.eos_token_id,
-                },
-                "stream": False,
-                "return_logprob": return_logprob,
-                "top_logprobs_num": top_logprobs_num,
-                "logprob_start_len": 0,
-            },
+            json=self.get_request_json(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                return_logprob=return_logprob,
+                top_logprobs_num=top_logprobs_num,
+                stream=False,
+                n=n,
+            ),
         )
         ret = response.json()
         print(json.dumps(ret))
@@ -137,19 +131,13 @@ class TestSkipTokenizerInit(CustomTestCase):
         requests.post(self.base_url + "/flush_cache")
         response_stream = requests.post(
             self.base_url + "/generate",
-            json={
-                "input_ids": input_ids,
-                "sampling_params": {
-                    "temperature": 0 if n == 1 else 0.5,
-                    "max_new_tokens": max_new_tokens,
-                    "n": n,
-                    "stop_token_ids": self.eos_token_id,
-                },
-                "stream": True,
-                "return_logprob": return_logprob,
-                "top_logprobs_num": top_logprobs_num,
-                "logprob_start_len": 0,
-            },
+            json=self.get_request_json(
+                input_ids=input_ids,
+                return_logprob=return_logprob,
+                top_logprobs_num=top_logprobs_num,
+                stream=True,
+                n=n,
+            ),
         )
 
         response_stream_json = []
@@ -188,6 +176,29 @@ class TestSkipTokenizerInit(CustomTestCase):
         ].tolist()
         return input_ids
 
+    def get_request_json(
+        self,
+        input_ids,
+        max_new_tokens=32,
+        return_logprob=False,
+        top_logprobs_num=0,
+        stream=False,
+        n=1,
+    ):
+        return {
+            "input_ids": input_ids,
+            "sampling_params": {
+                "temperature": 0 if n == 1 else 0.5,
+                "max_new_tokens": max_new_tokens,
+                "n": n,
+                "stop_token_ids": self.eos_token_id,
+            },
+            "stream": stream,
+            "return_logprob": return_logprob,
+            "top_logprobs_num": top_logprobs_num,
+            "logprob_start_len": 0,
+        }
+
 
 class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     @classmethod
@@ -195,7 +206,7 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
         cls.image_url = DEFAULT_IMAGE_URL
         response = requests.get(cls.image_url)
         cls.image = Image.open(BytesIO(response.content))
-        cls.model = DEFAULT_SMALL_VLM_MODEL_NAME
+        cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
         cls.processor = AutoProcessor.from_pretrained(cls.model, trust_remote_code=True)
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -217,6 +228,14 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
         )
 
         return inputs.input_ids[0].tolist()
+
+    def get_request_json(self, *args, **kwargs):
+        ret = super().get_request_json(*args, **kwargs)
+        ret["image_data"] = [self.image_url]
+        ret["logprob_start_len"] = (
+            -1
+        )  # Do not try to calculate logprobs of image embeddings.
+        return ret
 
     def test_simple_decode_stream(self):
         # TODO mick

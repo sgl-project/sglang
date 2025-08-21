@@ -5,6 +5,11 @@
 [![PyPI](https://img.shields.io/pypi/v/sgl-kernel)](https://pypi.org/project/sgl-kernel)
 
 ## Installation
+For CUDA 12.1 and above:
+
+```bash
+pip3 install sgl-kernel
+```
 
 For CUDA 11.8:
 
@@ -12,17 +17,111 @@ For CUDA 11.8:
 pip3 install sgl-kernel -i https://docs.sglang.ai/whl/cu118
 ```
 
-For CUDA 12.1 or CUDA 12.4:
+## Build from source
+
+Development build:
 
 ```bash
-pip3 install sgl-kernel
+make build
+```
+
+Note:
+
+The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
+
+### Build with [ccache](https://github.com/ccache/ccache)
+```bash
+# or `yum install -y ccache`.
+apt-get install -y ccache
+# Building with ccache is enabled when ccache is installed and CCACHE_DIR is set.
+export CCACHE_DIR=/path/to/your/ccache/dir
+export CCACHE_BACKEND=""
+export CCACHE_KEEP_LOCAL_STORAGE="TRUE"
+unset CCACHE_READONLY
+python -m uv build --wheel -Cbuild-dir=build --color=always .
+```
+
+### Configuring CMake Build Options
+Cmake options can be configuring by adding `-Ccmake.define.<option>=<value>` to the `uv build` flags.
+For example, to enable building FP4 kernels, use:
+```bash
+python -m uv build --wheel -Cbuild-dir=build -Ccmake.define.SGL_KERNEL_ENABLE_FP4=1 --color=always .
+```
+See CMakeLists.txt for more options.
+
+### Parallel Build
+
+We highly recommend you build sgl-kernel with Ninja. Ninja can automatically build sgl-kernel in parallel.
+And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLEL_LEVEL` for parallel build like:
+
+```bash
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .
+```
+
+### ⚠️ Compilation Issue with `sgl-kernel` and CUDA 12.6
+
+When compiling `sgl-kernel` with FlashAttention on a Hopper GPU using CUDA 12.6, you may encounter a segmentation fault:
+
+```bash
+kernel/build/_deps/repo-flash-attention-src/hopper/instantiations/flash_fwd_hdimall_bf16_paged_softcap_sm90.cu -o CMakeFiles/flash_ops.dir/_deps/repo-flash-attention-src/hopper/instantiations/flash_fwd_hdimall_bf16_paged_softcap_sm90.cu.o
+Segmentation fault (core dumped)
+```
+
+⚠️ **Note**: To ensure that FlashAttention compiles correctly on Hopper GPU Architecture(sm90), it is strongly [recommended](https://github.com/Dao-AILab/flash-attention/issues/1453) to use:
+- nvcc version: 12.6
+- ptxas version: 12.8
+
+**1. Check Current Versions**
+
+Before proceeding, verify your current CUDA tool versions:
+```bash
+nvcc --version
+ptxas --version
+```
+**2. Update ptxas to 12.8 (if needed)**
+
+1. Save the following script to a file (e.g., `update_ptxas.sh`).
+```bash
+#!/usr/bin/env bash
+# Source: https://github.com/Dao-AILab/flash-attention/blob/7ff1b621112ba8b538e2fc6a316f2a6b6f22e518/hopper/setup.py#L404
+set -ex
+
+if [ -z "$1" ]; then
+    echo "Usage: $0 <CUDA_VERSION>"
+    exit 1
+fi
+
+CUDA_VERSION=$1
+
+if awk "BEGIN {exit !("$CUDA_VERSION" >= 12.6 && "$CUDA_VERSION" < 12.8)}"; then
+    NVCC_ARCHIVE_VERSION="12.8.93"
+    NVCC_ARCHIVE_NAME="cuda_nvcc-linux-x86_64-${NVCC_ARCHIVE_VERSION}-archive"
+    NVCC_ARCHIVE_TAR="${NVCC_ARCHIVE_NAME}.tar.xz"
+    NVCC_ARCHIVE_URL="https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/linux-x86_64/${NVCC_ARCHIVE_TAR}"
+
+    wget "$NVCC_ARCHIVE_URL"
+    tar -xf "$NVCC_ARCHIVE_TAR"
+
+    mkdir -p /usr/local/cuda/bin
+    cp "${NVCC_ARCHIVE_NAME}/bin/ptxas" /usr/local/cuda/bin/
+
+    # Clean up temporary files
+    rm -f "${NVCC_ARCHIVE_TAR}"
+    rm -rf "${NVCC_ARCHIVE_NAME}"
+fi
+```
+2. Run the script with your CUDA version as the argument, using `sudo`:
+```bash
+sudo bash update_ptxas.sh 12.6
+# Check the version
+ptxas --version
 ```
 
 # Developer Guide
 
 ## Development Environment Setup
 
-Use Docker to set up the development environment. See [Docker setup guide](https://github.com/sgl-project/sglang/blob/main/docs/developer/development_guide_using_docker.md#setup-docker-container).
+Use Docker to set up the development environment. See [Docker setup guide](https://github.com/sgl-project/sglang/blob/main/docs/references/development_guide_using_docker.md#setup-docker-container).
 
 Create and enter development container:
 ```bash
@@ -40,6 +139,14 @@ Third-party libraries:
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
 - [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)
 - [FlashAttention](https://github.com/Dao-AILab/flash-attention)
+
+### FlashAttention FYI
+
+  FA3 can fail without a enough shared memory for a some shapes, such as higher hidden_dim or some special cases. Right now, fa3 is supported for sm80/sm87 and sm86/sm89.
+
+  The main different Between sm80/sm87 and sm86/sm89 is the shared memory size. you can follow the link below for more information https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x.
+
+  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a. That means if you use **A100(tested)**/A*0/**L20(tested)**/L40/L40s/**3090(tested)** you can use fa3.
 
 ### Kernel Development
 
@@ -132,38 +239,6 @@ To use this with your library functions, simply wrap them with make_pytorch_shim
  m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 ```
 
-### Build & Install
-
-Development build:
-
-```bash
-make build
-```
-
-Note:
-
-The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
-
-#### Build with [ccache](https://github.com/ccache/ccache)
-```bash
-# or `yum install -y ccache`.
-apt-get install -y ccache
-# Building with ccache is enabled when ccache is installed and CCACHE_DIR is set.
-export CCACHE_DIR=/path/to/your/ccache/dir
-export CCACHE_BACKEND=""
-export CCACHE_KEEP_LOCAL_STORAGE="TRUE"
-unset CCACHE_READONLY
-python -m uv build --wheel -Cbuild-dir=build --color=always .
-```
-
-##### Configuring CMake Build Options
-Cmake options can be configuring by adding `-Ccmake.define.<option>=<value>` to the `uv build` flags.
-For example, to enable building FP4 kernels, use:
-```bash
-python -m uv build --wheel -Cbuild-dir=build -Ccmake.define.SGL_KERNEL_ENABLE_FP4=1 --color=always .
-```
-See CMakeLists.txt for more options.
-
 ### Testing & Benchmarking
 
 1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests), if you need to skip some test, please use `@pytest.mark.skipif`
@@ -177,7 +252,9 @@ See CMakeLists.txt for more options.
 2. Add benchmarks using [triton benchmark](https://triton-lang.org/main/python-api/generated/triton.testing.Benchmark.html) in [benchmark/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/benchmark)
 3. Run test suite
 
+### FAQ
 
+- When encountering this error while compiling using ccache: `ImportError: /usr/local/lib/python3.10/dist-packages/sgl_kernel/common_ops.abi3.so: undefined symbol: _ZN3c108ListType3getERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEENS_4Type24SingletonOrSharedTypePtrIS9_EE`, please modify the last command as follows to resolve it: `python3 -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation` .
 
 ### Release new version
 

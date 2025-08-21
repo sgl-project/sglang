@@ -8,10 +8,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +42,6 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             torch.tensor(-1.0, dtype=torch.float32), requires_grad=False
         )
 
-    @classmethod
-    def is_fp8_fnuz(cls) -> bool:
-        # only device 0 is checked, this assumes MI300 platforms are homogeneous
-        return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
-
     def apply(self, layer: torch.nn.Module) -> torch.Tensor:
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
 
@@ -57,7 +50,7 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             # We prefer to use separate k_scale and v_scale if present
             k_scale = layer.k_scale.to("cpu").tolist()
             v_scale = layer.v_scale.to("cpu").tolist()
-            if _is_hip and self.is_fp8_fnuz():
+            if is_fp8_fnuz():
                 k_scale *= 2
                 v_scale *= 2
         elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
@@ -73,7 +66,7 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             scale_to_duplicate = max(layer.k_scale, layer.v_scale)
             k_scale = scale_to_duplicate.to("cpu").tolist()
             v_scale = scale_to_duplicate.to("cpu").tolist()
-            if _is_hip and self.is_fp8_fnuz():
+            if is_fp8_fnuz():
                 k_scale *= 2
                 v_scale *= 2
 

@@ -3,10 +3,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
-is_cuda_available = torch.cuda.is_available()
-if is_cuda_available:
+_is_cuda = is_cuda()
+if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
@@ -919,7 +919,7 @@ def _fwd_kernel(
 
         e_max = n_e_max
 
-    # stage 2: compute the trianlge part
+    # stage 2: compute the triangle part
 
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     for start_n in range(0, cur_block_m_end, BLOCK_N):
@@ -1037,12 +1037,12 @@ def extend_attention_fwd(
         num_warps = 4
 
     else:
-        if is_cuda_available and CUDA_CAPABILITY[0] >= 9:
+        if _is_cuda and CUDA_CAPABILITY[0] >= 9:
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (128, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
-        elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
+        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
             if Lq <= 128:
                 BLOCK_M, BLOCK_N = (128, 128)
             elif Lq <= 256:
