@@ -214,6 +214,7 @@ class ServerArgs:
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
+    hicache_storage_backend_tag: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
 
     # Double Sparsity
@@ -1606,6 +1607,12 @@ class ServerArgs:
             choices=["file", "mooncake", "hf3fs", "nixl"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache.",
+        )
+        parser.add_argument(
+            "--hicache-storage-backend-tag",
+            type=str,
+            default=ServerArgs.hicache_storage_backend_tag,
+            help="The storage backend tag for multiple tenant.",
         )
         parser.add_argument(
             "--hicache-storage-prefetch-policy",

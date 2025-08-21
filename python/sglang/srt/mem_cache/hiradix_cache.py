@@ -38,6 +38,7 @@ class HiRadixCache(RadixCache):
         hicache_io_backend: str,
         hicache_mem_layout: str,
         hicache_storage_backend: Optional[str] = None,
+        hicache_storage_backend_tag: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
     ):
 
@@ -86,6 +87,7 @@ class HiRadixCache(RadixCache):
             write_policy=hicache_write_policy,
             io_backend=hicache_io_backend,
             storage_backend=hicache_storage_backend,
+            storage_backend_tag=hicache_storage_backend_tag,
             prefetch_threshold=self.prefetch_threshold,
         )
 
