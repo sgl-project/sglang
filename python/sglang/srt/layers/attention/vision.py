@@ -20,7 +20,6 @@ if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 from sglang.srt.distributed import (
-    parallel_state,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
@@ -42,6 +41,22 @@ from sglang.srt.utils import add_prefix
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
+
+
+def convert_hf_attention_backend_to_sgl_attention_backend(
+    attn_implementation: Optional[str] = None,
+):
+    if attn_implementation is None:
+        qkv_backend = None
+    elif attn_implementation == "sdpa":
+        qkv_backend = "sdpa"
+    elif attn_implementation == "flash_attention_2":
+        qkv_backend = "triton_attn"
+    elif attn_implementation == "eager":
+        qkv_backend = "sdpa"
+    elif attn_implementation == "flash_attention_3":
+        qkv_backend = "fa3"
+    return qkv_backend
 
 
 @dataclasses.dataclass
@@ -103,34 +118,35 @@ class VisionSdpaAttention(nn.Module):
     @staticmethod
     @lru_cache(maxsize=128)
     def _generate_mask_cache(
-        s: int, flatten_batch: bool, cu_seqlens: tuple
+        s: int,
+        flatten_batch: bool,
+        cu_seqlens: tuple,
+        device: torch.device,
     ) -> torch.BoolTensor:
         """
         Generate a boolean attention mask with caching mechanism.
         Args:
-            s: sequence length
+            s: max sequence length described in cu_seqlens
             flatten_batch: whether to flatten batch dimension
             cu_seqlens: tuple of cumulative sequence lengths
         Returns:
             attention mask tensor of shape [b, 1, s, s] or [1, s, s]
         """
+        # TODO: replace with kernel
         if flatten_batch:
-            mask = torch.zeros([1, s, s], dtype=torch.bool)
+            mask = torch.zeros([1, s, s], dtype=torch.bool, device=device)
             for i in range(1, len(cu_seqlens)):
                 start = cu_seqlens[i - 1]
                 end = cu_seqlens[i]
                 mask[..., start:end, start:end] = True
         else:
-            # [1, 1, 1, s]
-            row_indices = torch.arange(s).view(1, 1, 1, s)
-            # [1, 1, s, 1]
-            col_indices = torch.arange(s).view(1, 1, s, 1)
-            # [b, 1, 1, 1]
-            seq_lens = torch.tensor(
-                [end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])],
-            ).view(-1, 1, 1, 1)
-
-            mask = (row_indices < seq_lens) & (col_indices < seq_lens)
+            # Build block-diagonal non-causal mask according to cu_seqlens,
+            # consistent with flatten_batch=True behavior to avoid cross-frame attention.
+            mask = torch.zeros([1, s, s], dtype=torch.bool, device=device)
+            for i in range(1, len(cu_seqlens)):
+                start = cu_seqlens[i - 1]
+                end = cu_seqlens[i]
+                mask[..., start:end, start:end] = True
 
         return mask
 
@@ -138,6 +154,7 @@ class VisionSdpaAttention(nn.Module):
         self,
         s: int,
         cu_seqlens: Optional[torch.Tensor],
+        device: torch.device,
         flatten_batch: bool = False,
     ) -> Optional[torch.Tensor]:
         r"""
@@ -154,7 +171,7 @@ class VisionSdpaAttention(nn.Module):
 
         cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
 
-        return self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple)
+        return self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple, device)
 
     def forward(
         self,
@@ -182,7 +199,7 @@ class VisionSdpaAttention(nn.Module):
         # [b, 1, s, s]
         if attention_mask is None:
             attention_mask = self.generate_patch_attention_mask(
-                s, cu_seqlens, flatten_batch=self.flatten_batch
+                s, cu_seqlens, flatten_batch=self.flatten_batch, device=q.device
             )
 
         if attention_mask is None:
