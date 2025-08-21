@@ -4,7 +4,6 @@ import triton.language as tl
 from triton.testing import do_bench
 
 
-# _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit
 def _moe_sum_reduce_kernel(
     input_ptr,
@@ -29,29 +28,51 @@ def _moe_sum_reduce_kernel(
     token_block_id = tl.program_id(0)
     dim_block_id = tl.program_id(1)
 
-    token_start = token_block_id * BLOCK_M
-    token_end = min((token_block_id + 1) * BLOCK_M, token_num)
+    offs_token = token_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_dim = dim_block_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
 
-    dim_start = dim_block_id * BLOCK_DIM
-    dim_end = min((dim_block_id + 1) * BLOCK_DIM, hidden_dim)
+    mask_token = offs_token < token_num
+    mask_dim = offs_dim < hidden_dim
 
-    offs_dim = dim_start + tl.arange(0, BLOCK_DIM)
+    base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
 
-    for token_index in range(token_start, token_end):
-        accumulator = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
-        input_t_ptr = input_ptr + token_index * input_stride_0 + offs_dim
-        for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
-            tmp = tl.load(
-                input_t_ptr + i * input_stride_1, mask=offs_dim < dim_end, other=0.0
-            )
-            accumulator += tmp
-        accumulator = accumulator * routed_scaling_factor
-        store_t_ptr = output_ptr + token_index * output_stride_0 + offs_dim
-        tl.store(
-            store_t_ptr,
-            accumulator.to(input_ptr.dtype.element_ty),
-            mask=offs_dim < dim_end,
+    accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
+
+    for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
+        tile = tl.load(
+            base_ptrs + i * input_stride_1,
+            mask=mask_token[:, None] & mask_dim[None, :],
+            other=0.0,
         )
+        accumulator += tile.to(tl.float32)
+    accumulator *= routed_scaling_factor
+
+    # -------- Write back --------
+    store_ptrs = output_ptr + offs_token[:, None] * output_stride_0 + offs_dim[None, :]
+    tl.store(
+        store_ptrs,
+        accumulator.to(input_ptr.dtype.element_ty),
+        mask=mask_token[:, None] & mask_dim[None, :],
+    )
+
+
+# ---------------- Autotune wrapper ----------------
+_moe_sum_reduce_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 1, "BLOCK_DIM": 2048, "NUM_STAGE": 1}, num_warps=8),
+        triton.Config({"BLOCK_M": 1, "BLOCK_DIM": 2048, "NUM_STAGE": 1}, num_warps=16),
+        triton.Config({"BLOCK_M": 1, "BLOCK_DIM": 2048, "NUM_STAGE": 1}, num_warps=32),
+        triton.Config({"BLOCK_M": 2, "BLOCK_DIM": 2048, "NUM_STAGE": 1}, num_warps=4),
+        triton.Config({"BLOCK_M": 4, "BLOCK_DIM": 2048, "NUM_STAGE": 1}, num_warps=4),
+        triton.Config({"BLOCK_M": 8, "BLOCK_DIM": 1024, "NUM_STAGE": 1}, num_warps=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_DIM": 1024, "NUM_STAGE": 1}, num_warps=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_DIM": 512, "NUM_STAGE": 2}, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_DIM": 256, "NUM_STAGE": 2}, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_DIM": 256, "NUM_STAGE": 2}, num_warps=4),
+        triton.Config({"BLOCK_M": 256, "BLOCK_DIM": 256, "NUM_STAGE": 2}, num_warps=4),
+    ],
+    key=["token_num", "hidden_dim", "topk_num"],
+)(_moe_sum_reduce_kernel)
 
 
 def moe_sum_reduce(
@@ -63,14 +84,9 @@ def moe_sum_reduce(
     token_num, topk_num, hidden_dim = input.shape
     assert output.shape[0] == token_num and output.shape[1] == hidden_dim
 
-    BLOCK_M = 1
-    BLOCK_DIM = 2048
-    NUM_STAGE = 1
-    num_warps = 8
-
-    grid = (
-        triton.cdiv(token_num, BLOCK_M),
-        triton.cdiv(hidden_dim, BLOCK_DIM),
+    grid = lambda META: (
+        triton.cdiv(token_num, META["BLOCK_M"]),
+        triton.cdiv(hidden_dim, META["BLOCK_DIM"]),
     )
 
     _moe_sum_reduce_kernel[grid](
@@ -82,10 +98,6 @@ def moe_sum_reduce(
         topk_num=topk_num,
         hidden_dim=hidden_dim,
         routed_scaling_factor=routed_scaling_factor,
-        BLOCK_M=BLOCK_M,
-        BLOCK_DIM=BLOCK_DIM,
-        NUM_STAGE=NUM_STAGE,
-        num_warps=num_warps,
     )
     return
 
