@@ -320,7 +320,7 @@ class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
 
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestEAGLEDraftExtendExplicitDraftFlashinfer(TestEAGLEDraftExtend):
+class TestEAGLEDraftExtendExplicitDraftFA3(TestEAGLEDraftExtend):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -342,9 +342,9 @@ class TestEAGLEDraftExtendExplicitDraftFlashinfer(TestEAGLEDraftExtend):
                 "--max-running-requests",
                 4,
                 "--attention-backend",
-                "fa3",
+                "triton",
                 "--draft-attention-backend",
-                "flashinfer",
+                "fa3",
             ],
         )
         cls.accept_len_threshold = 1.5
