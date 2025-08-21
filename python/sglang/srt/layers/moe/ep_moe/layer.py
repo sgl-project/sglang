@@ -736,7 +736,7 @@ class DeepEPMoE(EPMoE):
             assert isinstance(dispatch_output, AscendDeepEPLLOutput)
         hidden_states, topk_idx, topk_weights, _, seg_indptr, _ = dispatch_output
         assert self.quant_method is not None
-        assert self.activation == "silu"
+        assert self.moe_runner_config.activation == "silu"
 
         # NOTE: Ascend's Dispatch & Combine does not support FP16
         output_dtype = torch.bfloat16
