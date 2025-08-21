@@ -80,6 +80,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
             )
+            
+        if request.response_format and request.response_format.type == "json_schema":
+            schema = getattr(request.response_format.json_schema, "schema_", None)
+            if schema is None:
+                return "schema_ is required for json_schema response format request."
+            
 
         return None
 
