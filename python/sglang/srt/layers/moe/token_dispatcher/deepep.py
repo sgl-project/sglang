@@ -323,7 +323,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx = topk_idx.to(torch.int64)
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and get_moe_runner_backend() != "cutlass_w4afp8"
+            and not get_moe_runner_backend().is_cutlass_w4afp8()
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -395,7 +395,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             expert_alignment=(
                 128
                 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and get_moe_runner_backend() != "cutlass_w4afp8"
+                and not get_moe_runner_backend().is_cutlass_w4afp8()
                 else 1
             ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
