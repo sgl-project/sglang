@@ -94,7 +94,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         if reasoning_effort is not None:
             request.reasoning_effort = reasoning_effort
-            
+
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
