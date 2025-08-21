@@ -479,11 +479,6 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-            if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "trtllm_mla backend does not support speculative decoding yet."
-                )
-
             if self.kv_cache_dtype not in ["fp8_e4m3", "auto"]:
                 raise ValueError(
                     "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
