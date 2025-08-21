@@ -44,11 +44,12 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda or _is_hip:
+if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
+    from sgl_kernel import gelu_and_mul, silu_and_mul
     from vllm import _custom_ops as vllm_ops  # gelu_and_mul, silu_and_mul
 
     if _use_aiter:
