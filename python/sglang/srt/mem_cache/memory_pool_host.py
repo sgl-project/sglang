@@ -12,7 +12,7 @@ from sglang.srt.utils import is_npu,is_xpu
 
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-if (not _is_npu and not _is_xpu):
+if not (_is_npu or _is_xpu):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_lf_pf,

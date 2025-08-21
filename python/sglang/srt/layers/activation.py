@@ -47,13 +47,10 @@ _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
-if _is_cuda:
+if (_is_cuda or _is_xpu):
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
-
-if _is_xpu:
-    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 if is_npu():
     import torch_npu
@@ -88,7 +85,7 @@ class SiluAndMul(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        out = silu_and_mul(x, out)
+        silu_and_mul(x, out)
         return out
 
 
@@ -97,33 +94,27 @@ class GeluAndMul(CustomOp):
         super().__init__()
         self.approximate = approximate
 
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        if self.approximate == "tanh":
+            gelu_tanh_and_mul(x, out)
+        elif self.approximate == "none":
+            gelu_and_mul(x, out)
+        else:
+            raise RuntimeError("GeluAndMul only support tanh or none")
+        return out
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        if self.approximate == "tanh":
-            gelu_tanh_and_mul(x, out)
-        elif self.approximate == "none":
-            gelu_and_mul(x, out)
-        else:
-            raise RuntimeError("GeluAndMul only support tanh or none")
-        return out
+        return self._forward_impl(x)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        if self.approximate == "tanh":
-            gelu_tanh_and_mul(x, out)
-        elif self.approximate == "none":
-            gelu_and_mul(x, out)
-        else:
-            raise RuntimeError("GeluAndMul only support tanh or none")
-        return out
+        return self._forward_impl(x)
 
 
 class NewGELU(CustomOp):
