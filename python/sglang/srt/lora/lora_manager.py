@@ -420,13 +420,8 @@ class LoRAManager:
     ):
         """Infer LoRA target modules and max_lora_rank from loaded adapters if not provided."""
 
-        if target_modules is not None:
-            self.target_modules = set(target_modules)
-            user_normalized_modules = get_normalized_target_modules(self.target_modules)
-        else:
-            self.target_modules = set()
-            user_normalized_modules = None
-
+        self.target_modules = get_normalized_target_modules(target_modules) if target_modules else set()
+        
         for lora_id, config in self.configs.items():
             if not isinstance(config.target_modules, list):
                 raise ValueError(
@@ -436,25 +431,26 @@ class LoRAManager:
                     "enable all support modules types. "
                 )
 
+            adapter_target_modules = get_normalized_target_modules(
+                config.target_modules
+            )
+
             if target_modules is not None:
-                config_normalized_modules = get_normalized_target_modules(
-                    config.target_modules
-                )
-                if not config_normalized_modules.issubset(user_normalized_modules):
+                # When `--lora-target-modules` is provided, validate adapter target modules is a subset of the specified target modules.
+                if not adapter_target_modules.issubset(self.target_modules):
                     unsupported_modules = (
-                        config_normalized_modules - user_normalized_modules
+                        adapter_target_modules - self.target_modules
                     )
                     lora_name = self.lora_refs[lora_id].lora_name
                     raise ValueError(
                         f"LoRA adapter '{lora_name}' contains target modules {sorted(unsupported_modules)} "
-                        f"that are not included in the specified --lora-target-modules {sorted(user_normalized_modules)}. "
+                        f"that are not included in the specified --lora-target-modules {sorted(self.target_modules)}. "
                         f"Please update --lora-target-modules to include all required modules: "
-                        f"{sorted(user_normalized_modules | config_normalized_modules)}, or use 'all' to enable all supported modules."
+                        f"{sorted(self.target_modules | adapter_target_modules)}, or use 'all' to enable all supported modules."
                     )
             else:
-                self.target_modules.update(config.target_modules)
-
-        self.target_modules = get_normalized_target_modules(self.target_modules)
+                # Otherwise, infer target_modules from adapter configs.
+                self.target_modules.update(adapter_target_modules)
 
         if max_lora_rank is not None:
             self.max_lora_rank = max_lora_rank
