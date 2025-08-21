@@ -737,8 +737,8 @@ class ResponsesRequest(BaseModel):
         else:
             max_tokens = default_max_tokens
 
-        # Avoid exceed the context length by minus 1 token
-        max_tokens -= 1
+        # Avoid exceed the context length by minus 2 token
+        max_tokens -= 2
 
         # Get parameters with defaults
         temperature = self.temperature
