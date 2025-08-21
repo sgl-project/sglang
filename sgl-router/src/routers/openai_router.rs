@@ -184,9 +184,9 @@ impl super::RouterTrait for OpenAIRouter {
                 content: crate::protocols::openai::chat::types::UserMessageContent::Text(text),
                 ..
             }) => text.clone(),
-            Some(crate::protocols::openai::chat::types::ChatMessage::System { content, .. }) => {
-                content.clone()
-            }
+            Some(crate::protocols::openai::chat::types::ChatMessage::System {
+                content, ..
+            }) => content.clone(),
             _ => {
                 return (
                     StatusCode::BAD_REQUEST,
