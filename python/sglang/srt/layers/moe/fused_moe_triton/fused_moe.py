@@ -50,13 +50,14 @@ elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, silu_and_mul
-    from vllm import _custom_ops as vllm_ops  # gelu_and_mul, silu_and_mul
 
     if _use_aiter:
         try:
             from aiter import moe_sum
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+    else:
+        from vllm import _custom_ops as vllm_ops
 
 
 if _is_cuda or _is_hip:
@@ -1547,7 +1548,7 @@ def fused_experts_impl(
         elif activation == "gelu":
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_cuda:
+            if _is_cuda or _is_hip:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 vllm_ops.gelu_and_mul(
