@@ -1185,6 +1185,9 @@ def sample_random_image_requests(
             "Please install Pillow to generate random images: pip install pillow"
         ) from e
 
+    # Parse resolution (supports presets and 'heightxwidth')
+    width, height = parse_random_image_resolution(image_resolution)
+
     # Check for potentially problematic combinations and warn user
     if width * height >= 1920 * 1080 and num_images * num_requests >= 100:
         warnings.warn(
@@ -1193,9 +1196,6 @@ def sample_random_image_requests(
             UserWarning,
             stacklevel=2,
         )
-
-    # Parse resolution (supports presets and 'heightxwidth')
-    width, height = parse_random_image_resolution(image_resolution)
 
     # Sample text lengths
     input_lens = np.random.randint(
