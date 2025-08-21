@@ -109,6 +109,12 @@ class LlamaModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+
+        self.is_mrope_enabled = hasattr(config, "rope_scaling") and config.rope_scaling is not None and "mrope_section" in config.rope_scaling
+        # fix rope_scaling for qwen2.5-vl
+        if self.is_mrope_enabled:
+            config.rope_scaling["rope_type"] = "default"
+
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -130,8 +136,6 @@ class LlamaModel(nn.Module):
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.is_mrope_enabled = hasattr(config, "rope_scaling") and config.rope_scaling is not None and "mrope_section" in config.rope_scaling
 
     def forward(
         self,
@@ -181,10 +185,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
-
-        # fix rope_scaling for qwen2.5-vl
-        if hasattr(self.config, "rope_scaling") and self.config.rope_scaling is not None and self.config.rope_scaling["rope_type"] == "mrope":
-            self.config.rope_scaling["rope_type"] = "default"
             
         if self.config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
