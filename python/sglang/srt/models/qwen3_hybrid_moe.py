@@ -11,6 +11,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     make_layers,
     add_prefix,
+    is_cuda,
 )
 from sglang.srt.distributed import (
     divide,
@@ -18,6 +19,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_rank,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -78,6 +80,148 @@ from fla.ops.gated_delta_rule import (
 )
 
 logger = logging.getLogger(__name__)
+_is_cuda = is_cuda()
+
+import triton
+import triton.language as tl
+@triton.jit
+def fused_qkvzba_split_reshape_cat_kernel(
+    mixed_qkv,
+    z,
+    b,
+    a,
+    mixed_qkvzba,
+    NUM_HEADS_QK: tl.constexpr,
+    NUM_HEADS_V: tl.constexpr,
+    HEAD_QK: tl.constexpr,
+    HEAD_V: tl.constexpr,
+):
+    i_bs, i_qk = tl.program_id(0), tl.program_id(1)
+    QKVZBA_DIM_T: tl.constexpr = (HEAD_QK * 2 +
+                                  NUM_HEADS_V // NUM_HEADS_QK * HEAD_V * 2 +
+                                  NUM_HEADS_V // NUM_HEADS_QK * 2)
+    QKV_DIM_T: tl.constexpr = (HEAD_QK * 2 +
+                               NUM_HEADS_V // NUM_HEADS_QK * HEAD_V)
+    q_end: tl.constexpr = HEAD_QK
+    blk_q_ptr = mixed_qkvzba + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T + i_qk * QKVZBA_DIM_T + tl.arange(
+        0, q_end)
+    k_end: tl.constexpr = q_end + HEAD_QK
+    blk_k_ptr = mixed_qkvzba + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T + i_qk * QKVZBA_DIM_T + tl.arange(
+        q_end, k_end)
+    v_end: tl.constexpr = k_end + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
+    blk_v_ptr = mixed_qkvzba + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T + i_qk * QKVZBA_DIM_T + tl.arange(
+        k_end, v_end)
+    z_end: tl.constexpr = v_end + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
+    blk_z_ptr = mixed_qkvzba + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T + i_qk * QKVZBA_DIM_T + tl.arange(
+        v_end, z_end)
+    blk_q_st_ptr = mixed_qkv + i_bs * NUM_HEADS_QK * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(
+        0, HEAD_QK)
+    blk_k_st_ptr = mixed_qkv + i_bs * NUM_HEADS_QK * QKV_DIM_T + NUM_HEADS_QK * HEAD_QK + i_qk * HEAD_QK + tl.arange(
+        0, HEAD_QK)
+    blk_v_st_ptr = mixed_qkv + i_bs * NUM_HEADS_QK * QKV_DIM_T + NUM_HEADS_QK * HEAD_QK * 2 + i_qk * HEAD_V * NUM_HEADS_V // NUM_HEADS_QK + tl.arange(
+        0, HEAD_V * NUM_HEADS_V // NUM_HEADS_QK)
+    blk_z_st_ptr = z + i_bs * NUM_HEADS_V * HEAD_V + i_qk * HEAD_V * NUM_HEADS_V // NUM_HEADS_QK + tl.arange(
+        0, HEAD_V * NUM_HEADS_V // NUM_HEADS_QK)
+    tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
+    tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
+    tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
+    tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
+    b_end: tl.constexpr = z_end + NUM_HEADS_V // NUM_HEADS_QK
+    a_end: tl.constexpr = b_end + NUM_HEADS_V // NUM_HEADS_QK
+    for i in tl.static_range(z_end, b_end):
+        blk_b_ptr = mixed_qkvzba + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T + i_qk * QKVZBA_DIM_T + i
+        blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * NUM_HEADS_V // NUM_HEADS_QK + (
+            i - z_end)
+        tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
+    for i in tl.static_range(b_end, a_end):
+        blk_a_ptr = mixed_qkvzba + i_bs * NUM_HEADS_QK * QKVZBA_DIM_T + i_qk * QKVZBA_DIM_T + i
+        blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * NUM_HEADS_V // NUM_HEADS_QK + (
+            i - b_end)
+        tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
+
+def fused_qkvzba_split_reshape_cat(
+    mixed_qkvzba,
+    num_heads_qk,
+    num_heads_v,
+    head_qk,
+    head_v,
+):
+    batch, seq_len = mixed_qkvzba.shape[0], 1
+    qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+    mixed_qkv = torch.empty([batch * seq_len, qkv_dim_t],
+                            dtype=mixed_qkvzba.dtype,
+                            device=mixed_qkvzba.device)
+    z = torch.empty([batch * seq_len, num_heads_v, head_v],
+                    dtype=mixed_qkvzba.dtype,
+                    device=mixed_qkvzba.device)
+    b = torch.empty([batch * seq_len, num_heads_v],
+                    dtype=mixed_qkvzba.dtype,
+                    device=mixed_qkvzba.device)
+    a = torch.empty_like(b)
+    grid = (batch * seq_len, num_heads_qk)
+    fused_qkvzba_split_reshape_cat_kernel[grid](
+        mixed_qkv,
+        z,
+        b,
+        a,
+        mixed_qkvzba,
+        num_heads_qk,
+        num_heads_v,
+        head_qk,
+        head_v,
+        num_warps=1,
+        num_stages=3,
+    )
+    return mixed_qkv, z, b, a
+
+
+# g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+@triton.jit(do_not_specialize=['batch'])
+def fused_gdn_gating_kernel(
+    g,
+    A_log,
+    a,
+    dt_bias,
+    batch,
+    seq_len,
+    NUM_HEADS: tl.constexpr,
+    beta: tl.constexpr,
+    threshold: tl.constexpr,
+    BLK_HEADS: tl.constexpr,
+):
+    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
+    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    blk_A_log = tl.load(A_log + head_off)
+    blk_a = tl.load(a + off)
+    blk_bias = tl.load(dt_bias + head_off)
+    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
+    softplus_x = tl.where(beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x)
+    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
+    tl.store(g + off, blk_g.to(g.dtype.element_ty))
+def fused_gdn_gating(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+) -> torch.Tensor:
+    batch, num_heads = a.shape
+    seq_len = 1
+    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
+    g = torch.empty_like(a, dtype=torch.float32)
+    fused_gdn_gating_kernel[grid](g,
+                                  A_log,
+                                  a,
+                                  dt_bias,
+                                  batch,
+                                  seq_len,
+                                  num_heads,
+                                  beta,
+                                  threshold,
+                                  8,
+                                  num_warps=1)
+    return g
 
 class Qwen3GatedDeltaNet(nn.Module):
     def __init__(
@@ -251,19 +395,25 @@ class Qwen3GatedDeltaNet(nn.Module):
         if cache_params is None:
             raise ValueError("cache_params cannot be None")
 
+        has_prefill = forward_batch.forward_mode.is_prefill()
+
         projected_states, _ = self.in_proj(hidden_states)
-        query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states,)
-        query, key, value = map(lambda x: rearrange(x, 'l p d -> l (p d)'), (query, key, value))
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
+
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not has_prefill:
+            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
+                projected_states, triton.cdiv(self.num_k_heads, self.attn_tp_size),
+                triton.cdiv(self.num_v_heads, self.attn_tp_size), self.head_k_dim,
+                self.head_v_dim)
+        else:
+            query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states,)
+            query, key, value = map(lambda x: rearrange(x, 'l p d -> l (p d)'), (query, key, value))
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
         # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
 
         # 2. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
                                                self.conv1d.weight.size(2))
 
-        # TODO(cao1zhg):
-        # has_initial_states, attn_metadata.query_start_loc
-        has_prefill = forward_batch.forward_mode.is_prefill()
 
         if has_prefill:
             # - "cache_indices" updates the conv_state cache in positions
@@ -302,7 +452,10 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        if has_prefill:
+            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        else:
+            g = fused_gdn_gating(self.A_log, a, self.dt_bias)
 
         g, beta = map(lambda x: rearrange(x, 'l  d -> 1 l d'), (g, beta))
         
@@ -362,7 +515,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         config: Qwen3HybridMoeConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -444,7 +598,8 @@ class Qwen3HybridMixerDecoderLayer(nn.Module):
         config: Qwen3HybridMoeConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -535,12 +690,14 @@ class Qwen3HybridMixerDecoderLayer(nn.Module):
 
 
 class Qwen3HybridAttentionDecoderLayer(nn.Module):
+    
     def __init__(
         self,
         config: Qwen3HybridMoeConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -666,6 +823,29 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
+        self.alt_stream = alt_stream
+    
+    def _apply_qk_norm(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # overlap qk norm
+        if self.alt_stream is not None and get_is_capture_mode():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            with torch.cuda.stream(self.alt_stream):
+                k_by_head = k.reshape(-1, self.head_dim)
+                k_by_head = self.k_norm(k_by_head)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            k_by_head = k.reshape(-1, self.head_dim)
+            k_by_head = self.k_norm(k_by_head)
+        q = q_by_head.view(q.shape)
+        k = k_by_head.view(k.shape)
+        return q, k
 
     def self_attention(
         self,
@@ -686,12 +866,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         
         if self.config.use_qk_norm:
-            q = self.q_norm.forward_native(q.view(-1, self.num_heads, self.head_dim))
-            assert isinstance(q, torch.Tensor)
-            q = q.view(-1, self.num_heads * self.head_dim)
-            k = self.k_norm.forward_native(k.view(-1, self.num_kv_heads, self.head_dim))
-            assert isinstance(k, torch.Tensor)
-            k = k.view(-1, self.num_kv_heads * self.head_dim)
+            q, k = self._apply_qk_norm(q, k)
 
         if self.position_embedding_type == "rope":
             q, k = self.rotary_emb(positions, q, k)
@@ -753,6 +928,8 @@ class Qwen3HybridMoeModel(nn.Module):
         super().__init__()
         self.config = config
 
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -768,6 +945,7 @@ class Qwen3HybridMoeModel(nn.Module):
                 idx,
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=alt_stream,
             )
 
         # self.start_layer, self.end_layer, self.layers = make_layers(
