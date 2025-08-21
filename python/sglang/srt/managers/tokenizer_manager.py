@@ -576,7 +576,7 @@ class TokenizerManager:
                     f"model's context length ({self.context_len} tokens). "
                     "Truncating the input."
                 )
-                input_ids = input_ids[:_max_req_len]
+                del input_ids[_max_req_len:]
                 input_token_num = len(input_ids)
             else:
                 raise ValueError(
