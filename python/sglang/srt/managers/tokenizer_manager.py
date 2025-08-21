@@ -566,7 +566,7 @@ class TokenizerManager:
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
-        _max_req_len = self.context_len - 1
+        _max_req_len = self.context_len
 
         input_token_num = len(input_ids) if input_ids is not None else 0
         if input_token_num >= self.context_len:
@@ -576,7 +576,7 @@ class TokenizerManager:
                     f"model's context length ({self.context_len} tokens). "
                     "Truncating the input."
                 )
-                input_ids = input_ids[:_max_req_len]
+                del input_ids[_max_req_len:]
                 input_token_num = len(input_ids)
             else:
                 raise ValueError(

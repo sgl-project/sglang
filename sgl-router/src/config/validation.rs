@@ -344,6 +344,11 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        // IGW mode is independent - skip other compatibility checks when enabled
+        if config.enable_igw {
+            return Ok(());
+        }
+
         // All policies are now supported for both router types thanks to the unified trait design
         // No mode/policy restrictions needed anymore
 
