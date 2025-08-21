@@ -429,12 +429,16 @@ def get_available_gpu_memory(
                 ctypes.POINTER(ctypes.c_longlong),
             ]
             libnuma.numa_node_size64.restype = ctypes.c_longlong
-            if gpu_id < 0 or gpu_id > libnuma.numa_max_node():
-                free_gpu_memory = psutil.virtual_memory().available
-            else:
+            max_numa_index = libnuma.numa_max_node()
+            if 0 <= gpu_id <= max_numa_index:
                 free_size = ctypes.c_longlong()
                 libnuma.numa_node_size64(gpu_id, ctypes.byref(free_size))
                 free_gpu_memory = free_size.value
+            else:
+                raise ValueError(
+                    f"The rank index should be between 0-{max_numa_index} but {gpu_id} is detected. "
+                    "Please check your settings to correct it."
+                )
 
     elif device == "npu":
         num_gpus = torch.npu.device_count()
