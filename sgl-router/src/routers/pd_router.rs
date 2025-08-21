@@ -791,7 +791,7 @@ impl PDRouter {
                             .await;
 
                         // Record outcomes for circuit breakers
-                        let _status = response.status()
+                        let _status = response.status();
                         let not_error = _status.is_success() || _status.is_client_error();
                         prefill.record_outcome(not_error);
                         decode.record_outcome(not_error);
@@ -884,6 +884,8 @@ impl PDRouter {
                         );
 
                         if context.is_stream {
+                            let response_headers =
+                                header_utils::preserve_response_headers(res.headers());
                             let error_message = match res.bytes().await {
                                 Ok(error_body) => {
                                     if let Ok(error_json) = serde_json::from_slice::<Value>(&error_body) {
@@ -910,6 +912,7 @@ impl PDRouter {
                                 None,
                                 context.return_logprob,
                                 Some(decode.url().to_string()),
+                                Some(response_headers),
                             );
                         } else {
                             match res.bytes().await {
