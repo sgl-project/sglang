@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -923,6 +924,12 @@ class FusedMoE(torch.nn.Module):
             for shard_id in ["w1", "w2", "w3"]
         ]
 
+    def should_fuse_routed_scaling_factor_in_topk(self):
+        return isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod) or (
+            isinstance(self.quant_method, Fp8MoEMethod)
+            and self.quant_method.use_cutlass_fused_experts_fp8
+        )
+
 
 class FlashInferFusedMoE(FusedMoE):
     def __init__(self, *args, **kwargs):
@@ -932,11 +939,11 @@ class FlashInferFusedMoE(FusedMoE):
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         assert self.use_flashinfer_trtllm_moe
         assert (
-            self.activation == "silu"
+            self.moe_runner_config.activation == "silu"
         ), "Only silu is supported for flashinfer blockscale fp8 moe"
         assert self.quant_method is not None
         assert (
-            self.renormalize
+            topk_output.topk_config.renormalize
         ), "Renormalize is required for flashinfer blockscale fp8 moe"
         assert (
             self.num_fused_shared_experts == 0
