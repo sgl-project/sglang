@@ -63,10 +63,7 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        metadata = ForwardMetaData()
-        self.forward_metadata = metadata
-        print(f"---> DEBUG: {forward_mode.is_decode_or_idle()=} {forward_mode.is_target_verify()=} {forward_mode.is_draft_extend()}", flush=True)
-        assert False, "this should fail not does not"
+        raise RuntimeError("Prefill attention should not be captured in CUDA graphs.")
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -80,8 +77,7 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
-        print(f"---> DEBUG: {forward_mode.is_decode_or_idle()=} {forward_mode.is_target_verify()=} {forward_mode.is_draft_extend()}", flush=True)
-        assert False, "this should fail not does not"
+        raise RuntimeError("Prefill attention should not be replayed in CUDA graphs.")
 
     def forward_extend(
         self,
