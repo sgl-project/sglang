@@ -462,7 +462,7 @@ class HiRadixCache(RadixCache):
                     free_request_ids + [0] * (max_list_size - list_size),
                     dtype=torch.int,
                 )
-                list_values = [torch.zeros_like(list_value) for _ in self.tp_world_size]
+                list_values = [torch.zeros_like(list_value) for _ in range(self.tp_world_size)]
                 torch.distributed.all_gather(
                     list_values,
                     list_value,
