@@ -720,7 +720,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
                     paged_kernel_lens,
                     paged_kernel_lens_sum,
                     self.req_to_token,
-                    self.page_size,
                 )
             )
         if use_ragged:
