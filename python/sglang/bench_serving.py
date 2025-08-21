@@ -43,7 +43,6 @@ ASSISTANT_SUFFIX = "Assistant:"
 
 global args
 
-MOONCAKE_TRACE_URL = "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl"
 
 # don't want to import sglang package here
 def _get_bool_env_var(name: str, default: str = "false") -> bool:
@@ -681,16 +680,21 @@ def get_dataset(args, tokenizer):
             random_sample=True,
         )
     elif args.dataset_name == "mooncake":
-        assert not tokenize_prompt
-        input_requests = sample_mooncake_requests(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.sharegpt_output_len,
-            context_len=args.sharegpt_context_len,
-            prompt_suffix=args.prompt_suffix,
-            apply_chat_template=args.apply_chat_template,
-        )
+        # For mooncake, we don't generate the prompts here.
+        # We just load the raw trace data. The async generator will handle the rest.
+        if not args.dataset_path:
+            local_path = os.path.join("/tmp", "conversation_trace.jsonl")
+        else:
+            local_path = args.dataset_path
+
+        if not os.path.exists(local_path):
+            download_and_cache_file(MOONCAKE_DATASET_URL, local_path)
+
+        with open(local_path, "r") as f:
+            all_requests_data = [json.loads(line) for line in f if line.strip()]
+
+        # Limit the number of requests based on --num-prompts
+        input_requests = all_requests_data[:args.num_prompts]
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -805,6 +809,72 @@ class DatasetRow:
     image_data: Optional[str] = None
     timestamp: Optional[float] = None
 
+
+async def get_mooncake_request_over_time(
+    input_requests: List[Dict],
+    tokenizer: PreTrainedTokenizerBase,
+    slowdown_factor: float,
+    num_rounds: int,
+) -> AsyncGenerator[DatasetRow, None]:
+    """
+    An async generator that yields requests based on the timestamps in the Mooncake trace file,
+    with support for multi-round sessions.
+    """
+    if not input_requests:
+        return
+
+    input_requests.sort(key=lambda r: r['timestamp'])
+
+    start_time = time.perf_counter()
+    trace_start_time_ms = input_requests[0]['timestamp']
+
+    for record in input_requests:
+        # Calculate when this entire session should start
+        relative_arrival_time_s = (record['timestamp'] - trace_start_time_ms) / 1000.0
+        target_arrival_time_s = relative_arrival_time_s * slowdown_factor
+
+        current_elapsed_time_s = time.perf_counter() - start_time
+        sleep_duration_s = target_arrival_time_s - current_elapsed_time_s
+        if sleep_duration_s > 0:
+            await asyncio.sleep(sleep_duration_s)
+
+        # Once the session starts, generate all rounds for it as a burst
+        # This simulates a user engaging in a multi-turn conversation
+
+        # Base user query constructed from hash_ids
+        user_query_base = ""
+        hash_ids = record.get("hash_ids", [])
+        for hash_id in hash_ids:
+            user_query_base += f"{hash_id}" + " ".join(["hi"] * 128) # Shorter for multi-round
+        user_query_base += "Tell me a story based on this context."
+
+        output_len_per_round = record.get("output_length", 256)
+        chat_history = []
+
+        for i in range(num_rounds):
+            # Add user query for the current round
+            chat_history.append({"role": "user", "content": f"Round {i+1}: {user_query_base}"})
+
+            # Form the full prompt from history
+            try:
+                full_prompt_text = tokenizer.apply_chat_template(
+                    chat_history, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                full_prompt_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
+
+            prompt_len = len(tokenizer.encode(full_prompt_text))
+
+            yield DatasetRow(
+                prompt=full_prompt_text,
+                prompt_len=prompt_len,
+                output_len=output_len_per_round,
+            )
+
+            # Add a placeholder assistant response for the next round's context
+            # We use a placeholder because we don't know the real response
+            placeholder_response = " ".join(["story"] * output_len_per_round)
+            chat_history.append({"role": "assistant", "content": placeholder_response})
 
 def sample_mmmu_requests(
     num_requests: int,
@@ -1125,57 +1195,6 @@ def sample_random_requests(
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
 
-def sample_mooncake_requests(
-    dataset_path: str,
-    num_requests: int,
-    tokenizer: PreTrainedTokenizerBase,
-    fixed_output_len: Optional[int] = None,
-    context_len: Optional[int] = None,
-    prompt_suffix: Optional[str] = "",
-    apply_chat_template=False,
-) -> List[DatasetRow]:
-    # Use default path if none is provided
-    if not dataset_path:
-        dataset_path = "conversation_trace.jsonl"
-
-    # Download the file if it does not exist.
-    if not os.path.exists(dataset_path):
-        print(f"Dataset file '{dataset_path}' not found.")
-        download_and_cache_file(MOONCAKE_TRACE_URL, dataset_path)
-
-    print(f"Loading Mooncake dataset from {dataset_path}...")
-
-    requests = []
-    with open(dataset_path, "r") as f:
-        for i, line in enumerate(f):
-            if len(requests) == num_requests:
-                break
-            try:
-                row = json.loads(line)
-                prompt = ""
-                for hash_id in row["hash_ids"]:
-                    prompt += f"{hash_id}" + " ".join(["hi"] * 512)
-                prompt += "Can you tell me a detailed story in 1000 words?"
-
-                prompt_token_ids = tokenizer.encode(prompt)
-                prompt_len = len(prompt_token_ids)
-                output_len = row["output_length"]
-
-                requests.append(
-                    DatasetRow(
-                        prompt=prompt,
-                        prompt_len=prompt_len,
-                        output_len=output_len,
-                        timestamp=row["timestamp"],
-                    )
-                )
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"Skipping malformed line {i+1} in {dataset_path}: {e}")
-
-    requests.sort(key=lambda r: r.timestamp)
-    print(f"Loaded and processed {len(requests)} requests from {dataset_path}.")
-    return requests
-
 
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
@@ -1338,7 +1357,7 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            total_input += input_requests[i].prompt_len
+            total_input += outputs[i].prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
@@ -1411,7 +1430,8 @@ async def benchmark(
     flush_cache: bool = False,
     warmup_requests: int = 1,
     use_trace_timestamps: bool = False,
-    slowdown_factor: float = 1.0,
+    mooncake_slowdown_factor = 1.0,
+    mooncake_num_rounds = 1,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1431,8 +1451,32 @@ async def benchmark(
     # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
 
-    # Use the first request for all warmup iterations
-    test_request = input_requests[0]
+    # Handle the data structure difference for the warmup request
+    if args.dataset_name == "mooncake":
+        # For mooncake, input_requests is a list of dicts.
+        # We need to build a temporary DatasetRow for the warmup phase.
+        warmup_record = input_requests[0]
+
+        # Build prompt from hash_ids, just like in the async generator
+        hash_ids = warmup_record.get("hash_ids", [])
+        prompt_text = ""
+        for hash_id in hash_ids:
+            prompt_text += f"{hash_id}" + " ".join(["hi"] * 512)
+        prompt_text += "Can you tell me a detailed story in 1000 words?"
+
+        output_len = warmup_record.get("output_length", 32)
+        prompt_len = len(tokenizer.encode(prompt_text))
+
+        # Create a temporary DatasetRow object for warmup
+        test_request = DatasetRow(
+            prompt=prompt_text,
+            prompt_len=prompt_len,
+            output_len=output_len,
+            image_data=None, # Mooncake doesn't have image data
+        )
+    else:
+        # For all other datasets, input_requests is a list of DatasetRow objects
+        test_request = input_requests[0]
 
     if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
@@ -1486,12 +1530,22 @@ async def benchmark(
         if profile_output.success:
             print("Profiler started")
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
-
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate, use_trace_timestamps, slowdown_factor):
+    pbar_total = len(input_requests)
+    if backend == "sglang" and args.dataset_name == "mooncake": # Assuming mooncake is mainly for sglang or similar backends
+        print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
+        request_generator = get_mooncake_request_over_time(
+            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
+        )
+        print(f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}")
+        pbar_total *= args.mooncake_num_rounds
+    else:
+        request_generator = get_request(input_requests, request_rate)
+
+    pbar = None if disable_tqdm else tqdm(total=pbar_total)
+    async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
@@ -1863,7 +1917,8 @@ def run_benchmark(args_: argparse.Namespace):
             flush_cache=args.flush_cache,
             warmup_requests=args.warmup_requests,
             use_trace_timestamps=args.use_trace_timestamps,
-            slowdown_factor=args.slowdown_factor,
+            mooncake_slowdown_factor=args.mooncake_slowdown_factor,
+            mooncake_num_rounds=args.mooncake_num_rounds,
         )
     )
 
@@ -2106,6 +2161,22 @@ if __name__ == "__main__":
         type=int,
         default=256,
         help="Target length in tokens for outputs in generated-shared-prefix dataset",
+    )
+    mooncake_group = parser.add_argument_group("mooncake dataset arguments")
+    mooncake_group.add_argument(
+        "--mooncake-slowdown-factor",
+        type=float,
+        default=1.0,
+        help="Slowdown factor for replaying the mooncake trace. "
+             "A value of 2.0 means the replay is twice as slow. "
+             "NOTE: --request-rate is IGNORED in mooncake mode.",
+    )
+    mooncake_group.add_argument(
+        "--mooncake-num-rounds",
+        type=int,
+        default=1,
+        help="Number of conversation rounds for each session in the mooncake dataset. "
+             "A value > 1 will enable true multi-turn session benchmarking.",
     )
     args = parser.parse_args()
     run_benchmark(args)
