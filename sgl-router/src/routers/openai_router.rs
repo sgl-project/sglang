@@ -177,21 +177,23 @@ impl super::RouterTrait for OpenAIRouter {
             body.model.as_str()
         };
 
-        // Simple message conversion - just take the first user message for now
-        let user_content = if let Some(first_msg) = body.messages.first() {
-            match first_msg {
-                crate::protocols::openai::chat::types::ChatMessage::User {
-                    content: crate::protocols::openai::chat::types::UserMessageContent::Text(text),
-                    ..
-                } => text.clone(),
-                crate::protocols::openai::chat::types::ChatMessage::User { .. } => "Hello".to_string(),
-                crate::protocols::openai::chat::types::ChatMessage::System { content, .. } => {
-                    content.clone()
-                }
-                _ => "Hello".to_string(),
+        // For now, just extract text from the first message
+        // TODO: Properly convert all messages to OpenAI format
+        let user_content = match body.messages.first() {
+            Some(crate::protocols::openai::chat::types::ChatMessage::User {
+                content: crate::protocols::openai::chat::types::UserMessageContent::Text(text),
+                ..
+            }) => text.clone(),
+            Some(crate::protocols::openai::chat::types::ChatMessage::System { content, .. }) => {
+                content.clone()
             }
-        } else {
-            "Hello".to_string()
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "First message must be a text user or system message",
+                )
+                    .into_response();
+            }
         };
 
         // Use the content for OpenAI request
