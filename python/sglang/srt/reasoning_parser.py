@@ -186,6 +186,23 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class SeedOssDetector(BaseReasoningFormatDetector):
+    """
+    Detector for SeedOSS model.
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+        # SeedOSS is assumed to be reasoning until `</seed:think>` token
+        super().__init__(
+            "<seed:think>",
+            "</seed:think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+
+
 class GptOssDetector(BaseReasoningFormatDetector):
     """
     Detector for T4-style reasoning format.
@@ -519,6 +536,7 @@ class ReasoningParser:
         "kimi": KimiDetector,
         "step3": DeepSeekR1Detector,
         "gpt-oss": GptOssDetector,
+        "seed_oss": SeedOssDetector,
     }
 
     def __init__(
