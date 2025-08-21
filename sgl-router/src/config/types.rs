@@ -51,6 +51,9 @@ pub struct RouterConfig {
     pub disable_circuit_breaker: bool,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
+    /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
+    #[serde(default)]
+    pub enable_igw: bool,
 }
 
 /// Routing mode configuration
@@ -333,6 +336,7 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
         }
     }
 }
@@ -387,6 +391,11 @@ impl RouterConfig {
             cfg.failure_threshold = u32::MAX;
         }
         cfg
+    }
+
+    /// Check if running in IGW (Inference Gateway) mode
+    pub fn is_igw_mode(&self) -> bool {
+        self.enable_igw
     }
 }
 
@@ -483,6 +492,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -915,6 +925,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -971,6 +982,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1023,6 +1035,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            enable_igw: false,
         };
 
         assert!(config.has_service_discovery());
