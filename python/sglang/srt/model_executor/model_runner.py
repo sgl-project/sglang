@@ -343,7 +343,7 @@ class ModelRunner:
 
     #         with self.maybe_randomize_inputs(input_ids), set_forward_context(
     #                 attn_metadata,
-    #                 self.vllm_config,
+    #                 self.config,
     #                 num_tokens=num_tokens,
     #                 num_tokens_across_dp=num_tokens_across_dp):
     #             outputs = model(

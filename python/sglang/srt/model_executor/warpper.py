@@ -30,24 +30,6 @@ class TorchCompileWrapperWithCustomDispatcher:
     def __init__(self,
                  compiled_callable: Optional[Callable] = None,
                  compilation_level: int = 0):
-
-        vllm_config = get_current_vllm_config()
-        self.vllm_config = vllm_config
-        if compiled_callable is None:
-            # default compilation settings
-            # compiling the forward method
-            backend = vllm_config.compilation_config.init_backend(vllm_config)
-            options = None
-            if isinstance(backend, str) and backend == "inductor":
-                options = get_current_vllm_config(
-                ).compilation_config.inductor_compile_config
-
-            compiled_callable = torch.compile(
-                self.forward,
-                fullgraph=False,
-                backend=backend,
-                options=options)
-
         self.compiled_callable = compiled_callable
         self.original_code_object = self.__class__.forward.__code__
         self.compiled_codes: list[CodeType] = []
@@ -56,8 +38,7 @@ class TorchCompileWrapperWithCustomDispatcher:
         # read the env var to determine whether to use the custom dispatcher
         # subclasses can use this to switch between the custom dispatcher
         # and the default Dynamo guard mechanism.
-        self.use_custom_dispatcher: bool = \
-            compilation_level >= CompilationLevel.DYNAMO_ONCE
+        self.use_custom_dispatcher: True
 
     def __call__(self, *args, **kwargs):
         """Implement the dispatch logic here, beyond the torch.compile level.

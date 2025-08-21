@@ -268,10 +268,6 @@ def _support_torch_compile(
                         raise ValueError(
                             "Unsupported dynamic dimensions"
                             f" {dims} for argument {k} with type {type(arg)}.")
-            # here, it is the starting point of the `torch.compile` process
-            # start_monitoring_torch_compile(self.vllm_config)
-            # logger.debug("Start compiling function %s",
-            #              self.original_code_object)
 
         # if we don't use custom dispatcher, we can directly call the
         # compiled function and let torch.compile handle the dispatching,
@@ -288,7 +284,7 @@ def _support_torch_compile(
             # properly when any of these files change.
 
             # 1. the file containing the top-level forward function
-            self.vllm_config.compilation_config.traced_files.add(
+            self.config.compilation_config.traced_files.add(
                 self.original_code_object.co_filename)
 
             # 2. every time Dynamo sees a function call, it will inline
@@ -299,7 +295,7 @@ def _support_torch_compile(
 
             def patched_inline_call(parent, func, args, kwargs):
                 code = func.get_code()
-                self.vllm_config.compilation_config.traced_files.add(
+                self.config.compilation_config.traced_files.add(
                     code.co_filename)
                 return inline_call(parent, func, args, kwargs)
 
