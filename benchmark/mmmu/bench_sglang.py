@@ -153,7 +153,7 @@ async def eval_mmmu(args) -> None:
                 else None
             )
             process_result(
-                answer.group(1).strip() if answer else response.strip(),
+                answer.group(1).strip() if answer else response,
                 sample,
                 answer_dict,
                 out_samples,
@@ -176,7 +176,7 @@ async def eval_mmmu(args) -> None:
                 else None
             )
             process_result(
-                answer.group(1).strip() if answer else response.strip(),
+                answer.group(1).strip() if answer else response,
                 sample,
                 answer_dict,
                 out_samples,
