@@ -11,12 +11,9 @@ class StreamingParseResult:
         self,
         normal_text: Optional[str] = None,
         reasoning_text: Optional[str] = None,
-        tool_calls: Optional[list] = None,
     ):
         self.normal_text = normal_text or ""
         self.reasoning_text = reasoning_text or ""
-        self.reasoning_text = reasoning_text or ""
-        self.tool_calls = tool_calls or []
 
 
 class BaseReasoningFormatDetector:
@@ -218,12 +215,11 @@ class GptOssDetector(BaseReasoningFormatDetector):
             [e.content for e in events if e.event_type == "reasoning"]
         )
         normal_text = "".join([e.content for e in events if e.event_type == "normal"])
-        tool_calls = [e.content for e in events if e.event_type == "tool_call"]
+        # Tool call events are ignored in reasoning parser context
 
         return StreamingParseResult(
             normal_text=normal_text,
             reasoning_text=reasoning_text,
-            tool_calls=tool_calls,
         )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
@@ -233,12 +229,11 @@ class GptOssDetector(BaseReasoningFormatDetector):
             [e.content for e in events if e.event_type == "reasoning"]
         )
         normal_text = "".join([e.content for e in events if e.event_type == "normal"])
-        tool_calls = [e.content for e in events if e.event_type == "tool_call"]
+        # Tool call events are ignored in reasoning parser context
 
         return StreamingParseResult(
             normal_text=normal_text,
             reasoning_text=reasoning_text,
-            tool_calls=tool_calls,
         )
 
 
