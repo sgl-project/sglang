@@ -87,6 +87,14 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         request: ChatCompletionRequest,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        reasoning_effort = (
+            request.chat_template_kwargs.pop("reasoning_effort", None)
+            if request.chat_template_kwargs
+            else None
+        )
+        if reasoning_effort is not None:
+            request.reasoning_effort = reasoning_effort
+
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
