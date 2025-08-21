@@ -40,8 +40,8 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from sglang.srt.layers.moe.rocm_aiter_fused_moe import (
-        rocm_aiter_fused_experts,
+    from sglang.srt.layers.moe.rocm_moe_utils import (
+        rocm_fused_experts_tkw1,
         shuffle_weights,
     )
 
@@ -304,7 +304,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             and moe_runner_config.apply_router_weight_on_input
         ):
             topk_weights, topk_ids, _ = topk_output
-            return rocm_aiter_fused_experts(
+            return rocm_fused_experts_tkw1(
                 hidden_states=x,
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,

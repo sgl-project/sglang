@@ -99,10 +99,7 @@ if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
 
-    from sglang.srt.layers.moe.rocm_aiter_fused_moe import (
-        rocm_aiter_fused_experts,
-        shuffle_weights,
-    )
+    from sglang.srt.layers.moe.rocm_moe_utils import shuffle_weights
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -1154,7 +1151,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."
-            # TODO: replace this with "rocm_aiter_fused_experts" for ROCm
             return fused_moe(
                 x,
                 layer.w13_weight,
@@ -1172,7 +1168,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if _use_aiter:
             assert not no_combine, f"{no_combine=} is not supported."
             if self.block_quant:
-                # TODO: replace this with "rocm_aiter_fused_experts" for ROCm
                 return fused_moe(
                     x,
                     layer.w13_weight,
@@ -1190,7 +1185,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     expert_mask=None,
                 )
             else:
-                # TODO: replace this with "rocm_aiter_fused_experts" for ROCm
                 return fused_moe(
                     x,
                     layer.w13_weight,

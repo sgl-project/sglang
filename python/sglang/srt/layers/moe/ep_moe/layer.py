@@ -53,11 +53,6 @@ if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
 
-    from sglang.srt.layers.moe.rocm_aiter_fused_moe import (
-        rocm_aiter_fused_experts,
-        shuffle_weights,
-    )
-
 logger = logging.getLogger(__name__)
 
 
@@ -510,7 +505,6 @@ class DeepEPMoE(EPMoE):
         topk_idx_copy = topk_idx.to(torch.int32)
         topk_idx_copy[topk_idx_copy == -1] = self.num_local_experts
 
-        # TODO: replace this with "rocm_aiter_fused_experts" for ROCm
         return fused_moe(
             hidden_states,
             self.w13_weight,
