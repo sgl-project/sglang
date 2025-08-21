@@ -2216,6 +2216,8 @@ class ServerArgs:
             # auto-configure reasoning parser for Harmony support
             if self.reasoning_parser is None:
                 self.reasoning_parser = "gpt-oss"
+            if self.tool_call_parser is None:
+                self.tool_call_parser = "gpt-oss"
 
         elif "Llama4" in model_arch:
             assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
