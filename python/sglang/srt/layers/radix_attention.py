@@ -18,10 +18,14 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 from torch import nn
+import torch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+from sglang.srt.utils import direct_register_custom_op
+from sglang.srt.context_manager import get_forward_context
 
 
 class AttentionType(Enum):
@@ -80,6 +84,7 @@ class RadixAttention(nn.Module):
         if self.quant_method is not None:
             self.quant_method.create_weights(self)
         self.attn_type = attn_type
+        self.layer_name = str(layer_id)
 
     def forward(
         self,
@@ -99,12 +104,65 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        return forward_batch.attn_backend.forward(
-            q,
-            k,
-            v,
-            self,
-            forward_batch,
-            save_kv_cache,
-            **kwargs,
-        )
+        # return forward_batch.attn_backend.forward(
+        #     q,
+        #     k,
+        #     v,
+        #     self,
+        #     forward_batch,
+        #     save_kv_cache,
+        #     **kwargs,
+        # )
+        if forward_batch.forward_mode.is_extend():
+            return torch.ops.sglang.unified_attention_with_output(
+                q,
+                k,
+                v,
+                save_kv_cache,
+                self.layer_id
+            )
+        else:
+            return forward_batch.attn_backend.forward(
+                q,
+                k,
+                v,
+                self,
+                forward_batch,
+                save_kv_cache,
+                **kwargs,
+            )
+
+def unified_attention_with_output(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int
+) -> torch.Tensor:
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    return forward_batch.attn_backend.forward(
+        query,
+        key,
+        value,
+        None,
+        forward_batch,
+        save_kv_cache,
+        layer_id = layer_id
+    )
+
+def unified_attention_with_output_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int
+) -> torch.Tensor:
+    return torch.empty_like(query)
+
+direct_register_custom_op(
+    op_name="unified_attention_with_output",
+    op_func=unified_attention_with_output,
+    mutates_args=[],
+    fake_impl=unified_attention_with_output_fake,
+)

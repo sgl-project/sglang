@@ -121,6 +121,9 @@ from sglang.srt.utils import (
     set_cuda_arch,
 )
 
+from .backend import SGLangBackend
+from sglang.srt.context_manager import set_forward_context
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -237,6 +240,127 @@ class ModelRunner:
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
         self._model_update_group = {}
+
+        # compile model
+        backend = SGLangBackend()
+        
+        self.model.forward = torch.compile(self.model.forward, 
+            fullgraph=True,
+            backend=backend,
+            options=None
+        )
+        # self.model.forward = torch.compile(self.model.forward)
+        # self.model = torch.compile(self.model, fullgraph=True)
+
+    # @torch.inference_mode()
+    # def _dummy_run(
+    #     self,
+    #     num_tokens: int,
+    #     capture_attn_cudagraph: bool = False,
+    #     skip_eplb: bool = False,
+    #     is_profile: bool = False,
+    # ) -> tuple[torch.Tensor, torch.Tensor]:
+
+
+    #     # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+    #     # for dummy run with LoRA so that the num_reqs collectively
+    #     # has num_tokens in total.
+    #     max_num_reqs = self.scheduler_config.max_num_seqs
+    #     num_reqs = min(num_tokens, max_num_reqs)
+    #     min_tokens_per_req = num_tokens // num_reqs
+    #     num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+    #     num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+    #     assert sum(num_scheduled_tokens_list) == num_tokens
+    #     assert len(num_scheduled_tokens_list) == num_reqs
+    #     num_scheduled_tokens = np.array(num_scheduled_tokens_list,
+    #                                     dtype=np.int32)
+
+    #     attn_metadata: Optional[dict[str, Any]] = None
+    #     if capture_attn_cudagraph:
+    #         attn_metadata = {}
+
+    #         # Make sure max_model_len is used at the graph capture time.
+    #         self.seq_lens_np[:num_reqs] = self.max_model_len
+    #         self.seq_lens_np[num_reqs:] = 0
+    #         self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
+    #                                        non_blocking=True)
+
+    #         for kv_cache_group_id, kv_cache_group_spec in enumerate(
+    #                 self.kv_cache_config.kv_cache_groups):
+    #             common_attn_metadata = CommonAttentionMetadata(
+    #                 query_start_loc=self.query_start_loc[:num_reqs + 1],
+    #                 query_start_loc_cpu=self.query_start_loc_cpu[:num_reqs +
+    #                                                              1],
+    #                 seq_lens=self.seq_lens[:num_reqs],
+    #                 seq_lens_cpu=self.seq_lens_cpu[:num_reqs],
+    #                 num_computed_tokens_cpu=self.input_batch.
+    #                 num_computed_tokens_cpu_tensor[:num_reqs],
+    #                 num_reqs=num_reqs,
+    #                 num_actual_tokens=num_tokens,
+    #                 max_query_len=num_tokens,
+    #                 block_table_tensor=self.input_batch.block_table[
+    #                     kv_cache_group_id].get_device_tensor()[:num_reqs],
+    #                 slot_mapping=self.input_batch.
+    #                 block_table[kv_cache_group_id].slot_mapping[:num_tokens],
+    #                 causal=True)
+
+    #             attn_metadata_i = self.attn_metadata_builders[
+    #                 kv_cache_group_id].build_for_cudagraph_capture(
+    #                     common_attn_metadata)
+    #             for layer_name in kv_cache_group_spec.layer_names:
+    #                 attn_metadata[layer_name] = attn_metadata_i
+
+    #     with self.maybe_dummy_run_with_lora(self.lora_config,
+    #                                         num_scheduled_tokens):
+    #         model = self.model
+    #         if self.is_multimodal_model:
+    #             model_kwargs = self._init_model_kwargs_for_multimodal_model(
+    #                 num_reqs=num_reqs)
+    #             input_ids = None
+    #             inputs_embeds = self.inputs_embeds[:num_tokens]
+    #         else:
+    #             input_ids = self.input_ids[:num_tokens]
+    #             inputs_embeds = None
+    #             model_kwargs = {}
+
+    #         if self.uses_mrope:
+    #             positions = self.mrope_positions[:, :num_tokens]
+    #         else:
+    #             positions = self.positions[:num_tokens]
+
+    #         if get_pp_group().is_first_rank:
+    #             intermediate_tensors = None
+    #         else:
+    #             if self.intermediate_tensors is None:
+    #                 self.intermediate_tensors = (
+    #                     self.model.make_empty_intermediate_tensors(
+    #                         batch_size=self.max_num_tokens,
+    #                         dtype=self.model_config.dtype,
+    #                         device=self.device))
+
+    #             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+    #                 num_tokens, None, False)
+
+    #         with self.maybe_randomize_inputs(input_ids), set_forward_context(
+    #                 attn_metadata,
+    #                 self.vllm_config,
+    #                 num_tokens=num_tokens,
+    #                 num_tokens_across_dp=num_tokens_across_dp):
+    #             outputs = model(
+    #                 input_ids=input_ids,
+    #                 positions=positions,
+    #                 intermediate_tensors=intermediate_tensors,
+    #                 inputs_embeds=inputs_embeds,
+    #                 **MultiModalKwargs.as_kwargs(
+    #                     model_kwargs,
+    #                     device=self.device,
+    #                 ),
+    #             )
+
+    #         if self.use_aux_hidden_state_outputs:
+    #             hidden_states, _ = outputs
+    #         else:
+    #             hidden_states = outputs
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -1550,6 +1674,7 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
+
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
@@ -1650,11 +1775,12 @@ class ModelRunner:
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_extend():
-            ret = self.forward_extend(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            with set_forward_context(forward_batch):
+                ret = self.forward_extend(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
         elif forward_batch.forward_mode.is_split_prefill():
             ret = self.forward_split_prefill(
                 forward_batch,

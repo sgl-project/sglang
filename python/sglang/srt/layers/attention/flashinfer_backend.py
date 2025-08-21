@@ -78,7 +78,6 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__()
-
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,

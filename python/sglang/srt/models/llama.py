@@ -54,6 +54,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
+from sglang.srt.model_executor.decorators import support_torch_compile
 
 logger = logging.getLogger(__name__)
 
@@ -266,7 +267,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-
+@support_torch_compile
 class LlamaModel(nn.Module):
     def __init__(
         self,
