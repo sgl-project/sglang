@@ -8,7 +8,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.linear import LinearBase, LinearMethodBase
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
@@ -28,7 +29,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped, replace_parameter
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_fp8_fnuz
+from sglang.srt.utils import get_bool_env_var, is_cuda
 
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -87,6 +88,9 @@ class FBGEMMFp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return FBGEMMFp8LinearMethod(self)
         return None
+
+    def get_scaled_act_names(self) -> List[str]:
+        return []
 
 
 class FBGEMMFp8LinearMethod(LinearMethodBase):
