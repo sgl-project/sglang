@@ -222,7 +222,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PAGED_SIZE=self.page_size,
         )
 
-        metadata = TRTLLMMLADecodeMetadata(self.decode_cuda_graph_workspace, block_kv_indices)
+        metadata = TRTLLMMLADecodeMetadata(
+            self.decode_cuda_graph_workspace, block_kv_indices
+        )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
