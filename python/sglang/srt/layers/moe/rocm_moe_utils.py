@@ -4,17 +4,21 @@
 from enum import IntEnum
 from functools import cache
 from typing import Optional
+
 import torch
+
 from sglang.srt.utils import direct_register_custom_op, get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
 
 class ActivationMethod(IntEnum):
     # This allows interfacing with AITER ActivationType enum
     # without importing the ActivationType enum from AITER globally.
     SILU = 0
     GELU = 1
+
 
 def rocm_aiter_asm_moe_tkw1_impl(
     hidden_states: torch.Tensor,
@@ -135,27 +139,3 @@ def rocm_fused_experts_tkw1(
         )
     else:
         assert False, "This should not be called."
-
-
-def shuffle_weights(
-    *tensors: torch.Tensor, layout: tuple[int, int] = (16, 16)
-) -> tuple[torch.Tensor, ...]:
-    """
-    Applies shuffle_weight function from AITER to each
-    input tensor and returns them.
-
-    Rearranges (shuffles) the input tensor/s
-    into a specified block layout for optimized computation.
-
-    Args:
-        *tensors: Variable number of torch.Tensor objects.
-        layout: A pair of integers specifying the
-        block sizes used to divide the tensors during shuffling.
-        Default is (16, 16).
-
-    Returns:
-    A Tuple of shuffled tensors.
-    """
-    from aiter.ops.shuffle import shuffle_weight
-
-    return tuple(shuffle_weight(tensor, layout=layout) for tensor in tensors)

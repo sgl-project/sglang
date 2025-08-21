@@ -40,10 +40,9 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from sglang.srt.layers.moe.rocm_moe_utils import (
-        rocm_fused_experts_tkw1,
-        shuffle_weights,
-    )
+    from aiter.ops.shuffle import shuffle_weight
+
+    from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 try:
     import vllm
@@ -282,11 +281,16 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
         if _use_aiter:
             with torch.no_grad():
-                shuffled_w13, shuffled_w2 = shuffle_weights(
-                    layer.w13_weight.data, layer.w2_weight.data
+                # Pre-shuffle weights
+                layer.w13_weight = torch.nn.Parameter(
+                    shuffle_weight(layer.w13_weight.data, (16, 16)),
+                    requires_grad=False,
                 )
-                layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-                layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+                torch.cuda.empty_cache()
+                layer.w2_weight = torch.nn.Parameter(
+                    shuffle_weight(layer.w2_weight.data, (16, 16)),
+                    requires_grad=False,
+                )
                 torch.cuda.empty_cache()
 
     def apply(
