@@ -126,7 +126,8 @@ SGLang is a fast serving framework for large language models with three main com
 - See `docs/references/environment_variables.md` for complete list
 
 ### Build Troubleshooting
-- **Network timeouts:** Increase pip/uv timeout values to 600+ seconds
+- **Network timeouts:** Increase pip/uv timeout values to 600+ seconds. PyPI access may be limited in some environments.
+- **Pre-commit installation fails:** Network issues can prevent hook environment setup. Use `git commit --no-verify` if needed for urgent commits, but address before PR submission.
 - **CUDA not found:** Install CUDA toolkit or use CPU-only builds
 - **Protobuf missing:** Install with `sudo apt-get install protobuf-compiler`
 - **Memory issues:** Reduce parallel build jobs with `export MAKEFLAGS='-j2'`
@@ -147,7 +148,9 @@ SGLang is a fast serving framework for large language models with three main com
 |-----------|---------------|-------------------|
 | Python package install | 15-30 minutes | 45+ minutes |
 | sgl-kernel build | 20-45 minutes | 60+ minutes |
+| sgl-router check | ~30 seconds | 2+ minutes |
 | sgl-router build | 5-7 minutes | 15+ minutes |
+| sgl-router tests | ~5 minutes | 15+ minutes |
 | Pre-commit first run | 5-15 minutes | 30+ minutes |
 | Frontend tests | ~10 minutes | 20+ minutes |
 | Backend tests (full) | 30+ minutes | 60+ minutes |
