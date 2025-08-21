@@ -75,6 +75,15 @@ pub enum RoutingMode {
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
     },
+    #[serde(rename = "openai")]
+    OpenAI {
+        /// API key for OpenAI
+        api_key: Option<String>,
+        /// Model name to use
+        model: Option<String>,
+        /// Base URL for the API endpoint
+        base_url: Option<String>,
+    },
 }
 
 impl RoutingMode {
@@ -90,6 +99,7 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
+            RoutingMode::OpenAI { .. } => 1,
         }
     }
 
@@ -347,6 +357,7 @@ impl RouterConfig {
         match self.mode {
             RoutingMode::Regular { .. } => "regular",
             RoutingMode::PrefillDecode { .. } => "prefill_decode",
+            RoutingMode::OpenAI { .. } => "openai",
         }
     }
 

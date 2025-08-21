@@ -1,3 +1,4 @@
+pub mod mock_server;
 pub mod mock_worker;
 pub mod test_app;
 

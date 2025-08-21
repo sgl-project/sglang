@@ -95,6 +95,34 @@ impl ConfigValidator {
                     Self::validate_policy(d_policy)?;
                 }
             }
+            RoutingMode::OpenAI {
+                model, base_url, ..
+            } => {
+                // Validate model is provided and not empty
+                let model_str = model
+                    .as_ref()
+                    .ok_or_else(|| ConfigError::ValidationFailed {
+                        reason: "OpenAI model is required".to_string(),
+                    })?;
+                if model_str.trim().is_empty() {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "OpenAI model name cannot be empty".to_string(),
+                    });
+                }
+
+                // Validate base URL is provided and valid
+                let base_url_str =
+                    base_url
+                        .as_ref()
+                        .ok_or_else(|| ConfigError::ValidationFailed {
+                            reason: "OpenAI base URL is required".to_string(),
+                        })?;
+                if let Err(e) = url::Url::parse(base_url_str) {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!("Invalid OpenAI base URL '{}': {}", base_url_str, e),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -242,6 +270,12 @@ impl ConfigValidator {
                         reason: "PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
                     });
                 }
+            }
+            RoutingMode::OpenAI { .. } => {
+                // OpenAI mode doesn't use service discovery
+                return Err(ConfigError::ValidationFailed {
+                    reason: "OpenAI mode does not support service discovery".to_string(),
+                });
             }
         }
 

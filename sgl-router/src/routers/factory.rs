@@ -1,6 +1,6 @@
 //! Factory for creating router instances
 
-use super::{pd_router::PDRouter, router::Router, RouterTrait};
+use super::{openai_router::OpenAIRouter, pd_router::PDRouter, router::Router, RouterTrait};
 use crate::config::{PolicyConfig, RoutingMode};
 use crate::policies::PolicyFactory;
 use crate::server::AppContext;
@@ -31,6 +31,14 @@ impl RouterFactory {
                     ctx,
                 )
                 .await
+            }
+            RoutingMode::OpenAI {
+                api_key,
+                model,
+                base_url,
+            } => {
+                Self::create_openai_router(api_key.clone(), model.clone(), base_url.clone(), ctx)
+                    .await
             }
         }
     }
@@ -89,6 +97,25 @@ impl RouterFactory {
             ctx.router_config.retry.clone(),
             ctx.router_config.circuit_breaker.clone(),
             ctx.router_config.health_check.clone(),
+        )
+        .await?;
+
+        Ok(Box::new(router))
+    }
+
+    /// Create an OpenAI router
+    async fn create_openai_router(
+        api_key: Option<String>,
+        model: Option<String>,
+        base_url: Option<String>,
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        // Create OpenAI router - validation ensures model and base_url are present
+        let router = OpenAIRouter::new(
+            api_key,
+            model.unwrap(),
+            base_url.unwrap(),
+            Some(ctx.router_config.circuit_breaker.clone()),
         )
         .await?;
 
