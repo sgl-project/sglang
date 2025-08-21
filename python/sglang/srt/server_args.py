@@ -1373,17 +1373,7 @@ class ServerArgs:
         parser.add_argument(
             "--draft-attention-backend",
             type=str,
-            choices=[
-                "aiter",
-                "cutlass_mla",
-                "fa3",
-                "flashinfer",
-                "flashmla",
-                "intel_amx",
-                "torch_native",
-                "ascend",
-                "triton",
-            ],
+            choices=ATTN_BACKENDS,
             default=ServerArgs.draft_attention_backend,
             help="Choose the kernels for draft attention layers. Default to the same as attention backend.",
         )
