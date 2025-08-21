@@ -16,13 +16,9 @@
 import logging
 import multiprocessing as mp
 import signal
-import struct
-import sys
 import threading
 import time
 from enum import Enum, auto
-from multiprocessing import shared_memory
-from typing import Dict, List
 
 import psutil
 import setproctitle
@@ -39,7 +35,12 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.utils import DPBalanceMeta
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
+from sglang.srt.utils import (
+    bind_port,
+    configure_logger,
+    get_zmq_socket,
+    temp_set_cuda_visible_devices,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,9 @@ class DataParallelController:
             LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
+
+        # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
+        self.env_lock = threading.Lock()
 
         # Launch data parallel workers
         self.scheduler_procs = []
@@ -239,22 +243,23 @@ class DataParallelController:
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        rank_port_args,
-                        gpu_id,
-                        tp_rank,
-                        moe_ep_rank,
-                        pp_rank,
-                        dp_rank,
-                        writer,
-                        self.balance_meta,
-                    ),
-                )
-                with memory_saver_adapter.configure_subprocess():
-                    proc.start()
+                with self.env_lock, temp_set_cuda_visible_devices(gpu_id):
+                    proc = mp.Process(
+                        target=run_scheduler_process,
+                        args=(
+                            server_args,
+                            rank_port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            dp_rank,
+                            writer,
+                            self.balance_meta,
+                        ),
+                    )
+                    with memory_saver_adapter.configure_subprocess():
+                        proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 

@@ -149,6 +149,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_zmq_socket,
     is_cpu,
+    is_cuda_alike,
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
@@ -2546,6 +2547,11 @@ def run_scheduler_process(
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+
+    if is_cuda_alike():
+        # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
+        gpu_id = 0
+        assert torch.cuda.device_count() == 1
 
     # Create a scheduler and run the event loop
     try:
