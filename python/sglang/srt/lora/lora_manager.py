@@ -381,18 +381,19 @@ class LoRAManager:
                         lora_type=LoRAType.LORA_B,
                     ),
                 )
-        # call set_lora_info for embeddings
-        new_embeddings_buffer = None
-        for module_name, module in self.lora_embeddings_modules.items():
-            if self.lora_extra_vocab_size > 0:
-                new_embeddings_buffer = self.memory_pool.get_embedding_tensor(
-                    module_name
+        if len(self.lora_embeddings_modules) > 0:
+            # call set_lora_info for embeddings
+            new_embeddings_buffer = None
+            for module_name, module in self.lora_embeddings_modules.items():
+                if self.lora_extra_vocab_size > 0:
+                    new_embeddings_buffer = self.memory_pool.get_embedding_tensor(
+                        module_name
+                    )
+                module.set_lora_info(
+                    new_embeddings_buffer,
+                    self.memory_pool.get_embedding_tensor(module_name, LoRAType.LORA_A),
+                    self.memory_pool.get_embedding_tensor(module_name, LoRAType.LORA_B),
                 )
-            module.set_lora_info(
-                new_embeddings_buffer,
-                self.memory_pool.get_embedding_tensor(module_name, LoRAType.LORA_A),
-                self.memory_pool.get_embedding_tensor(module_name, LoRAType.LORA_B),
-            )
 
     def init_state(
         self,

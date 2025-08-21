@@ -210,17 +210,18 @@ class LoRAMemoryPool:
                 device=device,
             )
 
-        init_embedding_buffer(
-            self.embedding_A_buffer,
-            self.target_modules,
-            self.get_embedding_lora_A_shape,
-        )
+        if "embed_tokens" in self.target_modules:
+            init_embedding_buffer(
+                self.embedding_A_buffer,
+                self.target_modules,
+                self.get_embedding_lora_A_shape,
+            )
 
-        init_embedding_buffer(
-            self.embedding_B_buffer,
-            self.target_modules,
-            self.get_embedding_lora_B_shape,
-        )
+            init_embedding_buffer(
+                self.embedding_B_buffer,
+                self.target_modules,
+                self.get_embedding_lora_B_shape,
+            )
 
         init_buffer(
             self.A_buffer,
