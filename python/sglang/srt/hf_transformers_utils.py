@@ -43,7 +43,6 @@ from sglang.srt.configs import (
     KimiVLConfig,
     MultiModalityConfig,
     Step3VLConfig,
-    DotsVLMConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector

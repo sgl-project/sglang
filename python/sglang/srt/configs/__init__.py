@@ -11,7 +11,6 @@ from sglang.srt.configs.step3_vl import (
     Step3VisionEncoderConfig,
     Step3VLConfig,
 )
-from sglang.srt.configs.dots_vlm import DotsVLMConfig
 
 __all__ = [
     "ExaoneConfig",

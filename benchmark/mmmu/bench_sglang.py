@@ -124,7 +124,9 @@ async def eval_mmmu(args) -> None:
     answer_dict = {}
     out_samples = {}
     client = openai.AsyncOpenAI(
-        api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1", timeout=20 * 60 * 60,
+        api_key="sk",
+        base_url=f"http://127.0.0.1:{args.port}/v1",
+        timeout=20 * 60 * 60,
     )
     start = time.perf_counter()
     base_url = f"http://127.0.0.1:{args.port}"

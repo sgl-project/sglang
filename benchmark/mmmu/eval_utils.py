@@ -447,14 +447,14 @@ def eval_multi_choice(gold_i, pred_i):
     """
     correct = False
     # for case like Answer: A, Answer is A, answer is A, answer: A
-    for _exp in ['Answer:', 'Answer is ', 'answer is ', 'answer: ']:
+    for _exp in ["Answer:", "Answer is ", "answer is ", "answer: "]:
         if _exp in pred_i:
             pred_i = pred_i.split(_exp)[1].strip()
             break
     # for case like (A), (B), (C), (D) ......
     if "(" in pred_i and ")" in pred_i:
         try:
-            pred_i = re.search(r'\(([A-Z])\)', pred_i).group(1)
+            pred_i = re.search(r"\(([A-Z])\)", pred_i).group(1)
         except:
             print(f"Error to extract answer from: {pred_i}")
             pass
@@ -552,7 +552,7 @@ def process_result(response, sample, answer_dict, out_samples):
         "pred_ans": pred_ans,
         "original_response": sample["original_response"],
         "ground_truth": sample["answer"],
-        "question_type": sample["question_type"]
+        "question_type": sample["question_type"],
     }
 
     # set ground truth answer
