@@ -15,6 +15,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -258,7 +259,7 @@ class SeedOssModel(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                enable_tp=not global_server_args_dict["enable_dp_attention"],
+                enable_tp=not is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
