@@ -166,9 +166,9 @@ impl ParserFactory {
         registry.register_pattern("qwen-thinking", "qwen3_thinking");
         registry.register_pattern("qwen3", "qwen3");
         registry.register_pattern("qwen", "qwen3");
-        registry.register_pattern("glm45", "glm45"); // GLM45 has its own parser
+        registry.register_pattern("glm45", "glm45");
         registry.register_pattern("kimi", "kimi");
-        registry.register_pattern("step3", "step3"); // Step3 has its own parser
+        registry.register_pattern("step3", "step3");
 
         Self { registry }
     }
