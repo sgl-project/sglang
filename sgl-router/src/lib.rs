@@ -3,6 +3,8 @@ pub mod config;
 pub mod logging;
 use std::collections::HashMap;
 pub mod core;
+#[cfg(feature = "grpc-client")]
+pub mod grpc;
 pub mod metrics;
 pub mod middleware;
 pub mod policies;
@@ -80,6 +82,8 @@ struct Router {
     health_check_timeout_secs: u64,
     health_check_interval_secs: u64,
     health_check_endpoint: String,
+    // IGW (Inference Gateway) configuration
+    enable_igw: bool,
 }
 
 impl Router {
@@ -108,7 +112,12 @@ impl Router {
         };
 
         // Determine routing mode
-        let mode = if self.pd_disaggregation {
+        let mode = if self.enable_igw {
+            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            }
+        } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
@@ -189,6 +198,7 @@ impl Router {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
             },
+            enable_igw: self.enable_igw,
         })
     }
 }
@@ -250,6 +260,8 @@ impl Router {
         health_check_timeout_secs = 5,
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
+        // IGW defaults
+        enable_igw = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -303,6 +315,7 @@ impl Router {
         health_check_timeout_secs: u64,
         health_check_interval_secs: u64,
         health_check_endpoint: String,
+        enable_igw: bool,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -355,6 +368,7 @@ impl Router {
             health_check_timeout_secs,
             health_check_interval_secs,
             health_check_endpoint,
+            enable_igw,
         })
     }
 
