@@ -31,7 +31,7 @@ class GptOssDetector(BaseFormatDetector):
 
         # Pattern to extract function name and JSON from tool_call event content
         self.tool_extract_pattern = re.compile(
-            r"to=([a-zA-Z_][a-zA-Z0-9_.]*)\s*<\|constrain\|>json<\|message\|>(.*?)$",
+            r"to=([a-zA-Z_][a-zA-Z0-9_.]*)\s*<\|constrain\|>json<\|message\|>(.*?)(?:<\|call\|>|$)",
             re.DOTALL,
         )
 
@@ -58,7 +58,9 @@ class GptOssDetector(BaseFormatDetector):
             if event.event_type == "tool_call":
                 # Extract tool call from event content
                 tool_call = self._extract_tool_call_from_event(
-                    event.content, tool_indices, tool_index
+                    event.raw_text if event.raw_text else event.content,
+                    tool_indices,
+                    tool_index,
                 )
                 if tool_call:
                     calls.append(tool_call)
@@ -117,7 +119,7 @@ class GptOssDetector(BaseFormatDetector):
             if event.event_type == "tool_call":
                 # We got a complete tool call from HarmonyParser
                 tool_call_info = self._extract_tool_call_from_event(
-                    event.content,
+                    event.raw_text if event.raw_text else event.content,
                     self._tool_indices,
                     self.current_tool_id if self.current_tool_id >= 0 else 0,
                 )

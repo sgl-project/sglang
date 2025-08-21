@@ -9,6 +9,7 @@ class Event:
 
     event_type: str
     content: str
+    raw_text: str = None  # Original text including structural markers
 
 
 @dataclass
@@ -161,7 +162,13 @@ class CanonicalStrategy:
                 # Parse a channel block starting here
                 block_result = self._parse_block(text, tokens, pos)
                 if block_result is None:
-                    # Incomplete block
+                    # Incomplete block - check if we can emit partial reasoning content
+                    partial_result = self._parse_partial_analysis(text, tokens, pos)
+                    if partial_result:
+                        event, remaining_text = partial_result
+                        events.append(event)
+                        return events, remaining_text
+                    # No partial content, hold entire remaining text
                     remaining_start = tokens[pos].start
                     return events, text[remaining_start:]
                 event, new_pos = block_result
@@ -175,6 +182,51 @@ class CanonicalStrategy:
                 pos += 1
 
         return events, ""
+
+    def _parse_partial_analysis(
+        self, text: str, tokens: List[Token], start_pos: int
+    ) -> Optional[Tuple[Event, str]]:
+        """Try to parse partial analysis content for incremental streaming."""
+        pos = start_pos
+
+        # Skip <|start|> if present
+        if pos < len(tokens) and tokens[pos].type == "START":
+            pos += 1
+
+        # Look for <|channel|> followed by analysis
+        channel_pos = None
+        message_pos = None
+
+        for i in range(pos, len(tokens)):
+            if tokens[i].type == "CHANNEL" and channel_pos is None:
+                channel_pos = i
+            elif tokens[i].type == "MESSAGE":
+                message_pos = i
+                break
+
+        if channel_pos is None or message_pos is None:
+            return None
+
+        # Extract channel type
+        channel_start = (
+            tokens[channel_pos + 1].start
+            if channel_pos + 1 < len(tokens)
+            else tokens[channel_pos].end
+        )
+        channel_end = tokens[message_pos].start
+        channel_header = text[channel_start:channel_end]
+
+        channel_type = self._extract_channel_type(channel_header)
+        if channel_type != "analysis":
+            return None  # Only stream analysis content - tool calls wait for completion
+
+        # Extract partial content after <|message|>
+        content_start = tokens[message_pos].end
+        content = text[content_start:]
+
+        # Return partial reasoning content and preserve the channel structure for next parse
+        remaining_text = text[tokens[start_pos].start : content_start]
+        return Event("reasoning", content), remaining_text
 
     def _extract_channel_type(self, header_text: str) -> Optional[str]:
         """Extract channel type from header, ignoring other attributes like to=... or <|constrain|>..."""
@@ -258,7 +310,12 @@ class CanonicalStrategy:
                 end_pos += 1
 
         if end_pos >= len(tokens):
-            return None  # No end token
+            # No end token found
+            if channel_type == "final":
+                # Final blocks can end at end of input without requiring <|return|>
+                content = text[content_start:]
+                return Event("normal", content), end_pos
+            return None  # Analysis and commentary need proper end tokens
 
         end_token = tokens[end_pos]
         content = text[content_start : end_token.start]
@@ -267,12 +324,14 @@ class CanonicalStrategy:
         if channel_type == "analysis":
             if end_token.type == "CALL":
                 # Built-in tools (browser, python) use analysis channel with <|call|>
-                return Event("tool_call", content.strip()), end_pos + 1
+                raw_text = text[tokens[start_pos].start : end_token.end]
+                return Event("tool_call", content.strip(), raw_text), end_pos + 1
             else:
                 return Event("reasoning", content), end_pos + 1
         elif channel_type == "commentary":
             if end_token.type == "CALL":
-                return Event("tool_call", content.strip()), end_pos + 1
+                raw_text = text[tokens[start_pos].start : end_token.end]
+                return Event("tool_call", content.strip(), raw_text), end_pos + 1
             else:
                 return Event("normal", content), end_pos + 1
         elif channel_type == "final":

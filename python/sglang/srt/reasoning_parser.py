@@ -214,8 +214,15 @@ class GptOssDetector(BaseReasoningFormatDetector):
         reasoning_text = "".join(
             [e.content for e in events if e.event_type == "reasoning"]
         )
-        normal_text = "".join([e.content for e in events if e.event_type == "normal"])
-        # Tool call events are ignored in reasoning parser context
+        normal_parts = []
+        for e in events:
+            if e.event_type == "normal":
+                normal_parts.append(e.content)
+            elif e.event_type == "tool_call":
+                # Use raw_text to preserve structural markers for function call detector
+                normal_parts.append(e.raw_text if e.raw_text else e.content)
+        normal_text = "".join(normal_parts)
+        # Tool call events preserve raw text with structural markers
 
         return StreamingParseResult(
             normal_text=normal_text,
@@ -228,8 +235,14 @@ class GptOssDetector(BaseReasoningFormatDetector):
         reasoning_text = "".join(
             [e.content for e in events if e.event_type == "reasoning"]
         )
-        normal_text = "".join([e.content for e in events if e.event_type == "normal"])
-        # Tool call events are ignored in reasoning parser context
+        normal_parts = []
+        for e in events:
+            if e.event_type == "normal":
+                normal_parts.append(e.content)
+            elif e.event_type == "tool_call":
+                # Use raw_text to preserve structural markers for function call detector
+                normal_parts.append(e.raw_text if e.raw_text else e.content)
+        normal_text = "".join(normal_parts)
 
         return StreamingParseResult(
             normal_text=normal_text,
