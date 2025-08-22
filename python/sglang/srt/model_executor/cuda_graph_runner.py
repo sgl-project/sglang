@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Run the model with device graph and torch.compile."""
+"""Run the model with cuda graph and torch.compile."""
 
 from __future__ import annotations
 
@@ -221,7 +221,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     return capture_bs, compile_bs
 
 
-# Reuse this memory pool across all device graph runners.
+# Reuse this memory pool across all cuda graph runners.
 global_graph_memory_pool = None
 
 
@@ -234,8 +234,8 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
-class GraphRunner:
-    """A GraphRunner is a base class to run the forward pass of a model with device graph and torch.compile."""
+class CudaGraphRunner:
+    """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
@@ -267,7 +267,7 @@ class GraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        rank0_log(f"Capture graph bs {self.capture_bs}")
+        rank0_log(f"Capture cuda graph bs {self.capture_bs}")
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -384,7 +384,7 @@ class GraphRunner:
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture device graph failed: {e}\n{GRAPH_CAPTURE_FAILED_MSG}"
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def _cache_loc_dtype(self):
@@ -515,7 +515,7 @@ class GraphRunner:
         return out
 
     def _create_device_graph(self):
-        pass
+        return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = self._create_device_graph()
@@ -850,7 +850,7 @@ class GraphRunner:
         return spec_info
 
 
-GRAPH_CAPTURE_FAILED_MSG = (
+CUDA_GRAPH_CAPTURE_FAILED_MSG = (
     "Possible solutions:\n"
     "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
     "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
