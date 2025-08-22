@@ -208,9 +208,11 @@ class Phi4MMImageEncoder(nn.Module):
         assert (
             base_feat_height == base_feat_height_target
             and base_feat_width == base_feat_height_target
-        ), f'base_feat_height: {base_feat_height},"\
-                f" base_feat_width: {base_feat_width}, "\
-                f"expect {base_feat_height_target} features for hd transform'
+        ), (
+            f"base_feat_height: {base_feat_height}, "
+            f"base_feat_width: {base_feat_width}, "
+            f"expect {base_feat_height_target} features for hd transform"
+        )
 
         # bs x max_num_crops x (24x24) x C
         img_features = img_features.view(
@@ -352,15 +354,17 @@ class Phi4MMImageEncoder(nn.Module):
                 output_imgs.append(torch.cat([sub_img, self.glb_GN, glb_img], dim=1))
             else:
                 raise NotImplementedError(
-                    f'hd_transform_order = {self.hd_transform_order}, "\
-                        "not implemented'
+                    f"hd_transform_order = {self.hd_transform_order}, "
+                    "not implemented"
                 )
 
             # temp_len = int((h*w+1)*144 + 1 + (h+1)*12)
             assert (
                 temp_len == output_imgs[-1].shape[1]
-            ), f'temp_len: {temp_len}, output_imgs[-1].shape[1]: "\
-                    "{output_imgs[-1].shape[1]}'
+            ), (
+                f"temp_len: {temp_len}, output_imgs[-1].shape[1]: "
+                f"{output_imgs[-1].shape[1]}"
+            )
 
             output_len.append(temp_len)
 
