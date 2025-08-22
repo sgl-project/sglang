@@ -16,10 +16,11 @@ from sglang.srt.utils import (
     get_device_capability,
     is_blackwell,
     is_cuda,
+    is_hip,
     print_info_once,
 )
-
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -414,6 +415,10 @@ class VisionAttention(nn.Module):
             and _passed_backend is None
         ):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
+        
+        if (qkv_backend == "fa3") and _is_hip:
+            qkv_backend = "triton_attn"
+        
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
         self.customized_position_embedding_applier = (
