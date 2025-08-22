@@ -75,6 +75,8 @@ class EAGLEWorker(TpModelWorker):
         moe_ep_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
+        think_start_token_id: Optional[int],
+        think_end_token_id: Optional[int],
     ):
         # Parse arguments
         self.server_args = server_args
@@ -171,6 +173,13 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+        self.relaxed_thinking = global_server_args_dict.get(
+            "speculative_relaxed_thinking", False
+        )
+        if self.relaxed_thinking:
+            self.think_start_token_id = think_start_token_id
+            self.think_end_token_id = think_end_token_id
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -435,6 +444,16 @@ class EAGLEWorker(TpModelWorker):
         logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
             model_worker_batch
         )
+
+        if self.relaxed_thinking:
+            thinking_states = batch.thinking_states()
+            for i, tok in enumerate(next_token_ids):
+                if tok == self.think_start_token_id:
+                    thinking_states[i] = True
+                elif tok == self.think_end_token_id:
+                    thinking_states[i] = False
+            batch.update_thinking_states(thinking_states)
+
         return (
             logits_output,
             next_token_ids,
@@ -743,6 +762,7 @@ class EAGLEWorker(TpModelWorker):
 
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
+
         res: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,
@@ -750,6 +770,8 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
+        if self.relaxed_thinking:
+            batch.update_thinking_states(res.thinking_states)
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
