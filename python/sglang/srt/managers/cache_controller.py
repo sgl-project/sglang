@@ -26,8 +26,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
 
