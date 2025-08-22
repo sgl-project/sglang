@@ -1,10 +1,8 @@
 use super::traits::{
     Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
 };
-use crate::metrics::TokenizerMetrics;
 use anyhow::{Error, Result};
 use std::collections::HashMap;
-use std::time::Instant;
 use tokenizers::tokenizer::Tokenizer as HfTokenizer;
 
 #[cfg(feature = "minijinja")]
@@ -196,36 +194,17 @@ impl HuggingFaceTokenizer {
 
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str) -> Result<Encoding> {
-        let start = Instant::now();
-
-        TokenizerMetrics::record_encode_request("huggingface");
-        TokenizerMetrics::record_chars_per_encode(input.len());
-
         self.tokenizer
             .encode(input, false)
-            .map_err(|e| {
-                TokenizerMetrics::record_encode_error("encoding_failed");
-                Error::msg(format!("Encoding failed: {}", e))
-            })
-            .map(|encoding| {
-                TokenizerMetrics::record_tokens_per_encode(encoding.get_ids().len());
-                TokenizerMetrics::record_encode_duration(start.elapsed());
-                Encoding::Hf(Box::new(encoding))
-            })
+            .map_err(|e| Error::msg(format!("Encoding failed: {}", e)))
+            .map(|encoding| Encoding::Hf(Box::new(encoding)))
     }
 
     fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
-        let start = Instant::now();
-
         let encodings = self
             .tokenizer
             .encode_batch(inputs.to_vec(), false)
-            .map_err(|e| {
-                TokenizerMetrics::record_encode_error("batch_encoding_failed");
-                Error::msg(format!("Batch encoding failed: {}", e))
-            })?;
-
-        TokenizerMetrics::record_encode_batch_duration(start.elapsed(), inputs.len());
+            .map_err(|e| Error::msg(format!("Batch encoding failed: {}", e)))?;
 
         Ok(encodings
             .into_iter()
@@ -236,20 +215,9 @@ impl Encoder for HuggingFaceTokenizer {
 
 impl Decoder for HuggingFaceTokenizer {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
-        let start = Instant::now();
-
-        TokenizerMetrics::record_decode_request("huggingface");
-        TokenizerMetrics::record_tokens_per_decode(token_ids.len());
-
         self.tokenizer
             .decode(token_ids, skip_special_tokens)
-            .map_err(|e| {
-                TokenizerMetrics::record_decode_error("decoding_failed");
-                Error::msg(format!("Decoding failed: {}", e))
-            })
-            .inspect(|_| {
-                TokenizerMetrics::record_decode_duration(start.elapsed());
-            })
+            .map_err(|e| Error::msg(format!("Decoding failed: {}", e)))
     }
 }
 

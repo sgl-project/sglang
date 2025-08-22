@@ -66,7 +66,7 @@ fn test_tokenizer_encode_decode_lifecycle() {
         let encoding = tokenizer.encode(prompt).expect("Failed to encode prompt");
 
         let decoded = tokenizer
-            .decode(&encoding.token_ids(), false)
+            .decode(encoding.token_ids(), false)
             .expect("Failed to decode token_ids");
 
         assert_eq!(decoded, *prompt, "Encode-decode mismatch for: {}", prompt);
@@ -101,7 +101,7 @@ fn test_sequence_operations() {
 
         for token_id in encoding.token_ids() {
             let text = decoder
-                .append_token(token_id)
+                .append_token(*token_id)
                 .expect("Failed to append token");
             output.push_str(&text);
         }
@@ -131,7 +131,7 @@ fn test_decode_stream() {
         let mut output = String::new();
 
         for token_id in encoding.token_ids() {
-            if let Some(text) = decoder.step(token_id).expect("Failed to decode token") {
+            if let Some(text) = decoder.step(*token_id).expect("Failed to decode token") {
                 output.push_str(&text);
             }
         }
@@ -157,11 +157,11 @@ fn test_long_sequence_incremental_decode_with_prefill() {
             .encode(output_text)
             .expect("Failed to encode output");
 
-        let mut decoder = DecodeStream::new(tokenizer.clone(), &input_encoding.token_ids(), false);
+        let mut decoder = DecodeStream::new(tokenizer.clone(), input_encoding.token_ids(), false);
 
         let mut output = String::new();
         for token_id in output_encoding.token_ids() {
-            if let Some(text) = decoder.step(token_id).expect("Failed to decode token") {
+            if let Some(text) = decoder.step(*token_id).expect("Failed to decode token") {
                 output.push_str(&text);
             }
         }
@@ -199,7 +199,7 @@ fn test_stop_sequence_decoder() {
         let mut stopped = false;
 
         for token_id in encoding.token_ids() {
-            match decoder.process_token(token_id).unwrap() {
+            match decoder.process_token(*token_id).unwrap() {
                 SequenceDecoderOutput::Text(text) => output.push_str(&text),
                 SequenceDecoderOutput::StoppedWithText(text) => {
                     output.push_str(&text);
@@ -245,7 +245,7 @@ fn test_factory_creation() {
     let encoding = tokenizer.encode(TEST_PROMPTS[0]).expect("Failed to encode");
 
     let decoded = tokenizer
-        .decode(&encoding.token_ids(), false)
+        .decode(encoding.token_ids(), false)
         .expect("Failed to decode");
 
     assert_eq!(decoded, TEST_PROMPTS[0]);
@@ -265,7 +265,7 @@ fn test_batch_encoding() {
 
     for (i, encoding) in encodings.iter().enumerate() {
         let decoded = tokenizer
-            .decode(&encoding.token_ids(), false)
+            .decode(encoding.token_ids(), false)
             .expect("Failed to decode");
         assert_eq!(decoded, TEST_PROMPTS[i]);
     }
@@ -307,7 +307,7 @@ fn test_thread_safety() {
                     .encode(prompt)
                     .expect("Failed to encode in thread");
                 let decoded = tokenizer_clone
-                    .decode(&encoding.token_ids(), false)
+                    .decode(encoding.token_ids(), false)
                     .expect("Failed to decode in thread");
                 assert_eq!(decoded, prompt);
             })
