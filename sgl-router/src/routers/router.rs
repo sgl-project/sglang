@@ -9,10 +9,8 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
-use crate::protocols::{
-    common::GenerationRequest,
-    generate::GenerateRequest,
-    openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
+use crate::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest,
 };
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::{

@@ -1,3 +1,48 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+
+// # Protocol Specifications
+//
+// This module contains all protocol definitions for OpenAI and SGLang APIs.
+//
+// ## Table of Contents
+//
+// 1. **OPENAI SPEC - Chat Completions API**
+//    - Message Types
+//    - Response Format Types
+//    - Tool/Function Types
+//    - Streaming Delta Types
+//    - Request/Response structures
+//
+// 2. **OPENAI SPEC - Completions API**
+//    - Request/Response structures
+//    - Streaming support
+//
+// 3. **OPENAI SPEC - Responses API**
+//    - Tool Definitions
+//    - Reasoning Configuration
+//    - Input/Output Items
+//    - Service Tier & Tool Choice
+//    - Request/Response structures
+//
+// 4. **OPENAI SPEC - Common**
+//    - Shared Request Components
+//    - Tool Choice Types
+//    - Usage Tracking
+//    - Logprobs Types
+//    - Error Response Types
+//
+// 5. **SGLANG SPEC - GENERATE API**
+//    - Generate Parameters
+//    - Sampling Parameters
+//    - Request/Response structures
+//
+// 6. **COMMON**
+//    - GenerationRequest trait
+//    - StringOrArray & LoRAPath types
+//    - Helper functions
+
 // ==================================================================
 // =            OPENAI SPEC - Chat Completions API                  =
 // ==================================================================
@@ -8,7 +53,7 @@
 #[serde(untagged)]
 pub enum ChatMessage {
     System {
-        role: String, // "system"
+        role: String,
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
@@ -87,63 +132,6 @@ pub struct JsonSchemaFormat {
     pub schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
-}
-
-// ============= Tool/Function Types =============
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Tool {
-    #[serde(rename = "type")]
-    pub tool_type: String, // "function"
-    pub function: Function,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Function {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub parameters: Value, // JSON Schema
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum ToolChoice {
-    None,
-    Auto,
-    Required,
-    Function {
-        #[serde(rename = "type")]
-        tool_type: String, // "function"
-        function: FunctionChoice,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct FunctionChoice {
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub tool_type: String, // "function"
-    pub function: FunctionCallResponse,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum FunctionCall {
-    None,
-    Auto,
-    Function { name: String },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct FunctionCallResponse {
-    pub name: String,
-    pub arguments: String, // JSON string
 }
 
 // ============= Streaming Delta Types =============
@@ -804,22 +792,6 @@ impl Default for ServiceTier {
     }
 }
 
-// ============= Tool Choice =============
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolChoice {
-    Auto,
-    Required,
-    None,
-}
-
-impl Default for ToolChoice {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
 // ============= Truncation =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1092,10 +1064,6 @@ fn default_repetition_penalty() -> f32 {
     1.0
 }
 
-fn default_true() -> bool {
-    true
-}
-
 impl ResponsesRequest {
     /// Default sampling parameters
     const DEFAULT_TEMPERATURE: f32 = 0.7;
@@ -1303,10 +1271,6 @@ fn default_object_type() -> String {
     "response".to_string()
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn default_tool_choice() -> String {
     "auto".to_string()
 }
@@ -1332,10 +1296,11 @@ impl ResponsesResponse {
             status,
             usage,
             parallel_tool_calls: request.parallel_tool_calls,
-            tool_choice: match request.tool_choice {
+            tool_choice: match &request.tool_choice {
                 ToolChoice::Auto => "auto".to_string(),
                 ToolChoice::Required => "required".to_string(),
                 ToolChoice::None => "none".to_string(),
+                ToolChoice::Function { .. } => "function".to_string(),
             },
             tools: request.tools.clone(),
         }
@@ -1398,9 +1363,7 @@ impl ResponsesResponse {
     }
 
     /// Convert usage to OpenAI Responses API format
-    pub fn usage_in_response_format(
-        &self,
-    ) -> Option<crate::protocols::openai::responses::types::ResponseUsage> {
+    pub fn usage_in_response_format(&self) -> Option<ResponseUsage> {
         self.usage.as_ref().map(|usage| usage.to_response_usage())
     }
 
@@ -1475,7 +1438,7 @@ impl ResponseContentPart {
     pub fn new_text(
         text: String,
         annotations: Vec<String>,
-        logprobs: Option<crate::protocols::openai::common::ChatLogProbs>,
+        logprobs: Option<ChatLogProbs>,
     ) -> Self {
         Self::OutputText {
             text,
@@ -1531,6 +1494,74 @@ impl UsageInfo {
 pub struct StreamOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
+}
+
+// ============= Tool Choice Types =============
+
+/// Tool choice for both Chat Completion and Responses APIs
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "required")]
+    Required,
+    #[serde(rename = "none")]
+    None,
+    Function {
+        #[serde(rename = "type")]
+        tool_type: String, // "function"
+        function: FunctionChoice,
+    },
+}
+
+impl Default for ToolChoice {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Function choice specification for ToolChoice::Function
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionChoice {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "function"
+    pub function: Function,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Function {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: Value, // JSON Schema
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String, // "function"
+    pub function: FunctionCallResponse,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FunctionCall {
+    None,
+    Auto,
+    Function { name: String },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FunctionCallResponse {
+    pub name: String,
+    pub arguments: String, // JSON string
 }
 
 // ============= Usage Tracking =============
@@ -1657,7 +1688,7 @@ pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repetition_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop: Option<crate::protocols::common::StringOrArray>,
+    pub stop: Option<StringOrArray>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignore_eos: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1769,10 +1800,10 @@ impl GenerationRequest for GenerateRequest {
     }
 }
 
-
 // ==================================================================
 // =            COMMON                                              =
 // ==================================================================
+
 /// Helper function for serde default value
 pub fn default_true() -> bool {
     true
@@ -1830,8 +1861,3 @@ pub enum LoRAPath {
     Single(Option<String>),
     Batch(Vec<Option<String>>),
 }
-
-
-
-
-

@@ -1,8 +1,10 @@
 // Integration test for Responses API
 
-use sglang_router_rs::protocols::common::GenerationRequest;
-use sglang_router_rs::protocols::openai::responses::request::ResponseInput;
-use sglang_router_rs::protocols::openai::responses::*;
+use sglang_router_rs::protocols::spec::{
+    GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus,
+    ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
+    Truncation, UsageInfo,
+};
 
 #[test]
 fn test_responses_request_creation() {
