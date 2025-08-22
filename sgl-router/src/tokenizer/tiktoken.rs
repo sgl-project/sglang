@@ -213,7 +213,7 @@ mod tests {
         let text = "Hello, world!";
         let encoding = tokenizer.encode(text).unwrap();
 
-        let decoded = tokenizer.decode(&encoding.token_ids(), false).unwrap();
+        let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
         assert_eq!(decoded, text);
     }
 
@@ -226,7 +226,7 @@ mod tests {
 
         assert_eq!(encodings.len(), 3);
         for (i, encoding) in encodings.iter().enumerate() {
-            let decoded = tokenizer.decode(&encoding.token_ids(), false).unwrap();
+            let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
             assert_eq!(decoded, texts[i]);
         }
     }
