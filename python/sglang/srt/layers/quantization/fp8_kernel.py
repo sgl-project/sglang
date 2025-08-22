@@ -45,7 +45,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _is_cuda:
     from sgl_kernel import (
         sgl_per_tensor_quant_fp8,
-        sgl_per_token_group_quant_8bit,
+        sgl_per_token_group_quant_fp8,
         sgl_per_token_quant_fp8,
     )
 
@@ -496,18 +496,7 @@ def sglang_per_token_group_quant_fp8(
     )
 
     if x.shape[0] > 0:
-        sgl_per_token_group_quant_8bit(
-            x,
-            x_q,
-            x_s,
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            scale_ue8m0,
-            fuse_silu_and_mul,
-            masked_m,
-        )
+        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0)
 
     return x_q, x_s
 
