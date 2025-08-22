@@ -155,8 +155,16 @@ class CanonicalStrategy:
                         events.append(Event("normal", emit))
                     return events, hold
                 else:
-                    events.append(Event("normal", text[token.start : token.end]))
-                pos += 1
+                    # Check if this might be commentary filler between blocks
+                    if self._is_commentary_filler_between_blocks(text, tokens, pos):
+                        # Skip this filler text - don't emit as normal content
+                        pos += 1
+                    else:
+                        content = text[token.start : token.end]
+                        # Skip standalone structural tokens that shouldn't be emitted as normal text
+                        if not self._is_standalone_structural_token(content):
+                            events.append(Event("normal", content))
+                        pos += 1
 
             elif token.type in ("START", "CHANNEL"):
                 # Parse a channel block starting here
@@ -177,9 +185,16 @@ class CanonicalStrategy:
                 pos = new_pos
 
             else:
-                # Unexpected token - treat as text
-                events.append(Event("normal", text[token.start : token.end]))
-                pos += 1
+                # Check if this might be commentary filler between blocks
+                if self._is_commentary_filler_between_blocks(text, tokens, pos):
+                    # Skip this filler text - don't emit as normal content
+                    pos += 1
+                else:
+                    # Unexpected token - only emit as text if it's not a standalone structural token
+                    content = text[token.start : token.end]
+                    if not self._is_standalone_structural_token(content):
+                        events.append(Event("normal", content))
+                    pos += 1
 
         return events, ""
 
@@ -346,6 +361,60 @@ class CanonicalStrategy:
 
         return None, end_pos + 1
 
+    def _is_commentary_filler_between_blocks(
+        self, text: str, tokens: List[Token], pos: int
+    ) -> bool:
+        """Check if this is commentary filler text or problematic structural tokens in malformed sequences."""
+        current_token = tokens[pos]
+        current_text = text[current_token.start : current_token.end].strip()
+
+        # Check for commentary filler between CALL and CHANNEL
+        if pos > 0 and pos + 1 < len(tokens):
+            prev_token = tokens[pos - 1]
+            next_token = tokens[pos + 1]
+
+            # Check if we have CALL -> TEXT("commentary") -> CHANNEL pattern
+            if (
+                prev_token.type == "CALL"
+                and next_token.type == "CHANNEL"
+                and current_text.lower() == "commentary"
+            ):
+                return True
+
+        # Check for problematic patterns after CALL tokens (malformed sequences)
+        if pos > 0:
+            prev_token = tokens[pos - 1]
+
+            # Only filter structural tokens that appear immediately after CALL in malformed sequences
+            # These patterns indicate the content is malformed and the structural tokens are noise
+            if prev_token.type == "CALL":
+                # Filter MESSAGE tokens after CALL (should not happen in well-formed content)
+                if current_token.type == "MESSAGE":
+                    return True
+
+                # Filter standalone "commentary" text after CALL
+                if (
+                    current_token.type == "TEXT"
+                    and current_text.lower() == "commentary"
+                ):
+                    return True
+
+        return False
+
+    def _is_standalone_structural_token(self, content: str) -> bool:
+        """Check if content is just a standalone structural token that should be filtered."""
+        content_stripped = content.strip()
+        structural_tokens = [
+            "<|start|>",
+            "<|channel|>",
+            "<|message|>",
+            "<|constrain|>",
+            "<|end|>",
+            "<|call|>",
+            "<|return|>",
+        ]
+        return content_stripped in structural_tokens
+
 
 class TextStrategy:
     """Parses the text-based Harmony fallback format."""
@@ -435,6 +504,12 @@ class HarmonyParser:
     def __init__(self):
         self.strategy = None
         self._buffer = ""
+        self._should_filter_commentary = (
+            False  # Track if we should filter commentary in next chunks
+        )
+        self._partial_commentary = (
+            ""  # Track partial commentary being built across chunks
+        )
 
     def parse(self, chunk: str) -> List[Event]:
         self._buffer += chunk
@@ -457,5 +532,57 @@ class HarmonyParser:
             self.strategy.set_buffer_context(self._buffer)
 
         events, remaining = self.strategy.parse(self._buffer)
+
+        # Check if we should start filtering commentary (after <|call|> token or tool_call event)
+        buffer_has_call_token = self._buffer.rstrip().endswith("<|call|>")
+
         self._buffer = remaining
-        return events
+
+        # Filter events for streaming case
+        filtered_events = []
+        for event in events:
+            should_filter = False
+
+            if event.event_type == "normal":
+                # Check if we're in a commentary filtering state
+                if self._should_filter_commentary or self._partial_commentary:
+                    # Try to build partial commentary
+                    potential_commentary = (
+                        self._partial_commentary + event.content.strip().lower()
+                    )
+
+                    if potential_commentary == "commentary":
+                        # Complete commentary found - filter it
+                        should_filter = True
+                        self._partial_commentary = ""  # Reset
+                        self._should_filter_commentary = False  # Done filtering
+                    elif "commentary".startswith(potential_commentary):
+                        # Partial match - accumulate and filter this chunk
+                        should_filter = True
+                        self._partial_commentary = potential_commentary
+                    else:
+                        # Not commentary - reset and keep the event
+                        self._partial_commentary = ""
+                        self._should_filter_commentary = False
+                else:
+                    # Not in commentary filtering state - reset partial state
+                    self._partial_commentary = ""
+
+            if should_filter:
+                # Skip this commentary filler
+                continue
+
+            # Update filtering state based on events and buffer state
+            if event.event_type == "tool_call":
+                self._should_filter_commentary = (
+                    True  # Filter commentary after tool calls
+                )
+                self._partial_commentary = ""  # Reset on tool call
+            elif buffer_has_call_token:
+                self._should_filter_commentary = (
+                    True  # Filter commentary after <|call|> token
+                )
+
+            filtered_events.append(event)
+
+        return filtered_events

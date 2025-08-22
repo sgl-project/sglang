@@ -78,18 +78,20 @@ class GptOssDetector(BaseFormatDetector):
         """Parse incremental streaming text for TypeScript-style function calls."""
         self._buffer += new_text
 
+        # Always use HarmonyParser for parsing to ensure proper filtering
+        events = self.harmony_parser.parse(new_text)
+
         # Quick check if we might have tool calls
         if (
             "<|channel|>commentary to=" not in self._buffer
             and not self.current_tool_name_sent
         ):
-            # No tool calls, just return normal text
+            # No tool calls detected, check for final content
             if (
                 "<|channel|>final" in self._buffer
                 or "assistantfinal" in self._buffer.lower()
             ):
-                # Let HarmonyParser handle final content
-                events = self.harmony_parser.parse(new_text)
+                # Extract normal text from events
                 normal_text = "".join(
                     [e.content for e in events if e.event_type == "normal"]
                 )
@@ -97,12 +99,16 @@ class GptOssDetector(BaseFormatDetector):
                     self._buffer = ""
                     return StreamingParseResult(normal_text=normal_text, calls=[])
 
-            # Regular text, pass through
-            self._buffer = ""
-            return StreamingParseResult(normal_text=new_text, calls=[])
-
-        # Parse events from HarmonyParser
-        events = self.harmony_parser.parse(new_text)
+            # For other content, extract normal text from events (with filtering applied)
+            normal_text = "".join(
+                [e.content for e in events if e.event_type == "normal"]
+            )
+            if normal_text or events:
+                self._buffer = ""
+                return StreamingParseResult(normal_text=normal_text, calls=[])
+            else:
+                # No events processed, continue buffering
+                return StreamingParseResult(normal_text="", calls=[])
 
         if not events:
             # No complete events yet

@@ -292,6 +292,33 @@ class TestCanonicalStrategy(CustomTestCase):
         self.assertEqual(events[0].content, "")
         self.assertEqual(remaining, "")
 
+    def test_parse_commentary_filler_between_blocks(self):
+        """Test that 'commentary' filler between <|call|> and <|channel|> is filtered out."""
+        # This pattern occurs when the model generates malformed output
+        text = (
+            '<|channel|>commentary to=functions.get_weather<|message|>{"location":"SF"}<|call|>'
+            "commentary"  # This should be filtered out
+            '<|channel|>commentary to=functions.get_temp<|message|>{"location":"NYC"}<|call|>'
+        )
+        events, remaining = self.strategy.parse(text)
+
+        # Should have 2 tool calls, no "commentary" normal text
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].event_type, "tool_call")
+        self.assertEqual(events[0].content, '{"location":"SF"}')
+        self.assertEqual(events[1].event_type, "tool_call")
+        self.assertEqual(events[1].content, '{"location":"NYC"}')
+        self.assertEqual(remaining, "")
+
+        # Verify no "commentary" text was emitted as normal content
+        normal_events = [e for e in events if e.event_type == "normal"]
+        commentary_events = [
+            e for e in normal_events if "commentary" in e.content.lower()
+        ]
+        self.assertEqual(
+            len(commentary_events), 0, "Commentary filler should be filtered out"
+        )
+
 
 class TestTextStrategy(CustomTestCase):
     def setUp(self):
@@ -453,7 +480,7 @@ class TestHarmonyParser(CustomTestCase):
             events = self.parser.parse(chunk)
             all_events.extend(events)
 
-        self.assertEqual(len(all_events), 6)
+        self.assertEqual(len(all_events), 5)
 
         # Verify we get reasoning events
         reasoning_events = [e for e in all_events if e.event_type == "reasoning"]
@@ -489,6 +516,95 @@ class TestHarmonyParser(CustomTestCase):
 
         self.assertGreater(len(reasoning_events), 0)
         self.assertGreater(len(normal_events), 0)
+
+    def test_streaming_commentary_filler(self):
+        """Test that 'commentary' filler is filtered in streaming case."""
+        # Test when commentary arrives as a separate chunk after <|call|>
+        chunks = [
+            "<|channel|>commentary to=functions.get_weather",
+            "<|message|>",
+            '{"location":"SF"}',
+            "<|call|>",
+            "comment",  # This arrives as separate chunk - should be filtered
+            "ary",  # Continuation of the filler - should be filtered
+            "<|channel|>commentary to=functions.get_temp",
+            "<|message|>",
+            '{"location":"NYC"}',
+            "<|call|>",
+            "comment",  # Another separate chunk - should be filtered
+            "ary",  # Continuation of the filler - should be filtered
+            "<|start|>assistant<|channel|>final",
+            "<|message|>Done<|return|>",
+        ]
+
+        all_events = []
+        for chunk in chunks:
+            events = self.parser.parse(chunk)
+            all_events.extend(events)
+
+        # Count event types
+        tool_events = [e for e in all_events if e.event_type == "tool_call"]
+        normal_events = [e for e in all_events if e.event_type == "normal"]
+
+        # Should have 2 tool calls and 1 final message
+        self.assertEqual(len(tool_events), 2, "Should have 2 tool calls")
+        self.assertEqual(
+            len(normal_events), 1, "Should have 1 normal event (final message)"
+        )
+
+        # Verify no "commentary" in normal events
+        for event in normal_events:
+            self.assertNotEqual(
+                event.content.strip().lower(),
+                "commentary",
+                "Commentary filler should not appear as normal content in streaming",
+            )
+
+        # Verify content
+        self.assertEqual(tool_events[0].content, '{"location":"SF"}')
+        self.assertEqual(tool_events[1].content, '{"location":"NYC"}')
+        self.assertEqual(normal_events[0].content, "Done")
+
+    def test_repetitive_tool_calls_with_commentary_filler(self):
+        """Test handling of repetitive tool calls with 'commentary' filler text."""
+        # This simulates malformed output with repeated tool calls and commentary filler
+        text = (
+            "<|channel|>analysis<|message|>Need to get weather<|end|>"
+            '<|start|>assistant<|channel|>commentary to=functions.get_weather<|message|>{"city":"Boston"}<|call|>'
+            "commentary"  # Filler that should be filtered
+            '<|channel|>commentary to=functions.get_weather<|message|>{"city":"Boston"}<|call|>'
+            "commentary"  # Another filler
+            '<|channel|>commentary to=functions.get_weather<|message|>{"city":"Boston"}<|call|>'
+            "<|channel|>analysis<|message|>Tool not responding<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>Unable to fetch weather data<|return|>"
+        )
+
+        events = self.parser.parse(text)
+
+        # Count event types
+        reasoning_events = [e for e in events if e.event_type == "reasoning"]
+        tool_events = [e for e in events if e.event_type == "tool_call"]
+        normal_events = [e for e in events if e.event_type == "normal"]
+
+        # Verify correct number of each type
+        self.assertEqual(len(reasoning_events), 2, "Should have 2 reasoning events")
+        self.assertEqual(len(tool_events), 3, "Should have 3 tool calls")
+        self.assertEqual(
+            len(normal_events), 1, "Should have 1 normal event (final message)"
+        )
+
+        # Verify no "commentary" filler in normal events
+        for event in normal_events:
+            self.assertNotEqual(
+                event.content.strip().lower(),
+                "commentary",
+                "Commentary filler should not appear as normal content",
+            )
+
+        # Verify content is correct
+        self.assertEqual(reasoning_events[0].content, "Need to get weather")
+        self.assertEqual(reasoning_events[1].content, "Tool not responding")
+        self.assertEqual(normal_events[0].content, "Unable to fetch weather data")
 
 
 class TestIntegrationScenarios(CustomTestCase):
@@ -603,8 +719,18 @@ class TestIntegrationScenarios(CustomTestCase):
 
         # Chunked parsing
         parser2 = HarmonyParser()
-        chunks = ["<|channel|>","analysis", "<|message|>", "reasoning content", "<|end|>",
-                  "<|start|>assistant", "<|channel|>final", "<|message|>", "final ", "content"]
+        chunks = [
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "reasoning content",
+            "<|end|>",
+            "<|start|>assistant",
+            "<|channel|>final",
+            "<|message|>",
+            "final ",
+            "content",
+        ]
         events_chunked = []
         for chunk in chunks:
             events_chunked.extend(parser2.parse(chunk))
@@ -623,10 +749,9 @@ class TestIntegrationScenarios(CustomTestCase):
         normal_chunked = "".join(
             e.content for e in events_chunked if e.event_type == "normal"
         )
-        
+
         self.assertEqual(reasoning_chunked, reasoning_oneshot)
         self.assertEqual(normal_chunked, normal_oneshot)
-        
 
     def test_streaming_property_text(self):
         """Test streaming property for text format."""
