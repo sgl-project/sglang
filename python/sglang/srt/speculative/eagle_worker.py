@@ -1017,7 +1017,9 @@ def get_last_loc_large_page_size_top_k_1(
     return prefix_lens, seq_lens, last_loc
 
 
-@torch.compile(dynamic=True)
+# Disable torch.compile for this function because it will be
+# even slower.
+# @torch.compile(dynamic=True)
 def get_last_loc_large_page_size_large_top_k(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
