@@ -439,7 +439,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
     elif server_url in load_balancer.decode_servers:
         if len(load_balancer.decode_servers) <= 1:
             raise HTTPException(
-                status_code=500,
+                status_code=400,
                 detail=f"Cannot convert {server_url} to prefill, at least one decode server is required.",
             )
         current_role = "decode"
@@ -449,7 +449,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
         )
     else:
         raise HTTPException(
-            status_code=500,
+            status_code=400,
             detail=f"Invalid URL:{server_url}. The server may be not registered.",
         )
 
