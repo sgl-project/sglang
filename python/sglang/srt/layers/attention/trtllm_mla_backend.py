@@ -51,6 +51,7 @@ class TRTLLMMLADecodeMetadata:
 
     workspace: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
+    seq_lens: Optional[torch.Tensor] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -195,7 +196,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Initialize metadata for CUDA graph capture."""
 
         # Delegate to parent for non-decode modes.
-        if not forward_mode.is_decode_or_idle():
+        if not forward_mode.is_decode_or_idle() and not forward_mode.is_target_verify():
             return super().init_forward_metadata_capture_cuda_graph(
                 bs,
                 num_tokens,
@@ -205,6 +206,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_mode,
                 spec_info,
             )
+
+        if forward_mode.is_target_verify():
+            seq_lens = spec_info.draft_token_num + seq_lens
 
         # Custom fast-path for decode/idle.
         max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
@@ -223,7 +227,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         metadata = TRTLLMMLADecodeMetadata(
-            self.decode_cuda_graph_workspace, block_kv_indices
+            self.decode_cuda_graph_workspace, block_kv_indices, seq_lens
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -241,7 +245,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Replay CUDA graph with new inputs."""
         # Delegate to parent for non-decode modes.
-        if not forward_mode.is_decode_or_idle():
+        if not forward_mode.is_decode_or_idle() and not forward_mode.is_target_verify():
             return super().init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -254,6 +258,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
+        if forward_mode.is_target_verify():
+            seq_lens = spec_info.draft_token_num + seq_lens
+        metadata.seq_lens.copy_(seq_lens)
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[(bs,)](
@@ -275,10 +282,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
         # Delegate to parent for non-decode modes.
-        if not forward_batch.forward_mode.is_decode_or_idle():
+        if not forward_batch.forward_mode.is_decode_or_idle() and not forward_batch.forward_mode.is_target_verify():
             return super().init_forward_metadata(forward_batch)
 
         bs = forward_batch.batch_size
+        if forward_batch.forward_mode.is_target_verify():
+            seq_lens = forward_batch.spec_info.draft_token_num + forward_batch.seq_lens
+        else:
+            seq_lens = forward_batch.seq_lens
 
         # Get maximum sequence length.
         if getattr(forward_batch, "seq_lens_cpu", None) is not None:
@@ -291,7 +302,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             bs,
             max_seqlen_pad,
             forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
+            seq_lens,
             forward_batch.seq_lens.device,
         )
 
@@ -471,6 +482,81 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=metadata.block_kv_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
+            max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
+            bmm1_scale=bmm1_scale,
+        )
+
+        # Extract value projection part and reshape
+        raw_out_v = raw_out[..., : layer.v_head_dim].contiguous()
+        output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+        return output
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not forward_batch.forward_mode.is_target_verify():
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
+
+        if k is not None and save_kv_cache:
+            cache_loc = forward_batch.out_cache_loc
+            if k_rope is not None:
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, cache_loc, k, k_rope
+                )
+            elif v is not None:
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+
+        if q_rope is not None:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope_reshaped = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
+        else:
+            query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # TODO: draft extend cannot work with this kernel due to unsupport of varlen decoding
+        if query.dim() == 3:
+            query = query.view(
+                forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
+            )
+
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        pages = k_cache.view(-1, self.page_size, self.kv_cache_dim)
+        kv_cache = pages.unsqueeze(1)
+        metadata = self.forward_metadata
+
+        # TODO: Change once fp8 path is supported
+        q_scale = 1.0
+        k_scale = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+
+        bmm1_scale = q_scale * k_scale * layer.scaling
+
+        # Call TRT-LLM kernel
+        raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=metadata.workspace,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=metadata.block_kv_indices,
+            seq_lens=metadata.seq_lens.to(torch.int32),
             max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
             bmm1_scale=bmm1_scale,
         )

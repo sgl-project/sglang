@@ -868,9 +868,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         else:
             # mla paged prefill
             if spec_info is not None:
-                assert (
-                    self.page_size == 1
-                ), "Only page_size=1 is supported for flashinfer backend with speculative decoding"
                 kv_lens = kv_indptr[1:] - kv_indptr[:-1]
             else:
                 kv_lens = paged_kernel_lens.to(torch.int32)
