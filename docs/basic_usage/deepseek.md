@@ -167,9 +167,9 @@ python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --spec
   - Set `--cuda-graph-bs`. It's a list of batch sizes for cuda graph capture. The default captured batch sizes for speculative decoding is set [here](https://github.com/sgl-project/sglang/blob/49420741746c8f3e80e0eb17e7d012bfaf25793a/python/sglang/srt/model_executor/cuda_graph_runner.py#L126). You can include more batch sizes into it.
 
 
-### Reasoning Content for DeepSeek R1
+### Reasoning Content for DeepSeek R1 & V3.1
 
-See [Separate Reasoning](https://docs.sglang.ai/backend/separate_reasoning.html).
+See [Reasoning Parser](https://docs.sglang.ai/advanced_features/separate_reasoning.html) and [Thinking Parameter for DeepSeek V3.1](https://docs.sglang.ai/basic_usage/openai_api_completions.html#Example:-DeepSeek-V3-Models).
 
 
 ### Function calling for DeepSeek Models

@@ -158,6 +158,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("scaled_fp4_experts_quant", torch::kCUDA, &scaled_fp4_experts_quant);
 
   m.def(
+      "silu_and_mul_scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
+      "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
+      "Tensor output_scale_offset_by_experts, Tensor mask) -> ()");
+  m.impl("silu_and_mul_scaled_fp4_experts_quant", torch::kCUDA, &silu_and_mul_scaled_fp4_experts_quant);
+
+  m.def(
       "cutlass_fp4_group_mm(Tensor! output, Tensor a, Tensor b,"
       "Tensor a_blockscale, Tensor b_blockscale, Tensor alphas,"
       "Tensor ab_strides, Tensor c_strides, Tensor problem_sizes,"

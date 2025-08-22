@@ -52,7 +52,6 @@ if not (_is_npu or _is_hip):
 if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
-    from aiter.ops.shuffle import shuffle_weight
 
 logger = logging.getLogger(__name__)
 

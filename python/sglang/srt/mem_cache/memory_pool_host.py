@@ -7,6 +7,7 @@ from functools import wraps
 import psutil
 import torch
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.utils import is_npu
 
@@ -307,6 +308,9 @@ class MHATokenToKVPoolHost(HostKVCache):
 
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
+    def get_ksize_per_token(self):
+        return self.get_size_per_token() // 2
+
     def init_kv_buffer(self):
         if self.layout == "layer_first":
             dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
@@ -484,8 +488,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             ptr_list.append(k_ptr)
             ptr_list.append(v_ptr)
             key_ = keys[index // self.page_size]
-            key_list.append(f"{key_}_k")
-            key_list.append(f"{key_}_v")
+            key_list.append(f"{key_}_{get_tensor_model_parallel_rank()}_k")
+            key_list.append(f"{key_}_{get_tensor_model_parallel_rank()}_v")
         element_size = (
             self.layer_num
             * self.dtype.itemsize
@@ -495,6 +499,21 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
+
+    def get_buffer_with_hash(self, keys, indices):
+        assert self.layout == "page_first"
+        assert len(keys) == (len(indices) // self.page_size)
+
+        key_list = []
+        buf_list = []
+
+        for key, i in zip(keys, range(0, len(indices), self.page_size)):
+            key_list.append(f"{key}-k")
+            buf_list.append(self.k_buffer[i : i + self.page_size])
+            key_list.append(f"{key}-v")
+            buf_list.append(self.v_buffer[i : i + self.page_size])
+
+        return key_list, buf_list
 
 
 class MLATokenToKVPoolHost(HostKVCache):
@@ -537,6 +556,9 @@ class MLATokenToKVPoolHost(HostKVCache):
             * self.dtype.itemsize
             * self.layer_num
         )
+
+    def get_ksize_per_token(self):
+        return self.get_size_per_token()
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":
@@ -704,3 +726,14 @@ class MLATokenToKVPoolHost(HostKVCache):
         )
         element_size_list = [element_size] * len(key_list)
         return key_list, ptr_list, element_size_list
+
+    def get_buffer_with_hash(self, keys, indices):
+        assert self.layout == "page_first"
+        assert len(keys) == (len(indices) // self.page_size)
+
+        buf_list = []
+
+        for i in range(0, len(indices), self.page_size):
+            buf_list.append(self.kv_buffer[i : i + self.page_size])
+
+        return keys, buf_list
