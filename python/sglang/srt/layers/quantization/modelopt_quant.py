@@ -9,10 +9,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens, get_local_dp_buffer
-from sglang.srt.layers.moe import (
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
-    should_use_flashinfer_trtllm_moe,
-)
+from sglang.srt.layers.moe import should_use_flashinfer_trtllm_moe, get_moe_a2a_backend
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -1271,7 +1268,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = x.dtype
             x_sf = None
-            if should_use_flashinfer_cutlass_moe_fp4_allgather():
+            if get_moe_a2a_backend().is_fp4_allgather():
                 from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
 
                 # Quantize before comm, swizzle after.
@@ -1313,7 +1310,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
             # Scale by routed_scaling_factor is fused into select_experts.
-            if should_use_flashinfer_cutlass_moe_fp4_allgather():
+            if get_moe_a2a_backend().is_fp4_allgather():
                 output, global_output = get_local_dp_buffer(), output
                 get_tp_group().reduce_scatterv(
                     global_output, output=output, sizes=get_dp_global_num_tokens()
