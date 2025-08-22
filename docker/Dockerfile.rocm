@@ -16,6 +16,7 @@ ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.4"
 ENV NO_DEPS_FLAG=""
 
@@ -24,8 +25,9 @@ ENV NO_DEPS_FLAG=""
 FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
-ENV BUILD_AITER_ALL="1"
 ENV BUILD_LLVM="1"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="0"
 ENV AITER_COMMIT="v0.1.4"
 ENV HIP_CLANG_PATH="/sgl-workspace/llvm-project/build/bin/"
 ENV NO_DEPS_FLAG="--no-deps"
@@ -50,6 +52,9 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
 ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
+
+ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
+ARG MOONCAKE_COMMIT="b63322c9e8d11e9d40a2b4ce9ccbc9c12e82af2a"
 
 USER root
 
@@ -112,6 +117,32 @@ RUN if [ "$BUILD_VLLM" = "1" ]; then \
      && python setup.py clean --all \
      && python setup.py develop; \
     fi
+
+# -----------------------
+# Build Mooncake
+ENV PATH=$PATH:/usr/local/go/bin
+
+RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
+     apt update && apt install -y zip unzip wget && \
+     apt install -y gcc make libtool autoconf  librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool  libibverbs-dev rdma-core && \
+     apt install -y openssh-server openmpi-bin openmpi-common libopenmpi-dev && \
+     wget https://dl.google.com/go/go1.24.3.linux-amd64.tar.gz && \
+     rm -rf /usr/local/go && tar -C /usr/local -xzf go1.24.3.linux-amd64.tar.gz && \
+     git clone ${MOONCAKE_REPO} && \
+     cd Mooncake && \
+     git checkout ${MOONCAKE_COMMIT} && \
+     git submodule update --init --recursive && \
+     bash dependencies.sh -y && \
+     rm -rf /usr/local/go && \
+     wget https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
+     tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
+     rm go1.22.2.linux-amd64.tar.gz && \
+     mkdir -p build && \
+     cd build && \
+     cmake .. -DUSE_ETCD=ON && \
+     make -j "$(nproc)" && make install; \
+    fi
+
 
 # -----------------------
 # Build SGLang
