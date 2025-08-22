@@ -76,7 +76,7 @@ class HiCacheNixl(HiCacheStorage):
         self,
         buffers: Optional[List[torch.Tensor | tuple]],
         keys: List[str],
-        direction: str
+        direction: str,
     ) -> bool:
         if len(buffers) != len(keys):
             logger.error("Mismatch between number of tensors/buffers and files/objects")
@@ -89,7 +89,7 @@ class HiCacheNixl(HiCacheStorage):
             if not tuples or not self.registration._register_memory(tuples, "FILE"):
                 logger.error("Failed to prepare files for transfer")
                 return False
-        else: # mem_type == "OBJ"
+        else:  # mem_type == "OBJ"
             tuples = [(0, 0, key, "") for key in keys]
             if not tuples or not self.registration._register_memory(tuples, "OBJ"):
                 logger.error("Failed to register objects")
@@ -97,16 +97,22 @@ class HiCacheNixl(HiCacheStorage):
 
         # Prepare transfer descriptors
         if isinstance(buffers[0], torch.Tensor):
-            tensor_sizes = [tensor.element_size() * tensor.numel() for tensor in buffers]
+            tensor_sizes = [
+                tensor.element_size() * tensor.numel() for tensor in buffers
+            ]
             storage_tuples = [(x[0], s, x[2]) for x, s in zip(tuples, tensor_sizes)]
             host_descs = self.agent.get_xfer_descs(buffers)
         elif isinstance(buffers[0], tuple):
             storage_tuples = [(x[0], y[1], x[2]) for x, y in zip(tuples, buffers)]
-            host_descs = self.agent.get_xfer_descs([(x[0], x[1], 0) for x in buffers], "DRAM")
+            host_descs = self.agent.get_xfer_descs(
+                [(x[0], x[1], 0) for x in buffers], "DRAM"
+            )
         else:
             return False
 
-        storage_descs = self.agent.get_xfer_descs(storage_tuples, self.backend_selector.mem_type)
+        storage_descs = self.agent.get_xfer_descs(
+            storage_tuples, self.backend_selector.mem_type
+        )
 
         if (host_descs is None) or (storage_descs is None):
             logger.error("Failed to get transfer descriptors")
@@ -114,7 +120,9 @@ class HiCacheNixl(HiCacheStorage):
 
         # Initialize transfer, default assumption that tensor was registered
         try:
-            xfer_req = self.agent.initialize_xfer(direction, host_descs, storage_descs, self.agent_name)
+            xfer_req = self.agent.initialize_xfer(
+                direction, host_descs, storage_descs, self.agent_name
+            )
         except Exception:
             # Check if it was due to missing pre-registration
             if not self.register_buffers(buffers):
@@ -122,7 +130,9 @@ class HiCacheNixl(HiCacheStorage):
                 return False
 
             try:
-                xfer_req = self.agent.initialize_xfer(direction, host_descs, storage_descs, self.agent_name)
+                xfer_req = self.agent.initialize_xfer(
+                    direction, host_descs, storage_descs, self.agent_name
+                )
             except Exception as e:
                 logger.error(f"Failed to create transfer request: {e}")
                 return False
@@ -151,7 +161,7 @@ class HiCacheNixl(HiCacheStorage):
     def get(
         self,
         key: str,
-        target_location: Optional[torch.Tensor | int]=None,
+        target_location: Optional[torch.Tensor | int] = None,
         target_sizes: Optional[int] = None,
     ) -> torch.Tensor | None:
         # To be removed, being compatible with the current API
@@ -227,7 +237,7 @@ class HiCacheNixl(HiCacheStorage):
                     return False
                 file_paths.append(file_path)
             return self._execute_transfer(values, file_paths, "WRITE")
-        else: # mem_type == "OBJ"
+        else:  # mem_type == "OBJ"
             return self._execute_transfer(values, keys, "WRITE")
 
     def exists(self, key: str) -> bool:

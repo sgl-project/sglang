@@ -111,7 +111,7 @@ class NixlRegistration:
     def _register_memory(
         self,
         items: Union[List[tuple], torch.Tensor, List[torch.Tensor]],
-        mem_type: Optional[str] = None
+        mem_type: Optional[str] = None,
     ) -> Optional[Any]:
         """Common registration logic for files, objects, and buffers.
         Args:
@@ -128,13 +128,16 @@ class NixlRegistration:
 
         try:
             registered_memory = self.agent.register_memory(reg_descs)
-            return registered_memory # Could be None in case of error
+            return registered_memory  # Could be None in case of error
         except Exception as e:
             if not mem_type:
                 logger.error(f"Failed to register Tensors with NIXL: {e}")
             else:
-                logger.error(f"Failed to register memory of type {mem_type} with NIXL: {e}")
+                logger.error(
+                    f"Failed to register memory of type {mem_type} with NIXL: {e}"
+                )
             return None
+
 
 class NixlFileManager:
     """Handles file system operations for NIXL."""

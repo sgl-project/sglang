@@ -8,7 +8,10 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
-from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager, NixlRegistration
+from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
+    NixlFileManager,
+    NixlRegistration,
+)
 
 
 class TestNixlUnified(unittest.TestCase):
@@ -95,7 +98,10 @@ class TestNixlUnified(unittest.TestCase):
         key2 = "test_key2"
         dst_tensor2 = torch.zeros_like(value, device="cpu")
         src_addr, src_len = value.data_ptr(), value.numel() * value.element_size()
-        dst_addr, dst_len = dst_tensor2.data_ptr(), dst_tensor2.numel() * dst_tensor2.element_size()
+        dst_addr, dst_len = (
+            dst_tensor2.data_ptr(),
+            dst_tensor2.numel() * dst_tensor2.element_size(),
+        )
 
         # Test set
         self.assertTrue(self.hicache.set(key, None, src_addr, src_len))
@@ -128,9 +134,9 @@ class TestNixlUnified(unittest.TestCase):
         keys2 = ["key4", "key5", "key6"]
         dst_tensors2 = [torch.zeros_like(v, device="cpu") for v in values]
         src_addrs = [v.data_ptr() for v in values]
-        src_lens  = [v.numel() * v.element_size() for v in values]
+        src_lens = [v.numel() * v.element_size() for v in values]
         dst_addrs = [dt.data_ptr() for dt in dst_tensors2]
-        dst_lens  = [dt.numel() * dt.element_size() for dt in dst_tensors2]
+        dst_lens = [dt.numel() * dt.element_size() for dt in dst_tensors2]
 
         # Test batch set
         self.assertTrue(self.hicache.batch_set(keys2, None, src_addrs, src_lens))
