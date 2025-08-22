@@ -2,8 +2,8 @@
 
 use sglang_router_rs::protocols::spec::{
     GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus,
-    ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice, ToolChoiceValue,
-    Truncation, UsageInfo,
+    ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
+    ToolChoiceValue, Truncation, UsageInfo,
 };
 
 #[test]

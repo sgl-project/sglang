@@ -966,5 +966,198 @@ mod tests {
             request.top_k = Some(0); // Invalid
             assert!(request.validate().is_err());
         }
+
+        #[test]
+        fn test_parameter_ranges() {
+            let mut request = create_valid_chat_request();
+
+            // Test temperature range (0.0 to 2.0)
+            request.temperature = Some(1.5);
+            assert!(request.validate().is_ok());
+            request.temperature = Some(-0.1);
+            assert!(request.validate().is_err());
+            request.temperature = Some(3.0);
+            assert!(request.validate().is_err());
+
+            // Test top_p range (0.0 to 1.0)
+            request.temperature = Some(1.0); // Reset
+            request.top_p = Some(0.9);
+            assert!(request.validate().is_ok());
+            request.top_p = Some(-0.1);
+            assert!(request.validate().is_err());
+            request.top_p = Some(1.5);
+            assert!(request.validate().is_err());
+
+            // Test frequency_penalty range (-2.0 to 2.0)
+            request.top_p = Some(0.9); // Reset
+            request.frequency_penalty = Some(1.5);
+            assert!(request.validate().is_ok());
+            request.frequency_penalty = Some(-2.5);
+            assert!(request.validate().is_err());
+            request.frequency_penalty = Some(3.0);
+            assert!(request.validate().is_err());
+
+            // Test presence_penalty range (-2.0 to 2.0)
+            request.frequency_penalty = Some(0.0); // Reset
+            request.presence_penalty = Some(-1.5);
+            assert!(request.validate().is_ok());
+            request.presence_penalty = Some(-3.0);
+            assert!(request.validate().is_err());
+            request.presence_penalty = Some(2.5);
+            assert!(request.validate().is_err());
+
+            // Test repetition_penalty range (0.0 to 2.0)
+            request.presence_penalty = Some(0.0); // Reset
+            request.repetition_penalty = Some(1.2);
+            assert!(request.validate().is_ok());
+            request.repetition_penalty = Some(-0.1);
+            assert!(request.validate().is_err());
+            request.repetition_penalty = Some(2.1);
+            assert!(request.validate().is_err());
+
+            // Test min_p range (0.0 to 1.0)
+            request.repetition_penalty = Some(1.0); // Reset
+            request.min_p = Some(0.5);
+            assert!(request.validate().is_ok());
+            request.min_p = Some(-0.1);
+            assert!(request.validate().is_err());
+            request.min_p = Some(1.5);
+            assert!(request.validate().is_err());
+        }
+
+        #[test]
+        fn test_structured_output_conflicts() {
+            let mut request = create_valid_chat_request();
+
+            // JSON response format with regex should conflict
+            request.response_format = Some(ResponseFormat::JsonObject);
+            request.regex = Some(".*".to_string());
+            assert!(request.validate().is_err());
+
+            // JSON response format with EBNF should conflict
+            request.regex = None;
+            request.ebnf = Some("grammar".to_string());
+            assert!(request.validate().is_err());
+
+            // Multiple structured constraints should conflict
+            request.response_format = None;
+            request.regex = Some(".*".to_string());
+            request.ebnf = Some("grammar".to_string());
+            assert!(request.validate().is_err());
+
+            // Only one constraint should work
+            request.ebnf = None;
+            request.regex = Some(".*".to_string());
+            assert!(request.validate().is_ok());
+
+            request.regex = None;
+            request.ebnf = Some("grammar".to_string());
+            assert!(request.validate().is_ok());
+
+            request.ebnf = None;
+            request.response_format = Some(ResponseFormat::JsonObject);
+            assert!(request.validate().is_ok());
+        }
+
+        #[test]
+        fn test_stop_sequences_validation() {
+            let mut request = create_valid_chat_request();
+
+            // Valid stop sequences
+            request.stop = Some(StringOrArray::Array(vec![
+                "stop1".to_string(),
+                "stop2".to_string(),
+            ]));
+            assert!(request.validate().is_ok());
+
+            // Too many stop sequences (max 4)
+            request.stop = Some(StringOrArray::Array(vec![
+                "stop1".to_string(),
+                "stop2".to_string(),
+                "stop3".to_string(),
+                "stop4".to_string(),
+                "stop5".to_string(),
+            ]));
+            assert!(request.validate().is_err());
+
+            // Empty stop sequence should fail
+            request.stop = Some(StringOrArray::String("".to_string()));
+            assert!(request.validate().is_err());
+
+            // Empty string in array should fail
+            request.stop = Some(StringOrArray::Array(vec![
+                "stop1".to_string(),
+                "".to_string(),
+            ]));
+            assert!(request.validate().is_err());
+        }
+
+        #[test]
+        fn test_logprobs_validation() {
+            let mut request = create_valid_chat_request();
+
+            // Valid logprobs configuration
+            request.logprobs = true;
+            request.top_logprobs = Some(10);
+            assert!(request.validate().is_ok());
+
+            // logprobs=true without top_logprobs should fail
+            request.top_logprobs = None;
+            assert!(request.validate().is_err());
+
+            // top_logprobs without logprobs=true should fail
+            request.logprobs = false;
+            request.top_logprobs = Some(10);
+            assert!(request.validate().is_err());
+
+            // top_logprobs out of range (0-20)
+            request.logprobs = true;
+            request.top_logprobs = Some(25);
+            assert!(request.validate().is_err());
+        }
+
+        #[test]
+        fn test_n_parameter_validation() {
+            let mut request = create_valid_chat_request();
+
+            // Valid n values (1-10)
+            request.n = Some(1);
+            assert!(request.validate().is_ok());
+            request.n = Some(5);
+            assert!(request.validate().is_ok());
+            request.n = Some(10);
+            assert!(request.validate().is_ok());
+
+            // Invalid n values
+            request.n = Some(0);
+            assert!(request.validate().is_err());
+            request.n = Some(15);
+            assert!(request.validate().is_err());
+        }
+
+        #[test]
+        fn test_min_max_tokens_validation() {
+            let mut request = create_valid_chat_request();
+
+            // Valid token limits
+            request.min_tokens = Some(10);
+            request.max_tokens = Some(100);
+            assert!(request.validate().is_ok());
+
+            // min_tokens > max_tokens should fail
+            request.min_tokens = Some(150);
+            request.max_tokens = Some(100);
+            assert!(request.validate().is_err());
+
+            // Should work with max_completion_tokens instead
+            request.max_tokens = None;
+            request.max_completion_tokens = Some(200);
+            request.min_tokens = Some(50);
+            assert!(request.validate().is_ok());
+
+            // min_tokens > max_completion_tokens should fail
+            request.min_tokens = Some(250);
+            assert!(request.validate().is_err());
+        }
     }
 }
