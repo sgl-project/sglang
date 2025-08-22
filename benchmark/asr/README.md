@@ -33,3 +33,16 @@ CLI options
 
 Output
 - Prints aggregate stats and per-request summaries including success/failure, TTFT, total latency, and output token count if provided in the streamed usage event.
+
+Sample:
+```
+=== ASR Benchmark Summary ===
+Total: 8, Success: 8, Fail: 0
+Average TTFT: 1.494s
+Average Latency: 2.033s
+[0] ok ttft=3.393s lat=3.443s tokens=0
+[1] ok ttft=3.395s lat=3.567s tokens=0
+[2] ok ttft=3.391s lat=3.658s tokens=0
+[3] ok ttft=1.402s lat=3.777s tokens=0
+[4] ok ttft=0.084s lat=0.395s tokens=0
+```
