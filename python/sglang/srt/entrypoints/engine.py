@@ -94,8 +94,8 @@ class Engine(EngineBase):
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
-    1. The HTTP server, Engine, and TokenizerManager both run in the main process.
-    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
+    2. Inter-process communication (IPC) is handled via the ZMQ library, with each process using a different port.
     """
 
     def __init__(self, **kwargs):
@@ -635,6 +635,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    # flashinfer uses this environment variable for various kernels from MoE to quant kernels
+    os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
     # Set prometheus env vars
     if server_args.enable_metrics:

@@ -306,6 +306,13 @@ def marlin_permute_scales(
     return s
 
 
+def marlin_permute_bias(s: torch.Tensor) -> torch.Tensor:
+    origin_shape = s.shape
+    _, scale_perm_single = get_scale_perms()
+    s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+    return s.reshape(*origin_shape).contiguous()
+
+
 def marlin_moe_permute_scales(
     s: torch.Tensor,
     size_k: int,

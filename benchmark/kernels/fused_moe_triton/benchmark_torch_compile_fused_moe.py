@@ -9,7 +9,7 @@ from transformers import AutoConfig
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe as fused_moe_triton,
 )
-from sglang.srt.model_executor.graph_runner import set_torch_compile_config
+from sglang.srt.model_executor.cuda_graph_runner import set_torch_compile_config
 
 
 def get_model_config(model_name: str, tp_size: int):
