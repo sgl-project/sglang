@@ -480,11 +480,6 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-            if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "trtllm_mla backend does not support speculative decoding yet."
-                )
-
             if self.kv_cache_dtype not in ["fp8_e4m3", "auto"]:
                 raise ValueError(
                     "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
@@ -641,6 +636,10 @@ class ServerArgs:
                 else:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
+                    )
+                if self.page_size != 1 and self.attention_backend == "flashinfer":
+                    raise ValueError(
+                        "Speculative decoding with page_size != 1 is not supported. Please set page_size to 1."
                     )
 
             # Auto choose parameters
@@ -2424,8 +2423,12 @@ def auto_choose_speculative_params(self: ServerArgs):
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
-    elif arch in ["DeepseekV3ForCausalLM", "DeepseekV2ForCausalLM"]:
-        # The default value for deepseek
+    elif arch in [
+        "DeepseekV3ForCausalLM",
+        "DeepseekV2ForCausalLM",
+        "GptOssForCausalLM",
+    ]:
+        # The default value for deepseek and gpt-oss
         return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
