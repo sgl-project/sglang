@@ -206,6 +206,7 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+        self.cpu_mem_cache_cleared = False
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -228,6 +229,15 @@ class ModelRunner:
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
+            if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND") is None:
+                try:
+                    os.system("echo 3 | tee /proc/sys/vm/drop_caches")
+                    self.cpu_mem_cache_cleared = True
+                except Exception:
+                    logger.warning(
+                        f"Failed to clear CPU memory caches. Available memory amount information might be inaccurate. "
+                        f"Please set proper `--mem-fraction-static` or `--max-total-tokens` to avoid out-of-memory error."
+                    )
             self.init_threads_binding()
 
         # Get memory before model loading
@@ -619,6 +629,7 @@ class ModelRunner:
             self.gpu_id,
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
+            cpu_cache_cleared=self.cpu_mem_cache_cleared,
         )
         self.tp_group = get_tp_group()
         self.attention_tp_group = get_attention_tp_group()
@@ -1046,6 +1057,7 @@ class ModelRunner:
             self.gpu_id,
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
+            cpu_cache_cleared=self.cpu_mem_cache_cleared,
         )
         if self.is_draft_worker:
             num_layers = getattr(

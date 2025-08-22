@@ -362,7 +362,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
 
 
 def get_available_gpu_memory(
-    device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
+    device, gpu_id, distributed=False, empty_cache=True, cpu_group=None, cpu_cache_cleared=True
 ):
     """
     Get available memory for cuda:gpu_id device.
@@ -432,8 +432,9 @@ def get_available_gpu_memory(
             max_numa_index = libnuma.numa_max_node()
             if 0 <= gpu_id <= max_numa_index:
                 free_size = ctypes.c_longlong()
-                libnuma.numa_node_size64(gpu_id, ctypes.byref(free_size))
-                free_gpu_memory = free_size.value
+                numa_mem_size = libnuma.numa_node_size64(gpu_id, ctypes.byref(free_size))
+                # free_size is inaccurate if cache not cleared, use total numa memory size
+                free_gpu_memory = free_size.value if cpu_cache_cleared else numa_mem_size
             else:
                 raise ValueError(
                     f"The rank index should be between 0-{max_numa_index} but {gpu_id} is detected. "
