@@ -127,6 +127,18 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
+if _use_aiter:
+    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+    from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
+    from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import batched_gemm_afp4wfp4_pre_quant
+    #from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
+
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    def b_dynamic_mxfp4_quant(x):
+        h,b,d= x.shape
+        x, x_scales = dynamic_mxfp4_quant(x.reshape(-1, d))
+        return x.view(h,b,d//2), x_scales.view(h,b,d//32)
+
 if _is_cuda:
     from sgl_kernel import (
         awq_dequantize,
@@ -273,6 +285,8 @@ class MoEGate(nn.Module):
         ):
             # router gemm output float32
             logits = dsv3_router_gemm(hidden_states, self.weight)
+        #elif _use_aiter and hidden_states.shape[0] <= 256:
+        #    logits = gemm_a16w16(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
@@ -1262,10 +1276,15 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = q_nope_out[:, :expected_m, :]
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
-            q_nope_out = torch.bmm(
-                q_nope.to(torch.bfloat16).transpose(0, 1),
-                self.w_kc.to(torch.bfloat16) * self.w_scale,
-            )
+            if _use_aiter and self.w_kc.dtype == torch.uint8:
+                x = q_nope.transpose(0, 1)
+                q_nope_out = torch.empty(x.shape[0], x.shape[1], self.w_kc.shape[2], device=x.device, dtype=torch.bfloat16)
+                batched_gemm_afp4wfp4_pre_quant(x, self.w_kc.transpose(-2, -1), self.w_scale_k.transpose(-2,-1), torch.bfloat16, q_nope_out)
+            else:
+                q_nope_out = torch.bmm(
+                    q_nope.to(torch.bfloat16).transpose(0, 1),
+                    self.w_kc.to(torch.bfloat16) * self.w_scale,
+                )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
@@ -1279,13 +1298,13 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if not self._fuse_rope_for_trtllm_mla(forward_batch):
+        if not self._fuse_rope_for_trtllm_mla(forward_batch) and (not _use_aiter):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
+        return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator, positions
 
     def forward_absorb_core(
-        self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
+        self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator, positions
     ):
         if (
             self.current_attention_backend == "fa3"
@@ -1309,8 +1328,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 **extra_args,
             )
         else:
-            q = torch.cat([q_nope_out, q_pe], dim=-1)
-            k = torch.cat([k_nope, k_pe], dim=-1)
+            if _use_aiter:
+                cos = self.rotary_emb.cos_cache
+                sin = self.rotary_emb.sin_cache
+                q, k = fused_qk_rope_cat(q_nope_out, q_pe, k_nope, k_pe, positions, cos, sin, self.rotary_emb.is_neox_style)
+            else:
+                q = torch.cat([q_nope_out, q_pe], dim=-1)
+                k = torch.cat([k_nope, k_pe], dim=-1)
+
             attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
@@ -1335,10 +1360,16 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
-            attn_bmm_output = torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1),
-                self.w_vc.to(torch.bfloat16) * self.w_scale,
-            )
+            if _use_aiter and self.w_vc.dtype == torch.uint8:
+                x = attn_output.transpose(0, 1)
+                attn_bmm_output = torch.empty(x.shape[0], x.shape[1], self.w_vc.shape[2], device=x.device, dtype=torch.bfloat16)
+                batched_gemm_afp4wfp4_pre_quant(x, self.w_vc.transpose(-2, -1), self.w_scale_v.transpose(-2,-1), torch.bfloat16, attn_bmm_output)
+            else:
+                attn_bmm_output = torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    self.w_vc.to(torch.bfloat16) * self.w_scale,
+                )
+
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
@@ -2318,6 +2349,15 @@ class DeepseekV2ForCausalLM(nn.Module):
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+
+            if _use_aiter and self.quant_config.get_name() == "quark" and w.dtype == torch.bfloat16:
+                w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2,-1))
+                w_kc = w_kc.transpose(-2,-1)
+                w_s_kc = w_s_kc.transpose(-2,-1)
+                w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
+                self_attn.w_scale_k = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_scale_v = w_s_vc.contiguous().transpose(1, 2)
+
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
