@@ -103,7 +103,7 @@ class CuDNNBackend(AttentionBackend):
 
         # create one decode graph per batch size
         self._decode_graphs = self._init_decode_graphs(
-            self.input_size_params.max_batch_size // 4
+            self.input_size_params.max_batch_size
         )
         self._decode_seq_len = torch.ones(
             (self.input_size_params.max_batch_size, 1, 1, 1),
@@ -202,7 +202,6 @@ class CuDNNBackend(AttentionBackend):
                 # TODO: passing atten_scale as arg
                 attn_scale=1 / math.sqrt(self.input_size_params.head_size),
                 # TODO: enable passing casual argument in graph or cache graph for both casual_mask = True and False
-                use_causal_mask=causal,
                 use_padding_mask=True,
                 diagonal_band_right_bound=diagonal_band_right_bound,
                 seq_len_q=q_seq_len,

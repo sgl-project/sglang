@@ -1577,15 +1577,11 @@ class ModelRunner:
             )
 
             return DualChunkFlashAttentionBackend(self)
+        elif self.server_args.attention_backend == "cudnn":
+            return CuDNNBackend(self)
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
             self.attn_backend = FlashAttentionBackend(self)
-        elif self.server_args.attention_backend == "cudnn":
-            self.attn_backend = CuDNNBackend(self)
-        else:
-            raise ValueError(
-                f"Invalid attention backend: {self.server_args.attention_backend}"
-            )
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"
