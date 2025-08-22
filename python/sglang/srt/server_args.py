@@ -283,7 +283,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "fp4_allgather"] = "none"
     moe_runner_backend: Literal[
         "auto",
         "triton",
@@ -693,6 +693,9 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            if not self.disable_flashinfer_cutlass_moe_fp4_allgather and self.enable_dp_attention and self.dp_size == self.tp_size:
+                logger.info("FP4 allgather is automatically enabled for Flashinfer Cutlass MOE")
+                self.moe_a2a_backend = "fp4_allgather"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert (
@@ -1729,7 +1732,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep"],
+            choices=["none", "deepep", "fp4_allgather"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )

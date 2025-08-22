@@ -36,10 +36,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
@@ -130,12 +127,9 @@ class LayerScatterModes:
     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse:
             return (
+                # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 ScatterMode.SCATTERED
-                if (
-                    # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
-                    not get_moe_a2a_backend().is_none()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                )
+                if not get_moe_a2a_backend().is_none()
                 else ScatterMode.FULL
             )
         else:

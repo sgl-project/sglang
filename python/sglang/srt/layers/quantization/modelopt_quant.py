@@ -13,7 +13,6 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
     should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
@@ -1371,7 +1370,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = x.dtype
             x_sf = None
-            if should_use_flashinfer_cutlass_moe_fp4_allgather():
+            if get_moe_a2a_backend().is_fp4_allgather():
                 from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
 
                 # Quantize before comm, swizzle after.
@@ -1412,7 +1411,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
-            if should_use_flashinfer_cutlass_moe_fp4_allgather():
+            # Scale by routed_scaling_factor is fused into select_experts.
+            if get_moe_a2a_backend().is_fp4_allgather():
                 output, global_output = get_local_dp_buffer(), output
                 get_tp_group().reduce_scatterv(
                     global_output, output=output, sizes=get_dp_global_num_tokens()
