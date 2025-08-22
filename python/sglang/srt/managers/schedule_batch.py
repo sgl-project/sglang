@@ -84,6 +84,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "chunked_prefill_size",
     "device",
     "disable_chunked_prefix_cache",
+    "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_radix_cache",
     "enable_dp_lm_head",
     "enable_flashinfer_allreduce_fusion",
@@ -105,6 +106,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_symm_mem",
     "quantization",
     "enable_custom_logit_processor",
+    "disaggregation_mode",
 ]
 
 # Put some global args for easy access
