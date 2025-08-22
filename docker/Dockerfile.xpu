@@ -47,9 +47,8 @@ RUN --mount=type=secret,id=github_token \
     conda activate py${PYTHON_VERSION} && \
     git clone https://github.com/vllm-project/vllm.git && \
     cd vllm && \
-    git checkout yuhua/deepseek && \
-    pip install setuptools_scm --root-user-action=ignore && \
-    pip install setuptools==75.6.0 packaging==24.2 --root-user-action=ignore && \
+    pip install --upgrade pip && \
+    pip install -v -r requirements/xpu.txt && \
     VLLM_TARGET_DEVICE=xpu python setup.py install
 
 # Install SGlang from source
