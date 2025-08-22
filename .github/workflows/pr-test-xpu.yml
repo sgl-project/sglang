@@ -25,7 +25,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:pvc .
+          docker build --no-cache --progress=plain -f docker/Dockerfile.xpu -t xpu_sglang:pvc .
 
 
       - name: Run container
