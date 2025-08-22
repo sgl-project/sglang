@@ -90,8 +90,27 @@ class TestSchedulePolicy(CustomTestCase):
             Req(3, "a b c", [1, 2, 3], SamplingParams(max_new_tokens=10)),
             Req(2, "a", [1], SamplingParams(max_new_tokens=100)),
         ]
+
         policy = SchedulePolicy(
             policy="lof", tree_cache=tree_cache, enable_hierarchical_cache=True, enable_priority_scheduling=False
+        )
+        policy.calc_priority(waiting_queue)
+        # Check if priority enabled fcfs ordering is applied.
+        self.assertEqual(waiting_queue[0].rid, 1)
+        self.assertEqual(waiting_queue[1].rid, 2)
+        self.assertEqual(waiting_queue[2].rid, 3)
+
+    def test_calc_priority_priority_enabled_longest_output_first_scheduling(self):
+        tree_cache = RadixCache(None, None, False)
+
+        waiting_queue = [
+            Req(1, "a b", [1, 2], SamplingParams(max_new_tokens=1), priority=1),
+            Req(3, "a b c", [1, 2, 3], SamplingParams(max_new_tokens=10), priority=0),
+            Req(2, "a", [1], SamplingParams(max_new_tokens=100), priority=0),
+        ]
+
+        policy = SchedulePolicy(
+            policy="lof", tree_cache=tree_cache, enable_hierarchical_cache=True, enable_priority_scheduling=True
         )
         policy.calc_priority(waiting_queue)
         # Check if priority enabled fcfs ordering is applied.
