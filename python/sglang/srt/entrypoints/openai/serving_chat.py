@@ -81,12 +81,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"This model supports at most {server_context_length} completion tokens."
             )
 
+        if request.response_format and request.response_format.type == "json_schema":
+            schema = getattr(request.response_format.json_schema, "schema_", None)
+            if schema is None:
+                return "schema_ is required for json_schema response format request."
+
         return None
 
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        reasoning_effort = (
+            request.chat_template_kwargs.pop("reasoning_effort", None)
+            if request.chat_template_kwargs
+            else None
+        )
+        if reasoning_effort is not None:
+            request.reasoning_effort = reasoning_effort
+
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
@@ -859,12 +872,15 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             The boolean value of 'enable_thinking' if found, otherwise False.
         """
-        if (
-            hasattr(request, "chat_template_kwargs")
-            and request.chat_template_kwargs
-            and request.chat_template_kwargs.get("enable_thinking") is not None
-        ):
-            return request.chat_template_kwargs.get("enable_thinking")
+        if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
+            # For Qwen3 models, `enable_thinking` is supported.
+            if request.chat_template_kwargs.get("enable_thinking") is not None:
+                return request.chat_template_kwargs.get("enable_thinking")
+            # For DeepSeek-V3.1 models, `thinking` is supported.
+            elif request.chat_template_kwargs.get("thinking") is not None:
+                return request.chat_template_kwargs.get("thinking")
+            else:
+                return False
         return False
 
     async def _process_tool_call_stream(
