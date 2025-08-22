@@ -67,6 +67,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
+    get_bool_env_var,
     get_zmq_socket,
     is_cuda,
     kill_process_tree,
@@ -93,8 +94,8 @@ class Engine(EngineBase):
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
-    1. The HTTP server, Engine, and TokenizerManager both run in the main process.
-    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
+    2. Inter-process communication (IPC) is handled via the ZMQ library, with each process using a different port.
     """
 
     def __init__(self, **kwargs):
@@ -259,7 +260,7 @@ class Engine(EngineBase):
                     f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
                 )
 
-        logger.info(f"data_parallel_rank: {data_parallel_rank}")
+        logger.debug(f"data_parallel_rank: {data_parallel_rank}")
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -450,15 +451,20 @@ class Engine(EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[
+        if load_format == "flattened_bucket":
+            serialized_named_tensors = named_tensors
+        else:
+            serialized_named_tensors = [
                 MultiprocessingSerializer.serialize(named_tensors)
                 for _ in range(self.server_args.tp_size)
-            ],
+            ]
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
             flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
+
         return loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
@@ -492,12 +498,13 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str):
+    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
         """Load a new LoRA adapter without re-launching the engine."""
 
         obj = LoadLoRAAdapterReqInput(
             lora_name=lora_name,
             lora_path=lora_path,
+            pinned=pinned,
         )
 
         loop = asyncio.get_event_loop()
@@ -623,11 +630,13 @@ class Engine(EngineBase):
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
-    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+    os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+    if not server_args.enable_symm_mem:
+        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    # flashinfer uses this environment variable for various kernels from MoE to quant kernels
+    os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -640,37 +649,31 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.9rc1",
+            "0.2.11.post3",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
-    if _is_cuda:
+    if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.2.7",
+            "0.3.5",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
-    def sigchld_handler(signum, frame):
-        pid, exitcode = os.waitpid(0, os.WNOHANG)
-        if exitcode != 0:
-            logger.warning(
-                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
+    if True:  # Keep this check for internal code compatibility
+        # Register the signal handler.
+        # The child processes will send SIGQUIT to this process when any error happens
+        # This process then clean up the whole process tree
+        # Note: This sigquit handler is used in the launch phase, and may be replaced by
+        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+        def launch_phase_sigquit_handler(signum, frame):
+            logger.error(
+                "Received sigquit from a child process. It usually means the child failed."
             )
+            kill_process_tree(os.getpid())
 
-    signal.signal(signal.SIGCHLD, sigchld_handler)
-
-    # Register the signal handler.
-    # The child processes will send SIGQUIT to this process when any error happens
-    # This process then clean up the whole process tree
-    def sigquit_handler(signum, frame):
-        logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
-        )
-        kill_process_tree(os.getpid())
-
-    signal.signal(signal.SIGQUIT, sigquit_handler)
+        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
@@ -725,6 +728,7 @@ def _launch_subprocesses(
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
+                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
                 proc = mp.Process(
                     target=run_scheduler_process,
                     args=(
@@ -732,9 +736,11 @@ def _launch_subprocesses(
                         port_args,
                         gpu_id,
                         tp_rank,
+                        moe_ep_rank,
                         pp_rank,
                         None,
                         writer,
+                        None,
                     ),
                 )
 
@@ -765,7 +771,9 @@ def _launch_subprocesses(
             # When using `Engine` as a Python API, we don't want to block here.
             return None, None, None
 
-        launch_dummy_health_check_server(server_args.host, server_args.port)
+        launch_dummy_health_check_server(
+            server_args.host, server_args.port, server_args.enable_metrics
+        )
 
         for proc in scheduler_procs:
             proc.join()

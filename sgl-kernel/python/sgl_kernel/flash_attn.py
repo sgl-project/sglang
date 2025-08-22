@@ -1,4 +1,5 @@
-from typing import List, Optional, Tuple, Union
+from functools import lru_cache
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -9,6 +10,7 @@ except:
     raise ImportError("Can not import sgl_kernel. Please check your installation.")
 
 
+@lru_cache(maxsize=1)
 def is_fa3_supported(device=None) -> bool:
     #  There some fa3 FYI
     #  FA3 can fail without a enough shared memory for a some shapes, such as higher
@@ -18,10 +20,10 @@ def is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    return (
+    return (torch.version.cuda >= "12.3") and (
         torch.cuda.get_device_capability(device)[0] == 9
         or torch.cuda.get_device_capability(device)[0] == 8
-    ) and (torch.version.cuda >= "12.3")
+    )
 
 
 def maybe_contiguous(x):
@@ -58,6 +60,7 @@ def flash_attn_with_kvcache(
     pack_gqa=None,  # Can be tuned for speed
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
+    sinks=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -205,6 +208,7 @@ def flash_attn_with_kvcache(
         num_splits,
         pack_gqa,
         sm_margin,
+        sinks,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
@@ -232,6 +236,7 @@ def flash_attn_varlen_func(
     pack_gqa=None,
     sm_margin=0,
     return_softmax_lse=False,
+    sinks=None,
 ):
     if not is_fa3_supported():
         raise NotImplementedError(
@@ -277,6 +282,7 @@ def flash_attn_varlen_func(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
+        sinks=sinks,
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out
