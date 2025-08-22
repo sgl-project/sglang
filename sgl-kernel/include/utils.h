@@ -331,9 +331,11 @@ inline bool getEnvEnablePDL() {
 #ifndef USE_ROCM
 #define WARP_SIZE 32
 #else
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/macros/Macros.h>
-#define WARP_SIZE C10_WARP_SIZE
+#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+#define WARP_SIZE 64
+#else
+#define WARP_SIZE 32
+#endif
 #endif
 
 #ifdef USE_ROCM
