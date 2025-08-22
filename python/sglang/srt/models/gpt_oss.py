@@ -16,6 +16,7 @@
 """Inference-only GptOss model compatible with HuggingFace weights."""
 
 import logging
+import math
 from collections.abc import Iterable
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -788,18 +789,28 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_size = get_moe_expert_parallel_world_size()
 
         intermediate_size = self.config.intermediate_size
+        assert (
+            intermediate_size % mxfp4_block == 0
+        ), f"{intermediate_size=} must be divisible by {mxfp4_block=}"
         intermediate_size_block = intermediate_size // mxfp4_block
-        per_rank_intermediate_size_block = intermediate_size_block // moe_tp_size
+        if _is_sm100_supported:
+            per_rank_intermediate_size_block = math.ceil(
+                intermediate_size_block / moe_tp_size
+            )
+        else:
+            per_rank_intermediate_size_block = intermediate_size_block // moe_tp_size
         per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
 
         # Calculate common slicing bounds for current rank
         assert self.config.num_local_experts % moe_ep_size == 0
         moe_num_global_experts = self.config.num_local_experts
         moe_num_local_experts = self.config.num_local_experts // moe_ep_size
+
         moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
         moe_tp_rank_end = min(
             (moe_tp_rank + 1) * per_rank_intermediate_size, intermediate_size
         )
+
         moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
