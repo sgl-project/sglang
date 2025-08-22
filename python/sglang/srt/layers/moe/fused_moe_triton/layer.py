@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -926,6 +927,12 @@ class FusedMoE(torch.nn.Module):
             for shard_id in ["w1", "w2", "w3"]
         ]
 
+    def should_fuse_routed_scaling_factor_in_topk(self):
+        return isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod) or (
+            isinstance(self.quant_method, Fp8MoEMethod)
+            and self.quant_method.use_cutlass_fused_experts_fp8
+        )
+
 
 class FlashInferFusedMoE(FusedMoE):
     def __init__(self, *args, **kwargs):
@@ -1004,6 +1011,8 @@ class FlashInferFP4MoE(FusedMoE):
             hidden_states: Input tensor
             topk_output: TopKOutput object with Bypassed format
         """
+        assert isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
         router_logits = topk_output.router_logits

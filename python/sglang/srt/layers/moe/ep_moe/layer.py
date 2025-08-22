@@ -733,7 +733,7 @@ class DeepEPMoE(EPMoE):
             assert isinstance(dispatch_output, AscendDeepEPLLOutput)
         hidden_states, topk_idx, topk_weights, _, seg_indptr, _ = dispatch_output
         assert self.quant_method is not None
-        assert self.activation == "silu"
+        assert self.moe_runner_config.activation == "silu"
 
         # NOTE: Ascend's Dispatch & Combine does not support FP16
         output_dtype = torch.bfloat16
@@ -780,13 +780,17 @@ class DeepEPMoE(EPMoE):
         return hidden_states
 
 
-def get_moe_impl_class():
+def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
     if get_moe_a2a_backend().is_deepep():
         return DeepEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
     # Check for FP4 quantization with TRTLLM flag, regardless of EP
     if get_moe_runner_backend().is_flashinfer_trtllm():
+        # FlashInferFP4MoE must be paired with ModelOptNvFp4FusedMoEMethod.
+        # If UnquantizedFusedMoEMethod is detected, fall back to FusedMoE instead.
+        if quant_config is None:
+            return FusedMoE
         try:
             # Check the quantization argument directly
             quantization = global_server_args_dict.get("quantization")
