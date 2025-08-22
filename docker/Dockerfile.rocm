@@ -15,7 +15,7 @@ FROM $BASE_IMAGE_942 AS gfx942
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
-ENV BUILD_AITER_ALL="1"
+ENV BUILD_AITER_ALL="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.4"
 ENV NO_DEPS_FLAG=""
@@ -123,6 +123,9 @@ RUN if [ "$BUILD_VLLM" = "1" ]; then \
 ENV PATH=$PATH:/usr/local/go/bin
 
 RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
+     apt update && apt install -y zip unzip wget && \
+     apt install -y gcc make libtool autoconf  librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool  libibverbs-dev rdma-core && \
+     apt install -y openssh-server openmpi-bin openmpi-common libopenmpi-dev && \
      wget https://dl.google.com/go/go1.24.3.linux-amd64.tar.gz && \
      rm -rf /usr/local/go && tar -C /usr/local -xzf go1.24.3.linux-amd64.tar.gz && \
      git clone ${MOONCAKE_REPO} && \
@@ -137,7 +140,8 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      mkdir -p build && \
      cd build && \
      cmake .. -DUSE_ETCD=ON && \
-     make -j "$(nproc)" && make install
+     make -j "$(nproc)" && make install; \
+    fi
 
 
 # -----------------------
