@@ -5,7 +5,6 @@ from multiprocessing import shared_memory
 from pathlib import Path
 from typing import List, Optional
 
-import cuda.bindings.runtime as cuda_rt
 import numpy as np
 import torch
 
@@ -27,6 +26,8 @@ class HostSharedMemoryManager:
         return raw.view(dtype).view(*shape)
 
     def _malloc_raw(self, *, num_bytes: int) -> torch.Tensor:
+        import cuda.bindings.runtime as cuda_rt
+
         self._operation_index += 1
         shm_name = f"{self._base_name}_op{self._operation_index}"
 
