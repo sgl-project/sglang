@@ -51,39 +51,35 @@ impl PartialJsonParser for PartialJson {
 }
 
 /// Internal parser state
-struct Parser {
-    input: Vec<char>,
+struct Parser<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
     position: usize,
     max_depth: usize,
     allow_incomplete: bool,
 }
 
-impl Parser {
-    fn new(input: &str, max_depth: usize, allow_incomplete: bool) -> Self {
+impl<'a> Parser<'a> {
+    fn new(input: &'a str, max_depth: usize, allow_incomplete: bool) -> Self {
         Self {
-            input: input.chars().collect(),
+            chars: input.chars().peekable(),
             position: 0,
             max_depth,
             allow_incomplete,
         }
     }
 
-    fn current(&self) -> Option<char> {
-        self.input.get(self.position).copied()
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.current()
+    fn peek(&mut self) -> Option<char> {
+        self.chars.peek().copied()
     }
 
     fn advance(&mut self) {
-        if self.position < self.input.len() {
+        if self.chars.next().is_some() {
             self.position += 1;
         }
     }
 
     fn skip_whitespace(&mut self) {
-        while let Some(ch) = self.current() {
+        while let Some(ch) = self.peek() {
             if ch.is_whitespace() {
                 self.advance();
             } else {
@@ -270,7 +266,7 @@ impl Parser {
         let mut string = String::new();
         let mut escaped = false;
 
-        while let Some(ch) = self.current() {
+        while let Some(ch) = self.peek() {
             if escaped {
                 // Handle escape sequences
                 let escaped_char = match ch {
@@ -315,7 +311,7 @@ impl Parser {
     fn parse_unicode_escape(&mut self) -> ToolParserResult<char> {
         let mut hex = String::new();
         for _ in 0..4 {
-            if let Some(ch) = self.current() {
+            if let Some(ch) = self.peek() {
                 if ch.is_ascii_hexdigit() {
                     hex.push(ch);
                     self.advance();
@@ -419,9 +415,31 @@ impl Parser {
     }
 
     fn parse_bool(&mut self) -> ToolParserResult<Value> {
-        let start_pos = self.position;
         let mut word = String::new();
 
+        // Peek at upcoming characters to validate it looks like a boolean
+        let mut temp_chars = self.chars.clone();
+        while let Some(&ch) = temp_chars.peek() {
+            if ch.is_alphabetic() && word.len() < 5 {
+                // "false" is 5 chars
+                word.push(ch);
+                temp_chars.next();
+            } else {
+                break;
+            }
+        }
+
+        // Check if it's a valid boolean prefix
+        let is_valid = word == "true"
+            || word == "false"
+            || (self.allow_incomplete && ("true".starts_with(&word) || "false".starts_with(&word)));
+
+        if !is_valid {
+            return Err(ToolParserError::ParsingFailed("Invalid boolean".into()));
+        }
+
+        // Now actually consume the characters
+        word.clear();
         while let Some(ch) = self.peek() {
             if ch.is_alphabetic() {
                 word.push(ch);
@@ -440,21 +458,37 @@ impl Parser {
                 } else if "false".starts_with(partial) {
                     Ok(Value::Bool(false))
                 } else {
-                    self.position = start_pos;
                     Err(ToolParserError::ParsingFailed("Invalid boolean".into()))
                 }
             }
-            _ => {
-                self.position = start_pos;
-                Err(ToolParserError::ParsingFailed("Invalid boolean".into()))
-            }
+            _ => Err(ToolParserError::ParsingFailed("Invalid boolean".into())),
         }
     }
 
     fn parse_null(&mut self) -> ToolParserResult<Value> {
-        let start_pos = self.position;
         let mut word = String::new();
 
+        // Peek at upcoming characters to validate it looks like "null"
+        let mut temp_chars = self.chars.clone();
+        while let Some(&ch) = temp_chars.peek() {
+            if ch.is_alphabetic() && word.len() < 4 {
+                // "null" is 4 chars
+                word.push(ch);
+                temp_chars.next();
+            } else {
+                break;
+            }
+        }
+
+        // Check if it's a valid null prefix
+        let is_valid = word == "null" || (self.allow_incomplete && "null".starts_with(&word));
+
+        if !is_valid {
+            return Err(ToolParserError::ParsingFailed("Invalid null".into()));
+        }
+
+        // Now actually consume the characters
+        word.clear();
         while let Some(ch) = self.peek() {
             if ch.is_alphabetic() {
                 word.push(ch);
@@ -467,7 +501,6 @@ impl Parser {
         if word == "null" || (self.allow_incomplete && "null".starts_with(&word)) {
             Ok(Value::Null)
         } else {
-            self.position = start_pos;
             Err(ToolParserError::ParsingFailed("Invalid null".into()))
         }
     }
@@ -489,5 +522,6 @@ pub fn find_common_prefix(s1: &str, s2: &str) -> usize {
 /// Utility function to compute diff between old and new strings
 pub fn compute_diff(old: &str, new: &str) -> String {
     let common_len = find_common_prefix(old, new);
-    new[common_len..].to_string()
+    // Convert character count to byte offset
+    new.chars().skip(common_len).collect()
 }

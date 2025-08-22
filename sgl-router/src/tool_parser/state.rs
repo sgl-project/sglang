@@ -108,8 +108,18 @@ impl ParseState {
 
     /// Extract content from buffer starting at position
     pub fn extract_from(&self, start: usize) -> &str {
-        if start < self.buffer.len() {
-            &self.buffer[start..]
+        if start >= self.buffer.len() {
+            return "";
+        }
+
+        // Find the nearest character boundary at or after start
+        let mut safe_start = start;
+        while safe_start < self.buffer.len() && !self.buffer.is_char_boundary(safe_start) {
+            safe_start += 1;
+        }
+
+        if safe_start < self.buffer.len() {
+            &self.buffer[safe_start..]
         } else {
             ""
         }
@@ -124,8 +134,18 @@ impl ParseState {
 
     /// Get unconsumed content
     pub fn unconsumed(&self) -> &str {
-        if self.consumed < self.buffer.len() {
-            &self.buffer[self.consumed..]
+        if self.consumed >= self.buffer.len() {
+            return "";
+        }
+
+        // Find the nearest character boundary at or after consumed
+        let mut safe_consumed = self.consumed;
+        while safe_consumed < self.buffer.len() && !self.buffer.is_char_boundary(safe_consumed) {
+            safe_consumed += 1;
+        }
+
+        if safe_consumed < self.buffer.len() {
+            &self.buffer[safe_consumed..]
         } else {
             ""
         }
@@ -134,8 +154,16 @@ impl ParseState {
     /// Clear consumed content from buffer
     pub fn clear_consumed(&mut self) {
         if self.consumed > 0 {
-            self.buffer.drain(..self.consumed);
-            self.consumed = 0;
+            // Find the nearest character boundary at or before consumed
+            let mut safe_consumed = self.consumed;
+            while safe_consumed > 0 && !self.buffer.is_char_boundary(safe_consumed) {
+                safe_consumed -= 1;
+            }
+
+            if safe_consumed > 0 {
+                self.buffer.drain(..safe_consumed);
+                self.consumed = self.consumed.saturating_sub(safe_consumed);
+            }
         }
     }
 
