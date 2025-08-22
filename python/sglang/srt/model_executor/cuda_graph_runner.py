@@ -308,7 +308,10 @@ class CudaGraphRunner:
 
         # Graph inputs
         with torch.device(self.device):
-            if self.model_runner.model_config.channels:
+            if (
+                self.model_runner.model_config.channels
+                and self.model_runner.server_args.multi_channel
+            ):
                 self.input_ids = torch.zeros(
                     (self.max_num_token, self.model_runner.model_config.channels),
                     dtype=torch.int64,
@@ -378,7 +381,10 @@ class CudaGraphRunner:
                 dtype=torch.bool,
                 device=self.device,
             )
-            if self.model_runner.model_config.channels:
+            if (
+                self.model_runner.model_config.channels
+                and self.model_runner.server_args.multi_channel
+            ):
                 self.next_token_logits_buffer = torch.zeros(
                     (
                         self.max_num_token,
