@@ -39,6 +39,7 @@ except ImportError:
     )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 
 class WrapperDispatch(Enum):
@@ -153,6 +154,8 @@ class AiterAttnBackend(AttentionBackend):
             self.qo_indptr_ = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
+
+            self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -309,12 +312,32 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens_cpu.max().item(),
                     spec_info=None,
                 )
+                
                 self.mla_indices_updater_prefill.kv_indptr += (
                     self.mla_indices_updater_prefill.qo_indptr
                 )
+                
+                if (
+                    sum(forward_batch.extend_prefix_lens_cpu) != 0
+                    and self.enable_dp_attention
+                ):
+                    prefix_kv_indices = self.mla_indices_updater_prefill.kv_indices
+                    extend_kv_indices = forward_batch.out_cache_loc
+                    prefix = torch.split(
+                        prefix_kv_indices, forward_batch.extend_prefix_lens_cpu
+                    )
+                    extend = torch.split(
+                        extend_kv_indices, forward_batch.extend_seq_lens_cpu
+                    )
+                    kv_indices = torch.cat(
+                        [x for el in zip(prefix, extend) for x in el]
+                    ).to(torch.int)
+                else:
+                    kv_indices = self.mla_indices_updater_prefill.kv_indices
+
                 self.forward_metadata = ForwardMetadata(
                     self.mla_indices_updater_prefill.kv_indptr,
-                    self.mla_indices_updater_prefill.kv_indices,
+                    kv_indices,
                     self.mla_indices_updater_prefill.qo_indptr,
                     self.kv_last_page_len[:bs],
                     self.mla_indices_updater_prefill.max_q_len,
@@ -614,66 +637,91 @@ class AiterAttnBackend(AttentionBackend):
             assert len(k.shape) == 3
             assert len(v.shape) == 3
 
-            if kv_indices.shape[0] == 0:
-                o = flash_attn_varlen_func(
-                    q,
-                    k,
-                    v,
-                    qo_indptr,
-                    qo_indptr,
-                    max_q_len,
-                    max_q_len,
-                    softmax_scale=layer.scaling,
-                    causal=True,
-                )
-                return o
-            elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
-                K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
-                kvc, k_pe = torch.split(
-                    K_Buffer, [kv_lora_rank, qk_rope_head_dim], dim=-1
-                )
-                kvprefix = layer.kv_b_proj(kvc.contiguous())[0]
+            if forward_batch.forward_mode.is_extend():
+                if kv_indices.shape[0] == 0:
+                    o = flash_attn_varlen_func(
+                        q,
+                        k,
+                        v,
+                        qo_indptr,
+                        qo_indptr,
+                        max_q_len,
+                        max_q_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                    )
+                    return o
+                elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
+                    K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
+                    kvc, k_pe = torch.split(
+                        K_Buffer, [kv_lora_rank, qk_rope_head_dim], dim=-1
+                    )
+                    kvprefix = layer.kv_b_proj(kvc.contiguous())[0]
 
-                kvprefix = kvprefix.view(
-                    -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
-                )
-                k_prefix, v_prefix = torch.split(
-                    kvprefix, [qk_nope_head_dim, layer.v_head_dim], dim=-1
-                )
-                k_prefix = torch.cat(
-                    [
-                        k_prefix,
-                        torch.broadcast_to(
-                            k_pe,
-                            (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2]),
-                        ),
-                    ],
-                    dim=-1,
-                )
-                assert (
-                    forward_batch.extend_prefix_lens.shape
-                    == forward_batch.extend_seq_lens.shape
-                )
-                k_prefix = torch.split(k_prefix, forward_batch.extend_prefix_lens_cpu)
-                k_extend = torch.split(k, forward_batch.extend_seq_lens_cpu)
-                assert len(k_prefix) == len(forward_batch.extend_prefix_lens_cpu)
-                k = torch.cat([x for el in zip(k_prefix, k_extend) for x in el])
-                v_prefix = torch.split(v_prefix, forward_batch.extend_prefix_lens_cpu)
-                v_extend = torch.split(v, forward_batch.extend_seq_lens_cpu)
-                v = torch.cat([x for el in zip(v_prefix, v_extend) for x in el])
+                    kvprefix = kvprefix.view(
+                        -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
+                    )
+                    k_prefix, v_prefix = torch.split(
+                        kvprefix, [qk_nope_head_dim, layer.v_head_dim], dim=-1
+                    )
+                    k_prefix = torch.cat(
+                        [
+                            k_prefix,
+                            torch.broadcast_to(
+                                k_pe,
+                                (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2]),
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                    assert (
+                        forward_batch.extend_prefix_lens.shape
+                        == forward_batch.extend_seq_lens.shape
+                    )
+                    k_prefix = torch.split(k_prefix, forward_batch.extend_prefix_lens_cpu)
+                    k_extend = torch.split(k, forward_batch.extend_seq_lens_cpu)
+                    assert len(k_prefix) == len(forward_batch.extend_prefix_lens_cpu)
+                    k = torch.cat([x for el in zip(k_prefix, k_extend) for x in el])
+                    v_prefix = torch.split(v_prefix, forward_batch.extend_prefix_lens_cpu)
+                    v_extend = torch.split(v, forward_batch.extend_seq_lens_cpu)
+                    v = torch.cat([x for el in zip(v_prefix, v_extend) for x in el])
 
-                o = flash_attn_varlen_func(
-                    q,
-                    k,
-                    v,
-                    qo_indptr,
-                    kv_indptr,
-                    max_q_len,
-                    max_kv_len,
-                    softmax_scale=layer.scaling,
-                    causal=True,
-                )
-                return o
+                    o = flash_attn_varlen_func(
+                        q,
+                        k,
+                        v,
+                        qo_indptr,
+                        kv_indptr,
+                        max_q_len,
+                        max_kv_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                    )
+                    return o
+
+                else:
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        o = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        o = torch.empty_like(q)
+                    token_num = forward_batch.extend_num_tokens
+
+                    mla_prefill_fwd(
+                        q.view(token_num, layer.tp_q_head_num, layer.qk_head_dim),
+                        K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                        o.view(token_num, layer.tp_q_head_num, layer.v_head_dim),
+                        qo_indptr,
+                        kv_indptr,
+                        kv_indices,
+                        kv_last_page_lens,
+                        max_extend_len,
+                        layer.scaling,
+                        layer.logit_cap,
+                    )
+                    K_Buffer = K_Buffer.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                    return o
             elif forward_batch.forward_mode.is_target_verify():
                 o = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
                 mla_decode_fwd(
