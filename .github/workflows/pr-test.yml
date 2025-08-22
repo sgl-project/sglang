@@ -406,6 +406,55 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
 
+  benchmark-asr-1-gpu:
+    needs: check-changes
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Launch server (MiniCPM-o)
+        run: |
+          nohup python3 -m sglang.launch_server \
+            --model-path openbmb/MiniCPM-o-2_6 \
+            --port 30000 \
+            --trust-remote-code \
+            --disable-radix-cache > server.log 2>&1 & echo $! > server.pid
+          timeout=180
+          while ! curl -s -f http://127.0.0.1:30000/get_model_info >/dev/null; do
+            sleep 3
+            timeout=$((timeout-3))
+            if [ "$timeout" -le 0 ]; then
+              echo "Server did not become ready in time" && cat server.log && exit 1
+            fi
+          done
+
+      - name: Run ASR benchmark (1 sample)
+        env:
+          OPENAI_API_KEY: sk
+        run: |
+          python3 -m benchmark.asr.bench_sglang_asr \
+            --port 30000 \
+            --dataset openslr/librispeech_asr \
+            --subset clean \
+            --split test \
+            --limit 1 \
+            --concurrency 1
+
+      - name: Teardown server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then kill -9 $(cat server.pid) || true; fi
+          sleep 2
+          cat server.log || true
+
 
   pr-test-finish:
     needs: [
