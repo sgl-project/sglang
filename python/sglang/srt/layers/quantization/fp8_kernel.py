@@ -1840,12 +1840,12 @@ def _shuffle_map_fp8_scale_hopper_moe_mn_major(
     k_offset = (pid % width) // group_size
 
     m = tl.load(problem_sizes + expert_id * 3)
+    m = tl.multiple_of(m, M_ALIGNMENT)
     current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
 
     for i in tl.range(tl.cdiv(m, BLOCK_M)):
         coord_m = i * BLOCK_M + tl.arange(0, BLOCK_M)
         m_dst_offset = current_expert_offset + coord_m
-        m_dst_offset = tl.multiple_of(m_dst_offset, M_ALIGNMENT)
         m_dst_mask = coord_m < m
         m_src_offset = tl.load(shuffle_map + m_dst_offset, mask=m_dst_mask).to(tl.int64)
 
@@ -1855,7 +1855,6 @@ def _shuffle_map_fp8_scale_hopper_moe_mn_major(
 
         # Store sfa
         sfa_offset = current_expert_offset * K + k_offset * m + coord_m
-        sfa_offset = tl.multiple_of(sfa_offset, M_ALIGNMENT)
         sfa_ptrs = sfa + sfa_offset  # MN-Major with sfa
         tl.store(sfa_ptrs, as_val, mask=coord_m < m)
 
@@ -1882,18 +1881,17 @@ def _shuffle_fp8_scale_hopper_moe_mn_major(
     k_offset = (pid % width) // group_size
 
     m = tl.load(problem_sizes + expert_id * 3)
+    m = tl.multiple_of(m, M_ALIGNMENT)
     current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
 
     for i in tl.range(tl.cdiv(m, BLOCK_M)):
         coord_m = i * BLOCK_M + tl.arange(0, BLOCK_M)
         as_offset = current_expert_offset * K + coord_m * K + k_offset
-        as_offset = tl.multiple_of(as_offset, M_ALIGNMENT)
         as_mask = (coord_m < m) & (k_offset < K)
         as_val = tl.load(a_s + as_offset, mask=as_mask).to(tl.float32)
 
         # Store sfa
         sfa_offset = current_expert_offset * K + k_offset * m + coord_m
-        sfa_offset = tl.multiple_of(sfa_offset, M_ALIGNMENT)
         sfa_ptrs = sfa + sfa_offset  # MN-Major with sfa
         tl.store(sfa_ptrs, as_val, mask=coord_m < m)
 
@@ -1914,6 +1912,7 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
     output_m: int,
     # index mapping from the shuffled destination (topk * M) to the source (M)
     shuffle_map: Optional[torch.Tensor] = None,
+    M_ALIGNMENT=1,
 ) -> torch.Tensor:
     assert a_s.dim() == 2
     assert a_s.is_contiguous(), "`A` is not contiguous"
@@ -1921,9 +1920,6 @@ def shuffle_fp8_scale_hopper_moe_mn_major(
     k = a_s.shape[1]
     sfa = torch.empty((output_m, k), device=a_s.device, dtype=a_s.dtype)
     num_experts = problem_sizes.shape[0]
-    M_ALIGNMENT = (
-        a_s.element_size() * 8
-    )  # alignment to dtype can be independent to tensor shape
 
     grid = (k * num_experts,)
     if shuffle_map is not None:
