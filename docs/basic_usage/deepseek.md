@@ -24,6 +24,7 @@ To run DeepSeek V3/R1 models, the requirements are as follows:
 | **Quantized weights (int8)** | 16 x A100/800 |
 | | 32 x L40S |
 | | Xeon 6980P CPU |
+| | 2 x Atlas 800I A3 |
 
 <style>
 .md-typeset__table {
@@ -64,6 +65,7 @@ Detailed commands for reference:
 - [16 x A100 (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
 - [32 x L40S (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-32-l40s-with-int8-quantization)
 - [Xeon 6980P CPU](../platforms/cpu_server.md#example-running-deepseek-r1)
+- [2 x Atlas 800I A3 (int8)](../platforms/ascend_npu.md#running-deepseek-v3)
 
 ### Download Weights
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only) official guide to download the weights.
@@ -165,9 +167,9 @@ python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --spec
   - Set `--cuda-graph-bs`. It's a list of batch sizes for cuda graph capture. The default captured batch sizes for speculative decoding is set [here](https://github.com/sgl-project/sglang/blob/49420741746c8f3e80e0eb17e7d012bfaf25793a/python/sglang/srt/model_executor/cuda_graph_runner.py#L126). You can include more batch sizes into it.
 
 
-### Reasoning Content for DeepSeek R1
+### Reasoning Content for DeepSeek R1 & V3.1
 
-See [Separate Reasoning](https://docs.sglang.ai/backend/separate_reasoning.html).
+See [Reasoning Parser](https://docs.sglang.ai/advanced_features/separate_reasoning.html) and [Thinking Parameter for DeepSeek V3.1](https://docs.sglang.ai/basic_usage/openai_api_completions.html#Example:-DeepSeek-V3-Models).
 
 
 ### Function calling for DeepSeek Models

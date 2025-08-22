@@ -438,70 +438,6 @@ def is_pin_memory_available() -> bool:
     return torch.cuda.is_available()
 
 
-_CPU_OFFLOAD_BYTES = 0
-_CPU_OFFLOAD_MAX_BYTES = 0
-
-
-def set_cpu_offload_max_bytes(max_bytes: int) -> None:
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-    _CPU_OFFLOAD_BYTES = 0
-    _CPU_OFFLOAD_MAX_BYTES = max_bytes
-
-
-def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
-    device = next(module.parameters()).device
-
-    if device == torch.device("cpu"):
-        return module
-
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-    if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
-        return module
-
-    pin_memory = is_pin_memory_available()
-    # offload parameters to CPU
-    # use pin_memory if possible, which helps cudagraph capture speed
-    offloaded_parameters = False
-    for p in module.parameters():
-        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
-            # we use per-parameter offloading
-            # one module might have some parameters offloaded and some not
-            break
-
-        # `torch.empty_like` does not support `pin_memory` argument
-        cpu_data = torch.empty_strided(
-            size=p.data.size(),
-            stride=p.data.stride(),
-            dtype=p.data.dtype,
-            layout=p.data.layout,
-            device="cpu",
-            pin_memory=pin_memory,
-        )
-        cpu_data.copy_(p.data)
-        p.data = cpu_data
-        _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
-        offloaded_parameters = True
-
-    if offloaded_parameters:
-        original_forward = module.forward
-
-        def forward(*args, **kwargs):
-            module.forward = original_forward
-            device_state = {
-                # here we blindly call `to(device)`
-                # if the parameter is already on the device, it will be a no-op
-                k: v.to(device, non_blocking=True)
-                for k, v in module.state_dict().items()
-            }
-            output = functional_call(module, device_state, args=args, kwargs=kwargs)
-            module.forward = forward
-            return output
-
-        module.forward = forward
-
-    return module
-
-
 class LayerFn(Protocol):
 
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
@@ -514,11 +450,13 @@ def make_layers(
     pp_size: Optional[int] = None,
     prefix: str = "",
     return_tuple: bool = False,
+    offloader_kwargs: Dict[str, Any] = {},
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
+    from sglang.srt.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
@@ -532,10 +470,13 @@ def make_layers(
     )
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + [
-            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
-            for idx in range(start_layer, end_layer)
-        ]
+        + get_offloader().wrap_modules(
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                for idx in range(start_layer, end_layer)
+            ),
+            **offloader_kwargs,
+        )
         + [
             PPMissingLayer(return_tuple=return_tuple)
             for _ in range(end_layer, num_hidden_layers)
@@ -2343,6 +2284,7 @@ def is_fa3_default_architecture(hf_config):
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
     return architectures[0] in default_archs
@@ -2413,7 +2355,7 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif server_args.moe_a2a_backend is None:
+        elif server_args.moe_a2a_backend == "none":
             return True
         else:
             return (
@@ -2429,7 +2371,7 @@ def require_attn_tp_gather(server_args):
     Check if the input of attention is scattered.
     """
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.moe_a2a_backend is not None or server_args.moe_dense_tp_size == 1:
+    if server_args.moe_a2a_backend != "none" or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -2872,6 +2814,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_proj",
     "up_proj",
     "down_proj",
+    "qkv_proj",
+    "gate_up_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
@@ -2960,7 +2904,7 @@ class ConcurrentCounter:
         This suspends the calling coroutine without blocking the thread, allowing
         other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
         """
-        self.wait_for(lambda count: count == 0)
+        await self.wait_for(lambda count: count == 0)
 
 
 @lru_cache(maxsize=1)

@@ -64,7 +64,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
+from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -130,6 +130,7 @@ from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+from sglang.srt.mem_cache.lora_radix_cache import LoRARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -244,6 +245,9 @@ class Scheduler(
             )
         )
 
+        # Init model config
+        self.model_config = ModelConfig.from_server_args(server_args)
+
         # Init inter-process communication
         context = zmq.Context(2)
         self.idle_sleeper = None
@@ -290,6 +294,9 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+
+        # Init moe config
+        self.init_moe_config()
 
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
@@ -537,8 +544,6 @@ class Scheduler(
 
     def init_tokenizer(self):
         server_args = self.server_args
-
-        self.model_config = ModelConfig.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
 
         if server_args.skip_tokenizer_init:
@@ -630,7 +635,19 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                 )
-
+            elif self.enable_lora:
+                assert (
+                    not self.enable_hierarchical_cache
+                ), "LoRA radix cache doesn't support hierarchical cache"
+                assert (
+                    self.schedule_policy == "fcfs"
+                ), "LoRA radix cache only supports FCFS policy"
+                self.tree_cache = LoRARadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                    disable=server_args.disable_radix_cache,
+                )
             else:
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
@@ -747,6 +764,10 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+
+    def init_moe_config(self):
+        if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
+            initialize_moe_config(self.server_args)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1120,7 +1141,7 @@ class Scheduler(
                         f"boostrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    prepare_abort(req, error_msg)
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.stream_output([req], req.return_logprob)
                     return
 
@@ -1453,8 +1474,9 @@ class Scheduler(
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
-            # Merge the new batch into the running batch
-            if not self.last_batch.is_empty():
+            # Merge the new batch into the running batch.
+            # For prefill-only batch, we can avoid going through decoding step.
+            if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
@@ -1621,7 +1643,6 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            self.server_args.enable_custom_logit_processor,
             chunked_req=self.chunked_req,
         )
         if self.enable_hierarchical_cache:
@@ -1810,11 +1831,6 @@ class Scheduler(
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-            enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
-            enable_deepep_moe=MoeA2ABackend(
-                self.server_args.moe_a2a_backend
-            ).is_deepep(),
-            deepep_mode=DeepEPMode(self.server_args.deepep_mode),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )
@@ -1909,9 +1925,6 @@ class Scheduler(
         disable_cuda_graph: bool,
         spec_algorithm,
         speculative_num_draft_tokens,
-        enable_two_batch_overlap: bool,
-        enable_deepep_moe: bool,
-        deepep_mode: DeepEPMode,
         require_mlp_tp_gather: bool,
         disable_overlap_schedule: bool,
     ):
@@ -1959,9 +1972,6 @@ class Scheduler(
                 is_extend_in_batch,
                 *tbo_preparer.prepare_all_gather(
                     local_batch,
-                    deepep_mode,
-                    enable_deepep_moe,
-                    enable_two_batch_overlap,
                 ),
             ],
             dtype=torch.int64,
@@ -2018,7 +2028,6 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            self.server_args.enable_custom_logit_processor,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
@@ -2570,7 +2579,10 @@ def run_scheduler_process(
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_prefill()
             else:
-                scheduler.event_loop_normal_disagg_prefill()
+                if server_args.pp_size > 1:
+                    scheduler.event_loop_pp_disagg_prefill()
+                else:
+                    scheduler.event_loop_normal_disagg_prefill()
 
         elif disaggregation_mode == DisaggregationMode.DECODE:
             if scheduler.enable_overlap:
