@@ -1006,6 +1006,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             attention_backend == "flashinfer"
             or attention_backend == "fa3"
             or attention_backend == "flashmla"
+            or attention_backend == "trtllm_mla"
+            or attention_backend == "cutlass_mla"
         ):
             # Use MHA with chunked KV cache when prefilling on long sequences.
             sum_extend_prefix_lens = (
