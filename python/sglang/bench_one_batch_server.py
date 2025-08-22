@@ -26,7 +26,7 @@ from sglang.bench_serving import get_tokenizer, sample_random_requests
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 
@@ -363,7 +363,12 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         acc_length,
         trace_link,
     ) in result:
-        hourly_cost = 2 * server_args.tp_size  # $2/hour for one H100
+        if is_blackwell():
+            hourly_cost_per_gpu = 4  # $4/hour for one B200
+        else:
+            hourly_cost_per_gpu = 2  # $2/hour for one H100
+
+        hourly_cost = hourly_cost_per_gpu * server_args.tp_size
         input_util = 0.7
         accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
         line = (

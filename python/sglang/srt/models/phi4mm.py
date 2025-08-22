@@ -54,25 +54,6 @@ VISION_ENCODER_TO_PROCESSING_CONFIG = {
 }
 
 
-def get_navit_vision_model():
-    vision_config = {
-        "hidden_size": 1152,
-        "image_size": 448,
-        "intermediate_size": 4304,
-        "model_type": "siglip_vision_model",
-        "num_attention_heads": 16,
-        "num_hidden_layers": 26,  # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
-        "patch_size": 14,
-    }
-    model_config = SiglipVisionConfig(**vision_config)
-
-    vision_model = Idefics2VisionTransformer(
-        config=model_config, require_post_norm=False
-    )
-
-    return vision_model
-
-
 class Phi4MMImageEncoder(nn.Module):
     """Image embedding."""
 
@@ -88,8 +69,9 @@ class Phi4MMImageEncoder(nn.Module):
         # n_embed or hidden_size
         hidden_size = config.n_embd if hasattr(config, "n_embd") else config.hidden_size
         self.type_feature = "patch"
-
-        self.img_processor = get_navit_vision_model()
+        self.img_processor = Idefics2VisionTransformer(
+            config=config.vision_config, require_post_norm=False
+        )
 
         pe_weight = self.img_processor.embeddings.position_embedding.weight
         L, D = pe_weight.size()
@@ -435,7 +417,12 @@ class Phi4MMForCausalLM(nn.Module):
         dtype = next(self.vision_encoder.parameters()).dtype
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(dtype)
         image_attention_mask = torch.cat(
-            [item.image_attention_mask for item in items], dim=0
+            [
+                item.image_attention_mask
+                for item in items
+                if hasattr(item, "image_attention_mask")
+            ],
+            dim=0,
         )
         image_sizes = torch.cat([item.image_sizes for item in items], dim=0)
         image_embeds = self.vision_encoder(
@@ -456,7 +443,7 @@ class Phi4MMForCausalLM(nn.Module):
                 audio_features=item.feature.to(device).type(dtype),
                 audio_attention_mask=(
                     item.audio_attention_mask.to(device)
-                    if item.audio_attention_mask is not None
+                    if hasattr(item, "audio_attention_mask")
                     else None
                 ),
             )

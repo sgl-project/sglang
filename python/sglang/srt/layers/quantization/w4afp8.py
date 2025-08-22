@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from torch.nn import Module
@@ -16,6 +16,11 @@ from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe import MoeRunnerConfig
+    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -84,13 +89,14 @@ class W4AFp8Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
-        elif isinstance(layer, FusedMoE):
+        elif isinstance(layer, EPMoE):
             return W4AFp8MoEMethod(self)
         return None
 
@@ -105,19 +111,21 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
     def create_weights(
         self,
-        layer: Module,
-        num_experts_per_partition: int,
+        layer: EPMoE,
+        num_experts: int,
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         assert "weight_loader" in extra_weight_attrs
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts_per_partition,
+                num_experts,
                 intermediate_size * 2,
                 hidden_size // 2,
                 dtype=torch.int8,
@@ -130,7 +138,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts_per_partition,
+                num_experts,
                 hidden_size,
                 intermediate_size // 2,
                 dtype=torch.int8,
@@ -140,9 +148,12 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
+        )
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
-                num_experts_per_partition,
+                num_experts,
                 2 * intermediate_size,
                 hidden_size // self.quant_config.group_size,
                 dtype=torch.float32,
@@ -154,7 +165,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = torch.nn.Parameter(
             torch.zeros(
-                num_experts_per_partition,
+                num_experts,
                 hidden_size,
                 intermediate_size // self.quant_config.group_size,
                 dtype=torch.float32,
@@ -166,14 +177,14 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         # Input scales
         w13_input_scale = torch.nn.Parameter(
-            torch.ones((num_experts_per_partition, 2), dtype=torch.bfloat16),
+            torch.ones((num_experts, 2), dtype=torch.bfloat16),
             requires_grad=False,
         )
         layer.register_parameter("w13_input_scale", w13_input_scale)
         set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
         w2_input_scale = torch.nn.Parameter(
-            torch.ones(num_experts_per_partition, dtype=torch.bfloat16),
+            torch.ones(num_experts, dtype=torch.bfloat16),
             requires_grad=False,
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
@@ -183,25 +194,25 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         device = layer.w13_weight.device
 
         self.a_strides1 = torch.full(
-            (num_experts_per_partition, 3),
+            (num_experts, 3),
             hidden_size,
             device=device,
             dtype=torch.int64,
         )
         self.c_strides1 = torch.full(
-            (num_experts_per_partition, 3),
+            (num_experts, 3),
             2 * intermediate_size,
             device=device,
             dtype=torch.int64,
         )
         self.a_strides2 = torch.full(
-            (num_experts_per_partition, 3),
+            (num_experts, 3),
             intermediate_size,
             device=device,
             dtype=torch.int64,
         )
         self.c_strides2 = torch.full(
-            (num_experts_per_partition, 3),
+            (num_experts, 3),
             hidden_size,
             device=device,
             dtype=torch.int64,
@@ -212,13 +223,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self.s_strides2 = self.c_strides2
 
         self.expert_offsets = torch.empty(
-            (num_experts_per_partition + 1), dtype=torch.int32, device=device
+            (num_experts + 1), dtype=torch.int32, device=device
         )
         self.problem_sizes1 = torch.empty(
-            (num_experts_per_partition, 3), dtype=torch.int32, device=device
+            (num_experts, 3), dtype=torch.int32, device=device
         )
         self.problem_sizes2 = torch.empty(
-            (num_experts_per_partition, 3), dtype=torch.int32, device=device
+            (num_experts, 3), dtype=torch.int32, device=device
         )
 
         return
@@ -266,3 +277,52 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             [w2_input_scale_max], dtype=dtype, device=device
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
+
+    def apply(
+        self,
+        layer: EPMoE,
+        x: torch.Tensor,
+        topk_output: StandardTopKOutput,
+        moe_runner_config: MoeRunnerConfig,
+    ) -> torch.Tensor:
+
+        # TODO(ch-wan): move it out of this class
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+
+        topk_weights, topk_ids, _ = topk_output
+        local_topk_ids = topk_ids
+        local_topk_ids = torch.where(
+            topk_ids == -1,
+            layer.num_experts,
+            topk_ids,
+        )
+
+        output = cutlass_w4a8_moe(
+            layer.start_expert_id,
+            layer.end_expert_id,
+            layer.num_experts,
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            topk_weights,
+            topk_ids,
+            local_topk_ids,
+            self.a_strides1,
+            self.b_strides1,
+            self.c_strides1,
+            self.a_strides2,
+            self.b_strides2,
+            self.c_strides2,
+            self.s_strides13,
+            self.s_strides2,
+            self.expert_offsets,
+            self.problem_sizes1,
+            self.problem_sizes2,
+            layer.w13_input_scale,
+            layer.w2_input_scale,
+        )
+        if moe_runner_config.routed_scaling_factor is not None:
+            output *= moe_runner_config.routed_scaling_factor
+        return output

@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import PDRegistryRequest
+from sglang.srt.utils import maybe_wrap_ipv6_address
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
@@ -49,10 +50,16 @@ class PrefillConfig:
 
 
 class MiniLoadBalancer:
-    def __init__(self, prefill_configs: List[PrefillConfig], decode_servers: List[str]):
+    def __init__(
+        self,
+        prefill_configs: List[PrefillConfig],
+        decode_servers: List[str],
+        timeout: int,
+    ):
         self.prefill_configs = prefill_configs
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
+        self.timeout = timeout
 
     def add_prefill_server(self, new_prefill_config: PrefillConfig):
         self.prefill_configs.append(new_prefill_config)
@@ -77,7 +84,7 @@ class MiniLoadBalancer:
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
-                total=3600
+                total=self.timeout
             )  # Add timeout for request reliability
         ) as session:
             tasks = [
@@ -116,7 +123,7 @@ class MiniLoadBalancer:
         async def stream_results():
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(
-                    total=3600
+                    total=self.timeout
                 )  # Add timeout for request reliability
             ) as session:
                 # Create the tasks for both prefill and decode requests
@@ -271,7 +278,7 @@ async def handle_generate_request(request_data: dict):
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = parsed_url.hostname
+    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
 
     batch_size = _get_request_batch_size(modified_request)
@@ -309,7 +316,7 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
-    hostname = parsed_url.hostname
+    hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
     modified_request.update(
         {
@@ -400,9 +407,9 @@ async def register(obj: PDRegistryRequest):
     return Response(status_code=200)
 
 
-def run(prefill_configs, decode_addrs, host, port):
+def run(prefill_configs, decode_addrs, host, port, timeout):
     global load_balancer
-    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs)
+    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs, timeout=timeout)
     uvicorn.run(app, host=host, port=port)
 
 
