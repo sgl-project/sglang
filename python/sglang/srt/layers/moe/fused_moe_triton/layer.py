@@ -1008,6 +1008,8 @@ class FlashInferFP4MoE(FusedMoE):
             hidden_states: Input tensor
             topk_output: TopKOutput object with Bypassed format
         """
+        assert isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
         router_logits = topk_output.router_logits
