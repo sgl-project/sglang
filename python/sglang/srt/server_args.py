@@ -715,6 +715,12 @@ class ServerArgs:
             "1" if self.disable_outlines_disk_cache else "0"
         )
 
+        if self.enable_hierarchical_cache and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and tokenizer
