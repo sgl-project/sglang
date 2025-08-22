@@ -1,7 +1,6 @@
 [build-system]
 requires = [
   "scikit-build-core>=0.10",
-  "torch>=2.8.0",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"
