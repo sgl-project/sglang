@@ -12,13 +12,9 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
-use crate::protocols::{
-    common::StringOrArray,
-    generate::GenerateRequest,
-    openai::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
-        completions::CompletionRequest,
-    },
+use crate::protocols::spec::{
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, StringOrArray,
+    UserMessageContent,
 };
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;

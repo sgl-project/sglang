@@ -9,10 +9,7 @@ use axum::{
 };
 use std::fmt::Debug;
 
-use crate::protocols::{
-    generate::GenerateRequest,
-    openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
-};
+use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 
 pub mod factory;
 pub mod header_utils;
