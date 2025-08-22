@@ -496,7 +496,9 @@ def sglang_per_token_group_quant_fp8(
     )
 
     if x.shape[0] > 0:
-        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0)
+        sgl_per_token_group_quant_fp8(
+            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        )
 
     return x_q, x_s
 
