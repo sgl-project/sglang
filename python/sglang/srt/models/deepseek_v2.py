@@ -72,11 +72,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    get_moe_runner_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
@@ -667,9 +663,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    if not get_moe_a2a_backend().is_none()
                     else {}
                 ),
             )
@@ -795,7 +789,7 @@ class DeepseekV2MoE(nn.Module):
             self.tp_size > 1
             and not should_allreduce_fusion
             and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            and get_moe_a2a_backend().is_none()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -861,7 +855,7 @@ class DeepseekV2MoE(nn.Module):
             self.tp_size > 1
             and not should_allreduce_fusion
             and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            and get_moe_a2a_backend().is_none()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states

@@ -3,14 +3,8 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from enum import Enum
-from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
-from sglang.srt.layers.dp_attention import (
-    get_attention_dp_size,
-    is_dp_attention_enabled,
-)
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -24,6 +18,10 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
+    FP4_ALLGATHER = "fp4_allgather"  # For moe-runner backend flashinfer_cutlass
+    FLASHINFER_ALLTOALLV = (
+        "flashinfer_alltoallv"  # For moe-runner backend flashinfer_cutlass
+    )
 
     @classmethod
     def _missing_(cls, value):
@@ -42,6 +40,12 @@ class MoeA2ABackend(Enum):
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
+
+    def is_fp4_allgather(self):
+        return self == MoeA2ABackend.FP4_ALLGATHER
+
+    def is_flashinfer_alltoallv(self):
+        return self == MoeA2ABackend.FLASHINFER_ALLTOALLV
 
 
 class MoeRunnerBackend(Enum):
@@ -123,7 +127,6 @@ IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
-DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -135,7 +138,6 @@ def initialize_moe_config(server_args: ServerArgs):
     global IS_TBO_ENABLED
     global IS_SBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
-    global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -149,9 +151,6 @@ def initialize_moe_config(server_args: ServerArgs):
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
-    DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
-        server_args.disable_flashinfer_cutlass_moe_fp4_allgather
-    )
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -220,19 +219,6 @@ def get_tbo_token_distribution_threshold() -> float:
         )
         TBO_TOKEN_DISTRIBUTION_THRESHOLD = 0.48
     return TBO_TOKEN_DISTRIBUTION_THRESHOLD
-
-
-@lru_cache(maxsize=1)
-def should_use_flashinfer_cutlass_moe_fp4_allgather():
-    """
-    Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
-    """
-    return (
-        not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
-        and get_moe_runner_backend().is_flashinfer_cutlass()
-        and is_dp_attention_enabled()
-        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
-    )
 
 
 @contextmanager

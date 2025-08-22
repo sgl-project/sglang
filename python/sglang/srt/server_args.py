@@ -391,7 +391,9 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep", "mooncake"] = "none"
+    moe_a2a_backend: Literal[
+        "none", "deepep", "mooncake", "fp4_allgather", "flashinfer_alltoallv"
+    ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -471,7 +473,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
-    disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
+    disable_flashinfer_cutlass_moe_comm_opt: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
@@ -1398,6 +1400,23 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            if (
+                self.moe_a2a_backend == "none"
+                and not self.disable_flashinfer_cutlass_moe_comm_opt
+                and self.enable_dp_attention
+                and self.dp_size == self.tp_size
+            ):
+                from sglang.srt.layers.flashinfer_alltoall import (
+                    is_flashinfer_alltoallv_supported,
+                )
+
+                if is_flashinfer_alltoallv_supported():
+                    self.moe_a2a_backend = "flashinfer_alltoallv"
+                else:
+                    self.moe_a2a_backend = "fp4_allgather"
+                logger.warning(
+                    f"--moe-a2a-backend={self.moe_a2a_backend} is automatically enabled for Flashinfer Cutlass MOE. Use --disable-flashinfer-cutlass-moe-comm-opt to disable the automatic communication optimization."
+                )
 
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert (
@@ -1438,6 +1457,20 @@ class ServerArgs:
             logger.warning(
                 f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        if (
+            self.moe_a2a_backend == "fp4_allgather"
+            or self.moe_a2a_backend == "flashinfer_alltoallv"
+        ):
+            assert (
+                self.moe_runner_backend == "flashinfer_cutlass"
+            ), f"flashinfer_cutlass moe-runner-backend is required for --moe-a2a-backend={self.moe_a2a_backend}"
+            assert (
+                self.quantization == "modelopt_fp4"
+            ), f"modelopt_fp4 quantization is required for --moe-a2a-backend={self.moe_a2a_backend}"
+            assert self.ep_size == self.tp_size
+            assert self.enable_dp_attention
+            assert self.dp_size == self.tp_size
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -2830,7 +2863,13 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep", "mooncake"],
+            choices=[
+                "none",
+                "deepep",
+                "mooncake",
+                "fp4_allgather",
+                "flashinfer_alltoallv",
+            ],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
@@ -3203,9 +3242,9 @@ class ServerArgs:
             help="Enable NCCL symmetric memory for fast collectives.",
         )
         parser.add_argument(
-            "--disable-flashinfer-cutlass-moe-fp4-allgather",
+            "--disable-flashinfer-cutlass-moe-comm-opt",
             action="store_true",
-            help="Disables quantize before all-gather for flashinfer cutlass moe.",
+            help="When enabling flashinfer cutlass moe, disable the automatic communication optimization.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",
