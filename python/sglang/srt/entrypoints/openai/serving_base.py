@@ -36,6 +36,13 @@ class OpenAIServingBase(ABC):
                 request
             )
 
+            # get dp rank from raw_request
+            request_body = await raw_request.json()
+            data_parallel_rank = request_body.get("data_parallel_rank", None)
+            adapted_request.data_parallel_rank = data_parallel_rank
+            data_parallel_rank_decode = request_body.get("data_parallel_rank_decode", None)
+            adapted_request.data_parallel_rank_decode = data_parallel_rank_decode
+
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
                 return await self._handle_streaming_request(

@@ -399,9 +399,9 @@ impl Worker for BasicWorker {
 #[derive(Debug, Clone)]
 pub struct DPAwareWorker {
     /// The underlying basic worker
-    base_worker: BasicWorker,
+    pub base_worker: BasicWorker,
     /// DP rank for this worker
-    dp_rank: usize,
+    pub dp_rank: usize,
     /// Total DP size
     dp_size: usize,
     /// Base URL without DP suffix
@@ -881,7 +881,7 @@ pub fn start_health_checker(
 
             // Perform health checks concurrently
             let health_checks = workers_to_check.iter().map(|worker| {
-                let worker_url = worker.url().to_string();
+                let worker_url = worker.base_url().to_string();
                 let was_healthy = worker.is_healthy();
 
                 async move {

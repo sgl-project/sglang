@@ -7,7 +7,7 @@ use crate::config::types::{
     HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
 };
 use crate::core::{
-    is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig,
+    is_retryable_status, BasicWorker, DPAwareWorker, CircuitBreakerConfig, HealthChecker, HealthConfig,
     RetryExecutor, Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
 use crate::metrics::RouterMetrics;
@@ -58,7 +58,7 @@ pub struct PDRouter {
 }
 
 // Request context for PD router operations
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PDRequestContext {
     route: &'static str,
     batch_size: Option<usize>,
@@ -369,6 +369,41 @@ impl PDRouter {
         Ok(format!("Successfully removed decode server: {}", url))
     }
 
+    fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
+        let sync_client = reqwest::blocking::Client::new();
+        let mut req_builder = sync_client.get(format!("{}/get_server_info", worker_url));
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+
+        match req_builder.send() {
+            Ok(res) => {
+                if res.status().is_success() {
+                    let server_info = res
+                        .text()
+                        .map_err(|e| format!("failed to read text from response: {}", e))?;
+
+                    let server_info: serde_json::Value = serde_json::from_str(&server_info)
+                        .map_err(|e| format!("failed to decode JSON: {}", e))?;
+
+                    let dp_size = server_info
+                        .get("dp_size")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| String::from("dp_size not found or not an u64"))?;
+
+                    Ok(if dp_size > usize::MAX as u64 {
+                        return Err(format!("dp_size is too large: {}", dp_size));
+                    } else {
+                        dp_size as usize
+                    })
+                } else {
+                    Err(format!("unexpected status code: {}", res.status()))
+                }
+            }
+            Err(e) => Err(format!("error response: {}", e)),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -378,6 +413,8 @@ impl PDRouter {
         client: Client,
         timeout_secs: u64,
         interval_secs: u64,
+        dp_aware: bool,
+        api_key: Option<String>,
         retry_config: RetryConfig,
         circuit_breaker_config: ConfigCircuitBreakerConfig,
         health_check_config: ConfigHealthCheckConfig,
@@ -390,32 +427,66 @@ impl PDRouter {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        // Convert URLs to Worker trait objects with health check config
-        let prefill_workers: Vec<Box<dyn Worker>> = prefill_urls
-            .into_iter()
-            .map(|(url, port)| {
-                let worker = BasicWorker::new(
-                    url,
-                    WorkerType::Prefill {
-                        bootstrap_port: port,
-                    },
-                )
-                .with_circuit_breaker_config(core_cb_config.clone())
-                .with_health_config(HealthConfig {
-                    timeout_secs: health_check_config.timeout_secs,
-                    check_interval_secs: health_check_config.check_interval_secs,
-                    endpoint: health_check_config.endpoint.clone(),
-                    failure_threshold: health_check_config.failure_threshold,
-                    success_threshold: health_check_config.success_threshold,
-                });
-                Box::new(worker) as Box<dyn Worker>
-            })
-            .collect();
+        // workers health check must before create workers
+        let mut all_strings: Vec<String> = prefill_urls.iter().map(|(s, _)| s.clone()).collect();
+        all_strings.extend(decode_urls.clone());
 
-        let decode_workers: Vec<Box<dyn Worker>> = decode_urls
-            .into_iter()
-            .map(|url| {
-                let worker = BasicWorker::new(url, WorkerType::Decode)
+        // Wait for PD workers to be healthy (skip if empty - for service discovery mode)
+        if !all_strings.is_empty() {
+            crate::routers::router::Router::wait_for_healthy_workers(
+                &all_strings,
+                timeout_secs,
+                interval_secs,
+            )
+            .await?;
+        }
+
+        let prefill_workers: Vec<Box<dyn Worker>> = if dp_aware {
+            prefill_urls
+                .into_iter()
+                .flat_map(|(url, port)| {
+                    // get url dp size
+                    let dp_size = match Self::get_worker_dp_size(&url, &api_key) {
+                        Ok(size) => size,
+                        Err(e) => {
+                            panic!("Failed to get DP size for {}: {}", url, e);
+                        }
+                    };
+                    // create dp size workers
+                    (0..dp_size)
+                        .map(|dp_rank| {
+                            let mut worker = DPAwareWorker::new(
+                                url.clone(),
+                                dp_rank,
+                                dp_size,
+                                WorkerType::Prefill {
+                                    bootstrap_port: port,
+                                },
+                            );
+                            worker.base_worker = worker.base_worker
+                                .with_circuit_breaker_config(core_cb_config.clone())
+                                .with_health_config(HealthConfig {
+                                    timeout_secs: health_check_config.timeout_secs,
+                                    check_interval_secs: health_check_config.check_interval_secs,
+                                    endpoint: health_check_config.endpoint.clone(),
+                                    failure_threshold: health_check_config.failure_threshold,
+                                    success_threshold: health_check_config.success_threshold,
+                                });
+                            Box::new(worker) as Box<dyn Worker>
+                        })
+                        .collect::<Vec<Box<dyn Worker>>>()
+                })
+                .collect()
+        } else {
+            prefill_urls
+                .into_iter()
+                .map(|(url, port)| {
+                    let worker = BasicWorker::new(
+                        url,
+                        WorkerType::Prefill {
+                            bootstrap_port: port,
+                        },
+                    )
                     .with_circuit_breaker_config(core_cb_config.clone())
                     .with_health_config(HealthConfig {
                         timeout_secs: health_check_config.timeout_secs,
@@ -424,24 +495,68 @@ impl PDRouter {
                         failure_threshold: health_check_config.failure_threshold,
                         success_threshold: health_check_config.success_threshold,
                     });
-                Box::new(worker) as Box<dyn Worker>
-            })
-            .collect();
+                    Box::new(worker) as Box<dyn Worker>
+                })
+                .collect()
+        };
 
-        // Wait for PD workers to be healthy (skip if empty - for service discovery mode)
+        let decode_workers: Vec<Box<dyn Worker>> = if dp_aware {
+            decode_urls
+                .into_iter()
+                .flat_map(|url| {
+                    // get url dp size
+                    let dp_size = match Self::get_worker_dp_size(&url, &api_key) {
+                        Ok(size) => size,
+                        Err(e) => {
+                            panic!("Failed to get DP size for {}: {}", url, e);
+                        }
+                    };
+                    // create dp size workers
+                    (0..dp_size)
+                        .map(|dp_rank| {
+                            let mut worker = DPAwareWorker::new(
+                                url.clone(),
+                                dp_rank,
+                                dp_size,
+                                WorkerType::Decode,
+                            );
+                            worker.base_worker = worker.base_worker
+                                .with_circuit_breaker_config(core_cb_config.clone())
+                                .with_health_config(HealthConfig {
+                                    timeout_secs: health_check_config.timeout_secs,
+                                    check_interval_secs: health_check_config.check_interval_secs,
+                                    endpoint: health_check_config.endpoint.clone(),
+                                    failure_threshold: health_check_config.failure_threshold,
+                                    success_threshold: health_check_config.success_threshold,
+                                });
+                            Box::new(worker) as Box<dyn Worker>
+                        })
+                        .collect::<Vec<Box<dyn Worker>>>()
+                })
+                .collect()
+        } else {
+            decode_urls
+                .into_iter()
+                .map(|url| {
+                    let worker = BasicWorker::new(url, WorkerType::Decode)
+                        .with_circuit_breaker_config(core_cb_config.clone())
+                        .with_health_config(HealthConfig {
+                            timeout_secs: health_check_config.timeout_secs,
+                            check_interval_secs: health_check_config.check_interval_secs,
+                            endpoint: health_check_config.endpoint.clone(),
+                            failure_threshold: health_check_config.failure_threshold,
+                            success_threshold: health_check_config.success_threshold,
+                        });
+                    Box::new(worker) as Box<dyn Worker>
+                })
+                .collect()
+        };
+
         let all_urls: Vec<String> = prefill_workers
             .iter()
             .chain(decode_workers.iter())
             .map(|worker| worker.url().to_string())
             .collect();
-        if !all_urls.is_empty() {
-            crate::routers::router::Router::wait_for_healthy_workers(
-                &all_urls,
-                timeout_secs,
-                interval_secs,
-            )
-            .await?;
-        }
 
         // Initialize cache-aware policies with workers
         if let Some(cache_policy) = prefill_policy
@@ -859,6 +974,19 @@ impl PDRouter {
         }
     }
 
+    async fn insert_json_value(
+        mut json_request: Value,
+        key: &str,
+        value: Value,
+    ) -> Result<Value, anyhow::Error> {
+        if let Value::Object(ref mut map) = json_request {
+            map.insert(key.to_string(), value);
+            Ok(json_request)
+        } else {
+            Err(anyhow::anyhow!("JSON request is not an object"))
+        }
+    }
+
     // Internal method that performs the actual dual dispatch (without retry logic)
     async fn execute_dual_dispatch_internal(
         &self,
@@ -877,12 +1005,63 @@ impl PDRouter {
             None
         };
 
+        let mut prefill_json_request = json_request.clone();
+        let mut decode_json_request = json_request.clone();
+        if prefill.is_dp_aware() {
+            match prefill.prepare_request(prefill_json_request).await {
+                Ok(modified_request) => {
+                    prefill_json_request = modified_request;
+                }
+                Err(e) => {
+                    error!("Failed to insert the data_parallel_rank field into the request body: {}", e);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "Failed to insert the data_parallel_rank field into the request body",
+                    )
+                    .into_response();
+                }
+            }
+        }
+
+        // add prefill dp rank and decode dp rank to decode request json
+        let prefill_dp_rank_value = serde_json::json!(prefill.dp_rank());
+        let decode_dp_rank_value = serde_json::json!(decode.dp_rank());
+        decode_json_request = match Self::insert_json_value(
+            decode_json_request,
+            "data_parallel_rank",
+            prefill_dp_rank_value
+        ).await {
+            Ok(modified_request) => modified_request,
+            Err(e) => {
+                error!("Failed to insert data_parallel_rank field: {}", e);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Failed to insert data_parallel_rank field",
+                )
+                .into_response();
+            }
+        };
+        decode_json_request = match Self::insert_json_value(
+            decode_json_request,
+            "data_parallel_rank_decode",
+            decode_dp_rank_value
+        ).await {
+            Ok(modified_request) => modified_request,
+            Err(e) => {
+                error!("Failed to insert data_parallel_rank_decode field: {}", e);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Failed to insert data_parallel_rank_decode field",
+                )
+                .into_response();
+            }
+        };
         // Build decode request with shared client
         let decode_request = self.build_post_with_headers(
             &self.client,
-            decode.url(),
+            decode.base_url(),
             context.route,
-            &json_request,
+            &decode_json_request,
             headers,
             false,
         );
@@ -898,9 +1077,9 @@ impl PDRouter {
             // Build prefill request with shared client when we need response body
             let prefill_request = self.build_post_with_headers(
                 &self.client,
-                prefill.url(),
+                prefill.base_url(),
                 context.route,
-                &json_request,
+                &prefill_json_request,
                 headers,
                 false,
             );
@@ -913,8 +1092,8 @@ impl PDRouter {
             let duration = start_time.elapsed();
             RouterMetrics::record_pd_request_duration(context.route, duration);
             RouterMetrics::record_pd_request(context.route);
-            RouterMetrics::record_pd_prefill_request(prefill.url());
-            RouterMetrics::record_pd_decode_request(decode.url());
+            RouterMetrics::record_pd_prefill_request(prefill.base_url());
+            RouterMetrics::record_pd_decode_request(decode.base_url());
 
             // Process decode response with prefill for logprobs
             debug!("Processing decode response with logprobs");
@@ -925,10 +1104,10 @@ impl PDRouter {
                     debug!("Decode response status: {}", status);
 
                     if !status.is_success() {
-                        RouterMetrics::record_pd_decode_error(decode.url());
+                        RouterMetrics::record_pd_decode_error(decode.base_url());
                         error!(
                             "Decode server returned error status decode_url={} status={}",
-                            decode.url(),
+                            decode.base_url(),
                             status
                         );
 
@@ -941,7 +1120,7 @@ impl PDRouter {
                     let prefill_body = match self
                         .process_prefill_response(
                             prefill_result,
-                            prefill.url(),
+                            prefill.base_url(),
                             context.return_logprob,
                         )
                         .await
@@ -985,11 +1164,11 @@ impl PDRouter {
                 }
                 Err(e) => {
                     error!(
-                        decode_url = %decode.url(),
+                        decode_url = %decode.base_url(),
                         error = %e,
                         "Decode request failed"
                     );
-                    RouterMetrics::record_pd_decode_error(decode.url());
+                    RouterMetrics::record_pd_decode_error(decode.base_url());
                     (
                         StatusCode::BAD_GATEWAY,
                         format!("Decode server error: {}", e),
@@ -1004,9 +1183,9 @@ impl PDRouter {
             let prefill_future = self
                 .build_post_with_headers(
                     &self.prefill_client,
-                    prefill.url(),
+                    prefill.base_url(),
                     context.route,
-                    &json_request,
+                    &prefill_json_request,
                     headers,
                     true,
                 )
@@ -1016,7 +1195,7 @@ impl PDRouter {
             // Send prefill response to background worker for draining
             // This ensures HTTP compliance without blocking
             let drain_tx = self.prefill_drain_tx.clone();
-            let prefill_url = prefill.url().to_string();
+            let prefill_url = prefill.base_url().to_string();
             tokio::spawn(async move {
                 if let Ok(response) = prefill_future.await {
                     // Try to send to drain worker
@@ -1059,8 +1238,8 @@ impl PDRouter {
             let duration = start_time.elapsed();
             RouterMetrics::record_pd_request_duration(context.route, duration);
             RouterMetrics::record_pd_request(context.route);
-            RouterMetrics::record_pd_prefill_request(prefill.url());
-            RouterMetrics::record_pd_decode_request(decode.url());
+            RouterMetrics::record_pd_prefill_request(prefill.base_url());
+            RouterMetrics::record_pd_decode_request(decode.base_url());
 
             // Process decode response immediately
             debug!("Processing decode response (no logprobs)");
@@ -1071,10 +1250,10 @@ impl PDRouter {
                     debug!("Decode response status: {}", status);
 
                     if !status.is_success() {
-                        RouterMetrics::record_pd_decode_error(decode.url());
+                        RouterMetrics::record_pd_decode_error(decode.base_url());
                         error!(
                             "Decode server returned error status decode_url={} status={}",
-                            decode.url(),
+                            decode.base_url(),
                             status
                         );
 
@@ -1082,7 +1261,7 @@ impl PDRouter {
                             .await
                     } else if context.is_stream {
                         // Streaming response without logprobs - direct passthrough
-                        let decode_url = decode.url().to_string();
+                        let decode_url = decode.base_url().to_string();
                         let response_headers =
                             header_utils::preserve_response_headers(res.headers());
 
@@ -1119,11 +1298,11 @@ impl PDRouter {
                 }
                 Err(e) => {
                     error!(
-                        decode_url = %decode.url(),
+                        decode_url = %decode.base_url(),
                         error = %e,
                         "Decode request failed"
                     );
-                    RouterMetrics::record_pd_decode_error(decode.url());
+                    RouterMetrics::record_pd_decode_error(decode.base_url());
                     (
                         StatusCode::BAD_GATEWAY,
                         format!("Decode server error: {}", e),
