@@ -8,7 +8,7 @@ Quick start
 - Start server:
   - `python -m sglang.launch_server --model-path openbmb/MiniCPM-o-2_6 --port 30000 --trust-remote-code`
 - Run benchmark:
-  - `python benchmark/asr/bench_sglang_asr.py --port 30000 --dataset openslr/librispeech_asr --split test --limit 8 --concurrency 4`
+  - `python -m benchmark.asr.bench_sglang_asr --port 30000 --dataset openslr/librispeech_asr --split test --limit 8 --concurrency 4`
 
 Notes
 - The benchmark sends audio as a data URL (`data:audio/wav;base64,...`) in `messages[].content[].audio_url.url`, so no local files need to be exposed to the server.
@@ -19,7 +19,7 @@ Example for Gemma3n (if weights are available locally)
 - Start server:
   - `python -m sglang.launch_server --model-path google/gemma-3-**YOUR_VARIANT** --port 30000 --trust-remote-code`
 - Run benchmark:
-  - `python benchmark/asr/bench_sglang_asr.py --port 30000 --dataset openslr/librispeech_asr --split test --limit 8 --concurrency 4`
+  - `python -m benchmark.asr.bench_sglang_asr --port 30000 --dataset openslr/librispeech_asr --split test --limit 8 --concurrency 4`
 
 CLI options
 - `--port`: SGLang server port (default: 30000)
@@ -33,4 +33,3 @@ CLI options
 
 Output
 - Prints aggregate stats and per-request summaries including success/failure, TTFT, total latency, and output token count if provided in the streamed usage event.
-
