@@ -115,23 +115,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
+        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens_q": torch.arange(
-                0, max_bs + 1, dtype=torch.int32, device=self.device
-            ),
-            "cu_seqlens_k": torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            ),
             "page_table": torch.zeros(
                 max_bs,
-                (self.max_context_len + self.page_size - 1) // self.page_size,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "page_table_draft_decode": torch.zeros(
-                max_bs,
-                (self.max_context_len + self.page_size - 1) // self.page_size,
+                max_num_pages,
                 dtype=torch.int32,
                 device=self.device,
             ),
@@ -144,6 +133,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
         ):
+            self.decode_cuda_graph_metadata["cu_seqlens_q"] = torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            )
+            self.decode_cuda_graph_metadata["cu_seqlens_k"] = torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            )
+            self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
+                max_bs,
+                max_num_pages,
+                dtype=torch.int32,
+                device=self.device,
+            )
             self.target_verify_metadata = {
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -160,7 +161,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    (self.max_context_len + self.page_size - 1) // self.page_size,
+                    max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -183,7 +184,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    (self.max_context_len + self.page_size - 1) // self.page_size,
+                    max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
