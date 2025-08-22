@@ -81,10 +81,13 @@ class ASRDataset:
                 elif hasattr(audio, "metadata") and hasattr(audio, "get_all_samples"):
                     sr = int(getattr(audio.metadata, "sample_rate", 0))
                     hf_encoded = getattr(audio, "_hf_encoded", None)
-                    if isinstance(hf_encoded, dict) and isinstance(hf_encoded.get("bytes"), (bytes, bytearray)):
+                    if isinstance(hf_encoded, dict) and isinstance(
+                        hf_encoded.get("bytes"), (bytes, bytearray)
+                    ):
                         try:
-                            import soundfile as sf
                             from io import BytesIO
+
+                            import soundfile as sf
 
                             bio = BytesIO(hf_encoded["bytes"])
                             y, decoded_sr = sf.read(bio)
@@ -93,11 +96,17 @@ class ASRDataset:
                         except Exception:
                             # Fallback to decoder API if bytes decode fails
                             samples = audio.get_all_samples()
-                            y = np.asarray(samples.numpy() if hasattr(samples, "numpy") else samples)
+                            y = np.asarray(
+                                samples.numpy()
+                                if hasattr(samples, "numpy")
+                                else samples
+                            )
                     else:
                         # No bytes available; use decoder API
                         samples = audio.get_all_samples()
-                        y = np.asarray(samples.numpy() if hasattr(samples, "numpy") else samples)
+                        y = np.asarray(
+                            samples.numpy() if hasattr(samples, "numpy") else samples
+                        )
 
                 # Case 3: Other unexpected types (attempt minimal conversion)
                 else:
@@ -137,7 +146,5 @@ class ASRDataset:
 
         if self.verbose and skipped > 0:
             # Report skipped count only when verbose is enabled
-            print(
-                f"Skipped {skipped} samples longer than {self.max_duration_s}s."
-            )
+            print(f"Skipped {skipped} samples longer than {self.max_duration_s}s.")
         return results

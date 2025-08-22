@@ -14,19 +14,17 @@ import argparse
 import asyncio
 import base64
 import io
-import json
-import os
 import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import numpy as np
+import openai
 from tqdm import tqdm
 
 from .asr_dataset import ASRDataset, ASRSample
-import openai
 
 
 @dataclass
@@ -85,7 +83,9 @@ async def request_chat_completion(
         et = time.perf_counter()
         metrics.latency = et - st
         metrics.generated_text = resp.choices[0].message.content or ""
-        metrics.output_tokens = int(getattr(resp, "usage", {}).get("completion_tokens", 0) or 0)
+        metrics.output_tokens = int(
+            getattr(resp, "usage", {}).get("completion_tokens", 0) or 0
+        )
         metrics.success = True
         return metrics
     except Exception:
@@ -109,7 +109,9 @@ async def run_benchmark(
     samples: List[ASRSample] = ds.iter_samples(limit=limit)
 
     if len(samples) == 0:
-        print("No samples found after filtering. Consider disabling --skip-long or changing split.")
+        print(
+            "No samples found after filtering. Consider disabling --skip-long or changing split."
+        )
         return
 
     print(f"Collected {len(samples)} audio samples for benchmarking.")
@@ -145,7 +147,9 @@ async def run_benchmark(
     # Optional: print a short per-request line
     for i, m in enumerate(outs[: min(5, len(outs))]):
         status = "ok" if m.success else "fail"
-        print(f"[{i}] {status} ttft={m.ttft:.3f}s lat={m.latency:.3f}s tokens={m.output_tokens}")
+        print(
+            f"[{i}] {status} ttft={m.ttft:.3f}s lat={m.latency:.3f}s tokens={m.output_tokens}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,6 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--skip-long", action="store_true", default=True)
     from sglang.test.test_utils import add_common_sglang_args_and_parse
+
     return add_common_sglang_args_and_parse(parser)
 
 
