@@ -8,8 +8,12 @@ use crate::core::{
     RetryExecutor, Worker, WorkerFactory, WorkerType,
 };
 use crate::metrics::RouterMetrics;
-use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::policies::LoadBalancingPolicy;
+use crate::protocols::{
+    common::GenerationRequest,
+    generate::GenerateRequest,
+    openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
+};
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::{
     body::Body,
@@ -453,9 +457,7 @@ impl Router {
         Some(available[idx].clone_worker())
     }
 
-    pub async fn route_typed_request<
-        T: crate::openai_api_types::GenerationRequest + serde::Serialize + Clone,
-    >(
+    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
