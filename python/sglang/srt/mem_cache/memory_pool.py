@@ -894,7 +894,7 @@ class AscendMLAPagedTokenToKVPool(MHATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
-        super(MHATokenToKVPool, self).__init__(
+        super().__init__(
             size,
             page_size,
             dtype,
