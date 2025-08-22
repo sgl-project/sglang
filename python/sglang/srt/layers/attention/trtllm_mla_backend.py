@@ -282,7 +282,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
         # Delegate to parent for non-decode modes.
-        if not forward_batch.forward_mode.is_decode_or_idle() and not forward_batch.forward_mode.is_target_verify():
+        if (
+            not forward_batch.forward_mode.is_decode_or_idle()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
             return super().init_forward_metadata(forward_batch)
 
         bs = forward_batch.batch_size
@@ -526,7 +529,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        # TODO: draft extend cannot work with this kernel due to unsupport of varlen decoding
+        # TODO: draft extend cannot work with this kernel due to no support of varlen decoding
         if query.dim() == 3:
             query = query.view(
                 forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
