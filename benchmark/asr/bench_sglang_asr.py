@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover
     from benchmark.asr.asr_dataset import ASRDataset, ASRSample
 
 
-API_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+API_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60)
 
 
 @dataclass
@@ -233,7 +233,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=128)
-    parser.add_argument("--skip-long", action="store_true", default=True)
+    parser.add_argument("--skip-long", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 

@@ -104,8 +104,10 @@ class ASRDataset:
                     elif hasattr(audio, "__array__"):
                         y = np.asarray(audio)
 
-            except Exception:
+            except Exception as e:
                 # Skip problematic sample
+                import traceback
+                print(f"Warning. An audio sample failed to proccess, Error: {e}\n{traceback.format_exc()}")
                 continue
 
             if y is None or sr <= 0:
@@ -132,5 +134,6 @@ class ASRDataset:
             results.append(ASRSample(audio=y, sr=sr, text=text))
             if limit is not None and len(results) >= limit:
                 break
-
+            if skipped > 0:
+                print(f"INFO: Skipped {skipped} samples longer than {self.max_duration_s}s.")
         return results
