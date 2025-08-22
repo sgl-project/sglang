@@ -48,6 +48,7 @@ metrics = "0.24.2"
 metrics-exporter-prometheus = "0.17.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 thiserror = "2.0.12"
+regex = "1.10"
 url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
