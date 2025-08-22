@@ -648,6 +648,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
+
 @app.post("/update_weight_version")
 async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
     """Update the weight version. This operation requires no active requests."""

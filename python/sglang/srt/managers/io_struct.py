@@ -847,6 +847,7 @@ DISAGGREGATION_DECODE_ENVS = [
     "SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL",
 ]
 
+
 @dataclass
 class ConvertDisaggregationRoleReqInput:
     # the server url to convert
@@ -882,11 +883,10 @@ class ConvertDisaggregationRoleReqInput:
     )
 
 
-
-
 @dataclass
 class ConvertDisaggregationRoleReqOutput:
     """Converse PD disaggregation identity"""
+
     success: bool
     message: str
 

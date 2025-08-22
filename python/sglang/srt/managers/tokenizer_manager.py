@@ -1297,7 +1297,7 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         if not self.server_args.enable_pd_convert:
             return False, "PD role conversion is not enabled.", None
-        
+
         def set_env_vars(env_vars: Optional[Dict[str, Any]]):
             if env_vars:
                 for k, v in env_vars.items():

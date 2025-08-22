@@ -432,7 +432,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
                 detail=f"Cannot convert {server_url} to decode, at least one prefill server is required.",
             )
         current_role = "prefill"
-        bootstrap_port=load_balancer.remove_prefill_server(server_url)
+        bootstrap_port = load_balancer.remove_prefill_server(server_url)
         logger.info(
             f"Stop sending req to {server_url}. Waiting for prefill to finish all reqs."
         )
@@ -506,7 +506,11 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
         async with aiohttp.ClientSession() as session:
             tasks = []
             for decode_server in load_balancer.decode_servers:
-                tasks.append(session.post(f"{decode_server}/convert_pd_role", json=dataclasses.asdict(obj)))
+                tasks.append(
+                    session.post(
+                        f"{decode_server}/convert_pd_role", json=dataclasses.asdict(obj)
+                    )
+                )
             for i, response in enumerate(asyncio.as_completed(tasks)):
                 await response
 
