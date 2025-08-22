@@ -44,21 +44,11 @@ jobs:
           docker exec ci_sglang_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
           docker exec ci_sglang_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
-      - name: Run Sglang Kernel Cases
-        timeout-minutes: 20
-        run: |
-          docker exec -w /root/sglang ci_sglang_xpu \
-            /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/tests &&  python3 -m pytest -v -s test_awq_dequant.py"
-
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20
         run: |
-          echo "[PlaceHolder for E2E Test...]"
-
-      - name: Run E2E Qunatization tests
-        timeout-minutes: 20
-        run: |
-          echo "[PlaceHolder for E2E Test...]"
+          docker exec -w /sglang-checkout/ ci_sglang_xpu \
+            bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-xpu"
 
       - name: Cleanup container
         if: always()

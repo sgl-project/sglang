@@ -265,6 +265,13 @@ suite_xeon = {
     ],
 }
 
+# Add Intel Xeon tests
+suite_xpu = {
+    "per-commit-xpu": [
+        TestFile("test_intel_xpu_backend.py"),
+    ],
+}
+
 # Add Ascend NPU tests
 suite_ascend = {
     "per-commit-1-ascend-npu": [
