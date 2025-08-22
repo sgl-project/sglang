@@ -20,7 +20,7 @@ pub struct BaseReasoningParser {
 impl BaseReasoningParser {
     /// Create a new BaseReasoningParser with the given configuration.
     pub fn new(config: ParserConfig) -> Self {
-        let in_reasoning = config.force_reasoning;
+        let in_reasoning = config.initial_in_reasoning;
         Self {
             config,
             in_reasoning,
@@ -179,7 +179,7 @@ impl ReasoningParser for BaseReasoningParser {
     }
 
     fn reset(&mut self) {
-        self.in_reasoning = self.config.force_reasoning;
+        self.in_reasoning = self.config.initial_in_reasoning;
         self.buffer.clear();
         self.stripped_think_start = false;
     }
@@ -193,13 +193,16 @@ impl ReasoningParser for BaseReasoningParser {
 mod tests {
     use super::*;
 
-    fn create_test_parser(force_reasoning: bool, stream_reasoning: bool) -> BaseReasoningParser {
+    fn create_test_parser(
+        initial_in_reasoning: bool,
+        stream_reasoning: bool,
+    ) -> BaseReasoningParser {
         let config = ParserConfig {
             think_start_token: "<think>".to_string(),
             think_end_token: "</think>".to_string(),
-            force_reasoning,
             stream_reasoning,
             max_buffer_size: 65536,
+            initial_in_reasoning,
         };
         BaseReasoningParser::new(config)
     }
@@ -265,7 +268,8 @@ mod tests {
     }
 
     #[test]
-    fn test_force_reasoning_mode() {
+    fn test_initial_in_reasoning_true() {
+        // Parser starts with in_reasoning=true (like DeepSeek-R1)
         let mut parser = create_test_parser(true, true);
         let result = parser
             .detect_and_parse_reasoning("no think tags here")
