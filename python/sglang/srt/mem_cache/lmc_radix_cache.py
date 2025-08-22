@@ -190,21 +190,6 @@ class LMCRadixCache(BasePrefixCache):
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
 
-        self.load_queue = Queue()
-        self.store_queue = Queue()
-
-        self.stop_event = threading.Event()
-        self.load_cache_event = threading.Event()
-
-        self.load_thread = threading.Thread(
-            target=self._load_thread_func, daemon=True
-        )
-        self.store_thread = threading.Thread(
-            target=self._store_thread_func, daemon=True
-        )
-        self.load_thread.start()
-        self.store_thread.start()
-
         self.layer_done_executor = LayerTransferExecutor(model_config.num_hidden_layers, self.load_stream, self.lmcache_connector, printable=(rank == 0))
         self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_executor(self.layer_done_executor)
         self.reset()
@@ -219,23 +204,6 @@ class LMCRadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
-
-        # For LMCache
-        self.stop_event.set()
-        self.load_thread.join()
-        self.store_thread.join()
-        self.load_queue.queue.clear()
-        self.store_queue.queue.clear()
-
-        self.load_thread = threading.Thread(
-            target=self._load_thread_func, daemon=True
-        )
-        self.store_thread = threading.Thread(
-            target=self._store_thread_func, daemon=True
-        )
-        self.stop_event.clear()
-        self.load_thread.start()
-        self.store_thread.start()
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -375,14 +343,16 @@ class LMCRadixCache(BasePrefixCache):
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
-        self.lmcache_connector.store_kv(
-            StoreMetadata(
-                last_node=req.last_node,
-                token_ids=token_ids,
-                kv_indices=kv_indices,
-                offset=0,
+        with torch.cuda.stream(self.store_stream):
+            self.lmcache_connector.store_kv(
+                StoreMetadata(
+                    last_node=req.last_node,
+                    token_ids=token_ids,
+                    kv_indices=kv_indices,
+                    offset=0,
+                )
             )
-        )
+        self.store_stream.synchronize()
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
@@ -704,48 +674,7 @@ class LMCRadixCache(BasePrefixCache):
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())
-
-    def _store_thread_func(self):
-        torch.cuda.set_stream(self.store_stream)
-        while not self.stop_event.is_set():
-            try:
-                store_metadata = self.store_queue.get(block=True, timeout=1)
-                self.lmcache_connector.store_kv(store_metadata)
-                self.store_stream.synchronize()
-                last_node = store_metadata.last_node
-                self.dec_lock_ref(last_node)
-            except Empty:
-                continue
-            except Exception as e:
-                print("Error in store thread: ", e)
-                traceback.print_exc()
-
-    def _load_thread_func(self):
-        torch.cuda.set_stream(self.load_stream)
-        while not self.stop_event.is_set():
-            try:
-                self.load_cache_event.wait(timeout=1)
-                if not self.load_cache_event.is_set():
-                    continue
-                self.load_cache_event.clear()
-                self.layer_done_counter.update_producer()
-
-                self.layer_done_counter.reset()
-                
-                import time
-                start_time = time.time()
-                for _ in range(self.lmcache_connector.num_layer):
-                    self.lmcache_connector.load_kv_layerwise()
-                    # self.load_stream.synchronize()
-                    self.layer_done_counter.increment()
-                end_time = time.time()
-                print(f"In thread: Time taken: {end_time - start_time}")
-
-            except Empty:
-                continue
-            except Exception as e:
-                print("Error in load thread: ", e)
-
+            
     def take_events(self):
         """Atomically takes all events and clears the queue.
 
