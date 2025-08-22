@@ -80,7 +80,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_token), dtype=torch.int64
+            )
 
             if self.eagle_worker.speculative_algorithm.is_eagle3():
                 self.hidden_states = torch.zeros(

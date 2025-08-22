@@ -15,6 +15,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
@@ -50,7 +51,6 @@ from sglang.srt.utils import (
     is_cuda,
     next_power_of_2,
 )
-from sglang.srt.managers.mm_utils import embed_mm_inputs
 
 if is_cuda():
     from sgl_kernel import segment_packbits
@@ -889,7 +889,7 @@ class EAGLEWorker(TpModelWorker):
         )
         forward_batch.mm_inputs = None
         return inputs_embeds
-    
+
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
         # Backup fields that will be modified in-place

@@ -510,35 +510,49 @@ class ForwardBatch:
             or self.contains_image_inputs()
         )
 
-    def _compute_spec_mrope_positions(self, model_runner: ModelRunner, batch: ModelWorkerBatch):
+    def _compute_spec_mrope_positions(
+        self, model_runner: ModelRunner, batch: ModelWorkerBatch
+    ):
         # TODO support batched deltas
         batch_size = self.seq_lens.shape[0]
         device = model_runner.device
         mm_inputs = batch.multimodal_inputs
-        
-        if batch.forward_mode.is_draft_extend(): # draft_extend_after_decode
+
+        if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
             mrope_deltas = []
             extend_lens = []
             for batch_idx in range(batch_size):
                 extend_seq_len = batch.extend_seq_lens[batch_idx]
                 extend_lens.append(extend_seq_len)
-                mrope_delta = torch.tensor([0], dtype=torch.int64) if mm_inputs[batch_idx] is None else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
+                mrope_delta = (
+                    torch.tensor([0], dtype=torch.int64)
+                    if mm_inputs[batch_idx] is None
+                    else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
+                )
                 mrope_deltas.append(mrope_delta.to(device=device))
             position_chunks = torch.split(batch.spec_info.positions, extend_lens)
             mrope_positions_list = [
-                pos_chunk + delta 
+                pos_chunk + delta
                 for pos_chunk, delta in zip(position_chunks, mrope_deltas)
             ]
-            next_input_positions = torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
-            
+            next_input_positions = (
+                torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
+            )
+
         else:  # target_verify or draft_decode
             seq_positions = batch.spec_info.positions.view(batch_size, -1)
             mrope_deltas = [
-                torch.tensor([0], dtype=torch.int64) if mm_inputs[i] is None else mm_inputs[i].mrope_position_delta.squeeze(0)
+                (
+                    torch.tensor([0], dtype=torch.int64)
+                    if mm_inputs[i] is None
+                    else mm_inputs[i].mrope_position_delta.squeeze(0)
+                )
                 for i in range(batch_size)
             ]
             mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-            next_input_positions = (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+            next_input_positions = (
+                (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+            )
 
         self.mrope_positions = next_input_positions
 

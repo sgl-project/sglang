@@ -16,7 +16,7 @@
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple, Union, List 
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -455,7 +455,7 @@ class Qwen2ForCausalLM(nn.Module):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
-        
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embedding(input_ids)
 
@@ -487,11 +487,11 @@ class Qwen2ForCausalLM(nn.Module):
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
-                    input_ids, 
-                    hidden_states, 
-                    self.lm_head, 
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
                     forward_batch,
-                    aux_hidden_states
+                    aux_hidden_states,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)
@@ -644,5 +644,6 @@ class Qwen2ForCausalLM(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
 
 EntryClass = Qwen2ForCausalLM

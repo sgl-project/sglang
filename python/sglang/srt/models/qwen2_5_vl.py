@@ -622,10 +622,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
-    
+
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         self.capture_aux_hidden_states = True
         self.model.capture_aux_hidden_states = True
@@ -638,5 +638,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
-            
+
+
 EntryClass = [Qwen2_5_VLForConditionalGeneration]

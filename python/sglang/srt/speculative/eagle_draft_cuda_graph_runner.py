@@ -90,7 +90,9 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_token), dtype=torch.int64
+            )
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             self.hidden_states = torch.zeros(
