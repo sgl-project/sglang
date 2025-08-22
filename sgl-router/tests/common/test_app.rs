@@ -8,6 +8,7 @@ use sglang_router_rs::{
 use std::sync::Arc;
 
 /// Create a test Axum application using the actual server's build_app function
+#[allow(dead_code)]
 pub fn create_test_app(
     router: Arc<dyn RouterTrait>,
     client: Client,
