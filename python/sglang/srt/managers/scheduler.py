@@ -217,6 +217,8 @@ class Scheduler(
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
+        self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.priority_scheduling_preemption_threshold = server_args.priority_scheduling_preemption_threshold
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -444,10 +446,11 @@ class Scheduler(
             self.schedule_policy,
             self.tree_cache,
             self.enable_hierarchical_cache,
+            self.enable_priority_scheduling,
         )
-        self.use_priority_scheduling = self.schedule_policy == "priority"
-        if self.use_priority_scheduling:
-            heapq.heapify(self.waiting_queue)
+        # Enable preemption for priority scheduling.
+        self.try_preemption = self.enable_priority_scheduling
+
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
@@ -1221,7 +1224,7 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
-            if not self._pass_queued_limit_validation(req, heapify=True):
+            if self._abort_on_queued_limit(req, heapify=True):
                 return
             self._prefetch_kvcache(req)
             self._add_to_waiting_queue(req)
@@ -1247,50 +1250,44 @@ class Scheduler(
             # If this is a decode server, we put the request to the decode pending prealloc queue
             self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
         else:
-            self._extend_to_waiting_queue(reqs)
+            if self.enable_priority_scheduling:
+                heapq.heapify(self.waiting_queue)
+            for req in reqs:
+                if not self._abort_on_queued_limit(req):
+                    self._add_to_waiting_queue(req)
 
-    def _extend_to_waiting_queue(self, reqs: List[Req]):
-        if self.use_priority_scheduling:
-            heapq.heapify(self.waiting_queue)
-        for req in reqs:
-            if self._pass_queued_limit_validation(req):
-                self._add_to_waiting_queue(req)
-
-    def _pass_queued_limit_validation(
-        self, recv_req: Req, heapify: bool = False
-    ) -> bool:
-        """Returns True if the given request can be added to the queue. If at capacity, abort incoming or existing request to free up the queue."""
-        # If no limit is configured or the limit hasn't been reached, skip validation.
+    def _abort_on_queued_limit(self, recv_req: Req, heapify=False) -> bool:
+        """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
         ):
-            return True
-        # Queued request size is at limit.
-        # Reject incoming request by default.
-        abort_req = AbortReq(
-            recv_req.rid,
-            finished_reason={
-                "type": "abort",
-                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                "message": "The request queue is full.",
-            },
+            return False
+        
+        # TODO: Refactor to use a custom priority queue class that accepts scheduling policy.
+        if heapify:
+            heapq.heapify(self.waiting_queue)
+
+        # Reject the incoming request by default.
+        req_to_abort, message = recv_req, "The request queue is full."
+        if self.enable_priority_scheduling and recv_req.priority > self.waiting_queue[0].priority:
+            # With priority scheduling, abort the existing request if it has a lower priority.
+            req_to_abort, message = heapq.heappop(self.waiting_queue),  "The request is aborted based on priority."
+
+        self.send_to_tokenizer.send_pyobj(
+            AbortReq(
+                req_to_abort.rid,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+            )
         )
-        # When using priority scheduling, evict existing request if its priority is lower.
-        if self.use_priority_scheduling:
-            lowest_priority_req = heapq.heappop(self.waiting_queue)
-            if recv_req.priority > lowest_priority_req.priority:
-                abort_req.rid = lowest_priority_req.rid
-                abort_req.finished_reason["message"] = (
-                    "The request is evicted based on priority."
-                )
-            else:
-                heapq.heappush(self.waiting_queue, lowest_priority_req)
-        self.send_to_tokenizer.send_pyobj(abort_req)
-        return abort_req.rid != recv_req.rid
+        return req_to_abort.rid == recv_req.rid
 
     def _add_to_waiting_queue(self, req: Req):
-        if self.use_priority_scheduling:
+        if self.enable_priority_scheduling:
             heapq.heappush(self.waiting_queue, req)
         else:
             self.waiting_queue.append(req)
@@ -1535,6 +1532,10 @@ class Scheduler(
         if self.grammar_queue:
             self.move_ready_grammar_requests()
 
+        if self.try_preemption:
+            # Reset batch_is_full to try preemption with a prefill adder.
+            self.running_batch.batch_is_full = False
+
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -1547,7 +1548,7 @@ class Scheduler(
         # as the space for the chunked request has just been released.
         # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
-        if self.get_num_allocatable_reqs(running_bs) <= 0 and not self.chunked_req:
+        if self.get_num_allocatable_reqs(running_bs) <= 0 and not self.chunked_req and not self.try_preemption:
             self.running_batch.batch_is_full = True
             return None
 
@@ -1567,6 +1568,7 @@ class Scheduler(
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
+            self.priority_scheduling_preemption_threshold,
         )
 
         if self.chunked_req is not None:
@@ -1590,15 +1592,19 @@ class Scheduler(
                 self.running_batch.batch_is_full = True
                 break
 
+            running_bs = len(self.running_batch.reqs) - len(adder.preempt_list)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
-                break
-
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
+
+            if self.running_batch.batch_is_full:
+                if not self.try_preemption:
+                    break
+                if not adder.preempt_to_schedule(req, self.server_args):
                     break
 
             if self.enable_hicache_storage:
@@ -1631,6 +1637,8 @@ class Scheduler(
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
+        if adder.preempt_list:
+            self._extend_requests_to_queue(adder.preempt_list)
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None

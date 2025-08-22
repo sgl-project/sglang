@@ -1450,41 +1450,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
-
-            if server_args.disaggregation_mode == "decode":
-                req.offload_kv_cache(
-                    self.req_to_token_pool, self.token_to_kv_pool_allocator
-                )
-
-            if isinstance(self.tree_cache, ChunkCache):
-                # ChunkCache does not have eviction
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : seq_lens_cpu[idx]
-                ]
-                self.token_to_kv_pool_allocator.free(token_indices)
-                self.req_to_token_pool.free(req.req_pool_idx)
-            else:
-                # TODO: apply more fine-grained retraction
-                last_uncached_pos = (
-                    len(req.prefix_indices) // server_args.page_size
-                ) * server_args.page_size
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
-                ]
-                self.token_to_kv_pool_allocator.free(token_indices)
-                self.req_to_token_pool.free(req.req_pool_idx)
-
-                # release the last node
-                if self.is_hybrid:
-                    self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
-                else:
-                    self.tree_cache.dec_lock_ref(req.last_node)
-
-                # NOTE(lsyin): we should use the newly evictable memory instantly.
-                num_tokens = len(sorted_indices) * global_config.retract_decode_steps
-                self._evict_tree_cache_if_needed(num_tokens)
-
-            req.reset_for_retract()
+            self.unbudget_req(req, idx, len(sorted_indices), server_args)
 
             if len(retracted_reqs) == 0:
                 # Corner case: only one request left
@@ -1504,6 +1470,44 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio
+    
+    def unbudget_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+        req = self.reqs[idx]
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
+
+        if server_args.disaggregation_mode == "decode":
+            req.offload_kv_cache(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
+        if isinstance(self.tree_cache, ChunkCache):
+            # ChunkCache does not have eviction
+            token_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : seq_lens_cpu[idx]
+            ]
+            self.token_to_kv_pool_allocator.free(token_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
+        else:
+            # TODO: apply more fine-grained retraction
+            last_uncached_pos = (
+                len(req.prefix_indices) // server_args.page_size
+            ) * server_args.page_size
+            token_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
+            ]
+            self.token_to_kv_pool_allocator.free(token_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
+
+            # release the last node
+            if self.is_hybrid:
+                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+            else:
+                self.tree_cache.dec_lock_ref(req.last_node)
+
+            # NOTE(lsyin): we should use the newly evictable memory instantly.
+            num_tokens = remaing_req_count * global_config.retract_decode_steps
+            self._evict_tree_cache_if_needed(num_tokens)
+
+        req.reset_for_retract()
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status

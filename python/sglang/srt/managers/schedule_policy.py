@@ -72,7 +72,6 @@ class CacheAgnosticPolicy(Enum):
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
     RANDOM = "random"
-    PRIORITY = "priority"  # higher priority first
 
 
 class SchedulePolicy:
@@ -83,10 +82,12 @@ class SchedulePolicy:
         policy: str,
         tree_cache: BasePrefixCache,
         enable_hierarchical_cache: bool,
+        enable_priority_scheduling: bool,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
+        self.enable_priority_scheduling = enable_priority_scheduling
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache(
@@ -98,7 +99,8 @@ class SchedulePolicy:
 
     def calc_priority(self, waiting_queue: List[Req]) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
-            # A shortcut for FCFS
+            if self.enable_priority_scheduling:
+                SchedulePolicy._sort_by_priority_and_fcfs(waiting_queue)
             return False
 
         policy = self._determine_active_policy(waiting_queue)
@@ -121,14 +123,11 @@ class SchedulePolicy:
             if policy == CacheAgnosticPolicy.FCFS:
                 pass
             elif policy == CacheAgnosticPolicy.LOF:
-                SchedulePolicy._sort_by_longest_output(waiting_queue)
+                SchedulePolicy._sort_by_longest_output(waiting_queue, self.enable_priority_scheduling)
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
-            elif policy == CacheAgnosticPolicy.PRIORITY:
-                SchedulePolicy._sort_by_priority(waiting_queue)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
-
         return prefix_computed
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
@@ -234,9 +233,12 @@ class SchedulePolicy:
         )
 
     @staticmethod
-    def _sort_by_longest_output(waiting_queue: List[Req]) -> None:
-        """Sorts the waiting queue based on the longest output (max_new_tokens)."""
-        waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
+    def _sort_by_longest_output(waiting_queue: List[Req], enable_priority_scheduling: bool) -> None:
+        """Sorts the waiting queue based on the longest output (max_new_tokens). If using priority scheduling, sort by priority first."""
+        if enable_priority_scheduling:
+            waiting_queue.sort(key=lambda x: (-x.priority, -x.sampling_params.max_new_tokens))
+        else:
+            waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
 
     @staticmethod
     def _sort_randomly(waiting_queue: List[Req]) -> None:
@@ -244,7 +246,7 @@ class SchedulePolicy:
         random.shuffle(waiting_queue)
 
     @staticmethod
-    def _sort_by_priority(waiting_queue: List[Req]) -> None:
+    def _sort_by_priority_and_fcfs(waiting_queue: List[Req]) -> None:
         """Sorts the waiting queue based on the request priority then received titmestamp."""
         waiting_queue.sort(key=lambda x: (-x.priority, x.queue_time_start))
 
@@ -287,6 +289,7 @@ class PrefillAdder:
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
+        priority_scheduling_preemption_threshold: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -303,6 +306,7 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
+        self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
@@ -311,18 +315,21 @@ class PrefillAdder:
         if running_batch is not None:
             self.rem_total_token_offset += sum(
                 [
-                    min(
-                        (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                    )
-                    * self.new_token_ratio
-                    for r in running_batch.reqs
+                    self._get_running_request_total_token_offset(r) for r in running_batch.reqs
                 ]
             )
 
         self.is_hybrid = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
+
+        self.priority_scheduling_preemption_threshold = priority_scheduling_preemption_threshold
+
+    def _get_running_request_total_token_offset(self, req: Req) -> int:
+        return min(
+            (req.sampling_params.max_new_tokens - len(req.output_ids)),
+            CLIP_MAX_NEW_TOKENS_ESTIMATION,
+        )  * self.new_token_ratio
 
     @property
     def rem_total_tokens(self):
@@ -575,3 +582,37 @@ class PrefillAdder:
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
+
+
+    def preempt_to_schedule(self, req: Req, server_args) -> bool:
+        """
+        Preempt runnnig requests to serve the new request if the priority threshold is met and token count sum is verified. 
+        Returns True if preemption was commited, and the new request can be scheduled.
+        """
+        preemptable_reqs = []
+        min_tokens_to_remove = req.extend_input_len + min(
+            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
+        ) - self.rem_total_tokens
+        for running_req in sorted(self.running_batch.reqs, key=lambda x: (x.priority, -x.queue_time_start)):
+            if running_req in self.preempt_list:
+                continue
+           # Preempt the existing request if the incoming priority difference is higher than the threshold.
+            if req.priority >= running_req.priority + self.priority_scheduling_preemption_threshold:
+                preemptable_reqs.append(running_req)
+                min_tokens_to_remove -= self._get_running_request_total_token_offset(running_req)
+        if len(preemptable_reqs) == 0 or min_tokens_to_remove > 0:
+            return False
+
+        preemptable_reqs = set(preemptable_reqs)
+        keep_indices = []
+        unbudget_counter = 0 
+        for i, running_req in enumerate(self.running_batch.reqs):
+            if running_req in preemptable_reqs:
+                self.rem_total_token_offset -= self._get_running_request_total_token_offset(req)
+                unbudget_counter += 1
+                self.running_batch.unbudget_req(i, len(self.running_batch.reqs)-unbudget_counter, server_args)
+            else:
+                keep_indices.append(i)
+        self.running_batch.filter_batch(keep_indices=keep_indices)
+        self.preempt_list.extend(preemptable_reqs)
+        return True

@@ -80,6 +80,8 @@ class ServerArgs:
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
+    enable_priority_scheduling: bool = False
+    priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
     page_size: Optional[int] = None
@@ -867,9 +869,22 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
             help="The scheduling policy of the requests.",
         )
+        parser.add_argument(
+            "--enable-priority-scheduling",
+            action="store_true",
+            default=ServerArgs.enable_priority_scheduling,
+            help="Enable requests with higher priority values to be scheduled first.",
+        )
+        parser.add_argument(
+            "--priority-scheduling-preemption-threshold",
+            type=int,
+            default=ServerArgs.priority_scheduling_preemption_threshold,
+            help="Minimum difference in priorities for an incoming request to have to preempt running request(s).",
+        )
+        # todo - consider adding validation for above with cache aware priroity mode. error out?
         parser.add_argument(
             "--schedule-conservativeness",
             type=float,
