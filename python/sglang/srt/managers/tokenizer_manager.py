@@ -300,7 +300,7 @@ class TokenizerManager:
         # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
         # serves as the source of truth for available adapters and maps user-friendly LoRA names
         # to internally used unique LoRA IDs.
-        self.lora_registry = LoRARegistry(self.server_args.lora_paths or {})
+        self.lora_registry = LoRARegistry(self.server_args.lora_paths)
         # Lock to serialize LoRA update operations.
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
@@ -568,7 +568,7 @@ class TokenizerManager:
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
-        _max_req_len = self.context_len - 1
+        _max_req_len = self.context_len
 
         input_token_num = len(input_ids) if input_ids is not None else 0
         if input_token_num >= self.context_len:
@@ -578,7 +578,7 @@ class TokenizerManager:
                     f"model's context length ({self.context_len} tokens). "
                     "Truncating the input."
                 )
-                input_ids = input_ids[:_max_req_len]
+                del input_ids[_max_req_len:]
                 input_token_num = len(input_ids)
             else:
                 raise ValueError(
