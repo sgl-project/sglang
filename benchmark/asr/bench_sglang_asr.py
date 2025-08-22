@@ -5,7 +5,7 @@ Usage:
   1) Launch server (example, MiniCPM-o):
      python -m sglang.launch_server --model-path openbmb/MiniCPM-o-2_6 --port 30000 --trust-remote-code
   2) Run benchmark:
-     python benchmark/asr/bench_sglang_asr.py --port 30000 --dataset openslr/librispeech_asr --split test --limit 8 --concurrency 4
+     python -m benchmark.asr.bench_sglang_asr --port 30000 --dataset openslr/librispeech_asr --split test --limit 8 --concurrency 4
 """
 
 from __future__ import annotations
@@ -22,19 +22,11 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-import aiohttp
 import numpy as np
 from tqdm import tqdm
 
-try:
-    # When running as a script: python benchmark/asr/bench_sglang_asr.py
-    from asr_dataset import ASRDataset, ASRSample
-except Exception:  # pragma: no cover
-    # Fallback if executed differently
-    from benchmark.asr.asr_dataset import ASRDataset, ASRSample
-
-
-API_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60)
+from .asr_dataset import ASRDataset, ASRSample
+import openai
 
 
 @dataclass
@@ -65,105 +57,41 @@ def wav_data_url(y: np.ndarray, sr: int) -> str:
     return f"data:audio/wav;base64,{b64}"
 
 
-async def stream_chat_with_audio(
-    base_url: str,
+async def request_chat_completion(
+    client: Any,
     audio_data_url: str,
     prompt: str,
     max_tokens: int,
 ) -> RequestMetrics:
-    """POST to /v1/chat/completions with streaming and parse SSE chunks.
-
-    This mirrors the VLLM-style async streaming loop, adapted for SGLang's
-    chat completions API with multimodal audio messages.
-    """
-    api_url = f"{base_url}/v1/chat/completions"
-    headers = {
-        # SGLang accepts any bearer; use env if provided
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'sk')}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "default",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    # Keep text instruction clear and short
-                    {"type": "text", "text": prompt},
-                    {"type": "audio_url", "audio_url": {"url": audio_data_url}},
-                ],
-            }
-        ],
-        "temperature": 0.0,
-        "max_completion_tokens": max_tokens,
-        "stream": True,
-        # Include usage in stream if server supports it
-        "stream_include_usage": True,
-        "stream_continuous_usage_stats": True,
-    }
-
+    """Call OpenAI-compatible chat.completions via SDK (non-streaming)."""
     metrics = RequestMetrics(success=False)
     st = time.perf_counter()
-    most_recent = st
-    ttft_recorded = False
-
-    async with aiohttp.ClientSession(trust_env=True, timeout=API_TIMEOUT) as session:
-        try:
-            async with session.post(api_url, headers=headers, data=json.dumps(payload)) as resp:
-                if resp.status != 200:
-                    metrics.error = resp.reason or f"HTTP {resp.status}"
-                    return metrics
-
-                async for raw_chunk in resp.content:
-                    chunk = raw_chunk.strip()
-                    if not chunk:
-                        continue
-                    # SGLang streams SSE lines prefixed with 'data: '
-                    try:
-                        line = chunk.decode("utf-8")
-                    except Exception:
-                        continue
-
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[len("data:") :].strip()
-                    if data_str == "[DONE]":
-                        break
-
-                    now = time.perf_counter()
-                    try:
-                        data = json.loads(data_str)
-                    except Exception:
-                        # Skip malformed JSON fragments
-                        continue
-
-                    # Choices/delta content
-                    if "choices" in data and data["choices"]:
-                        delta = data["choices"][0].get("delta", {})
-                        content_piece = delta.get("content")
-
-                        if content_piece is not None:
-                            if not ttft_recorded:
-                                metrics.ttft = now - st
-                                ttft_recorded = True
-                            else:
-                                metrics.itl.append(now - most_recent)
-                            metrics.generated_text += content_piece
-                            most_recent = now
-
-                    # Usage token counts (if present)
-                    if "usage" in data and isinstance(data["usage"], dict):
-                        # SGLang may include completion_tokens here during streaming
-                        metrics.output_tokens = int(data["usage"].get("completion_tokens") or 0)
-
-        except Exception:
-            exc = sys.exc_info()
-            metrics.error = "".join(traceback.format_exception(*exc))
-            return metrics
-
-    metrics.latency = most_recent - st if most_recent > st else 0.0
-    metrics.success = True
-    return metrics
+    try:
+        resp = await client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "audio_url", "audio_url": {"url": audio_data_url}},
+                    ],
+                }
+            ],
+            temperature=0.0,
+            max_completion_tokens=max_tokens,
+            max_tokens=max_tokens,
+        )
+        et = time.perf_counter()
+        metrics.latency = et - st
+        metrics.generated_text = resp.choices[0].message.content or ""
+        metrics.output_tokens = int(getattr(resp, "usage", {}).get("completion_tokens", 0) or 0)
+        metrics.success = True
+        return metrics
+    except Exception:
+        exc = sys.exc_info()
+        metrics.error = "".join(traceback.format_exception(*exc))
+        return metrics
 
 
 async def run_benchmark(
@@ -176,7 +104,7 @@ async def run_benchmark(
     max_tokens: int,
     skip_long: bool,
 ) -> None:
-    base_url = f"http://127.0.0.1:{port}"
+    client = openai.AsyncOpenAI(api_key="sk", base_url=f"http://127.0.0.1:{port}/v1")
     ds = ASRDataset(path=dataset, split=split, subset=subset, skip_long=skip_long)
     samples: List[ASRSample] = ds.iter_samples(limit=limit)
 
@@ -192,8 +120,8 @@ async def run_benchmark(
     async def process_one(sample: ASRSample) -> RequestMetrics:
         async with sem:
             url = wav_data_url(sample.audio, sample.sr)
-            return await stream_chat_with_audio(
-                base_url=base_url, audio_data_url=url, prompt=prompt, max_tokens=max_tokens
+            return await request_chat_completion(
+                client=client, audio_data_url=url, prompt=prompt, max_tokens=max_tokens
             )
 
     tasks = [process_one(s) for s in samples]
@@ -206,12 +134,8 @@ async def run_benchmark(
             ttfts.append(m.ttft)
             lats.append(m.latency)
 
-    if succ:
-        avg_ttft = sum(ttfts) / len(ttfts)
-        avg_lat = sum(lats) / len(lats)
-    else:
-        avg_ttft = 0.0
-        avg_lat = 0.0
+    avg_ttft = (sum(ttfts) / len(ttfts)) if ttfts else 0.0
+    avg_lat = (sum(lats) / len(lats)) if lats else 0.0
 
     print("\n=== ASR Benchmark Summary ===")
     print(f"Total: {len(samples)}, Success: {succ}, Fail: {len(samples) - succ}")
@@ -233,8 +157,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=128)
-    parser.add_argument("--skip-long", action=argparse.BooleanOptionalAction, default=True)
-    return parser.parse_args()
+    parser.add_argument("--skip-long", action="store_true", default=True)
+    from sglang.test.test_utils import add_common_sglang_args_and_parse
+    return add_common_sglang_args_and_parse(parser)
 
 
 def main() -> None:

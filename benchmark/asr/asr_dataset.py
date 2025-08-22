@@ -36,12 +36,14 @@ class ASRDataset:
         subset: Optional[str] = None,
         skip_long: bool = True,
         max_duration_s: float = 30.0,
+        verbose: bool = False,
     ) -> None:
         self.path = path
         self.split = split
         self.subset = subset
         self.skip_long = skip_long
         self.max_duration_s = max_duration_s
+        self.verbose = verbose
 
         # Lazy-loaded dataset
         self._data = None
@@ -104,10 +106,8 @@ class ASRDataset:
                     elif hasattr(audio, "__array__"):
                         y = np.asarray(audio)
 
-            except Exception as e:
-                # Skip problematic sample
-                import traceback
-                print(f"Warning. An audio sample failed to proccess, Error: {e}\n{traceback.format_exc()}")
+            except Exception:
+                # Skip problematic sample silently to match repo benchmark style
                 continue
 
             if y is None or sr <= 0:
@@ -134,6 +134,10 @@ class ASRDataset:
             results.append(ASRSample(audio=y, sr=sr, text=text))
             if limit is not None and len(results) >= limit:
                 break
-            if skipped > 0:
-                print(f"INFO: Skipped {skipped} samples longer than {self.max_duration_s}s.")
+
+        if self.verbose and skipped > 0:
+            # Report skipped count only when verbose is enabled
+            print(
+                f"Skipped {skipped} samples longer than {self.max_duration_s}s."
+            )
         return results
