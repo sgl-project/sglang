@@ -46,24 +46,7 @@ class BaseLayerWithLoRA(nn.Module):
         pass
 
 
-class EmbeddingLayerWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self,
-        base_layer: nn.Module,
-        lora_backend: BaseLoRABackend,
-    ) -> None:
-        super().__init__(base_layer, lora_backend)
-
-    def set_lora_info(self, *args):
-        pass
-
-    def _get_token_weight_indices(
-        self, input_: torch.Tensor, batch_info: LoRABatchInfo
-    ):
-        pass
-
-
-class VocabParallelEmbeddingWithLoRA(EmbeddingLayerWithLoRA):
+class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     """
     Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
 

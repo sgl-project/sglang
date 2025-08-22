@@ -24,7 +24,7 @@ class LoRAConfig:
         path: str,
     ) -> None:
         self.path = path
-        self.weights_dir = self._get_weights_dir()
+        self.weights_dir = self.get_weights_dir()
         self.hf_config = self.get_lora_config()
         self.added_tokens = self.get_added_tokens()
         self.target_modules = self.hf_config["target_modules"]
@@ -43,7 +43,7 @@ class LoRAConfig:
             len(self.added_tokens) if self.added_tokens is not None else 0
         )
 
-    def _get_weights_dir(self):
+    def get_weights_dir(self):
         if not os.path.isdir(self.path):
             return snapshot_download(self.path, allow_patterns=["*.json"])
         else:
