@@ -129,30 +129,12 @@ class TestIntelAMXAttnBackend(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
+    @intel_amx_benchmark(
+        extra_args=["--enable-torch-compile", "--torch-compile-max-bs", "4"],
+        min_throughput=40,
+    )
     def test_latency_torch_compile_cpu(self):
-        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-            DEFAULT_MLA_MODEL_NAME_FOR_TEST,
-            [
-                "--attention-backend",
-                "intel_amx",
-                "--mem-fraction-static",
-                "0.05",
-                "--disable-radix",
-                "--trust-remote-code",
-                "--batch-size",
-                "1",
-                "--enable-torch-compile",
-                "--torch-compile-max-bs",
-                "1",
-            ],
-        )
-
-        print(f"{prefill_latency=}")
-        print(f"{decode_throughput=}")
-        print(f"{decode_latency=}")
-
-        if is_in_ci():
-            self.assertGreater(decode_throughput, 10)
+        return DEFAULT_MODEL_NAME_FOR_TEST
 
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
