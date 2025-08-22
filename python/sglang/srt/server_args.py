@@ -2411,8 +2411,12 @@ def auto_choose_speculative_params(self: ServerArgs):
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
-    elif arch in ["DeepseekV3ForCausalLM", "DeepseekV2ForCausalLM"]:
-        # The default value for deepseek
+    elif arch in [
+        "DeepseekV3ForCausalLM",
+        "DeepseekV2ForCausalLM",
+        "GptOssForCausalLM",
+    ]:
+        # The default value for deepseek and gpt-oss
         return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
