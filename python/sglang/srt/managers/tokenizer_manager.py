@@ -1297,9 +1297,18 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         if not self.server_args.enable_pd_convert:
             return False, "PD role conversion is not enabled.", None
+        
+        def set_env_vars(env_vars: Optional[Dict[str, Any]]):
+            if env_vars:
+                for k, v in env_vars.items():
+                    if v is not None:
+                        os.environ[k] = v
+                    else:
+                        os.environ.pop(k, None)
 
-        if obj.check_idle:
-            req = obj
+        bootstrap_port = None
+        if obj.clean_connection_pool or obj.check_idle:
+            pass
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # start a bootstarp server first
             kv_bootstrap_server_class = get_kv_class(
@@ -1317,66 +1326,26 @@ class TokenizerManager:
             )
             self.server_args.disaggregation_bootstrap_port = bootstrap_port
             obj.bootstrap_port = bootstrap_port
-            req = obj
-            if obj.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE is not None:
-                os.environ["SGLANG_DISAGGREGATION_THREAD_POOL_SIZE"] = (
-                    obj.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE
-                )
-            else:
-                os.environ.pop("SGLANG_DISAGGREGATION_THREAD_POOL_SIZE", None)
-
-            if obj.SGLANG_DISAGGREGATION_QUEUE_SIZE is not None:
-                os.environ["SGLANG_DISAGGREGATION_QUEUE_SIZE"] = (
-                    obj.SGLANG_DISAGGREGATION_QUEUE_SIZE
-                )
-            else:
-                os.environ.pop("SGLANG_DISAGGREGATION_QUEUE_SIZE", None)
-
-            if obj.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT is not None:
-                os.environ["SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT"] = (
-                    obj.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
-                )
-            else:
-                os.environ.pop("SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", None)
-        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            req = obj
-            if obj.SGLANG_DISAGGREGATION_WAITING_TIMEOUT is not None:
-                os.environ["SGLANG_DISAGGREGATION_WAITING_TIMEOUT"] = (
-                    obj.SGLANG_DISAGGREGATION_WAITING_TIMEOUT
-                )
-            else:
-                os.environ.pop("SGLANG_DISAGGREGATION_WAITING_TIMEOUT", None)
-
-            if obj.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES is not None:
-                os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES"] = (
-                    obj.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES
-                )
-            else:
-                os.environ.pop("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES", None)
-
-            if obj.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL is not None:
-                os.environ["SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL"] = (
-                    obj.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL
-                )
-            else:
-                os.environ.pop("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", None)
-        else:
-            return False, "Not support converting disaggregation of 'null'", None
-
-        responses: List[ConvertDisaggregationRoleReqOutput] = (
-            await self.convert_pd_role_communicator(req)
-        )
-        if obj.check_idle:
-            return responses[0].success, responses[0].message, None
+            set_env_vars(obj.disaggregation_prefill_envs)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # stop the bootstrap server
             self.bootstrap_server.close()
             del self.bootstrap_server
+            set_env_vars(obj.disaggregation_decode_envs)
+        else:
+            return False, "Not support converting disaggregation of 'null'", None
+
+        responses: List[ConvertDisaggregationRoleReqOutput] = (
+            await self.convert_pd_role_communicator(obj)
+        )
+
+        if obj.clean_connection_pool or obj.check_idle:
+            pass
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disaggregation_mode = DisaggregationMode.DECODE
-            return responses[0].success, responses[0].message, None
         else:
             self.disaggregation_mode = DisaggregationMode.PREFILL
-            return responses[0].success, responses[0].message, bootstrap_port
+        return responses[0].success, responses[0].message, bootstrap_port
 
     async def get_load(self) -> dict:
         # TODO(lsyin): fake load report server

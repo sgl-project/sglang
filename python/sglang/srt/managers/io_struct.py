@@ -835,12 +835,24 @@ class UpdateWeightsFromDistributedReqOutput:
     message: str
 
 
+DISAGGREGATION_PREFILL_ENVS = [
+    "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE",
+    "SGLANG_DISAGGREGATION_QUEUE_SIZE",
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT",
+    "SGLANG_MOONCAKE_CUSTOM_MEM_POOL",
+]
+DISAGGREGATION_DECODE_ENVS = [
+    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT",
+    "SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES",
+    "SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL",
+]
+
 @dataclass
 class ConvertDisaggregationRoleReqInput:
     # the server url to convert
     server_url: str
     check_idle: bool = True
-
+    clean_connection_pool: Optional[str] = None
     # convert decode to prefill
     bootstrap_port: Optional[int] = None
     disaggregation_decode_tp: Optional[int] = None
@@ -855,27 +867,26 @@ class ConvertDisaggregationRoleReqInput:
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
-    # environ for prefill
-    SGLANG_DISAGGREGATION_THREAD_POOL_SIZE: Optional[int] = None
-    SGLANG_DISAGGREGATION_QUEUE_SIZE: Optional[int] = None
-    SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT: Optional[int] = None
-
     # convert prefill to decode
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = True  # default open cuda graph in decode
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
-    # environ for decode
-    SGLANG_DISAGGREGATION_WAITING_TIMEOUT: Optional[int] = None
-    SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES: Optional[int] = None
-    SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL: Optional[float] = None
+    # disaggregation envs
+    disaggregation_decode_envs: Optional[Dict[str, Any]] = field(
+        default_factory=lambda: {k: None for k in DISAGGREGATION_DECODE_ENVS}
+    )
+    disaggregation_prefill_envs: Optional[Dict[str, Any]] = field(
+        default_factory=lambda: {k: None for k in DISAGGREGATION_PREFILL_ENVS}
+    )
+
+
 
 
 @dataclass
 class ConvertDisaggregationRoleReqOutput:
     """Converse PD disaggregation identity"""
-
     success: bool
     message: str
 

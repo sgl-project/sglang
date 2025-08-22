@@ -893,9 +893,10 @@ class SchedulerDisaggregationPrefillMixin:
         model_runner.server_args = self.server_args
         if hasattr(self, "decode_cuda_graph_runner"):
             model_runner.cuda_graph_runner = self.decode_cuda_graph_runner
+            model_runner.cuda_graph_mem_usage = self.decode_cuda_graph_mem_usage
             del self.decode_cuda_graph_runner
         elif not self.server_args.disable_cuda_graph:
-            model_runner.init_device_graphs()
+            model_runner.init_cuda_graphs()
 
         max_num_reqs = self.req_to_token_pool.size
         pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0

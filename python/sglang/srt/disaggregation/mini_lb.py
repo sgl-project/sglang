@@ -72,8 +72,10 @@ class MiniLoadBalancer:
 
     def remove_prefill_server(self, prefill_url: str):
         index_to_remove = self.prefill_servers.index(prefill_url)
+        bootstrap_port = self.prefill_configs[index_to_remove].bootstrap_port
         del self.prefill_configs[index_to_remove]
         del self.prefill_servers[index_to_remove]
+        return bootstrap_port
 
     def remove_decode_server(self, decode_url: str):
         self.decode_servers.remove(decode_url)
@@ -430,7 +432,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
                 detail=f"Cannot convert {server_url} to decode, at least one prefill server is required.",
             )
         current_role = "prefill"
-        load_balancer.remove_prefill_server(server_url)
+        bootstrap_port=load_balancer.remove_prefill_server(server_url)
         logger.info(
             f"Stop sending req to {server_url}. Waiting for prefill to finish all reqs."
         )
@@ -474,10 +476,11 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
                 detail=f"Wait 100s for server: {server_url} to finish all reqs. "
                 f"May be caused by: 1. Server is stuck or shut down, 2. 60s is not enough for server to finish all reqs.",
             )
-
+    # flush cache
     async with aiohttp.ClientSession() as session:
         response = await session.post(f"{server_url}/flush_cache")
 
+    # check if P/D node is idle
     obj.check_idle = False
     async with aiohttp.ClientSession() as session:
         response = await session.post(
@@ -495,6 +498,18 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
                 detail=f"Can not receive server info from {server_url} in 10s, maybe role conversion failed.",
             )
 
+    # clean connection pool in decode server
+    if current_role == "prefill":
+        parsed_url = urllib.parse.urlparse(server_url)
+        hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
+        obj.clean_connection_pool = f"{hostname}:{bootstrap_port}"
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for decode_server in load_balancer.decode_servers:
+                tasks.append(session.post(f"{decode_server}/convert_pd_role", json=dataclasses.asdict(obj)))
+            for i, response in enumerate(asyncio.as_completed(tasks)):
+                await response
+
     finished_time = time.perf_counter()
     logger.info(
         f"Convert role finished in {(finished_time-start_time):.2f}s, response: {content}"
@@ -510,7 +525,6 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
             )
             logger.info(f"Converted decode server to prefill: {server_url}")
             logger.info(f"prefill server bootstrap port: {content['bootstrap_port']}")
-        await asyncio.sleep(5)
         return Response(status_code=200)
     else:
         raise HTTPException(

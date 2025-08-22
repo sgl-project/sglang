@@ -1132,11 +1132,11 @@ class MooncakeKVManager(BaseKVManager):
                     session.close()
                 self.session_pool.clear()
 
-        for kv_data_ptr in self.kv_args.kv_data_ptrs:
-            self.engine.deregister(kv_data_ptr)
+        if self.kv_args.kv_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
 
-        for aux_data_ptr in self.kv_args.aux_data_ptrs:
-            self.engine.deregister(aux_data_ptr)
+        if self.kv_args.aux_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
 
         del self.engine
         logger.info(

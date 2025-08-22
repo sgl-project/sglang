@@ -2471,6 +2471,17 @@ class Scheduler(
                     success=True,
                     message="this server is idle and can convert disaggregation role.",
                 )
+        
+        if recv_req.clean_connection_pool:
+            kv_manager = self.disagg_decode_prealloc_queue.kv_manager
+            kv_manager._handle_node_failure(recv_req.clean_connection_pool)
+            with kv_manager.session_pool_lock:
+                if recv_req.clean_connection_pool in kv_manager.session_pool:
+                    del kv_manager.session_pool[recv_req.clean_connection_pool]
+            return ConvertDisaggregationRoleReqOutput(
+                success=True,
+                message="clean connection pool successfully.",  
+            )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # disaggregation
