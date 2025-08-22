@@ -26,7 +26,12 @@ import aiohttp
 import numpy as np
 from tqdm import tqdm
 
-from .asr_dataset import ASRDataset, ASRSample
+try:
+    # When running as a script: python benchmark/asr/bench_sglang_asr.py
+    from asr_dataset import ASRDataset, ASRSample
+except Exception:  # pragma: no cover
+    # Fallback if executed differently
+    from benchmark.asr.asr_dataset import ASRDataset, ASRSample
 
 
 API_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
@@ -193,8 +198,7 @@ async def run_benchmark(
 
     tasks = [process_one(s) for s in samples]
     ttfts, lats, succ, outs = [], [], 0, []
-    pbar = tqdm(asyncio.as_completed(tasks), total=len(tasks))
-    async for fut in _aiter_futures(pbar):
+    for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
         m = await fut
         outs.append(m)
         if m.success:
@@ -218,11 +222,6 @@ async def run_benchmark(
     for i, m in enumerate(outs[: min(5, len(outs))]):
         status = "ok" if m.success else "fail"
         print(f"[{i}] {status} ttft={m.ttft:.3f}s lat={m.latency:.3f}s tokens={m.output_tokens}")
-
-
-async def _aiter_futures(pbar):
-    for fut in pbar:
-        yield fut
 
 
 def parse_args() -> argparse.Namespace:
@@ -256,4 +255,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
