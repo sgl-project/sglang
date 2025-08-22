@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import gc
 import logging
 import os
 import signal
@@ -26,7 +27,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
-import gc
+
 import psutil
 import setproctitle
 import torch
@@ -792,37 +793,47 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
-        
+
         # 初始化内存日志文件
-        if not hasattr(self, '_memory_log_file'):
+        if not hasattr(self, "_memory_log_file"):
             import datetime
+
             start_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             self._memory_log_filename = f"{start_time}_memory_log.txt"
-            self._memory_log_file = open(self._memory_log_filename, 'w')
-            self._memory_log_file.write("timestamp,memory_summary,memory_allocated,memory_reserved\n")
+            self._memory_log_file = open(self._memory_log_filename, "w")
+            self._memory_log_file.write(
+                "timestamp,memory_summary,memory_allocated,memory_reserved\n"
+            )
             self._memory_log_file.flush()
 
         while True:
             current_time = time.time()
-            if not hasattr(self, '_last_memory_log_time') or current_time - self._last_memory_log_time >= 1.0:
+            if (
+                not hasattr(self, "_last_memory_log_time")
+                or current_time - self._last_memory_log_time >= 1.0
+            ):
                 gc.collect()
                 torch.cuda.empty_cache()
-                
+
                 # 获取内存信息
-                memory_summary = torch.cuda.memory_summary(device=self.gpu_id, abbreviated=True)
+                memory_summary = torch.cuda.memory_summary(
+                    device=self.gpu_id, abbreviated=True
+                )
                 memory_allocated = torch.cuda.memory_allocated()
                 memory_reserved = torch.cuda.memory_reserved()
-                
+
                 # 记录时间戳
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                
+
                 # 写入日志文件
-                self._memory_log_file.write(f"{timestamp},\"{memory_summary.replace(',', ';')}\",{memory_allocated},{memory_reserved}\n")
+                self._memory_log_file.write(
+                    f"{timestamp},\"{memory_summary.replace(',', ';')}\",{memory_allocated},{memory_reserved}\n"
+                )
                 self._memory_log_file.flush()
-                
+
                 # 更新时间记录
                 self._last_memory_log_time = current_time
-                
+
                 # 同时打印到控制台（可选）
                 print(f"[{timestamp}] Memory allocated: {memory_allocated}")
                 print(f"[{timestamp}] Memory reserved: {memory_reserved}")
