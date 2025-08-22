@@ -593,16 +593,18 @@ class TestIntegrationScenarios(CustomTestCase):
         """Test streaming property: chunked parsing produces same semantic content as one-shot parsing."""
         full_text = (
             "<|channel|>analysis<|message|>reasoning content<|end|>"
-            "<|start|>assistant<|channel|>final<|message|>final content<|return|>"
+            "<|start|>assistant<|channel|>final<|message|>final content"
         )
 
         # One-shot parsing
         parser1 = HarmonyParser()
         events_oneshot = parser1.parse(full_text)
+        events_oneshot += parser1.parse("")
 
         # Chunked parsing
         parser2 = HarmonyParser()
-        chunks = [full_text[i : i + 10] for i in range(0, len(full_text), 10)]
+        chunks = ["<|channel|>","analysis", "<|message|>", "reasoning content", "<|end|>",
+                  "<|start|>assistant", "<|channel|>final", "<|message|>", "final ", "content"]
         events_chunked = []
         for chunk in chunks:
             events_chunked.extend(parser2.parse(chunk))
@@ -621,13 +623,10 @@ class TestIntegrationScenarios(CustomTestCase):
         normal_chunked = "".join(
             e.content for e in events_chunked if e.event_type == "normal"
         )
-
-        # Due to streaming behavior, content may be spread across multiple events
-        # but the combined content should contain the expected text
-        self.assertIn("reasoning content", reasoning_chunked)
-        self.assertIn(
-            "final content", normal_chunked or reasoning_chunked
-        )  # Final content might be in reasoning due to streaming
+        
+        self.assertEqual(reasoning_chunked, reasoning_oneshot)
+        self.assertEqual(normal_chunked, normal_oneshot)
+        
 
     def test_streaming_property_text(self):
         """Test streaming property for text format."""
