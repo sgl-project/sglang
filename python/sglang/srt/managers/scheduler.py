@@ -2432,7 +2432,7 @@ class Scheduler(
             obj = get_global_expert_distribution_recorder().dump_record(output_mode="object")
             return ExpertDistributionReqOutput(success=True, payload=obj)
         else:
-            raise ValueError("Unrecognized ExpertDistributionReq value")
+            raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
