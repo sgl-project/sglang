@@ -16,7 +16,7 @@ GPT‑OSS can call built‑in tools for web search and Python execution. You can
 
 - Executes short Python snippets for calculations, parsing, and quick scripts.
 - By default runs in a Docker-based sandbox. To run on the host, set `PYTHON_EXECUTION_BACKEND=UV` (this executes model-generated code locally; use with care).
-- Ensure Docker is available if you are not using the UV backend.
+- Ensure Docker is available if you are not using the UV backend. It is recommended to run `docker pull python:3.11` in advance.
 
 #### Web Search Tool
 
@@ -25,7 +25,7 @@ GPT‑OSS can call built‑in tools for web search and Python execution. You can
 
 ## Notes
 
-- Use Python 3.12 for the demo tools. Install the required `gpt-oss` packages.
+- Use **Python 3.12** for the demo tools. And install the required `gpt-oss` packages.
 - The default demo integrates the web search tool (Exa backend) and a demo Python interpreter via Docker.
 - For search, set `EXA_API_KEY`. For Python execution, either have Docker available or set `PYTHON_EXECUTION_BACKEND=UV`.
 
