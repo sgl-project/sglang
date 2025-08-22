@@ -573,9 +573,23 @@ class Llama4ForConditionalGeneration(nn.Module):
         loaded_weight: torch.Tensor,
     ) -> Tuple[str, torch.Tensor]:
 
-        def permute(w: torch.Tensor, n_heads: int):
+        def permute(w: torch.Tensor, n_heads: int, is_weight_scale: bool):
             attn_in = self.language_model.config.head_dim * n_heads
             attn_out = self.language_model.config.hidden_size
+
+            # If the weight is FP4 packed as uint8, we need to divide attn_out
+            # by 2.
+            if w.dtype == torch.uint8 and w.shape[1] * 2 == attn_out:
+                attn_out = attn_out // 2
+
+            # If the weight is a weight scale, we need to divide attn_out by
+            # block size, which is currently 16.
+            elif (
+                w.dtype == torch.float8_e4m3fn
+                and is_weight_scale
+                and w.shape[1] * 16 == attn_out
+            ):
+                attn_out = attn_out // 16
 
             return (
                 w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
@@ -585,19 +599,25 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         modules = name.split(".")
 
-        # rotary embeds should be sliced
-        if ("wk" in modules or "k_proj" in modules) and modules[-1] == "weight":
-            if _is_cpu:
-                dim = self.language_model.config.original_total_num_kv_heads
-            else:
-                dim = self.language_model.config.num_key_value_heads
-            loaded_weight = permute(loaded_weight, dim)
-        elif ("wq" in modules or "q_proj" in modules) and modules[-1] == "weight":
-            if _is_cpu:
-                dim = self.language_model.config.original_num_attention_heads
-            else:
-                dim = self.language_model.config.num_attention_heads
-            loaded_weight = permute(loaded_weight, dim)
+        # Permute Q/K weights and weight block scales for rotary embedding
+        is_weight = modules[-1] == "weight"
+        is_nvfp4_weight_scale = (
+            modules[-1] == "weight_scale" and loaded_weight.dtype == torch.float8_e4m3fn
+        )
+
+        if is_weight or is_nvfp4_weight_scale:
+            if "wk" in modules or "k_proj" in modules:
+                if _is_cpu:
+                    dim = self.language_model.config.original_total_num_kv_heads
+                else:
+                    dim = self.language_model.config.num_key_value_heads
+                loaded_weight = permute(loaded_weight, dim, is_nvfp4_weight_scale)
+            elif "wq" in modules or "q_proj" in modules:
+                if _is_cpu:
+                    dim = self.language_model.config.original_num_attention_heads
+                else:
+                    dim = self.language_model.config.num_attention_heads
+                loaded_weight = permute(loaded_weight, dim, is_nvfp4_weight_scale)
 
         return name, loaded_weight
 
@@ -841,6 +861,15 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         param = params_dict[transformed_name]
 
+        # Transpose if weight scales are FP8 block scales with
+        # three dimensions: [num_experts, hidden_in, hidden_out].
+        if (
+            name.endswith("weight_scale")
+            and loaded_weight.dtype == torch.float8_e4m3fn
+            and loaded_weight.ndim == 3
+        ):
+            loaded_weight = loaded_weight.transpose(-1, -2)
+
         # Handle scale parameters
         if expert_match:
             # If we have a specific expert ID, only load for that expert
@@ -848,10 +877,16 @@ class Llama4ForConditionalGeneration(nn.Module):
             # For scale parameters, we can directly set the value
             param.data[expert_id] = loaded_weight
         else:
-            # No expert ID found - this is a single scale for all experts
-            # Load the same scale for all experts
-            for expert_id in range(num_experts):
-                param.data[expert_id] = loaded_weight
+            # No expert ID found - check if loaded_weight is fused (contains all experts)
+            if loaded_weight.dim() == 3 and loaded_weight.shape[0] == num_experts:
+                # Fused case: loaded_weight has shape [num_experts, ...]
+                # Load each expert's scale from the fused tensor
+                for expert_id in range(num_experts):
+                    param.data[expert_id] = loaded_weight[expert_id]
+            else:
+                # Single scale for all experts case
+                for expert_id in range(num_experts):
+                    param.data[expert_id] = loaded_weight
         loaded_params.add(transformed_name)
 
         return True
@@ -903,6 +938,17 @@ class Llama4ForConditionalGeneration(nn.Module):
                     weight_loader(
                         param,
                         weight_chunk.T,
+                        param_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+            elif weight_chunk.dim() == 3 and weight_chunk.shape[0] == num_experts:
+                # Fused case: weight_chunk has shape [num_experts, hidden_in, hidden_out]
+                # Load each expert's weights from the fused tensor
+                for expert_id in range(num_experts):
+                    weight_loader(
+                        param,
+                        weight_chunk[expert_id].T,
                         param_name,
                         shard_id=shard_id,
                         expert_id=expert_id,
