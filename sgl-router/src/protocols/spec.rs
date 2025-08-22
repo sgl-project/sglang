@@ -1297,9 +1297,9 @@ impl ResponsesResponse {
             usage,
             parallel_tool_calls: request.parallel_tool_calls,
             tool_choice: match &request.tool_choice {
-                ToolChoice::Auto => "auto".to_string(),
-                ToolChoice::Required => "required".to_string(),
-                ToolChoice::None => "none".to_string(),
+                ToolChoice::Value(ToolChoiceValue::Auto) => "auto".to_string(),
+                ToolChoice::Value(ToolChoiceValue::Required) => "required".to_string(),
+                ToolChoice::Value(ToolChoiceValue::None) => "none".to_string(),
                 ToolChoice::Function { .. } => "function".to_string(),
             },
             tools: request.tools.clone(),
@@ -1498,16 +1498,20 @@ pub struct StreamOptions {
 
 // ============= Tool Choice Types =============
 
+/// Tool choice value for simple string options
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceValue {
+    Auto,
+    Required,
+    None,
+}
+
 /// Tool choice for both Chat Completion and Responses APIs
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ToolChoice {
-    #[serde(rename = "auto")]
-    Auto,
-    #[serde(rename = "required")]
-    Required,
-    #[serde(rename = "none")]
-    None,
+    Value(ToolChoiceValue),
     Function {
         #[serde(rename = "type")]
         tool_type: String, // "function"
@@ -1517,7 +1521,7 @@ pub enum ToolChoice {
 
 impl Default for ToolChoice {
     fn default() -> Self {
-        Self::Auto
+        Self::Value(ToolChoiceValue::Auto)
     }
 }
 

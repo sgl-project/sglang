@@ -2,7 +2,7 @@
 
 use sglang_router_rs::protocols::spec::{
     GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus,
-    ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
+    ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice, ToolChoiceValue,
     Truncation, UsageInfo,
 };
 
@@ -26,7 +26,7 @@ fn test_responses_request_creation() {
         store: true,
         stream: false,
         temperature: Some(0.7),
-        tool_choice: ToolChoice::Auto,
+        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
         tools: vec![ResponseTool {
             r#type: ResponseToolType::WebSearchPreview,
         }],
@@ -69,7 +69,7 @@ fn test_sampling_params_conversion() {
         store: true, // Use default true
         stream: false,
         temperature: Some(0.8),
-        tool_choice: ToolChoice::Auto,
+        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
         tools: vec![],
         top_logprobs: 0, // Use default 0
         top_p: Some(0.95),
@@ -179,7 +179,7 @@ fn test_json_serialization() {
         store: false,
         stream: true,
         temperature: Some(0.9),
-        tool_choice: ToolChoice::Required,
+        tool_choice: ToolChoice::Value(ToolChoiceValue::Required),
         tools: vec![ResponseTool {
             r#type: ResponseToolType::CodeInterpreter,
         }],
