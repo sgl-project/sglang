@@ -420,8 +420,10 @@ class LoRAManager:
     ):
         """Infer LoRA target modules and max_lora_rank from loaded adapters if not provided."""
 
-        self.target_modules = get_normalized_target_modules(target_modules) if target_modules else set()
-        
+        self.target_modules = (
+            get_normalized_target_modules(target_modules) if target_modules else set()
+        )
+
         for lora_id, config in self.configs.items():
             if not isinstance(config.target_modules, list):
                 raise ValueError(
@@ -438,9 +440,7 @@ class LoRAManager:
             if target_modules is not None:
                 # When `--lora-target-modules` is provided, validate adapter target modules is a subset of the specified target modules.
                 if not adapter_target_modules.issubset(self.target_modules):
-                    unsupported_modules = (
-                        adapter_target_modules - self.target_modules
-                    )
+                    unsupported_modules = adapter_target_modules - self.target_modules
                     lora_name = self.lora_refs[lora_id].lora_name
                     raise ValueError(
                         f"LoRA adapter '{lora_name}' contains target modules {sorted(unsupported_modules)} "
