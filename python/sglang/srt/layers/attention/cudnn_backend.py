@@ -111,6 +111,9 @@ class CuDNNBackend(AttentionBackend):
             device="cuda",
         )
 
+        assert model_runner.page_size == 1, "CuDNNBackend only support page_size = 1 for now"
+        print(f"CuDNN Backend Token Pool type: {type(model_runner.token_to_kv_pool)}")
+
     def _create_cudnn_graph(
         self,
         batch_size: int,
@@ -506,6 +509,7 @@ class CuDNNBackend(AttentionBackend):
         save_kv_cache=True,
     ):
 
+        
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
@@ -666,16 +670,17 @@ class CuDNNBackend(AttentionBackend):
         k,
         v,
         layer,
-        forward_batch,
+        forward_batch:ForwardBatch,
         save_kv_cache=True,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         #q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
+        assert forward_batch.token_to_kv_pool.page_size == 1 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
             )
 
 
@@ -703,15 +708,14 @@ class CuDNNBackend(AttentionBackend):
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
 
-        # heads, tokens, head size
-        # The tokens of queries are indexed by req_to_token
-        s, h, d = k_cache.shape
+        # shape of k cache is kv_index, head, head_dim 
+        max_token, k_heads, k_dim = k_cache.shape
         # Block Size of Paged Cache, 1 since only one token per block
         b = 1
         # get the kv cache with request id
         # container: num_blocks, num heads, tokens_per_block, dim
-        container_k_gpu = k_cache.view(s, h, b, d)
-        container_v_gpu = v_cache.view(s, h, b, d)
+        container_k_gpu = k_cache.view(max_token, k_heads, b, k_dim)
+        container_v_gpu = v_cache.view(max_token, k_heads, b, k_dim)
 
 
         seq_lens_kv = seq_lens.view(seq_lens.shape[0], 1, 1, 1)
@@ -745,6 +749,10 @@ class CuDNNBackend(AttentionBackend):
             cudnn_decode_graph.get_workspace_size(), device="cuda", dtype=torch.uint8
         )
         cudnn_decode_graph.execute(variant_pack, workspace)
-
         output_head_concat = output.view(output.shape[0], -1).contiguous()
+
         return output_head_concat
+
+    def support_triton(self):
+        """Check if the current backend supports triton."""
+        return False
