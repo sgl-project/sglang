@@ -23,8 +23,10 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import random
 import signal
 import threading
+import time
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
@@ -653,6 +655,11 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
     # flashinfer uses this environment variable for various kernels from MoE to quant kernels
     os.environ["TRTLLM_ENABLE_PDL"] = "1"
+
+    # Can also be passed as argument
+    os.environ["SGLANG_RUN_ID"] = (
+        f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
+    )
 
     # Set prometheus env vars
     if server_args.enable_metrics:
