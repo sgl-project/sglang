@@ -50,7 +50,7 @@ Add [performance optimization options](#performance-optimization-options) as nee
 - [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models): For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
 - [Torch.compile Optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#torchcompile-latency-optimizations): Add `--enable-torch-compile` argument to enable it. This will take some time while server starts. The maximum batch size for torch.compile optimization can be controlled with `--torch-compile-max-bs`. It's recommended to set it between `1` and `8`. (e.g., `--torch-compile-max-bs 8`)
 
-### Usage: Chat with DeepSeek 
+### Usage: Chat with DeepSeek
 
 #### DeepSeek V3/R1
 
@@ -75,7 +75,7 @@ print(response)
 #### DeepSeek V3.1
 On top of the basic usage similar to the DeepSeek V3/R1 example, DeepSeek V3.1 supports a request-level thinking/non-thinking toggle. Simply switch the `"thinking"` field in `extra_body={"chat_template_kwargs": {"thinking": True}}` to enable/disable the thinking mode.
 
-##### Non Thinking 
+##### Non Thinking
 ```python3
 import openai
 client = openai.Client(
