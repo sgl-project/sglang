@@ -123,18 +123,19 @@ from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    configure_gc_warning,
     dataclass_to_string_truncated,
+    freeze_gc,
     get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
-    freeze_gc,
-    configure_gc_warning,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
+
 
 @dataclasses.dataclass
 class ReqState:
@@ -452,7 +453,10 @@ class TokenizerManager:
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
-                (FreezeGCReq, lambda x: None), # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
+                (
+                    FreezeGCReq,
+                    lambda x: None,
+                ),  # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
@@ -1371,7 +1375,6 @@ class TokenizerManager:
         self.send_to_scheduler.send_pyobj(FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
-        
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.

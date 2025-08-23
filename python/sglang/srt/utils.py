@@ -2540,13 +2540,15 @@ def dynamic_import(func_path: str):
     func = getattr(module, func_name)
     return func
 
-def gc_object_counts(): 
+
+def gc_object_counts():
     import gc
 
     g0 = len(gc.get_objects(0))
     g1 = len(gc.get_objects(1))
     g2 = len(gc.get_objects(2))
     return g0, g1, g2
+
 
 def configure_gc_warning(warn_threshold_secs):
     import gc
@@ -2568,16 +2570,20 @@ def configure_gc_warning(warn_threshold_secs):
 
     gc.callbacks.append(gc_callback)
 
+
 def freeze_gc(context: str):
     import gc
 
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
-    logger.info(f"Freezing GC in {context} process. "
-                f"gen0: {g0_before}->{g0_after}, "
-                f"gen1: {g1_before}->{g1_after}, "
-                f"gen2: {g2_before}->{g2_after}")
+    logger.info(
+        f"Freezing GC in {context} process. "
+        f"gen0: {g0_before}->{g0_after}, "
+        f"gen1: {g1_before}->{g1_after}, "
+        f"gen2: {g2_before}->{g2_after}"
+    )
+
 
 def configure_gc_logger():
     logger.info("Enable GC Logger")
