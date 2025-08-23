@@ -525,7 +525,7 @@ class ForwardBatch:
                 extend_seq_len = batch.extend_seq_lens[batch_idx]
                 extend_lens.append(extend_seq_len)
                 mrope_delta = (
-                    torch.tensor([0], dtype=torch.int64)
+                    torch.zeros(1, dtype=torch.int64)
                     if mm_inputs[batch_idx] is None
                     else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
                 )
