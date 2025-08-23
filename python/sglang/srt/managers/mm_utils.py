@@ -375,7 +375,6 @@ def _get_chunked_prefill_embedding(
     items_offset_list: List[List[Tuple[int, int]]],
 ) -> Optional[torch.Tensor]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
-    embedding_list = []
 
     merge = get_bool_env_var("merge")
     print_info_once(f"{merge=}")
