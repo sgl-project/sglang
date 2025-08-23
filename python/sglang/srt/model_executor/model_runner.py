@@ -1550,6 +1550,12 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif backend_str == "cudnn":
+            from sglang.srt.layers.attention.cudnn_backend import (
+                CuDNNBackend,
+            )
+            
+            return CuDNNBackend(self)
         elif backend_str == "trtllm_mla":
             if not self.use_mla_backend:
                 raise ValueError("trtllm_mla backend can only be used with MLA models.")

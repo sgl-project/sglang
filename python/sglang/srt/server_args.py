@@ -1354,6 +1354,7 @@ class ServerArgs:
             "flashmla",
             "trtllm_mla",
             "trtllm_mha",
+            "cudnn",
             "dual_chunk_flash_attn",
             # AMD specific
             "aiter",
