@@ -1264,12 +1264,9 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
-            print("0000")
-
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if recv_req.bootstrap_room is None:
-                    print("1111")
 
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
