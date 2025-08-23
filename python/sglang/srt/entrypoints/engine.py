@@ -536,6 +536,22 @@ class Engine(EngineBase):
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
 
+    def freeze_gc(self):
+        """
+        To maintain a high performance server with low latency, we want to reduce the
+        stalls caused by the garbage collector scanning through a large number of objects.
+
+        It is usually helpful to start the server and warm it up with real requests to
+        initialize many of the long-lived objects that do not need to be garbage collected.
+
+        After sufficient warmup, we can call this function to freeze the garbage collector
+        so that all objects created before this point are considered out of scope for garbage
+        collection.
+        """
+
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.freeze_gc())
+
     """
     Execute an RPC call on all scheduler processes.
     """
