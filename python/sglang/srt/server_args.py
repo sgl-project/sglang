@@ -1273,15 +1273,8 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-token-map",
             type=str,
-                    help="The path of the draft model's small vocab table.",
-        default=ServerArgs.speculative_token_map,
-        )
-        parser.add_argument(
-            "--log-cold-token-prob",
-            action="store_true",
-            default=ServerArgs.log_cold_token_prob,
-            help="Log the sum of probabilities for cold tokens. "
-            "This is for debugging and requires --speculative-token-map.",
+            help="The path of the draft model's small vocab table.",
+            default=ServerArgs.speculative_token_map,
         )
         # Expert parallelism
         parser.add_argument(

@@ -17,4 +17,3 @@ python3 -m sglang.bench_offline_throughput \
   --dtype float16 \
   --log-level info \
   --disable-cuda-graph \
-  --log-cold-token-prob
