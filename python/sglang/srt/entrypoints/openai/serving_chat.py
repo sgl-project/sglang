@@ -207,6 +207,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_data,
                 modalities,
             )
+
+            # per the Transformers docs & maintainers, tool call arguments in
+            # assistant-role messages with tool_calls need to be dicts not JSON str -
+            # this is how tool-use chat templates will expect them moving forwards
+            # so, for messages that have tool_calls, parse the string (which we get
+            # from openAI format) to dict
+            if (
+                processed_msg["role"] == "assistant"
+                and "tool_calls" in processed_msg
+                and isinstance(processed_msg["tool_calls"], list)
+            ):
+                for item in processed_msg["tool_calls"]:
+                    if "arguments" in item["function"] and isinstance(
+                        item["function"]["arguments"], str
+                    ):
+                        item["function"]["arguments"] = json.loads(
+                            item["function"]["arguments"]
+                        )
+
             openai_compatible_messages.append(processed_msg)
 
         # Handle assistant prefix for continue_final_message
