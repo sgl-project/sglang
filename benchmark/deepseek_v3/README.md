@@ -75,7 +75,7 @@ print(response)
 #### DeepSeek V3.1
 On top of the basic usage similar with the DeepSeek V3/R1 example, DeepSeek V3.1 support request level thinking/non-thinking toggle, simply switch the `"thinking"` fields in `extra_body={"chat_template_kwargs": {"thinking": True}}` to leash/unleash the thinking mode. 
 
-##### Thinking 
+##### Non Thinking 
 ```python3
 import openai
 client = openai.Client(
@@ -86,15 +86,20 @@ response = client.chat.completions.create(
     model="default",
     messages=[
         {"role": "system", "content": "You are a helpful AI assistant"},
-        {"role": "user", "content": "How many 'r' are there in straberry?"},
+        {"role": "user", "content": "Answer the following with the second letter of the correct answer only: What is the capital of France?"},
     ],
     temperature=0,
-    max_tokens=64,
+    max_tokens=1024,
     extra_body = {"chat_template_kwargs": {"thinking": False}}
 )
-print(response)
+print(response.choices[0].message.content)
 ```
-##### Non Thinking
+Answer:
+```
+h
+```
+* The correct reponse should be A, as the questions correct answer should be Paris
+##### Thinking
 ```python3
 import openai
 client = openai.Client(
@@ -105,14 +110,43 @@ response = client.chat.completions.create(
     model="default",
     messages=[
         {"role": "system", "content": "You are a helpful AI assistant"},
-        {"role": "user", "content": "How many 'r' are there in straberry?"},
+        {"role": "user", "content": "Answer the following with the second letter of the correct answer only: What is the capital of France?"},
     ],
     temperature=0,
-    max_tokens=64,
+    max_tokens=1024,
     extra_body = {"chat_template_kwargs": {"thinking": True}}
 )
 print(response)
 ```
+Answer:
+```
+First, the question is: "What is the capital of France?" I know that the capital of France is Paris.
+
+The user says: "Answer the following with the second letter of the correct answer only." So, I need to provide only the second letter of the correct answer.
+
+The correct answer is "Paris". Now, I need to find the second letter of "Paris".
+
+Let's spell it out: P-A-R-I-S.
+
+- First letter: P
+
+- Second letter: A
+
+- Third letter: R
+
+- Fourth letter: I
+
+- Fifth letter: S
+
+So, the second letter is "A".
+
+I should only output the second letter, which is "A". No additional text or explanation, just the letter.
+
+The user emphasized "the second letter of the correct answer only", so my response should be just "A".
+
+Finally, I need to make sure that this is the correct answer. Yes, Paris is indeed the capital of France.</think>A
+```
+* The response contains `</think>` thinking trace and model was able to derive the correct anwser from it.
 
 ### Example: Serving with two H20\*8 nodes
 
