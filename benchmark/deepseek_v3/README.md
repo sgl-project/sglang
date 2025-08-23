@@ -73,7 +73,7 @@ print(response)
 ```
 
 #### DeepSeek V3.1
-On top of the basic usage similar with the DeepSeek V3/R1 example, DeepSeek V3.1 support request level thinking/non-thinking toggle, simply switch the `"thinking"` fields in `extra_body={"chat_template_kwargs": {"thinking": True}}` to leash/unleash the thinking mode. 
+On top of the basic usage similar to the DeepSeek V3/R1 example, DeepSeek V3.1 supports a request-level thinking/non-thinking toggle. Simply switch the `"thinking"` field in `extra_body={"chat_template_kwargs": {"thinking": True}}` to enable/disable the thinking mode.
 
 ##### Non Thinking 
 ```python3
