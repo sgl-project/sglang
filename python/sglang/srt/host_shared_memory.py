@@ -8,7 +8,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from sglang.srt.naive_distributed import get_naive_distributed
+from sglang.srt.distributed.naive_distributed import get_naive_distributed
 from sglang.srt.utils import check_cuda_result
 
 logger = logging.getLogger(__name__)

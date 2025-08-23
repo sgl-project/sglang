@@ -12,7 +12,7 @@ from sglang.srt.host_shared_memory import (
     set_host_shared_memory_manager,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
-from sglang.srt.naive_distributed import (
+from sglang.srt.distributed.naive_distributed import (
     NaiveDistributed,
     get_naive_distributed,
     set_naive_distributed,
