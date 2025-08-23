@@ -853,8 +853,8 @@ class Llama4ForConditionalGeneration(nn.Module):
         # Check if this matches the expert parameter pattern: experts.{expert_id}.{param_name}
         expert_match = re.search(r"experts\.(\d+)\.", name)
 
-        # Transform name
-        transformed_name, _, _ = self._transform_expert_name(name)
+        # Transform name to get the proper shard_id
+        transformed_name, shard_id, shard_id_list = self._transform_expert_name(name)
 
         if transformed_name not in params_dict:
             return True
@@ -870,23 +870,71 @@ class Llama4ForConditionalGeneration(nn.Module):
         ):
             loaded_weight = loaded_weight.transpose(-1, -2)
 
-        # Handle scale parameters
+        # Handle scale parameters using weight_loader to properly handle sharding
         if expert_match:
             # If we have a specific expert ID, only load for that expert
             expert_id = int(expert_match.group(1))
-            # For scale parameters, we can directly set the value
-            param.data[expert_id] = loaded_weight
+            # For fused gate_up_proj (w13), we need to handle w1 and w3 separately
+            if shard_id == "w13":
+                # Load the same scale for both w1 and w3 shards
+                for individual_shard_id in shard_id_list:
+                    param.weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=individual_shard_id,
+                        expert_id=expert_id,
+                    )
+            else:
+                # Use weight_loader to handle tensor parallel sharding properly
+                param.weight_loader(
+                    param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id
+                )
         else:
             # No expert ID found - check if loaded_weight is fused (contains all experts)
             if loaded_weight.dim() == 3 and loaded_weight.shape[0] == num_experts:
                 # Fused case: loaded_weight has shape [num_experts, ...]
                 # Load each expert's scale from the fused tensor
                 for expert_id in range(num_experts):
-                    param.data[expert_id] = loaded_weight[expert_id]
+                    if shard_id == "w13":
+                        # Load the same scale for both w1 and w3 shards
+                        for individual_shard_id in shard_id_list:
+                            param.weight_loader(
+                                param,
+                                loaded_weight[expert_id],
+                                name,
+                                shard_id=individual_shard_id,
+                                expert_id=expert_id,
+                            )
+                    else:
+                        param.weight_loader(
+                            param,
+                            loaded_weight[expert_id],
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
             else:
                 # Single scale for all experts case
                 for expert_id in range(num_experts):
-                    param.data[expert_id] = loaded_weight
+                    if shard_id == "w13":
+                        # Load the same scale for both w1 and w3 shards
+                        for individual_shard_id in shard_id_list:
+                            param.weight_loader(
+                                param,
+                                loaded_weight,
+                                name,
+                                shard_id=individual_shard_id,
+                                expert_id=expert_id,
+                            )
+                    else:
+                        param.weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
         loaded_params.add(transformed_name)
 
         return True
@@ -916,9 +964,22 @@ class Llama4ForConditionalGeneration(nn.Module):
             name, is_weight=True
         )
 
+        # Check if weights are fused (all experts in single tensor)
+        fused = loaded_weight.dim() == 3 and loaded_weight.shape[0] == num_experts
+
+        # Handle different weight types differently
         if ".gate_up_proj" in name:
-            loaded_weight_list = loaded_weight.chunk(2, dim=-1)
+            # gate_up_proj weights may need transpose if stored as [num_experts, hidden_size, 2*intermediate_size]
+            if fused:
+                # Transpose to get [num_experts, 2*intermediate_size, hidden_size] for chunking
+                loaded_weight = loaded_weight.transpose(-1, -2)
+            # Split along the 2*intermediate_size dimension (dim -2 works for both 2D and 3D cases)
+            loaded_weight_list = loaded_weight.chunk(2, dim=-2)
         else:  # down_proj
+            # down_proj weights may also need transpose if stored as [num_experts, hidden_size, intermediate_size]
+            if fused:
+                # Transpose to get [num_experts, intermediate_size, hidden_size]
+                loaded_weight = loaded_weight.transpose(-1, -2)
             loaded_weight_list = [loaded_weight]
 
         for param_name, weight_chunk, shard_id in zip(
@@ -937,18 +998,18 @@ class Llama4ForConditionalGeneration(nn.Module):
                 for expert_id in range(num_experts):
                     weight_loader(
                         param,
-                        weight_chunk.T,
+                        weight_chunk,
                         param_name,
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
             elif weight_chunk.dim() == 3 and weight_chunk.shape[0] == num_experts:
-                # Fused case: weight_chunk has shape [num_experts, hidden_in, hidden_out]
+                # Fused case: extract individual expert weights
                 # Load each expert's weights from the fused tensor
                 for expert_id in range(num_experts):
                     weight_loader(
                         param,
-                        weight_chunk[expert_id].T,
+                        weight_chunk[expert_id],
                         param_name,
                         shard_id=shard_id,
                         expert_id=expert_id,
@@ -958,7 +1019,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                 for expert_id in range(num_experts):
                     weight_loader(
                         param,
-                        weight_chunk[expert_id].T,
+                        weight_chunk[expert_id],
                         param_name,
                         shard_id=shard_id,
                         expert_id=expert_id,
