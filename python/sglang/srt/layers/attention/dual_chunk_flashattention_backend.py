@@ -1537,8 +1537,6 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     query_inter,
                     key_cache,
                     value_cache,
-                    # Pass the full preallocated page table to keep shapes static for CUDA graphs.
-                    # The effective sequence length is still controlled by cache_seqlens.
                     block_table,
                     decode_meta.seq_lens_inter,
                     softmax_scale,
