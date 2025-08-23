@@ -180,7 +180,7 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
-        self.is_vision_understanding_model = enable_multimodal and hasattr(
+        self.is_image_understanding_model = enable_multimodal and hasattr(
             self.hf_config, "vision_config"
         )
         self.is_audio_understanding_model = enable_multimodal and hasattr(
