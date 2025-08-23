@@ -20,7 +20,12 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import flatten_nested_list, get_bool_env_var, print_warning_once
+from sglang.srt.utils import (
+    flatten_nested_list,
+    get_bool_env_var,
+    print_info_once,
+    print_warning_once,
+)
 from sglang.utils import logger
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
@@ -373,32 +378,40 @@ def _get_chunked_prefill_embedding(
     embedding_list = []
 
     merge = get_bool_env_var("merge")
-    print_warning_once(f"{merge=}")
+    print_info_once(f"{merge=}")
     embedding_list = []
 
     if merge:
         # Step 1: Identify cached and uncached embeddings for all requests
-        embeddings_per_req_map: Dict[int, torch.Tensor] = {}
-        uncached_requests = []
         items_to_compute = embedding_items
-        can_merge_process = True
         embedding_items_hash = get_embedding_hash(items_to_compute)
         merged_embeddings = data_embedding_func(items_to_compute)
         embedding_cache.put(embedding_items_hash, merged_embeddings)
 
-        flattened_items_offset_list = flatten_nested_list(items_offset_list)
-
-        print(f"{flattened_items_offset_list=}")
+        # flattened_items_offset_list = flatten_nested_list(items_offset_list)
 
         # Step 4: Extract chunks for each request if merge process was successful
-        embedding_per_req_chunk, _, _ = get_embedding_chunk(
-            embedding=merged_embeddings,
-            extend_prefix_len=prefix_length[0],
-            extend_seq_len=extend_length[0],
-            items_offset=flattened_items_offset_list,
-        )
-
-        embedding_list.append(embedding_per_req_chunk)
+        max_iterations = min(len(items_count) - 1, len(prefix_length))
+        start_idx, end_idx = None, None
+        accu_token_count = 0
+        for i in range(max_iterations):
+            items_offset_per_req = items_offset_list[i][0]
+            extend_prefix_len = prefix_length[i]
+            # extend_seq_len = extend_length[i]
+            # items_offset = flattened_items_offset_list
+            item_start_offset, item_end_offset = items_offset_per_req
+            if extend_prefix_len < item_end_offset:
+                if start_idx is None:
+                    start_idx = accu_token_count + max(
+                        extend_prefix_len - item_start_offset, 0
+                    )
+                end_idx = accu_token_count + (item_end_offset - extend_prefix_len)
+            accu_token_count += item_end_offset - item_start_offset + 1
+        if start_idx is None or end_idx is None or start_idx >= end_idx:
+            pass
+        else:
+            appeared_embedding_slice = merged_embeddings[start_idx : end_idx + 1]
+            embedding_list.append(appeared_embedding_slice)
     else:
         # NOTE: This is the original logic, now serving as a fallback.
         # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
@@ -591,9 +604,11 @@ def embed_mm_inputs(
                     if item.is_modality(modality=modality)
                 ]
                 items_size[i + 1] = len(mm_items)
-                items_offsets.append(
-                    flatten_nested_list([item.offsets for item in mm_items])
+                items_offsets_per_req_per_modality = flatten_nested_list(
+                    [item.offsets for item in mm_items]
                 )
+                assert len(items_offsets_per_req_per_modality) == 1
+                items_offsets.append(items_offsets_per_req_per_modality)
             items_size = torch.cumsum(items_size, dim=0).tolist()
 
             embedding, mask = get_embedding_and_mask(
