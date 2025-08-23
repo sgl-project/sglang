@@ -505,7 +505,6 @@ class ServerArgs:
                 "Mixed chunk, radix cache, and cuda graphs are disabled because of using dual chunk flash attention backend"
             )
             self.enable_mixed_chunk = False
-            self.disable_cuda_graph = True
             self.disable_radix_cache = True
 
         # Set page size
