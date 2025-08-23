@@ -146,7 +146,7 @@ The user emphasized "the second letter of the correct answer only", so my respon
 
 Finally, I need to make sure that this is the correct answer. Yes, Paris is indeed the capital of France.</think>A
 ```
-* The response contains `</think>` thinking trace and model was able to derive the correct anwser from it.
+* The response contains `</think>` thinking trace and model was able to derive the correct answer from it.
 
 ### Example: Serving with two H20\*8 nodes
 
