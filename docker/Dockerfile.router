@@ -39,13 +39,13 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 # install dependencies
 RUN apt update -y \
-    && apt install -y git build-essential libssl-dev pkg-config \
+    && apt install -y git build-essential libssl-dev pkg-config protobuf-compiler \
     && rm -rf /var/lib/apt/lists/* \
     && apt clean
 
 # install rustup from rustup.rs
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustc --version && cargo --version
+    && rustc --version && cargo --version && protoc --version
 
 # pull the github repository
 RUN cd /opt \
