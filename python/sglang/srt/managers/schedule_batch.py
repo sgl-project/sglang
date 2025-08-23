@@ -1200,6 +1200,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
+                # No need to consider radix cache and chunked prefill,
+                # because when a user sends input_embeds, radix cache and chunked prefill
+                # are already required to be disabled in tokenizer_manager.
+                # See the _tokenize_one_request method in TokenizerManager for details.
+
             multimodal_inputs.append(req.multimodal_inputs)
 
             req.cached_tokens += pre_len - req.already_computed
