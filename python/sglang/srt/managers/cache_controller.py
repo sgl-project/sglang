@@ -269,7 +269,6 @@ class HiCacheController:
                     HiCacheHF3FS,
                 )
 
-                rank = get_tensor_model_parallel_rank()
                 if self.mem_pool_host.layout == "page_first":
                     bytes_per_page = (
                         mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
@@ -280,7 +279,7 @@ class HiCacheController:
                     )
                 dtype = mem_pool_host.dtype
                 self.storage_backend = HiCacheHF3FS.from_env_config(
-                    rank, bytes_per_page, dtype
+                    bytes_per_page, dtype
                 )
                 self.get_hash_str = get_hash_str
             else:

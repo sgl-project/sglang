@@ -59,7 +59,7 @@ def test():
         raise RuntimeError(f"Failed to dump config to {config_path}: {str(e)}")
 
     rank = 0
-    hicache_hf3fs = HiCacheHF3FS.from_env_config(rank, bytes_per_page, dtype)
+    hicache_hf3fs = HiCacheHF3FS.from_env_config(bytes_per_page, dtype, rank)
 
     numel = 2 * tokens_per_page * layer_num * head_num * head_dim
     assert numel * dtype.itemsize == bytes_per_page
