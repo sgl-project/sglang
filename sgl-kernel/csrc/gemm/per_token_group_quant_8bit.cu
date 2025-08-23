@@ -30,9 +30,13 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
 }
 
 __device__ __forceinline__ float silu(const float& val) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   float half = 0.5f * val;
   float t = __tanhf(half);
   return half * (1.0f + t);
+#else
+  return val / (1.0f + __expf(-val));
+#endif
 }
 
 __device__ float2 fmul2_rn(float2 a, float2 b) {
