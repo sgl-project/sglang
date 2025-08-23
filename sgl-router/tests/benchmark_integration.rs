@@ -5,13 +5,9 @@
 
 use serde_json::{from_str, to_string, to_value};
 use sglang_router_rs::core::{BasicWorker, WorkerType};
-use sglang_router_rs::protocols::{
-    common::StringOrArray,
-    generate::{GenerateParameters, GenerateRequest, SamplingParams},
-    openai::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
-        completions::CompletionRequest,
-    },
+use sglang_router_rs::protocols::spec::{
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
+    SamplingParams, StringOrArray, UserMessageContent,
 };
 
 /// Create a default GenerateRequest for benchmarks with minimal fields set
