@@ -123,6 +123,7 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
+    gc_warning_threshold_secs: float = 0.0
 
     # API related
     api_key: Optional[str] = None
@@ -1171,6 +1172,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.collect_tokens_histogram,
             help="Collect prompt/generation tokens histogram.",
+        )
+        parser.add_argument(
+            "--gc-warning-threshold-secs",
+            type=float,
+            default=ServerArgs.gc_warning_threshold_secs,
+            help="The threshold for long GC warning. If a GC takes longer than this, a warning will be logged. Set to 0 to disable.",
         )
         parser.add_argument(
             "--decode-log-interval",
