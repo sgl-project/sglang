@@ -1477,15 +1477,14 @@ def _execute_server_warmup(
     else:
         request_name = "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
-
+    json_data = {
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": max_new_tokens,
+        },
+    }
     if server_args.skip_tokenizer_init:
-        json_data = {
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": max_new_tokens,
-            },
-            "input_ids": [[10, 11, 12] for _ in range(server_args.dp_size)],
-        }
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
@@ -1515,13 +1514,7 @@ def _execute_server_warmup(
             "temperature": 0.0,
         }
     else:
-        json_data = {
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": max_new_tokens,
-            },
-            "text": ["The capital city of France is"] * server_args.dp_size,
-        }
+        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
