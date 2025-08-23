@@ -500,11 +500,6 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-            if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "trtllm_mha backend does not support speculative decoding yet."
-                )
-
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
                 "Mixed chunk, radix cache, and cuda graphs are disabled because of using dual chunk flash attention backend"
@@ -654,6 +649,16 @@ class ServerArgs:
                 ) = auto_choose_speculative_params(self)
 
             if (
+                self.attention_backend == "trtllm_mha"
+                or self.decode_attention_backend == "trtllm_mha"
+                or self.prefill_attention_backend == "trtllm_mha"
+            ):
+                if self.speculative_eagle_topk > 1:
+                    raise ValueError(
+                        "trtllm_mha backend only supports topk = 1 for speculative decoding."
+                    )
+
+            if (
                 self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
             ):
@@ -709,6 +714,12 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        if self.enable_hierarchical_cache and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -2217,7 +2228,10 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
         elif "Llama4" in model_arch:
-            assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
+            assert self.attention_backend in {
+                "fa3",
+                "aiter",
+            }, "fa3 or aiter is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
