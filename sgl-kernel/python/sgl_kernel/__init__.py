@@ -80,6 +80,7 @@ from sgl_kernel.moe import (
     ep_moe_post_reorder,
     ep_moe_pre_reorder,
     ep_moe_silu_and_mul,
+    flashinfer_cutedsl_moe_masked,
     fp8_blockwise_scaled_grouped_mm,
     moe_align_block_size,
     moe_fused_gate,
