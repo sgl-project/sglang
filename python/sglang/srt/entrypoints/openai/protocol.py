@@ -629,12 +629,50 @@ class RerankResponse(BaseModel):
     meta_info: Optional[dict] = None
 
 
+class TokenizeRequest(BaseModel):
+    """Request schema for the /tokenize endpoint."""
+
+    model: str
+    prompt: Union[str, List[str]]
+    add_special_tokens: bool = Field(
+        default=True,
+        description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
+    )
+
+
+class TokenizeResponse(BaseModel):
+    """Response schema for the /tokenize endpoint."""
+
+    tokens: Union[List[int], List[List[int]]]
+    count: Union[int, List[int]]
+    max_model_len: int
+
+
+class DetokenizeRequest(BaseModel):
+    """Request schema for the /detokenize endpoint."""
+
+    model: str
+    tokens: Union[List[int], List[List[int]]]
+    skip_special_tokens: bool = Field(
+        default=True,
+        description="whether to exclude special tokens (e.g. padding or EOS) during decoding.",
+    )
+
+
+class DetokenizeResponse(BaseModel):
+    """Response schema for the /detokenize endpoint."""
+
+    text: Union[str, List[str]]
+
+
 OpenAIServingRequest = Union[
     ChatCompletionRequest,
     CompletionRequest,
     EmbeddingRequest,
     ScoringRequest,
     V1RerankReqInput,
+    TokenizeRequest,
+    DetokenizeRequest,
 ]
 
 
