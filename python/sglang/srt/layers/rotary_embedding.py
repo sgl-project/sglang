@@ -1029,6 +1029,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
+    @torch.compile(dynamic=True)
     def forward(
         self,
         positions: torch.Tensor,
