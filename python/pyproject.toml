@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.0rc2"
+version = "0.5.1"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -85,8 +85,11 @@ srt_hip = [
     "wave-lang==1.0.1",
 ]
 
-# CPU: torch wheel for CPU needs to be installed from https://download.pytorch.org/whl/cpu
-srt_cpu = ["sglang[runtime_common]", "einops"]
+# https://docs.sglang.ai/platforms/cpu_server.html
+srt_cpu = ["sglang[runtime_common]"]
+
+# https://docs.sglang.ai/platforms/ascend_npu.html
+srt_npu = ["sglang[runtime_common]"]
 
 # xpu is not enabled in public vllm and torch whl,
 # need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
@@ -95,9 +98,6 @@ srt_xpu = ["sglang[runtime_common]"]
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
 srt_hpu = ["sglang[runtime_common]"]
-
-# https://vllm-ascend.readthedocs.io/en/latest/installation.html
-srt_npu = ["sglang[runtime_common]"]
 
 openai = ["openai==1.99.1", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]

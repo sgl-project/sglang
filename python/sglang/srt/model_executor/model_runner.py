@@ -96,6 +96,11 @@ from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.offloader import (
+    create_offloader_from_server_args,
+    get_offloader,
+    set_offloader,
+)
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
@@ -118,7 +123,6 @@ from sglang.srt.utils import (
     is_npu,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
-    set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -168,6 +172,7 @@ class ModelRunner:
         pp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -222,15 +227,15 @@ class ModelRunner:
             }
         )
 
-        # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
-
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
+
+        # CPU offload
+        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -514,9 +519,6 @@ class ModelRunner:
 
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
-        elif self.page_size > 1:
-            logger.info("Disable chunked prefix cache when page size > 1.")
-            server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
@@ -689,6 +691,8 @@ class ModelRunner:
             )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
+
+        get_offloader().post_init()
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
@@ -1241,6 +1245,11 @@ class ModelRunner:
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
+            # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
+            extra_max_context_len = 4
+            if self.server_args.speculative_num_draft_tokens is not None:
+                extra_max_context_len += self.server_args.speculative_num_draft_tokens
+
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 
@@ -1249,7 +1258,8 @@ class ModelRunner:
                 pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
                 self.req_to_token_pool = DecodeReqToTokenPool(
                     size=max_num_reqs,
-                    max_context_len=self.model_config.context_len + 4,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     pre_alloc_size=pre_alloc_size,
@@ -1257,7 +1267,8 @@ class ModelRunner:
             else:
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
-                    max_context_len=self.model_config.context_len + 4,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                 )
