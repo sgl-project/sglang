@@ -7,8 +7,11 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.nixl.hicache_nixl import HiCacheNixl
-from sglang.srt.mem_cache.nixl.nixl_utils import NixlFileManager, NixlRegistration
+from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
+from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
+    NixlFileManager,
+    NixlRegistration,
+)
 
 
 class TestNixlUnified(unittest.TestCase):
@@ -88,7 +91,26 @@ class TestNixlUnified(unittest.TestCase):
 
         # Test get
         retrieved = self.hicache.get(key, dst_tensor)
+        self.verify_tensors_equal(value, dst_tensor)
         self.verify_tensors_equal(value, retrieved)
+
+        # Same test in addr,len mode with another key and dst_tensor
+        key2 = "test_key2"
+        dst_tensor2 = torch.zeros_like(value, device="cpu")
+        src_addr, src_len = value.data_ptr(), value.numel() * value.element_size()
+        dst_addr, dst_len = (
+            dst_tensor2.data_ptr(),
+            dst_tensor2.numel() * dst_tensor2.element_size(),
+        )
+
+        # Test set
+        self.assertTrue(self.hicache.set(key, None, src_addr, src_len))
+        self.assertTrue(self.hicache.exists(key))
+
+        # Test get
+        retrieved2 = self.hicache.get(key, dst_addr, dst_len)
+        self.assertTrue(retrieved2 == None)
+        self.verify_tensors_equal(value, dst_tensor2)
 
     def test_batch_set_get(self):
         """Test batch tensor set/get operations."""
@@ -107,6 +129,23 @@ class TestNixlUnified(unittest.TestCase):
         # Test batch get
         retrieved = self.hicache.batch_get(keys, dst_tensors)
         self.verify_tensor_lists_equal(values, retrieved)
+
+        # Same test in addr,len mode with another key and dst_tensor
+        keys2 = ["key4", "key5", "key6"]
+        dst_tensors2 = [torch.zeros_like(v, device="cpu") for v in values]
+        src_addrs = [v.data_ptr() for v in values]
+        src_lens = [v.numel() * v.element_size() for v in values]
+        dst_addrs = [dt.data_ptr() for dt in dst_tensors2]
+        dst_lens = [dt.numel() * dt.element_size() for dt in dst_tensors2]
+
+        # Test batch set
+        self.assertTrue(self.hicache.batch_set(keys2, None, src_addrs, src_lens))
+        self.assertTrue(all(self.hicache.exists(key) for key in keys2))
+
+        # Test batch get
+        retrieved2 = self.hicache.batch_get(keys, dst_addrs, dst_lens)
+        self.assertTrue(all(ret == None for ret in retrieved2))
+        self.verify_tensor_lists_equal(values, dst_tensors2)
 
     def test_mixed_operations(self):
         """Test mixing single and batch operations."""
@@ -170,7 +209,7 @@ class TestNixlUnified(unittest.TestCase):
         self.file_manager.create_file(test_file)
 
         # Test tuple creation
-        tuples = self.file_manager.files_to_nixl_tuples([test_file], False)
+        tuples = self.file_manager.files_to_nixl_tuples([test_file])
         self.assertIsNotNone(tuples)
         self.assertTrue(len(tuples) > 0)
 
@@ -190,11 +229,11 @@ class TestNixlUnified(unittest.TestCase):
         tensor = torch.randn(10, 10)
 
         # Test buffer registration
-        self.assertIsNotNone(self.registration.register_buffers(tensor))
+        self.assertIsNotNone(self.hicache.register_buffers(tensor))
 
         # Test batch registration
         tensors = [torch.randn(5, 5) for _ in range(3)]
-        self.assertIsNotNone(self.registration.register_buffers(tensors))
+        self.assertIsNotNone(self.hicache.register_buffers(tensors))
 
     def test_register_files_with_tuples(self):
         """Test registration of files using NIXL tuples."""
@@ -203,8 +242,8 @@ class TestNixlUnified(unittest.TestCase):
             self.file_manager.create_file(file)
 
         # Create tuples and register
-        tuples = self.file_manager.files_to_nixl_tuples(files, False)
-        self.registration.register_files(tuples)
+        tuples = self.file_manager.files_to_nixl_tuples(files)
+        self.hicache.register_files(tuples)
 
         # Verify tuples
         self.assertEqual(len(tuples), len(files))

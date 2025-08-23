@@ -52,7 +52,6 @@ if not (_is_npu or _is_hip):
 if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
-    from aiter.ops.shuffle import shuffle_weight
 
 logger = logging.getLogger(__name__)
 
@@ -783,13 +782,17 @@ class DeepEPMoE(EPMoE):
         return hidden_states
 
 
-def get_moe_impl_class():
+def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
     if get_moe_a2a_backend().is_deepep():
         return DeepEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
     # Check for FP4 quantization with TRTLLM flag, regardless of EP
     if get_moe_runner_backend().is_flashinfer_trtllm():
+        # FlashInferFP4MoE must be paired with ModelOptNvFp4FusedMoEMethod.
+        # If UnquantizedFusedMoEMethod is detected, fall back to FusedMoE instead.
+        if quant_config is None:
+            return FusedMoE
         try:
             # Check the quantization argument directly
             quantization = global_server_args_dict.get("quantization")

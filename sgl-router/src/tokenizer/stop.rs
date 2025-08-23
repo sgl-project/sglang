@@ -1,9 +1,7 @@
 use super::traits::{self, TokenIdType};
-use crate::metrics::TokenizerMetrics;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Output from the sequence decoder
 #[derive(Debug, Clone, PartialEq)]
@@ -95,8 +93,6 @@ impl StopSequenceDecoder {
 
     /// Process a single token
     pub fn process_token(&mut self, token_id: TokenIdType) -> Result<SequenceDecoderOutput> {
-        let start = Instant::now();
-
         if self.stopped {
             return Ok(SequenceDecoderOutput::Stopped);
         }
@@ -104,22 +100,18 @@ impl StopSequenceDecoder {
         // Check for token-level stops first
         if self.config.stop_tokens.contains(&token_id) {
             self.stopped = true;
-            TokenizerMetrics::record_stop_sequence_detected("token");
 
             // Flush any jailed text before stopping
             if !self.jail_buffer.is_empty() {
                 let output = self.jail_buffer.clone();
                 self.jail_buffer.clear();
-                TokenizerMetrics::record_stop_detection_duration(start.elapsed());
                 return Ok(SequenceDecoderOutput::StoppedWithText(output));
             }
-            TokenizerMetrics::record_stop_detection_duration(start.elapsed());
             return Ok(SequenceDecoderOutput::Stopped);
         }
 
         if self.config.visible_stop_tokens.contains(&token_id) {
             self.stopped = true;
-            TokenizerMetrics::record_stop_sequence_detected("visible_token");
 
             // Include jailed text plus the stop token
             let stop_text = self
@@ -127,7 +119,6 @@ impl StopSequenceDecoder {
                 .decode(&[token_id], self.skip_special_tokens)?;
             let output = format!("{}{}", self.jail_buffer, stop_text);
             self.jail_buffer.clear();
-            TokenizerMetrics::record_stop_detection_duration(start.elapsed());
             return Ok(SequenceDecoderOutput::StoppedWithText(output));
         }
 
@@ -172,12 +163,10 @@ impl StopSequenceDecoder {
         for stop_seq in &self.config.stop_sequences {
             if let Some(pos) = check_text.find(stop_seq) {
                 self.stopped = true;
-                TokenizerMetrics::record_stop_sequence_detected("string");
 
                 // Output text before the stop sequence
                 let output = check_text[..pos].to_string();
                 self.jail_buffer.clear();
-                TokenizerMetrics::record_stop_detection_duration(start.elapsed());
                 return Ok(if output.is_empty() {
                     SequenceDecoderOutput::Stopped
                 } else {
@@ -190,13 +179,11 @@ impl StopSequenceDecoder {
         for stop_seq in &self.config.visible_stop_sequences {
             if let Some(pos) = check_text.find(stop_seq) {
                 self.stopped = true;
-                TokenizerMetrics::record_stop_sequence_detected("visible_string");
 
                 // Include the stop sequence in output
                 let end_pos = pos + stop_seq.len();
                 let output = check_text[..end_pos].to_string();
                 self.jail_buffer.clear();
-                TokenizerMetrics::record_stop_detection_duration(start.elapsed());
                 return Ok(SequenceDecoderOutput::StoppedWithText(output));
             }
         }
@@ -219,8 +206,6 @@ impl StopSequenceDecoder {
         }
 
         if partial_match_len > 0 {
-            TokenizerMetrics::record_partial_match();
-
             // Split: output safe text, jail the potential match
             let safe_end = check_text.len() - partial_match_len;
             let safe_text = &check_text[..safe_end];
@@ -229,8 +214,6 @@ impl StopSequenceDecoder {
             // Update offsets for next iteration
             self.prefix_offset = self.read_offset;
             self.read_offset = self.token_buffer.len();
-
-            TokenizerMetrics::record_stop_detection_duration(start.elapsed());
 
             if safe_text.is_empty() {
                 Ok(SequenceDecoderOutput::Held)
@@ -244,8 +227,6 @@ impl StopSequenceDecoder {
             // Update offsets for next iteration
             self.prefix_offset = self.read_offset;
             self.read_offset = self.token_buffer.len();
-
-            TokenizerMetrics::record_stop_detection_duration(start.elapsed());
 
             Ok(SequenceDecoderOutput::Text(check_text))
         }

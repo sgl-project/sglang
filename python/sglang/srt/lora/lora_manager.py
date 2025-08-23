@@ -55,7 +55,7 @@ class LoRAManager:
         tp_rank: int = 0,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
-        lora_paths: Optional[Dict[str, LoRARef]] = None,
+        lora_paths: Optional[List[LoRARef]] = None,
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -370,7 +370,7 @@ class LoRAManager:
         self,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
-        lora_paths: Optional[Dict[str, LoRARef]] = None,
+        lora_paths: Optional[List[LoRARef]] = None,
     ):
         """
         Initialize the internal (mutable) state of the LoRAManager.
@@ -392,7 +392,7 @@ class LoRAManager:
         self.init_memory_pool()
         self.update_lora_info()
 
-    def init_lora_adapters(self, lora_paths: Optional[Dict[str, LoRARef]] = None):
+    def init_lora_adapters(self, lora_paths: Optional[List[LoRARef]] = None):
         # Configs of all active LoRA adapters, indexed by LoRA ID.
         self.configs: Dict[str, LoRAConfig] = {}
 
@@ -406,7 +406,7 @@ class LoRAManager:
         self.num_pinned_loras: int = 0
 
         if lora_paths:
-            for lora_ref in lora_paths.values():
+            for lora_ref in lora_paths:
                 result = self.load_lora_adapter(lora_ref)
                 if not result.success:
                     raise RuntimeError(

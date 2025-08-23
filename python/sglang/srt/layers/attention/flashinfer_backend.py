@@ -1263,11 +1263,12 @@ def should_use_tensor_core(
     # Calculate GQA group size
     gqa_group_size = num_attention_heads // num_kv_heads
 
-    # Determine based on dtype and GQA group size
+    # For Flashinfer, a GQA group size of at least 4 is needed to efficiently
+    # use Tensor Cores, as it fuses the head group with the token dimension in MMA.
     if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         return True
     elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
-        return gqa_group_size > 4
+        return gqa_group_size >= 4
     else:
         return False
 
@@ -1372,7 +1373,14 @@ def fast_decode_plan(
 
         if self.use_tensor_cores:
             # ALSO convert last_page_len to CPU
-            last_page_len_host = last_page_len.cpu()
+            if page_size == 1:
+                # When page size is 1, last_page_len is always 1.
+                # Directly construct the host tensor rather than executing a device-to-host copy.
+                last_page_len_host = torch.ones(
+                    (batch_size,), dtype=torch.int32, device="cpu"
+                )
+            else:
+                last_page_len_host = last_page_len.cpu()
 
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 

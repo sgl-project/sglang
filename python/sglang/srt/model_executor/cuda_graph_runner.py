@@ -240,6 +240,8 @@ class CudaGraphRunner:
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
+        self.device = model_runner.device
+        self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -305,13 +307,15 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
 
         # Graph inputs
-        with torch.device("cuda"):
+        with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.out_cache_loc = torch.zeros(
+                (self.max_num_token,), dtype=self._cache_loc_dtype()
+            )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -366,12 +370,12 @@ class CudaGraphRunner:
                     * self.num_tokens_per_bs
                 ),
                 dtype=torch.bool,
-                device="cuda",
+                device=self.device,
             )
             self.next_token_logits_buffer = torch.zeros(
                 (self.max_num_token, self.model_runner.model_config.vocab_size),
                 dtype=torch.float,
-                device="cuda",
+                device=self.device,
             )
 
         # Capture
@@ -382,6 +386,9 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _cache_loc_dtype(self):
+        return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -502,8 +509,16 @@ class CudaGraphRunner:
             )
             logger.info(log_message)
 
+    def _capture_graph(self, graph, pool, stream, run_once_fn):
+        with self.device_module.graph(graph, pool=pool, stream=stream):
+            out = run_once_fn()
+        return out
+
+    def _create_device_graph(self):
+        return torch.cuda.CUDAGraph()
+
     def capture_one_batch_size(self, bs: int, forward: Callable):
-        graph = torch.cuda.CUDAGraph()
+        graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -643,19 +658,17 @@ class CudaGraphRunner:
             return logits_output_or_pp_proxy_tensors
 
         for _ in range(2):
-            torch.cuda.synchronize()
+            self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
-
             run_once()
 
         if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(torch.cuda.graph_pool_handle())
+            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
-        with torch.cuda.graph(
-            graph, pool=get_global_graph_memory_pool(), stream=stream
-        ):
-            out = run_once()
+        out = self._capture_graph(
+            graph, get_global_graph_memory_pool(), stream, run_once
+        )
 
         return graph, out
 

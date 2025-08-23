@@ -101,11 +101,11 @@ class HiCacheStorage(ABC):
 
 class HiCacheFile(HiCacheStorage):
 
-    def __init__(self, file_path: str = "/tmp/hicache"):
+    def __init__(self, file_path: str = "/tmp/hicache", is_mla: bool = False):
         self.file_path = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", file_path)
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
-        self.tp_suffix = f"_{tp_rank}_{tp_size}" if tp_size > 1 else ""
+        self.tp_suffix = f"_{tp_rank}_{tp_size}" if tp_size > 1 and not is_mla else ""
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")

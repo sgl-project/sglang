@@ -1,10 +1,8 @@
 // src/tokenizer/stream.rs
 
 use super::traits::{self, TokenIdType};
-use crate::metrics::TokenizerMetrics;
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Instant;
 
 const INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET: usize = 5;
 
@@ -45,11 +43,7 @@ impl DecodeStream {
     /// Step appends a token_id to the internal state and tries to produce a text chunk.
     /// Returning `None` means the given id is not enough to produce a chunk.
     pub fn step(&mut self, id: TokenIdType) -> Result<Option<String>> {
-        let start = Instant::now();
-
         self.all_token_ids.push(id);
-
-        TokenizerMetrics::record_stream_token();
 
         let prefix_text = self.tokenizer.decode(
             &self.all_token_ids[self.prefix_offset..self.read_offset],
@@ -67,16 +61,8 @@ impl DecodeStream {
             self.prefix_offset = self.read_offset;
             self.read_offset = self.all_token_ids.len();
 
-            TokenizerMetrics::record_stream_step_duration(start.elapsed());
-
             Ok(Some(new_text))
         } else {
-            if new_text.ends_with("�") {
-                TokenizerMetrics::record_incomplete_utf8();
-            }
-
-            TokenizerMetrics::record_stream_step_duration(start.elapsed());
-
             Ok(None)
         }
     }
