@@ -715,6 +715,12 @@ class ServerArgs:
             "1" if self.disable_outlines_disk_cache else "0"
         )
 
+        if self.enable_hierarchical_cache and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and tokenizer
@@ -2222,7 +2228,10 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
         elif "Llama4" in model_arch:
-            assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
+            assert self.attention_backend in {
+                "fa3",
+                "aiter",
+            }, "fa3 or aiter is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
