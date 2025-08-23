@@ -12,20 +12,19 @@ It is recommended to use uv for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang[all]>=0.5.0rc2"
+uv pip install "sglang[all]>=0.5.1"
 ```
 
 **Quick fixes to common problems**
 - If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
-- SGLang currently uses torch 2.8 and flashinfer for torch 2.8. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the FlashInfer pypi package is called `flashinfer-python` instead of `flashinfer`.
 
 ## Method 2: From source
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.0rc2 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
@@ -35,7 +34,6 @@ pip install -e "python[all]"
 
 **Quick fixes to common problems**
 - If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](../developer_guide/development_guide_using_docker.md#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
-- SGLang currently uses torch 2.8 and flashinfer for torch 2.8. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html). Please note that the FlashInfer pypi package is called `flashinfer-python` instead of `flashinfer`.
 
 ## Method 3: Using docker
 
