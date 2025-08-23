@@ -1,11 +1,9 @@
-use super::traits::{self, Tokenizer as TokenizerTrait};
-use crate::metrics::TokenizerMetrics;
+use super::traits;
 use anyhow::{Error, Result};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 
 #[cfg(feature = "huggingface")]
 use super::huggingface::HuggingFaceTokenizer;
@@ -26,8 +24,14 @@ pub enum TokenizerType {
 /// - json: HuggingFace tokenizer
 /// - For testing: can return mock tokenizer
 pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
-    let start_time = Instant::now();
+    create_tokenizer_with_chat_template(file_path, None)
+}
 
+/// Create a tokenizer from a file path with an optional chat template
+pub fn create_tokenizer_with_chat_template(
+    file_path: &str,
+    chat_template_path: Option<&str>,
+) -> Result<Arc<dyn traits::Tokenizer>> {
     // Special case for testing
     if file_path == "mock" || file_path == "test" {
         return Ok(Arc::new(super::mock::MockTokenizer::new()));
@@ -37,7 +41,6 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tok
 
     // Check if file exists
     if !path.exists() {
-        TokenizerMetrics::record_factory_error("file_not_found");
         return Err(Error::msg(format!("File not found: {}", file_path)));
     }
 
@@ -51,16 +54,15 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tok
         Some("json") => {
             #[cfg(feature = "huggingface")]
             {
-                let tokenizer = HuggingFaceTokenizer::from_file(file_path)?;
-
-                TokenizerMetrics::record_factory_load("json");
-                TokenizerMetrics::set_vocab_size("huggingface", tokenizer.vocab_size());
+                let tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
+                    file_path,
+                    chat_template_path,
+                )?;
 
                 Ok(Arc::new(tokenizer) as Arc<dyn traits::Tokenizer>)
             }
             #[cfg(not(feature = "huggingface"))]
             {
-                TokenizerMetrics::record_factory_error("huggingface_disabled");
                 Err(Error::msg(
                     "HuggingFace support not enabled. Enable the 'huggingface' feature.",
                 ))
@@ -68,26 +70,18 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tok
         }
         Some("model") => {
             // SentencePiece model file
-            TokenizerMetrics::record_factory_error("unsupported_sentencepiece");
             Err(Error::msg("SentencePiece models not yet supported"))
         }
         Some("gguf") => {
             // GGUF format
-            TokenizerMetrics::record_factory_error("unsupported_gguf");
             Err(Error::msg("GGUF format not yet supported"))
         }
         _ => {
             // Try to auto-detect by reading file content
-            auto_detect_tokenizer(file_path).inspect(|tokenizer| {
-                TokenizerMetrics::record_factory_load("auto_detected");
-                TokenizerMetrics::set_vocab_size("auto_detected", tokenizer.vocab_size());
-            })
+            auto_detect_tokenizer(file_path)
         }
     };
 
-    if result.is_ok() {
-        TokenizerMetrics::record_factory_load_duration(start_time.elapsed());
-    }
     result
 }
 
@@ -179,8 +173,6 @@ pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<dyn traits::Toke
         {
             use super::tiktoken::TiktokenTokenizer;
             let tokenizer = TiktokenTokenizer::from_model_name(model_name_or_path)?;
-            TokenizerMetrics::record_factory_load("tiktoken");
-            TokenizerMetrics::set_vocab_size("tiktoken", tokenizer.vocab_size());
             return Ok(Arc::new(tokenizer));
         }
     }
@@ -275,7 +267,7 @@ mod tests {
         // Test encoding and decoding
         let text = "Hello, world!";
         let encoding = tokenizer.encode(text).unwrap();
-        let decoded = tokenizer.decode(&encoding.token_ids(), false).unwrap();
+        let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
         assert_eq!(decoded, text);
     }
 }
