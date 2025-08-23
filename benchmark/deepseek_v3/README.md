@@ -1,4 +1,4 @@
-# DeepSeek V3 Support
+# DeepSeek V3.1/V3/R1 Support
 
 The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVIDIA and AMD GPUs **from day one**. SGLang also supports [MLA optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [DP attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models), making SGLang one of the best open-source LLM engines for running DeepSeek models. SGLang is the inference engine recommended by the official [DeepSeek team](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended).
 
@@ -50,7 +50,9 @@ Add [performance optimization options](#performance-optimization-options) as nee
 - [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models): For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
 - [Torch.compile Optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#torchcompile-latency-optimizations): Add `--enable-torch-compile` argument to enable it. This will take some time while server starts. The maximum batch size for torch.compile optimization can be controlled with `--torch-compile-max-bs`. It's recommended to set it between `1` and `8`. (e.g., `--torch-compile-max-bs 8`)
 
-### Example: Sending requests with OpenAI API
+### Usage: Chat with DeepSeek 
+
+#### DeepSeek V3/R1
 
 ```python3
 import openai
@@ -66,6 +68,48 @@ response = client.chat.completions.create(
     ],
     temperature=0,
     max_tokens=64,
+)
+print(response)
+```
+
+#### DeepSeek V3.1
+On top of the basic usage similar with the DeepSeek V3/R1 example, DeepSeek V3.1 support request level thinking/non-thinking toggle, simply switch the `"thinking"` fields in `extra_body={"chat_template_kwargs": {"thinking": True}}` to leash/unleash the thinking mode. 
+
+##### Thinking 
+```python3
+import openai
+client = openai.Client(
+    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+# Chat completion
+response = client.chat.completions.create(
+    model="default",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "How many 'r' are there in straberry?"},
+    ],
+    temperature=0,
+    max_tokens=64,
+    extra_body = {"chat_template_kwargs": {"thinking": False}}
+)
+print(response)
+```
+##### Non Thinking
+```python3
+import openai
+client = openai.Client(
+    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+# Chat completion
+response = client.chat.completions.create(
+    model="default",
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "How many 'r' are there in straberry?"},
+    ],
+    temperature=0,
+    max_tokens=64,
+    extra_body = {"chat_template_kwargs": {"thinking": True}}
 )
 print(response)
 ```
