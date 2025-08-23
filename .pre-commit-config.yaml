@@ -38,7 +38,7 @@ repos:
     hooks:
       - id: codespell
         additional_dependencies: ['tomli']
-        args: ['--toml', 'python/pyproject.toml', '-L', 'cann,thi']
+        args: ['--toml', 'python/pyproject.toml', '-L', 'cann,thi,makro,wil,rouge']
         exclude: |
           (?x)^(
             test/srt/test_reasoning_parser\.py|
