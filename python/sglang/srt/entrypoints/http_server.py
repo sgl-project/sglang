@@ -483,8 +483,8 @@ async def get_model_info():
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
-        "has_image_understanding": _global_state.tokenizer_manager.model_config.is_image_understanding_model,
-        "has_audio_understanding": _global_state.tokenizer_manager.model_config.is_audio_understanding_model,
+        "has_image_understanding": _global_state.tokenizer_manager.model_config.is_image_understandable_model,
+        "has_audio_understanding": _global_state.tokenizer_manager.model_config.is_audio_understandable_model,
     }
     return result
 
