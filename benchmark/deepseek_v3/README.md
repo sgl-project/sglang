@@ -98,7 +98,7 @@ Answer:
 ```
 h
 ```
-* The correct reponse should be A, as the questions correct answer should be Paris
+* The correct response should be 'A', as the correct answer to the question is 'Paris'.
 ##### Thinking
 ```python3
 import openai
