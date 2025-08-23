@@ -190,6 +190,7 @@ class ServerArgs:
         "flashinfer_cutlass",
         "flashinfer_mxfp4",
     ] = "auto"
+    flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -1496,9 +1497,17 @@ class ServerArgs:
                 "triton_kernel",
                 "flashinfer_trtllm",
                 "flashinfer_cutlass",
+                "flashinfer_mxfp4",
             ],
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
+        )
+        parser.add_argument(
+            "--flashinfer-mxfp4-moe-precision",
+            type=str,
+            choices=["mxfp4", "bf16"],
+            default=ServerArgs.flashinfer_mxfp4_moe_precision,
+            help="Choose the computation precision of flashinfer mxfp4 moe",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
