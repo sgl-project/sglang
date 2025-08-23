@@ -1,3 +1,4 @@
+use crate::tool_parser::json_parser::JsonParser;
 use crate::tool_parser::traits::ToolParser;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +21,9 @@ impl ParserRegistry {
             model_mapping: HashMap::new(),
             default_parser: "json".to_string(),
         };
+
+        // Register default parsers
+        registry.register_default_parsers();
 
         // Register default model mappings
         registry.register_default_mappings();
@@ -75,6 +79,14 @@ impl ParserRegistry {
             .collect()
     }
 
+    /// Register default parsers
+    fn register_default_parsers(&mut self) {
+        // JSON parser - most common format
+        self.register_parser("json", Arc::new(JsonParser::new()));
+
+        // Note: Additional parsers (mistral, qwen, llama) will be added in later phases
+    }
+
     /// Register default model mappings
     fn register_default_mappings(&mut self) {
         // OpenAI models
@@ -85,16 +97,16 @@ impl ParserRegistry {
         // Anthropic models
         self.map_model("claude-*", "json");
 
-        // Mistral models
-        self.map_model("mistral-*", "mistral");
-        self.map_model("mixtral-*", "mistral");
+        // Mistral models (will use json until mistral parser is implemented)
+        self.map_model("mistral-*", "json");
+        self.map_model("mixtral-*", "json");
 
-        // Qwen models
-        self.map_model("qwen*", "qwen");
+        // Qwen models (will use json until qwen parser is implemented)
+        self.map_model("qwen*", "json");
 
-        // Llama models
-        self.map_model("llama-*", "llama");
-        self.map_model("meta-llama-*", "llama");
+        // Llama models (will use json until llama parser is implemented)
+        self.map_model("llama-*", "json");
+        self.map_model("meta-llama-*", "json");
 
         // Other models default to JSON
         self.map_model("gemini-*", "json");
