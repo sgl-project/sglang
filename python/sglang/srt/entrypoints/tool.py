@@ -66,9 +66,7 @@ class HarmonyPythonTool(Tool):
             from gpt_oss.tools.python_docker.docker_tool import PythonTool
         except ImportError:
             self.enabled = False
-            print_warning_once(
-                "gpt_oss is not installed, code interpreter is disabled"
-            )
+            print_warning_once("gpt_oss is not installed, code interpreter is disabled")
             return
 
         self.python_tool = PythonTool()
