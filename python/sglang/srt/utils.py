@@ -2541,6 +2541,50 @@ def dynamic_import(func_path: str):
     return func
 
 
+def gc_object_counts():
+    import gc
+
+    g0 = len(gc.get_objects(0))
+    g1 = len(gc.get_objects(1))
+    g2 = len(gc.get_objects(2))
+    return g0, g1, g2
+
+
+def configure_gc_warning(warn_threshold_secs):
+    import gc
+
+    gc_start_time = {}
+
+    def gc_callback(phase, info):
+        gen = info.get("generation", "?")
+        if phase == "start":
+            gc_start_time[gen] = time.time()
+        elif phase == "stop":
+            duration = time.time() - gc_start_time.get(gen, time.time())
+            if duration > warn_threshold_secs:
+                g0, g1, g2 = gc_object_counts()
+                logger.warn(
+                    f"LONG GARBAGE COLLECTION DETECTED | Generation {gen} | Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "
+                    f"This may cause latency jitter. Consider calling the freeze_gc API after sending a few warmup requests."
+                )
+
+    gc.callbacks.append(gc_callback)
+
+
+def freeze_gc(context: str):
+    import gc
+
+    g0_before, g1_before, g2_before = gc_object_counts()
+    gc.freeze()
+    g0_after, g1_after, g2_after = gc_object_counts()
+    logger.info(
+        f"Freezing GC in {context} process. "
+        f"gen0: {g0_before}->{g0_after}, "
+        f"gen1: {g1_before}->{g1_after}, "
+        f"gen2: {g2_before}->{g2_after}"
+    )
+
+
 def configure_gc_logger():
     logger.info("Enable GC Logger")
 
