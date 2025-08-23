@@ -871,70 +871,35 @@ class Llama4ForConditionalGeneration(nn.Module):
             loaded_weight = loaded_weight.transpose(-1, -2)
 
         # Handle scale parameters using weight_loader to properly handle sharding
+        # For w13 (gate_up_proj), we need to load for both w1 and w3 shards
+        actual_shard_ids = shard_id_list if shard_id == "w13" else [shard_id]
+
+        def load_for_expert(weight_tensor, expert_id):
+            """Load weight tensor for a specific expert across all required shard_ids."""
+            for actual_shard_id in actual_shard_ids:
+                param.weight_loader(
+                    param,
+                    weight_tensor,
+                    name,
+                    shard_id=actual_shard_id,
+                    expert_id=expert_id,
+                )
+
         if expert_match:
             # If we have a specific expert ID, only load for that expert
             expert_id = int(expert_match.group(1))
-            # For fused gate_up_proj (w13), we need to handle w1 and w3 separately
-            if shard_id == "w13":
-                # Load the same scale for both w1 and w3 shards
-                for individual_shard_id in shard_id_list:
-                    param.weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=individual_shard_id,
-                        expert_id=expert_id,
-                    )
-            else:
-                # Use weight_loader to handle tensor parallel sharding properly
-                param.weight_loader(
-                    param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id
-                )
+            load_for_expert(loaded_weight, expert_id)
         else:
             # No expert ID found - check if loaded_weight is fused (contains all experts)
             if loaded_weight.dim() == 3 and loaded_weight.shape[0] == num_experts:
                 # Fused case: loaded_weight has shape [num_experts, ...]
                 # Load each expert's scale from the fused tensor
                 for expert_id in range(num_experts):
-                    if shard_id == "w13":
-                        # Load the same scale for both w1 and w3 shards
-                        for individual_shard_id in shard_id_list:
-                            param.weight_loader(
-                                param,
-                                loaded_weight[expert_id],
-                                name,
-                                shard_id=individual_shard_id,
-                                expert_id=expert_id,
-                            )
-                    else:
-                        param.weight_loader(
-                            param,
-                            loaded_weight[expert_id],
-                            name,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                        )
+                    load_for_expert(loaded_weight[expert_id], expert_id)
             else:
                 # Single scale for all experts case
                 for expert_id in range(num_experts):
-                    if shard_id == "w13":
-                        # Load the same scale for both w1 and w3 shards
-                        for individual_shard_id in shard_id_list:
-                            param.weight_loader(
-                                param,
-                                loaded_weight,
-                                name,
-                                shard_id=individual_shard_id,
-                                expert_id=expert_id,
-                            )
-                    else:
-                        param.weight_loader(
-                            param,
-                            loaded_weight,
-                            name,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                        )
+                    load_for_expert(loaded_weight, expert_id)
         loaded_params.add(transformed_name)
 
         return True
