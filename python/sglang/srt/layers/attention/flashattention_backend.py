@@ -776,14 +776,13 @@ class FlashAttentionBackend(AttentionBackend):
                 o = result
         else:
             if (
-                not global_server_args_dict["disable_chunked_prefix_cache"]
-                and forward_batch.attn_attend_prefix_cache is not None
+                forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
             ):
                 # Do multi-head attention with chunked prefix cache
-
                 if forward_batch.attn_attend_prefix_cache:
+                    assert not global_server_args_dict["disable_chunked_prefix_cache"]
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
@@ -792,7 +791,8 @@ class FlashAttentionBackend(AttentionBackend):
                     chunk_idx = forward_batch.prefix_chunk_idx
                     assert chunk_idx >= 0
 
-                    output, lse, *rest = flash_attn_varlen_func(
+                    assert forward_batch.mha_return_lse
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -806,7 +806,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
-                    output, lse, *rest = flash_attn_varlen_func(
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -816,9 +816,13 @@ class FlashAttentionBackend(AttentionBackend):
                         max_seqlen_k=metadata.max_seq_len_q,
                         softmax_scale=layer.scaling,
                         causal=True,
-                        return_softmax_lse=True,
+                        return_softmax_lse=forward_batch.mha_return_lse,
                     )
-                return output, lse
+                if forward_batch.mha_return_lse:
+                    output, lse, *rest = output
+                    lse = torch.transpose(lse, 0, 1).contiguous()
+                    return output, lse
+                return output
             else:
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
@@ -1163,6 +1167,8 @@ class FlashAttentionBackend(AttentionBackend):
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+
         # This is being used by normal decode and draft decode when topk == 1
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -1174,13 +1180,7 @@ class FlashAttentionBackend(AttentionBackend):
             ),
             "page_table": torch.zeros(
                 max_bs,
-                (self.max_context_len + self.page_size - 1) // self.page_size,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "page_table_draft_decode": torch.zeros(
-                max_bs,
-                (self.max_context_len + self.page_size - 1) // self.page_size,
+                max_num_pages,
                 dtype=torch.int32,
                 device=self.device,
             ),
@@ -1188,7 +1188,6 @@ class FlashAttentionBackend(AttentionBackend):
                 0, self.max_context_len, self.page_size, device=self.device
             ),
         }
-
         # Only allocate local attention buffers if local attention is enabled
         # This prevents OOM errors when local attention is not being used
         if self.attention_chunk_size is not None:
@@ -1274,6 +1273,14 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
         ):
+            # "page_table_draft_decode" will be set only when spec decoding enabled to save memory
+            self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
+                max_bs,
+                max_num_pages,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
             self.target_verify_metadata = {
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -1290,7 +1297,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    (self.max_context_len + self.page_size - 1) // self.page_size,
+                    max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -1313,7 +1320,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    (self.max_context_len + self.page_size - 1) // self.page_size,
+                    max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
