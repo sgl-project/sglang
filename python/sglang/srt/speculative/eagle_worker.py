@@ -89,9 +89,8 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.log_cold_token_prob = server_args.log_cold_token_prob
         self.padded_static_len = -1
-        
+
         # Accumulators for cross-batch statistics
         self.all_cold_probs_data = []
         self.log_stats_call_count = 0
@@ -124,21 +123,40 @@ class EAGLEWorker(TpModelWorker):
             server_args.json_model_override_args = (
                 f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
             )
-
-            if self.log_cold_token_prob:
-                # Move hot_token_id to the correct device first
-                self.hot_token_id = self.hot_token_id.to(self.device)
-                # Create a boolean mask for cold tokens
-                self.cold_token_mask = torch.ones(
-                    target_worker.model_runner.model_config.vocab_size,
-                    dtype=torch.bool,
-                    device=self.device,
-                )
-                self.cold_token_mask[self.hot_token_id] = False
-            else:
-                self.hot_token_id = None
+            # Move hot_token_id to the correct device first
+            self.hot_token_id = self.hot_token_id.to(self.device)
+            # Create a boolean mask for cold tokens
+            self.cold_token_mask = torch.ones(
+                target_worker.model_runner.model_config.vocab_size,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            self.cold_token_mask[self.hot_token_id] = False
         else:
             self.hot_token_id = None
+
+        # Load weaker drafter map if provided
+        self.weaker_drafter = None
+        if self.server_args.speculative_weaker_drafter_probs is not None:
+            weaker_drafter_all_vocab = load_tensor_from_path(
+                self.server_args.speculative_weaker_drafter_probs
+            ).to(self.device)
+            # The loaded weaker_drafter is for the full vocabulary.
+            # We need to select the values for the cold tokens.
+            target_vocab_size = self.target_worker.model_runner.model_config.vocab_size
+            if weaker_drafter_all_vocab.shape[0] != target_vocab_size:
+                raise ValueError(
+                    "The weaker drafter probabilities tensor should have a size "
+                    f"equal to the target model's vocabulary size. "
+                    f"Expected {target_vocab_size}, but got "
+                    f"{weaker_drafter_all_vocab.shape[0]}."
+                )
+            # Zero out the hot tokens
+            weaker_drafter_all_vocab[self.hot_token_id] = 0
+            # Normalize the weaker drafter
+            self.weaker_drafter = (
+                weaker_drafter_all_vocab / weaker_drafter_all_vocab.sum()
+            )
 
         # Init draft worker
         with empty_context():
@@ -167,7 +185,7 @@ class EAGLEWorker(TpModelWorker):
                 )
 
         else:
-            if self.hot_token_id is not None and not self.log_cold_token_prob:
+            if self.hot_token_id is not None and self.weaker_drafter is None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 head.data = head.data[self.hot_token_id]
@@ -610,7 +628,7 @@ class EAGLEWorker(TpModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
-        if self.hot_token_id is not None and not self.log_cold_token_prob:
+        if self.hot_token_id is not None and self.weaker_drafter is None:
             topk_index = self.hot_token_id[topk_index]
 
         out_cache_loc = out_cache_loc.reshape(
@@ -652,12 +670,10 @@ class EAGLEWorker(TpModelWorker):
             )
             self._detect_nan_if_needed(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            if self.log_cold_token_prob:
-                cold_probs = probs[:, self.cold_token_mask]
-                sum_of_cold_probs = torch.sum(cold_probs, dim=-1)
-                self.log_stats(sum_of_cold_probs, "draft_forward")
+            if self.weaker_drafter is not None:
+                probs = self.process_probs(probs, "draft_forward")
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            if self.hot_token_id is not None and not self.log_cold_token_prob:
+            if self.hot_token_id is not None and self.weaker_drafter is None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
@@ -946,10 +962,8 @@ class EAGLEWorker(TpModelWorker):
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        if self.log_cold_token_prob:
-            cold_probs = probs[:, self.cold_token_mask]
-            sum_of_cold_probs = torch.sum(cold_probs, dim=-1)
-            self.log_stats(sum_of_cold_probs, "capture_for_decode")
+        if self.weaker_drafter is not None:
+            probs = self.process_probs(probs, "capture_for_decode")
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 
@@ -959,42 +973,74 @@ class EAGLEWorker(TpModelWorker):
             if torch.any(torch.isnan(logits)):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
-    
+
     def log_stats(self, sum_of_cold_probs: torch.Tensor, calling_func: str):
         """Log statistics for current batch and accumulate for cross-batch stats."""
         sum_of_cold_probs = sum_of_cold_probs.to(torch.float64)
         # logger.info(f"Sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs}")
-        logger.info(f"Mean sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.mean().item()}")
-        logger.info(f"Std of sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.std().item()}")
-        logger.info(f"Max sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.max().item()}")
-        logger.info(f"Min sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.min().item()}")
-        
+        logger.info(
+            f"Mean sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.mean().item()}"
+        )
+        logger.info(
+            f"Std of sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.std().item()}"
+        )
+        logger.info(
+            f"Max sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.max().item()}"
+        )
+        logger.info(
+            f"Min sum of cold token probs for each batched req in {calling_func}: {sum_of_cold_probs.min().item()}"
+        )
+
         # Accumulate data for cross-batch statistics
-        self.all_cold_probs_data.extend(sum_of_cold_probs.cpu().tolist())
+        self.all_cold_probs_data.extend(sum_of_cold_probs.detach().cpu().tolist())
         self.log_stats_call_count += 1
-        
+
         # Log accumulated stats every 50 calls
         if self.log_stats_call_count % 50 == 0:
             self.log_accumulated_stats()
-    
+
     def log_accumulated_stats(self):
         """Log statistics across all batches processed so far."""
         if not self.all_cold_probs_data:
             logger.info("No accumulated cold token probability data to log.")
             return
-        
+
         all_probs = torch.tensor(self.all_cold_probs_data)
         logger.info(f"=== ACCUMULATED STATS ACROSS ALL BATCHES ===")
-        logger.info(f"Total number of requests processed: {len(self.all_cold_probs_data)}")
-        logger.info(f"Mean sum of cold token probs across all requests: {all_probs.mean().item()}")
-        logger.info(f"Std of sum of cold token probs across all requests: {all_probs.std().item()}")
-        logger.info(f"Max sum of cold token probs across all requests: {all_probs.max().item()}")
-        logger.info(f"Min sum of cold token probs across all requests: {all_probs.min().item()}")
+        logger.info(
+            f"Total number of requests processed: {len(self.all_cold_probs_data)}"
+        )
+        logger.info(
+            f"Mean sum of cold token probs across all requests: {all_probs.mean().item()}"
+        )
+        logger.info(
+            f"Std of sum of cold token probs across all requests: {all_probs.std().item()}"
+        )
+        logger.info(
+            f"Max sum of cold token probs across all requests: {all_probs.max().item()}"
+        )
+        logger.info(
+            f"Min sum of cold token probs across all requests: {all_probs.min().item()}"
+        )
         logger.info(f"=== END ACCUMULATED STATS ===")
-    
+
     def reset_accumulated_stats(self):
         """Reset the accumulated statistics."""
         self.all_cold_probs_data = []
+
+    def process_probs(self, probs: torch.Tensor, calling_func: str) -> torch.Tensor:
+        cold_probs = probs[:, self.cold_token_mask]
+        sum_of_cold_probs = torch.sum(cold_probs, dim=-1)
+        self.log_stats(sum_of_cold_probs, calling_func)
+        # Mix the probs and the weaker drafter for every probs in the batch
+        weaker_drafters_cold = (
+            sum_of_cold_probs[:, None]
+            * self.weaker_drafter[self.cold_token_mask][None, :]
+        )
+        probs[:, self.cold_token_mask] = weaker_drafters_cold
+        # Normalize the each probs in the batch
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        return probs
 
 
 def load_token_map(token_map_path: str) -> List[int]:
@@ -1006,6 +1052,21 @@ def load_token_map(token_map_path: str) -> List[int]:
         token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
     hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int64)
+
+
+def load_tensor_from_path(tensor_path: str) -> torch.Tensor:
+    if not os.path.exists(tensor_path):
+        cache_dir = snapshot_download(
+            os.path.dirname(tensor_path),
+            # Avoid downloading the large model weights
+            ignore_patterns=["*.bin", "*.safetensors"],
+        )
+        tensor_path = os.path.join(cache_dir, os.path.basename(tensor_path))
+    tensor = torch.load(tensor_path, weights_only=True)
+    if not isinstance(tensor, torch.Tensor):
+        # The loaded object could be a list of numbers
+        tensor = torch.tensor(tensor)
+    return tensor
 
 
 @torch.compile(dynamic=True)
