@@ -404,7 +404,12 @@ class HFRunner:
                 input_ids = torch.tensor([p], device="cuda")
 
             if lora_paths is not None and lora_paths[i] is not None:
-                from peft import PeftModel
+                from peft import PeftConfig, PeftModel
+
+                peft_config = PeftConfig.from_pretrained(lora_paths[i])
+                if "embed_tokens" in peft_config.target_modules:
+                    tok = get_tokenizer(lora_paths[i])
+                    base_model.resize_token_embeddings(len(tok))
 
                 model = PeftModel.from_pretrained(
                     base_model,
