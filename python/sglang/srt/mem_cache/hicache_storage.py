@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import torch
@@ -30,6 +31,13 @@ def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
         hasher.update(t.to_bytes(4, byteorder="little", signed=False))
 
     return hasher.hexdigest()
+
+
+@dataclass
+class HiCacheStorageConfig:
+    tp_rank: int
+    tp_size: int
+    is_mla_model: bool
 
 
 class HiCacheStorage(ABC):
@@ -117,18 +125,17 @@ class HiCacheStorage(ABC):
 
 class HiCacheFile(HiCacheStorage):
 
-    def __init__(self, file_path: str = "/tmp/hicache", is_mla_backend: bool = False):
+    def __init__(
+        self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
+    ):
         self.file_path = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", file_path)
-        if is_dp_attention_enabled():
-            tp_rank = get_attention_tp_rank()
-            tp_size = get_attention_tp_size()
-        else:
-            tp_rank = get_tensor_model_parallel_rank()
-            tp_size = get_tensor_model_parallel_world_size()
 
-        self.tp_suffix = (
-            f"_{tp_rank}_{tp_size}" if tp_size > 1 and not is_mla_backend else ""
+        tp_rank, tp_size, is_mla = (
+            storage_config.tp_rank,
+            storage_config.tp_size,
+            storage_config.is_mla_model,
         )
+        self.tp_suffix = f"_{tp_rank}_{tp_size}" if tp_size > 1 and not is_mla else ""
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")

@@ -26,7 +26,15 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
 logger = logging.getLogger(__name__)
@@ -248,6 +256,13 @@ class HiCacheController:
 
             self.get_hash_str = get_hash_str
 
+            if is_dp_attention_enabled():
+                self.tp_rank = get_attention_tp_rank()
+                self.tp_size = get_attention_tp_size()
+            else:
+                self.tp_rank = get_tensor_model_parallel_rank()
+                self.tp_size = get_tensor_model_parallel_world_size()
+
             # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
             is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
             # In MLA backend, only one rank needs to backup the KV cache
@@ -258,10 +273,17 @@ class HiCacheController:
                 # todo: support other storage backends
                 and self.storage_backend_type in ["file", "mooncake"]
             )
+
+            self.storage_config = HiCacheStorageConfig(
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                is_mla_model=is_mla_backend,
+            )
+
             if storage_backend == "file":
                 from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 
-                self.storage_backend = HiCacheFile(is_mla_backend=is_mla_backend)
+                self.storage_backend = HiCacheFile(self.storage_config)
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 
@@ -271,7 +293,7 @@ class HiCacheController:
                     MooncakeStore,
                 )
 
-                self.storage_backend = MooncakeStore(is_mla_backend=is_mla_backend)
+                self.storage_backend = MooncakeStore(self.storage_config)
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":
@@ -289,7 +311,7 @@ class HiCacheController:
                     )
                 dtype = mem_pool_host.dtype
                 self.storage_backend = HiCacheHF3FS.from_env_config(
-                    bytes_per_page, dtype
+                    bytes_per_page, dtype, self.storage_config
                 )
             else:
                 raise NotImplementedError(
