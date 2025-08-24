@@ -11,7 +11,7 @@ def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
     if sm_version < 90:
         return False
-    # TODO fix deepgemm cu128 fp8 issue
+    # TODO fix deepgemm cu129 fp8 issue
     if torch.version.cuda == "12.9":
         return False
 
