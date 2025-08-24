@@ -114,6 +114,11 @@ def test_per_token_group_quant_with_column_major(
         f"{num_tokens=} {hidden_dim=} {group_size=} {num_ranks=} {dst_dtype=} {flags=}"
     )
 
+    arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+    if flags["scale_ue8m0"] and (arch_major <= 9):
+        pytest.skip("Only Blackwell need ue8m0 fusion")
+        return
+
     if (flags["scale_ue8m0"] and (group_size != 128)) or (
         (dst_dtype == torch.int8) and flags["column_major_scales"]
     ):
