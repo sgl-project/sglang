@@ -67,7 +67,7 @@ __global__ void per_token_quant_fp8_kernel(
     for (uint32_t j = 0; j < kVecSize; ++j) {
       float val = static_cast<float>(input_vec[j]) * scale_inv;
       val = fmaxf(fminf(val, FP8_E4M3_MAX), -FP8_E4M3_MAX);
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
       output_arr[j] = static_cast<DST_DTYPE>(val);
 #else
       output_arr[j] = c10::Float8_e4m3fnuz(
@@ -143,7 +143,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
       float val = fmaxf(fminf(static_cast<float>(input_vec[j]) * scale_inv, FP8_E4M3_MAX), -FP8_E4M3_MAX);
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
       output_arr[j] = static_cast<DST_DTYPE>(val);
 #else
       output_arr[j] = c10::Float8_e4m3fnuz(
@@ -173,9 +173,8 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   TORCH_CHECK(hidden_dim % 8 == 0, "Hidden dimension must be divisible by 8, but got ", hidden_dim);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  // Hard-code sm_count
-  int sm_count = 132;
-  constexpr int TOKENS_PER_CTA = 8;
+  const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const int TOKENS_PER_CTA = 8;
   const bool use_warp_kernel = (num_tokens >= sm_count * 2 * TOKENS_PER_CTA);
   const bool use_vec16 = (hidden_dim % 16 == 0);
 
