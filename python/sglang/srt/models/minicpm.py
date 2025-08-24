@@ -14,7 +14,7 @@
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
 
 import math
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, List
 
 import torch
 from torch import nn
@@ -38,6 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+
 
 
 class MiniCPMMLP(nn.Module):
@@ -76,7 +77,6 @@ class MiniCPMMLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
-
 
 class MiniCPMAttention(nn.Module):
     def __init__(
@@ -138,6 +138,8 @@ class MiniCPMAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        # set rope as fp32 instead of bf16
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -163,7 +165,6 @@ class MiniCPMAttention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
-
 
 class MiniCPMDecoderLayer(nn.Module):
     def __init__(
@@ -231,7 +232,6 @@ class MiniCPMDecoderLayer(nn.Module):
 
         return hidden_states, None
 
-
 class MiniCPMModel(nn.Module):
     def __init__(
         self,
@@ -240,6 +240,8 @@ class MiniCPMModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        #[MODIFIED: SUPPORT EAGLE3]
+        self.layers_to_capture = []
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -275,7 +277,14 @@ class MiniCPMModel(nn.Module):
             hidden_states = input_embeds
         residual = None
 
+        #[MODIFIED: FOR EAGLE3 SUPPORT]
+        aux_hidden_states = []
+
         for i in range(len(self.layers)):
+            #[MODIFIED: FOR EAGLE3 SUPPORT]
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
+            
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -283,9 +292,13 @@ class MiniCPMModel(nn.Module):
                 forward_batch,
                 residual,
             )
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
 
+        hidden_states = self.norm(hidden_states)
+
+        #[MODIFIED: FOR EAGLE3 SUPPORT, otherwise directly return hidden_states]
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 class MiniCPMForCausalLM(nn.Module):
     def __init__(
@@ -315,6 +328,9 @@ class MiniCPMForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
 
+        #[MODIFIED: FOR EAGLE3 SUPPORT]
+        self.capture_aux_hidden_states = False
+
     @torch.no_grad()
     def forward(
         self,
@@ -326,12 +342,19 @@ class MiniCPMForCausalLM(nn.Module):
         if input_embeds is not None:
             input_embeds = input_embeds * self.config.scale_emb
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        #[MODIFIED: FOR EAGLE3 SUPPORT]
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         hidden_states = hidden_states / self.scale_width
+
         if self.config.tie_word_embeddings:
             lm_head = self.model.embed_tokens
         else:
             lm_head = self.lm_head
-        return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
+        return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -394,6 +417,37 @@ class MiniCPMForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+    
+    #[MODIFIED: FOR EAGLE3 SUPPORT]
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
 
+    #[MODIFIED: FOR EAGLE3 SUPPORT]
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    #[MODIFIED: FOR EAGLE3 SUPPORT]
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        self.model.load_kv_cache_scales(quantization_param_path)
+    
+    #[MODIFIED: FOR EAGLE3 SUPPORT]
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            # 规定捕捉哪些hidden states的layers
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 EntryClass = MiniCPMForCausalLM
