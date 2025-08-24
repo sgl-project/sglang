@@ -207,6 +207,8 @@ def run_one_case(
     overall_throughput = batch_size * (input_len + output_len) / latency
 
     server_info = requests.get(url + "/get_server_info").json()
+    if "decode" in server_info:
+        server_info = server_info["decode"][0]
     acc_length = server_info["internal_states"][0].get("avg_spec_accept_length", None)
     last_gen_throughput = server_info["internal_states"][0]["last_gen_throughput"]
 
