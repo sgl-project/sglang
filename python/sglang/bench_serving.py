@@ -696,6 +696,7 @@ ASYNC_REQUEST_FUNCS = {
     "trt": async_request_trt_llm,
     "gserver": async_request_gserver,
     "truss": async_request_truss,
+    "mlc": async_request_openai_completions,
 }
 
 
@@ -1465,6 +1466,7 @@ async def benchmark(
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
+    print("{:<40} {:<10}".format("Model:", model_id))
     print("{:<40} {:<10}".format("Backend:", backend))
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
     print(
@@ -1533,6 +1535,7 @@ async def benchmark(
     ):
         result = {
             # Arguments
+            "model": model_id,
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": request_rate,
@@ -1664,6 +1667,7 @@ def run_benchmark(args_: argparse.Namespace):
             "trt": 8000,
             "gserver": 9988,
             "truss": 8080,
+            "mlc": 8000,
         }.get(args.backend, 30000)
 
     model_url = (
@@ -1678,7 +1682,7 @@ def run_benchmark(args_: argparse.Namespace):
             if args.base_url
             else f"http://{args.host}:{args.port}/generate"
         )
-    elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
+    elif args.backend in ["sglang-oai", "vllm", "lmdeploy", "mlc"]:
         api_url = (
             f"{args.base_url}/v1/completions"
             if args.base_url
