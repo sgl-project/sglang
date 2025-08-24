@@ -1,4 +1,4 @@
-# SGLang on Ascend NPUs
+# Ascend NPUs
 
 You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
@@ -99,7 +99,7 @@ We are also providing a DeepEP-compatible Library as a drop-in replacement of de
 
 ```shell
 # Use the last release branch
-git clone -b v0.5.0rc2 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
