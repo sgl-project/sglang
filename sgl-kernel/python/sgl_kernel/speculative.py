@@ -60,6 +60,35 @@ def verify_tree_greedy(
     )
 
 
+def verify_tree_relaxed(
+    predicts: torch.Tensor,  # mutable
+    accept_index: torch.Tensor,  # mutable
+    accept_token_num: torch.Tensor,  # mutable
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_topk_ids: torch.Tensor,
+    target_topk_probs: torch.Tensor,
+    relax_top_ks: torch.Tensor,
+    relax_ratios: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.verify_tree_relaxed.default(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        target_topk_ids,
+        target_topk_probs,
+        relax_top_ks,
+        relax_ratios,
+        get_cuda_stream(),
+    )
+
+
 def build_tree_kernel_efficient(
     parent_list: torch.Tensor,
     selected_index: torch.Tensor,
