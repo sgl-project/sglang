@@ -41,6 +41,7 @@ class TestEnableThinking(CustomTestCase):
                 "qwen3",
             ],
         )
+        cls.additional_chat_kwargs = {}
 
     @classmethod
     def tearDownClass(cls):
@@ -57,6 +58,7 @@ class TestEnableThinking(CustomTestCase):
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": True},
+                **self.additional_chat_kwargs,
             },
         )
 
@@ -80,6 +82,7 @@ class TestEnableThinking(CustomTestCase):
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": False},
+                **self.additional_chat_kwargs,
             },
         )
 
@@ -105,6 +108,7 @@ class TestEnableThinking(CustomTestCase):
                 "separate_reasoning": True,
                 "stream": True,
                 "chat_template_kwargs": {"enable_thinking": True},
+                **self.additional_chat_kwargs,
             },
             stream=True,
         )
@@ -149,6 +153,7 @@ class TestEnableThinking(CustomTestCase):
                 "separate_reasoning": True,
                 "stream": True,
                 "chat_template_kwargs": {"enable_thinking": False},
+                **self.additional_chat_kwargs,
             },
             stream=True,
         )
@@ -310,6 +315,57 @@ class TestEnableThinkingWithStructuredOutputs(CustomTestCase):
         self.assertIsInstance(json_output, dict)
         self.assertIsInstance(json_output["name"], str)
         self.assertIsInstance(json_output["population"], int)
+
+        
+# Skip for ci test
+# class TestGLM45EnableThinking(TestEnableThinking):
+#     @classmethod
+#     def setUpClass(cls):
+#         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+#         cls.model = "THUDM/GLM-4.5"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-1234"
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             api_key=cls.api_key,
+#             other_args=[
+#                 "--tool-call-parser",
+#                 "glm45",
+#                 "--reasoning-parser",
+#                 "glm45",
+#                 "--tp-size",
+#                 "8"
+#             ],
+#         )
+
+#         # Validate whether enable-thinking conflict with tool_calls
+#         cls.additional_chat_kwargs = {
+#             "tools": [
+#                 {
+#                     "type": "function",
+#                     "function": {
+#                         "name": "add",
+#                         "description": "Compute the sum of two numbers",
+#                         "parameters": {
+#                             "type": "object",
+#                             "properties": {
+#                                 "a": {
+#                                     "type": "int",
+#                                     "description": "A number",
+#                                 },
+#                                 "b": {
+#                                     "type": "int",
+#                                     "description": "A number",
+#                                 },
+#                             },
+#                             "required": ["a", "b"],
+#                         },
+#                     },
+#                 }
+#             ]
+#         }
 
 
 if __name__ == "__main__":
