@@ -34,6 +34,9 @@ apt-get update \
 python3 python3-pip \
 && apt-get clean \
 && rm -rf /var/lib/apt/lists/*
+# apt install python3.12 python3.12-venv python3.12-dev
+# curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+# python3.12 get-pip.py
 
 # Generated wheel location: dist/hf3fs_py_usrbio-1.2.9+2db69ce-cp310-cp310-linux_x86_64.whl
 python3 setup.py bdist_wheel
@@ -60,6 +63,6 @@ apt update && apt install -y                            \
   libuv1-dev
 
 # Install Python Package
-pip install hf3fs_py_usrbio-1.2.9+2db69ce-cp310-cp310-linux_x86_64.whl
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.10/dist-packages
+pip install hf3fs_py_usrbio-1.2.9+394583d-cp312-cp312-linux_x86_64.whl
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/dist-packages
 ```

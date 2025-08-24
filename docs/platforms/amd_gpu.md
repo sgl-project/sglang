@@ -44,7 +44,7 @@ You can install SGLang using one of the methods below.
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.0rc2 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Compile sgl-kernel

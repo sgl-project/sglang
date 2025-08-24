@@ -48,6 +48,7 @@ metrics = "0.24.2"
 metrics-exporter-prometheus = "0.17.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 thiserror = "2.0.12"
+regex = "1.10"
 url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
@@ -73,11 +74,17 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 portpicker = "0.1"
 tempfile = "3.8"
+lazy_static = "1.4"
 
 [[bench]]
 name = "request_processing"
 harness = false
 path = "benches/request_processing.rs"
+
+[[bench]]
+name = "tokenizer_benchmark"
+harness = false
+path = "benches/tokenizer_benchmark.rs"
 
 [profile.release]
 lto = "thin"

@@ -557,7 +557,10 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+        pad_output = (
+            not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+            and not cutlass_fp8_supported
+        )
     output_padding = 17 if pad_output else None
 
     # View input as 2D matrix for fp8 methods
