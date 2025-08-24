@@ -866,7 +866,6 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
-
     def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
         """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
 
