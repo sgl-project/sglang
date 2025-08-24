@@ -597,6 +597,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.handle,
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
+            **(
+                dict(use_logfmt=True)
+                if get_bool_env_var("SGLANG_DEEPEP_LL_COPMBINE_USE_LOGFMT")
+                else {}
+            ),
         )
         self.handle = None
         return combined_hidden_states, event, hook
