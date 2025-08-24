@@ -1740,7 +1740,7 @@ def run_benchmark(args_: argparse.Namespace):
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
 
-    print(f"{args}\n")
+    print(json.dumps(vars(args), indent=2))
 
     # Read dataset
     backend = args.backend
