@@ -5,15 +5,22 @@ from sgl_kernel import tree_speculative_sampling_target_only
 
 test_cases = [
     (
-        1,
-        1,
+        [1, 1],
+        [1, 1],
         [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18],
         [[0, 3, 4, 5], [6, 10, 11, -1]],
         [3, 2],
     ),
     (
-        0,  # threshold_single
-        0,  # threshold_acc
+        [0, 0],  # threshold_single
+        [0, 0],  # threshold_acc
+        [1, 2, 18, -1, -1, -1, 11, -1, -1, -1, 12, 18],
+        [[0, 1, 2, -1], [6, 10, 11, -1]],
+        [2, 2],
+    ),
+    (
+        [0, 1],
+        [0, 1],
         [1, 2, 18, -1, -1, -1, 11, -1, -1, -1, 12, 18],
         [[0, 1, 2, -1], [6, 10, 11, -1]],
         [2, 2],
@@ -22,12 +29,12 @@ test_cases = [
 
 
 @pytest.mark.parametrize(
-    "threshold_single, threshold_acc, expected_predicts, expected_accept_index, expected_accept_token_num",
+    "threshold_singles, threshold_accs, expected_predicts, expected_accept_index, expected_accept_token_num",
     test_cases,
 )
 def test_tree_speculative_sampling_target_only(
-    threshold_single,
-    threshold_acc,
+    threshold_singles,
+    threshold_accs,
     expected_predicts,
     expected_accept_index,
     expected_accept_token_num,
@@ -97,6 +104,11 @@ def test_tree_speculative_sampling_target_only(
     coins = torch.rand(bs, num_draft_tokens, device=device, dtype=torch.float32)
     coins_for_final_sampling = torch.rand(bs, device=device).to(torch.float32)
 
+    threshold_singles = torch.tensor(
+        threshold_singles, dtype=torch.float32, device=device
+    )
+    threshold_accs = torch.tensor(threshold_accs, dtype=torch.float32, device=device)
+
     tree_speculative_sampling_target_only(
         predicts=predicts,
         accept_index=accept_index,
@@ -109,20 +121,20 @@ def test_tree_speculative_sampling_target_only(
         uniform_samples_for_final_sampling=coins_for_final_sampling,
         target_probs=target_probs,
         draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
+        threshold_singles=threshold_singles,
+        threshold_accs=threshold_accs,
         deterministic=True,
     )
 
     assert (
         predicts.tolist() == expected_predicts
-    ), f"Predicts mismatch for thresholds ({threshold_single}, {threshold_acc})"
+    ), f"Predicts mismatch for thresholds ({threshold_singles}, {threshold_accs})"
     assert (
         accept_index.tolist() == expected_accept_index
-    ), f"Accept index mismatch for thresholds ({threshold_single}, {threshold_acc})"
+    ), f"Accept index mismatch for thresholds ({threshold_singles}, {threshold_accs})"
     assert (
         accept_token_num.tolist() == expected_accept_token_num
-    ), f"Accept token num mismatch for thresholds ({threshold_single}, {threshold_acc})"
+    ), f"Accept token num mismatch for thresholds ({threshold_singles}, {threshold_accs})"
 
 
 if __name__ == "__main__":
