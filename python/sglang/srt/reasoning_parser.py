@@ -513,12 +513,13 @@ class ReasoningParser:
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
+        "deepseek-v3": Qwen3Detector,
+        "glm45": Qwen3Detector,
+        "gpt-oss": GptOssDetector,
+        "kimi": KimiDetector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
-        "glm45": Qwen3Detector,
-        "kimi": KimiDetector,
         "step3": DeepSeekR1Detector,
-        "gpt-oss": GptOssDetector,
     }
 
     def __init__(
