@@ -599,7 +599,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             return_recv_hook=self.return_recv_hook,
             **(
                 dict(use_logfmt=True)
-                if get_bool_env_var("SGLANG_DEEPEP_LL_COPMBINE_USE_LOGFMT")
+                if get_bool_env_var("SGLANG_DEEPEP_LL_COMBINE_USE_LOGFMT")
                 else {}
             ),
         )
