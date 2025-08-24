@@ -64,6 +64,15 @@ class FlashAttentionMetadata:
 
     local_attn_metadata: Optional[LocalAttentionMetadata] = None
 
+    @dataclass
+    class SlidingWindowAttentionMetadata:
+        window_cache_seqlens_int32: torch.Tensor = None
+        window_page_table: torch.Tensor = None
+        window_cu_seqlens_k: torch.Tensor = None
+        window_max_seq_len: int = 0
+
+    sliding_window_attn_metadata: Optional[SlidingWindowAttentionMetadata] = None
+
 
 # Copied from:
 # https://github.com/houseroad/vllm/blob/4e45bfcaf928bdb9bd952b4ac922a3c205589ae8/vllm/v1/attention/backends/flash_attn.py
@@ -340,6 +349,10 @@ class FlashAttentionBackend(AttentionBackend):
             else None
         )
 
+        # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
+        # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
+        self.sliding_window_size = model_runner.sliding_window_size
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -433,6 +446,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                self._init_sliding_window_attn_metadata(forward_batch, metadata, device)
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -1025,9 +1039,22 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                page_table = metadata.page_table
-                cache_seqlens = metadata.cache_seqlens_int32
-                cu_seqlens_k = metadata.cu_seqlens_k
+                # Use sliding_window_attn_metadata for sliding window layer
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                    and metadata.sliding_window_attn_metadata is not None
+                ):
+                    sliding_window_attn_metadata = metadata.sliding_window_attn_metadata
+                    page_table = sliding_window_attn_metadata.window_page_table
+                    cache_seqlens = (
+                        sliding_window_attn_metadata.window_cache_seqlens_int32
+                    )
+                    cu_seqlens_k = sliding_window_attn_metadata.window_cu_seqlens_k
+                else:
+                    page_table = metadata.page_table
+                    cache_seqlens = metadata.cache_seqlens_int32
+                    cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
@@ -2039,6 +2066,37 @@ class FlashAttentionBackend(AttentionBackend):
             lam.local_max_query_len = int(seqlens_q_local_np.max())
             lam.local_max_seq_len = int(seqlens_k_local_np.max())
 
+    def _init_sliding_window_attn_metadata(
+        self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
+    ):
+        if self.sliding_window_size is None or self.sliding_window_size <= -1:
+            return
+
+        # TODO: support page_size > 1 for swa optimization
+        if self.page_size != 1:
+            return
+
+        (
+            window_page_table,
+            window_cache_seqlens_int32,
+            window_cu_seqlens_k,
+            window_max_seq_len,
+        ) = prepare_sliding_window_metadata(
+            metadata.page_table,
+            metadata.cache_seqlens_int32,
+            metadata.cu_seqlens_k,
+            self.sliding_window_size,
+        )
+
+        metadata.sliding_window_attn_metadata = (
+            FlashAttentionMetadata.SlidingWindowAttentionMetadata(
+                window_cache_seqlens_int32=window_cache_seqlens_int32,
+                window_cu_seqlens_k=window_cu_seqlens_k,
+                window_page_table=window_page_table,
+                window_max_seq_len=window_max_seq_len,
+            )
+        )
+
 
 class FlashAttentionMultiStepBackend:
 
@@ -2129,3 +2187,34 @@ def normal_decode_set_metadata(
         strided_indices[:max_seq_pages][None, :],
     ]
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
+
+
+def prepare_sliding_window_metadata(
+    page_table: torch.Tensor,
+    cache_seqlens_int32: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    sliding_window_size: int,
+):
+    bs = page_table.shape[0]
+    window_page_table = page_table.new_zeros((bs, sliding_window_size))
+    window_cache_seqlens_int32 = cache_seqlens_int32.new_empty(bs)
+    window_cu_seqlens_k = cu_seqlens_k.new_empty(bs + 1)
+    window_cu_seqlens_k[0] = 0
+    window_max_seq_len = 0
+
+    for i in range(bs):
+        ori_seq_len = cache_seqlens_int32[i]
+        window_seq_len = min(ori_seq_len, sliding_window_size)
+        window_page_table[i, :window_seq_len] = page_table[
+            i, ori_seq_len - window_seq_len : ori_seq_len
+        ]
+        window_cache_seqlens_int32[i] = window_seq_len
+        window_max_seq_len = max(window_seq_len, window_max_seq_len)
+        window_cu_seqlens_k[i + 1] = window_cu_seqlens_k[i] + window_seq_len
+
+    return (
+        window_page_table,
+        window_cache_seqlens_int32,
+        window_cu_seqlens_k,
+        window_max_seq_len,
+    )
