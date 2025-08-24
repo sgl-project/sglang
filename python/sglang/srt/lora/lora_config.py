@@ -49,17 +49,14 @@ class LoRAConfig:
         else:
             return self.path
 
-    def get_added_tokens(self, dummy=False):
-        if dummy:
-            raise NotImplementedError()
+    def get_added_tokens(self):
+        added_tokens_config_name = "added_tokens.json"
+        added_tokens_path = os.path.join(self.weights_dir, added_tokens_config_name)
+        if os.path.exists(added_tokens_path):
+            with open(added_tokens_path, "r") as f:
+                return json.load(f)
         else:
-            added_tokens_config_name = "added_tokens.json"
-            added_tokens_path = os.path.join(self.weights_dir, added_tokens_config_name)
-            if os.path.exists(added_tokens_path):
-                with open(added_tokens_path, "r") as f:
-                    return json.load(f)
-            else:
-                return None
+            return None
 
     def get_lora_config(self, dummy=False):
         if dummy:
