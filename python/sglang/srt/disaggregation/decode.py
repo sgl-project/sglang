@@ -45,7 +45,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
@@ -251,6 +251,7 @@ class DecodePreallocQueue:
                 data_parallel_rank=req.data_parallel_rank,
             )
 
+            req.add_latency(RequestStage.DECODE_PREPARE)
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -417,6 +418,7 @@ class DecodePreallocQueue:
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
             decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
+            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -656,6 +658,7 @@ class DecodeTransferQueue:
         for i in indices_to_remove:
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
+            self.queue[i].req.add_latency(RequestStage.DECODE_TRANSFERRED)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -847,6 +850,7 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
+                req.add_latency(RequestStage.DECODE_WAITING)
                 req.init_next_round_input(self.tree_cache)
             else:
                 waiting_queue.append(req)
