@@ -509,8 +509,6 @@ class CuDNNBackend(AttentionBackend):
         forward_batch,
         save_kv_cache=True,
     ):
-
-        
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
@@ -600,9 +598,9 @@ class CuDNNBackend(AttentionBackend):
             container_k_gpu = k_cache.view(s, h, b, d)
             container_v_gpu = v_cache.view(s, h, b, d)
 
-            # Sequence lengths
-            seq_lens_kv = seq_lens[i].view(1, 1, 1, 1)
-            seq_lens_q = padded_extend_seq_lens[i].view(1, 1, 1, 1)
+            # Sequence lengths, CuDNN requires int32 inputs
+            seq_lens_kv = seq_lens[i].to(dtype=torch.int32).view(1, 1, 1, 1)
+            seq_lens_q = padded_extend_seq_lens[i].to(dtype=torch.int32).view(1, 1, 1, 1)
 
             # Build the page table
             # only want prefix + the newly added tokens for each sequence
@@ -634,20 +632,8 @@ class CuDNNBackend(AttentionBackend):
                 args_i[self._ArgMapKeys.o]: output_i,
             }
 
-            if VALIDATE_PARAMS:
-                # Validate the shape and strides of cudnn args are same as torch inputs
-                for key in args_i:
-                    tensor_attr = args_i[key]
-                    torch_tensor = variant_pack[tensor_attr]
-                    if tensor_attr.get_dim() != list(torch_tensor.shape):
-                        raise ValueError(
-                            f"Invalid tensor shape {key}: cudnn expect {tensor_attr.get_dim()} but got {torch_tensor.shape}"
-                        )
-                    if tensor_attr.get_stride() != list(torch_tensor.stride()):
-                        raise ValueError(
-                            f"Invalid tensor stride {key}: cudnn expect {tensor_attr.get_stride()} (shape: {tensor_attr.get_dim()}) but got {torch_tensor.stride()} (shape: {torch_tensor.shape})"
-                        )
-
+            _validate_param(args_i,variant_pack)
+            
             workspace = torch.empty(
                 graph_i.get_workspace_size(), device="cuda", dtype=torch.uint8
             )
@@ -738,7 +724,7 @@ class CuDNNBackend(AttentionBackend):
         # Sequence length tensors for CuDNN
         # seq_lens: [batch_size] -> [batch_size, 1, 1, 1]
         batch_size = forward_batch.batch_size
-        seq_lens_kv = seq_lens.view(batch_size, 1, 1, 1)  # [batch_size, 1, 1, 1]
+        seq_lens_kv = seq_lens.to(dtype=torch.int32).view(batch_size, 1, 1, 1)  # [batch_size, 1, 1, 1]
         seq_lens_q = torch.ones_like(seq_lens_kv)  # [batch_size, 1, 1, 1] - always 1 for decode
         
         
@@ -754,20 +740,8 @@ class CuDNNBackend(AttentionBackend):
             args_i[self._ArgMapKeys.o]: output_reshaped,  # [batch_size, num_heads, 1, head_size]
         }
         
-        # Validate tensor shapes and strides if enabled
-        if VALIDATE_PARAMS:
-            for key in args_i:
-                tensor_attr = args_i[key]
-                torch_tensor = variant_pack[tensor_attr]
-                if tensor_attr.get_dim() != list(torch_tensor.shape):
-                    raise ValueError(
-                        f"Invalid tensor shape {key}: cudnn expect {tensor_attr.get_dim()} but got {torch_tensor.shape}"
-                    )
-                if tensor_attr.get_stride() != list(torch_tensor.stride()):
-                    raise ValueError(
-                        f"Invalid tensor stride {key}: cudnn expect {tensor_attr.get_stride()} but got {torch_tensor.stride()}"
-                    )
-        
+        _validate_param(args_i,variant_pack)
+       
         # Execute CuDNN graph
         workspace = torch.empty(
             graph_i.get_workspace_size(), device="cuda", dtype=torch.uint8
@@ -776,6 +750,26 @@ class CuDNNBackend(AttentionBackend):
         # Return the output in the expected format
         return output
 
+    
     def support_triton(self):
         """Check if the current backend supports triton."""
         return False
+
+def _validate_param(args_i, variant_pack):
+     # Validate tensor shapes, strides and dtype if enabled
+    if VALIDATE_PARAMS:
+        for key in args_i:
+            tensor_attr = args_i[key]
+            torch_tensor = variant_pack[tensor_attr]
+            if tensor_attr.get_dim() != list(torch_tensor.shape):
+                raise ValueError(
+                    f"Invalid tensor shape {key}: cudnn expect {tensor_attr.get_dim()} but got {torch_tensor.shape}"
+                )
+            if tensor_attr.get_stride() != list(torch_tensor.stride()):
+                raise ValueError(
+                    f"Invalid tensor stride {key}: cudnn expect {tensor_attr.get_stride()} but got {torch_tensor.stride()}"
+                )
+            if tensor_attr.get_data_type() != convert_to_cudnn_type(torch_tensor.dtype):
+                raise ValueError(
+                    f"Invalid dtype {key}: cudnn expect {tensor_attr.get_data_type()} but got {torch_tensor.dtype}"
+                )
