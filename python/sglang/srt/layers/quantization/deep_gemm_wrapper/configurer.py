@@ -1,5 +1,7 @@
 import logging
 
+import torch
+
 from sglang.srt.utils import get_bool_env_var, get_device_sm
 
 logger = logging.getLogger(__name__)
@@ -7,8 +9,10 @@ logger = logging.getLogger(__name__)
 
 def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
-    # TODO fix blackwell fp8
-    if sm_version != 90:
+    if sm_version < 90:
+        return False
+    # TODO fix deepgemm cu129 fp8 issue
+    if torch.version.cuda == "12.9":
         return False
 
     try:
