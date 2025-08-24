@@ -666,7 +666,8 @@ class Llama4ForConditionalGeneration(nn.Module):
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             log_info_on_rank0(
-                f"Some weights are not initialized from checkpoints {unloaded_params}"
+                logger,
+                f"Some weights are not initialized from checkpoints {unloaded_params}",
             )
 
     def _should_skip_weight(self, name: str) -> bool:
