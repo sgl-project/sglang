@@ -1701,14 +1701,17 @@ def direct_register_custom_op(
         my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
-    except RuntimeError as e:
+    except RuntimeError as error:
         if "Tried to register an operator" in str(e) and "multiple times" in str(e):
             # Silently ignore duplicate registration errors
             # This can happen in multi-engine scenarios
             pass
         else:
             # Re-raise other RuntimeErrors
-            raise
+            raise error
+    except AttributeError as error:
+        # Always re-raise AttributeError as it indicates missing dependencies
+        raise error
 
 
 def set_gpu_proc_affinity(
