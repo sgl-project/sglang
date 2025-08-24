@@ -32,14 +32,14 @@ def tree_speculative_sampling_target_only(
         # 3. Global stats
         global_mean = per_pos_mean_abs.mean()
         global_max = per_pos_mean_abs.max()
-        logger.debug("=========== <Probs diff stats> ===========")
-        logger.debug("target_probs: %s", target_probs)
-        logger.debug("draft_probs: %s", draft_probs)
-        logger.debug("diff: %s", diff)
-        logger.debug("per_seq_mean_abs: %s", per_seq_mean_abs)
-        logger.debug("global mean `q-p` per position: %s", global_mean.item())
-        logger.debug("global max  `q-p` per position: %s", global_max.item())
-        logger.debug("=========== </Probs diff stats> ===========")
+        logger.info("=========== <Probs diff stats> ===========")
+        logger.info("target_probs: %s", target_probs)
+        logger.info("draft_probs: %s", draft_probs)
+        logger.info("diff: %s", diff)
+        logger.info("per_seq_mean_abs: %s", per_seq_mean_abs)
+        logger.info("global mean `q-p` per position: %s", global_mean.item())
+        logger.info("global max  `q-p` per position: %s", global_max.item())
+        logger.info("=========== </Probs diff stats> ===========")
     torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default(
         predicts,
         accept_index,
