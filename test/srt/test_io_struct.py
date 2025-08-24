@@ -158,6 +158,9 @@ class TestGenerateReqInputNormalization(CustomTestCase):
     def test_mixed_none_and_images_with_parallel_samples(self):
         """Test that when some batch items have images and others None, parallel expansion works correctly."""
         req = copy.deepcopy(self.base_req)
+        # Initialization was done with 2 Ids but text in this test 3
+        # setting None for rid to be set in EmbeddingReqInput class
+        req.rid = None
         req.text = ["Prompt 1", "Prompt 2", "Prompt 3"]
         req.rid = ["id1", "id2", "id3"]
         req.image_data = [
