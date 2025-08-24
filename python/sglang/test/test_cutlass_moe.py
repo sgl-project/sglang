@@ -21,7 +21,7 @@ def calc_diff(x, y):
 
 def get_model_config(tp_size: int):
     config = AutoConfig.from_pretrained(
-        "/workdir/huggingface.co/deepseek-ai/DeepSeek-V3-0324/", trust_remote_code=True
+        "deepseek-ai/deepseek-R1", trust_remote_code=True
     )
     E = config.n_routed_experts
     topk = config.num_experts_per_tok
@@ -109,7 +109,6 @@ def run_test(tp_size, batch_size, model_config, check=False):
         torch.rand(batch_size, topk, device="cuda", dtype=dtype), dim=-1
     )
     topk_ids = torch.randint(0, E, (batch_size, topk), dtype=torch.int32, device="cuda")
-    router_logits = torch.rand(batch_size, E, device="cuda", dtype=dtype)
 
     a1_strides = torch.full((E,), H, dtype=torch.int64, device="cuda")
     c1_strides = torch.full((E,), I, dtype=torch.int64, device="cuda")

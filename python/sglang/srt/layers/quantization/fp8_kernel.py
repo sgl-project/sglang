@@ -1840,8 +1840,9 @@ def _shuffle_map_fp8_scale_hopper_moe_mn_major(
     k_offset = (pid % width) // group_size
 
     m = tl.load(problem_sizes + expert_id * 3)
-    m = tl.multiple_of(m, M_ALIGNMENT)
     current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
+    m = tl.multiple_of(m, M_ALIGNMENT)
+    current_expert_offset = tl.multiple_of(current_expert_offset, M_ALIGNMENT)
 
     for i in tl.range(tl.cdiv(m, BLOCK_M)):
         coord_m = i * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1881,8 +1882,9 @@ def _shuffle_fp8_scale_hopper_moe_mn_major(
     k_offset = (pid % width) // group_size
 
     m = tl.load(problem_sizes + expert_id * 3)
-    m = tl.multiple_of(m, M_ALIGNMENT)
     current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
+    m = tl.multiple_of(m, M_ALIGNMENT)
+    current_expert_offset = tl.multiple_of(current_expert_offset, M_ALIGNMENT)
 
     for i in tl.range(tl.cdiv(m, BLOCK_M)):
         coord_m = i * BLOCK_M + tl.arange(0, BLOCK_M)

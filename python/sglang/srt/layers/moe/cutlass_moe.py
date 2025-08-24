@@ -169,7 +169,6 @@ def cutlass_fused_experts_fp8(
                 problem_sizes1,
                 m * topk,
                 a_map,
-                M_ALIGNMENT=16,
             )
     else:
         raise NotImplementedError("Only support sm100 and sm90 for now")
@@ -215,7 +214,6 @@ def cutlass_fused_experts_fp8(
                 expert_offsets[:-1],
                 problem_sizes2,
                 m * topk,
-                M_ALIGNMENT=16,
             )
     w2_scale = w2_scale.contiguous()
 
