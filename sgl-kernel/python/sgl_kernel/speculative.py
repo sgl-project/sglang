@@ -1,5 +1,9 @@
+import logging
+
 import torch
 from sgl_kernel.utils import get_cuda_stream
+
+logger = logging.getLogger(__name__)
 
 
 def tree_speculative_sampling_target_only(
@@ -18,6 +22,24 @@ def tree_speculative_sampling_target_only(
     threshold_acc: float = 1.0,
     deterministic: bool = True,
 ) -> None:
+    with torch.no_grad():
+        # target_probs, draft_probs: [bs, num_draft_tokens, vocab]
+        diff = target_probs - draft_probs
+        # 1. Per drafted token mean difference
+        per_pos_mean_abs = diff.mean(dim=-1)  # [bs, num_draft_tokens]
+        # 2. Batch-level summary (mean over positions)
+        per_seq_mean_abs = per_pos_mean_abs.mean(dim=-1)  # [bs]
+        # 3. Global stats
+        global_mean = per_pos_mean_abs.mean()
+        global_max = per_pos_mean_abs.max()
+        logger.debug("=========== <Probs diff stats> ===========")
+        logger.debug("target_probs: %s", target_probs)
+        logger.debug("draft_probs: %s", draft_probs)
+        logger.debug("diff: %s", diff)
+        logger.debug("per_seq_mean_abs: %s", per_seq_mean_abs)
+        logger.debug("global mean `q-p` per position: %s", global_mean.item())
+        logger.debug("global max  `q-p` per position: %s", global_max.item())
+        logger.debug("=========== </Probs diff stats> ===========")
     torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default(
         predicts,
         accept_index,
