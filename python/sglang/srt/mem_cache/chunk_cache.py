@@ -85,11 +85,18 @@ class SWAChunkCache(ChunkCache):
         req: Req,
         prelen: int,
         attention_chunk_size: int,
+        sliding_window_size: int,
     ):
-        if prelen >= req.evicted_seqlen_local + attention_chunk_size:
-            new_evicted_seqlen_local = attention_chunk_size * (
-                prelen // attention_chunk_size
-            )
+        locked_zone_start = prelen - sliding_window_size
+
+        if locked_zone_start <= 0:
+            return
+
+        new_evicted_seqlen_local = attention_chunk_size * (
+            locked_zone_start // attention_chunk_size
+        )
+
+        if new_evicted_seqlen_local > req.evicted_seqlen_local:
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
             ]
