@@ -65,7 +65,7 @@ elif _is_hip:
 elif _is_cpu and _is_cpu_amx_available:
     from sglang.srt.layers.amx_utils import (
         SGLANG_USE_CPU_INT4_W4A8,
-        _amx_process_int4_packed_qweight_after_loading,
+        _amx_process_weight_after_loading,
     )
 else:
     warnings.warn(f"Only CUDA, HIP and CPU support AWQ currently.")
@@ -413,8 +413,8 @@ class AWQLinearMethod(LinearMethodBase):
             assert (
                 _is_cpu_amx_available
             ), "AWQLinearMethod on CPU requires that CPU has AMX support"
-            _amx_process_int4_packed_qweight_after_loading(
-                layer, ["qweight", "qzeros", "scales"], "awq"
+            _amx_process_weight_after_loading(
+                layer, ["qweight", "qzeros", "scales"], None, "awq"
             )
         else:
             layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
@@ -716,11 +716,11 @@ class AWQMoEMethod(FusedMoEMethodBase):
             assert (
                 _is_cpu_amx_available
             ), "AWQLinearMethod on CPU requires that CPU has AMX support"
-            _amx_process_int4_packed_qweight_after_loading(
-                layer, ["w13_qweight", "w13_qzeros", "w13_scales"], "awq"
+            _amx_process_weight_after_loading(
+                layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "awq"
             )
-            _amx_process_int4_packed_qweight_after_loading(
-                layer, ["w2_qweight", "w2_qzeros", "w2_scales"], "awq"
+            _amx_process_weight_after_loading(
+                layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "awq"
             )
             return
         num_experts = layer.w13_qweight.shape[0]
