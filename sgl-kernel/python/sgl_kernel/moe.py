@@ -349,7 +349,7 @@ def flashinfer_cutedsl_moe_masked(
         hidden_states,
         input_global_scale,
     )
-    gateup_output = torch.zeros(
+    gateup_output = torch.empty(
         (num_experts, m, n * 2), dtype=hidden_states.dtype, device=aq.device
     )
     gateup_output = gateup_output.permute(1, 2, 0)  # requirement of kernel
@@ -394,7 +394,7 @@ def flashinfer_cutedsl_moe_masked(
     )
 
     # Gemm2
-    out = torch.zeros_like(hidden_states)
+    out = torch.empty_like(hidden_states)
     out = out.permute(1, 2, 0)  # requirement of kernel
     grouped_gemm_nt_masked(
         (diq, diq_sf),
