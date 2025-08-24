@@ -383,6 +383,107 @@ cvt_fp16_to_fp4(
 #endif
 }
 
+// Use UE4M3 by default.
+template <class Type, bool UE8M0_SF = false>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+__launch_bounds__(512, 4) cvt_fp16_to_fp4_expert(
+#else
+cvt_fp16_to_fp4_expert(
+#endif
+    int32_t numRows,
+    int32_t numCols,
+    Type const* in,
+    float const* SFScale,
+    uint32_t* out,
+    uint32_t* SFout,
+    uint32_t* input_offset_by_experts,
+    uint32_t* output_scale_offset_by_experts,
+    int32_t* mask,
+    int n_experts) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  using PackedVec = PackedVec<Type>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
+
+  // Input tensor row/col loops.
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = (gridDim.x * blockDim.x) / n_experts;
+  int remainder = (gridDim.x * blockDim.x) % n_experts;
+  int expert_idx;
+  int tid_in_expert;
+  int actual_stride;
+  if (remainder > 0) {
+    int bound = remainder * (stride + 1);
+    if (tid < bound) {
+      expert_idx = tid / (stride + 1);
+      tid_in_expert = tid % (stride + 1);
+      actual_stride = stride + 1;
+    } else {
+      expert_idx = remainder + (tid - bound) / stride;
+      tid_in_expert = (tid - bound) % stride;
+      actual_stride = stride;
+    }
+  } else {
+    expert_idx = tid / stride;
+    tid_in_expert = tid % stride;
+    actual_stride = stride;
+  }
+
+  int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+  // TODO(kaixih@nvidia): For now, we assume mask is used together with
+  // silu_and_mal. Maybe we want a more general behavior of mask later. In the
+  // silu case, the input last dim doubles.
+  bool use_mask = mask != nullptr;
+  int actualColsPerRow = use_mask ? colsPerRow * 2 : colsPerRow;
+
+  // Each global thread processes one element
+  for (int globalIdx = tid_in_expert + input_offset_by_experts[expert_idx] * colsPerRow;
+       globalIdx < input_offset_by_experts[expert_idx + 1] * colsPerRow;
+       globalIdx += actual_stride) {
+    // Calculate which row and column this global thread should process
+    int rowIdx = globalIdx / colsPerRow;
+    int colIdx = globalIdx % colsPerRow;
+
+    // Find index within the experts
+    int rowIdx_in_expert = rowIdx - input_offset_by_experts[expert_idx];
+
+    // Eerly exit when using masks.
+    if (use_mask && rowIdx_in_expert >= mask[expert_idx]) {
+      break;
+    }
+
+    int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
+    PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+    if (use_mask) {
+      PackedVec in_vec_mul = reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
+      silu_and_mul(in_vec, in_vec_mul);
+    }
+
+    // Get the output tensor offset.
+    // Same as inOffset because 8 elements are packed into one uint32_t.
+    int64_t outOffset = rowIdx * colsPerRow + colIdx;
+    auto& out_pos = out[outOffset];
+
+    // Get the global scaling factor, which will be applied to the SF.
+    // Note SFScale is the same as next GEMM's alpha, which is
+    // (448.f / (Alpha_A / 6.f)).
+    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
+
+    int factor = CVT_FP4_SF_VEC_SIZE * 4;
+    // The actual output_scales dim is computed from the padded numCols.
+    int32_t numCols_padded = (numCols + factor - 1) / factor * factor;
+    int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
+    uint32_t* SFout_in_expert = SFout + output_scale_offset_by_experts[expert_idx] * numCols_SFout;
+
+    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+        rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
+
+    out_pos = cvt_warp_fp16_to_fp4<Type, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+  }
+#endif
+}
+
 // Kernel for LARGE_M_TOPK = true (large m_topk optimized version)
 template <class Type, bool UE8M0_SF = false, bool SMALL_NUM_EXPERTS = false>
 __global__ void
@@ -520,6 +621,23 @@ void quant_impl(
   while (grid.x <= multiProcessorCount && block.x > 64) {
     grid.x *= 2;
     block.x = (block.x + 1) / 2;
+  }
+
+  // TODO(kaixih@nvidia): Should relax this to allow any grid size.
+  if (mask != nullptr) {
+    grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;
+    cvt_fp16_to_fp4_expert<T, false><<<grid, block, 0, stream>>>(
+        m_topk,
+        k,
+        reinterpret_cast<T*>(input),
+        reinterpret_cast<float*>(input_global_scale),
+        reinterpret_cast<uint32_t*>(output),
+        reinterpret_cast<uint32_t*>(output_scale),
+        reinterpret_cast<uint32_t*>(input_offset_by_experts),
+        reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
+        reinterpret_cast<int32_t*>(mask),
+        n_experts);
+    return;
   }
 
   int const blockRepeat = (totalWorkSize + block.x * grid.x - 1) / (block.x * grid.x);
