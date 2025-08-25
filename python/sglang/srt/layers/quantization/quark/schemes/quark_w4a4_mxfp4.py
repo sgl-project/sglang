@@ -9,6 +9,7 @@ from aiter.ops.gemm_op_a4w4 import gemm_a4w4
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
 from aiter.utility import dtypes
 from aiter.utility.fp4_utils import e8m0_shuffle
 
@@ -94,7 +95,6 @@ class QuarkW4A4MXFP4(QuarkScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        out_dtype = x.dtype
         # M = x.shape[0]
         # N = layer.weight.shape[0]
 
@@ -108,11 +108,53 @@ class QuarkW4A4MXFP4(QuarkScheme):
         # return out[:M]
 
         # triton implement
-        x_q, x_s = dynamic_mxfp4_quant(x)
-        y = torch.empty(
-            x_q.shape[0], layer.weight.shape[0], device=x_q.device, dtype=out_dtype
-        )
 
-        out = gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, out_dtype, y)
+        #x_q, x_s = dynamic_mxfp4_quant(x)
+        #y = torch.empty(
+        #    x_q.shape[0], layer.weight.shape[0], device=x_q.device, dtype=out_dtype
+        #)
 
-        return out
+        #out = gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, out_dtype, y)
+
+        #return out
+
+        # This path doesnt have support for bias currently
+        assert bias is None, "bias is not supported"
+        three_d=False
+        x_s = None
+        y = None
+        if isinstance(x, tuple):
+            assert len(x) in [2, 3], "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+            if len(x) == 2:
+                x, x_s = x
+            elif len(x) == 3:
+                x, x_s, y = x
+
+        out_dtype = x.dtype
+
+        use_prequant_kernel = (
+            x_s is None and y is not None and layer.weight.shape[0] == y.shape[1]
+        )    
+
+        if x.dim() == 3:
+            three_d=True
+            x = x.view(-1, x.shape[-1])
+            output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+
+        if use_prequant_kernel or x_s is not None:
+            x_q = x
+        else:
+            x_q, x_s = dynamic_mxfp4_quant(x)
+
+        if y is None:
+            y = torch.empty(x_q.shape[0], layer.weight.shape[0], device=x_q.device, dtype=self.out_dtype)
+
+        if use_prequant_kernel:
+            gemm_afp4wfp4_pre_quant(x_q, layer.weight, layer.weight_scale, y.dtype, y)
+        else:
+            gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, self.out_dtype, y)
+
+        if three_d:
+            return y.view(*output_shape)
+        
+        return y 

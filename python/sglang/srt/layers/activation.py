@@ -49,6 +49,7 @@ if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
+    from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
 
 if is_npu():
     import torch_npu
@@ -57,18 +58,21 @@ logger = logging.getLogger(__name__)
 
 
 class SiluAndMul(CustomOp):
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_native(self, x: torch.Tensor, fused_mxfp4_prequant: Optional[bool] = False) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
+    def forward_cuda(self, x: torch.Tensor, fused_mxfp4_prequant: Optional[bool] = False) -> torch.Tensor:
+        if fused_mxfp4_prequant:
+            out = act_mul_and_mxfp4_quant(x, "silu")
+        else:
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            silu_and_mul(x, out)
         return out
 
-    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_cpu(self, x: torch.Tensor, fused_mxfp4_prequant: Optional[bool] = False) -> torch.Tensor:
         if _is_cpu_amx_available:
             d = x.shape[-1] // 2
             output_shape = x.shape[:-1] + (d,)
@@ -77,7 +81,7 @@ class SiluAndMul(CustomOp):
         else:
             return self.forward_native(x)
 
-    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_npu(self, x: torch.Tensor, fused_mxfp4_prequant: Optional[bool] = False) -> torch.Tensor:
         out = torch_npu.npu_swiglu(x)
         return out
 

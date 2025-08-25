@@ -128,10 +128,10 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 if _use_aiter:
-    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
     from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
     from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import batched_gemm_afp4wfp4_pre_quant
-    #from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
+    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+    from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
     def b_dynamic_mxfp4_quant(x):
@@ -233,11 +233,18 @@ class DeepseekV2MLP(nn.Module):
         forward_batch=None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        gate_up, _ = self.gate_up_proj(x)
+        if gemm_output_zero_allocator != None and x.shape[0] <= 256:
+            y = gemm_output_zero_allocator.allocate(x.shape[0]*self.gate_up_proj.output_size_per_partition).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+            gate_up, _ = self.gate_up_proj((x, None, y))
+            gate_up = gate_up.to(x.dtype)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
@@ -266,7 +273,7 @@ class MoEGate(nn.Module):
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None):
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
@@ -285,8 +292,25 @@ class MoEGate(nn.Module):
         ):
             # router gemm output float32
             logits = dsv3_router_gemm(hidden_states, self.weight)
-        #elif _use_aiter and hidden_states.shape[0] <= 256:
-        #    logits = gemm_a16w16(hidden_states, self.weight)
+        elif _use_aiter and hidden_states.shape[0] <= 256:
+            M = hidden_states.shape[0]
+            N = self.weight.shape[0]
+            y = None
+
+            if M <= 256:
+                # TODO (cagri): convert to bfloat16 as part of another kernel to save time
+                # for now it is also coupled with zero allocator.
+                dtype = torch.float32
+
+                if gemm_output_zero_allocator != None:
+                    y = gemm_output_zero_allocator.allocate(M * N).view(dtype).view(M, N)
+                else:
+                    y = torch.zeros((M, N), dtype=dtype, device=hidden_states.device)
+            
+            if y is not None:
+                logits = gemm_a16w16_atomic(hidden_states, self.weight, y=y).to(hidden_states.dtype)
+            else:
+                logits = gemm_a16w16(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
@@ -450,6 +474,7 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -463,12 +488,14 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states,
                     should_allreduce_fusion,
                     use_reduce_scatter,
+                    gemm_output_zero_allocator,
                 )
             else:
                 return self.forward_normal(
                     hidden_states,
                     should_allreduce_fusion,
                     use_reduce_scatter,
+                    gemm_output_zero_allocator,
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -478,6 +505,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
@@ -486,7 +514,7 @@ class DeepseekV2MoE(nn.Module):
 
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda:
@@ -513,6 +541,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -522,7 +551,7 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
         else:
             shared_output = None
@@ -1878,6 +1907,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -2050,6 +2080,27 @@ class DeepseekV2Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        if _use_aiter:
+            self.gemm_output_zero_allocator_size = 0
+            self.n_routed_experts = config.n_routed_experts
+
+            num_moe_layers = sum([1 for i in range(len(self.layers)) if isinstance(self.layers[i].mlp, DeepseekV2MoE)])
+            per_layer_size = 0
+
+            assert self.embed_tokens.embedding_dim == 7168, f"SGLANG_DSR1_AITER_TRITON_DECODE_FC1_FUSED_QUANT_GEMM=True option only surrport config.hidden_size == 7168, but got {self.embed_tokens.embedding_dim}, please set SGLANG_DSR1_AITER_TRITON_DECODE_FC1_FUSED_QUANT_GEMM=0"
+            allocate_size = 0
+            for i in range(len(self.layers)):
+                if isinstance(self.layers[i].mlp, DeepseekV2MoE):
+                    allocate_size = self.layers[i].mlp.shared_experts.gate_up_proj.output_size_per_partition
+                    break
+
+                per_layer_size += 256 * allocate_size
+
+            assert self.n_routed_experts == 256, f"SGLANG_DSR1_AITER_TRITON_MOEGATE_AITER_GEMM>0 option only support config.n_routed_experts == 256, but got {self.n_routed_experts}, please set SGLANG_DSR1_AITER_TRITON_MOEGATE_AITER_GEMM=0"
+            per_layer_size += 256 * self.n_routed_experts
+
+            self.gemm_output_zero_allocator_size = num_moe_layers * per_layer_size
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -2068,6 +2119,8 @@ class DeepseekV2Model(nn.Module):
             dtype=torch.float32,
             device=device,
         )
+
+        gemm_output_zero_allocator = BumpAllocator(buffer_size = self.gemm_output_zero_allocator_size, dtype=torch.float32, device=device) if self.gemm_output_zero_allocator_size > 0 else None
 
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -2095,7 +2148,7 @@ class DeepseekV2Model(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator
+                    positions, hidden_states, forward_batch, residual, zero_allocator, gemm_output_zero_allocator
                 )
 
         if normal_end_layer != self.end_layer:
