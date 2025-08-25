@@ -19,11 +19,13 @@ class BaseReasoningFormatDetector:
         think_end_token: str,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
+        is_hybrid: bool = False,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
+        self.is_hybrid = is_hybrid
 
         self._buffer = ""
         self.stripped_think_start = False
@@ -132,13 +134,19 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        is_hybrid: bool = False,
+    ):
         # DeepSeek-R1 is assumed to be reasoning until `</think>` token
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
+            is_hybrid=is_hybrid,
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
@@ -159,12 +167,18 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        is_hybrid: bool = True,
+    ):
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            is_hybrid=is_hybrid,
         )
 
 
@@ -177,12 +191,18 @@ class KimiDetector(BaseReasoningFormatDetector):
     and the rest of the text as `normal_text`.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        is_hybrid: bool = False,
+    ):
         super().__init__(
             "◁think▷",
             "◁/think▷",
             force_reasoning=False,
             stream_reasoning=stream_reasoning,
+            is_hybrid=is_hybrid,
         )
 
 
@@ -202,13 +222,19 @@ class GptOssDetector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        is_hybrid: bool = False,
+    ):
         # TypeScript uses channel tokens instead of simple start/end tokens
         super().__init__(
             "<|channel|>analysis<|message|>",
             "<|end|>",
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
+            is_hybrid=is_hybrid,
         )
         self.final_channel_start = "<|start|>assistant<|channel|>final<|message|>"
         self.final_channel_end = "<|return|>"
@@ -527,6 +553,7 @@ class ReasoningParser:
         model_type: Optional[str] = None,
         stream_reasoning: bool = True,
         force_reasoning: bool = False,
+        is_hybrid: bool = False,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -538,8 +565,13 @@ class ReasoningParser:
         if model_type.lower() == "qwen3-thinking":
             force_reasoning = True
 
+        if model_type.lower() == "qwen3":
+            is_hybrid = True
+
         self.detector = detector_class(
-            stream_reasoning=stream_reasoning, force_reasoning=force_reasoning
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            is_hybrid=is_hybrid,
         )
 
     def parse_non_stream(self, full_text: str) -> Tuple[str, str]:
