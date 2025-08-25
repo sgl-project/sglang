@@ -400,7 +400,7 @@ class DeepEPMoE(EPMoE):
                 self.w13_weight,
                 (
                     self.w13_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or get_moe_runner_backend().is_cutlass_w4afp8()
                     else self.w13_weight_scale
                 ),
             )
@@ -408,7 +408,7 @@ class DeepEPMoE(EPMoE):
                 self.w2_weight,
                 (
                     self.w2_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or get_moe_runner_backend().is_cutlass_w4afp8()
                     else self.w2_weight_scale
                 ),
             )
@@ -460,7 +460,7 @@ class DeepEPMoE(EPMoE):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif dispatch_output.format.is_deepep_ll():
-            if get_bool_env_var("SGLANG_USE_W4A8"):
+            if get_moe_runner_backend().is_cutlass_w4afp8():
                 return self.forward_cutlass_w4a8_masked(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled
+from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled,get_moe_runner_backend
 from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -496,7 +496,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=False if get_bool_env_var("SGLANG_USE_W4A8") else True,
+            use_fp8=not get_moe_runner_backend().is_cutlass_w4afp8(),
         )
         return (
             hidden_states,
