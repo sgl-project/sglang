@@ -333,10 +333,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
+            # Prefer runner-provided CPU seq_lens to avoid device->host copy during capture
+            seq_lens_cpu_capture = getattr(self, "_capture_seq_lens_cpu", None)
             self.indices_updater_decode.update(
                 req_pool_indices,
                 seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
+                (seq_lens_cpu_capture[:bs] if seq_lens_cpu_capture is not None else seq_lens.cpu()),
                 seq_lens_sum,
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
@@ -365,10 +367,11 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
+            seq_lens_cpu_capture = getattr(self, "_capture_seq_lens_cpu", None)
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
+                (seq_lens_cpu_capture[:bs] if seq_lens_cpu_capture is not None else seq_lens.cpu()),
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=prefill_wrappers,
@@ -395,10 +398,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             seq_lens_sum = seq_lens.sum().item()
+            seq_lens_cpu_capture = getattr(self, "_capture_seq_lens_cpu", None)
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
+                (seq_lens_cpu_capture[:bs] if seq_lens_cpu_capture is not None else seq_lens.cpu()),
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=prefill_wrappers,
