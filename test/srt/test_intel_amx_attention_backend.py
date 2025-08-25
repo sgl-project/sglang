@@ -3,7 +3,6 @@ Usage:
 python3 -m unittest test_intel_amx_attention_backend.TestIntelAMXAttnBackend.test_mmlu
 """
 
-import os
 import unittest
 from functools import wraps
 from types import SimpleNamespace
