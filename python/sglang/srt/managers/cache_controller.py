@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
 logger = logging.getLogger(__name__)
@@ -239,6 +240,7 @@ class HiCacheController:
         self.io_backend = io_backend
 
         self.enable_storage = False
+
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -246,10 +248,19 @@ class HiCacheController:
 
             self.get_hash_str = get_hash_str
 
+            is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
+            # In MLA backend, only one rank needs to backup the KV cache
+            self.backup_skip = (
+                is_mla_backend
+                # todo: for load balancing, decide which rank to backup the KV cache by hash value
+                and get_tensor_model_parallel_rank() != 0
+                # todo: support other storage backends
+                and self.storage_backend_type in ["file", "mooncake"]
+            )
             if storage_backend == "file":
                 from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 
-                self.storage_backend = HiCacheFile()
+                self.storage_backend = HiCacheFile(is_mla_backend=is_mla_backend)
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 
@@ -259,27 +270,25 @@ class HiCacheController:
                     MooncakeStore,
                 )
 
-                if isinstance(self.mem_pool_device, MHATokenToKVPool):
-                    self.storage_backend = MooncakeStore(cache_type="mha")
-                elif isinstance(self.mem_pool_device, MLATokenToKVPool):
-                    self.storage_backend = MooncakeStore(cache_type="mla")
-                else:
-                    raise ValueError(f"Unsupported cache type: {self.mem_pool_device}")
+                self.storage_backend = MooncakeStore(is_mla_backend=is_mla_backend)
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
             elif storage_backend == "hf3fs":
-                from sglang.srt.distributed import get_tensor_model_parallel_rank
                 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
                     HiCacheHF3FS,
                 )
 
-                rank = get_tensor_model_parallel_rank()
-                bytes_per_page = (
-                    mem_pool_host.get_size_per_token() * mem_pool_host.page_size
-                )
+                if self.mem_pool_host.layout == "page_first":
+                    bytes_per_page = (
+                        mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
+                    )
+                elif self.mem_pool_host.layout == "layer_first":
+                    bytes_per_page = (
+                        mem_pool_host.get_size_per_token() * mem_pool_host.page_size
+                    )
                 dtype = mem_pool_host.dtype
                 self.storage_backend = HiCacheHF3FS.from_env_config(
-                    rank, bytes_per_page, dtype
+                    bytes_per_page, dtype
                 )
             else:
                 raise NotImplementedError(
@@ -299,6 +308,9 @@ class HiCacheController:
             if self.tp_world_size > 1:
                 group_ranks = torch.distributed.get_process_group_ranks(tp_group)
                 self.prefetch_tp_group = torch.distributed.new_group(
+                    group_ranks, backend="gloo"
+                )
+                self.prefetch_io_tp_group = torch.distributed.new_group(
                     group_ranks, backend="gloo"
                 )
                 self.backup_tp_group = torch.distributed.new_group(
@@ -557,6 +569,26 @@ class HiCacheController:
         operation.mark_done()
         return operation.completed_tokens, operation.hash_value
 
+    def zerocopy_page_transfer(self, operation, batch_size=8):
+        hashes, dsts = self.mem_pool_host.get_buffer_with_hash(
+            operation.hash_value, operation.host_indices
+        )
+        for i in range(0, len(hashes), batch_size):
+            page_hashes = hashes[i : i + batch_size]
+            page_dsts = dsts[i : i + batch_size]
+            page_data = self.storage_backend.batch_get(page_hashes, page_dsts)
+            if page_data is None:
+                logger.warning(
+                    f"Prefetch operation {operation.request_id} failed to retrieve page {page_hashes}."
+                )
+                break
+            completed_tokens = operation.completed_tokens
+            if operation.increment(self.page_size * len(page_hashes)):
+                for i in range(len(page_hashes)):
+                    completed_tokens += self.page_size
+            else:
+                break
+
     def generic_page_transfer(self, operation, batch_size=8):
         for i in range(0, len(operation.hash_value), batch_size):
             batch_hashes = operation.hash_value[i : i + batch_size]
@@ -626,14 +658,19 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                if self.is_mooncake_backend() or self.storage_backend_type == "hf3fs":
+                if self.is_mooncake_backend():
                     self.generic_page_transfer(operation, batch_size=128)
+                elif self.storage_backend_type == "hf3fs":
+                    if self.mem_pool_host.layout == "page_first":
+                        self.zerocopy_page_transfer(operation, batch_size=128)
+                    elif self.mem_pool_host.layout == "layer_first":
+                        self.generic_page_transfer(operation, batch_size=128)
                 else:
                     self.generic_page_transfer(operation)
 
                 if self.tp_world_size > 1:
                     # to ensure all TP workers release the host memory at the same time
-                    torch.distributed.barrier(group=self.prefetch_tp_group)
+                    torch.distributed.barrier(group=self.prefetch_io_tp_group)
                 # operation terminated by controller, release pre-allocated memory
                 self.mem_pool_host.free(
                     operation.host_indices[operation.completed_tokens :]
@@ -739,6 +776,19 @@ class HiCacheController:
         self.backup_queue.put(operation)
         return operation.id
 
+    def zerocopy_page_backup(self, operation, batch_size=8):
+        hashes, dsts = self.mem_pool_host.get_buffer_with_hash(
+            operation.hash_value, operation.host_indices
+        )
+        for i in range(0, len(hashes), batch_size):
+            page_hashes = hashes[i : i + batch_size]
+            page_data = dsts[i : i + batch_size]
+            success = self.storage_backend.batch_set(page_hashes, page_data)
+            if not success:
+                logger.warning(f"Failed to write page {page_hashes} to storage.")
+                break
+            operation.completed_tokens += self.page_size * len(page_hashes)
+
     # Backup batch by batch
     def generic_page_backup(self, operation, batch_size=8):
         for i in range(0, len(operation.hash_value), batch_size):
@@ -787,12 +837,20 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if self.is_mooncake_backend() or self.storage_backend_type == "hf3fs":
-                    self.generic_page_backup(operation, batch_size=128)
+                if not self.backup_skip:
+                    if self.is_mooncake_backend():
+                        self.generic_page_backup(operation, batch_size=128)
+                    elif self.storage_backend_type == "hf3fs":
+                        if self.mem_pool_host.layout == "page_first":
+                            self.zerocopy_page_backup(operation, batch_size=128)
+                        elif self.mem_pool_host.layout == "layer_first":
+                            self.generic_page_backup(operation, batch_size=128)
+                    else:
+                        self.generic_page_backup(operation)
+                    min_completed_tokens = operation.completed_tokens
                 else:
-                    self.generic_page_backup(operation)
+                    min_completed_tokens = len(operation.token_ids)
 
-                min_completed_tokens = operation.completed_tokens
                 if self.tp_world_size > 1:
                     completed_tokens_tensor = torch.tensor(
                         min_completed_tokens, dtype=torch.int

@@ -84,18 +84,14 @@ class MooncakeStoreConfig:
 
 
 class MooncakeStore(HiCacheStorage):
-    def __init__(self, cache_type: str = "mha"):
+    def __init__(self, is_mla_backend: bool = False):
         """
         Initialize MooncakeStore.
 
         Args:
-            cache_type: Type of KV cache, either "mha" (Multi-Head Attention) or "mla" (Multi-Layer Attention)
+            is_mla_backend: If the backend is MLA
         """
-        if cache_type not in ["mha", "mla"]:
-            raise ValueError(f"cache_type must be 'mha' or 'mla', got {cache_type}")
-        print(f"MooncakeStore initialized with cache_type: {cache_type}")
-
-        self.cache_type = cache_type
+        self.is_mla_backend = is_mla_backend
 
         try:
             from mooncake.store import MooncakeDistributedStore
@@ -222,12 +218,10 @@ class MooncakeStore(HiCacheStorage):
         if len(keys) == 0:
             return 0
         get_result = self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
-        if self.cache_type == "mha":
-            key_multiplier = 2
-        elif self.cache_type == "mla":
+        if self.is_mla_backend:
             key_multiplier = 1
         else:
-            raise ValueError(f"Unsupported cache type: {self.cache_type}")
+            key_multiplier = 2
         for i in range(len(keys)):
             if get_result[i] < 0:
                 return i // key_multiplier
@@ -237,17 +231,15 @@ class MooncakeStore(HiCacheStorage):
         return self.batch_exists([key]) > 0
 
     def batch_exists(self, keys) -> int:
-        if self.cache_type == "mha":
+        if self.is_mla_backend:
+            query_keys = [f"{key}_k" for key in keys]
+            key_multiplier = 1
+        else:
             query_keys = []
             for key in keys:
                 query_keys.append(f"{key}_{self.local_rank}_k")
                 query_keys.append(f"{key}_{self.local_rank}_v")
             key_multiplier = 2
-        elif self.cache_type == "mla":
-            query_keys = [f"{key}_{self.local_rank}_k" for key in keys]
-            key_multiplier = 1
-        else:
-            raise ValueError(f"Unsupported cache type: {self.cache_type}")
 
         exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):

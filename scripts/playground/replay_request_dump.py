@@ -36,7 +36,7 @@ def read_records(files):
 
 def run_one_request_internal(record):
     (req, output, replay_init_time, start_time, end_time, idx) = record
-    time.sleep(max(0, start_time - (time.time() - replay_init_time)))
+    time.sleep(max(0, (start_time - (time.time() - replay_init_time)) / args.speed))
 
     if "completion_tokens" in output.get("meta_info", {}):
         recorded_completion_tokens = output["meta_info"]["completion_tokens"]
@@ -121,6 +121,7 @@ if __name__ == "__main__":
     parser.add_argument("--parallel", type=int, default=512)
     parser.add_argument("--idx", type=int, default=None)
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--speed", type=float, default=1)
     args = parser.parse_args()
 
     set_ulimit()

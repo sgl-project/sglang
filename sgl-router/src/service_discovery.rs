@@ -10,6 +10,7 @@ use kube::{
 };
 use std::collections::{HashMap, HashSet};
 
+use rustls;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task;
@@ -74,11 +75,10 @@ impl PodInfo {
             return false;
         }
 
-        pod.metadata.labels.as_ref().map_or(false, |labels| {
-            selector
-                .iter()
-                .all(|(k, v)| labels.get(k).map_or(false, |label_value| label_value == v))
-        })
+        pod.metadata
+            .labels
+            .as_ref()
+            .is_some_and(|labels| selector.iter().all(|(k, v)| labels.get(k) == Some(v)))
     }
 
     /// Check if a pod should be included in service discovery
@@ -187,6 +187,8 @@ pub async fn start_service_discovery(
             code: 400,
         }));
     }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Initialize Kubernetes client
     let client = Client::try_default().await?;
@@ -592,6 +594,7 @@ mod tests {
             None,
             crate::config::types::RetryConfig::default(),
             crate::config::types::CircuitBreakerConfig::default(),
+            crate::config::types::HealthCheckConfig::default(),
         )
         .await
         .unwrap();
