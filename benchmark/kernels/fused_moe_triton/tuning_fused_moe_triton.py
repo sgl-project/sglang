@@ -319,7 +319,7 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
-        with torch.cuda.device(self.device_id) if is_rocm() else nullcontext():
+        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             for config in tqdm(search_space):
                 try:
                     kernel_time = benchmark_config(
