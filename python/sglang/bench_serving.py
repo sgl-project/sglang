@@ -2032,7 +2032,7 @@ if __name__ == "__main__":
         "--random-image-num-images",
         type=int,
         default=1,
-        help="Number of images per request (only for the random-image dataset)",
+        help="Number of images per request (only available with the random-image dataset)",
     )
     parser.add_argument(
         "--random-image-resolution",
