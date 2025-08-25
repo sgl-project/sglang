@@ -261,7 +261,7 @@ suite_xeon = {
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
-        TestFile("test_attention_backend_on_cpu.py"),
+        TestFile("test_intel_amx_attention_backend.py"),
     ],
 }
 
