@@ -140,7 +140,8 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = True
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 1
+        # 0 is required for Gemma like models
+        return 0
 
     def forward_extend(
         self,
