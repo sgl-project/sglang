@@ -1813,8 +1813,8 @@ class FlashAttentionBackend(AttentionBackend):
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
             accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+            if spec_info.spec_steps is not None:
+                metadata.max_seq_len_q = spec_info.spec_steps + 1
             else:
                 metadata.max_seq_len_q = 1
 

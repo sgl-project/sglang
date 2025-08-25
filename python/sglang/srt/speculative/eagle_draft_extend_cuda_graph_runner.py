@@ -230,6 +230,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             accept_length=accept_length,
+            spec_steps=self.speculative_num_steps,
         )
         spec_info.positions = None
 

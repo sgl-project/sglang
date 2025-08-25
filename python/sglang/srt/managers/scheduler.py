@@ -177,6 +177,7 @@ _is_cpu = is_cpu()
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput]
     pp_hidden_states_proxy_tensors: Optional[torch.Tensor]
+    free_cache_loc_cpu: Optional[torch.Tensor]
     next_token_ids: Optional[List[int]]
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
@@ -317,7 +318,7 @@ class Scheduler(
             logger.info("Overlap scheduler is disabled for embedding models.")
 
         # Launch a tensor parallel worker
-        if self.enable_overlap:
+        if self.enable_overlap and not self.spec_algorithm.is_eagle():
             TpWorkerClass = TpModelWorkerClient
         else:
             TpWorkerClass = TpModelWorker
@@ -334,9 +335,16 @@ class Scheduler(
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+            if self.enable_overlap:
+                from sglang.srt.speculative.eagle_worker_overlap_thread import (
+                    EAGLEWorkerClient as EAGLEWorkerClass,
+                )
+            else:
+                from sglang.srt.speculative.eagle_worker import (
+                    EAGLEWorker as EAGLEWorkerClass,
+                )
 
-            self.draft_worker = EAGLEWorker(
+            self.draft_worker = EAGLEWorkerClass(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 moe_ep_rank=moe_ep_rank,
@@ -818,7 +826,11 @@ class Scheduler(
                     tmp_batch = ScheduleBatch(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                        next_batch_sampling_info=(
+                            self.draft_worker.cur_sampling_info
+                            if self.spec_algorithm.is_eagle()
+                            else self.tp_worker.cur_sampling_info
+                        ),
                     )
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
 
@@ -826,7 +838,13 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    (
+                        self.draft_worker.cur_sampling_info
+                        if self.spec_algorithm.is_eagle()
+                        else self.tp_worker.cur_sampling_info
+                    )
+                    if batch
+                    else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
@@ -1787,17 +1805,35 @@ class Scheduler(
                     )
                 bid = model_worker_batch.bid
             else:
+                if batch.has_grammar:
+                    raise NotImplementedError("Grammar is not supported for now")
+
+                model_worker_batch = batch.get_model_worker_batch()
+                if self.enable_overlap:
+                    # TODO (timmy): Do not alias seq_lens between forward and scheduler threads.
+                    # Optimistically estimate the seq_lens_cpu for the next draft forward
+                    model_worker_batch.seq_lens_cpu.add_(
+                        self.server_args.speculative_num_steps + 1
+                    )
+
+                # Populate fields needed to reuse batch for verify
+                model_worker_batch.extend_seq_lens = batch.extend_lens
+                model_worker_batch.extend_prefix_lens = batch.prefix_lens
+                model_worker_batch.extend_logprob_start_lens = (
+                    batch.extend_logprob_start_lens
+                )
+
                 (
                     logits_output,
                     next_token_ids,
+                    free_cache_loc_cpu,
                     bid,
-                    num_accepted_tokens,
                     can_run_cuda_graph,
-                ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                bs = batch.batch_size()
-                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
-                self.spec_num_total_forward_ct += bs
-                self.num_generated_tokens += num_accepted_tokens
+                    next_spec_info,
+                ) = self.draft_worker.forward_batch_speculative_generation(
+                    model_worker_batch
+                )
+                batch.spec_info = next_spec_info
 
             if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids
@@ -1822,6 +1858,9 @@ class Scheduler(
                     pp_hidden_states_proxy_tensors
                     if not self.pp_group.is_last_rank
                     else None
+                ),
+                free_cache_loc_cpu=(
+                    free_cache_loc_cpu if self.spec_algorithm.is_eagle() else None
                 ),
                 next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
                 extend_input_len_per_req=extend_input_len_per_req,

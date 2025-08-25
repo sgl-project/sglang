@@ -209,6 +209,7 @@ class EAGLEDraftCudaGraphRunner:
             topk_index=topk_index,
             hidden_states=hidden_states,
             capture_hidden_mode=CaptureHiddenMode.LAST,
+            spec_steps=self.speculative_num_steps,
         )
 
         # Forward batch
