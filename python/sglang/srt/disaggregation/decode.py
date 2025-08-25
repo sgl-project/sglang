@@ -475,7 +475,7 @@ class DecodePreallocQueue:
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
         if (
             self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_extend()
+            and self.scheduler.last_batch.forward_mode.is_fake_extend()
         ):
             allocatable_tokens -= self.num_reserved_decode_tokens * len(
                 self.scheduler.last_batch.reqs
@@ -636,16 +636,7 @@ class DecodeTransferQueue:
                 if hasattr(decode_req.kv_receiver, "clear"):
                     decode_req.kv_receiver.clear()
 
-                # special handling for sampling_params.max_new_tokens == 1
-                if decode_req.req.sampling_params.max_new_tokens == 1:
-                    # finish immediately
-                    decode_req.req.check_finished()
-                    self.scheduler.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
-                    )
-                    self.tree_cache.cache_finished_req(decode_req.req)
-                else:
-                    transferred_reqs.append(decode_req.req)
+                transferred_reqs.append(decode_req.req)
 
                 indices_to_remove.add(i)
             elif poll in [
@@ -683,24 +674,9 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
-            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
-
             if batch:
-                # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, any(req.return_logprob for req in batch.reqs)
-                    )
-                    if prepare_mlp_sync_flag:
-                        self._prepare_idle_batch_and_run(None)
-                else:
-                    if prepare_mlp_sync_flag:
-                        self.prepare_mlp_sync_batch(batch)
-                    result = self.run_batch(batch)
-                    self.process_batch_result(batch, result)
-            elif prepare_mlp_sync_flag:
-                batch, _ = self._prepare_idle_batch_and_run(None)
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
 
             if batch is None and (
                 len(self.waiting_queue)
@@ -714,9 +690,8 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
-        result_queue = deque()
+        self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
         while True:
             recv_reqs = self.recv_requests()
@@ -725,56 +700,29 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
-            last_batch_in_queue = False
-
-            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
 
             if batch:
-                # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, any(req.return_logprob for req in batch.reqs)
+                batch.launch_done = threading.Event()
+                result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), result))
+
+                if self.last_batch is None:
+                    # Create a dummy batch to start the pipeline for overlap schedule.
+                    # It is now used for triggering the sampling_info_done event.
+                    tmp_batch = ScheduleBatch(
+                        reqs=None,
+                        forward_mode=ForwardMode.DUMMY_FIRST,
+                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
-                    if prepare_mlp_sync_flag:
-                        batch_, result = self._prepare_idle_batch_and_run(
-                            None, delay_process=True
-                        )
-                        if batch_:
-                            result_queue.append((batch_.copy(), result))
-                            last_batch_in_queue = True
-                else:
-                    if prepare_mlp_sync_flag:
-                        self.prepare_mlp_sync_batch(batch)
-                    result = self.run_batch(batch)
-                    result_queue.append((batch.copy(), result))
-
-                    if (self.last_batch is None) or (not self.last_batch_in_queue):
-                        # Create a dummy first batch to start the pipeline for overlap schedule.
-                        # It is now used for triggering the sampling_info_done event.
-                        tmp_batch = ScheduleBatch(
-                            reqs=None,
-                            forward_mode=ForwardMode.DUMMY_FIRST,
-                            next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                        )
-                        self.set_next_batch_sampling_info_done(tmp_batch)
-                    last_batch_in_queue = True
-
-            elif prepare_mlp_sync_flag:
-                batch, result = self._prepare_idle_batch_and_run(
-                    None, delay_process=True
-                )
-                if batch:
-                    result_queue.append((batch.copy(), result))
-                    last_batch_in_queue = True
+                    self.process_batch_result(tmp_batch, None, batch.launch_done)
 
             # Process the results of the previous batch but skip if the last batch is extend
-            if self.last_batch and self.last_batch_in_queue:
-                tmp_batch, tmp_result = result_queue.popleft()
+            if self.last_batch:
+                tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
-                self.process_batch_result(tmp_batch, tmp_result)
+                self.process_batch_result(tmp_batch, tmp_result, batch.launch_done if batch else None)
 
             if batch is None and (
                 len(self.waiting_queue)
@@ -798,11 +746,23 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
-    ) -> Optional[Tuple[ScheduleBatch, bool]]:
-        """Create fake completed prefill if possible and merge with running batch"""
+    ) -> Optional[ScheduleBatch]:
+        """Create fake completed prefill if possible and merge with running batch
+        - Returns the fake prefill batch if there are requests can join decode.
+        - Returns the running batch if no joinable requests and the running batch is not empty.
+        - Returns None if no active requests.
+        - When Data Parallelism (DP) is enabled:
+            - Returns a DP idle batch/None if no active requests.
+            - Returns a prepared running batch if no joinable requests.
+            - Returns the fake prefill batch if there are requests in the waiting queue.
+
+        Note:
+            - the running batch is always a decode batch.
+            - fake prefill batch is associated with an idle batch which will be created in `run_batch`
+        """
         # Merge the prefill batch into the running batch
         last_batch = self.last_batch
-        if last_batch and last_batch.forward_mode.is_extend():
+        if last_batch and last_batch.forward_mode.is_fake_extend():
             # chunked prefill doesn't happen in decode instance.
             assert self.chunked_req is None
             # Filter finished batches.
@@ -825,6 +785,10 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+            if self.prepare_mlp_sync_flag:
+                # in dp, idle batch is created if ret is None.
+                # for fake prefill, the dp batch is also idle and created in run_batch
+                ret, _ = self.prepare_dp_attn_batch(ret)
 
         return ret
 
@@ -873,6 +837,7 @@ class SchedulerDisaggregationDecodeMixin:
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt_extend()
         new_batch.process_prebuilt_extend(self.server_args, self.model_config)
+        new_batch.forward_mode = ForwardMode.FAKE_EXTEND
 
         return new_batch
 

@@ -22,7 +22,7 @@ import threading
 import time
 from collections import deque
 from concurrent import futures
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
@@ -546,6 +546,8 @@ class Scheduler(
             and server_args.load_balance_method == "minimum_tokens"
         ):
             assert dp_balance_meta is not None
+
+        self.prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
 
         self.recv_dp_balance_id_this_term = []
 
@@ -1756,6 +1758,32 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    def _run_fake_extend_batch(self, batch: ScheduleBatch):
+        if self.prepare_dp_attn_flag:
+            idle_batch, _ = self.prepare_dp_attn_batch(None)
+        else:
+            idle_batch = None
+        if idle_batch:  # launch an idle batch instead
+            idle_batch.launch_done = batch.launch_done
+            result = self.run_batch(idle_batch)
+        else:  # no batch launched
+            if self.enable_overlap:
+                batch.launch_done.set()
+                self.tp_worker.cur_sampling_info = replace(
+                    batch.sampling_info,
+                    sampling_info_done=threading.Event(),
+                )
+            result = GenerationBatchResult(
+                logits_output=None,
+                pp_hidden_states_proxy_tensors=None,
+                next_token_ids=None,
+                extend_input_len_per_req=[],
+                extend_logprob_start_len_per_req=[],
+                bid=-1,  # This is a fake result.
+                can_run_cuda_graph=False,
+            )
+        return result
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -1767,6 +1795,10 @@ class Scheduler(
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
+
+        # Handle fake prefill for disaggregation decode
+        if batch.forward_mode.is_fake_extend():
+            return self._run_fake_extend_batch(batch)
 
         # Run forward
         if self.is_generation:
@@ -1853,6 +1885,16 @@ class Scheduler(
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
+        elif batch.forward_mode.is_fake_extend():
+            assert self.disaggregation_mode == DisaggregationMode.DECODE
+            for req in batch.reqs:
+                req.check_finished()
+                if req.finished():
+                    req.time_stats.completion_time = time.time()
+                    self.tree_cache.cache_finished_req(req)
+            self.stream_output(batch.reqs, batch.return_logprob)
+            if self.enable_overlap:
+                self.set_next_batch_sampling_info_done(batch)
 
         self.maybe_send_health_check_signal()
 
