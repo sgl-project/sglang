@@ -8,6 +8,8 @@ from transformers import AutoConfig
 
 from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 
 def get_model_config(tp_size: int):
@@ -148,14 +150,32 @@ def run_test(tp_size, batch_size, model_config, check=False):
         problem_sizes2,
     )
 
+    topk_output = StandardTopKOutput(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=torch.randn(
+            (batch_size, topk), device=topk_weights.device, dtype=dtype
+        ),
+    )
+
+    moe_runner_config = MoeRunnerConfig(
+        num_experts=E,
+        topk=topk,
+        hidden_size=H,
+        shard_intermediate_size=I,
+        dtype=dtype,
+        block_shape=block_shape,
+        activation="silu",
+        inplace=False,
+    )
+
     # Note: Triton expects non-transposed weights
     triton_lambda = lambda: fused_experts(
         x,
         w1,
         w2,
-        (topk_weights, topk_ids, "dummy"),
-        inplace=False,
-        activation="silu",  # Assuming SiLU activation common in MoEs
+        topk_output,
+        moe_runner_config,
         use_fp8_w8a8=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -220,9 +240,8 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 x,
                 w1,  # Original shape
                 w2,  # Original shape
-                (topk_weights, topk_ids, "dummy"),
-                inplace=False,  # Important: Use False to get output tensor
-                activation="silu",
+                topk_output,
+                moe_runner_config,
                 use_fp8_w8a8=True,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,

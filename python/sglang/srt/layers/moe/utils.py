@@ -131,7 +131,7 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
     global MOE_A2A_BACKEND
     if MOE_A2A_BACKEND is None:
         logger.warning("MOE_A2A_BACKEND is not initialized, using default backend")
-        MOE_A2A_BACKEND = MoeA2ABackend(None)
+        MOE_A2A_BACKEND = MoeA2ABackend("none")
     return MOE_A2A_BACKEND
 
 
@@ -139,7 +139,7 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
     global MOE_RUNNER_BACKEND
     if MOE_RUNNER_BACKEND is None:
         logger.warning("MOE_RUNNER_BACKEND is not initialized, using triton backend")
-        MOE_RUNNER_BACKEND = MoeRunnerBackend("triton")
+        MOE_RUNNER_BACKEND = MoeRunnerBackend("auto")
     return MOE_RUNNER_BACKEND
 
 
