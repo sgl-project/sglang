@@ -534,7 +534,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states,
             input_global_scale,
             topk_idx,
-            use_fp8=False if get_bool_env_var("SGLANG_USE_W4A8") else True,
+            use_fp8=not get_moe_runner_backend().is_cutlass_w4afp8(),
         )
         return (
             hidden_states,
