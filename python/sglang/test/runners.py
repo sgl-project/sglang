@@ -404,7 +404,12 @@ class HFRunner:
                 input_ids = torch.tensor([p], device="cuda")
 
             if lora_paths is not None and lora_paths[i] is not None:
-                from peft import PeftModel
+                from peft import PeftConfig, PeftModel
+
+                peft_config = PeftConfig.from_pretrained(lora_paths[i])
+                if "embed_tokens" in peft_config.target_modules:
+                    tok = get_tokenizer(lora_paths[i])
+                    base_model.resize_token_embeddings(len(tok))
 
                 model = PeftModel.from_pretrained(
                     base_model,
@@ -517,6 +522,7 @@ class SRTRunner:
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
+        lora_extra_vocab_size: int = 0,
         max_loaded_loras: Optional[int] = None,
     ):
         self.model_type = model_type
@@ -560,6 +566,7 @@ class SRTRunner:
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
+            lora_extra_vocab_size=lora_extra_vocab_size,
             max_loaded_loras=max_loaded_loras,
             **spec_kwargs,
         )

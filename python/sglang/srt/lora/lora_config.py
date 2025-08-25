@@ -24,24 +24,44 @@ class LoRAConfig:
         path: str,
     ) -> None:
         self.path = path
+        self.weights_dir = self.get_weights_dir()
         self.hf_config = self.get_lora_config()
+        self.added_tokens = self.get_added_tokens()
         self.target_modules = self.hf_config["target_modules"]
 
-        # TODO: Support more modules
-        if any(module in self.target_modules for module in ["embed_tokens", "lm_head"]):
+        # TODO: Support lm_head modules
+        if any(module in self.target_modules for module in ["lm_head"]):
             raise ValueError("Not supported yet")
+        # TODO: remove below after we support lm_head
+        # Uncomment below for testing adapter: yard1/llama-2-7b-sql-lora-test (since it has lm_head which is not supported yet)
+        # if "lm_head" in self.target_modules:
+        #     self.target_modules.remove("lm_head")
 
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
+        self.extra_vocab_size = (
+            len(self.added_tokens) if self.added_tokens is not None else 0
+        )
+
+    def get_weights_dir(self):
+        if not os.path.isdir(self.path):
+            return snapshot_download(self.path, allow_patterns=["*.json"])
+        else:
+            return self.path
+
+    def get_added_tokens(self):
+        added_tokens_config_name = "added_tokens.json"
+        added_tokens_path = os.path.join(self.weights_dir, added_tokens_config_name)
+        if os.path.exists(added_tokens_path):
+            with open(added_tokens_path, "r") as f:
+                return json.load(f)
+        else:
+            return None
 
     def get_lora_config(self, dummy=False):
         if dummy:
             raise NotImplementedError()
         else:
-            if not os.path.isdir(self.path):
-                weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
-            else:
-                weights_dir = self.path
             config_name = "adapter_config.json"
-            with open(os.path.join(weights_dir, config_name), "r") as f:
+            with open(os.path.join(self.weights_dir, config_name), "r") as f:
                 return json.load(f)
