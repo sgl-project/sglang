@@ -701,6 +701,9 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         # We do cascade attention for Target Verify with topk > 1
+        # We don't use cascade attention for Sliding Window Attention:
+        # - Different window sizes should be passed in for each q in the first stage of cascade attention, but FA3 interface doesn't support pass in a list of window sizes.
+        # - The overhead of duplicated computation of the common prefix part is small for sliding window layers (seq_len <= window_size), so we can just expand it.
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
             and self.topk > 1
