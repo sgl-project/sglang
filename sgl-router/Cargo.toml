@@ -55,6 +55,7 @@ anyhow = "1.0"
 tokenizers = { version = "0.21.4", optional = true }
 tiktoken-rs = { version = "0.7.0", optional = true }
 minijinja = { version = "2.0", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.12", features = ["tls", "gzip", "transport"] }
