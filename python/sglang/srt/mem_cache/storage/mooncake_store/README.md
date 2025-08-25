@@ -55,7 +55,7 @@ Launch Mooncake meta server:
 python -m mooncake.http_metadata_server
 ```
 
-Start the SGLang server with Mooncake enabled. Mooncake configuration can be provided via environment variables:
+Start the SGLang server with Mooncake enabled. Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` layout.
 
 ```bash
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
