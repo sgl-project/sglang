@@ -148,6 +148,16 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        is_gpt_oss = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
+        )
+
+        # GptOss model needs to keep special tokens for harmony parsing
+        if is_gpt_oss:
+            request.skip_special_tokens = False
+
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
@@ -207,6 +217,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_data,
                 modalities,
             )
+
+            # per the Transformers docs & maintainers, tool call arguments in
+            # assistant-role messages with tool_calls need to be dicts not JSON str -
+            # this is how tool-use chat templates will expect them moving forwards
+            # so, for messages that have tool_calls, parse the string (which we get
+            # from openAI format) to dict
+            if (
+                processed_msg["role"] == "assistant"
+                and "tool_calls" in processed_msg
+                and isinstance(processed_msg["tool_calls"], list)
+            ):
+                for item in processed_msg["tool_calls"]:
+                    if "arguments" in item["function"] and isinstance(
+                        item["function"]["arguments"], str
+                    ):
+                        item["function"]["arguments"] = json.loads(
+                            item["function"]["arguments"]
+                        )
+
             openai_compatible_messages.append(processed_msg)
 
         # Handle assistant prefix for continue_final_message
