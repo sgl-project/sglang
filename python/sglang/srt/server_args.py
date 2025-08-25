@@ -85,7 +85,6 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
-    cpu_offload_gb: int = 0
     page_size: Optional[int] = None
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
@@ -123,6 +122,7 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
+    gc_warning_threshold_secs: float = 0.0
 
     # API related
     api_key: Optional[str] = None
@@ -153,7 +153,9 @@ class ServerArgs:
     enable_lora: Optional[bool] = None
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
-    lora_paths: Optional[Union[dict[str, str], dict[str, LoRARef], List[str]]] = None
+    lora_paths: Optional[
+        Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]
+    ] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
@@ -187,6 +189,7 @@ class ServerArgs:
         "flashinfer_cutlass",
         "flashinfer_mxfp4",
     ] = "auto"
+    flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -221,6 +224,13 @@ class ServerArgs:
     ds_heavy_token_num: int = 256
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
+
+    # Offloading
+    cpu_offload_gb: int = 0
+    offload_group_size: int = -1
+    offload_num_in_group: int = 1
+    offload_prefetch_step: int = 1
+    offload_mode: str = "cpu"
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -297,9 +307,6 @@ class ServerArgs:
 
     def __post_init__(self):
         # Check deprecated arguments
-        def print_deprecated_warning(message: str):
-            logger.warning(f"\033[33m{message}\033[0m")
-
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
             print_deprecated_warning(
@@ -480,11 +487,6 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-            if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "trtllm_mla backend does not support speculative decoding yet."
-                )
-
             if self.kv_cache_dtype not in ["fp8_e4m3", "auto"]:
                 raise ValueError(
                     "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3 or auto."
@@ -505,11 +507,6 @@ class ServerArgs:
                     f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
-
-            if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "trtllm_mha backend does not support speculative decoding yet."
-                )
 
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
@@ -553,7 +550,6 @@ class ServerArgs:
             assert (
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
-            os.environ["TRTLLM_ENABLE_PDL"] = "1"
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -643,6 +639,10 @@ class ServerArgs:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
                     )
+                if self.page_size != 1 and self.attention_backend == "flashinfer":
+                    raise ValueError(
+                        "Speculative decoding with page_size != 1 is not supported. Please set page_size to 1."
+                    )
 
             # Auto choose parameters
             if self.speculative_num_steps is None:
@@ -655,6 +655,16 @@ class ServerArgs:
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
+
+            if (
+                self.attention_backend == "trtllm_mha"
+                or self.decode_attention_backend == "trtllm_mha"
+                or self.prefill_attention_backend == "trtllm_mha"
+            ):
+                if self.speculative_eagle_topk > 1:
+                    raise ValueError(
+                        "trtllm_mha backend only supports topk = 1 for speculative decoding."
+                    )
 
             if (
                 self.speculative_eagle_topk == 1
@@ -712,6 +722,12 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        if self.enable_hierarchical_cache and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -967,12 +983,6 @@ class ServerArgs:
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
         parser.add_argument(
-            "--cpu-offload-gb",
-            type=int,
-            default=ServerArgs.cpu_offload_gb,
-            help="How many GBs of RAM to reserve for CPU offloading.",
-        )
-        parser.add_argument(
             "--page-size",
             type=int,
             default=ServerArgs.page_size,
@@ -1165,6 +1175,12 @@ class ServerArgs:
             help="Collect prompt/generation tokens histogram.",
         )
         parser.add_argument(
+            "--gc-warning-threshold-secs",
+            type=float,
+            default=ServerArgs.gc_warning_threshold_secs,
+            help="The threshold for long GC warning. If a GC takes longer than this, a warning will be logged. Set to 0 to disable.",
+        )
+        parser.add_argument(
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
@@ -1323,7 +1339,7 @@ class ServerArgs:
             nargs="*",
             default=None,
             action=LoRAPathAction,
-            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}.",
+            help='The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool}',
         )
         parser.add_argument(
             "--max-loras-per-batch",
@@ -1481,9 +1497,17 @@ class ServerArgs:
                 "triton_kernel",
                 "flashinfer_trtllm",
                 "flashinfer_cutlass",
+                "flashinfer_mxfp4",
             ],
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
+        )
+        parser.add_argument(
+            "--flashinfer-mxfp4-moe-precision",
+            type=str,
+            choices=["mxfp4", "bf16"],
+            default=ServerArgs.flashinfer_mxfp4_moe_precision,
+            help="Choose the computation precision of flashinfer mxfp4 moe",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
@@ -1657,6 +1681,38 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The type of heavy channels in double sparsity attention",
+        )
+
+        # Offloading
+        parser.add_argument(
+            "--cpu-offload-gb",
+            type=int,
+            default=ServerArgs.cpu_offload_gb,
+            help="How many GBs of RAM to reserve for CPU offloading.",
+        )
+        parser.add_argument(
+            "--offload-group-size",
+            type=int,
+            default=ServerArgs.offload_group_size,
+            help="Number of layers per group in offloading.",
+        )
+        parser.add_argument(
+            "--offload-num-in-group",
+            type=int,
+            default=ServerArgs.offload_num_in_group,
+            help="Number of layers to be offloaded within a group.",
+        )
+        parser.add_argument(
+            "--offload-prefetch-step",
+            type=int,
+            default=ServerArgs.offload_prefetch_step,
+            help="Steps to prefetch in offloading.",
+        )
+        parser.add_argument(
+            "--offload-mode",
+            type=str,
+            default=ServerArgs.offload_mode,
+            help="Mode of offloading.",
         )
 
         # Optimization/debug options
@@ -1956,22 +2012,23 @@ class ServerArgs:
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
         parser.add_argument(
+            "--weight-loader-disable-mmap",
+            action="store_true",
+            help="Disable mmap while loading weight using safetensors.",
+        )
+
+        # For PD-Multiplexing
+        parser.add_argument(
             "--enable-pdmux",
             action="store_true",
             help="Enable PD-Multiplexing, PD running on greenctx stream.",
         )
 
-        # For PD-Multiplexing
         parser.add_argument(
             "--sm-group-num",
             type=int,
             default=ServerArgs.sm_group_num,
             help="Number of sm partition groups.",
-        )
-        parser.add_argument(
-            "--weight-loader-disable-mmap",
-            action="store_true",
-            help="Disable mmap while loading weight using safetensors.",
         )
 
         # Deprecated arguments
@@ -2089,28 +2146,42 @@ class ServerArgs:
                 )
 
         if self.enable_lora:
-            # Normalize lora_paths to a dictionary if it is a list.
-            # TODO (lifuhuang): support specifying pinned adapters in server_args.
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
-                self.lora_paths = {}
+                self.lora_paths = []
                 for lora_path in lora_paths:
-                    if "=" in lora_path:
-                        name, path = lora_path.split("=", 1)
-                        self.lora_paths[name] = LoRARef(
-                            lora_name=name, lora_path=path, pinned=False
+                    if isinstance(lora_path, str):
+                        if "=" in lora_path:
+                            name, path = lora_path.split("=", 1)
+                            lora_ref = LoRARef(
+                                lora_name=name, lora_path=path, pinned=False
+                            )
+                        else:
+                            lora_ref = LoRARef(
+                                lora_name=lora_path, lora_path=lora_path, pinned=False
+                            )
+                    elif isinstance(lora_path, dict):
+                        assert (
+                            "lora_name" in lora_path and "lora_path" in lora_path
+                        ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                        lora_ref = LoRARef(
+                            lora_name=lora_path["lora_name"],
+                            lora_path=lora_path["lora_path"],
+                            pinned=lora_path.get("pinned", False),
                         )
                     else:
-                        self.lora_paths[lora_path] = LoRARef(
-                            lora_name=lora_path, lora_path=lora_path, pinned=False
+                        raise ValueError(
+                            f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
+                            "Expected a string or a dictionary."
                         )
+                    self.lora_paths.append(lora_ref)
             elif isinstance(self.lora_paths, dict):
-                self.lora_paths = {
-                    k: LoRARef(lora_name=k, lora_path=v, pinned=False)
+                self.lora_paths = [
+                    LoRARef(lora_name=k, lora_path=v, pinned=False)
                     for k, v in self.lora_paths.items()
-                }
+                ]
             elif self.lora_paths is None:
-                self.lora_paths = {}
+                self.lora_paths = []
             else:
                 raise ValueError(
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
@@ -2137,9 +2208,7 @@ class ServerArgs:
                     "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
                     f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
                 )
-                assert (
-                    not self.lora_paths or len(self.lora_paths) <= self.max_loaded_loras
-                ), (
+                assert len(self.lora_paths) <= self.max_loaded_loras, (
                     "The number of LoRA paths should not exceed max_loaded_loras. "
                     f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
                 )
@@ -2172,10 +2241,11 @@ class ServerArgs:
             ), f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got '{self.attention_backend}'"
 
             if is_sm100_supported():
-                self.enable_flashinfer_allreduce_fusion = True
-                logger.info(
-                    "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
-                )
+                if not self.enable_dp_attention:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
+                    )
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
@@ -2206,7 +2276,10 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
         elif "Llama4" in model_arch:
-            assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
+            assert self.attention_backend in {
+                "fa3",
+                "aiter",
+            }, "fa3 or aiter is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
@@ -2360,13 +2433,22 @@ class PortArgs:
 
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, {})
-        for lora_path in values:
-            if "=" in lora_path:
-                name, path = lora_path.split("=", 1)
-                getattr(namespace, self.dest)[name] = path
-            else:
-                getattr(namespace, self.dest)[lora_path] = lora_path
+        lora_paths = []
+        if values:
+            assert isinstance(values, list), "Expected a list of LoRA paths."
+            for lora_path in values:
+                lora_path = lora_path.strip()
+                if lora_path.startswith("{") and lora_path.endswith("}"):
+                    obj = json.loads(lora_path)
+                    assert "lora_path" in obj and "lora_name" in obj, (
+                        f"{repr(lora_path)} looks like a JSON str, "
+                        "but it does not contain 'lora_name' and 'lora_path' keys."
+                    )
+                    lora_paths.append(obj)
+                else:
+                    lora_paths.append(lora_path)
+
+        setattr(namespace, self.dest, lora_paths)
 
 
 class DeprecatedAction(argparse.Action):
@@ -2377,6 +2459,10 @@ class DeprecatedAction(argparse.Action):
 
     def __call__(self, parser, namespace, values, option_string=None):
         raise ValueError(self.help)
+
+
+def print_deprecated_warning(message: str):
+    logger.warning(f"\033[33m{message}\033[0m")
 
 
 def auto_choose_speculative_params(self: ServerArgs):
@@ -2391,8 +2477,12 @@ def auto_choose_speculative_params(self: ServerArgs):
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
-    elif arch in ["DeepseekV3ForCausalLM", "DeepseekV2ForCausalLM"]:
-        # The default value for deepseek
+    elif arch in [
+        "DeepseekV3ForCausalLM",
+        "DeepseekV2ForCausalLM",
+        "GptOssForCausalLM",
+    ]:
+        # The default value for deepseek and gpt-oss
         return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)

@@ -7,10 +7,15 @@ import signal
 import threading
 from abc import ABC, abstractmethod
 from functools import wraps
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    is_dp_attention_enabled,
+)
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
 
@@ -167,12 +172,19 @@ class HiCacheHF3FS(HiCacheStorage):
 
     @staticmethod
     def from_env_config(
-        rank: int, bytes_per_page: int, dtype: torch.dtype
+        bytes_per_page: int, dtype: torch.dtype, rank: int = None
     ) -> "HiCacheHF3FS":
         from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
             Hf3fsGlobalMetadataClient,
             Hf3fsLocalMetadataClient,
         )
+
+        if rank is None:
+            rank = (
+                get_attention_tp_rank()
+                if is_dp_attention_enabled()
+                else get_tensor_model_parallel_rank()
+            )
 
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
@@ -228,15 +240,23 @@ class HiCacheHF3FS(HiCacheStorage):
         )
 
     def get(
-        self, key: str, target_location: Optional[torch.Tensor] = None
+        self,
+        key: str,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
-        return self.batch_get([key], [target_location] if target_location else None)[0]
+        return self.batch_get(
+            [key],
+            [target_location] if target_location is not None else None,
+            [target_sizes] if target_sizes is not None else None,
+        )[0]
 
     @synchronized()
     def batch_get(
         self,
         keys: List[str],
-        target_locations: Optional[List[torch.Tensor]] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
         page_indices = self.metadata_client.get_page_indices(self.rank, keys)
 
@@ -246,9 +266,15 @@ class HiCacheHF3FS(HiCacheStorage):
                 batch_indices.append(i)
                 file_offsets.append(page_index * self.bytes_per_page)
 
-        file_results = [
-            torch.empty(self.numel, dtype=self.dtype) for _ in range(len(batch_indices))
-        ]
+        if target_locations is not None:
+            for target_location in target_locations:
+                assert target_location.is_contiguous()
+            file_results = target_locations
+        else:
+            file_results = [
+                torch.empty(self.numel, dtype=self.dtype)
+                for _ in range(len(batch_indices))
+            ]
 
         futures = [
             self.executor.submit(
@@ -273,10 +299,27 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return results
 
-    def set(self, key: str, value: torch.Tensor) -> bool:
-        return self.batch_set([key], [value])
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        return self.batch_set(
+            [key],
+            [value] if value is not None else None,
+            [target_location] if target_location is not None else None,
+            [target_sizes] if target_sizes is not None else None,
+        )
 
-    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
         # Todo: Add prefix block's hash key
         key_with_prefix = [(key, "") for key in keys]
         indices = self.metadata_client.reserve_and_allocate_page_indices(
@@ -292,7 +335,8 @@ class HiCacheHF3FS(HiCacheStorage):
 
             batch_indices.append(i)
             file_offsets.append(page_index * self.bytes_per_page)
-            file_values.append(value.contiguous())
+            assert value.is_contiguous()
+            file_values.append(value)
 
         futures = [
             self.executor.submit(

@@ -438,72 +438,6 @@ def is_pin_memory_available() -> bool:
     return torch.cuda.is_available()
 
 
-_CPU_OFFLOAD_BYTES = 0
-_CPU_OFFLOAD_MAX_BYTES = 0
-
-
-def set_cpu_offload_max_bytes(max_bytes: int) -> None:
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-    _CPU_OFFLOAD_BYTES = 0
-    _CPU_OFFLOAD_MAX_BYTES = max_bytes
-
-
-def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
-    if (params := next(module.parameters(), None)) is None:
-        return module
-
-    device = params.device
-    if device == torch.device("cpu"):
-        return module
-
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-    if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
-        return module
-
-    pin_memory = is_pin_memory_available()
-    # offload parameters to CPU
-    # use pin_memory if possible, which helps cudagraph capture speed
-    offloaded_parameters = False
-    for p in module.parameters():
-        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
-            # we use per-parameter offloading
-            # one module might have some parameters offloaded and some not
-            break
-
-        # `torch.empty_like` does not support `pin_memory` argument
-        cpu_data = torch.empty_strided(
-            size=p.data.size(),
-            stride=p.data.stride(),
-            dtype=p.data.dtype,
-            layout=p.data.layout,
-            device="cpu",
-            pin_memory=pin_memory,
-        )
-        cpu_data.copy_(p.data)
-        p.data = cpu_data
-        _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
-        offloaded_parameters = True
-
-    if offloaded_parameters:
-        original_forward = module.forward
-
-        def forward(*args, **kwargs):
-            module.forward = original_forward
-            device_state = {
-                # here we blindly call `to(device)`
-                # if the parameter is already on the device, it will be a no-op
-                k: v.to(device, non_blocking=True)
-                for k, v in module.state_dict().items()
-            }
-            output = functional_call(module, device_state, args=args, kwargs=kwargs)
-            module.forward = forward
-            return output
-
-        module.forward = forward
-
-    return module
-
-
 class LayerFn(Protocol):
 
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
@@ -516,11 +450,13 @@ def make_layers(
     pp_size: Optional[int] = None,
     prefix: str = "",
     return_tuple: bool = False,
+    offloader_kwargs: Dict[str, Any] = {},
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
+    from sglang.srt.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
@@ -534,10 +470,13 @@ def make_layers(
     )
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + [
-            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
-            for idx in range(start_layer, end_layer)
-        ]
+        + get_offloader().wrap_modules(
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                for idx in range(start_layer, end_layer)
+            ),
+            **offloader_kwargs,
+        )
         + [
             PPMissingLayer(return_tuple=return_tuple)
             for _ in range(end_layer, num_hidden_layers)
@@ -2602,6 +2541,50 @@ def dynamic_import(func_path: str):
     return func
 
 
+def gc_object_counts():
+    import gc
+
+    g0 = len(gc.get_objects(0))
+    g1 = len(gc.get_objects(1))
+    g2 = len(gc.get_objects(2))
+    return g0, g1, g2
+
+
+def configure_gc_warning(warn_threshold_secs):
+    import gc
+
+    gc_start_time = {}
+
+    def gc_callback(phase, info):
+        gen = info.get("generation", "?")
+        if phase == "start":
+            gc_start_time[gen] = time.time()
+        elif phase == "stop":
+            duration = time.time() - gc_start_time.get(gen, time.time())
+            if duration > warn_threshold_secs:
+                g0, g1, g2 = gc_object_counts()
+                logger.warn(
+                    f"LONG GARBAGE COLLECTION DETECTED | Generation {gen} | Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "
+                    f"This may cause latency jitter. Consider calling the freeze_gc API after sending a few warmup requests."
+                )
+
+    gc.callbacks.append(gc_callback)
+
+
+def freeze_gc(context: str):
+    import gc
+
+    g0_before, g1_before, g2_before = gc_object_counts()
+    gc.freeze()
+    g0_after, g1_after, g2_after = gc_object_counts()
+    logger.info(
+        f"Freezing GC in {context} process. "
+        f"gen0: {g0_before}->{g0_after}, "
+        f"gen1: {g1_before}->{g1_after}, "
+        f"gen2: {g2_before}->{g2_after}"
+    )
+
+
 def configure_gc_logger():
     logger.info("Enable GC Logger")
 
@@ -2971,3 +2954,13 @@ class ConcurrentCounter:
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
     return importlib.util.find_spec("triton_kernels") is not None
+
+
+def check_cuda_result(raw_output):
+    import cuda.bindings.runtime as cuda_rt
+
+    err, *results = raw_output
+    if err != cuda_rt.cudaError_t.cudaSuccess:
+        raise Exception(f"CUDA error: {err}")
+
+    return results

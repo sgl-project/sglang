@@ -944,7 +944,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     type="output_text",
                                     text="",
                                     annotations=[],
-                                    logprobs=[],
+                                    logprobs=None,
                                 ),
                             )
                         )
@@ -992,7 +992,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     type="output_text",
                                     text="",
                                     annotations=[],
-                                    logprobs=[],
+                                    logprobs=None,
                                 ),
                             )
                         )

@@ -319,18 +319,7 @@ class DeepseekV2MoE(nn.Module):
             config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
         )
 
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
-            renormalize=config.norm_topk_prob,
-            use_grouped_topk=True,
-            num_expert_group=config.n_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
-
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
             + global_server_args_dict["ep_num_redundant_experts"],
@@ -342,6 +331,19 @@ class DeepseekV2MoE(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
+        )
+
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk(),
+            force_topk=quant_config is None,
         )
 
         self.shared_experts_is_int8 = False
@@ -993,29 +995,33 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if attention_backend == "ascend":
             return AttnForwardMethod.MLA
-        elif attention_backend == "flashinfer":
+        elif (
+            attention_backend == "flashinfer"
+            or attention_backend == "fa3"
+            or attention_backend == "flashmla"
+            or attention_backend == "trtllm_mla"
+            or attention_backend == "cutlass_mla"
+        ):
+            # Use MHA with chunked KV cache when prefilling on long sequences.
+            sum_extend_prefix_lens = (
+                sum(forward_batch.extend_prefix_lens_cpu)
+                if forward_batch.extend_prefix_lens_cpu is not None
+                else 0
+            )
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
+            disable_ragged = (
+                attention_backend == "flashinfer" or attention_backend == "flashmla"
+            ) and self.flashinfer_mla_disable_ragged
             if (
-                not self.flashinfer_mla_disable_ragged
+                not disable_ragged
                 and forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                and sum(forward_batch.extend_prefix_lens_cpu) == 0
-            ):
-                return AttnForwardMethod.MHA
-            else:
-                return _dispatch_mla_subtype()
-        elif attention_backend == "fa3":
-            # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
-            if forward_batch.extend_prefix_lens_cpu is not None:
-                sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
-            if (
-                forward_batch.forward_mode.is_extend()
-                and not self.disable_chunked_prefix_cache
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
                 and (
-                    sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
+                    (
+                        sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
+                        and not self.disable_chunked_prefix_cache
+                    )
                     or sum_extend_prefix_lens == 0
                 )
             ):
@@ -1200,7 +1206,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        from sglang.srt.model_executor.graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
             if hidden_states.shape[0] <= 16 and self.use_min_latency_fused_a_gemm:
@@ -1683,7 +1689,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             k[..., self.qk_nope_head_dim :] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-            lse = torch.transpose(lse, 0, 1).contiguous()
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
@@ -1705,55 +1710,26 @@ class DeepseekV2AttentionMLA(nn.Module):
         # will be helpful for understanding the purpose of this function.
 
         # First do normal mha forward to get output for extended part
-        if self.q_lora_rank is not None:
-            q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
-            )
-            q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-        else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        latent_cache = latent_cache.unsqueeze(1)
-        kv_a = self.kv_a_layernorm(kv_a)
-        kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
-
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
-        k = torch.empty_like(q)
-        k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
-
-        latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank :] = k_pe
-
-        # Save latent cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+        return self.forward_normal_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
         )
 
-        return q, k, v, forward_batch
-
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
+        has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        # Only initialize the info once
+        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+            forward_batch.prepare_chunked_prefix_cache_info(q.device)
+            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
+                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+
+        forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
-        attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        lse = torch.transpose(lse, 0, 1).contiguous()
+        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
 
         # Do mha attention with chunked prefix cache if there are any sequence with prefix
-        if any(forward_batch.extend_prefix_lens_cpu):
-            # Only initialize the info once
-            if forward_batch.num_prefix_chunks is None:
-                forward_batch.prepare_chunked_prefix_cache_info(q.device)
-
+        if has_extend_prefix:
+            attn_output, lse = attn_output
             forward_batch.set_attn_attend_prefix_cache(True)
             attn_output = self._chunked_prefix_attn_mha(
                 q=q,
@@ -1852,9 +1828,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_last_layer=(
+                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+            ),
         )
-
-        self._fuse_allreduce_lookup_table = self._build_fuse_allreduce_lookup_table()
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
@@ -1862,20 +1839,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id >= self.config.first_k_dense_replace
             and layer_id % self.config.moe_layer_freq == 0
         )
-
-    def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
-        """Check if MLP allreduce can be fused with next layer's residual_rmsnorm"""
-
-        batch_size = (
-            forward_batch.input_ids.shape[0]
-            if hasattr(forward_batch, "input_ids")
-            else 0
-        )
-
-        if batch_size > 128:
-            return False
-
-        return self._fuse_allreduce_lookup_table.get(batch_size, False)
 
     def forward(
         self,
@@ -1902,11 +1865,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         should_allreduce_fusion = (
-            self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
-            and not (
-                is_dp_attention_enabled() and self.speculative_algorithm.is_eagle()
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
             )
-            and not self.is_nextn
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
@@ -1997,26 +1958,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         return output
 
-    def _build_fuse_allreduce_lookup_table(self):
-        static_conditions_met = (
-            self.layer_id != self.config.num_hidden_layers - 1
-            and get_tensor_model_parallel_world_size() > 1
-            and global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False)
-            and _is_sm100_supported
-            and _is_flashinfer_available
-        )
-
-        if not static_conditions_met:
-            return {}
-
-        lookup_table = {}
-        for batch_size in range(129):  # 0 to 128
-            is_last_layer = self.layer_id == self.config.num_hidden_layers - 1
-            should_fuse = batch_size > 0 and batch_size <= 128 and not is_last_layer
-            lookup_table[batch_size] = should_fuse
-
-        return lookup_table
-
 
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -2055,6 +1996,23 @@ class DeepseekV2Model(nn.Module):
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            offloader_kwargs=dict(
+                submodule_accessor=lambda layer: (
+                    layer.mlp.experts
+                    if isinstance(layer.mlp, DeepseekV2MoE)
+                    else layer.mlp
+                ),
+                whitelist_param_names_creator=lambda module: (
+                    [
+                        "w13_weight",
+                        "w2_weight",
+                        "w13_blockscale_swizzled",
+                        "w2_blockscale_swizzled",
+                    ]
+                    if isinstance(module, FusedMoE)
+                    else []
+                ),
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -59,7 +59,7 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-h20
 
-  pr-test-finish:
+  pr-test-h20-finish:
     needs: [
       check-changes,
       per-commit-8-gpu-h20,

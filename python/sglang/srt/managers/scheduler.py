@@ -72,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -145,6 +146,7 @@ from sglang.srt.utils import (
     configure_gc_logger,
     configure_logger,
     disable_request_logging,
+    freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
     get_zmq_socket,
@@ -524,6 +526,7 @@ class Scheduler(
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
+                (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
@@ -2468,6 +2471,12 @@ class Scheduler(
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
+
+    def handle_freeze_gc(self, recv_req: FreezeGCReq):
+        """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
+        freeze_gc("Scheduler")
+        self.send_to_detokenizer.send_pyobj(recv_req)
+        return None
 
 
 class IdleSleeper:

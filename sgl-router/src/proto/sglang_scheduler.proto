@@ -7,7 +7,7 @@ import "google/protobuf/struct.proto";
 
 // Service definition for SGLang scheduler communication
 // This protocol bridges the Rust router and Python scheduler
-service SGLangScheduler {
+service SglangScheduler {
   // Initialize connection and get model info
   rpc Initialize(InitializeRequest) returns (InitializeResponse);
 
@@ -21,7 +21,7 @@ service SGLangScheduler {
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 
   // Abort a running request
-  rpc AbortRequest(AbortRequest) returns (AbortResponse);
+  rpc Abort(AbortRequest) returns (AbortResponse);
 
   // Flush KV cache
   rpc FlushCache(FlushCacheRequest) returns (FlushCacheResponse);

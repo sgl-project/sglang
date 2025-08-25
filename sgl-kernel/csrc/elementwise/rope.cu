@@ -27,6 +27,7 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor cos_sin_cache,
     at::Tensor pos_ids,
     bool interleave,
+    bool enable_pdl,
     int64_t cuda_stream,
     const std::optional<at::Tensor>& v,
     const std::optional<at::Tensor>& k_buffer,
@@ -124,12 +125,14 @@ void apply_rope_pos_ids_cos_sin_cache(
           kv_cache_loc_ptr,
           interleave,
           save_kv_cache,
+          enable_pdl,
           stream);
       TORCH_CHECK(
           status == cudaSuccess,
           "BatchQKApplyRotaryPosIdsCosSinCacheEnhanced failed with error code " +
               std::string(cudaGetErrorString(status)));
     } else {
+      TORCH_CHECK(!enable_pdl);
       cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
           static_cast<c_type*>(q.data_ptr()),
           static_cast<c_type*>(k.data_ptr()),

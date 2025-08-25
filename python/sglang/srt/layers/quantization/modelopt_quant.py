@@ -1305,8 +1305,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
-            if moe_runner_config.routed_scaling_factor is not None:
-                output *= moe_runner_config.routed_scaling_factor
+            # Scale by routed_scaling_factor is fused into select_experts.
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 output, global_output = get_local_dp_buffer(), output
                 get_tp_group().reduce_scatterv(
@@ -1332,6 +1331,5 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             params=layer.cutlass_moe_params,
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
         ).to(x.dtype)
-        if moe_runner_config.routed_scaling_factor is not None:
-            output *= moe_runner_config.routed_scaling_factor
+        # Scale by routed_scaling_factor is fused into select_experts.
         return output
