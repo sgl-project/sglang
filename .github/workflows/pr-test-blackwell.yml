@@ -1,23 +1,26 @@
-name: PR Test
+name: PR Test (Blackwell)
 
 on:
   push:
     branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-blackwell.yml"
   pull_request:
     branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-blackwell.yml"
   workflow_dispatch:
-    inputs:
-      version:
-        description: "FlashInfer version"
-        required: true
-        type: choice
-        default: 'release'
-        options:
-          - 'release'
-          - 'nightly'
 
 concurrency:
-  group: pr-test-${{ github.ref }}
+  group: pr-test-blackwell-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -38,362 +41,271 @@ jobs:
               - "python/**"
               - "scripts/**"
               - "test/**"
-              - ".github/workflows/pr-test.yml"
+              - "sgl-kernel/**"
+              - ".github/workflows/pr-test-blackwell.yml"
 
-  unit-test-frontend:
-    needs: check-changes
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
-    runs-on: 1-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 10
-        run: |
-          cd test/lang
-          python3 run_suite.py --suite per-commit
-
-  unit-test-backend-1-gpu:
-    needs: [check-changes, unit-test-frontend]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
-    runs-on: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 10
-
-  unit-test-backend-2-gpu:
+  unit-test-backend-1-gpu-blackwell:
     needs: [check-changes]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
-    runs-on: 2-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    runs-on: b200-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 50
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 10
+
+  unit-test-backend-2-gpu-blackwell:
+    needs: [check-changes]
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
+    runs-on: b200-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 40
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-2-gpu
+
+  unit-test-backend-4-gpu-blackwell:
+    needs: [check-changes, unit-test-backend-2-gpu-blackwell]
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    runs-on: b200-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-gpu
-
-  unit-test-backend-4-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
-    runs-on: 4-gpu-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  unit-test-backend-8-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu]
+  unit-test-backend-8-gpu-blackwell:
+    needs: [check-changes, unit-test-backend-2-gpu-blackwell]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
-    runs-on: 8-gpu-runner
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1]
+    runs-on: b200-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  performance-test-1-gpu-part-1:
-    needs: check-changes
+  unit-test-backend-8-gpu-b200-suite:
+    needs: [check-changes, unit-test-backend-2-gpu-blackwell]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: b200-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Benchmark single latency
-        timeout-minutes: 10
+      - name: Run test
+        timeout-minutes: 30
         run: |
           cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_small
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default
+          python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
 
-      - name: Benchmark online latency
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
-
-      - name: Benchmark offline throughput
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
-
-      - name: Benchmark offline throughput (Non-streaming, small batch size)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
-
-      - name: Benchmark online latency (EAGLE)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
-
-      - name: Benchmark online latency (LoRA)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency
-          python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
-
-  performance-test-1-gpu-part-2:
-    needs: check-changes
+  performance-test-1-gpu-blackwell:
+    needs: [check-changes]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
-    runs-on: 1-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    runs-on: b200-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark offline throughput (w/o RadixAttention)
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
 
       - name: Benchmark offline throughput (w/ Triton)
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
 
       - name: Benchmark offline throughput (w/ FP8)
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
-      - name: Benchmark VLM offline throughput
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
-
-      - name: Benchmark VLM online latency
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
-
-  performance-test-2-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu]
+  performance-test-2-gpu-blackwell:
+    needs: [check-changes, unit-test-backend-2-gpu-blackwell]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
-    runs-on: 2-gpu-runner
+    runs-on: b200-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Benchmark single latency (TP=2)
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           cd test/srt
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
       - name: Benchmark single latency + torch.compile (TP=2)
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           cd test/srt
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
 
       - name: Benchmark offline throughput (TP=2)
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
 
-      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
-
-      - name: Benchmark offline PP decode throughput (PP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_pp_offline_throughput_default_decode
-
-      - name: Benchmark offline PP prefill throughput (PP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
-
-  accuracy-test-1-gpu:
-    needs: check-changes
+  accuracy-test-1-gpu-blackwell:
+    needs: [check-changes]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
-    runs-on: 1-gpu-runner
+    runs-on: b200-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
 
       - name: Evaluate accuracy
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test/srt
           python3 test_eval_accuracy_large.py
 
-  accuracy-test-2-gpu:
-    needs: [check-changes, accuracy-test-1-gpu]
+  accuracy-test-2-gpu-blackwell:
+    needs: [check-changes, accuracy-test-1-gpu-blackwell]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
-    runs-on: 2-gpu-runner
+    runs-on: b200-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e .
 
       - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
 
-  unit-test-deepep-4-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu]
+  unit-test-sgl-kernel-blackwell:
+    needs: [check-changes]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false &&
         needs.check-changes.outputs.src == 'true'
-    runs-on: 4-gpu-runner
+    runs-on: b200-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_deepep.sh
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run test
+      - name: Run SGL Kernel tests
         timeout-minutes: 20
         run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-deepep
+          cd sgl-kernel/tests
+          python3 -m pytest test_moe_align.py
+          python3 -m pytest test_moe_topk_softmax.py
+          python3 -m pytest test_activation.py
+          cd speculative
+          python3 -m pytest test_eagle_utils.py
+          cd ..
+          python3 -m pytest test_apply_token_bitmask_inplace.py
 
-  unit-test-deepep-8-gpu:
-    needs: [check-changes, unit-test-backend-2-gpu]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
-    runs-on: 8-gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_deepep.sh
-
-      - name: Run test
-        timeout-minutes: 20
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-deepep
-
-  pr-test-finish:
+  pr-test-blackwell-finish:
+    if: always()
     needs: [
       check-changes,
-      unit-test-frontend, unit-test-backend-1-gpu,
-      unit-test-backend-2-gpu, unit-test-backend-4-gpu, unit-test-backend-8-gpu,
-      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
-      accuracy-test-1-gpu, accuracy-test-2-gpu,
-      unit-test-deepep-4-gpu, unit-test-deepep-8-gpu,
+      unit-test-backend-1-gpu-blackwell, unit-test-backend-2-gpu-blackwell,
+      unit-test-backend-4-gpu-blackwell, unit-test-backend-8-gpu-blackwell,
+      unit-test-backend-8-gpu-b200-suite, performance-test-1-gpu-blackwell,
+      performance-test-2-gpu-blackwell, accuracy-test-1-gpu-blackwell,
+      accuracy-test-2-gpu-blackwell, unit-test-sgl-kernel-blackwell
     ]
-    if: needs.check-changes.outputs.src == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
