@@ -281,8 +281,8 @@ def get_report_summary(
         ttft,
         input_throughput,
         output_throughput,
-        overall_throughput,
-        last_gen_throughput,
+        _,
+        _,
         acc_length,
         trace_link,
     ) in result:
