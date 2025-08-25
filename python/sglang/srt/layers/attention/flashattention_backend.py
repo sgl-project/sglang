@@ -2200,7 +2200,7 @@ def _prepare_swa_spec_page_table_kernel(
     seq_len_b = tl.load(seq_len_b_ptr + idx_b)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    in_bounds_out = offs_n < LEN_OUT
+    in_bounds_out = offs_n < seq_len_a + seq_len_b
 
     in_a = offs_n < seq_len_a
     in_b = (offs_n >= seq_len_a) & (offs_n < seq_len_a + seq_len_b)
@@ -2252,10 +2252,10 @@ def prepare_swa_spec_page_table_triton(
         page_table_a.stride(1),
         page_table_b.stride(0),
         page_table_b.stride(1),
-        LEN_A,
-        LEN_B,
-        LEN_OUT,
-        REPEAT_STEP,
+        LEN_A=LEN_A,
+        LEN_B=LEN_B,
+        LEN_OUT=LEN_OUT,
+        REPEAT_STEP=REPEAT_STEP,
         BLOCK_N=BLOCK_N,
         num_warps=4,
     )
