@@ -48,6 +48,7 @@ limitations under the License.
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
+#include "cutlass_extensions/gemm/fp8_gemm_sm90_dispatch.cuh"
 #include "math.hpp"
 #include "utils.h"
 
@@ -1224,11 +1225,7 @@ torch::Tensor fp8_scaled_mm(
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12000
   if (sm_version >= 90) {
-    if (out_dtype == torch::kBFloat16) {
-      sm90_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
-    } else {
-      sm90_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
-    }
+    cutlass_scaled_mm_sm90_fp8(out, mat_a, mat_b, scales_a, scales_b, bias);
     return out;
   }
 #endif
