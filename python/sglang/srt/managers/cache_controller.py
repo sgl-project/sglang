@@ -282,6 +282,10 @@ class HiCacheController:
                     bytes_per_page, dtype
                 )
                 self.get_hash_str = get_hash_str
+            elif storage_backend == "test":
+                from sglang.srt.mem_cache.hicache_storage import HiCacheTestStorage
+                self.storage_backend = HiCacheTestStorage()
+                self.get_hash_str = get_hash_str
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
