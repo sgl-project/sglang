@@ -281,7 +281,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefill_wrapper_paged=self.prefill_wrapper_paged,
                 spec_info=forward_batch.spec_info,
             )
-            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged, False)
+            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -291,7 +291,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefill_wrapper_paged=self.prefill_wrapper_verify,
                 spec_info=forward_batch.spec_info,
             )
-            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify, False)
+            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify)
         else:
             prefix_lens = forward_batch.extend_prefix_lens
             self.indices_updater_prefill.update(
@@ -389,7 +389,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
             self.prefill_cuda_graph_metadata[bs] = verify_wrapper
-            self.forward_metadata = PrefillMetadata(verify_wrapper, False)
+            self.forward_metadata = PrefillMetadata(verify_wrapper)
         elif forward_mode.is_draft_extend():
             draft_extend_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
@@ -410,7 +410,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
             self.prefill_cuda_graph_metadata[bs] = draft_extend_wrapper
-            self.forward_metadata = PrefillMetadata(draft_extend_wrapper, False)
+            self.forward_metadata = PrefillMetadata(draft_extend_wrapper)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
