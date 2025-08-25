@@ -35,7 +35,10 @@ class TestAutoRound(CustomTestCase):
                     model,
                     self.base_url,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    other_args=["--trust-remote-code"],
+                    other_args=[
+                        "--trust-remote-code",
+                        "--quantization","auto-round"
+                        ],
                     device=device,
                 )
 
