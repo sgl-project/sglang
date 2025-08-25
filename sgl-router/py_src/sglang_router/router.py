@@ -66,6 +66,11 @@ class Router:
         request_timeout_secs: Request timeout in seconds. Default: 600
         max_concurrent_requests: Maximum number of concurrent requests allowed for rate limiting. Default: 64
         cors_allowed_origins: List of allowed origins for CORS. Empty list allows all origins. Default: []
+        health_failure_threshold: Number of consecutive health check failures before marking worker unhealthy. Default: 3
+        health_success_threshold: Number of consecutive health check successes before marking worker healthy. Default: 2
+        health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
+        health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
+        health_check_endpoint: Health check endpoint path. Default: '/health'
     """
 
     def __init__(
@@ -74,14 +79,14 @@ class Router:
         policy: PolicyType = PolicyType.RoundRobin,
         host: str = "127.0.0.1",
         port: int = 3001,
-        worker_startup_timeout_secs: int = 300,
-        worker_startup_check_interval: int = 10,
-        cache_threshold: float = 0.50,
-        balance_abs_threshold: int = 32,
-        balance_rel_threshold: float = 1.0001,
-        eviction_interval_secs: int = 60,
-        max_tree_size: int = 2**24,
-        max_payload_size: int = 256 * 1024 * 1024,  # 256MB
+        worker_startup_timeout_secs: int = 600,
+        worker_startup_check_interval: int = 30,
+        cache_threshold: float = 0.3,
+        balance_abs_threshold: int = 64,
+        balance_rel_threshold: float = 1.5,
+        eviction_interval_secs: int = 120,
+        max_tree_size: int = 2**26,
+        max_payload_size: int = 512 * 1024 * 1024,  # 512MB
         dp_aware: bool = False,
         api_key: Optional[str] = None,
         log_dir: Optional[str] = None,
@@ -95,15 +100,31 @@ class Router:
         bootstrap_port_annotation: str = "sglang.ai/bootstrap-port",
         prometheus_port: Optional[int] = None,
         prometheus_host: Optional[str] = None,
-        request_timeout_secs: int = 600,
+        request_timeout_secs: int = 1800,
         request_id_headers: Optional[List[str]] = None,
         pd_disaggregation: bool = False,
         prefill_urls: Optional[List[tuple]] = None,
         decode_urls: Optional[List[str]] = None,
         prefill_policy: Optional[PolicyType] = None,
         decode_policy: Optional[PolicyType] = None,
-        max_concurrent_requests: int = 64,
+        max_concurrent_requests: int = 256,
         cors_allowed_origins: List[str] = None,
+        retry_max_retries: int = 5,
+        retry_initial_backoff_ms: int = 50,
+        retry_max_backoff_ms: int = 30_000,
+        retry_backoff_multiplier: float = 1.5,
+        retry_jitter_factor: float = 0.2,
+        cb_failure_threshold: int = 10,
+        cb_success_threshold: int = 3,
+        cb_timeout_duration_secs: int = 60,
+        cb_window_duration_secs: int = 120,
+        disable_retries: bool = False,
+        disable_circuit_breaker: bool = False,
+        health_failure_threshold: int = 3,
+        health_success_threshold: int = 2,
+        health_check_timeout_secs: int = 5,
+        health_check_interval_secs: int = 60,
+        health_check_endpoint: str = "/health",
     ):
         if selector is None:
             selector = {}
@@ -149,6 +170,22 @@ class Router:
             decode_policy=decode_policy,
             max_concurrent_requests=max_concurrent_requests,
             cors_allowed_origins=cors_allowed_origins,
+            retry_max_retries=retry_max_retries,
+            retry_initial_backoff_ms=retry_initial_backoff_ms,
+            retry_max_backoff_ms=retry_max_backoff_ms,
+            retry_backoff_multiplier=retry_backoff_multiplier,
+            retry_jitter_factor=retry_jitter_factor,
+            cb_failure_threshold=cb_failure_threshold,
+            cb_success_threshold=cb_success_threshold,
+            cb_timeout_duration_secs=cb_timeout_duration_secs,
+            cb_window_duration_secs=cb_window_duration_secs,
+            disable_retries=disable_retries,
+            disable_circuit_breaker=disable_circuit_breaker,
+            health_failure_threshold=health_failure_threshold,
+            health_success_threshold=health_success_threshold,
+            health_check_timeout_secs=health_check_timeout_secs,
+            health_check_interval_secs=health_check_interval_secs,
+            health_check_endpoint=health_check_endpoint,
         )
 
     def start(self) -> None:

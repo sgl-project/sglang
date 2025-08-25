@@ -1,7 +1,7 @@
 use crate::config::RouterConfig;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
-use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
+use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::routers::{RouterFactory, RouterTrait};
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use axum::{
@@ -269,7 +269,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let client = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
-        .pool_max_idle_per_host(100) // Increase from default of 1 to allow more concurrent connections
+        .pool_max_idle_per_host(500) // Increase to 500 connections per host
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect_timeout(Duration::from_secs(10)) // Separate connection timeout
         .tcp_nodelay(true)
@@ -285,7 +285,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     ));
 
     // Create router with the context
-    let router = RouterFactory::create_router(&app_context)?;
+    let router = RouterFactory::create_router(&app_context).await?;
 
     // Create app state with router and context
     let app_state = Arc::new(AppState {

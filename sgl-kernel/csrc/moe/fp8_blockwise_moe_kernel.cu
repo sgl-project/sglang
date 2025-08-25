@@ -481,13 +481,32 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
     using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
   };
 
+  // [NOTE] default for H20
+  struct MmaConfigH20_default {
+    using ElementA = cutlass::float_e4m3_t;
+    using MmaTileShape = Shape<_64, _128, _128>;
+    using ClusterShape = Shape<_1, _2, _1>;
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
+    using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
+
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  };
+
   int num_experts = (int)expert_offsets.size(0);
   torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
   torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
 
-  if (at::cuda::getCurrentDeviceProperties()->multiProcessorCount == 78 && a.size(1) > 128) {
-    // For H20 with K > 128, use Pingpong Schedule
-    run_get_group_gemm_starts<MmaConfig0::LayoutSFA, MmaConfig0::LayoutSFB, MmaConfig0::ScaleConfig>(
+  const std::string H20_device_type_str = "NVIDIA H20";
+  bool is_h20_device = isDeviceType(H20_device_type_str);
+
+  if (is_h20_device) {
+    using execute_gemm_config = MmaConfigH20_default;
+    run_get_group_gemm_starts<
+        execute_gemm_config::LayoutSFA,
+        execute_gemm_config::LayoutSFB,
+        execute_gemm_config::ScaleConfig>(
         expert_offsets,
         a_ptrs,
         b_ptrs,
@@ -503,7 +522,8 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
         layout_sfb,
         problem_sizes,
         problem_sizes_transpose);
-    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig0, cutlass::layout::RowMajor>(
+
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, execute_gemm_config, cutlass::layout::RowMajor>(
         out_ptrs,
         a_ptrs,
         b_ptrs,
@@ -518,37 +538,71 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
         expert_offsets,
         workspace);
   } else {
-    // For H20 with K <= 128, and H100 & H200 & H800, use Cooperative Schedule
-    run_get_group_gemm_starts<MmaConfig1::LayoutSFA, MmaConfig1::LayoutSFB, MmaConfig1::ScaleConfig>(
-        expert_offsets,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        a,
-        b,
-        output,
-        scales_a,
-        scales_b,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        problem_sizes_transpose);
-    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig1, cutlass::layout::RowMajor>(
-        out_ptrs,
-        a_ptrs,
-        b_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        stride_a,
-        stride_b,
-        stride_c,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        expert_offsets,
-        workspace);
+    if (at::cuda::getCurrentDeviceProperties()->multiProcessorCount == 78 && a.size(1) > 128) {
+      // For H20 with K > 128, use Pingpong Schedule
+      run_get_group_gemm_starts<MmaConfig0::LayoutSFA, MmaConfig0::LayoutSFB, MmaConfig0::ScaleConfig>(
+          expert_offsets,
+          a_ptrs,
+          b_ptrs,
+          out_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          a,
+          b,
+          output,
+          scales_a,
+          scales_b,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          problem_sizes_transpose);
+      launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig0, cutlass::layout::RowMajor>(
+          out_ptrs,
+          a_ptrs,
+          b_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          stride_a,
+          stride_b,
+          stride_c,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          expert_offsets,
+          workspace);
+    } else {
+      // For H20 with K <= 128, and H100 & H200 & H800, use Cooperative Schedule
+      run_get_group_gemm_starts<MmaConfig1::LayoutSFA, MmaConfig1::LayoutSFB, MmaConfig1::ScaleConfig>(
+          expert_offsets,
+          a_ptrs,
+          b_ptrs,
+          out_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          a,
+          b,
+          output,
+          scales_a,
+          scales_b,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          problem_sizes_transpose);
+      launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig1, cutlass::layout::RowMajor>(
+          out_ptrs,
+          a_ptrs,
+          b_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          stride_a,
+          stride_b,
+          stride_c,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          expert_offsets,
+          workspace);
+    }
   }
 }
 

@@ -1,14 +1,14 @@
-use super::{WorkerError, WorkerResult};
+use super::{CircuitBreaker, CircuitBreakerConfig, WorkerError, WorkerResult};
+use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
 use futures;
-use once_cell::sync::Lazy;
 use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
-static WORKER_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30)) // Default timeout, overridden per request
         .build()
@@ -66,6 +66,47 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Clone the worker (for trait objects)
     fn clone_worker(&self) -> Box<dyn Worker>;
+
+    /// Get the circuit breaker for this worker
+    fn circuit_breaker(&self) -> &CircuitBreaker;
+
+    /// Check if the worker is available (healthy + circuit closed/half-open)
+    fn is_available(&self) -> bool {
+        self.is_healthy() && self.circuit_breaker().can_execute()
+    }
+
+    /// Record the outcome of a request to this worker
+    fn record_outcome(&self, success: bool) {
+        // Record outcome-level metric with worker label
+        let outcome_str = if success { "success" } else { "failure" };
+        RouterMetrics::record_cb_outcome(self.url(), outcome_str);
+
+        // Record into circuit breaker and infer state change for metrics
+        let before = self.circuit_breaker().state();
+        self.circuit_breaker().record_outcome(success);
+        let after = self.circuit_breaker().state();
+
+        if before != after {
+            let from = match before {
+                crate::core::CircuitState::Closed => "closed",
+                crate::core::CircuitState::Open => "open",
+                crate::core::CircuitState::HalfOpen => "half_open",
+            };
+            let to = match after {
+                crate::core::CircuitState::Closed => "closed",
+                crate::core::CircuitState::Open => "open",
+                crate::core::CircuitState::HalfOpen => "half_open",
+            };
+            RouterMetrics::record_cb_state_transition(self.url(), from, to);
+        }
+
+        let state_code = match self.circuit_breaker().state() {
+            crate::core::CircuitState::Closed => 0u8,
+            crate::core::CircuitState::Open => 1u8,
+            crate::core::CircuitState::HalfOpen => 2u8,
+        };
+        RouterMetrics::set_cb_state(self.url(), state_code);
+    }
 
     // === DP-aware methods ===
 
@@ -141,6 +182,10 @@ pub struct HealthConfig {
     pub check_interval_secs: u64,
     /// Health check endpoint path
     pub endpoint: String,
+    /// Number of consecutive failures before marking unhealthy
+    pub failure_threshold: u32,
+    /// Number of consecutive successes before marking healthy
+    pub success_threshold: u32,
 }
 
 impl Default for HealthConfig {
@@ -149,6 +194,8 @@ impl Default for HealthConfig {
             timeout_secs: 5,
             check_interval_secs: 30,
             endpoint: "/health".to_string(),
+            failure_threshold: 3,
+            success_threshold: 2,
         }
     }
 }
@@ -173,6 +220,9 @@ pub struct BasicWorker {
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
+    consecutive_failures: Arc<AtomicUsize>,
+    consecutive_successes: Arc<AtomicUsize>,
+    circuit_breaker: CircuitBreaker,
 }
 
 impl BasicWorker {
@@ -189,6 +239,9 @@ impl BasicWorker {
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
+            consecutive_failures: Arc::new(AtomicUsize::new(0)),
+            consecutive_successes: Arc::new(AtomicUsize::new(0)),
+            circuit_breaker: CircuitBreaker::new(),
         }
     }
 
@@ -199,6 +252,11 @@ impl BasicWorker {
 
     pub fn with_health_config(mut self, config: HealthConfig) -> Self {
         self.metadata.health_config = config;
+        self
+    }
+
+    pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
+        self.circuit_breaker = CircuitBreaker::with_config(config);
         self
     }
 
@@ -240,6 +298,7 @@ impl Worker for BasicWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
+        RouterMetrics::set_worker_health(self.url(), healthy);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -251,26 +310,41 @@ impl Worker for BasicWorker {
         let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
         // Use the shared client with a custom timeout for this request
-        match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    self.set_healthy(true);
-                    Ok(())
-                } else {
-                    self.set_healthy(false);
-                    Err(WorkerError::HealthCheckFailed {
-                        url: url.to_string(),
-                        reason: format!("Health check returned status: {}", response.status()),
-                    })
-                }
+        let health_result = match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
+            Ok(response) => response.status().is_success(),
+            Err(_) => false,
+        };
+
+        if health_result {
+            // Health check succeeded
+            self.consecutive_failures.store(0, Ordering::Release);
+            let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Mark healthy if we've reached the success threshold
+            if !self.is_healthy()
+                && successes >= self.metadata.health_config.success_threshold as usize
+            {
+                self.set_healthy(true);
+                self.consecutive_successes.store(0, Ordering::Release);
             }
-            Err(e) => {
+            Ok(())
+        } else {
+            // Health check failed
+            self.consecutive_successes.store(0, Ordering::Release);
+            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+            // Mark unhealthy if we've reached the failure threshold
+            if self.is_healthy()
+                && failures >= self.metadata.health_config.failure_threshold as usize
+            {
                 self.set_healthy(false);
-                Err(WorkerError::HealthCheckFailed {
-                    url: url.to_string(),
-                    reason: format!("Health check request failed: {}", e),
-                })
+                self.consecutive_failures.store(0, Ordering::Release);
             }
+
+            Err(WorkerError::HealthCheckFailed {
+                url: url.to_string(),
+                reason: format!("Health check failed (consecutive failures: {})", failures),
+            })
         }
     }
 
@@ -304,6 +378,10 @@ impl Worker for BasicWorker {
 
     fn clone_worker(&self) -> Box<dyn Worker> {
         Box::new(self.clone())
+    }
+
+    fn circuit_breaker(&self) -> &CircuitBreaker {
+        &self.circuit_breaker
     }
 }
 
@@ -355,43 +433,8 @@ impl Worker for DPAwareWorker {
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
-        // Use base URL for health checks
-        let health_url = format!("{}/health", self.base_url);
-        let timeout =
-            std::time::Duration::from_secs(self.base_worker.metadata.health_config.timeout_secs);
-
-        let health_result = async {
-            let response = WORKER_CLIENT
-                .get(&health_url)
-                .timeout(timeout)
-                .send()
-                .await
-                .map_err(|e| format!("Health check request failed: {}", e))?;
-
-            if response.status().is_success() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Health check returned status: {}",
-                    response.status()
-                ))
-            }
-        }
-        .await;
-
-        match health_result {
-            Ok(()) => {
-                self.set_healthy(true);
-                Ok(())
-            }
-            Err(reason) => {
-                self.set_healthy(false);
-                Err(WorkerError::HealthCheckFailed {
-                    url: self.base_url.clone(),
-                    reason,
-                })
-            }
-        }
+        // Delegate to the base worker's health check logic
+        self.base_worker.check_health_async().await
     }
 
     fn load(&self) -> usize {
@@ -420,6 +463,10 @@ impl Worker for DPAwareWorker {
 
     fn clone_worker(&self) -> Box<dyn Worker> {
         Box::new(self.clone())
+    }
+
+    fn circuit_breaker(&self) -> &CircuitBreaker {
+        self.base_worker.circuit_breaker()
     }
 
     // DP-aware specific implementations
@@ -470,6 +517,17 @@ impl WorkerFactory {
         Box::new(BasicWorker::new(url, WorkerType::Regular))
     }
 
+    /// Create a regular worker with custom circuit breaker configuration
+    pub fn create_regular_with_config(
+        url: String,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        Box::new(
+            BasicWorker::new(url, WorkerType::Regular)
+                .with_circuit_breaker_config(circuit_breaker_config),
+        )
+    }
+
     /// Create a prefill worker with optional bootstrap port
     pub fn create_prefill(url: String, bootstrap_port: Option<u16>) -> Box<dyn Worker> {
         Box::new(BasicWorker::new(
@@ -478,12 +536,36 @@ impl WorkerFactory {
         ))
     }
 
+    /// Create a prefill worker with custom circuit breaker configuration
+    pub fn create_prefill_with_config(
+        url: String,
+        bootstrap_port: Option<u16>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        Box::new(
+            BasicWorker::new(url, WorkerType::Prefill { bootstrap_port })
+                .with_circuit_breaker_config(circuit_breaker_config),
+        )
+    }
+
     /// Create a decode worker
     pub fn create_decode(url: String) -> Box<dyn Worker> {
         Box::new(BasicWorker::new(url, WorkerType::Decode))
     }
 
+    /// Create a decode worker with custom circuit breaker configuration
+    pub fn create_decode_with_config(
+        url: String,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        Box::new(
+            BasicWorker::new(url, WorkerType::Decode)
+                .with_circuit_breaker_config(circuit_breaker_config),
+        )
+    }
+
     /// Create workers from URLs with automatic type detection
+    #[allow(clippy::type_complexity)]
     pub fn create_from_urls(
         regular_urls: Vec<String>,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -519,7 +601,7 @@ impl WorkerFactory {
 
     /// Get DP size from a worker
     async fn get_worker_dp_size(url: &str, api_key: &Option<String>) -> WorkerResult<usize> {
-        let mut req_builder = WORKER_CLIENT.get(&format!("{}/get_server_info", url));
+        let mut req_builder = WORKER_CLIENT.get(format!("{}/get_server_info", url));
 
         if let Some(key) = api_key {
             req_builder = req_builder.bearer_auth(key);
@@ -797,6 +879,7 @@ pub fn start_health_checker(
 mod tests {
     use super::*;
     use std::sync::RwLock;
+    use std::thread;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -859,6 +942,8 @@ mod tests {
         assert_eq!(config.timeout_secs, 5);
         assert_eq!(config.check_interval_secs, 30);
         assert_eq!(config.endpoint, "/health");
+        assert_eq!(config.failure_threshold, 3);
+        assert_eq!(config.success_threshold, 2);
     }
 
     #[test]
@@ -867,10 +952,14 @@ mod tests {
             timeout_secs: 10,
             check_interval_secs: 60,
             endpoint: "/healthz".to_string(),
+            failure_threshold: 5,
+            success_threshold: 3,
         };
         assert_eq!(config.timeout_secs, 10);
         assert_eq!(config.check_interval_secs, 60);
         assert_eq!(config.endpoint, "/healthz");
+        assert_eq!(config.failure_threshold, 5);
+        assert_eq!(config.success_threshold, 3);
     }
 
     // Test BasicWorker
@@ -902,6 +991,8 @@ mod tests {
             timeout_secs: 15,
             check_interval_secs: 45,
             endpoint: "/custom-health".to_string(),
+            failure_threshold: 4,
+            success_threshold: 2,
         };
 
         let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
@@ -1106,12 +1197,6 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
-
-        // Final state should be deterministic (last write wins)
-        // We can't predict the exact final state due to scheduling,
-        // but we can verify no data corruption occurred
-        let final_health = worker.is_healthy();
-        assert!(final_health == true || final_health == false);
     }
 
     // Test WorkerFactory
@@ -1573,6 +1658,94 @@ mod tests {
         assert!(!workers[1].is_dp_aware());
         assert_eq!(workers[0].url(), "http://w1:8080");
         assert_eq!(workers[1].url(), "http://w2:8080");
+    }
+
+    // ===== Circuit Breaker Integration Tests =====
+
+    #[test]
+    fn test_worker_circuit_breaker() {
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+
+        // Initial state should be available
+        assert!(worker.is_available());
+        assert_eq!(
+            worker.circuit_breaker().state(),
+            crate::core::CircuitState::Closed
+        );
+
+        // Record some failures
+        worker.record_outcome(false);
+        worker.record_outcome(false);
+
+        // Still available (default threshold is 5)
+        assert!(worker.is_available());
+
+        // Record more failures to open circuit
+        worker.record_outcome(false);
+        worker.record_outcome(false);
+        worker.record_outcome(false);
+
+        // Circuit should be open, worker not available
+        assert!(!worker.is_available());
+        assert!(worker.is_healthy()); // Still healthy
+        assert!(!worker.circuit_breaker().can_execute()); // But circuit is open
+    }
+
+    #[test]
+    fn test_worker_with_circuit_breaker_config() {
+        let config = crate::core::CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            timeout_duration: Duration::from_millis(100),
+            window_duration: Duration::from_secs(60),
+        };
+
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
+            .with_circuit_breaker_config(config);
+
+        // Should open after 2 failures
+        worker.record_outcome(false);
+        assert!(worker.is_available());
+        worker.record_outcome(false);
+        assert!(!worker.is_available());
+
+        // Wait for timeout
+        thread::sleep(Duration::from_millis(150));
+
+        // Should be half-open
+        assert!(worker.is_available());
+        assert_eq!(
+            worker.circuit_breaker().state(),
+            crate::core::CircuitState::HalfOpen
+        );
+
+        // Success should close it
+        worker.record_outcome(true);
+        assert_eq!(
+            worker.circuit_breaker().state(),
+            crate::core::CircuitState::Closed
+        );
+    }
+
+    #[test]
+    fn test_dp_aware_worker_circuit_breaker() {
+        let dp_worker =
+            DPAwareWorker::new("http://worker:8080".to_string(), 0, 2, WorkerType::Regular);
+
+        // Should have circuit breaker
+        assert!(dp_worker.is_available());
+
+        // Record failures
+        for _ in 0..5 {
+            dp_worker.record_outcome(false);
+        }
+
+        // Should not be available
+        assert!(!dp_worker.is_available());
+        assert_eq!(
+            dp_worker.circuit_breaker().state(),
+            crate::core::CircuitState::Open
+        );
     }
 
     // ===== Integration tests =====

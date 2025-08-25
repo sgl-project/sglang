@@ -49,6 +49,8 @@ SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 
+TREE_SPEC_KERNEL_AVAILABLE = "tree_speculative_sampling_target_only" in globals()
+
 
 @dataclass
 class EagleDraftInput:
@@ -177,11 +179,24 @@ class EagleDraftInput:
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
-    def filter_batch(self, new_indices: torch.Tensor):
-        self.topk_p = self.topk_p[: len(new_indices)]
-        self.topk_index = self.topk_index[: len(new_indices)]
-        self.hidden_states = self.hidden_states[: len(new_indices)]
-        self.verified_id = self.verified_id[: len(new_indices)]
+    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if has_been_filtered:
+            # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
+            # therefore, we don't need to filter the batch again in scheduler
+            if len(new_indices) != len(self.topk_p):
+                logger.warning(
+                    f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
+                )
+            self.topk_p = self.topk_p[: len(new_indices)]
+            self.topk_index = self.topk_index[: len(new_indices)]
+            self.hidden_states = self.hidden_states[: len(new_indices)]
+            self.verified_id = self.verified_id[: len(new_indices)]
+        else:
+            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
+            self.topk_p = self.topk_p[new_indices]
+            self.topk_index = self.topk_index[new_indices]
+            self.hidden_states = self.hidden_states[new_indices]
+            self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
         if self.hidden_states is None:
@@ -410,8 +425,15 @@ class EagleVerifyInput:
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
-        # Sample tokens
-        if batch.sampling_info.is_all_greedy:
+        # Sample tokens. Force greedy sampling on AMD
+        is_all_greedy = sampling_info.is_all_greedy
+        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+            logger.warning(
+                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
+                "Falling back to greedy verification."
+            )
+
+        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
 
@@ -440,12 +462,13 @@ class EagleVerifyInput:
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                ),
-            )
+            if not torch.all(sampling_info.top_ps == 1.0):
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, self.draft_token_num, dim=0
+                    ),
+                )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
             draft_probs = torch.zeros(
