@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+from collections.abc import Iterable, Mapping
 from fractions import Fraction
 from typing import Any, Optional, Union
 
@@ -8,8 +9,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
+
 ScalarType, scalar_types = get_scalar_types()
 
 
@@ -104,7 +105,9 @@ class AutoRoundConfig(QuantizationConfig):
             group_size=cls.get_from_keys(config, ["group_size"]),
             sym=cls.get_from_keys(config, ["sym"]),
             packing_format=cls.get_from_keys_or(
-                config, ["packing_format"], "auto_round:auto_gptq",
+                config,
+                ["packing_format"],
+                "auto_round:auto_gptq",
             ),
             block_name_to_quantize=cls.get_from_keys_or(
                 config, ["block_name_to_quantize", "to_quant_block_names"], None
@@ -124,28 +127,59 @@ class AutoRoundConfig(QuantizationConfig):
         raise NotImplementedError
 
     def get_layer_config(self, layer, layer_name: str):
-        # Priority: extra_config > block_name_to_quantize > type fallback
-        if self.extra_config and layer_name in self.extra_config:
-            cfg = self.extra_config[layer_name]
+
+        def get_config(name: str, quantized: bool = True):
+            cfg = self.extra_config.get(name, {}) if self.extra_config else {}
             return (
-                cfg.get("bits", self.weight_bits),
-                cfg.get("group_size", self.group_size),
-                cfg.get("sym", self.sym),
+                cfg.get("bits", self.weight_bits if quantized else 16),
+                cfg.get("group_size", self.group_size if quantized else -1),
+                cfg.get("sym", self.sym if quantized else True),
             )
 
-        quantized = True
+        # 1. Exact match from config
+        if self.extra_config and layer_name in self.extra_config:
+            return get_config(layer_name)
+
+        # 2. Determine whether layer should be quantized
+        quantized = not isinstance(layer, ParallelLMHead)
         if self.block_name_to_quantize:
             quantized = any(
                 layer_name.startswith(name) for name in self.block_name_to_quantize
             )
-        elif isinstance(layer, ParallelLMHead):
-            quantized = False
 
-        return (
-            (self.weight_bits, self.group_size, self.sym)
-            if quantized
-            else (16, -1, True)
-        )
+        # 3. Handle fused MoE
+        if self.extra_config and "fusedmoe" in layer.__class__.__name__.lower():
+            moe_configs = [
+                get_config(name, quantized)
+                for name in self.extra_config
+                if name.startswith(layer_name)
+            ]
+            if moe_configs:
+                if len(set(moe_configs)) == 1:
+                    return moe_configs[0]
+                raise ValueError(
+                    f"Fused MoE layer '{layer_name}' requires "
+                    f"consistent quant config for all sub-layers"
+                )
+
+        # 4. Handle fused QKV or other patterns
+        if self.extra_config:
+            for fusion_key, sub_keys in self.packed_modules_mapping.items():
+                if fusion_key in layer_name and layer_name.count(fusion_key) == 1:
+                    sub_names = [
+                        layer_name.replace(fusion_key, sub_key) for sub_key in sub_keys
+                    ]
+                    sub_configs = [get_config(name, quantized) for name in sub_names]
+                    if len(set(sub_configs)) == 1:
+                        return sub_configs[0]
+                    raise ValueError(
+                        f"Fused module '{layer_name}' requires "
+                        f"consistent quant config for {sub_names}"
+                    )
+
+        # 5. Fallback
+        return get_config(layer_name, quantized)
+        
 
     def check_quantized(self, weight_bits: int) -> bool:
         return weight_bits < 16
@@ -157,6 +191,7 @@ class AutoRoundConfig(QuantizationConfig):
             check_marlin_supports_layer,
             check_moe_marlin_supports_layer,
         )
+
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
@@ -237,6 +272,7 @@ class AutoRoundConfig(QuantizationConfig):
             check_marlin_supported,
             check_moe_marlin_supports_layer,
         )
+
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
             if isinstance(layer, (LinearBase, ParallelLMHead)):

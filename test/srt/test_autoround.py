@@ -27,6 +27,7 @@ class TestAutoRound(CustomTestCase):
         pass
 
     def test_mmlu(self):
+        device = "auto"
         for model in DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST:
             with self.subTest(model=model):
                 print(f"\n[INFO] Launching server for model: {model}")
@@ -35,6 +36,7 @@ class TestAutoRound(CustomTestCase):
                     self.base_url,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                     other_args=["--trust-remote-code"],
+                    device=device,
                 )
 
                 try:
@@ -44,6 +46,7 @@ class TestAutoRound(CustomTestCase):
                         eval_name="mmlu",
                         num_examples=64,
                         num_threads=32,
+                        device=device,
                     )
                     metrics = run_eval(args)
                     if "Llama" in model:
