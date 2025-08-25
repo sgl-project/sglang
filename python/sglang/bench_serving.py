@@ -33,6 +33,7 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 from transformers import (
+    AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -635,7 +636,30 @@ def get_tokenizer(
     )
 
 
-def get_dataset(args, tokenizer):
+def get_processor(
+    pretrained_model_name_or_path: str,
+) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    assert (
+        pretrained_model_name_or_path is not None
+        and pretrained_model_name_or_path != ""
+    )
+    if pretrained_model_name_or_path.endswith(
+        ".json"
+    ) or pretrained_model_name_or_path.endswith(".model"):
+        from sglang.srt.hf_transformers_utils import get_processor
+
+        return get_processor(pretrained_model_name_or_path)
+
+    if pretrained_model_name_or_path is not None and not os.path.exists(
+        pretrained_model_name_or_path
+    ):
+        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
+    return AutoProcessor.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=True
+    )
+
+
+def get_dataset(args, tokenizer, model_id):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
@@ -648,13 +672,15 @@ def get_dataset(args, tokenizer):
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
-    elif args.dataset_name.startswith("random-image"):
+    elif args.dataset_name == "image":
         input_requests = sample_image_requests(
-            input_len=args.random_input_len,
+            image_width=args.image_width,
+            image_height=args.image_height,
+            image_type=args.image_type,
             output_len=args.random_output_len,
             num_prompts=args.num_prompts,
-            # range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
+            model_id=model_id,
         )
     elif args.dataset_name.startswith("random"):
         input_requests = sample_random_requests(
@@ -1122,33 +1148,50 @@ def sample_random_requests(
 
 
 def sample_image_requests(
-    input_len: int,
+    image_width: int,
+    image_height: int,
+    image_type: str,
     output_len: int,
     num_prompts: int,
     tokenizer: PreTrainedTokenizerBase,
+    model_id: str,
     apply_chat_template: bool = True,
 ) -> List[DatasetRow]:
     import io
 
+    import numpy as np
     import pybase64
+    from PIL import Image
+
+    pixels = np.zeros((image_height, image_width, 3), dtype=np.uint8)
+    image = Image.fromarray(pixels)
+
+    processor = get_processor(model_id)
+    num_image_tokens = (
+        processor(images=image, text=processor.image_token, return_tensors="pt")
+        .input_ids[0]
+        .numel()
+    )
 
     # Create prompts
     dataset = []
+    total_image_bytes = 0
 
     for i in range(num_prompts):
-        # Create a blank (all white) PNG image and store in image_data as base64
-        # Create a random JPEG image
-        import numpy as np
-        from PIL import Image
-
-        width, height = 1120, 720
-        pixels = np.random.randint(0, 256, (height, width, 3), dtype=np.uint8)
-        # pixels = np.zeros((height, width, 3), dtype=np.uint8)
-        image = Image.fromarray(pixels, "RGB")
+        if image_type == "random":
+            pixels = np.random.randint(
+                0, 256, (image_height, image_width, 3), dtype=np.uint8
+            )
+        elif image_type == "blank":
+            pixels = np.zeros((image_height, image_width, 3), dtype=np.uint8)
+        else:
+            raise ValueError(f"Invalid image_type {image_type}")
+        image = Image.fromarray(pixels)
         buffered = io.BytesIO()
         image.save(buffered, format="PNG")
         img_str = pybase64.b64encode(buffered.getvalue()).decode("utf-8")
         image_data = f"data:image/png;base64,{img_str}"
+        total_image_bytes += len(image_data.encode("utf-8"))
 
         try:
             # Construct the prompt
@@ -1178,14 +1221,12 @@ def sample_image_requests(
 
             # Calculate token lengths for text only (without image data)
             prompt_token_ids = tokenizer.encode(prompt)
-            # print(f'len(prompt_token_ids): {len(prompt_token_ids)}')
-            # print(f'prompt_token_ids: {prompt_token_ids}')
             prompt_len = len(prompt_token_ids)
 
             dataset.append(
                 DatasetRow(
                     prompt=prompt,
-                    prompt_len=prompt_len + 1000,
+                    prompt_len=prompt_len + num_image_tokens,
                     output_len=output_len,
                     image_data=[image_data],
                 )
@@ -1194,7 +1235,9 @@ def sample_image_requests(
         except Exception as e:
             print(f"Error processing example {i}: {e}")
 
-    print(f"\nCreated {len(dataset)} image prompts")
+    print(
+        f"\nCreated {len(dataset)} {image_type} image prompts with average {total_image_bytes//num_prompts} image bytes per request"
+    )
     return dataset
 
 
@@ -1840,7 +1883,7 @@ def run_benchmark(args_: argparse.Namespace):
     model_id = args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer)
+    input_requests = get_dataset(args, tokenizer, args.model)
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
@@ -1916,7 +1959,7 @@ if __name__ == "__main__":
             "sharegpt",
             "random",
             "random-ids",
-            "random-image",
+            "image",
             "generated-shared-prefix",
             "mmmu",
         ],
@@ -1971,6 +2014,24 @@ if __name__ == "__main__":
         default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random dataset.",
+    )
+    parser.add_argument(
+        "--image-type",
+        type=str,
+        default="random",
+        help="Type of image to test with, used only for image dataset.",
+    )
+    parser.add_argument(
+        "--image-width",
+        type=int,
+        default=None,
+        help="Width of image to test with, used only for image dataset.",
+    )
+    parser.add_argument(
+        "--image-height",
+        type=int,
+        default=None,
+        help="Height of image to test with, used only for image dataset.",
     )
     parser.add_argument(
         "--request-rate",
