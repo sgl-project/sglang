@@ -9,7 +9,7 @@ from typing import AbstractSet, Dict, List, Optional, Tuple, Type, Union
 
 import torch.nn as nn
 
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils import log_warning_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ def import_model_classes():
             try:
                 module = importlib.import_module(name)
             except Exception as e:
-                log_info_on_rank0(
+                log_warning_on_rank0(
                     logger, f"Ignore import error when loading {name}: {e}"
                 )
                 continue

@@ -34,7 +34,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    log_info_on_rank0,
+    log_warning_on_rank0,
 )
 
 _is_hip = is_hip()
@@ -876,7 +876,7 @@ def get_moe_configs(
         )
         if os.path.exists(try_config_file_path):
             with open(try_config_file_path) as f:
-                log_info_on_rank0(
+                log_warning_on_rank0(
                     logger,
                     f"Config file not found at {config_file_path}. Fallback to triton version {try_triton_version} and use MoE kernel config from {try_config_file_path}. Performance might be sub-optimal!",
                 )
@@ -885,7 +885,7 @@ def get_moe_configs(
 
     # If no optimized configuration is available, we will use the default
     # configuration
-    log_info_on_rank0(
+    log_warning_on_rank0(
         logger,
         (
             "Using default MoE kernel config. Performance might be sub-optimal! "
