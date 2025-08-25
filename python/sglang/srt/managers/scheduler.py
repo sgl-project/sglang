@@ -301,7 +301,7 @@ class Scheduler(
         # Init moe config
         self.init_moe_config()
 
-        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        # Set think_end_id and is_hybrid if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
@@ -309,6 +309,7 @@ class Scheduler(
             self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
+            self.tokenizer.is_hybrid = reasoning_parser.detector.is_hybrid
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -1243,10 +1244,10 @@ class Scheduler(
                 key_string = req.sampling_params.structural_tag
 
             if isinstance(self.grammar_backend, ReasonerGrammarBackend):
-                is_in_reasoning = req.sampling_params.is_in_reasoning
-                if is_in_reasoning is None:
-                    is_in_reasoning = True
-                key = (key_type, key_string, is_in_reasoning)
+                enable_thinking = req.sampling_params.enable_thinking
+                if enable_thinking is None:
+                    enable_thinking = True
+                key = (key_type, key_string, enable_thinking)
             else:
                 key = (key_type, key_string)
 

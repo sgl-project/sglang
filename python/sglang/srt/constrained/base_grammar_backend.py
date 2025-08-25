@@ -207,8 +207,7 @@ def create_grammar_backend(
         )
 
         grammar_backend = ReasonerGrammarBackend(
-            grammar_backend,
-            tokenizer.think_end_id,
+            grammar_backend, tokenizer.think_end_id, tokenizer.is_hybrid
         )
 
     return grammar_backend

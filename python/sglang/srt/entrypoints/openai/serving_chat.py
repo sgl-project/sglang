@@ -397,9 +397,8 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 sampling_params[constraint_type] = constraint_value
 
-        sampling_params["is_in_reasoning"] = (
-            self.template_manager.force_reasoning
-            or self._get_enable_thinking_from_request(request)
+        sampling_params["enable_thinking"] = self._get_enable_thinking_from_request(
+            request
         )
 
         return sampling_params

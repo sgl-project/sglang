@@ -90,21 +90,24 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self,
         grammar_backend: BaseGrammarBackend,
         think_end_id: int,
+        is_hybrid: bool,
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
         self.think_end_id = think_end_id
+        self.is_hybrid = is_hybrid
 
     def _init_value_dispatch(
         self,
         key: Tuple[str, str, bool],
     ) -> Optional[ReasonerGrammarObject]:
-        key_type, key_string, is_in_reasoning = key
+        key_type, key_string, enable_thinking = key
         base_key = (key_type, key_string)
         ret = self.grammar_backend._init_value_dispatch(base_key)
         if ret is None:
             return None
-        return ReasonerGrammarObject(ret, self.think_end_id, is_in_reasoning)
+        is_is_reasoning = not self.is_hybrid or enable_thinking
+        return ReasonerGrammarObject(ret, self.think_end_id, is_is_reasoning)
 
     def get_cached_or_future_value(
         self, key: Tuple[str, str, bool]
