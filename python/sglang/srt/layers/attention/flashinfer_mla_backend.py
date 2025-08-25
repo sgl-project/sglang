@@ -60,7 +60,7 @@ class PrefillMetadata:
 global_workspace_buffer = None
 
 
-class FlashInferMhaChunkKVRunner:
+class FlashInferMhaRaggedRunner:
     def __init__(
         self, model_runner: ModelRunner, attn_backend: "FlashInferMlaAttnBackend"
     ):
@@ -175,9 +175,6 @@ class FlashInferMhaChunkKVRunner:
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
-        if forward_batch.mha_return_lse:
-            o1, s1 = o
-            return o1, s1
         return o
 
 
@@ -251,7 +248,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.indices_updater_prefill = FlashInferMLAIndicesUpdaterPrefill(
                 model_runner, self
             )
-            self.mha_chunk_kv_cache = FlashInferMhaChunkKVRunner(model_runner, self)
+            self.mha_ragged_runner = FlashInferMhaRaggedRunner(model_runner, self)
 
         self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
             model_runner, self
@@ -300,7 +297,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify)
         else:
             if forward_batch.num_prefix_chunks is not None:
-                self.mha_chunk_kv_cache.update_wrapper(forward_batch)
+                self.mha_ragged_runner.update_wrapper(forward_batch)
             else:
                 self.indices_updater_prefill.update(
                     forward_batch.req_pool_indices,
@@ -497,8 +494,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert not forward_batch.forward_mode.is_draft_extend()
             assert q_rope is None
             assert k_rope is None
-            o = self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
-            return o
+            return self.mha_ragged_runner.forward(q, k, v, layer, forward_batch)
 
         cache_loc = forward_batch.out_cache_loc
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
@@ -526,14 +522,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             q, q_rope = (
                 qall[:, :, : layer.v_head_dim],
-                qall[:, :, layer.v_head_dim:],
+                qall[:, :, layer.v_head_dim :],
             )
         o = q.new_empty(q.shape)
         o = prefill_wrapper_paged.run(
             q,
             q_rope,
             k_buf[:, :, : layer.v_head_dim],
-            k_buf[:, :, layer.v_head_dim:],
+            k_buf[:, :, layer.v_head_dim :],
             out=o,
         )
 
