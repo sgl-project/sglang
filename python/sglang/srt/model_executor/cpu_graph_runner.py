@@ -37,7 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
-    rank0_log,
+    log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -402,7 +402,7 @@ class CPUGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs = get_batch_sizes_to_capture(model_runner)
-        rank0_log(f"Capture cpu graph bs {self.capture_bs}")
+        log_info_on_rank0(logger, f"Capture cpu graph bs {self.capture_bs}")
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
