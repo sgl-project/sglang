@@ -909,9 +909,10 @@ class FlashInferIndicesUpdaterPrefill:
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # window attention use paged only
+                # Avoid creating a CPU tensor inside a CUDA expression; use python int for device-side op
                 paged_kernel_lens = torch.minimum(
                     seq_lens,
-                    torch.tensor(self.sliding_window_size) + seq_lens - prefix_lens,
+                    seq_lens - prefix_lens + self.sliding_window_size,
                 )
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
             else:
