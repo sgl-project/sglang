@@ -78,6 +78,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    FreezeGCReq,
     GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -122,7 +123,9 @@ from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    configure_gc_warning,
     dataclass_to_string_truncated,
+    freeze_gc,
     get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
@@ -298,7 +301,7 @@ class TokenizerManager:
         # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
         # serves as the source of truth for available adapters and maps user-friendly LoRA names
         # to internally used unique LoRA IDs.
-        self.lora_registry = LoRARegistry(self.server_args.lora_paths or {})
+        self.lora_registry = LoRARegistry(self.server_args.lora_paths)
         # Lock to serialize LoRA update operations.
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
@@ -351,6 +354,10 @@ class TokenizerManager:
                 bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
                 collect_tokens_histogram=self.server_args.collect_tokens_histogram,
             )
+
+        # Configure GC warning
+        if self.server_args.gc_warning_threshold_secs > 0.0:
+            configure_gc_warning(self.server_args.gc_warning_threshold_secs)
 
         # Communicators
         self.init_weights_update_group_communicator = _Communicator(
@@ -446,6 +453,10 @@ class TokenizerManager:
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
+                (
+                    FreezeGCReq,
+                    lambda x: None,
+                ),  # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
@@ -566,7 +577,7 @@ class TokenizerManager:
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
-        _max_req_len = self.context_len - 1
+        _max_req_len = self.context_len
 
         input_token_num = len(input_ids) if input_ids is not None else 0
         if input_token_num >= self.context_len:
@@ -576,7 +587,7 @@ class TokenizerManager:
                     f"model's context length ({self.context_len} tokens). "
                     "Truncating the input."
                 )
-                input_ids = input_ids[:_max_req_len]
+                del input_ids[_max_req_len:]
                 input_token_num = len(input_ids)
             else:
                 raise ValueError(
@@ -1358,6 +1369,12 @@ class TokenizerManager:
             self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
         self.log_request_metadata = self.get_log_request_metadata()
+
+    async def freeze_gc(self):
+        """Send a freeze_gc message to the scheduler first, then freeze locally."""
+        self.send_to_scheduler.send_pyobj(FreezeGCReq())
+        freeze_gc("Tokenizer Manager")
+        return None
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.

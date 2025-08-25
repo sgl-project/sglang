@@ -41,6 +41,7 @@ class EAGLEDraftCudaGraphRunner:
         # Parse args
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.model_runner
+        self.model_runner: EAGLEWorker
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
