@@ -55,7 +55,7 @@ The URLs should be MCP SSE servers that expose server information and well-docum
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:30323/v1",
+    base_url="http://localhost:30000/v1",
     api_key="sk-123456"
 )
 
