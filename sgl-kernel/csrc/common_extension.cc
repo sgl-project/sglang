@@ -247,18 +247,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/moe/marlin_moe_wna16
    */
-  m.def(
-      "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
-      "Tensor! b_q_weight, Tensor! b_scales, Tensor? b_zeros_or_none,"
-      "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor! workspace,"
-      "Tensor sorted_token_ids,"
-      "Tensor! expert_ids, Tensor! num_tokens_past_padded,"
-      "Tensor! topk_weights, int moe_block_size, int top_k, "
-      "bool mul_topk_weights, bool is_ep, int b_q_type_id,"
-      "int size_m, int size_n, int size_k,"
-      "bool is_k_full, bool use_atomic_add,"
-      "bool use_fp32_reduce, bool is_zp_float) -> Tensor");
-  m.impl("moe_wna16_marlin_gemm", torch::kCUDA, &moe_wna16_marlin_gemm);
+  //   m.def(
+  //       "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
+  //       "Tensor! b_q_weight, Tensor! b_scales, Tensor? b_zeros_or_none,"
+  //       "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor! workspace,"
+  //       "Tensor sorted_token_ids,"
+  //       "Tensor! expert_ids, Tensor! num_tokens_past_padded,"
+  //       "Tensor! topk_weights, int moe_block_size, int top_k, "
+  //       "bool mul_topk_weights, bool is_ep, int b_q_type_id,"
+  //       "int size_m, int size_n, int size_k,"
+  //       "bool is_k_full, bool use_atomic_add,"
+  //       "bool use_fp32_reduce, bool is_zp_float) -> Tensor");
+  //   m.impl("moe_wna16_marlin_gemm", torch::kCUDA, &moe_wna16_marlin_gemm);
 
   /*
    * From csrc/moe/cutlass_moe/w4a8

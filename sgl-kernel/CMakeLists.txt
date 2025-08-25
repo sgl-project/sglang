@@ -82,8 +82,8 @@ FetchContent_Populate(repo-triton)
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        9220fb3443b5a5d274f00ca5552f798e225239b7
+    GIT_REPOSITORY https://github.com/rainj-me/flashinfer.git
+    GIT_TAG        dev_cuda130
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -179,8 +179,6 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_101,code=sm_101"
-        "-gencode=arch=compute_101a,code=sm_101a"
         "-gencode=arch=compute_120,code=sm_120"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
@@ -265,13 +263,6 @@ set(SOURCES
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
-    "csrc/moe/marlin_moe_wna16/ops.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
