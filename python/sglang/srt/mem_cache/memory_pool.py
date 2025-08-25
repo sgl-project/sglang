@@ -839,8 +839,15 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        k_scale: Optional[float] = None,
     ):
         layer_id = layer.layer_id
+
+        if k_scale is not None:
+            # be safe: not change it inplace
+            cache_k_nope = cache_k_nope / k_scale
+            cache_k_rope = cache_k_rope / k_scale
+
         if cache_k_nope.dtype != self.dtype:
             cache_k_nope = cache_k_nope.to(self.dtype)
             cache_k_rope = cache_k_rope.to(self.dtype)
