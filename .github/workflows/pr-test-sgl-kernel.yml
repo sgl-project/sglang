@@ -39,7 +39,7 @@ jobs:
           - python-version: "3.10"
             cuda-version: "12.4"
           - python-version: "3.10"
-            cuda-version: "12.9"
+            cuda-version: "12.8"
     name: Build Wheel (CUDA ${{ matrix.cuda-version }})
     steps:
       - name: Cleanup
