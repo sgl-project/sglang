@@ -625,14 +625,9 @@ class CudaGraphRunner:
 
         # Attention backend
         # Provide CPU seq_lens to attn backend(s) for capture to avoid extra .cpu() copies
-        try:
-            setattr(self.model_runner.attn_backend, "_capture_seq_lens_cpu", self.seq_lens_cpu)
-            # In speculative/multistep backends, propagate to nested backends if any
-            if hasattr(self.model_runner.attn_backend, "attn_backends"):
-                for ab in getattr(self.model_runner.attn_backend, "attn_backends"):
-                    setattr(ab, "_capture_seq_lens_cpu", self.seq_lens_cpu)
-        except Exception:
-            pass
+        setter = getattr(self.model_runner.attn_backend, "set_capture_seq_lens_cpu", None)
+        if callable(setter):
+            setter(self.seq_lens_cpu)
 
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,

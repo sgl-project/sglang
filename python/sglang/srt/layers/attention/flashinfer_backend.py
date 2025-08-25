@@ -204,6 +204,10 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+        self._capture_seq_lens_cpu: Optional[torch.Tensor] = None
+
+    def set_capture_seq_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> None:
+        self._capture_seq_lens_cpu = seq_lens_cpu
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -316,6 +320,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        cpu_view = (self._capture_seq_lens_cpu[:bs] if self._capture_seq_lens_cpu is not None else None)
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
@@ -333,12 +338,10 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
-            # Prefer runner-provided CPU seq_lens to avoid device->host copy during capture
-            seq_lens_cpu_capture = getattr(self, "_capture_seq_lens_cpu", None)
             self.indices_updater_decode.update(
                 req_pool_indices,
                 seq_lens,
-                (seq_lens_cpu_capture[:bs] if seq_lens_cpu_capture is not None else seq_lens.cpu()),
+                (cpu_view if cpu_view is not None else seq_lens.cpu()),
                 seq_lens_sum,
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
@@ -367,11 +370,10 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
-            seq_lens_cpu_capture = getattr(self, "_capture_seq_lens_cpu", None)
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
-                (seq_lens_cpu_capture[:bs] if seq_lens_cpu_capture is not None else seq_lens.cpu()),
+                (cpu_view if cpu_view is not None else seq_lens.cpu()),
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=prefill_wrappers,
@@ -398,11 +400,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             seq_lens_sum = seq_lens.sum().item()
-            seq_lens_cpu_capture = getattr(self, "_capture_seq_lens_cpu", None)
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
-                (seq_lens_cpu_capture[:bs] if seq_lens_cpu_capture is not None else seq_lens.cpu()),
+                (cpu_view if cpu_view is not None else seq_lens.cpu()),
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=prefill_wrappers,
@@ -913,7 +914,6 @@ class FlashInferIndicesUpdaterPrefill:
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # window attention use paged only
-                # Avoid creating a CPU tensor inside a CUDA expression; use python int for device-side op
                 paged_kernel_lens = torch.minimum(
                     seq_lens,
                     seq_lens - prefix_lens + self.sliding_window_size,
@@ -1118,6 +1118,11 @@ class FlashInferMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+
+    def set_capture_seq_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> None:
+        for ab in self.attn_backends:
+            if hasattr(ab, "set_capture_seq_lens_cpu"):
+                ab.set_capture_seq_lens_cpu(seq_lens_cpu)
 
     def common_template(
         self,
