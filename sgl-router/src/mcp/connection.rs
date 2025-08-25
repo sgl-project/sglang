@@ -1,8 +1,10 @@
+use crate::mcp::types::{
+    ConnectionInfo, ConnectionType, MCPRequest, MCPResponse, ToolMetadata, ToolRegistry,
+};
 use crate::mcp::{MCPError, MCPResult};
-use crate::mcp::types::{ConnectionInfo, ConnectionType, MCPRequest, MCPResponse, ToolRegistry, ToolMetadata};
+use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
-use std::collections::HashMap;
 
 pub struct LocalConnection {
     process: Option<Child>,
@@ -28,13 +30,15 @@ impl LocalConnection {
     pub async fn connect(&mut self) -> MCPResult<()> {
         let parts: Vec<&str> = self.connection_info.endpoint.split_whitespace().collect();
         if parts.is_empty() {
-            return Err(MCPError::ConfigurationError("Empty server command".to_string()));
+            return Err(MCPError::ConfigurationError(
+                "Empty server command".to_string(),
+            ));
         }
 
         let command = parts[0];
         let args = &parts[1..];
 
-        let mut child = Command::new(command)
+        let child = Command::new(command)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -43,9 +47,9 @@ impl LocalConnection {
             .map_err(|e| MCPError::ConnectionError(format!("Failed to spawn process: {}", e)))?;
 
         self.process = Some(child);
-        
+
         self.discover_tools().await?;
-        
+
         Ok(())
     }
 
@@ -59,10 +63,12 @@ impl LocalConnection {
 
     pub async fn send_request(&mut self, request: MCPRequest) -> MCPResult<MCPResponse> {
         if self.process.is_none() {
-            return Err(MCPError::ConnectionError("Not connected to MCP server".to_string()));
+            return Err(MCPError::ConnectionError(
+                "Not connected to MCP server".to_string(),
+            ));
         }
 
-        let request_json = serde_json::to_string(&request)
+        let _request_json = serde_json::to_string(&request)
             .map_err(|e| MCPError::ParseError(format!("Failed to serialize request: {}", e)))?;
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

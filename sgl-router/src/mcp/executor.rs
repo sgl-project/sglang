@@ -1,5 +1,5 @@
+use crate::mcp::types::{MCPRequest, ToolCall, ToolResult};
 use crate::mcp::{MCPError, MCPResult};
-use crate::mcp::types::{ToolCall, ToolResult, MCPRequest};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
@@ -14,10 +14,15 @@ impl SimpleExecutor {
 
     pub async fn execute_tool(&self, tool_call: ToolCall) -> MCPResult<ToolResult> {
         let start_time = Instant::now();
-        
+
         let result = timeout(self.timeout, self.execute_tool_internal(tool_call.clone()))
             .await
-            .map_err(|_| MCPError::TimeoutError(format!("Tool '{}' timed out after {:?}", tool_call.name, self.timeout)))?;
+            .map_err(|_| {
+                MCPError::TimeoutError(format!(
+                    "Tool '{}' timed out after {:?}",
+                    tool_call.name, self.timeout
+                ))
+            })?;
 
         let execution_time = start_time.elapsed();
 
@@ -50,7 +55,7 @@ impl SimpleExecutor {
 
     async fn send_request(&self, _request: MCPRequest) -> MCPResult<serde_json::Value> {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         Ok(serde_json::json!({
             "status": "success",
             "message": "Tool executed successfully (mock implementation)"
