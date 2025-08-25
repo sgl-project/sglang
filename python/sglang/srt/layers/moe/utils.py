@@ -25,6 +25,7 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     FP4_ALLGATHER = "fp4_allgather"
+    FLASHINFER_ALLTOALLV = "flashinfer_alltoallv"
 
     @classmethod
     def _missing_(cls, value):
@@ -43,6 +44,9 @@ class MoeA2ABackend(Enum):
 
     def is_fp4_allgather(self):
         return self == MoeA2ABackend.FP4_ALLGATHER
+
+    def is_flashinfer_alltoallv(self):
+        return self == MoeA2ABackend.FLASHINFER_ALLTOALLV
 
 
 class MoeRunnerBackend(Enum):
@@ -189,4 +193,3 @@ def should_use_flashinfer_trtllm_moe():
         >= pkg_version.parse("0.2.9rc1")
     )
     return result
-

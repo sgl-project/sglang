@@ -2417,7 +2417,9 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif server_args.moe_a2a_backend == "none":
+        elif (
+            server_args.moe_a2a_backend == "none"
+        ):  # TODO(tmorris): see if needed for flashinfer cutlass options (fp4_allgather/alltoallv)
             return True
         else:
             return (
