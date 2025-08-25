@@ -2002,13 +2002,6 @@ def configure_ipv6(dist_init_addr):
     return port, host
 
 
-def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() == 0:
-        logger.info(msg)
-
-
 def launch_dummy_health_check_server(host, port, enable_metrics):
     import asyncio
 
@@ -2954,3 +2947,13 @@ class ConcurrentCounter:
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
     return importlib.util.find_spec("triton_kernels") is not None
+
+
+def check_cuda_result(raw_output):
+    import cuda.bindings.runtime as cuda_rt
+
+    err, *results = raw_output
+    if err != cuda_rt.cudaError_t.cudaSuccess:
+        raise Exception(f"CUDA error: {err}")
+
+    return results
