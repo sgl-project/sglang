@@ -167,6 +167,7 @@ class ServerArgs:
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
+    draft_attention_backend: Optional[str] = None
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -1386,6 +1387,13 @@ class ServerArgs:
             choices=ATTN_BACKENDS,
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
+        )
+        parser.add_argument(
+            "--draft-attention-backend",
+            type=str,
+            choices=ATTN_BACKENDS,
+            default=ServerArgs.draft_attention_backend,
+            help="Choose the kernels for draft attention layers. Default to the same as attention backend.",
         )
         parser.add_argument(
             "--prefill-attention-backend",
