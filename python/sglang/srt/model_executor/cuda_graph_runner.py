@@ -624,7 +624,7 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
-        # Provide CPU seq_lens to attn backend(s) for capture to avoid extra .cpu() copies
+        # Provide CPU seq_lens to attn backend to avoid sync.
         setter = getattr(self.model_runner.attn_backend, "set_capture_seq_lens_cpu", None)
         if callable(setter):
             setter(self.seq_lens_cpu)
