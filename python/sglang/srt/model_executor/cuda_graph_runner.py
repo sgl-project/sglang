@@ -625,7 +625,9 @@ class CudaGraphRunner:
 
         # Attention backend
         # Provide CPU seq_lens to attn backend to avoid sync.
-        setter = getattr(self.model_runner.attn_backend, "set_capture_seq_lens_cpu", None)
+        setter = getattr(
+            self.model_runner.attn_backend, "set_capture_seq_lens_cpu", None
+        )
         if callable(setter):
             setter(self.seq_lens_cpu)
 

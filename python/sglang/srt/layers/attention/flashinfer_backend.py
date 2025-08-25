@@ -320,7 +320,11 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        cpu_view = (self._capture_seq_lens_cpu[:bs] if self._capture_seq_lens_cpu is not None else None)
+        cpu_view = (
+            self._capture_seq_lens_cpu[:bs]
+            if self._capture_seq_lens_cpu is not None
+            else None
+        )
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
