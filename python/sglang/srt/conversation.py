@@ -26,6 +26,8 @@ Key components:
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses
+import json
+import os
 import re
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -964,11 +966,31 @@ def match_internvl(model_path: str):
     if re.search(r"internvl", model_path, re.IGNORECASE):
         return "internvl-2-5"
 
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+            model_type = config.get("model_type")
+            if model_type == "internvl_chat":
+                return "internvl-2-5"
+    except Exception:
+        pass
+
 
 @register_conv_template_matching_function
 def match_deepseek_janus_pro(model_path: str):
     if re.search(r"janus", model_path, re.IGNORECASE):
         return "janus-pro"
+
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+            model_type = config.get("model_type")
+            if model_type == "multi_modality":
+                return "janus-pro"
+    except Exception:
+        pass
 
 
 @register_conv_template_matching_function
@@ -982,6 +1004,16 @@ def match_deepseek_vl(model_path: str):
     if re.search(r"deepseek.*vl2", model_path, re.IGNORECASE):
         return "deepseek-vl2"
 
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+            model_type = config.get("model_type")
+            if model_type == "deepseek_vl_v2":
+                return "deepseek-vl2"
+    except Exception:
+        pass
+
 
 @register_conv_template_matching_function
 def match_qwen_chat_ml(model_path: str):
@@ -994,14 +1026,33 @@ def match_qwen_chat_ml(model_path: str):
 
 
 @register_conv_template_matching_function
-def match_openbmb_minicpm(model_path: str):
-    if re.search(r"minicpm-v", model_path, re.IGNORECASE):
-        return "minicpmv"
-    elif re.search(r"minicpm-o", model_path, re.IGNORECASE):
-        return "minicpmo"
+def match_minicpm(model_path: str):
+    match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
+    if match:
+        return f"minicpm{match.group(1).lower()}"
+
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+            model_type = config.get("model_type")
+            if model_type in ["minicpmv", "minicpmo"]:
+                return model_type
+    except Exception:
+        pass
 
 
 @register_conv_template_matching_function
 def match_phi_4_mm(model_path: str):
     if "phi-4-multimodal" in model_path.lower():
         return "phi-4-mm"
+
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+            model_type = config.get("model_type")
+            if model_type == "phi4mm":
+                return "phi-4-mm"
+    except Exception:
+        pass
