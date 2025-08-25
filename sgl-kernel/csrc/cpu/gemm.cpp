@@ -458,10 +458,10 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   return packed_weight;
 }
 
-// mat1 : [M, K]
+// mat1 : [*, K]
 // mat2 : [N, K]
 // bias : [N]
-// out  : [M, N]
+// out  : [*, N]
 //
 at::Tensor
 weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni) {
@@ -471,18 +471,18 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
-
-  int64_t M = mat1.size(0);
+  const int64_t ndim = mat1.ndimension();
+  auto input_sizes = mat1.sizes().vec();
   int64_t N = mat2.size(0);
   int64_t K = mat2.size(1);
-  CHECK_EQ(mat1.size(1), K);
-  CHECK_DIM(2, mat1);
+  int64_t M = mat1.numel() / K;
+  CHECK_EQ(mat1.size(ndim - 1), K);
   CHECK_DIM(2, mat2);
 
   auto out = at::empty({M, N}, mat1.options());
 
   // strides
-  int64_t mat1_strideM = mat1.stride(0);
+  int64_t mat1_strideM = mat1.stride(-2);
   int64_t out_strideM = out.stride(0);
 
   const bool has_bias = bias.has_value();
@@ -504,6 +504,6 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
         mat1_strideM,
         out_strideM);
   });
-
-  return out;
+  input_sizes[ndim - 1] = N;
+  return out.view(input_sizes);
 }
