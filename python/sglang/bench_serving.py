@@ -33,6 +33,7 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 from transformers import (
+    AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -635,7 +636,30 @@ def get_tokenizer(
     )
 
 
-def get_dataset(args, tokenizer):
+def get_processor(
+    pretrained_model_name_or_path: str,
+) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    assert (
+        pretrained_model_name_or_path is not None
+        and pretrained_model_name_or_path != ""
+    )
+    if pretrained_model_name_or_path.endswith(
+        ".json"
+    ) or pretrained_model_name_or_path.endswith(".model"):
+        from sglang.srt.hf_transformers_utils import get_processor
+
+        return get_processor(pretrained_model_name_or_path)
+
+    if pretrained_model_name_or_path is not None and not os.path.exists(
+        pretrained_model_name_or_path
+    ):
+        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
+    return AutoProcessor.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=True
+    )
+
+
+def get_dataset(args, tokenizer, model_id):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
@@ -647,6 +671,16 @@ def get_dataset(args, tokenizer):
             context_len=args.sharegpt_context_len,
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
+        )
+    elif args.dataset_name == "image":
+        input_requests = sample_image_requests(
+            image_width=args.image_width,
+            image_height=args.image_height,
+            image_type=args.image_type,
+            output_len=args.random_output_len,
+            num_prompts=args.num_prompts,
+            tokenizer=tokenizer,
+            model_id=model_id,
         )
     elif args.dataset_name.startswith("random"):
         input_requests = sample_random_requests(
@@ -913,7 +947,7 @@ def sample_mmmu_requests(
                         prompt=prompt,
                         prompt_len=prompt_len,
                         output_len=output_len,
-                        image_data=image_data,
+                        image_data=[image_data],
                     )
                 )
 
@@ -1111,6 +1145,100 @@ def sample_random_requests(
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
+
+
+def sample_image_requests(
+    image_width: int,
+    image_height: int,
+    image_type: str,
+    output_len: int,
+    num_prompts: int,
+    tokenizer: PreTrainedTokenizerBase,
+    model_id: str,
+    apply_chat_template: bool = True,
+) -> List[DatasetRow]:
+    import io
+
+    import numpy as np
+    import pybase64
+    from PIL import Image
+
+    pixels = np.zeros((image_height, image_width, 3), dtype=np.uint8)
+    image = Image.fromarray(pixels)
+
+    processor = get_processor(model_id)
+    num_image_tokens = (
+        processor(images=image, text=processor.image_token, return_tensors="pt")
+        .input_ids[0]
+        .numel()
+    )
+
+    # Create prompts
+    dataset = []
+    total_image_bytes = 0
+
+    for i in range(num_prompts):
+        if image_type == "random":
+            pixels = np.random.randint(
+                0, 256, (image_height, image_width, 3), dtype=np.uint8
+            )
+        elif image_type == "blank":
+            pixels = np.zeros((image_height, image_width, 3), dtype=np.uint8)
+        else:
+            raise ValueError(f"Invalid image_type {image_type}")
+        image = Image.fromarray(pixels)
+        buffered = io.BytesIO()
+        image.save(buffered, format="PNG")
+        img_str = pybase64.b64encode(buffered.getvalue()).decode("utf-8")
+        image_data = f"data:image/png;base64,{img_str}"
+        total_image_bytes += len(image_data.encode("utf-8"))
+
+        try:
+            # Construct the prompt
+            prompt = f"Caption"
+            if apply_chat_template:
+                try:
+                    prompt = tokenizer.apply_chat_template(
+                        [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": image_data},
+                                    },
+                                    {"type": "text", "text": prompt},
+                                ],
+                            }
+                        ],
+                        add_generation_prompt=True,
+                        tokenize=False,
+                    )
+                except Exception as e:
+                    # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
+                    print(f"Error applying chat template: {e}, fallback to <image> tag")
+                    prompt = f"<image>{prompt}"
+
+            # Calculate token lengths for text only (without image data)
+            prompt_token_ids = tokenizer.encode(prompt)
+            prompt_len = len(prompt_token_ids)
+
+            dataset.append(
+                DatasetRow(
+                    prompt=prompt,
+                    prompt_len=prompt_len + num_image_tokens,
+                    output_len=output_len,
+                    image_data=[image_data],
+                )
+            )
+
+        except Exception as e:
+            print(f"Error processing example {i}: {e}")
+
+    print(
+        f"\nCreated {len(dataset)} {image_type} image prompts with average {total_image_bytes//num_prompts} image bytes per request"
+    )
+    return dataset
 
 
 def gen_prompt(tokenizer, token_num):
@@ -1392,13 +1520,6 @@ async def benchmark(
     time.sleep(1.0)
 
     # Start profiler
-    if profile:
-        print("Starting profiler...")
-        profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
-        )
-        if profile_output.success:
-            print("Profiler started")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -1428,14 +1549,29 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-
-    # Stop profiler
     if profile:
-        print("Stopping profiler...")
-        profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
-        if profile_output.success:
-            print("Profiler stopped")
+
+        async def delayed_start():
+            await asyncio.sleep(20)
+            profile_output = await async_request_profile(
+                api_url=base_url + "/start_profile"
+            )
+            if profile_output.success:
+                print("Profiler started")
+
+        async def delayed_stop():
+            await asyncio.sleep(22)
+            profile_output = await async_request_profile(
+                api_url=base_url + "/stop_profile"
+            )
+            if profile_output.success:
+                print("Profiler stopped")
+
+        tasks.append(asyncio.create_task(delayed_start()))
+        tasks.append(asyncio.create_task(delayed_stop()))
+    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    # Filter out profiler task outputs
+    outputs = [out for out in outputs if isinstance(out, RequestFuncOutput)]
 
     if pbar is not None:
         pbar.close()
@@ -1747,7 +1883,7 @@ def run_benchmark(args_: argparse.Namespace):
     model_id = args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer)
+    input_requests = get_dataset(args, tokenizer, args.model)
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
@@ -1819,7 +1955,14 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu"],
+        choices=[
+            "sharegpt",
+            "random",
+            "random-ids",
+            "image",
+            "generated-shared-prefix",
+            "mmmu",
+        ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1871,6 +2014,24 @@ if __name__ == "__main__":
         default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random dataset.",
+    )
+    parser.add_argument(
+        "--image-type",
+        type=str,
+        default="random",
+        help="Type of image to test with, used only for image dataset.",
+    )
+    parser.add_argument(
+        "--image-width",
+        type=int,
+        default=None,
+        help="Width of image to test with, used only for image dataset.",
+    )
+    parser.add_argument(
+        "--image-height",
+        type=int,
+        default=None,
+        help="Height of image to test with, used only for image dataset.",
     )
     parser.add_argument(
         "--request-rate",
