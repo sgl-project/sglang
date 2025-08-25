@@ -889,9 +889,8 @@ def get_moe_configs(
         logger,
         (
             "Using default MoE kernel config. Performance might be sub-optimal! "
-            "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
+            f"Config file not found at {config_file_path}, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
         ),
-        config_file_path,
     )
     return None
 
