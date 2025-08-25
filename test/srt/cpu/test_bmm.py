@@ -8,12 +8,7 @@ import torch.nn as nn
 
 from sglang.srt.layers.quantization.fp8_utils import input_to_float8
 from sglang.test.test_utils import CustomTestCase
-from utils import (
-    convert_weight,
-    native_w8a8_per_token_matmul,
-    per_token_quant_int8,
-    precision,
-)
+from utils import precision
 
 torch.manual_seed(1234)
 

@@ -185,6 +185,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     std::optional<at::Tensor> q_a_proj_scale,
     std::optional<at::Tensor> q_b_proj_scale,
     std::optional<at::Tensor> kv_a_proj_scale,
+    std::optional<at::Tensor> w_scale,
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size);
 
@@ -202,6 +203,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     bool use_fp8_w8a16,
     std::optional<at::Tensor> qkv_a_proj_scale,
     std::optional<at::Tensor> q_b_proj_scale,
+    std::optional<at::Tensor> w_scale,
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size,
     int64_t q_lora_rank,
@@ -321,14 +323,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "qkv_proj_with_rope(Tensor hidden_states, Tensor q_a_proj_weight, Tensor q_b_proj_weight, Tensor "
       "kv_a_proj_weight, Tensor w_kc, Tensor q_a_layernorm_weight, Tensor kv_a_layernorm_weight, Tensor positions, "
       "Tensor cos_sin_cache, float eps, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? q_a_proj_scale, Tensor? "
-      "q_b_proj_scale, Tensor? "
-      "kv_a_proj_scale, bool is_vnni, int[]? block_size) -> (Tensor, Tensor, Tensor)");
+      "q_b_proj_scale, Tensor? kv_a_proj_scale, Tensor? w_scale, "
+      "bool is_vnni, int[]? block_size) -> (Tensor, Tensor, Tensor)");
   m.impl("qkv_proj_with_rope", torch::kCPU, &qkv_proj_with_rope);
   m.def(
       "qkv_proj_with_rope_fused_weight(Tensor hidden_states, Tensor qkv_a_proj_weight, Tensor q_b_proj_weight, "
       "Tensor w_kc, Tensor q_a_layernorm_weight, Tensor kv_a_layernorm_weight, Tensor positions, "
       "Tensor cos_sin_cache, float eps, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? qkv_a_proj_scale, Tensor? "
-      "q_b_proj_scale,"
+      "q_b_proj_scale, Tensor? w_scale,"
       "bool is_vnni, int[]? block_size, int q_lora_rank, int kv_lora_rank,"
       "int qk_rope_head_dim) -> (Tensor, Tensor, Tensor)");
   m.impl("qkv_proj_with_rope_fused_weight", torch::kCPU, &qkv_proj_with_rope_fused_weight);
