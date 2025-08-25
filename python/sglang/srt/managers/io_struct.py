@@ -897,6 +897,7 @@ class UpdateWeightVersionReqInput:
     new_version: str
     # Whether to abort all running requests before updating
     abort_all_requests: bool = True
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -1032,7 +1033,7 @@ class ProfileReqOutput:
 
 @dataclass
 class FreezeGCReq:
-    pass
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -1067,7 +1068,6 @@ class OpenSessionReqOutput:
 @dataclass
 class HealthCheckOutput:
     rids: Optional[Union[List[str], str]] = None
-    pass
 
 
 class ExpertDistributionReq(Enum):
