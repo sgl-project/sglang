@@ -92,8 +92,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
-from sglang.srt.managers.multi_tokenizer_manager import MultiTokenizerManager
 from sglang.srt.managers.multi_tokenizer_mixin import (
+    MultiTokenizerManager,
     deserialize_data,
     get_main_process_id,
     read_from_shared_memory,

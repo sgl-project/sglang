@@ -25,11 +25,8 @@ from typing import Dict
 
 import zmq
 import zmq.asyncio
-from sglang.srt.managers.tokenizer_manager import TokenizerManager, _Communicator
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    TransferBackend,
-)
+
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchMultimodalOut,
@@ -37,12 +34,9 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     MultiTokenizerRegisterReq,
 )
+from sglang.srt.managers.tokenizer_manager import TokenizerManager, _Communicator
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
-    get_workerids_from_rids,
-    get_zmq_socket,
-    kill_process_tree,
-)
+from sglang.srt.utils import get_workerids_from_rids, get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -470,6 +464,7 @@ async def print_exception_wrapper(func):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
+
 
 def serialize_port_args(port_args: PortArgs) -> dict:
     """Serialize PortArgs into a shareable dictionary"""
