@@ -452,35 +452,14 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
             status_code=400,
             detail=f"Invalid URL:{server_url}. The server may be not registered.",
         )
-
-    # wait 60s for server to finish all requests
-    max_tries = 60
+    # check_idle for server to finish all requests and flush cache in tokenizer manager
+    obj.check_idle = True
     async with aiohttp.ClientSession() as session:
-        try:
-            while max_tries > 0:
-                response = await session.post(
-                    f"{server_url}/convert_pd_role", json=dataclasses.asdict(obj)
-                )
-                content = await response.json()
-                if content["success"]:
-                    break
-                else:
-                    logger.warning(
-                        f"There are some request to server {server_url} haven't been done. Waiting..."
-                    )
-                max_tries -= 1
-                await asyncio.sleep(1)
-        except:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Wait 100s for server: {server_url} to finish all reqs. "
-                f"May be caused by: 1. Server is stuck or shut down, 2. 60s is not enough for server to finish all reqs.",
-            )
-    # flush cache
-    async with aiohttp.ClientSession() as session:
-        response = await session.post(f"{server_url}/flush_cache")
+        response = await session.post(
+            f"{server_url}/convert_pd_role", json=dataclasses.asdict(obj)
+        )
 
-    # check if P/D node is idle
+    # Convert P/D role
     obj.check_idle = False
     async with aiohttp.ClientSession() as session:
         response = await session.post(

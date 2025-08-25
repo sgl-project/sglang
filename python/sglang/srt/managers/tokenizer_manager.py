@@ -1307,8 +1307,18 @@ class TokenizerManager:
                         os.environ.pop(k, None)
 
         bootstrap_port = None
-        if obj.clean_connection_pool or obj.check_idle:
+        if obj.clean_connection_pool:
             pass
+        elif obj.check_idle:
+            check_count = 60
+            while len(self.rid_to_state) > 0:
+                await asyncio.sleep(1)
+                check_count -= 1
+                logger.info("Waiting for all requests to finish...")
+                if check_count <= 0:
+                    return False, "Maybe caused by: 1. Server stuck, 2. 60s is not enough", None
+            await self.flush_cache()
+            return True, "All requests are finished and cache flushed, can convert p/d role", None
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # start a bootstarp server first
             kv_bootstrap_server_class = get_kv_class(

@@ -2460,18 +2460,6 @@ class Scheduler(
 
     def convert_disaggregation_role(self, recv_req: ConvertDisaggregationRoleReqInput):
         """Convert the disaggregation role of the scheduler."""
-        if recv_req.check_idle:
-            if not self.check_disaggregation_idle():
-                return ConvertDisaggregationRoleReqOutput(
-                    success=False,
-                    message="Cannot convert disaggregation role while the server is busy.",
-                )
-            else:
-                return ConvertDisaggregationRoleReqOutput(
-                    success=True,
-                    message="this server is idle and can convert disaggregation role.",
-                )
-
         if recv_req.clean_connection_pool:
             kv_manager = self.disagg_decode_prealloc_queue.kv_manager
             kv_manager._handle_node_failure(recv_req.clean_connection_pool)
@@ -2555,30 +2543,6 @@ class Scheduler(
                 success=True,
                 message="The role of this server is now PREFILL.",
             )
-
-    def check_disaggregation_idle(self):
-        """Check if the disaggregation server is idle."""
-        # only for enable_pd_convert mode
-        if (
-            len(self.waiting_queue) == 0
-            and self.running_batch.is_empty()
-            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
-        ):
-            pass
-        else:
-            return False
-
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            return (
-                len(self.disagg_prefill_bootstrap_queue.queue) == 0
-                and len(self.disagg_prefill_inflight_queue) == 0
-            )
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            return (
-                len(self.disagg_decode_prealloc_queue.queue) == 0
-                and len(self.disagg_decode_transfer_queue.queue) == 0
-            )
-        return False
 
     def get_print_prefix(self):
         prefix = ""

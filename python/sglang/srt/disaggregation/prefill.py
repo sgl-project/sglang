@@ -891,7 +891,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         # reuse the cuda graph runner
         model_runner.server_args = self.server_args
-        if hasattr(self, "decode_cuda_graph_runner"):
+        if hasattr(self, "decode_graph_runner"):
             model_runner.graph_runner = self.decode_graph_runner
             model_runner.cuda_graph_mem_usage = self.decode_cuda_graph_mem_usage
             del self.decode_graph_runner
