@@ -61,6 +61,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.configs.qwen3_hybrid_moe import Qwen3HybridMoeConfig
 from sglang.srt.models.qwen2_moe import (
     Qwen2MoeMLP,
@@ -77,6 +78,7 @@ from sglang.srt.layers.attention.mamba.ops.causal_conv1d import (
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule, 
     fused_recurrent_gated_delta_rule_update,
+    fused_recurrent_gated_delta_rule_update_v3,
 )
 
 logger = logging.getLogger(__name__)
@@ -1245,5 +1247,13 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
+    
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
 
 EntryClass = Qwen3HybridMoEForCausalLM
