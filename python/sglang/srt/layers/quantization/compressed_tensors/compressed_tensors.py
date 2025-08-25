@@ -86,9 +86,22 @@ class CompressedTensorsConfig(QuantizationConfig):
         kv_cache_scheme: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None,
         packed_modules_mapping: Dict[str, List[str]] = {},
+        model_type: Optional[str] = None,
     ):
         super().__init__()
-        self.ignore = ignore
+
+        # Adapt to VisionAttention
+        if model_type in ["qwen2_vl", "qwen2_5_vl"]:
+            self.ignore = [
+                (
+                    name.replace(r"attn.qkv", r"attn.qkv_proj")
+                    if "visual" in name
+                    else name
+                )
+                for name in ignore
+            ]
+        else:
+            self.ignore = ignore
         self.quant_format = quant_format
         # Map from [target -> scheme]
         self.target_scheme_map = target_scheme_map
@@ -148,6 +161,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             config=config
         )
         packed_modules_mapping = config.get("packed_modules_mapping", {})
+        model_type = config.get("model_type", None)
 
         return cls(
             target_scheme_map=target_scheme_map,
@@ -157,6 +171,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             sparsity_ignore_list=sparsity_ignore_list,
             config=config,
             packed_modules_mapping=packed_modules_mapping,
+            model_type=model_type,
         )
 
     @classmethod
