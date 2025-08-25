@@ -1011,13 +1011,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 or sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
             )
 
-        # Determine attention backend used by current forward batch
-        if forward_batch.forward_mode.is_decode_or_idle():
-            attention_backend = global_server_args_dict["decode_attention_backend"]
-        else:
-            attention_backend = global_server_args_dict["prefill_attention_backend"]
-        self.current_attention_backend = attention_backend
-
+        attention_backend = self.current_attention_backend
         if attention_backend == "ascend":
             return AttnForwardMethod.MLA
         elif (
@@ -1107,7 +1101,18 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, None, forward_batch, None
 
-        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        # Determine attention backend used by current forward batch
+        if forward_batch.forward_mode.is_decode_or_idle():
+            attention_backend = global_server_args_dict["decode_attention_backend"]
+        else:
+            attention_backend = global_server_args_dict["prefill_attention_backend"]
+        self.current_attention_backend = attention_backend
+
+        if forward_batch.attn_forward_method is None:
+            forward_batch.attn_forward_method = self.dispatch_attn_forward_method(
+                forward_batch
+            )
+        attn_forward_method = forward_batch.attn_forward_method
 
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
