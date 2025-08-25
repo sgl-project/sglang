@@ -11,8 +11,6 @@ from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 class HybridAttnBackend(AttentionBackend):
     """Support different backends for prefill and decode."""
 
-    __slots__ = ("prefill_backend", "decode_backend")
-
     def __init__(
         self, prefill_backend: AttentionBackend, decode_backend: AttentionBackend
     ):
@@ -73,28 +71,6 @@ class HybridAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-        **kwargs,
-    ):
-        fm = forward_batch.forward_mode
-        if fm.is_idle():
-            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        elif fm.is_decode():
-            return self.decode_backend.forward_decode(
-                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-            )
-        else:
-            return self.prefill_backend.forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-            )
-
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -122,9 +98,3 @@ class HybridAttnBackend(AttentionBackend):
         return self.prefill_backend.forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
-
-    def support_triton(self):
-        """Delegate to decode backend for triton support.
-        Hybrid backend is primarily used on the decode path for CUDA graphs.
-        """
-        return getattr(self.decode_backend, "support_triton", lambda: True)()
