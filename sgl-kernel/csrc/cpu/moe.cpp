@@ -980,9 +980,7 @@ at::Tensor fused_experts_cpu(
     at::Tensor& topk_weights,
     at::Tensor& topk_ids,
     bool inplace,
-    bool use_int8_w8a8,
-    bool use_fp8_w8a16,
-    bool use_int4_w4a16,
+    int64_t moe_comp_method,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<at::Tensor>& w1_zero,
@@ -1026,17 +1024,17 @@ at::Tensor fused_experts_cpu(
   int64_t topk = topk_weights_.size(1);
 
   // we use int32_t compensation for int8 w8a8
-  int64_t packed_K = get_row_size(K, use_int8_w8a8);
-  int64_t packed_N = get_row_size(N, use_int8_w8a8);
+  int64_t packed_K = get_row_size(K, moe_comp_method == 1);
+  int64_t packed_N = get_row_size(N, moe_comp_method == 1);
 
   // check weight shapes
   CHECK_EQ(w2.size(0), E);
   CHECK_EQ(w2.size(1), K);
-  CHECK_EQ(packed_w1.size(2), packed_K / (use_int4_w4a16 ? 2 : 1));
-  CHECK_EQ(packed_w2.size(2), packed_N / (use_int4_w4a16 ? 2 : 1));
+  CHECK_EQ(packed_w1.size(2), packed_K / (moe_comp_method == 3 ? 2 : 1));
+  CHECK_EQ(packed_w2.size(2), packed_N / (moe_comp_method == 3 ? 2 : 1));
 
   // check scales
-  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, w1_scale, w2_scale, block_size, a1_scale, a2_scale);
+  check_moe_scales(moe_comp_method == 1, moe_comp_method == 2, w1_scale, w2_scale, block_size, a1_scale, a2_scale);
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 
@@ -1093,16 +1091,22 @@ at::Tensor fused_experts_cpu(
   //   8. B_tmp : [T, BLOCK_N, std::max(K, N)]
   //
   int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
-                               num_threads * BLOCK_M * K * (use_int8_w8a8 ? 1 : 2) +
+                               num_threads * BLOCK_M * K * (moe_comp_method == 1 ? 1 : 2) +
                                num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
 
-  if (use_int8_w8a8) {
+  // moe_comp_method :
+  //    BF16_GEMM = 0
+  //    INT8_W8A8_GEMM = 1
+  //    FP8_W8A16_GEMM = 2
+  //    INT4_W8A16_GEMM = 3
+
+  if (moe_comp_method == 1) {
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
   }
-  if (use_fp8_w8a16) {
+  if (moe_comp_method == 2) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * BLOCK_N * std::max(K, N) * 2;
   }
-  if (use_int4_w4a16) {
+  if (moe_comp_method == 3) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * BLOCK_N * std::max(K, N) * 2;
   }
 
@@ -1112,7 +1116,7 @@ at::Tensor fused_experts_cpu(
     scalar_t* __restrict__ intermediate_cache1 = (scalar_t*)((void*)(buffer2.data_ptr<int8_t>()));
     scalar_t* __restrict__ intermediate_cache2 = intermediate_cache1 + M * topk * N;
 
-    if (use_int8_w8a8) {
+    if (moe_comp_method == 1) {
       uint8_t* __restrict__ A_tmp = (uint8_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       uint8_t* __restrict__ Aq_tmp = (uint8_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
@@ -1146,7 +1150,7 @@ at::Tensor fused_experts_cpu(
           E,
           topk,
           num_tokens_post_pad);
-    } else if (use_fp8_w8a16) {
+    } else if (moe_comp_method == 2) {
       // here we just ignore C_tmp as it is not used
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
@@ -1179,7 +1183,7 @@ at::Tensor fused_experts_cpu(
           E,
           topk,
           num_tokens_post_pad);
-    } else if (use_int4_w4a16) {
+    } else if (moe_comp_method == 3) {
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));  // Ctmp is ignored?
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));

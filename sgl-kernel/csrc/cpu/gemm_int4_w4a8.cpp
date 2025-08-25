@@ -2,11 +2,11 @@
 #include <c10/util/Unroll.h>
 #include <torch/all.h>
 
+#include "gemm.h"
 #include "vec.h"
-
 namespace {
 
-#define BLOCK_N 32
+#define BLOCK_N block_size_n()
 
 static bool cpublas_checked = false;
 static bool cpublas_can_pack = false;
@@ -429,7 +429,6 @@ void _da8w4_linear_impl(
     const at::Tensor& weight,
     const at::Tensor& weight_scales,
     const at::Tensor& weight_qzeros,
-    const at::Tensor& compensation,
     const std::optional<at::Tensor>& bias,
     at::Tensor& output) {
   // input shape = [..., K]
@@ -442,14 +441,13 @@ void _da8w4_linear_impl(
     TORCH_CHECK(input_scales.sizes() == input_qzeros.sizes(), "DA8W4: unexpected input qzeros shape");
   }
 
-  // weight shape = [Nc, Kc, block_k, block_n/2]
+  // weight + compensation shape = [Nc, Kc, block_n * block_k / 2 + block_n*sizeof(int32_t)]
   // scales/qzeros shape = [Nc, G, block_n]
-  // compensation shape = [Nc, Kc, block_n]
+
   int64_t Nc = weight.size(0);
   int64_t Kc = weight.size(1);
-  int64_t block_k = weight.size(2);
+  int64_t block_k = BLOCK_K;
   constexpr int64_t block_n = BLOCK_N;
-  TORCH_CHECK(weight.size(3) * 2 == block_n, "DA8W4: unexpected weight shape");
   int64_t N = Nc * block_n;
   TORCH_CHECK(K == Kc * block_k, "DA8W4: weight and input shapes mismatch");
   int64_t block_m = [&]() -> long {
@@ -480,7 +478,6 @@ void _da8w4_linear_impl(
   const uint8_t* b_ptr = weight.data_ptr<uint8_t>();
   const float* b_scales_ptr = weight_scales.data_ptr<float>();
   const int8_t* b_qzeros_ptr = weight_qzeros.data_ptr<int8_t>();
-  const int32_t* compensation_ptr = sym_quant_a ? nullptr : compensation.data_ptr<int32_t>();
   out_dtype* c_ptr = output.data_ptr<out_dtype>();
   const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
 
@@ -497,15 +494,19 @@ void _da8w4_linear_impl(
         auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
         copy_bias<block_n>(bias_data, y_buf[0], m_size);
         for (int kci = 0; kci < Kc; ++kci) {
+          int32_t* compensation_ptr =
+              sym_quant_a ? nullptr
+                          : (int32_t*)(void*)(b_ptr + (nc * Kc + kci) * (block_n * (block_k / 2 + sizeof(int32_t))) +
+                                              block_k * block_n / 2) /*Bcomp*/;
           _dequant_gemm_accum<cpublas_can_pack, block_n, block_n / 2, sym_quant_a>(
               y_buf[0] /*C*/,
               (uint8_t*)a_ptr + mci * block_m * K + kci * block_k /*A*/,
               a_scales_ptr + mci * block_m /*scales_a*/,
               a_qzeros_ptr + mci * block_m /*qzeros_a*/,
-              b_ptr + (nc * Kc + kci) * block_n * block_k / 2 /*B*/,
+              b_ptr + (nc * Kc + kci) * (block_n * (block_k / 2 + sizeof(int32_t))),
               b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*scales_b*/,
               b_qzeros_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*qzeros_b*/,
-              compensation_ptr + nc * block_n * Kc + kci * block_n /*compensation*/,
+              compensation_ptr /*Bcomp*/,
               m_size /*M*/,
               block_k /*K*/,
               K /*lda*/,
@@ -523,105 +524,11 @@ void _da8w4_linear_impl(
 
 }  // anonymous namespace
 
-/*
-return: packed_weight, packed_scales, packed_qzeros, compensation
-*/
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-convert_int4_weight_packed(const at::Tensor& weight, const at::Tensor& scales, const at::Tensor& qzeros) {
-  // weight shape = [N, K]
-  // scales shape = [N, G]
-  // qzeros shape = [N, G]
-  TORCH_CHECK(weight.dim() == 2, "DA8W4 CPU: Weight should be a 2D tensor for packing");
-  TORCH_CHECK(weight.size(1) % 2 == 0, "DA8W4 CPU: Weight should have even number of columns for packing");
-
-  auto new_scales = scales;
-  auto new_qzeros = qzeros;
-  if (new_scales.dim() == 1) {
-    new_scales.unsqueeze_(1);
-  }
-  new_scales = new_scales.to(at::kFloat);
-  if (new_qzeros.dim() == 1) {
-    new_qzeros.unsqueeze_(1);
-  }
-  new_qzeros = new_qzeros.to(at::kChar);
-  int N = weight.size(0);
-  int K = weight.size(1);
-  int G = scales.size(1);
-  int group_size = K / G;
-  int block_k = group_size > 128 ? 128 : group_size;
-  constexpr int block_n = BLOCK_N;
-  int Nc = N / block_n;
-  int Kc = K / block_k;
-
-  // Reorder weight to [N/block_n, K/block_k, block_k, block_n]
-  // Reorder scales/qzeros to [N/block_n, G, block_n]
-  auto weight_view = weight.view({Nc, block_n, Kc, block_k});
-  at::Tensor weight_reordered = weight_view.permute({0, 2, 3, 1}).contiguous();
-  at::Tensor blocked_weight;
-  at::Tensor blocked_scales = new_scales.view({Nc, block_n, G}).permute({0, 2, 1}).contiguous();
-  at::Tensor blocked_qzeros = new_qzeros.view({Nc, block_n, G}).permute({0, 2, 1}).contiguous();
-  // Compensation = Σ(k)(W[k][n] - ZP[n]) for each block.
-  auto weight_sub_qzero = weight.view({Nc, block_n, G, -1}).to(at::kInt) - new_qzeros.view({Nc, block_n, G, -1});
-  weight_sub_qzero = weight_sub_qzero.view({Nc, block_n, Kc, block_k});
-  at::Tensor compensation = weight_sub_qzero.sum(-1);
-  compensation = compensation.permute({0, 2, 1}).contiguous().to(at::kInt);
-#if defined(CPU_CAPABILITY_AVX512)
-  if (cpublas_could_pack()) {
-    blocked_weight = at::empty({Nc, Kc, block_k, block_n / 2}, weight.options());
-    auto weight_ptr = weight_reordered.data_ptr<uint8_t>();
-    auto blocked_weight_ptr = blocked_weight.data_ptr<uint8_t>();
-    int64_t num_blocks = Nc * Kc;
-    at::parallel_for(0, num_blocks, 1, [&](int64_t begin, int64_t end) {
-      for (const auto i : c10::irange(begin, end)) {
-        auto in_ptr = weight_ptr + i * block_k * block_n;
-        auto out_ptr = blocked_weight_ptr + i * block_k * block_n / 2;
-
-        // Reorder weight block to VNNI4 and pack two lanes along N
-        // N=16 viewed as two lanes: a0, ...a7, b0, ...b7
-        // pack two lanes: [a0, b0], ..., [a7, b7]
-        // plain shape = [block_k, block_n]
-        // packed shape = [block_k / 4, block_n / 2, 4] viewed as [block_k, block_n / 2]
-        constexpr int n_group_size = 8;
-        constexpr int vnni_size = 4;
-        constexpr int n_group = block_n / n_group_size;  // 4
-        for (int nb = 0; nb < n_group; nb += 2) {
-          for (int k = 0; k < block_k; k += vnni_size) {
-            for (int ni = 0; ni < n_group_size; ++ni) {
-              for (int ki = 0; ki < vnni_size; ++ki) {
-                int src_idx_1 = nb * n_group_size + ni + (k + ki) * block_n;
-                int src_idx_2 = (nb + 1) * n_group_size + ni + (k + ki) * block_n;
-                int dst_idx = (nb / 2 * n_group_size + ni) * vnni_size + k * block_n / 2 + ki;
-                uint8_t src_1 = *(in_ptr + src_idx_1);
-                uint8_t src_2 = *(in_ptr + src_idx_2);
-                uint8_t dst = (src_1 & 0x0f) | ((src_2 & 0x0f) << 4);
-                *(out_ptr + dst_idx) = dst;
-              }
-            }
-          }
-        }
-      }
-    });
-  } else
-#endif
-  {
-    // Pack weight: two int4 -> one int8
-    using namespace at::indexing;
-    at::Tensor even_columns = weight_reordered.index({Slice(), Slice(), Slice(), Slice(1, None, 2)});
-    even_columns = even_columns.bitwise_left_shift(4);
-    at::Tensor odd_columns = weight_reordered.index({Slice(), Slice(), Slice(), Slice(None, None, 2)});
-    blocked_weight = even_columns.bitwise_or(odd_columns);
-  }
-
-  return std::make_tuple(
-      std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros), std::move(compensation));
-}
-
 at::Tensor int4_scaled_mm_cpu_with_quant(
     const at::Tensor& input,
     const at::Tensor& weight,
     const at::Tensor& weight_scales,
     const at::Tensor& weight_qzeros,
-    const at::Tensor& compensation,
     const std::optional<at::Tensor>& bias,
     at::ScalarType output_dtype) {
   RECORD_FUNCTION("sgl-kernel::int4_scaled_mm_cpu_with_quant", std::vector<c10::IValue>({input, weight}));
@@ -640,7 +547,7 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
   bool sym_quant_a = false;  // sym_a s8s8 is unified to u8s8 with compensation (128)
   static bool cpublas_can_pack = cpublas_could_pack();
   auto out_sizes = input.sizes().vec();
-  int64_t N = weight.size(0) * weight.size(-1) * 2;
+  int64_t N = weight_scales.size(0) * weight_scales.size(-1);
   out_sizes.back() = N;
   auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
 
@@ -657,7 +564,7 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
           }                                                                                                \
         });                                                                                                \
         _da8w4_linear_impl<scalar_t, cpublas_can_pack, sym_quant_act>(                                     \
-            Aq, As, Azp, weight, weight_scales, weight_qzeros, compensation, bias, output);                \
+            Aq, As, Azp, weight, weight_scales, weight_qzeros, bias, output);                              \
       });
 
   if (cpublas_can_pack) {

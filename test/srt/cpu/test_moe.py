@@ -10,6 +10,8 @@ kernel = torch.ops.sgl_kernel
 
 torch.manual_seed(1234)
 
+from enum import IntEnum
+
 from utils import (
     BLOCK_K,
     BLOCK_N,
@@ -26,6 +28,13 @@ from utils import (
 )
 
 from sglang.test.test_utils import CustomTestCase
+
+
+class CPUMoECompMethod(IntEnum):
+    BF16_GEMM = 0
+    INT8_W8A8_GEMM = 1
+    FP8_W8A16_GEMM = 2
+    INT4_W8A16_GEMM = 3
 
 
 def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
@@ -51,9 +60,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         topk_weights,
         topk_ids,
         inplace,
-        False,
-        False,
-        False,
+        CPUMoECompMethod.BF16_GEMM,
         None,
         None,
         None,
@@ -168,9 +175,7 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             inplace,
-            True,
-            False,
-            False,
+            CPUMoECompMethod.INT8_W8A8_GEMM,
             w1_s,
             w2_s,
             None,
@@ -238,9 +243,7 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             False,
-            False,
-            True,
-            False,
+            CPUMoECompMethod.FP8_W8A16_GEMM,
             w1s,
             w2s,
             None,
@@ -340,9 +343,7 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             False,
-            False,
-            False,
-            True,
+            CPUMoECompMethod.INT4_W8A16_GEMM,
             awq_w13_scales_pack,
             awq_w2_scales_pack,
             awq_w13_zero_pack,

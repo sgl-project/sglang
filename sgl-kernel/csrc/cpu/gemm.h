@@ -64,6 +64,10 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
 // pack weight to vnni format
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
+// pack weight to vnni format for int4
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales, bool is_w4a8);
+
 // moe implementations for int8 w8a8
 template <typename scalar_t>
 void fused_experts_int8_kernel_impl(

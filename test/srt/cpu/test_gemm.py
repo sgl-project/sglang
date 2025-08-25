@@ -206,21 +206,24 @@ class TestGemm(CustomTestCase):
             x, bf16_weight, bias=bias.to(torch.bfloat16) if has_bias else None
         )
         if w4a8:
-            packed_weight, packed_zero, packed_scales, packed_compensation = (
-                autoawq_to_int4pack(awq_weight, awq_zero, awq_scales, True)
+            packed_weight, packed_zero, packed_scales = (
+                torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                    awq_weight, awq_zero, awq_scales, True
+                )
             )
             target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu_with_quant(
                 x,
                 packed_weight,
                 packed_scales,
                 packed_zero,
-                packed_compensation,
                 bias,
                 torch.bfloat16,
             )
         else:
-            packed_weight, packed_zero, packed_scales = autoawq_to_int4pack(
-                awq_weight, awq_zero, awq_scales, False
+            packed_weight, packed_zero, packed_scales = (
+                torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                    awq_weight, awq_zero, awq_scales, False
+                )
             )
             target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
                 x, packed_weight, packed_zero, packed_scales, bias
@@ -230,7 +233,7 @@ class TestGemm(CustomTestCase):
 
     def test_int4_awq_gemm(self):
         for params in itertools.product(
-            self.M_awq, self.N_awq, self.K_awq, [128], self.has_bias, [True, False]
+            self.M_awq, self.N_awq, self.K_awq, [128], self.has_bias, [False, True]
         ):
             with self.subTest(
                 M=params[0],
