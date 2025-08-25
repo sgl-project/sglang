@@ -1781,7 +1781,7 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
 
 def _unwrap_tensor(tensor, tp_rank):
     if isinstance(tensor, LocalSerializedTensor):
-        monkey_patch_torch_reductions()
+        # monkey_patch_torch_reductions()
         tensor = tensor.get(tp_rank)
     return tensor.to(torch.npu.current_device())
 

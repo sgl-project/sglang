@@ -444,26 +444,31 @@ class Engine(EngineBase):
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
-    def update_weights_from_tensor(
-        self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
-        load_format: Optional[str] = None,
-        flush_cache: bool = True,
-    ):
-        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
-        to avoid duplicated cache cleaning operation."""
-        obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[
-                MultiprocessingSerializer.serialize(named_tensors)
-                for _ in range(self.server_args.tp_size)
-            ],
-            load_format=load_format,
-            flush_cache=flush_cache,
-        )
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_tensor(obj, None)
-        )
+    # def update_weights_from_tensor(
+    #     self,
+    #     named_tensors: List[Tuple[str, torch.Tensor]],
+    #     load_format: Optional[str] = None,
+    #     flush_cache: bool = True,
+    # ):
+    #     """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
+    #     to avoid duplicated cache cleaning operation."""
+    #     obj = UpdateWeightsFromTensorReqInput(
+    #         serialized_named_tensors=[
+    #             MultiprocessingSerializer.serialize(named_tensors)
+    #             for _ in range(self.server_args.tp_size)
+    #         ],
+    #         load_format=load_format,
+    #         flush_cache=flush_cache,
+    #     )
+    #     loop = asyncio.get_event_loop()
+    #     return loop.run_until_complete(
+    #         self.tokenizer_manager.update_weights_from_tensor(obj, None)
+    #     )
+
+
+    async def update_weights_from_tensor(self, update_weights_request: UpdateWeightsFromTensorReqInput):
+        return await self.tokenizer_manager.update_weights_from_tensor(update_weights_request, None)
+
 
     def update_weights_from_disk(
         self,

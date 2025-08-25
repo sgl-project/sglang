@@ -516,12 +516,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         # Special case for per-tensor scale to load scalar into fused array.
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
-        print(f"1111111111111111 loaded_shard_id {loaded_shard_id}", flush=True)
-        print(f"1111111111111111 output_dim {output_dim}", flush=True)
-        print(f"1111111111111111 is_metadata {is_metadata}", flush=True)
-        print(f"1111111111111111 needs_scalar_to_array {needs_scalar_to_array}", flush=True)
-        print(f"1111111111111111 is_gguf_weight_type {is_gguf_weight_type}", flush=True)
-        print(f"1111111111111111 is_gguf_weight {is_gguf_weight}", flush=True)
         if loaded_shard_id is None:
             # Loaded weight is already fused on disk (qkv/mlp).
             if output_dim is None:
@@ -591,19 +585,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if use_bitsandbytes_4bit:
                 shard_size = loaded_weight.shape[output_dim]
                 shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
-            print(f"22222222222222222 param_data.shape {param_data.shape}", flush=True)
-            print(f"22222222222222222 loaded_weight.shape {loaded_weight.shape}", flush=True)
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
-            print(f"1111111111111111 self.output_sizes {self.output_sizes}", flush=True)
-            print(f"1111111111111111 shard_offset {shard_offset}", flush=True)
-            print(f"1111111111111111 shard_size {shard_size}", flush=True)
-            print(f"1111111111111111 packed_dim {packed_dim}", flush=True)
-            print(f"1111111111111111 output_dim {output_dim}", flush=True)
-            print(f"1111111111111111 use_bitsandbytes_4bit {use_bitsandbytes_4bit}", flush=True)
-            print(f"1111111111111111 _is_cpu {_is_cpu}", flush=True)
-            print(f"1111111111111111 self.use_presharded_weights {self.use_presharded_weights}", flush=True)
             if _is_cpu:
                 from sglang.srt.model_loader.weight_utils import (
                     narrow_padded_param_and_loaded_weight,

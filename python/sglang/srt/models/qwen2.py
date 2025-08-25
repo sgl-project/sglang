@@ -536,8 +536,8 @@ class Qwen2ForCausalLM(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
-            # ("gate_up_proj", "gate_proj", 0),
-            # ("gate_up_proj", "up_proj", 1),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -573,11 +573,6 @@ class Qwen2ForCausalLM(nn.Module):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name in ["gate_proj", "up_proj"]:
-                    print(f"00000000000000 layer_id {layer_id}")
-                    print(f"00000000000000 name {name}")
-                    print(f"00000000000000 weight_name {weight_name}")
-
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
