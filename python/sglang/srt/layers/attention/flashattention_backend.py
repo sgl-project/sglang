@@ -64,14 +64,8 @@ class FlashAttentionMetadata:
 
     local_attn_metadata: Optional[LocalAttentionMetadata] = None
 
-    @dataclass
-    class SlidingWindowAttentionMetadata:
-        window_cache_seqlens_int32: torch.Tensor = None
-        window_page_table: torch.Tensor = None
-        window_cu_seqlens_k: torch.Tensor = None
-        window_max_seq_len: int = 0
-
-    sliding_window_attn_metadata: Optional[SlidingWindowAttentionMetadata] = None
+    # For sliding window attention topk>1 spec decoding
+    swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
 
 # Copied from:
@@ -352,6 +346,9 @@ class FlashAttentionBackend(AttentionBackend):
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
         # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
         self.sliding_window_size = model_runner.sliding_window_size
+        self.has_swa = (
+            self.sliding_window_size is not None and self.sliding_window_size > -1
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -446,7 +443,6 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
-                self._init_sliding_window_attn_metadata(forward_batch, metadata, device)
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -570,6 +566,12 @@ class FlashAttentionBackend(AttentionBackend):
                     (1, 0),
                 )
                 self.forward_metadata_spec_decode_expand = metadata_expand
+
+                if self.has_swa:
+                    self._init_sliding_window_attn_spec_metadata(
+                        metadata, metadata_expand
+                    )
+
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
@@ -671,11 +673,10 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        window_size = (
-            (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
-            else (-1, -1)
+        is_swa = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
+        window_size = (layer.sliding_window_size, 0) if is_swa else (-1, -1)
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -699,7 +700,9 @@ class FlashAttentionBackend(AttentionBackend):
 
         # We do cascade attention for Target Verify with topk > 1
         use_cascade_attn = (
-            forward_batch.forward_mode.is_target_verify() and self.topk > 1
+            forward_batch.forward_mode.is_target_verify()
+            and self.topk > 1
+            and not is_swa
         )
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
@@ -714,13 +717,18 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_q = local_metadata.local_query_start_loc
             cache_seqlens = local_metadata.local_seqused_k
             max_seqlen_q = local_metadata.local_max_query_len
-            max_seqlen_k = local_metadata.local_max_seq_len
+        elif is_swa and metadata.swa_spec_metadata is not None:
+            swa_spec_metadata = metadata.swa_spec_metadata
+            page_table = swa_spec_metadata.page_table
+            cu_seqlens_q = swa_spec_metadata.cu_seqlens_q
+            cache_seqlens = swa_spec_metadata.cache_seqlens_int32
+            max_seqlen_q = swa_spec_metadata.max_seq_len_q
+            cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
         else:
             page_table = metadata.page_table
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
-            max_seqlen_k = metadata.max_seq_len_k
             cu_seqlens_k = metadata.cu_seqlens_k
 
         # Use Flash Attention for prefill
@@ -1039,22 +1047,9 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                # Use sliding_window_attn_metadata for sliding window layer
-                if (
-                    layer.sliding_window_size is not None
-                    and layer.sliding_window_size > -1
-                    and metadata.sliding_window_attn_metadata is not None
-                ):
-                    sliding_window_attn_metadata = metadata.sliding_window_attn_metadata
-                    page_table = sliding_window_attn_metadata.window_page_table
-                    cache_seqlens = (
-                        sliding_window_attn_metadata.window_cache_seqlens_int32
-                    )
-                    cu_seqlens_k = sliding_window_attn_metadata.window_cu_seqlens_k
-                else:
-                    page_table = metadata.page_table
-                    cache_seqlens = metadata.cache_seqlens_int32
-                    cu_seqlens_k = metadata.cu_seqlens_k
+                page_table = metadata.page_table
+                cache_seqlens = metadata.cache_seqlens_int32
+                cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
@@ -1404,6 +1399,32 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
+            if self.has_swa:
+                self.target_verify_metadata_topk_swa = {
+                    "cache_seqlens": torch.zeros(
+                        max_bs * self.speculative_num_draft_tokens,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    "cu_seqlens_k": torch.zeros(
+                        max_bs * self.speculative_num_draft_tokens + 1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    "cu_seqlens_q": torch.arange(
+                        0,
+                        max_bs * self.speculative_num_draft_tokens + 1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    "page_table": torch.zeros(
+                        max_bs * self.speculative_num_draft_tokens,
+                        self.max_context_len,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                }
+
         self.encoder_metadata = {
             "encoder_page_table": torch.zeros(
                 max_bs,
@@ -1591,6 +1612,28 @@ class FlashAttentionBackend(AttentionBackend):
 
                 self.target_verify_metadata_topk_normal[bs] = metadata
                 self.target_verify_metadata_topk_expand[bs] = metadata_expand
+
+                if self.has_swa:
+                    metadata_swa = FlashAttentionMetadata()
+                    metadata_swa.cache_seqlens_int32 = (
+                        self.target_verify_metadata_topk_swa["cache_seqlens"][
+                            : bs * self.speculative_num_draft_tokens
+                        ]
+                    )
+                    metadata_swa.max_seq_len_q = 1
+                    metadata_swa.cu_seqlens_q = self.target_verify_metadata_topk_swa[
+                        "cu_seqlens_q"
+                    ][: bs * self.speculative_num_draft_tokens + 1]
+                    metadata_swa.cu_seqlens_k = self.target_verify_metadata_topk_swa[
+                        "cu_seqlens_k"
+                    ][: bs * self.speculative_num_draft_tokens + 1]
+
+                    metadata_swa.page_table = self.target_verify_metadata_topk_swa[
+                        "page_table"
+                    ][: bs * self.speculative_num_draft_tokens]
+                    self.target_verify_metadata_topk_swa[bs] = metadata_swa
+                    metadata.swa_spec_metadata = metadata_swa
+
         elif forward_mode.is_draft_extend():
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
@@ -1831,6 +1874,12 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 )
 
+                if self.has_swa:
+                    metadata_swa = self.target_verify_metadata_topk_swa[bs]
+                    self._init_sliding_window_attn_spec_metadata(
+                        metadata, metadata_expand, metadata_swa
+                    )
+
         elif forward_mode.is_draft_extend():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
@@ -2066,36 +2115,53 @@ class FlashAttentionBackend(AttentionBackend):
             lam.local_max_query_len = int(seqlens_q_local_np.max())
             lam.local_max_seq_len = int(seqlens_k_local_np.max())
 
-    def _init_sliding_window_attn_metadata(
-        self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
+    def _init_sliding_window_attn_spec_metadata(
+        self,
+        metadata: FlashAttentionMetadata,
+        metadata_expand: FlashAttentionMetadata,
+        metadata_swa: FlashAttentionMetadata = None,
     ):
-        if self.sliding_window_size is None or self.sliding_window_size <= -1:
-            return
+        # TODO: support page_size > 1 for swa spec
+        assert (
+            self.page_size == 1
+        ), "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
 
-        # TODO: support page_size > 1 for swa optimization
-        if self.page_size != 1:
-            return
-
-        (
-            window_page_table,
-            window_cache_seqlens_int32,
-            window_cu_seqlens_k,
-            window_max_seq_len,
-        ) = prepare_sliding_window_metadata(
-            metadata.page_table,
-            metadata.cache_seqlens_int32,
-            metadata.cu_seqlens_k,
-            self.sliding_window_size,
-        )
-
-        metadata.sliding_window_attn_metadata = (
-            FlashAttentionMetadata.SlidingWindowAttentionMetadata(
-                window_cache_seqlens_int32=window_cache_seqlens_int32,
-                window_cu_seqlens_k=window_cu_seqlens_k,
-                window_page_table=window_page_table,
-                window_max_seq_len=window_max_seq_len,
+        cache_seqlens_int32 = (
+            metadata.cache_seqlens_int32.repeat_interleave(
+                self.speculative_num_draft_tokens
             )
+            + metadata_expand.cache_seqlens_int32
         )
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
+        )
+        bs = cache_seqlens_int32.shape[0]
+        page_table = metadata.page_table.new_zeros(
+            (bs, metadata.max_seq_len_k + metadata_expand.page_table.shape[1])
+        )
+
+        for i in range(bs):
+            idx = i // self.speculative_num_draft_tokens
+            seq_len = metadata.cache_seqlens_int32[idx]
+            seq_len_expand = metadata_expand.cache_seqlens_int32[i]
+            page_table[i][:seq_len] = metadata.page_table[idx][:seq_len]
+            page_table[i][seq_len : seq_len + seq_len_expand] = (
+                metadata_expand.page_table[i][:seq_len_expand]
+            )
+
+        if metadata_swa is None:
+            metadata_swa = FlashAttentionMetadata()
+            metadata_swa.max_seq_len_q = 1
+            metadata_swa.cu_seqlens_q = metadata_expand.cu_seqlens_q
+            metadata_swa.cache_seqlens_int32 = cache_seqlens_int32
+            metadata_swa.cu_seqlens_k = cu_seqlens_k
+            metadata_swa.page_table = page_table
+        else:
+            metadata_swa.cache_seqlens_int32.copy_(cache_seqlens_int32)
+            metadata_swa.cu_seqlens_k.copy_(cu_seqlens_k)
+            metadata_swa.page_table[:, : page_table.shape[1]].copy_(page_table)
+
+        metadata.swa_spec_metadata = metadata_swa
 
 
 class FlashAttentionMultiStepBackend:
