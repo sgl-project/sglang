@@ -277,9 +277,20 @@ class DataParallelController:
                     self.workers
                 )
         else:
-            if req.data_parallel_rank is not None:
+            if (
+                self.server_args.disaggregation_mode == "prefill"
+                and req.data_parallel_rank is not None
+            ):
                 logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
                 self.workers[req.data_parallel_rank].send_pyobj(req)
+            elif (
+                self.server_args.disaggregation_mode == "decode"
+                and req.data_parallel_rank_decode is not None
+            ):
+                logger.debug(
+                    f"Direct routing to DP rank {req.data_parallel_rank_decode}"
+                )
+                self.workers[req.data_parallel_rank_decode].send_pyobj(req)
             else:
                 self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
