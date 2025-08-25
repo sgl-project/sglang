@@ -1594,7 +1594,6 @@ class Scheduler(
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                print(f"Prefetch operation {req.rid} done: {prefetch_done}")
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
