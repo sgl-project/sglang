@@ -6,12 +6,12 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
+import asyncio
+import json
 import unittest
 import uuid
 from typing import Optional
 from unittest.mock import Mock, patch
-import asyncio
-import json
 
 from fastapi import Request
 
@@ -327,7 +327,6 @@ class ServingChatTestCase(unittest.TestCase):
             result, "Should return None when parser has no tool call data"
         )
 
-
     # ------------- kimi_k2 tool_call_id formatting -------------
     def test_kimi_k2_non_streaming_tool_call_id_format(self):
         """Ensure non-streaming tool_call.id matches functions.{name}:{index} for kimi_k2 parser."""
@@ -418,7 +417,7 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertIsNotNone(line)
             self.assertTrue(line.startswith("data: "))
 
-            payload = json.loads(line[len("data: "):])
+            payload = json.loads(line[len("data: ") :])
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:0")
 
