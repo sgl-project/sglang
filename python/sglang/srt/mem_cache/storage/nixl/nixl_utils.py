@@ -109,65 +109,34 @@ class NixlRegistration:
             return [(0, 0, key)]
 
     def _register_memory(
-        self, items: Union[List[tuple], List[torch.Tensor]], mem_type: str, desc: str
+        self,
+        items: Union[List[tuple], torch.Tensor, List[torch.Tensor]],
+        mem_type: Optional[str] = None,
     ) -> Optional[Any]:
         """Common registration logic for files, objects, and buffers.
         Args:
             items: List of tuples or tensors to register
-            mem_type: Memory type ("FILE", "OBJ", "DRAM", "VRAM")
-            desc: Description for logging
+            mem_type: Memory type ("FILE", "OBJ") or None for tensor or list of tensors
         """
+        if isinstance(items, list) and not items:
+            return None
+
+        reg_descs = self.agent.get_reg_descs(items, mem_type)
+        if reg_descs is None:
+            logger.error("Failed to create registration descriptors")
+            return None
+
         try:
-            if not items:
-                return None
-
-            reg_descs = self.agent.get_reg_descs(items, mem_type)
-            if reg_descs is None:
-                logger.error("Failed to create registration descriptors")
-                return None
-
             registered_memory = self.agent.register_memory(reg_descs)
-            if registered_memory:
-                return registered_memory
-            else:
-                logger.error("Failed to register with NIXL")
-                return None
-
+            return registered_memory  # Could be None in case of error
         except Exception as e:
-            logger.error(f"Failed to register {desc}: {e}")
+            if not mem_type:
+                logger.error(f"Failed to register Tensors with NIXL: {e}")
+            else:
+                logger.error(
+                    f"Failed to register memory of type {mem_type} with NIXL: {e}"
+                )
             return None
-
-    def register_buffers(
-        self, buffers: Union[torch.Tensor, List[torch.Tensor]]
-    ) -> Optional[Any]:
-        """Register tensors/buffers with NIXL."""
-        if isinstance(buffers, torch.Tensor):
-            buffers = [buffers]
-
-        if not buffers:
-            return None
-
-        # Determine memory type based on tensor device
-        mem_type = "VRAM" if buffers[0].device.type == "cuda" else "DRAM"
-        return self._register_memory(buffers, mem_type, "buffers")
-
-    def register_files(self, tuples: List[tuple]) -> Optional[Any]:
-        """Register files with NIXL using (0, 0, fd, file_path) tuples."""
-        return self._register_memory(tuples, "FILE", "files")
-
-    def register_objects(
-        self, keys: List[str], tensors: Optional[List[torch.Tensor]] = None
-    ) -> Optional[Any]:
-        """Register objects with NIXL."""
-        if not keys:
-            return None
-
-        # Create object tuples with proper sizes
-        tuples = [
-            (0, tensor.element_size() * tensor.numel() if tensor else 0, key)
-            for key, tensor in zip(keys, tensors or [None] * len(keys))
-        ]
-        return self._register_memory(tuples, "OBJ", "objects")
 
 
 class NixlFileManager:
@@ -221,12 +190,9 @@ class NixlFileManager:
             return False
 
     def files_to_nixl_tuples(
-        self, file_paths: List[str], open_file: bool = True
+        self, file_paths: List[str]
     ) -> List[Tuple[int, int, int, str]]:
         """Create NIXL tuples (offset, length, fd, file_path) for given files."""
-        if not open_file:
-            return [(0, 0, 0, path) for path in file_paths]
-
         tuples = []
         for path in file_paths:
             if (fd := self.open_file(path)) is None:

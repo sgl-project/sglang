@@ -111,9 +111,8 @@ class FusedMoE(torch.nn.Module):
         hidden_size: Input hidden state size of the transformer
         intermediate_size: Intermediate size of the experts
         params_dtype: Data type for the parameters.
-        reduce_results: Whether to all all_reduce on the output of the layer
-        renomalize: Whether to renormalize the logits in the fused_moe kernel
-        quant_config: Quantization configure.
+        reduce_results: Whether to apply all_reduce on the output of the layer
+        quant_config: Quantization configuration.
         inplace: suggestion to compute inplace (modify input activation).
     """
 
@@ -179,9 +178,6 @@ class FusedMoE(torch.nn.Module):
         if self.moe_ep_size > 1:
             # TODO(ch-wan): support shared experts fusion
             # Create a tensor of size num_experts filled with -1
-            self.expert_map_cpu = torch.full(
-                (self.num_experts,), -1, dtype=torch.int32, device="cpu"
-            )
             self.expert_map_cpu = torch.full(
                 (self.num_experts,), -1, dtype=torch.int32, device="cpu"
             )

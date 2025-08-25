@@ -45,11 +45,14 @@ def fused_moe_router_kernel(
     logits = tl.sum((w_router.to(tl.float32) * x[None, :].to(tl.float32)), axis=-1)
 
     # logit softcap
-    logits_scaled = logits / moe_softcapping
-    exped = tl.exp(2 * logits_scaled)
-    top = exped - 1
-    bottom = exped + 1
-    logits_softcapped = top / bottom * moe_softcapping
+    if moe_softcapping == 0:
+        logits_softcapped = logits
+    else:
+        logits_scaled = logits / moe_softcapping
+        exped = tl.exp(2 * logits_scaled)
+        top = exped - 1
+        bottom = exped + 1
+        logits_softcapped = top / bottom * moe_softcapping
 
     # Add bias after softcapping
     if is_correction_bias:
@@ -207,9 +210,12 @@ def fused_moe_router_large_bs_kernel(
         b_ptrs += BLOCK_SIZE_K
 
     # 4. logit softcap
-    logits_scaled = acc / moe_softcapping
-    exped = tl.exp(2 * logits_scaled)
-    logits_softcapped = (exped - 1) / (exped + 1) * moe_softcapping
+    if moe_softcapping == 0:
+        logits_softcapped = acc
+    else:
+        logits_scaled = acc / moe_softcapping
+        exped = tl.exp(2 * logits_scaled)
+        logits_softcapped = (exped - 1) / (exped + 1) * moe_softcapping
 
     # 5. top1
     arange_block_size_n = tl.arange(0, BLOCK_SIZE_N)[None, :]
@@ -234,7 +240,7 @@ def fused_moe_router_large_bs_kernel(
 
     # 7. handle topk == 2
     if topk == 2:
-        cond_top2 = (arange_block_size_n < num_experts) and (
+        cond_top2 = (arange_block_size_n < num_experts) & (
             arange_block_size_n != top1[:, None]
         )
         top2 = tl.argmax(
