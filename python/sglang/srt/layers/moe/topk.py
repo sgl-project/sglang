@@ -304,12 +304,12 @@ class TopK(CustomOp):
         global_num_experts = router_logits.shape[-1]
 
         # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
-        if global_num_experts == 256 and self.topk_config.renormalize is False:
+        if global_num_experts == 256:
 
             routed_scaling_factor = self.topk_config.routed_scaling_factor or 1
             router_logits = router_logits.to(torch.float32)
 
-            return torch_npu.npu_moe_gating_top_k(
+            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
                 router_logits,
                 k=self.topk_config.top_k,
                 bias=self.topk_config.correction_bias.to(torch.float32),
@@ -321,6 +321,16 @@ class TopK(CustomOp):
                 routed_scaling_factor=routed_scaling_factor,
                 eps=float(1e-20),
             )
+
+            if self.topk_config.renormalize:
+                topk_weights_sum = (
+                    topk_weights.sum(dim=-1, keepdim=True)
+                    if self.topk_config.num_fused_shared_experts == 0
+                    else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+                )
+                topk_weights = topk_weights / topk_weights_sum
+
+            return StandardTopKOutput(topk_weights, topk_ids, _)
         else:
             self.topk_config.torch_native = True
             return select_experts(
