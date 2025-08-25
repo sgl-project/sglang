@@ -1,5 +1,3 @@
-from sglang.srt.utils import get_int_env_var
-
 """For Now, MSCCL is only supported on TP16 and TP8 case
 
 if [[ $RANK -eq 0  ]]; then
@@ -40,6 +38,7 @@ from sglang.srt.distributed.parallel_state import (
     set_mscclpp_all_reduce,
 )
 from sglang.srt.distributed.utils import StatelessProcessGroup
+from sglang.srt.utils import get_int_env_var
 from sglang.test.test_utils import CustomTestCase
 
 

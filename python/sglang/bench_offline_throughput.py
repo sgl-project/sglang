@@ -1,5 +1,3 @@
-from sglang.srt.utils import get_bool_env_var
-
 """
 Benchmark the throughput in the offline mode.
 It accepts server arguments (the same as launch_server.py) and benchmark arguments (the same as bench_serving.py).
@@ -35,6 +33,7 @@ from sglang.bench_serving import (
 from sglang.lang.backend.runtime_endpoint import Runtime
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_bool_env_var
 
 
 @dataclasses.dataclass

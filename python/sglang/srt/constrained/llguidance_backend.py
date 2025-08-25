@@ -1,5 +1,3 @@
-from sglang.srt.utils import get_int_env_var
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,6 +32,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
 

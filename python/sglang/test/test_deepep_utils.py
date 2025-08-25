@@ -1,3 +1,5 @@
+# Copy from deepseek-ai/DeepEP/tests/test_utils.py
+
 import os
 import sys
 from typing import Optional
@@ -7,7 +9,6 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.utils import get_int_env_var
-
 
 
 def init_dist(local_rank: int, num_local_ranks: int):
