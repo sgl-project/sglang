@@ -27,7 +27,6 @@ import tempfile
 import threading
 import time
 from http import HTTPStatus
-from multiprocessing import shared_memory
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 # Fix a bug of Python threading
@@ -93,6 +92,13 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
+from sglang.srt.managers.multi_tokenizer_manager import MultiTokenizerManager
+from sglang.srt.managers.multi_tokenizer_mixin import (
+    deserialize_data,
+    get_main_process_id,
+    read_from_shared_memory,
+    write_data_for_multi_tokenizer,
+)
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -132,109 +138,6 @@ def set_global_state(global_state: _GlobalState):
     _global_state = global_state
 
 
-def serialize_port_args(port_args: PortArgs) -> dict:
-    """Serialize PortArgs into a shareable dictionary"""
-    return {
-        "tokenizer_ipc_name": port_args.tokenizer_ipc_name,
-        "scheduler_input_ipc_name": port_args.scheduler_input_ipc_name,
-        "detokenizer_ipc_name": port_args.detokenizer_ipc_name,
-        "nccl_port": port_args.nccl_port,
-        "rpc_ipc_name": port_args.rpc_ipc_name,
-        "metrics_ipc_name": port_args.metrics_ipc_name,
-        "tokenizer_worker_ipc_name": port_args.tokenizer_worker_ipc_name,
-    }
-
-
-def deserialize_port_args(data: dict) -> PortArgs:
-    """Deserialize PortArgs from a shared dictionary"""
-    return PortArgs(**data)
-
-
-def serialize_server_args(server_args: ServerArgs) -> dict:
-    """Serialize ServerArgs into a shareable dictionary"""
-    return dataclasses.asdict(server_args)
-
-
-def deserialize_server_args(data: dict) -> ServerArgs:
-    """Deserialize ServerArgs from a shared dictionary"""
-    return ServerArgs(**data)
-
-
-def serialize_scheduler_info(scheduler_info: Dict) -> dict:
-    """Serialize scheduler_info into a shareable dictionary"""
-    return scheduler_info
-
-
-def deserialize_scheduler_info(data: dict) -> Dict:
-    """Deserialize scheduler_info from a shared dictionary"""
-    return data
-
-
-def write_to_shared_memory(data: dict, name: str) -> shared_memory.SharedMemory:
-    """Write data to shared memory"""
-    serialized = json.dumps(data).encode("utf-8")
-    size = len(serialized)
-    try:
-        # Try to open existing shared memory
-        shm = shared_memory.SharedMemory(name=name)
-        # If size is insufficient, close and recreate
-        if shm.size < size:
-            shm.close()
-            shm.unlink()
-            shm = shared_memory.SharedMemory(create=True, size=size, name=name)
-    except FileNotFoundError:
-        # If not present, create new shared memory
-        shm = shared_memory.SharedMemory(create=True, size=size, name=name)
-
-    shm.buf[:size] = serialized
-    return shm
-
-
-def read_from_shared_memory(name: str) -> dict:
-    """Read data from shared memory"""
-    try:
-        shm = shared_memory.SharedMemory(name=name)
-        data = json.loads(bytes(shm.buf).decode("utf-8"))
-        shm.close()
-        return data
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Shared memory {name} not found")
-
-
-def get_main_process_id() -> int:
-    """Get the main process ID"""
-    return multiprocessing.current_process()._parent_pid
-
-
-def write_data_for_multi_tokenizer(
-    port_args: PortArgs, server_args: ServerArgs, scheduler_info: Dict
-):
-    """Write args information to share memory for multi-tokenizer"""
-    # get main process ID
-    main_pid = get_main_process_id()
-    current_pid = os.getpid()
-    logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
-
-    # Write port_args to shared memory
-    port_args_shm = write_to_shared_memory(
-        serialize_port_args(port_args), f"port_args_{current_pid}"
-    )
-    # Write server_args to shared memory
-    server_args_shm = write_to_shared_memory(
-        serialize_server_args(server_args), f"server_args_{current_pid}"
-    )
-    # Write scheduler_info to shared memory
-    scheduler_info_shm = write_to_shared_memory(
-        serialize_scheduler_info(scheduler_info), f"scheduler_info_{current_pid}"
-    )
-
-    port_args_shm.close()
-    server_args_shm.close()
-    scheduler_info_shm.close()
-
-    return port_args_shm, server_args_shm, scheduler_info_shm
-
-
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
     pid = os.getpid()
@@ -245,16 +148,15 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
     server_args_data = read_from_shared_memory(f"server_args_{main_pid}")
     scheduler_info_data = read_from_shared_memory(f"scheduler_info_{main_pid}")
-    port_args = deserialize_port_args(port_args_data)
-    server_args = deserialize_server_args(server_args_data)
-    scheduler_info = deserialize_scheduler_info(scheduler_info_data)
+    port_args, server_args = deserialize_data(port_args_data, server_args_data)
+    scheduler_info = scheduler_info_data
 
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
 
     # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args, False)
+    tokenizer_manager = MultiTokenizerManager(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
