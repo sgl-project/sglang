@@ -10,6 +10,7 @@ use kube::{
 };
 use std::collections::{HashMap, HashSet};
 
+use rustls;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task;
@@ -186,6 +187,8 @@ pub async fn start_service_discovery(
             code: 400,
         }));
     }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Initialize Kubernetes client
     let client = Client::try_default().await?;
