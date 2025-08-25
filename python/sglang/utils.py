@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import random
-import signal
 import socket
 import subprocess
 import sys
@@ -291,17 +290,6 @@ def find_printable_text(text: str):
         return text[: text.rfind(" ") + 1]
 
 
-def graceful_registry(sub_module_name: str):
-    def graceful_shutdown(signum, frame):
-        logger.info(
-            f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
-        )
-        if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} receive sigterm")
-
-    signal.signal(signal.SIGTERM, graceful_shutdown)
-
-
 class LazyImport:
     """Lazy import to make `import sglang` run faster."""
 
@@ -469,7 +457,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
+                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break
