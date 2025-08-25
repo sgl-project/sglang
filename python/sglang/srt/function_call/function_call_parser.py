@@ -44,7 +44,7 @@ class FunctionCallParser:
         "glm45": Glm4MoeDetector,
         "step3": Step3Detector,
         "gpt-oss": GptOssDetector,
-	"seed_oss": SeedOssDetector,
+	    "seed_oss": SeedOssDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
