@@ -122,3 +122,9 @@ class HybridAttnBackend(AttentionBackend):
         return self.prefill_backend.forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
+
+    def support_triton(self):
+        """Delegate to decode backend for triton support.
+        Hybrid backend is primarily used on the decode path for CUDA graphs.
+        """
+        return getattr(self.decode_backend, "support_triton", lambda: True)()
