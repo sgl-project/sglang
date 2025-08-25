@@ -1968,6 +1968,7 @@ def get_last_loc(
     if (
         global_server_args_dict["attention_backend"] != "ascend"
         and global_server_args_dict["attention_backend"] != "torch_native"
+        and global_server_args_dict["attention_backend"] != "cudnn"
     ):
         impl = get_last_loc_triton
     else:
