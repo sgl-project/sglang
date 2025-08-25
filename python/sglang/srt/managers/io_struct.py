@@ -971,8 +971,13 @@ class AbortReq:
     rid: str = ""
     # Whether to abort all requests
     abort_all: bool = False
-    # The finished reason data
+
+    rids: Optional[Union[List[str], str]] = None
+
     finished_reason: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        self.rids = self.rid
 
 
 @dataclass
@@ -1027,6 +1032,7 @@ class ProfileReq:
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
+    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass
@@ -1172,6 +1178,16 @@ class LoRAUpdateResult:
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
 
+
+@dataclass
+class MultiTokenizerRegisterReq:
+    rids: Optional[Union[List[str], str]] = None
+    ipc_name: Optional[str] = None
+
+@dataclass
+class MultiTokenizerWarpper:
+    worker_id: int
+    obj: Optional[Any] = None
 
 class BlockReqType(Enum):
     BLOCK = 1

@@ -116,6 +116,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    MultiTokenizerWarpper,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -129,6 +130,7 @@ from sglang.srt.utils import (
     dataclass_to_string_truncated,
     freeze_gc,
     get_bool_env_var,
+    get_origin_rid,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -264,9 +266,15 @@ class TokenizerManager:
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-        )
+        if self.server_args.tokenizer_worker_num == 1:
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            )
+        else:
+            # for multi tokenizer mode
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
+            )
 
         # Request states
         self.no_create_loop = False
@@ -487,6 +495,15 @@ class TokenizerManager:
         created_time = time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
+
+        if self.server_args.tokenizer_worker_num > 1:
+            # Modify rid, add worker_id
+            if isinstance(obj.rid, list):
+                # If it's an array, add worker_id prefix to each element
+                obj.rid = [f"{self.worker_id}_{rid}" for rid in obj.rid]
+            else:
+                # If it's a single value, add worker_id prefix
+                obj.rid = f"{self.worker_id}_{obj.rid}"
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -1299,6 +1316,8 @@ class TokenizerManager:
         elif obj.session_id in self.session_futures:
             return None
 
+        if self.server_args.tokenizer_worker_num > 1:
+            obj = MultiTokenizerWarpper(self.worker_id, obj)
         self.send_to_scheduler.send_pyobj(obj)
 
         self.session_futures[obj.session_id] = asyncio.Future()
@@ -1576,7 +1595,6 @@ class TokenizerManager:
 
     async def handle_loop(self):
         """The event loop that handles requests"""
-
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
@@ -1596,9 +1614,12 @@ class TokenizerManager:
                 )
                 continue
 
+            originRid = rid
+            if self.server_args.tokenizer_worker_num > 1:
+                originRid = get_origin_rid(rid)
             # Build meta_info and return value
             meta_info = {
-                "id": rid,
+                "id": originRid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
@@ -1904,6 +1925,9 @@ class TokenizerManager:
         if is_health_check_generate_req(recv_obj):
             return
         state = self.rid_to_state[recv_obj.rid]
+        rid = recv_obj.rid
+        if self.server_args.tokenizer_worker_num > 1:
+            rid = get_origin_rid(rid)
         state.finished = True
         if recv_obj.finished_reason:
             out = {
@@ -1916,7 +1940,7 @@ class TokenizerManager:
             out = {
                 "text": "",
                 "meta_info": {
-                    "id": recv_obj.rid,
+                    "id": rid,
                     "finish_reason": {
                         "type": "abort",
                         "message": "Abort before prefill",
@@ -2102,6 +2126,8 @@ T = TypeVar("T")
 class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
 
+    enable_multi_tokenizer = False
+
     def __init__(self, sender, fan_out: int):
         self._sender = sender
         self._fan_out = fan_out
@@ -2118,6 +2144,15 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
+            if _Communicator.enable_multi_tokenizer:
+                # if obj.rids is None:
+                #     obj.rids = f"{os.getpid()}_{uuid.uuid4().hex}_Communicator"
+                # else:
+                #     if isinstance(obj.rids, str):
+                #         obj.rids = f"{os.getpid()}_{obj.rids}"
+                #     elif isinstance(obj.rids, list):
+                #         obj.rids = [f"{os.getpid()}_{rid}" for rid in obj.rids]
+                obj = MultiTokenizerWarpper(worker_id=os.getpid(),obj=obj)
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
@@ -2132,6 +2167,18 @@ class _Communicator(Generic[T]):
         return result_values
 
     def handle_recv(self, recv_obj: T):
+        if _Communicator.enable_multi_tokenizer:
+            # If rids is a string and not empty, remove the prefix
+            # if (
+            #     hasattr(recv_obj, "rids")
+            #     and isinstance(recv_obj.rids, str)
+            #     and recv_obj.rids
+            # ):
+            #     recv_obj.rids = get_origin_rid(recv_obj.rids)
+            # # If rids is a list, remove prefix from each element
+            # elif hasattr(recv_obj, "rids") and isinstance(recv_obj.rids, list):
+            #     recv_obj.rids = [get_origin_rid(rid) for rid in recv_obj.rids]
+            pass
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
