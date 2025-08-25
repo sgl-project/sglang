@@ -244,6 +244,7 @@ class ForwardBatch:
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether lse needs to be returned
     mha_return_lse: Optional[bool] = None
+    attn_forward_method: Optional["AttnForwardMethod"] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None

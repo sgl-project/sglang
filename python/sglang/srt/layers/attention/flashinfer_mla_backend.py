@@ -197,12 +197,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
-        self.enable_chunk_kv = (
-            not skip_prefill
-            and global_server_args_dict["disaggregation_mode"] != "decode"
-            and not global_server_args_dict["disable_chunked_prefix_cache"]
-            and not global_server_args_dict["flashinfer_mla_disable_ragged"]
-        )
         self.page_size = model_runner.page_size
 
         # Allocate buffers
