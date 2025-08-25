@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     sglang_per_token_group_quant_fp8,
@@ -129,6 +130,12 @@ class EPMoE(FusedMoE):
             self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
+        elif isinstance(quant_config, W4AFp8Config):
+            self.use_w4afp8 = True
+            self.use_fp8_w8a8 = False
+            self.use_block_quant = False
+            self.block_shape = None
+            self.activation_scheme = None
         else:
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
@@ -382,6 +389,7 @@ class DeepEPMoE(EPMoE):
             deepep_mode=self.deepep_mode,
             async_finish=True,  # TODO
             return_recv_hook=True,
+            quant_config=quant_config,
         )
 
         if self.deepep_mode.enable_low_latency() and not _is_npu:
@@ -407,7 +415,7 @@ class DeepEPMoE(EPMoE):
                 self.w13_weight,
                 (
                     self.w13_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or self.use_w4afp8
                     else self.w13_weight_scale
                 ),
             )
@@ -415,7 +423,7 @@ class DeepEPMoE(EPMoE):
                 self.w2_weight,
                 (
                     self.w2_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or self.use_w4afp8
                     else self.w2_weight_scale
                 ),
             )
@@ -464,9 +472,13 @@ class DeepEPMoE(EPMoE):
             assert DispatchOutputChecker.format_is_ascent_ll(dispatch_output)
             return self.forward_npu(dispatch_output)
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            if self.use_w4afp8:
+                return self.forward_w4afp8(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            if self.use_w4afp8:
+                return self.forward_w4afp8_masked(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -520,6 +532,20 @@ class DeepEPMoE(EPMoE):
                 else ActivationType.Gelu
             ),
             expert_mask=self.expert_mask,
+        )
+        
+    def forward_w4afp8(
+        self,
+        dispatch_output: DeepEPNormalOutput,
+    ):
+        return self.quant_method.apply(
+            layer=self,
+            x=dispatch_output.hidden_states,
+            topk_weights=dispatch_output.topk_weights,
+            topk_ids=dispatch_output.topk_idx,
+            masked_m=None,
+            moe_runner_config=None,
+            deepep_mode=dispatch_output.format,
         )
 
     def forward_deepgemm_contiguous(
@@ -645,6 +671,20 @@ class DeepEPMoE(EPMoE):
         ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
 
         return gather_out
+    
+    def forward_w4afp8_masked(
+        self,
+        dispatch_output: DeepEPLLOutput,
+    ):
+        return self.quant_method.apply(
+            layer=self,
+            x=dispatch_output.hidden_states_fp8,
+            topk_weights=dispatch_output.topk_weights,
+            topk_ids=dispatch_output.topk_idx,
+            masked_m=dispatch_output.masked_m,
+            moe_runner_config=None,
+            deepep_mode=dispatch_output.format,
+        )
 
     def forward_deepgemm_masked(
         self,

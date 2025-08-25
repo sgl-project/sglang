@@ -13,6 +13,8 @@ from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -252,6 +254,7 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         if not use_deepep:
             raise ImportError(
@@ -267,6 +270,7 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.quant_config = quant_config
 
         self.params_bytes = 2
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
@@ -315,7 +319,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if (deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM 
+            and not isinstance(self.quant_config, W4AFp8Config)):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -384,7 +389,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=(
+                128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM 
+                and not isinstance(self.quant_config, W4AFp8Config) 
+                else 1
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
 
@@ -495,7 +504,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=True,
+            use_fp8=not isinstance(self.quant_config, W4AFp8Config),
         )
         return (
             hidden_states,
@@ -634,6 +643,7 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         self.deepep_mode = deepep_mode
 
@@ -646,6 +656,7 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            quant_config=quant_config,
         )
 
         if self.deepep_mode.enable_low_latency():
