@@ -145,7 +145,7 @@ def is_host_cpu_x86() -> bool:
 
 
 def is_cpu() -> bool:
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
+    return get_bool_env_var("SGLANG_USE_CPU_ENGINE", "0") and is_host_cpu_x86()
 
 
 def get_cuda_version():
@@ -662,7 +662,7 @@ def load_audio(
             BytesIO(pybase64.b64decode(audio_file, validate=True))
         )
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        timeout = get_int_env_var("REQUEST_TIMEOUT", 5)
         response = requests.get(audio_file, stream=True, timeout=timeout)
         audio_file = BytesIO(response.content)
         response.close()
@@ -703,7 +703,7 @@ def load_image(
     elif isinstance(image_file, bytes):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        timeout = get_int_env_var("REQUEST_TIMEOUT", 3)
         response = requests.get(image_file, stream=True, timeout=timeout)
         try:
             response.raise_for_status()
@@ -746,7 +746,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             vr = VideoReader(tmp_file.name, ctx=ctx)
         elif isinstance(video_file, str):
             if video_file.startswith(("http://", "https://")):
-                timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+                timeout = get_int_env_var("REQUEST_TIMEOUT", 10)
                 response = requests.get(video_file, stream=True, timeout=timeout)
                 response.raise_for_status()
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")

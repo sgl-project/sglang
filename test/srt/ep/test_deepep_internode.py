@@ -11,6 +11,7 @@ import test_deepep_low_latency
 import torch
 import torch.distributed as dist
 
+from sglang.srt.utils import get_int_env_var
 from sglang.test.test_deepep_utils import (
     bench,
     calc_diff,
@@ -401,7 +402,7 @@ def test_main(
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
-    num_nodes = int(os.getenv("WORLD_SIZE", 1))
+    num_nodes = get_int_env_var("WORLD_SIZE", 1)
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     test_ll_compatibility = False
     if test_ll_compatibility:

@@ -1355,7 +1355,7 @@ def init_distributed_environment(
         # local rank not set, this usually happens in single-node
         # setting, where we can use rank as local rank
         if distributed_init_method == "env://":
-            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            local_rank = get_int_env_var("LOCAL_RANK", 0)
         else:
             local_rank = rank
     global _WORLD
