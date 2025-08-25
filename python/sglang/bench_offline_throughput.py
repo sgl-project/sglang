@@ -1,3 +1,5 @@
+from sglang.srt.utils import get_bool_env_var
+
 """
 Benchmark the throughput in the offline mode.
 It accepts server arguments (the same as launch_server.py) and benchmark arguments (the same as bench_serving.py).
@@ -420,7 +422,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # handling ModelScope model downloads
-    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() in ("true", "1"):
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE", "false"):
         if os.path.exists(args.model_path):
             print(f"Using local model path: {args.model_path}")
         else:

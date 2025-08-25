@@ -1,3 +1,5 @@
+from sglang.srt.utils import get_int_env_var
+
 """
 Memory-efficient attention for prefill.
 It support page size = 1.
@@ -16,7 +18,7 @@ from wave_lang.kernel.wave.templates.prefill_attention import (
 from wave_lang.kernel.wave.utils.general_utils import get_default_scheduling_params
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 
-dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
+dump_generated_mlir = get_int_env_var("WAVE_DUMP_MLIR", 0)
 
 
 def prefill_attention_wave(

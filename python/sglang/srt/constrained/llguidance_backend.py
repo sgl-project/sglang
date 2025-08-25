@@ -1,3 +1,5 @@
+from sglang.srt.utils import get_int_env_var
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,7 +48,7 @@ class GuidanceGrammar(BaseGrammarObject):
         self.ll_matcher = LLMatcher(
             self.llguidance_tokenizer,
             self.serialized_grammar,
-            log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
+            log_level=get_int_env_var("LLGUIDANCE_LOG_LEVEL", 1),
         )
         self.finished = False
         self.bitmask = None

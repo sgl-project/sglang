@@ -1,3 +1,5 @@
+from sglang.srt.utils import get_int_env_var
+
 """
 Memory-efficient attention for decoding.
 It supports page size = 1.
@@ -20,7 +22,7 @@ from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 logger = logging.getLogger(__name__)
 import os
 
-dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
+dump_generated_mlir = get_int_env_var("WAVE_DUMP_MLIR", 0)
 
 
 @functools.lru_cache(maxsize=4096)
