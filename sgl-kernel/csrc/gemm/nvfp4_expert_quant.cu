@@ -411,6 +411,9 @@ cvt_fp16_to_fp4_expert(
   int threadsPerExpert = (gridDim.x * blockDim.x + n_experts - 1) / n_experts;
   int tid_in_expert = tid % threadsPerExpert;
   int expert_idx = tid / threadsPerExpert;
+  int remainder_bound = gridDim.x * blockDim.x / threadsPerExpert;
+  int remainder_stride = gridDim.x * blockDim.x % threadsPerExpert;
+  int stride = expert_idx < remainder_bound ? threadsPerExpert : remainder_stride;
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
   // TODO(kaixih@nvidia): For now, we assume mask is used together with
   // silu_and_mal. Maybe we want a more general behavior of mask later. In the
@@ -421,7 +424,7 @@ cvt_fp16_to_fp4_expert(
   // Each global thread processes one element
   for (int globalIdx = tid_in_expert + input_offset_by_experts[expert_idx] * colsPerRow;
        globalIdx < input_offset_by_experts[expert_idx + 1] * colsPerRow;
-       globalIdx += threadsPerExpert) {
+       globalIdx += stride) {
     // Calculate which row and column this global thread should process
     int rowIdx = globalIdx / colsPerRow;
     int colIdx = globalIdx % colsPerRow;
@@ -605,7 +608,7 @@ void quant_impl(
     block.x = (block.x + 1) / 2;
   }
 
-  if (block.x * grid.x >= n_experts) {
+  if (mask != nullptr && block.x * grid.x >= n_experts) {
     cvt_fp16_to_fp4_expert<T, false><<<grid, block, 0, stream>>>(
         m_topk,
         k,
