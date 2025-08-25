@@ -301,7 +301,7 @@ class Gemma3RMSNorm(CustomOp):
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
-    def forward_cuda(slef, x):
+    def forward_cuda(self, x):
         return self.forward_native(x)
 
     def forward_npu(self, x):
