@@ -8,7 +8,6 @@ import torch.distributed as dist
 
 from sglang.srt.utils import get_int_env_var
 
-# Copy from deepseek-ai/DeepEP/tests/test_utils.py
 
 
 def init_dist(local_rank: int, num_local_ranks: int):
