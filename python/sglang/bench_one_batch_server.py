@@ -18,7 +18,7 @@ import json
 import multiprocessing
 import os
 import time
-from typing import Tuple
+from typing import List, Tuple
 
 import requests
 
@@ -252,6 +252,71 @@ def run_one_case(
     )
 
 
+def get_report_summary(
+    result: List[Tuple], server_args: ServerArgs, bench_args: BenchArgs
+):
+    import tabulate
+
+    summary = (
+        f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
+    )
+
+    headers = [
+        "batch size",
+        "latency (s)",
+        "input throughput (tok/s)",
+        "output throughput (tok/s)",
+        "acc length",
+        "ITL (ms)",
+        "input cost ($/1M)",
+        "output cost ($/1M)",
+    ]
+    if bench_args.profile:
+        headers.append("profile")
+    rows = []
+
+    for (
+        batch_size,
+        latency,
+        ttft,
+        input_throughput,
+        output_throughput,
+        overall_throughput,
+        last_gen_throughput,
+        acc_length,
+        trace_link,
+    ) in result:
+        if is_blackwell():
+            hourly_cost_per_gpu = 4  # $4/hour for one B200
+        else:
+            hourly_cost_per_gpu = 2  # $2/hour for one H100
+
+        hourly_cost = hourly_cost_per_gpu * server_args.tp_size
+        input_util = 0.7
+        accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
+        itl = 1 / (output_throughput / batch_size) * 1000
+        input_cost = 1e6 / (input_throughput * input_util) / 3600 * hourly_cost
+        output_cost = 1e6 / output_throughput / 3600 * hourly_cost
+        row = [
+            batch_size,
+            latency,
+            input_throughput,
+            output_throughput,
+            accept_length,
+            itl,
+            input_cost,
+            output_cost,
+        ]
+        if trace_link:
+            row.append(f"[Profile]({trace_link})")
+        rows.append(row)
+
+    summary += tabulate.tabulate(
+        rows, headers=headers, tablefmt="github", floatfmt=".2f"
+    )
+    return summary
+
+
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
@@ -343,63 +408,14 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if not bench_args.show_report:
         return
 
-    summary = (
-        f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
-    )
-    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
-
-    if bench_args.profile:
-        summary += " profile |"
-
-    summary += "\n"
-    summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |"
-
-    if bench_args.profile:
-        summary += "-------------|"
-    summary += "\n"
-
-    for (
-        batch_size,
-        latency,
-        ttft,
-        input_throughput,
-        output_throughput,
-        overall_throughput,
-        last_gen_throughput,
-        acc_length,
-        trace_link,
-    ) in result:
-        if is_blackwell():
-            hourly_cost_per_gpu = 4  # $4/hour for one B200
-        else:
-            hourly_cost_per_gpu = 2  # $2/hour for one H100
-
-        hourly_cost = hourly_cost_per_gpu * server_args.tp_size
-        input_util = 0.7
-        accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
-        line = (
-            f"| {batch_size} | "
-            f"{latency:.2f} | "
-            f"{input_throughput:.2f} | "
-            f"{output_throughput:.2f} | "
-            f"{accept_length} | "
-            f"{1 / (output_throughput/batch_size) * 1000:.2f} | "
-            f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
-            f"{1e6 / output_throughput / 3600 * hourly_cost:.2f} |"
-        )
-        if trace_link:
-            line += f" [Profile]({trace_link}) |"
-        line += "\n"
-        summary += line
-
-    # print metrics table
+    summary = get_report_summary(result, server_args, bench_args)
     print(summary)
 
     if is_in_ci():
         write_github_step_summary(summary)
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
@@ -408,3 +424,7 @@ if __name__ == "__main__":
     bench_args = BenchArgs.from_cli_args(args)
 
     run_benchmark(server_args, bench_args)
+
+
+if __name__ == "__main__":
+    main()
