@@ -32,11 +32,13 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
     MultiTokenizerRegisterReq,
+    FreezeGCReq,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
     get_workerids_from_rids,
+    freeze_gc,
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
@@ -101,7 +103,8 @@ class DetokenizerManager:
                 (BatchEmbeddingOut, self.handle_batch_embedding_out),
                 (BatchTokenIDOut, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
-                (MultiTokenizerRegisterReq, lambda x: None),
+                (MultiTokenizerRegisterReq, lambda x: x),
+                (FreezeGCReq, self.handle_freeze_gc_req),
             ]
         )
 
@@ -112,6 +115,8 @@ class DetokenizerManager:
             try:
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
                 output = self._request_dispatcher(recv_obj)
+                if output is None:
+                    continue
                 if self.tokenizer_worker_num <= 1:
                     self.send_to_tokenizer.send_pyobj(output)
                 else:
@@ -405,7 +410,7 @@ class DetokenizerManager:
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
-            output_ids=recv_obj.output_ids,
+            output_ids=recv_obj.decode_ids,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
@@ -435,6 +440,10 @@ class DetokenizerManager:
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
         )
+
+    def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
+        freeze_gc("Detokenizer Manager")
+        return None
 
 
 class LimitedCapacityDict(OrderedDict):
