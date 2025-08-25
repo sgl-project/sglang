@@ -469,7 +469,7 @@ class DeepEPMoE(EPMoE):
                 get_moe_runner_backend().is_flashinfer_cutedsl()
             )
             if enable_flashinfer_cutedsl_moe:
-                return self.forward_flashinfer_dsl(dispatch_output)
+                return self.forward_flashinfer_cutedsl(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -649,7 +649,7 @@ class DeepEPMoE(EPMoE):
 
         return gather_out
 
-    def forward_flashinfer_dsl(
+    def forward_flashinfer_cutedsl(
         self,
         dispatch_output: DeepEPLLOutput,
     ):
