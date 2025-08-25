@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -262,6 +263,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        self.flashinfer_mxfp4_moe_precision = global_server_args_dict[
+            "flashinfer_mxfp4_moe_precision"
+        ]
 
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
@@ -305,6 +309,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size, 64
                 )
+        elif has_triton_kernels:
+            # TODO: this is a hack to make
+            # intermediate_size_per_partition_after_pad the same as the
+            # per_rank_intermediate_size during weight loading
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size, mxfp4_block
+            )
 
         self.intermediate_size = intermediate_size_per_partition_after_pad
 
@@ -615,11 +626,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         if self.use_flashinfer:
-            # Based on profiling results, we need to quantize x to mxfp8 here to achieve better performance
-            x_quant, x_scale = mxfp8_quantize(
-                x, False, alignment=self.hidden_size
-            )  # to mxfp8
-            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            # When bf16 mode is enabled, we don't need to quantize the input,
+            # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
+            # which can theoretically improve performance
+            if self.flashinfer_mxfp4_moe_precision == "bf16":
+                assert x.dtype == torch.bfloat16
+                x_quant = x
+                x_scale = None
+
+                # May be fused later if this code branch is frequently needed
+                origin_hidden_states_dim = x_quant.shape[-1]
+                if self.hidden_size != origin_hidden_states_dim:
+                    x_quant = torch.nn.functional.pad(
+                        x_quant,
+                        (0, self.hidden_size - origin_hidden_states_dim),
+                        mode="constant",
+                        value=0.0,
+                    )
+            elif self.flashinfer_mxfp4_moe_precision == "default":
+                x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
+                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            else:
+                raise NotImplementedError
+
             assert x_quant.shape[-1] == self.hidden_size
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
