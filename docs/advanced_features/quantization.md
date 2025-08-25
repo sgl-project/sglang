@@ -106,7 +106,8 @@ Several limitations currently affect offline quantized model loading in sglang, 
 
 2. Limited Support for Quantized MoE Models
 
-    Most quantized MoE models may encounter inference issues due to kernel-related limitation. Detailed failure cases are listed below.
+    Quantized MoE models may encounter inference issues due to kernel limitations (e.g., lack of support for mlp.gate layer quantization). To avoid such errors, please skip quantizing gate layers when processing quantization to MoE modules.
+
     <details>
         <summary>MoE failure cases</summary>
     Qwen3-30B-A3B:
@@ -129,6 +130,7 @@ Several limitations currently affect offline quantized model loading in sglang, 
         ValueError: The input size is not aligned with the quantized weight shape. This can be caused by too large tensor parallel size.
         ``` The same issue occurs with both AWQ and GPTQ formats.
     </details>
+
 
 3. Limited Support for Quantized VLMs
     <details>
@@ -259,3 +261,5 @@ python3 -m sglang.launch_server \
 - [Torchao: PyTorch Architecture Optimization](https://github.com/pytorch/ao)
 - [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)
 - [auto-round](https://github.com/intel/auto-round)
+
+
