@@ -150,11 +150,33 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run test
+      - name: Install PyTorch and pytest
+        run: |
+          pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129
+          pip install pytest
+
+      - name: Build sgl-kernel wheel
+        run: |
+          cd sgl-kernel
+          chmod +x ./build.sh
+          # Build for Python 3.10 and CUDA 12.9 (Blackwell)
+          ./build.sh "3.10" "12.9"
+
+      - name: Install sgl-kernel wheel
+        run: |
+          pip uninstall sgl-kernel -y || true
+          pip install sgl-kernel/dist/*whl --force-reinstall --no-deps
+          pip list | grep sgl-kernel
+
+      - name: Run test suite
         timeout-minutes: 30
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
+
+      - name: Cleanup
+        run: |
+          pip uninstall sgl-kernel -y
 
   performance-test-1-gpu-blackwell:
     needs: [check-changes]
@@ -270,32 +292,6 @@ jobs:
           cd test/srt
           python3 test_moe_eval_accuracy_large.py
 
-  unit-test-sgl-kernel-blackwell:
-    needs: [check-changes]
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.check-changes.outputs.src == 'true'
-    runs-on: b200-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run SGL Kernel tests
-        timeout-minutes: 20
-        run: |
-          cd sgl-kernel/tests
-          python3 -m pytest test_moe_align.py
-          python3 -m pytest test_moe_topk_softmax.py
-          python3 -m pytest test_activation.py
-          cd speculative
-          python3 -m pytest test_eagle_utils.py
-          cd ..
-          python3 -m pytest test_apply_token_bitmask_inplace.py
-
   pr-test-blackwell-finish:
     if: always()
     needs: [
@@ -304,7 +300,7 @@ jobs:
       unit-test-backend-4-gpu-blackwell, unit-test-backend-8-gpu-blackwell,
       unit-test-backend-8-gpu-b200-suite, performance-test-1-gpu-blackwell,
       performance-test-2-gpu-blackwell, accuracy-test-1-gpu-blackwell,
-      accuracy-test-2-gpu-blackwell, unit-test-sgl-kernel-blackwell
+      accuracy-test-2-gpu-blackwell
     ]
     runs-on: ubuntu-latest
     steps:
