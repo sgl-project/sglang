@@ -73,6 +73,7 @@ suites = {
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_gpt_oss_1gpu.py", 600),
+        TestFile("test_harmony_parser.py", 20),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_hybrid_attn_backend.py", 100),
         TestFile("test_input_embeddings.py", 38),
