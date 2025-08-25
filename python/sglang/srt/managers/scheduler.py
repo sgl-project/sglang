@@ -99,6 +99,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    MultiTokenizerWarpper,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -1081,14 +1082,23 @@ class Scheduler(
                     )
                     self.send_to_tokenizer.send_pyobj(abort_req)
                     continue
+            
+            # If it is a MultiTokenizerWarpper, unwrap it and handle the inner request.
+            if isinstance(recv_req, MultiTokenizerWarpper):
+                worker_id = recv_req.worker_id
+                recv_req = recv_req.obj
+                output = self._request_dispatcher(recv_req)
+                if output is not None:
+                    output = MultiTokenizerWarpper(worker_id, output)
+                    self.send_to_tokenizer.send_pyobj(output)
+                continue
+
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if isinstance(output, RpcReqOutput):
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
                 else:
-                    if recv_req.rids is not None:
-                        output.rids = recv_req.rids
                     self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(

@@ -114,6 +114,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    MultiTokenizerWarpper,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -1282,6 +1283,8 @@ class TokenizerManager:
         elif obj.session_id in self.session_futures:
             return None
 
+        if self.server_args.tokenizer_worker_num > 1:
+            obj = MultiTokenizerWarpper(self.worker_id, obj)
         self.send_to_scheduler.send_pyobj(obj)
 
         self.session_futures[obj.session_id] = asyncio.Future()
@@ -2109,13 +2112,14 @@ class _Communicator(Generic[T]):
 
         if obj:
             if _Communicator.enable_multi_tokenizer:
-                if obj.rids is None:
-                    obj.rids = f"{os.getpid()}_{uuid.uuid4().hex}_Communicator"
-                else:
-                    if isinstance(obj.rids, str):
-                        obj.rids = f"{os.getpid()}_{obj.rids}"
-                    elif isinstance(obj.rids, list):
-                        obj.rids = [f"{os.getpid()}_{rid}" for rid in obj.rids]
+                # if obj.rids is None:
+                #     obj.rids = f"{os.getpid()}_{uuid.uuid4().hex}_Communicator"
+                # else:
+                #     if isinstance(obj.rids, str):
+                #         obj.rids = f"{os.getpid()}_{obj.rids}"
+                #     elif isinstance(obj.rids, list):
+                #         obj.rids = [f"{os.getpid()}_{rid}" for rid in obj.rids]
+                obj = MultiTokenizerWarpper(worker_id=os.getpid(),obj=obj)
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
@@ -2132,16 +2136,16 @@ class _Communicator(Generic[T]):
     def handle_recv(self, recv_obj: T):
         if _Communicator.enable_multi_tokenizer:
             # If rids is a string and not empty, remove the prefix
-            if (
-                hasattr(recv_obj, "rids")
-                and isinstance(recv_obj.rids, str)
-                and recv_obj.rids
-            ):
-                recv_obj.rids = get_origin_rid(recv_obj.rids)
-            # If rids is a list, remove prefix from each element
-            elif hasattr(recv_obj, "rids") and isinstance(recv_obj.rids, list):
-                recv_obj.rids = [get_origin_rid(rid) for rid in recv_obj.rids]
-
+            # if (
+            #     hasattr(recv_obj, "rids")
+            #     and isinstance(recv_obj.rids, str)
+            #     and recv_obj.rids
+            # ):
+            #     recv_obj.rids = get_origin_rid(recv_obj.rids)
+            # # If rids is a list, remove prefix from each element
+            # elif hasattr(recv_obj, "rids") and isinstance(recv_obj.rids, list):
+            #     recv_obj.rids = [get_origin_rid(rid) for rid in recv_obj.rids]
+            pass
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()

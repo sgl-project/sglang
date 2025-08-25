@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
     MultiTokenizerRegisterReq,
+    MultiTokenizerWarpper,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager, _Communicator
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -385,9 +386,14 @@ class MultiTokenizerRouter(MultiTokenizerMixin):
 
     async def _distribute_result_to_workers(self, recv_obj):
         """Distribute result to corresponding workers based on rid"""
-        worker_ids = get_workerids_from_rids(recv_obj.rids)
+        if isinstance(recv_obj, MultiTokenizerWarpper):
+            worker_ids = [recv_obj.worker_id]
+            recv_obj = recv_obj.obj
+        else:
+            worker_ids = get_workerids_from_rids(recv_obj.rids)
+
         if len(worker_ids) == 0:
-            self._result_dispatcher(recv_obj)
+            logger.error(f"Cannot find worker_id from rids {recv_obj.rids}")
             return
 
         # Distribute result to each worker
@@ -442,7 +448,7 @@ class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
         """Register this worker to the main TokenizerManager"""
         # create a handle loop to receive messages from the main TokenizerManager
         self.auto_create_handle_loop()
-        req = MultiTokenizerRegisterReq(rids=["register_multitokenizer"])
+        req = MultiTokenizerRegisterReq(rids=[f"{self.worker_id}_register"])
         req.ipc_name = self.tokenizer_ipc_name
         _Communicator.enable_multi_tokenizer = True
         await self.register_multi_tokenizer_communicator(req)
