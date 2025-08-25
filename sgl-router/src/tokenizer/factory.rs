@@ -13,7 +13,9 @@ use super::huggingface::HuggingFaceTokenizer;
 pub enum TokenizerType {
     HuggingFace(String),
     Mock,
-    // Future: SentencePiece, GGUF, Tiktoken
+    #[cfg(feature = "tiktoken")]
+    Tiktoken(String),
+    // Future: SentencePiece, GGUF
 }
 
 /// Create a tokenizer from a file path to a tokenizer file.
@@ -22,6 +24,14 @@ pub enum TokenizerType {
 /// - json: HuggingFace tokenizer
 /// - For testing: can return mock tokenizer
 pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
+    create_tokenizer_with_chat_template(file_path, None)
+}
+
+/// Create a tokenizer from a file path with an optional chat template
+pub fn create_tokenizer_with_chat_template(
+    file_path: &str,
+    chat_template_path: Option<&str>,
+) -> Result<Arc<dyn traits::Tokenizer>> {
     // Special case for testing
     if file_path == "mock" || file_path == "test" {
         return Ok(Arc::new(super::mock::MockTokenizer::new()));
@@ -40,12 +50,16 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tok
         .and_then(std::ffi::OsStr::to_str)
         .map(|s| s.to_lowercase());
 
-    match extension.as_deref() {
+    let result = match extension.as_deref() {
         Some("json") => {
             #[cfg(feature = "huggingface")]
             {
-                let tokenizer = HuggingFaceTokenizer::from_file(file_path)?;
-                Ok(Arc::new(tokenizer))
+                let tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
+                    file_path,
+                    chat_template_path,
+                )?;
+
+                Ok(Arc::new(tokenizer) as Arc<dyn traits::Tokenizer>)
             }
             #[cfg(not(feature = "huggingface"))]
             {
@@ -66,7 +80,9 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tok
             // Try to auto-detect by reading file content
             auto_detect_tokenizer(file_path)
         }
-    }
+    };
+
+    result
 }
 
 /// Auto-detect tokenizer type by examining file content
@@ -144,6 +160,21 @@ pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<dyn traits::Toke
     let path = Path::new(model_name_or_path);
     if path.exists() {
         return create_tokenizer_from_file(model_name_or_path);
+    }
+
+    // Check if it's a GPT model name that should use Tiktoken
+    #[cfg(feature = "tiktoken")]
+    {
+        if model_name_or_path.contains("gpt-")
+            || model_name_or_path.contains("davinci")
+            || model_name_or_path.contains("curie")
+            || model_name_or_path.contains("babbage")
+            || model_name_or_path.contains("ada")
+        {
+            use super::tiktoken::TiktokenTokenizer;
+            let tokenizer = TiktokenTokenizer::from_model_name(model_name_or_path)?;
+            return Ok(Arc::new(tokenizer));
+        }
     }
 
     // Otherwise, try to load from HuggingFace Hub
@@ -224,5 +255,19 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("File not found"));
         }
+    }
+
+    #[cfg(feature = "tiktoken")]
+    #[test]
+    fn test_create_tiktoken_tokenizer() {
+        // Test creating tokenizer for GPT models
+        let tokenizer = create_tokenizer("gpt-4").unwrap();
+        assert!(tokenizer.vocab_size() > 0);
+
+        // Test encoding and decoding
+        let text = "Hello, world!";
+        let encoding = tokenizer.encode(text).unwrap();
+        let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
+        assert_eq!(decoded, text);
     }
 }
