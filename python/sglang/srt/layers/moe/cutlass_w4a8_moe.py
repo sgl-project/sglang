@@ -19,7 +19,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     pre_reorder_triton_kernel_for_cutlass_moe,
     run_cutlass_moe_ep_preproess,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +142,7 @@ def cutlass_w4a8_moe(
             k,
             BLOCK_SIZE=512,
         )
-    elif deepep_mode == DeepEPMode.NORMAL:
+    elif  deepep_mode.is_deepep_normal() :
         reorder_topk_ids, src2dst, _ = deepep_run_moe_deep_preprocess(
             topk_ids_, num_experts
         )
@@ -252,7 +251,7 @@ def cutlass_w4a8_moe(
             0,
             BLOCK_SIZE=512,
         )
-    elif deepep_mode == DeepEPMode.NORMAL:
+    elif deepep_mode.is_deepep_normal() :
         num_tokens = src2dst.shape[0] // topk
         output = torch.empty(
             (num_tokens, c2.shape[1]),
