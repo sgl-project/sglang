@@ -407,7 +407,7 @@ class DeepEPMoE(EPMoE):
                 self.w13_weight,
                 (
                     self.w13_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or get_moe_runner_backend().is_cutlass_w4afp8()
                     else self.w13_weight_scale
                 ),
             )
@@ -415,7 +415,7 @@ class DeepEPMoE(EPMoE):
                 self.w2_weight,
                 (
                     self.w2_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or get_moe_runner_backend().is_cutlass_w4afp8()
                     else self.w2_weight_scale
                 ),
             )
@@ -466,13 +466,52 @@ class DeepEPMoE(EPMoE):
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
-        elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+        elif dispatch_output.format.is_deepep_ll():
+            if get_moe_runner_backend().is_cutlass_w4afp8():
+                return self.forward_cutlass_w4a8_masked(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
             raise ValueError(
                 f"Dispatch output format {dispatch_output.format} is not supported"
             )
+
+    def forward_cutlass_w4a8_masked(
+        self,
+        dispatch_output: DeepEPLLOutput,
+    ):
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+
+        hidden_states, _, _, masked_m, _ = dispatch_output
+        output = cutlass_w4a8_moe(
+            self.start_expert_id,
+            self.end_expert_id,
+            self.num_experts,
+            hidden_states,
+            self.w13_weight,
+            self.w2_weight,
+            self.w13_weight_scale_inv,
+            self.w2_weight_scale_inv,
+            None,
+            None,
+            masked_m,
+            self.quant_method.a_strides1,
+            self.quant_method.b_strides1,
+            self.quant_method.c_strides1,
+            self.quant_method.a_strides2,
+            self.quant_method.b_strides2,
+            self.quant_method.c_strides2,
+            self.quant_method.s_strides13,
+            self.quant_method.s_strides2,
+            self.quant_method.expert_offsets,
+            self.quant_method.problem_sizes1,
+            self.quant_method.problem_sizes2,
+            self.w13_input_scale,
+            self.w2_input_scale,
+            deepep_mode=dispatch_output.format,
+        )
+
+        return output
 
     def combine(
         self,

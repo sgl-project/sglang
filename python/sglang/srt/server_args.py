@@ -1494,6 +1494,7 @@ class ServerArgs:
                 "flashinfer_trtllm",
                 "flashinfer_cutlass",
                 "flashinfer_mxfp4",
+                "cutlass_w4afp8",
             ],
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
