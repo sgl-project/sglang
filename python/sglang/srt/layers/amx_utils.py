@@ -6,9 +6,16 @@ from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-import os
+from enum import IntEnum
 
 SGLANG_USE_CPU_INT4_W4A8 = get_bool_env_var("SGLANG_USE_CPU_INT4_W4A8")
+
+
+class CPUMoECompMethod(IntEnum):
+    BF16_GEMM = 0
+    INT8_W8A8_GEMM = 1
+    FP8_W8A16_GEMM = 2
+    INT4_W8A16_GEMM = 3
 
 
 def amx_process_weight_after_loading(weight):
@@ -81,10 +88,8 @@ def _amx_process_weight_after_loading(
         has_prefix = len(prefix_list) != 1
         # TODO: support MoE layers for W4A8 path
         use_w4a8 = SGLANG_USE_CPU_INT4_W4A8 and not has_prefix
-        qweight, qzeros, scales, compensation = (
-            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                qweight, qzeros, scales, use_w4a8
-            )
+        qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+            qweight, qzeros, scales, use_w4a8
         )
         packed_qweight = torch.nn.Parameter(
             qweight,
@@ -104,7 +109,6 @@ def _amx_process_weight_after_loading(
         setattr(module, weight_names[0], packed_qweight)
         setattr(module, weight_names[1], packed_qzeros)
         setattr(module, weight_names[2], packed_scales)
-
     if (
         module.use_intel_amx_backend
         and hasattr(module, "bias")

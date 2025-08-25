@@ -65,6 +65,7 @@ elif _is_hip:
 elif _is_cpu and _is_cpu_amx_available:
     from sglang.srt.layers.amx_utils import (
         SGLANG_USE_CPU_INT4_W4A8,
+        CPUMoECompMethod,
         _amx_process_weight_after_loading,
     )
 else:
@@ -428,20 +429,14 @@ class AWQLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if use_intel_amx_backend(layer):
-            if SGLANG_USE_CPU_INT4_W4A8:
-                return torch.ops.sgl_kernel.int4_scaled_mm_cpu_with_quant(
-                    x,
-                    layer.qweight,
-                    layer.scales,
-                    layer.qzeros,
-                    layer.compensation,
-                    bias,
-                    x.dtype,
-                )
-            else:
-                return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
-                    x, layer.qweight, layer.qzeros, layer.scales, bias
-                )
+            return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+                x,
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                bias,
+                SGLANG_USE_CPU_INT4_W4A8,
+            )
 
         qweight = layer.qweight
         scales = layer.scales
@@ -808,9 +803,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
                 topk_weights,
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
-                False,  # use_int8_w8a8
-                False,  # use_fp8_w8a16
-                True,  # use_int4_w4a16
+                CPUMoECompMethod.INT4_W8A16_GEMM,
                 layer.w13_scales,  # w1_scale
                 layer.w2_scales,  # w2_scale
                 layer.w13_qzeros,

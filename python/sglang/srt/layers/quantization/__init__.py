@@ -103,6 +103,14 @@ VLLM_QUANTIZATION_METHODS = {
     "gptq": GPTQConfig,
 }
 
+# subset of above quant methods, supported on CPU
+CPU_QUANTIZATIPON_METHODS = {
+    "fp8": Fp8Config,
+    "w8a8_int8": W8A8Int8Config,
+    "compressed-tensors": CompressedTensorsConfig,
+    "awq": AWQConfig,
+}
+
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS, **VLLM_QUANTIZATION_METHODS}
 
 
@@ -115,12 +123,16 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
 
     from sglang.srt.utils import is_cpu
 
-    # for CPU quantization, will not need vLLM dependency
-    if (
-        not is_cpu()
-        and quantization in VLLM_QUANTIZATION_METHODS
-        and not VLLM_AVAILABLE
-    ):
+    if is_cpu():
+        if quantization not in CPU_QUANTIZATIPON_METHODS:
+            raise ValueError(
+                f"Invalid quantization method on CPU: {quantization}. "
+                f"Available methods on CPU: {list(QUANTIZATION_METHODS.keys())}"
+            )
+        else:
+            return CPU_QUANTIZATIPON_METHODS[quantization]
+
+    if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
             "Please install vllm by `pip install vllm==0.9.0.1`"
