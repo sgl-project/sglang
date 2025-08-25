@@ -907,6 +907,7 @@ class ServerArgs:
                 "qoq",
                 "w4afp8",
                 "mxfp4",
+                "auto-round"
             ],
             help="The quantization method.",
         )
