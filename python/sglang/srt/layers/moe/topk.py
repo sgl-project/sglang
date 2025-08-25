@@ -469,20 +469,31 @@ def grouped_topk_gpu(
         sorted=(True if num_fused_shared_experts > 0 else False),
     )
     if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
+        assert (
+            topk >= num_fused_shared_experts
+        ), "topk must be >= num_fused_shared_experts"
+        # Assign the last N ids to all shared expert ids [num_experts, num_experts+N)
+        shared_ids = torch.arange(
+            num_experts,
+            num_experts + num_fused_shared_experts,
             device=topk_ids.device,
+            dtype=topk_ids.dtype,
         )
-        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+        topk_ids[:, -num_fused_shared_experts:] = shared_ids.unsqueeze(0).expand(
+            topk_ids.size(0), -1
+        )
+        # Set each shared expert's weight to sum(real_experts)/routed_scaling_factor
+        real_sum = topk_weights[:, :-num_fused_shared_experts].sum(dim=-1)
+        shared_weight = real_sum / routed_scaling_factor
+        topk_weights[:, -num_fused_shared_experts:] = shared_weight.unsqueeze(
+            -1
+        ).expand(-1, num_fused_shared_experts)
 
     if renormalize:
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-num_fused_shared_experts].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
         if apply_routed_scaling_factor_on_output:
@@ -571,20 +582,31 @@ def biased_grouped_topk_impl(
     topk_weights = scores.gather(1, topk_ids)
 
     if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
+        assert (
+            topk >= num_fused_shared_experts
+        ), "topk must be >= num_fused_shared_experts"
+        # Assign the last N ids to all shared expert ids [num_experts, num_experts+N)
+        shared_ids = torch.arange(
+            num_experts,
+            num_experts + num_fused_shared_experts,
             device=topk_ids.device,
+            dtype=topk_ids.dtype,
         )
-        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+        topk_ids[:, -num_fused_shared_experts:] = shared_ids.unsqueeze(0).expand(
+            topk_ids.size(0), -1
+        )
+        # Set each shared expert's weight to sum(real_experts)/routed_scaling_factor
+        real_sum = topk_weights[:, :-num_fused_shared_experts].sum(dim=-1)
+        shared_weight = real_sum / routed_scaling_factor
+        topk_weights[:, -num_fused_shared_experts:] = shared_weight.unsqueeze(
+            -1
+        ).expand(-1, num_fused_shared_experts)
 
     if renormalize:
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-num_fused_shared_experts].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
         if apply_routed_scaling_factor_on_output:
@@ -640,8 +662,10 @@ def biased_grouped_topk_gpu(
     if (
         _is_cuda
         and gating_output.shape[1] // num_expert_group
-        <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
-        and is_power_of_two(correction_bias.shape[0])
+        <= 512  # moe_fused_gate kernel now supports MAX_VPT up to 512, including Kimi K2's 384 experts
+        and (
+            is_power_of_two(correction_bias.shape[0]) or correction_bias.shape[0] == 384
+        )  # Kimi K2 has 384 experts
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),

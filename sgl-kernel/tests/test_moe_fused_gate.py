@@ -2,7 +2,7 @@ import pytest
 import torch
 from sgl_kernel import moe_fused_gate
 
-from sglang.srt.layers.moe.topk import biased_grouped_topk
+from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
 
 
 @pytest.mark.parametrize(
@@ -16,6 +16,12 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
         (128, 4, 2, 4),
         (256, 8, 4, 8),  # deepseek v3
         (512, 16, 8, 16),
+        # VPT > 32 cases to exercise tiled kernel path
+        (1024, 8, 4, 8),  # VPT = 128
+        (2048, 8, 4, 8),  # VPT = 256
+        # Kimi series
+        (64, 1, 1, 6),  # kimi-vl: VPT = 64
+        (384, 1, 1, 8),  # kimi-K2: VPT = 384 (special-case allowed)
     ],
 )
 @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
@@ -42,7 +48,7 @@ def test_moe_fused_gate_combined(
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
     )
-    ref_output, ref_indices = biased_grouped_topk(
+    ref_output, ref_indices = biased_grouped_topk_impl(
         scores,
         scores,
         bias,
