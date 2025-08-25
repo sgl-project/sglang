@@ -42,7 +42,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    convert_hf_attention_backend_to_sgl_attention_backend,
+)
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -124,27 +127,9 @@ class Qwen2_5_VisionBlock(nn.Module):
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = Qwen2RMSNorm(dim, eps=1e-6)
         self.norm2 = Qwen2RMSNorm(dim, eps=1e-6)
-
-        if attn_implementation is None:
-            softmax_in_single_precision = False
-            qkv_backend = None
-            flatten_batch = True
-        elif attn_implementation == "sdpa":
-            softmax_in_single_precision = False
-            qkv_backend = "sdpa"
-            flatten_batch = True
-        elif attn_implementation == "flash_attention_2":
-            softmax_in_single_precision = False
-            qkv_backend = "triton_attn"
-            flatten_batch = True
-        elif attn_implementation == "eager":
-            softmax_in_single_precision = True
-            qkv_backend = "sdpa"
-            flatten_batch = True
-        elif attn_implementation == "flash_attention_3":
-            softmax_in_single_precision = False
-            qkv_backend = "fa3"
-            flatten_batch = True
+        qkv_backend = convert_hf_attention_backend_to_sgl_attention_backend(
+            attn_implementation
+        )
 
         self.attn = VisionAttention(
             embed_dim=dim,
@@ -154,8 +139,9 @@ class Qwen2_5_VisionBlock(nn.Module):
             rotary_embed="normal",
             proj_bias=True,
             qkv_backend=qkv_backend,
-            softmax_in_single_precision=softmax_in_single_precision,
-            flatten_batch=flatten_batch,
+            softmax_in_single_precision=False,
+            # handled by cu_seq_lens
+            flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
@@ -173,6 +159,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        max_seqlen: int,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -180,6 +167,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            max_seqlen=max_seqlen,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -408,23 +396,40 @@ class Qwen2_5_VisionTransformer(nn.Module):
         position_embeddings = (emb.cos(), emb.sin())
 
         # compute cu_seqlens
-        cu_seqlens = torch.cat(
-            [
-                torch.tensor([0], device=grid_thw.device),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
-            ]
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(
+            dim=0,
+            dtype=torch.int32,
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
-        # transformers
+        # pre-compute max seqlens for different attention windows
+        if cu_window_seqlens.numel() >= 2:
+            max_seqlen_window = (
+                (cu_window_seqlens[1:] - cu_window_seqlens[:-1]).max().item()
+            )
+        else:
+            max_seqlen_window = 0
+        if cu_seqlens.numel() >= 2:
+            max_seqlen_full = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        else:
+            max_seqlen_full = 0
+
+        # flattened
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
+                max_seqlen_now = max_seqlen_full
             else:
                 cu_seqlens_now = cu_window_seqlens
+                max_seqlen_now = max_seqlen_window
             x = blk(
-                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+                x,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+                max_seqlen=max_seqlen_now,
             )
 
         # adapter
