@@ -1,3 +1,5 @@
+from sglang.srt.utils import get_int_env_var
+
 """For Now, MSCCL is only supported on TP16 and TP8 case
 
 if [[ $RANK -eq 0  ]]; then
@@ -88,7 +90,7 @@ class TestMSCCLAllReduce(CustomTestCase):
         # 1KB to 1MB
         cls.test_sizes = [512, 4096, 32768, 262144, 524288]
         cls.world_sizes = [8]
-        TEST_TP16 = int(os.getenv("SGL_MSCCLPP_TEST_TP16", "0"))
+        TEST_TP16 = get_int_env_var("SGL_MSCCLPP_TEST_TP16", 0)
         if TEST_TP16:
             cls.world_sizes = [16]
         cls.test_loop = 10

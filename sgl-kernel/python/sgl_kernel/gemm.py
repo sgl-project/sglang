@@ -4,6 +4,8 @@ import torch
 from sgl_kernel.scalar_type import ScalarType
 from sgl_kernel.utils import _get_cache_buf, get_cuda_stream
 
+from sglang.srt.utils import get_int_env_var
+
 
 def awq_dequantize(
     qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
@@ -466,7 +468,7 @@ def scaled_fp4_experts_quant(
     # larger models.
     import os
 
-    MAX_TOKENS_PER_EXPERT = os.environ.get("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536)
+    MAX_TOKENS_PER_EXPERT = get_int_env_var("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536)
     assert m_numtopk <= MAX_TOKENS_PER_EXPERT * topk, (
         f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT("
         f"{MAX_TOKENS_PER_EXPERT})"
