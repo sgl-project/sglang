@@ -45,6 +45,7 @@ class BenchArgs:
     skip_warmup: bool = False
     show_report: bool = False
     profile: bool = False
+    profile_steps: int = 3
     profile_by_stage: bool = False
 
     @staticmethod
@@ -78,6 +79,9 @@ class BenchArgs:
         parser.add_argument("--skip-warmup", action="store_true")
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
+        parser.add_argument(
+            "--profile-steps", type=int, default=BenchArgs.profile_steps
+        )
         parser.add_argument("--profile-by-stage", action="store_true")
 
     @classmethod
@@ -132,6 +136,7 @@ def run_one_case(
     result_filename: str,
     tokenizer,
     profile: bool = False,
+    profile_steps: int = 3,
     profile_by_stage: bool = False,
 ):
     requests.post(url + "/flush_cache")
@@ -162,7 +167,7 @@ def run_one_case(
     profile_link = None
     if profile:
         profile_link: str = run_profile(
-            url, 3, ["CPU", "GPU"], None, None, profile_by_stage
+            url, profile_steps, ["CPU", "GPU"], None, None, profile_by_stage
         )
 
     tic = time.perf_counter()
@@ -321,6 +326,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 result_filename=bench_args.result_filename,
                                 tokenizer=tokenizer,
                                 profile=bench_args.profile,
+                                profile_steps=bench_args.profile_steps,
                                 profile_by_stage=bench_args.profile_by_stage,
                             )[-1],
                         )
