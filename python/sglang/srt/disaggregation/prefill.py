@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
+    maybe_wrap_ipv6_address,
     point_to_point_pyobj,
     require_mlp_sync,
 )
@@ -162,7 +163,7 @@ class PrefillBootstrapQueue:
 
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            bootstrap_addr=f"{maybe_wrap_ipv6_address(req.bootstrap_host)}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
