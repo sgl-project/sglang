@@ -54,14 +54,13 @@ class DecodeMetadata:
 @dataclass
 class PrefillMetadata:
     prefill_wrapper: BatchMLAPagedAttentionWrapper
-    use_ragged: bool
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
 
-class FlashInferMhaChunkKVRunner:
+class FlashInferMhaRaggedRunner:
     def __init__(
         self, model_runner: ModelRunner, attn_backend: "FlashInferMlaAttnBackend"
     ):
@@ -78,10 +77,15 @@ class FlashInferMhaChunkKVRunner:
         # Buffers and wrappers
         self.qo_indptr = attn_backend.qo_indptr
         self.workspace_buffer = attn_backend.workspace_buffer
-        self.fmha_backend = attn_backend.fmha_backend
+
+        self.fmha_backend = "auto"
+        if is_sm100_supported():
+            self.fmha_backend = "cutlass"
 
         self.chunk_ragged_wrappers = []
-        self.ragged_wrapper = attn_backend.prefill_wrapper_ragged
+        self.ragged_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer, "NHD", backend=self.fmha_backend
+        )
 
     def update_prefix_chunks(self, num_prefix_chunks: int):
         while num_prefix_chunks > len(self.chunk_ragged_wrappers):
@@ -149,7 +153,7 @@ class FlashInferMhaChunkKVRunner:
             chunk_idx = forward_batch.prefix_chunk_idx
             assert chunk_idx >= 0
             wrapper = self.chunk_ragged_wrappers[chunk_idx]
-            o1, s1 = wrapper.forward_return_lse(
+            o = wrapper.forward_return_lse(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
@@ -158,7 +162,12 @@ class FlashInferMhaChunkKVRunner:
                 logits_soft_cap=logits_soft_cap,
             )
         else:
-            o1, s1 = self.ragged_wrapper.forward_return_lse(
+            forward = (
+                self.ragged_wrapper.forward_return_lse
+                if forward_batch.mha_return_lse
+                else self.ragged_wrapper.forward
+            )
+            o = forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
@@ -166,8 +175,7 @@ class FlashInferMhaChunkKVRunner:
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
-
-        return o1, s1
+        return o
 
 
 class FlashInferMLAAttnBackend(AttentionBackend):
@@ -186,12 +194,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
-        self.enable_chunk_kv = (
-            not skip_prefill
-            and global_server_args_dict["disaggregation_mode"] != "decode"
-            and not global_server_args_dict["disable_chunked_prefix_cache"]
-            and not global_server_args_dict["flashinfer_mla_disable_ragged"]
-        )
         self.page_size = model_runner.page_size
 
         # Allocate buffers
@@ -225,13 +227,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        self.fmha_backend = "auto"
-        if is_sm100_supported():
-            self.fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=self.fmha_backend
-        )
-
         if not self.skip_prefill:
             self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
@@ -253,8 +248,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.indices_updater_prefill = FlashInferMLAIndicesUpdaterPrefill(
                 model_runner, self
             )
-            if self.enable_chunk_kv:
-                self.mha_chunk_kv_cache = FlashInferMhaChunkKVRunner(model_runner, self)
+            self.mha_ragged_runner = FlashInferMhaRaggedRunner(model_runner, self)
 
         self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
             model_runner, self
@@ -264,6 +258,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
+        self.flashinfer_mla_disable_ragged = global_server_args_dict[
+            "flashinfer_mla_disable_ragged"
+        ]
+
+    def is_mha_chunk_supported(self):
+        return not self.flashinfer_mla_disable_ragged
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -282,10 +282,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=False,
                 spec_info=forward_batch.spec_info,
             )
-            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged, False)
+            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -293,29 +292,23 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrapper_paged=self.prefill_wrapper_verify,
-                use_ragged=False,
                 spec_info=forward_batch.spec_info,
             )
-            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify, False)
+            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify)
         else:
-            prefix_lens = forward_batch.extend_prefix_lens
-            extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-            use_ragged = (
-                not global_server_args_dict["flashinfer_mla_disable_ragged"]
-                and extend_no_prefix
-            )
-
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                prefix_lens,
-                prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=use_ragged,
-            )
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrapper_paged, use_ragged
-            )
+            if forward_batch.num_prefix_chunks is not None:
+                self.mha_ragged_runner.update_wrapper(forward_batch)
+            else:
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_sum,
+                    forward_batch.extend_prefix_lens,
+                    prefill_wrapper_paged=self.prefill_wrapper_paged,
+                )
+                self.forward_metadata = PrefillMetadata(
+                    self.prefill_wrapper_paged,
+                )
 
     def init_cuda_graph_state(
         self,
@@ -398,11 +391,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrapper_paged=verify_wrapper,
-                use_ragged=False,
                 spec_info=spec_info,
             )
             self.prefill_cuda_graph_metadata[bs] = verify_wrapper
-            self.forward_metadata = PrefillMetadata(verify_wrapper, False)
+            self.forward_metadata = PrefillMetadata(verify_wrapper)
         elif forward_mode.is_draft_extend():
             draft_extend_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
@@ -420,11 +412,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrapper_paged=draft_extend_wrapper,
-                use_ragged=False,
                 spec_info=spec_info,
             )
             self.prefill_cuda_graph_metadata[bs] = draft_extend_wrapper
-            self.forward_metadata = PrefillMetadata(draft_extend_wrapper, False)
+            self.forward_metadata = PrefillMetadata(draft_extend_wrapper)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -469,7 +460,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=False,
                 spec_info=spec_info,
             )
         elif forward_mode.is_draft_extend():
@@ -479,7 +469,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=False,
                 spec_info=spec_info,
             )
         else:
@@ -487,10 +476,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
-
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
-        self.mha_chunk_kv_cache.update_wrapper(forward_batch)
 
     def forward_extend(
         self,
@@ -503,18 +488,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if (
-            forward_batch.attn_attend_prefix_cache is not None
-            and forward_batch.mha_return_lse
-        ):  # MHA Chunk
-            assert self.enable_chunk_kv
+        if forward_batch.num_prefix_chunks is not None:
+            assert forward_batch.attn_attend_prefix_cache is not None
+            assert not forward_batch.forward_mode.is_target_verify()
+            assert not forward_batch.forward_mode.is_draft_extend()
             assert q_rope is None
             assert k_rope is None
-            o1, s1 = self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
-            return o1, s1
+            return self.mha_ragged_runner.forward(q, k, v, layer, forward_batch)
 
         cache_loc = forward_batch.out_cache_loc
-        logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
 
         # Save kv cache
@@ -532,41 +514,24 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-
-        if self.forward_metadata.use_ragged:
-            # ragged prefill
-            if q_rope is not None:
-                q = torch.cat([q, q_rope], dim=-1)
+        # mla paged prefill
+        k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+            q.dtype
+        )
+        if q_rope is None:
             qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-            if k_rope is not None:
-                k = torch.cat([k, k_rope], dim=-1)
-            o = self.prefill_wrapper_ragged.forward(
-                qall,
-                k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
+            q, q_rope = (
+                qall[:, :, : layer.v_head_dim],
+                qall[:, :, layer.v_head_dim :],
             )
-        else:
-            # mla paged prefill
-            k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
-            )
-            if q_rope is None:
-                qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-                q, q_rope = (
-                    qall[:, :, : layer.v_head_dim],
-                    qall[:, :, layer.v_head_dim :],
-                )
-            o = q.new_empty(q.shape)
-            o = prefill_wrapper_paged.run(
-                q,
-                q_rope,
-                k_buf[:, :, : layer.v_head_dim],
-                k_buf[:, :, layer.v_head_dim :],
-                out=o,
-            )
+        o = q.new_empty(q.shape)
+        o = prefill_wrapper_paged.run(
+            q,
+            q_rope,
+            k_buf[:, :, : layer.v_head_dim],
+            k_buf[:, :, layer.v_head_dim :],
+            out=o,
+        )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -759,7 +724,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.kv_indptr = attn_backend.kv_indptr
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
     def update(
         self,
@@ -768,18 +732,12 @@ class FlashInferMLAIndicesUpdaterPrefill:
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
-        use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
     ):
-        if use_ragged:
-            paged_kernel_lens = prefix_lens
-            paged_kernel_lens_sum = paged_kernel_lens.sum().item()
-        else:
-            paged_kernel_lens = seq_lens
-            paged_kernel_lens_sum = seq_lens_sum
+        paged_kernel_lens = seq_lens
+        paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
-            self.prefill_wrapper_ragged,
             prefill_wrapper_paged,
             req_pool_indices,
             paged_kernel_lens,
@@ -788,13 +746,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
             prefix_lens,
             self.kv_indptr,
             self.qo_indptr,
-            use_ragged,
             spec_info,
         )
 
     def call_begin_forward(
         self,
-        wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
         wrapper_paged: BatchMLAPagedAttentionWrapper,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
@@ -803,7 +759,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
-        use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
     ):
         bs = len(seq_lens)
@@ -843,36 +798,22 @@ class FlashInferMLAIndicesUpdaterPrefill:
                     self.req_to_token,
                 )
             )
-
-        if use_ragged:
-            # ragged prefill
-            wrapper_ragged.begin_forward(
-                qo_indptr=qo_indptr,
-                kv_indptr=qo_indptr,
-                num_qo_heads=self.num_local_heads,
-                num_kv_heads=self.num_local_heads,
-                head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
-                head_dim_vo=self.v_head_dim,
-                q_data_type=self.q_data_type,
-                causal=True,
-            )
-        else:
-            # mla paged prefill
-            kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
-            wrapper_paged.plan(
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_len_arr,
-                self.num_local_heads,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                1,
-                True,
-                sm_scale,
-                self.q_data_type,
-                self.data_type,
-            )
+        # mla paged prefill
+        kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+        wrapper_paged.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            self.num_local_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            1,
+            True,
+            sm_scale,
+            self.q_data_type,
+            self.data_type,
+        )
 
 
 class FlashInferMLAMultiStepDraftBackend:

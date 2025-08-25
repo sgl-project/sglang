@@ -223,7 +223,7 @@ class ForwardBatch:
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether the kv cache needs to be attended in current pass
     attn_attend_prefix_cache: Optional[bool] = None
-    # Number of prefix cache chunks
+    # Number of prefix cache chunks, None when mha chunk is disabled
     num_prefix_chunks: Optional[int] = None
     # Index of current chunk, used by attention backend
     prefix_chunk_idx: Optional[int] = None
@@ -816,6 +816,10 @@ class ForwardBatch:
         assert isinstance(
             self.token_to_kv_pool, MLATokenToKVPool
         ), "Currently chunked prefix cache can only be used by Deepseek models"
+
+        if not any(self.extend_prefix_lens_cpu):
+            self.num_prefix_chunks = 0
+            return
 
         if self.prefix_chunk_len is not None:
             # Chunked kv cache info already prepared by prior modules

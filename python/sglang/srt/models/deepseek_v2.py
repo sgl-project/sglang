@@ -893,23 +893,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
 
-        self.flashinfer_mla_disable_ragged = global_server_args_dict[
-            "flashinfer_mla_disable_ragged"
-        ]
-        self.disable_chunked_prefix_cache = global_server_args_dict[
-            "disable_chunked_prefix_cache"
-        ]
-
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
         )
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
-        )
-
-        # TODO: Design a finer way to determine the threshold
-        self.chunked_prefix_cache_threshold = get_int_env_var(
-            "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
         # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
@@ -1002,29 +990,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             or attention_backend == "trtllm_mla"
             or attention_backend == "cutlass_mla"
         ):
-            # Use MHA with chunked KV cache when prefilling on long sequences.
-            sum_extend_prefix_lens = (
-                sum(forward_batch.extend_prefix_lens_cpu)
-                if forward_batch.extend_prefix_lens_cpu is not None
-                else 0
-            )
-            # Flashinfer MLA: Do not absorb when enabling ragged prefill
-            disable_ragged = (
-                attention_backend == "flashinfer" or attention_backend == "flashmla"
-            ) and self.flashinfer_mla_disable_ragged
-            if (
-                not disable_ragged
-                and forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-                and (
-                    (
-                        sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
-                        and not self.disable_chunked_prefix_cache
-                    )
-                    or sum_extend_prefix_lens == 0
-                )
-            ):
+            if forward_batch.num_prefix_chunks is not None:
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return _dispatch_mla_subtype()
@@ -1716,12 +1682,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
-        # Only initialize the info once
-        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
-            forward_batch.prepare_chunked_prefix_cache_info(q.device)
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
-
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
