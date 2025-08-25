@@ -1137,6 +1137,7 @@ def parse_random_image_resolution(image_resolution: str) -> Tuple[int, int]:
     (e.g., '1080x1920' means height=1080, width=1920).
     """
     resolution_to_size = {
+        "4k": (3840, 2160),
         "1080p": (1920, 1080),
         "720p": (1280, 720),
         "360p": (640, 360),
@@ -1155,7 +1156,7 @@ def parse_random_image_resolution(image_resolution: str) -> Tuple[int, int]:
 
     raise ValueError(
         f"Unsupported random-image resolution: {image_resolution}. "
-        "Choose from 1080p, 720p, 360p, or provide custom 'heightxwidth' (e.g., 1080x1920)."
+        "Choose from 4k, 1080p, 720p, 360p, or provide custom 'heightxwidth' (e.g., 1080x1920)."
     )
 
 
@@ -1172,7 +1173,7 @@ def sample_random_image_requests(
     """Generate requests with random images.
 
     - Each request includes ``num_images`` random images.
-    - Supported resolutions: 1080p (1920x1080), 720p (1280x720), 360p (640x360),
+    - Supported resolutions: 4k (3840x2160), 1080p (1920x1080), 720p (1280x720), 360p (640x360),
       or custom 'heightxwidth' (e.g., 1080x1920).
     - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
       only counts text tokens and excludes image data.
@@ -2040,7 +2041,7 @@ if __name__ == "__main__":
         default="1080p",
         help=(
             "Resolution of random images for random-image dataset. "
-            "Supports presets 1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
+            "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
         ),
     )
     parser.add_argument(
