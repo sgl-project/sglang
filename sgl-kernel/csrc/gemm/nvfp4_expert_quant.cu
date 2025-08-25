@@ -408,12 +408,28 @@ cvt_fp16_to_fp4_expert(
 
   // Input tensor row/col loops.
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int threadsPerExpert = (gridDim.x * blockDim.x + n_experts - 1) / n_experts;
-  int tid_in_expert = tid % threadsPerExpert;
-  int expert_idx = tid / threadsPerExpert;
-  int remainder_bound = gridDim.x * blockDim.x / threadsPerExpert;
-  int remainder_stride = gridDim.x * blockDim.x % threadsPerExpert;
-  int stride = expert_idx < remainder_bound ? threadsPerExpert : remainder_stride;
+  int stride = (gridDim.x * blockDim.x) / n_experts;
+  int remainder = (gridDim.x * blockDim.x) % n_experts;
+  int expert_idx;
+  int tid_in_expert;
+  int actual_stride;
+  if (remainder > 0) {
+    int bound = remainder * (stride + 1);
+    if (tid < bound) {
+      expert_idx = tid / (stride + 1);
+      tid_in_expert = tid % (stride + 1);
+      actual_stride = stride + 1;
+    } else {
+      expert_idx = remainder + (tid - bound) / stride;
+      tid_in_expert = (tid - bound) % stride;
+      actual_stride = stride;
+    }
+  } else {
+    expert_idx = tid / stride;
+    tid_in_expert = tid % stride;
+    actual_stride = stride;
+  }
+
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
   // TODO(kaixih@nvidia): For now, we assume mask is used together with
   // silu_and_mal. Maybe we want a more general behavior of mask later. In the
@@ -424,13 +440,12 @@ cvt_fp16_to_fp4_expert(
   // Each global thread processes one element
   for (int globalIdx = tid_in_expert + input_offset_by_experts[expert_idx] * colsPerRow;
        globalIdx < input_offset_by_experts[expert_idx + 1] * colsPerRow;
-       globalIdx += stride) {
+       globalIdx += actual_stride) {
     // Calculate which row and column this global thread should process
     int rowIdx = globalIdx / colsPerRow;
     int colIdx = globalIdx % colsPerRow;
 
-    // Find index within the experts using different strategies based on expert
-    // count
+    // Find index within the experts
     int rowIdx_in_expert = rowIdx - input_offset_by_experts[expert_idx];
 
     // Eerly exit when using masks.
@@ -608,7 +623,8 @@ void quant_impl(
     block.x = (block.x + 1) / 2;
   }
 
-  if (mask != nullptr && block.x * grid.x >= n_experts) {
+  // TODO(kaixih@nvidia): Should relax this to allow any grid size.
+  if ((block.x * grid.x) % n_experts == 0) {
     cvt_fp16_to_fp4_expert<T, false><<<grid, block, 0, stream>>>(
         m_topk,
         k,
