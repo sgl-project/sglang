@@ -423,7 +423,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
             + global_server_args_dict["ep_num_redundant_experts"],
