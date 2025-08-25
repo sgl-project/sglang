@@ -23,9 +23,9 @@ def parse_memory_log(log_file):
         # 转换时间戳为datetime对象
         df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-        # 转换内存值为MB单位
-        df["memory_allocated_mb"] = df["memory_allocated"] / (1024 * 1024)
-        df["memory_reserved_mb"] = df["memory_reserved"] / (1024 * 1024)
+        # 内存值现在已经是MiB单位，直接使用
+        df["memory_allocated_mb"] = df["memory_allocated"]
+        df["memory_reserved_mb"] = df["memory_reserved"]
 
         return df
     except Exception as e:
@@ -55,7 +55,7 @@ def create_memory_plots(df, output_prefix=None):
         linewidth=2,
         label="Allocated Memory",
     )
-    ax1.set_ylabel("Memory Allocated (MB)", fontsize=12)
+    ax1.set_ylabel("Memory Allocated (MiB)", fontsize=12)
     ax1.grid(True, alpha=0.3)
     ax1.legend()
     ax1.set_title("GPU Memory Allocated Over Time")
@@ -68,7 +68,7 @@ def create_memory_plots(df, output_prefix=None):
         linewidth=2,
         label="Reserved Memory",
     )
-    ax2.set_ylabel("Memory Reserved (MB)", fontsize=12)
+    ax2.set_ylabel("Memory Reserved (MiB)", fontsize=12)
     ax2.grid(True, alpha=0.3)
     ax2.legend()
     ax2.set_title("GPU Memory Reserved Over Time")
@@ -94,7 +94,7 @@ def create_memory_plots(df, output_prefix=None):
         df["timestamp"], df["memory_allocated_mb"], alpha=0.3, color="blue"
     )
     ax3.fill_between(df["timestamp"], df["memory_reserved_mb"], alpha=0.3, color="red")
-    ax3.set_ylabel("Memory Usage (MB)", fontsize=12)
+    ax3.set_ylabel("Memory Usage (MiB)", fontsize=12)
     ax3.set_xlabel("Time", fontsize=12)
     ax3.grid(True, alpha=0.3)
     ax3.legend()
@@ -132,13 +132,13 @@ def print_memory_stats(df):
         f"监控时长: {(df['timestamp'].iloc[-1] - df['timestamp'].iloc[0]).total_seconds():.1f} 秒"
     )
 
-    print(f"\n分配内存 (MB):")
+    print(f"\n分配内存 (MiB):")
     print(f"  最小值: {df['memory_allocated_mb'].min():.2f}")
     print(f"  最大值: {df['memory_allocated_mb'].max():.2f}")
     print(f"  平均值: {df['memory_allocated_mb'].mean():.2f}")
     print(f"  标准差: {df['memory_allocated_mb'].std():.2f}")
 
-    print(f"\n保留内存 (MB):")
+    print(f"\n保留内存 (MiB):")
     print(f"  最小值: {df['memory_reserved_mb'].min():.2f}")
     print(f"  最大值: {df['memory_reserved_mb'].max():.2f}")
     print(f"  平均值: {df['memory_reserved_mb'].mean():.2f}")

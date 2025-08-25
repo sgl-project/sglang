@@ -812,8 +812,9 @@ class Scheduler(
                 not hasattr(self, "_last_memory_log_time")
                 or current_time - self._last_memory_log_time >= 1.0
             ):
-                gc.collect()
-                torch.cuda.empty_cache()
+                # gc.collect()
+                # torch.cuda.empty_cache()
+                print("not collecting and empty cache")
 
                 # 获取内存信息
                 memory_summary = torch.cuda.memory_summary(
@@ -822,16 +823,16 @@ class Scheduler(
                 memory_allocated = torch.cuda.memory_allocated()
                 memory_reserved = torch.cuda.memory_reserved()
 
-                # 转换为MB
-                memory_allocated_mb = memory_allocated / (1024 * 1024)
-                memory_reserved_mb = memory_reserved / (1024 * 1024)
+                # 转换为MiB (与memory_summary保持一致)
+                memory_allocated_mib = memory_allocated / (1024 * 1024)
+                memory_reserved_mib = memory_reserved / (1024 * 1024)
 
                 # 记录时间戳
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
                 # 写入日志文件
                 self._memory_log_file.write(
-                    f"{timestamp},\"{memory_summary.replace(',', ';')}\",{memory_allocated_mb:.2f},{memory_reserved_mb:.2f}\n"
+                    f"{timestamp},\"{memory_summary.replace(',', ';')}\",{memory_allocated_mib:.0f},{memory_reserved_mib:.0f}\n"
                 )
                 self._memory_log_file.flush()
 
@@ -839,8 +840,8 @@ class Scheduler(
                 self._last_memory_log_time = current_time
 
                 # 同时打印到控制台（可选）
-                print(f"[{timestamp}] Memory allocated: {memory_allocated_mb:.2f} MB")
-                print(f"[{timestamp}] Memory reserved: {memory_reserved_mb:.2f} MB")
+                print(f"[{timestamp}] Memory allocated: {memory_allocated_mib:.0f} MiB")
+                print(f"[{timestamp}] Memory reserved: {memory_reserved_mib:.0f} MiB")
 
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
