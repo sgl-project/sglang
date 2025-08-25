@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -2119,7 +2121,7 @@ class FlashAttentionBackend(AttentionBackend):
         self,
         metadata: FlashAttentionMetadata,
         metadata_expand: FlashAttentionMetadata,
-        metadata_swa: FlashAttentionMetadata = None,
+        metadata_swa: Optional[FlashAttentionMetadata] = None,
     ):
         # TODO: support page_size > 1 for swa spec
         assert (
@@ -2136,18 +2138,22 @@ class FlashAttentionBackend(AttentionBackend):
             torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
         )
         bs = cache_seqlens_int32.shape[0]
-        page_table = metadata.page_table.new_zeros(
-            (bs, metadata.max_seq_len_k + metadata_expand.page_table.shape[1])
+        page_table = (
+            metadata.page_table.new_zeros(
+                (bs, metadata.max_seq_len_k + metadata_expand.page_table.shape[1])
+            )
+            if metadata_swa is None
+            else metadata_swa.page_table
         )
 
-        for i in range(bs):
-            idx = i // self.speculative_num_draft_tokens
-            seq_len = metadata.cache_seqlens_int32[idx]
-            seq_len_expand = metadata_expand.cache_seqlens_int32[i]
-            page_table[i][:seq_len] = metadata.page_table[idx][:seq_len]
-            page_table[i][seq_len : seq_len + seq_len_expand] = (
-                metadata_expand.page_table[i][:seq_len_expand]
-            )
+        prepare_swa_spec_page_table_triton(
+            page_table,
+            metadata.page_table,
+            metadata_expand.page_table,
+            metadata.cache_seqlens_int32,
+            metadata_expand.cache_seqlens_int32,
+            self.speculative_num_draft_tokens,
+        )
 
         if metadata_swa is None:
             metadata_swa = FlashAttentionMetadata()
@@ -2159,9 +2165,97 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             metadata_swa.cache_seqlens_int32.copy_(cache_seqlens_int32)
             metadata_swa.cu_seqlens_k.copy_(cu_seqlens_k)
-            metadata_swa.page_table[:, : page_table.shape[1]].copy_(page_table)
 
         metadata.swa_spec_metadata = metadata_swa
+
+
+@triton.jit
+def _prepare_swa_spec_page_table_kernel(
+    dst_ptr,
+    src_a_ptr,
+    src_b_ptr,
+    seq_len_a_ptr,
+    seq_len_b_ptr,
+    dst_stride_m,
+    dst_stride_n,
+    a_stride_m,
+    a_stride_n,
+    b_stride_m,
+    b_stride_n,
+    LEN_A: tl.constexpr,
+    LEN_B: tl.constexpr,
+    LEN_OUT: tl.constexpr,
+    REPEAT_STEP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    idx_a = pid_m // REPEAT_STEP
+    idx_b = pid_m
+    seq_len_a = tl.load(seq_len_a_ptr + idx_a)
+    seq_len_b = tl.load(seq_len_b_ptr + idx_b)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    in_bounds_out = offs_n < LEN_OUT
+
+    in_a = offs_n < seq_len_a
+    in_b = (offs_n >= seq_len_a) & (offs_n < seq_len_a + seq_len_b)
+    offs_b = offs_n - seq_len_a
+
+    a_ptr = src_a_ptr + idx_a * a_stride_m + offs_n * a_stride_n
+    b_ptr = src_b_ptr + idx_b * b_stride_m + offs_b * b_stride_n
+    dst = dst_ptr + pid_m * dst_stride_m + offs_n * dst_stride_n
+
+    a_mask = in_a & (offs_n < LEN_A)
+    b_mask = in_b & (offs_b < LEN_B)
+
+    a_val = tl.load(a_ptr, mask=a_mask, other=0)
+    b_val = tl.load(b_ptr, mask=b_mask, other=0)
+
+    out_val = tl.where(in_a, a_val, tl.where(in_b, b_val, 0))
+    tl.store(dst, out_val, mask=in_bounds_out)
+
+
+def prepare_swa_spec_page_table_triton(
+    page_table_dst: torch.Tensor,
+    page_table_a: torch.Tensor,
+    page_table_b: torch.Tensor,  # expand page table
+    seq_len_a: torch.Tensor,
+    seq_len_b: torch.Tensor,  # expand seq lens
+    speculative_num_draft_tokens: int,
+):
+    # concat page_table and expand page_table by kv seq length
+    bs = seq_len_a.numel()
+    bs_expand = seq_len_b.numel()
+    assert bs_expand == bs * speculative_num_draft_tokens
+
+    LEN_A = page_table_a.shape[1]
+    LEN_B = page_table_b.shape[1]
+    LEN_OUT = LEN_A + LEN_B
+    REPEAT_STEP = speculative_num_draft_tokens
+    BLOCK_N = 256
+
+    grid = (bs_expand, triton.cdiv(LEN_OUT, BLOCK_N))
+    _prepare_swa_spec_page_table_kernel[grid](
+        page_table_dst,
+        page_table_a,
+        page_table_b,
+        seq_len_a,
+        seq_len_b,
+        page_table_dst.stride(0),
+        page_table_dst.stride(1),
+        page_table_a.stride(0),
+        page_table_a.stride(1),
+        page_table_b.stride(0),
+        page_table_b.stride(1),
+        LEN_A,
+        LEN_B,
+        LEN_OUT,
+        REPEAT_STEP,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
 
 
 class FlashAttentionMultiStepBackend:
@@ -2253,34 +2347,3 @@ def normal_decode_set_metadata(
         strided_indices[:max_seq_pages][None, :],
     ]
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
-
-
-def prepare_sliding_window_metadata(
-    page_table: torch.Tensor,
-    cache_seqlens_int32: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    sliding_window_size: int,
-):
-    bs = page_table.shape[0]
-    window_page_table = page_table.new_zeros((bs, sliding_window_size))
-    window_cache_seqlens_int32 = cache_seqlens_int32.new_empty(bs)
-    window_cu_seqlens_k = cu_seqlens_k.new_empty(bs + 1)
-    window_cu_seqlens_k[0] = 0
-    window_max_seq_len = 0
-
-    for i in range(bs):
-        ori_seq_len = cache_seqlens_int32[i]
-        window_seq_len = min(ori_seq_len, sliding_window_size)
-        window_page_table[i, :window_seq_len] = page_table[
-            i, ori_seq_len - window_seq_len : ori_seq_len
-        ]
-        window_cache_seqlens_int32[i] = window_seq_len
-        window_max_seq_len = max(window_seq_len, window_max_seq_len)
-        window_cu_seqlens_k[i + 1] = window_cu_seqlens_k[i] + window_seq_len
-
-    return (
-        window_page_table,
-        window_cache_seqlens_int32,
-        window_cu_seqlens_k,
-        window_max_seq_len,
-    )
