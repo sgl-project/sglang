@@ -36,22 +36,19 @@ pub enum Encoding {
 }
 
 impl Encoding {
-    /// Returns a reference to token IDs when possible, owned Vec for compatibility
-    pub fn token_ids(&self) -> Vec<TokenIdType> {
-        match self {
-            Encoding::Hf(inner) => inner.get_ids().to_vec(),
-            Encoding::Sp(inner) => inner.clone(),
-            Encoding::Tiktoken(inner) => inner.clone(),
-        }
-    }
-
-    /// Returns a reference to token IDs where possible
-    pub fn token_ids_ref(&self) -> &[TokenIdType] {
+    /// Returns a reference to token IDs - zero-copy operation
+    pub fn token_ids(&self) -> &[TokenIdType] {
         match self {
             Encoding::Hf(inner) => inner.get_ids(),
             Encoding::Sp(inner) => inner,
-            Encoding::Tiktoken(inner) => inner, // Now works with tiktoken-rs 0.7.0!
+            Encoding::Tiktoken(inner) => inner,
         }
+    }
+
+    /// Deprecated: Use token_ids() instead (kept for compatibility)
+    #[deprecated(since = "0.1.0", note = "Use token_ids() instead")]
+    pub fn token_ids_ref(&self) -> &[TokenIdType] {
+        self.token_ids()
     }
 
     /// Get a hash of the token IDs for caching purposes

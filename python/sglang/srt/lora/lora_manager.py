@@ -55,7 +55,7 @@ class LoRAManager:
         tp_rank: int = 0,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
-        lora_paths: Optional[Dict[str, LoRARef]] = None,
+        lora_paths: Optional[List[LoRARef]] = None,
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -370,7 +370,7 @@ class LoRAManager:
         self,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
-        lora_paths: Optional[Dict[str, LoRARef]] = None,
+        lora_paths: Optional[List[LoRARef]] = None,
     ):
         """
         Initialize the internal (mutable) state of the LoRAManager.
@@ -392,7 +392,7 @@ class LoRAManager:
         self.init_memory_pool()
         self.update_lora_info()
 
-    def init_lora_adapters(self, lora_paths: Optional[Dict[str, LoRARef]] = None):
+    def init_lora_adapters(self, lora_paths: Optional[List[LoRARef]] = None):
         # Configs of all active LoRA adapters, indexed by LoRA ID.
         self.configs: Dict[str, LoRAConfig] = {}
 
@@ -406,7 +406,7 @@ class LoRAManager:
         self.num_pinned_loras: int = 0
 
         if lora_paths:
-            for lora_ref in lora_paths.values():
+            for lora_ref in lora_paths:
                 result = self.load_lora_adapter(lora_ref)
                 if not result.success:
                     raise RuntimeError(
@@ -420,20 +420,37 @@ class LoRAManager:
     ):
         """Infer LoRA target modules and max_lora_rank from loaded adapters if not provided."""
 
-        if target_modules is not None:
-            self.target_modules = set(target_modules)
-        else:
-            self.target_modules = set()
-            for config in self.configs.values():
-                if not isinstance(config.target_modules, list):
+        self.target_modules = (
+            get_normalized_target_modules(target_modules) if target_modules else set()
+        )
+
+        for lora_id, config in self.configs.items():
+            if not isinstance(config.target_modules, list):
+                raise ValueError(
+                    f"SGLang currently only supports inferring LoRA target modules when a list of "
+                    "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
+                    "specify `--lora-target-modules` during server startup. You can specify `all` to "
+                    "enable all support modules types. "
+                )
+
+            adapter_target_modules = get_normalized_target_modules(
+                config.target_modules
+            )
+
+            if target_modules is not None:
+                # When `--lora-target-modules` is provided, validate adapter target modules is a subset of the specified target modules.
+                if not adapter_target_modules.issubset(self.target_modules):
+                    unsupported_modules = adapter_target_modules - self.target_modules
+                    lora_name = self.lora_refs[lora_id].lora_name
                     raise ValueError(
-                        f"SGLang currently only supports inferring LoRA target modules when a list of "
-                        "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
-                        "specify `--lora-target-modules` during server startup. You can specify `all` to "
-                        "enable all support modules types. "
+                        f"LoRA adapter '{lora_name}' contains target modules {sorted(unsupported_modules)} "
+                        f"that are not included in the specified --lora-target-modules {sorted(self.target_modules)}. "
+                        f"Please update --lora-target-modules to include all required modules: "
+                        f"{sorted(self.target_modules | adapter_target_modules)}, or use 'all' to enable all supported modules."
                     )
-                self.target_modules.update(config.target_modules)
-        self.target_modules = get_normalized_target_modules(self.target_modules)
+            else:
+                # Otherwise, infer target_modules from adapter configs.
+                self.target_modules.update(adapter_target_modules)
 
         if max_lora_rank is not None:
             self.max_lora_rank = max_lora_rank
