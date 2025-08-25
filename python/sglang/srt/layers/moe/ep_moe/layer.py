@@ -758,7 +758,7 @@ class DeepEPMoE(EPMoE):
                 self.quant_method.problem_sizes2,
                 self.w13_input_scale,
                 self.w2_input_scale,
-                deepep_mode=self.deepep_mode,
+                deepep_mode=dispatch_output.format,
             )
             return output
         else:
