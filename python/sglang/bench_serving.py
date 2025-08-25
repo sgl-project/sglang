@@ -1010,6 +1010,88 @@ def sample_sharegpt_requests(
     return filtered_dataset
 
 
+def _batch_encode_texts(
+    tokenizer: PreTrainedTokenizerBase,
+    texts: List[str],
+    target_lengths: np.ndarray,
+) -> List[List[int]]:
+    try:
+        # Prefer batch encoding if supported
+        if hasattr(tokenizer, "batch_encode_plus"):
+            # Use batch_encode_plus for batch encoding
+            encoded_batch = tokenizer.batch_encode_plus(
+                texts,
+                add_special_tokens=False,
+                padding=False,
+                truncation=False,
+                return_tensors=None,
+            )
+
+            # Extract input_ids and truncate to target length
+            truncated_sequences = []
+            for i, input_ids in enumerate(encoded_batch["input_ids"]):
+                target_len = int(target_lengths[i])
+                truncated_sequences.append(input_ids[:target_len])
+
+            return truncated_sequences
+        else:
+            # Fallback to individual encoding
+            return [
+                tokenizer.encode(text, add_special_tokens=False)[: int(target_len)]
+                for text, target_len in zip(texts, target_lengths)
+            ]
+    except Exception:
+        # If batch encoding fails, fallback to individual encoding
+        return [
+            tokenizer.encode(text, add_special_tokens=False)[: int(target_len)]
+            for text, target_len in zip(texts, target_lengths)
+        ]
+
+
+def _batch_decode_tokens(
+    tokenizer: PreTrainedTokenizerBase, token_sequences: List[List[int]]
+) -> List[str]:
+    try:
+        # Prefer batch decoding if supported
+        if hasattr(tokenizer, "batch_decode"):
+            return tokenizer.batch_decode(token_sequences, skip_special_tokens=True)
+        else:
+            # Fallback to individual decoding
+            return [tokenizer.decode(seq) for seq in token_sequences]
+    except Exception:
+        # If batch decoding fails, fallback to individual decoding
+        return [tokenizer.decode(seq) for seq in token_sequences]
+
+
+def _normalize_prompt_lengths(
+    prompts: List[str],
+    input_lens: np.ndarray,
+    output_lens: np.ndarray,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[DatasetRow]:
+    # 1. Batch re-encode all texts
+    re_encoded_sequences = _batch_encode_texts(
+        tokenizer=tokenizer, texts=prompts, target_lengths=input_lens
+    )
+
+    # 2. Batch decode truncated sequences
+    final_prompts = _batch_decode_tokens(
+        tokenizer=tokenizer, token_sequences=re_encoded_sequences
+    )
+
+    # 3. Batch construct results
+    return [
+        DatasetRow(
+            prompt=final_prompt,
+            prompt_len=len(re_encoded_seq),
+            output_len=int(output_len),
+        )
+        for final_prompt, re_encoded_seq, output_len in zip(
+            final_prompts, re_encoded_sequences, output_lens
+        )
+    ]
+
+
 def sample_random_requests(
     input_len: int,
     output_len: int,
@@ -1090,24 +1172,39 @@ def sample_random_requests(
                 )
             )
     else:
-        # Sample token ids from random integers. This can cause some NaN issues.
+        # Generate random offsets in batch
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
-        input_requests = []
-        for i in range(num_prompts):
-            input_content = [
-                (offsets[i] + i + j) % tokenizer.vocab_size
-                for j in range(input_lens[i])
-            ]
-            if return_text:
-                input_content = tokenizer.decode(input_content)
-            input_requests.append(
-                DatasetRow(
-                    prompt=input_content,
-                    prompt_len=int(input_lens[i]),
-                    output_len=int(output_lens[i]),
-                )
-            )
 
+        # Pre-allocate token matrix for better performance
+        max_input_len = np.max(input_lens)
+        token_matrix = np.zeros((num_prompts, max_input_len), dtype=np.int32)
+
+        # Vectorized generation of all token sequences
+        indices = np.arange(max_input_len)
+        for i in range(num_prompts):
+            # Generate unique token sequence for each request
+            token_ids = (
+                offsets[i] + i + indices[: input_lens[i]]
+            ) % tokenizer.vocab_size
+            token_matrix[i, : input_lens[i]] = token_ids
+
+        # Extract token sequences in batch
+        token_sequences = [
+            token_matrix[i, : input_lens[i]].tolist() for i in range(num_prompts)
+        ]
+
+        # Decode to text in batch
+        prompts = _batch_decode_tokens(tokenizer, token_sequences)
+
+        # Re-encode in batch to ensure token count consistency
+        input_requests = _normalize_prompt_lengths(
+            prompts=prompts,
+            input_lens=input_lens,
+            output_lens=output_lens,
+            tokenizer=tokenizer,
+        )
+
+    end_time = time.perf_counter()
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
