@@ -3,13 +3,9 @@ use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
 use sglang_router_rs::core::{BasicWorker, Worker, WorkerType};
-use sglang_router_rs::protocols::{
-    common::StringOrArray,
-    generate::{GenerateParameters, GenerateRequest, SamplingParams},
-    openai::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
-        completions::CompletionRequest,
-    },
+use sglang_router_rs::protocols::spec::{
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
+    SamplingParams, StringOrArray, UserMessageContent,
 };
 use sglang_router_rs::routers::pd_types::{generate_room_id, get_hostname, RequestWithBootstrap};
 

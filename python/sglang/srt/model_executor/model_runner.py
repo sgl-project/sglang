@@ -172,6 +172,7 @@ class ModelRunner:
         pp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -234,7 +235,7 @@ class ModelRunner:
         min_per_gpu_memory = self.init_torch_distributed()
 
         # CPU offload
-        set_offloader(create_offloader_from_server_args(server_args))
+        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -517,9 +518,6 @@ class ModelRunner:
                 )
 
         if not self.use_mla_backend:
-            server_args.disable_chunked_prefix_cache = True
-        elif self.page_size > 1:
-            logger.info("Disable chunked prefix cache when page size > 1.")
             server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
