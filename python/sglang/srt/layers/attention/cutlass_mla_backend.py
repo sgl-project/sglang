@@ -102,7 +102,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     block_kv_indices,
                     self.req_to_token.stride(0),
                     max_seqlen_pad,
-                    PAGE_SIZE,
+                    PAGED_SIZE=PAGE_SIZE,
                 )
                 workspace_size = cutlass_mla_get_workspace_size(
                     max_seqlen_pad * PAGE_SIZE, bs, num_kv_splits=1
@@ -165,7 +165,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     self.cuda_graph_kv_indices,
                     self.req_to_token.stride(0),
                     self.cuda_graph_kv_indices.stride(0),
-                    PAGE_SIZE,
+                    PAGED_SIZE=PAGE_SIZE,
                 )
                 self.forward_metadata = CutlassMLADecodeMetadata(
                     self.cuda_graph_mla_workspace,
@@ -206,7 +206,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_kv_indices,
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
-                PAGE_SIZE,
+                PAGED_SIZE=PAGE_SIZE,
             )
         else:
             super().init_forward_metadata_replay_cuda_graph(

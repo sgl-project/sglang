@@ -29,12 +29,15 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci_install_dependency.sh
-          pip install "vllm==0.9.0.1"
+          bash scripts/ci/ci_install_dependency.sh
           pip install "bitsandbytes>=0.44.0"
 
-      - name: Run VLLM dependency tests
+          pip install "sgl-kernel==0.3.5"
+
+      - name: Run vLLM dependency tests
         timeout-minutes: 60
         run: |
+          export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+
           cd test/srt
           python3 run_suite.py --suite vllm_dependency_test --timeout-per-file 3600
