@@ -78,7 +78,6 @@ from sglang.srt.layers.attention.mamba.ops.causal_conv1d import (
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule, 
     fused_recurrent_gated_delta_rule_update,
-    fused_recurrent_gated_delta_rule_update_v3,
 )
 
 logger = logging.getLogger(__name__)
