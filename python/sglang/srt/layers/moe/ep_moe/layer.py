@@ -409,7 +409,7 @@ class DeepEPMoE(EPMoE):
                 self.w13_weight,
                 (
                     self.w13_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or get_moe_runner_backend().is_cutlass_w4afp8()
                     else self.w13_weight_scale
                 ),
             )
@@ -417,7 +417,7 @@ class DeepEPMoE(EPMoE):
                 self.w2_weight,
                 (
                     self.w2_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or get_moe_runner_backend().is_cutlass_w4afp8()
                     else self.w2_weight_scale
                 ),
             )
