@@ -608,19 +608,20 @@ class HiCacheController:
             hash_values
         )
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
-        if page_data:
-            for i in range(len(hash_values)):
-                if page_data[i] is None:
-                    logger.warning(
-                        f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
-                    )
-                    break
-                self.mem_pool_host.set_from_flat_data_page(
-                    host_indices[operation.completed_tokens],
-                    page_data[i],
+        if page_data is None:
+            return
+        for i in range(len(hash_values)):
+            if page_data[i] is None:
+                logger.warning(
+                    f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
-                if not operation.increment(self.page_size):
-                    break  # Operation terminated by controller
+                break
+            self.mem_pool_host.set_from_flat_data_page(
+                host_indices[operation.completed_tokens],
+                page_data[i],
+            )
+            if not operation.increment(self.page_size):
+                break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
         # Select the get function and batch size
@@ -776,17 +777,17 @@ class HiCacheController:
         return operation.id
 
     # non-zero copy
-    def _generic_page_set(self, hashe_values, host_indices) -> bool:
+    def _generic_page_set(self, hash_values, host_indices) -> bool:
         data = [
             self.mem_pool_host.get_flat_data_page(host_indices[i * self.page_size])
-            for i in range(len(hashe_values))
+            for i in range(len(hash_values))
         ]
-        return self.storage_backend.batch_set(hashe_values, data)
+        return self.storage_backend.batch_set(hash_values, data)
 
     # zero copy
-    def _mooncake_page_set(self, hashe_values, host_indices) -> bool:
+    def _mooncake_page_set(self, hash_values, host_indices) -> bool:
         key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-            hashe_values,
+            hash_values,
             host_indices,
         )
         success = self.storage_backend.batch_set(
@@ -797,9 +798,9 @@ class HiCacheController:
         return success
 
     # zero copy
-    def _3fs_zero_copy_page_set(self, hashe_values, host_indices) -> bool:
+    def _3fs_zero_copy_page_set(self, hash_values, host_indices) -> bool:
         hashes, dsts = self.mem_pool_host.get_buffer_with_hash(
-            hashe_values, host_indices
+            hash_values, host_indices
         )
         return self.storage_backend.batch_set(hashes, dsts)
 
