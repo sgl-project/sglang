@@ -639,10 +639,6 @@ class ServerArgs:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
                     )
-                if self.page_size != 1 and self.attention_backend == "flashinfer":
-                    raise ValueError(
-                        "Speculative decoding with page_size != 1 is not supported. Please set page_size to 1."
-                    )
 
             # Auto choose parameters
             if self.speculative_num_steps is None:
