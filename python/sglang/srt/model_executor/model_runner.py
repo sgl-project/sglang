@@ -580,6 +580,9 @@ class ModelRunner:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
+        # Allow enabling/disabling TP all-reduce overlap via server args
+        if getattr(self.server_args, "disable_tp_allreduce_overlap", False):
+            os.environ["SGLANG_ENABLE_TP_ALLREDUCE_OVERLAP"] = "false"
 
         if not self.is_draft_worker:
             if self.device == "cpu":

@@ -144,6 +144,13 @@ class Llama4MoE(nn.Module):
 
         if self.tp_size > 1 and not use_reduce_scatter:
             out_aD = tensor_model_parallel_all_reduce(out_aD)
+            pending = getattr(out_aD, "_sglang_pending_allreduce_event", None)
+            if pending is not None:
+                torch.cuda.current_stream().wait_event(pending)
+                try:
+                    delattr(out_aD, "_sglang_pending_allreduce_event")
+                except Exception:
+                    pass
 
         return out_aD
 

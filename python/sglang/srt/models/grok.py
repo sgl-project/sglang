@@ -677,6 +677,13 @@ class Grok1DecoderLayer(nn.Module):
 
         if get_tensor_model_parallel_world_size() > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            pending = getattr(hidden_states, "_sglang_pending_allreduce_event", None)
+            if pending is not None:
+                torch.cuda.current_stream().wait_event(pending)
+                try:
+                    delattr(hidden_states, "_sglang_pending_allreduce_event")
+                except Exception:
+                    pass
 
         hidden_states, residual = fused_dual_residual_rmsnorm(
             hidden_states,
