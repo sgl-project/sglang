@@ -1879,10 +1879,18 @@ class ModelRunner:
                 next_token_ids[:, i:] = truncated_input_ids[current_generation_step, i:]
             elif truncated_input_ids.dim() == 1 and len(truncated_input_ids) > 0:
                 # 1D case: flattened or single sequence - use pad tokens
-                next_token_ids[:, i:] = self.model_config.pad_token[i:]
+                next_token_ids[:, i:] = torch.tensor(
+                    self.model_config.pad_token[i:],
+                    dtype=next_token_ids.dtype,
+                    device=next_token_ids.device,
+                )
             else:
                 # Fallback: use pad tokens
-                next_token_ids[:, i:] = self.model_config.pad_token[i:]
+                next_token_ids[:, i:] = torch.tensor(
+                    self.model_config.pad_token[i:],
+                    dtype=next_token_ids.dtype,
+                    device=next_token_ids.device,
+                )
 
         # Handle tensor boolean operations properly
         mask = (needs_additional_steps > 0) & (needs_additional_steps < channels - 1)
