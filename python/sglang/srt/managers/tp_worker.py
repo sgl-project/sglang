@@ -30,6 +30,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
+    SendWeightsToRemoteInstanceReqInput,
     LoadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -277,6 +279,25 @@ class TpModelWorker:
             recv_req.world_size,
             recv_req.group_name,
             recv_req.backend,
+        )
+        return success, message
+
+    def init_weights_send_group_for_remote_instance(self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput):
+        success, message = self.model_runner.init_weights_send_group_for_remote_instance(
+            recv_req.master_address,
+            recv_req.master_port,
+            recv_req.group_rank,
+            recv_req.world_size,
+            recv_req.group_name,
+            recv_req.backend,
+        )
+        return success, message
+
+    def send_weights_to_remote_instance(self, recv_req: SendWeightsToRemoteInstanceReqInput):
+        success, message = self.model_runner.send_weights_to_remote_instance(
+            recv_req.master_address,
+            recv_req.master_port,
+            recv_req.group_name,
         )
         return success, message
 

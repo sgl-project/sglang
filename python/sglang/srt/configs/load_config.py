@@ -23,6 +23,7 @@ class LoadFormat(str, enum.Enum):
     LAYERED = "layered"
     JAX = "jax"
     REMOTE = "remote"
+    REMOTE_INSTANCE = "remote_instance"
 
 
 @dataclass
@@ -50,6 +51,8 @@ class LoadConfig:
 
     load_format: Union[str, LoadFormat] = LoadFormat.AUTO
     download_dir: Optional[str] = None
+    seed_instance_url: Optional[str] = None
+    dst_instance_id: Optional[str] = None
     model_loader_extra_config: Optional[Union[str, dict]] = field(default_factory=dict)
     ignore_patterns: Optional[Union[List[str], str]] = None
     decryption_key_file: Optional[str] = None
