@@ -517,6 +517,7 @@ class LogitsProcessor(nn.Module):
             logits = logits[:, : self.config.vocab_size]
 
         if self.final_logit_softcapping:
+            logits = logits.to(dtype=torch.float32)
             fused_softcap(logits, self.final_logit_softcapping)
 
         return logits
