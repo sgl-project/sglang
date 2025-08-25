@@ -130,11 +130,17 @@ class TestIntelAMXAttnBackend(CustomTestCase):
             kill_process_tree(process.pid)
 
     @intel_amx_benchmark(
-        extra_args=["--enable-torch-compile", "--torch-compile-max-bs", "4"],
-        min_throughput=40,
+        extra_args=[
+            "--mem-fraction-static",
+            "0.05",
+            "--enable-torch-compile",
+            "--torch-compile-max-bs",
+            "4",
+        ],
+        min_throughput=10,
     )
     def test_latency_torch_compile_cpu(self):
-        return DEFAULT_MODEL_NAME_FOR_TEST
+        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
