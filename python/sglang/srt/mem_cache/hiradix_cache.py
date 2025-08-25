@@ -473,6 +473,15 @@ class HiRadixCache(RadixCache):
         if not self.can_terminate_prefetch(operation):
             return False
 
+        # Prevent host memory leaks because last_host_node may have been evicted,
+        # and is no longer in the radix tree
+        if (last_host_node != self.root_node
+            and last_host_node not in last_host_node.parent.children.values()):
+            self.cache_controller.mem_pool_host.free(host_indices)
+            last_host_node.release_host()
+            del self.ongoing_prefetch[req_id]
+            return True
+
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
