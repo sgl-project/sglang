@@ -102,6 +102,16 @@ class Sampler(nn.Module):
 
             if True:  # Keep this redundant check to simplify some internal code sync
                 if global_server_args_dict["sampling_backend"] == "flashinfer":
+                    if return_logprob:
+                        # NOTE: the top_p_renorm_prob from flashinfer has numerical problems,
+                        # https://github.com/flashinfer-ai/flashinfer/issues/708
+                        # so we use the torch implementation.
+                        # clamp to avoid -inf
+                        logprobs = torch.log(
+                            top_p_normalize_probs_torch(probs, sampling_info.top_ps)
+                        ).clamp(min=torch.finfo(probs.dtype).min)
+
+                    max_top_k_round, batch_size = 32, probs.shape[0]
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
@@ -109,12 +119,14 @@ class Sampler(nn.Module):
                             probs, sampling_info.min_ps
                         )
                     else:
+                        # Check Nan will throw exception, only check when crash_on_warnings is True
+                        check_nan = self.use_nan_detection and crash_on_warnings()
                         batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                            probs.contiguous(),
+                            probs,
                             sampling_info.top_ks,
                             sampling_info.top_ps,
                             filter_apply_order="joint",
-                            check_nan=self.use_nan_detection,
+                            check_nan=check_nan,
                         )
                 elif global_server_args_dict["sampling_backend"] == "pytorch":
                     # A slower fallback implementation with torch native operations.
@@ -125,21 +137,16 @@ class Sampler(nn.Module):
                         sampling_info.min_ps,
                         sampling_info.need_min_p_sampling,
                     )
+
+                    if return_logprob:
+                        # clamp to avoid -inf
+                        logprobs = torch.log(
+                            top_p_normalize_probs_torch(probs, sampling_info.top_ps)
+                        ).clamp(min=torch.finfo(probs.dtype).min)
                 else:
                     raise ValueError(
                         f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
                     )
-
-            if return_logprob:
-                # clamp to avoid -inf
-                if RETURN_ORIGINAL_LOGPROB:
-                    logprobs = torch.log(probs_without_temp_scaling).clamp(
-                        min=torch.finfo(probs_without_temp_scaling.dtype).min
-                    )
-                    del probs_without_temp_scaling
-                else:
-                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
-
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
             if any(x > 0 for x in top_logprobs_nums):
