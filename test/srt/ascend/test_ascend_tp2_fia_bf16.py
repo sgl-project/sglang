@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -14,15 +15,15 @@ from sglang.test.test_utils import (
 )
 
 TEST_MODEL_MATRIX = {
-    "/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V2-Lite-W8A8": {
-        "accuracy": 0.34,
-        "latency": 1000,
-        "output_throughput": 6,
+    "Qwen/Qwen2.5-7B-Instruct": {
+        "accuracy": 0.85,
+        "latency": 180,
+        "output_throughput": 20,
     },
 }
 
 
-class TestAscendMlaW8A8Int8(CustomTestCase):
+class TestAscendTp2Bf16(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -36,14 +37,13 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
             0.8,
             "--attention-backend",
             "ascend",
-            "--quantization",
-            "w8a8_int8",
             "--tp-size",
-            4,
+            2,
             "--disable-radix-cache",
         ]
 
     def test_a_gsm8k(self):
+        os.environ["ASCEND_USE_FIA"] = "true"
         for model in self.models:
             with self.subTest(model=model):
                 print(f"##=== Testing accuracy: {model} ===##")
