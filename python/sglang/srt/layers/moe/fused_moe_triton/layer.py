@@ -814,7 +814,9 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = self.quant_method.apply(
                 layer=self,
                 x=hidden_states,
-                topk_output=topk_output,
+                topk_weights=topk_output.topk_weights,
+                topk_ids=topk_output.topk_ids,
+                masked_m=None,
                 moe_runner_config=self.moe_runner_config,
             )
             sm.tag(final_hidden_states)
