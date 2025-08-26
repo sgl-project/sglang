@@ -8,38 +8,39 @@ use tokio::process::{Child, Command};
 
 pub struct LocalConnection {
     process: Option<Child>,
+    command: String,
+    args: Vec<String>,
     connection_info: ConnectionInfo,
     tools: ToolRegistry,
 }
 
 impl LocalConnection {
-    pub fn new(server_command: String, args: Vec<String>) -> Self {
+    pub fn new(command: String, args: Vec<String>) -> Self {
+        // Store command and args separately instead of joining them
         let connection_info = ConnectionInfo {
             connection_type: ConnectionType::Stdio,
-            endpoint: format!("{} {}", server_command, args.join(" ")),
+            endpoint: format!("{} {}", command, args.join(" ")), // Only for display/logging
             timeout_ms: 5000,
         };
 
         Self {
             process: None,
+            command,
+            args,
             connection_info,
             tools: HashMap::new(),
         }
     }
 
     pub async fn connect(&mut self) -> MCPResult<()> {
-        let parts: Vec<&str> = self.connection_info.endpoint.split_whitespace().collect();
-        if parts.is_empty() {
+        if self.command.is_empty() {
             return Err(MCPError::ConfigurationError(
                 "Empty server command".to_string(),
             ));
         }
 
-        let command = parts[0];
-        let args = &parts[1..];
-
-        let child = Command::new(command)
-            .args(args)
+        let child = Command::new(&self.command)
+            .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -71,6 +72,7 @@ impl LocalConnection {
         let _request_json = serde_json::to_string(&request)
             .map_err(|e| MCPError::ParseError(format!("Failed to serialize request: {}", e)))?;
 
+        // Mock implementation - will be replaced in Phase 2
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let response = MCPResponse {
@@ -87,6 +89,7 @@ impl LocalConnection {
     }
 
     async fn discover_tools(&mut self) -> MCPResult<()> {
+        // Mock tool discovery - will be replaced with real discovery in Phase 2
         let mock_tools = vec![
             ToolMetadata {
                 name: "file_read".to_string(),
@@ -128,5 +131,9 @@ impl LocalConnection {
 
     pub fn is_connected(&self) -> bool {
         self.process.is_some()
+    }
+
+    pub fn get_connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
     }
 }
