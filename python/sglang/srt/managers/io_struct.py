@@ -1002,7 +1002,6 @@ class ProfileReq:
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
-    rids: Optional[Union[List[str], str]] = None
 
 
 @dataclass

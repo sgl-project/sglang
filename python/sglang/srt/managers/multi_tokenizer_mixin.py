@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 
 class MultiTokenizerMixin:
+    """Mixin class for MultiTokenizerManager and DetokenizerManager"""
+
     def create_sockets_mapping(self):
         if not hasattr(self, "tokenizer_mapping"):
             self.tokenizer_mapping = {}
@@ -343,6 +345,8 @@ class MultiTokenizerMixin:
 
 
 class MultiTokenizerRouter(MultiTokenizerMixin):
+    """A router to receive requests from MultiTokenizerManager"""
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -412,6 +416,8 @@ class MultiTokenizerRouter(MultiTokenizerMixin):
 
 
 class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
+    """Multi Process Tokenizer Manager that tokenizes the text."""
+
     def __init__(
         self,
         server_args: ServerArgs,

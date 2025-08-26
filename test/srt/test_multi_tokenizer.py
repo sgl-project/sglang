@@ -1,6 +1,4 @@
-import inspect
 import unittest
-from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
 
 import sglang.srt.managers.io_struct as io_struct
@@ -52,20 +50,6 @@ class TestMultiTokenizer(CustomTestCase):
         )
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
-
-    def test_all_io_struct(self):
-        print("check all req types in io_struct.py")
-        result = []
-        for name, obj in inspect.getmembers(io_struct):
-            if inspect.isclass(obj) and is_dataclass(obj):
-                field_names = [f.name for f in fields(obj)]
-                if "rids" in field_names or "rid" in field_names:
-                    continue
-                result.append(name)
-        print(f"WARNING:Some Request types in io_struct.py have no rids: {result}")
-        print(
-            "If a special request type can't work, check the rids field which is needed for multi-tokenizer."
-        )
 
     def test_multi_tokenizer_ttft(self):
         # from test_bench_serving.py run_bench_serving
