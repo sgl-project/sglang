@@ -1041,7 +1041,6 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     return ORJSONResponse({"predictions": ret})
 
 
-<<<<<<< HEAD
 ## Anthropic API
 @app.post("/v1/messages", dependencies=[Depends(validate_json_request)])
 async def anthropic_v1_messages(request: AnthropicMessagesRequest, raw_request: Request):
@@ -1049,12 +1048,12 @@ async def anthropic_v1_messages(request: AnthropicMessagesRequest, raw_request: 
     return await raw_request.app.state.anthropic_serving_messages.handle_request(
         request, raw_request
     )
-=======
+
+
 def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
     """Update weight version if provided."""
     if weight_version is not None:
         _global_state.tokenizer_manager.server_args.weight_version = weight_version
->>>>>>> main
 
 
 def _create_error_response(e):
