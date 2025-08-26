@@ -26,7 +26,15 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
@@ -240,14 +248,30 @@ class HiCacheController:
         self.io_backend = io_backend
 
         self.enable_storage = False
-        self.is_mla = isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
         # todo: move backend initialization to storage backend module
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
-            from sglang.srt.mem_cache.hicache_storage import HiCacheFile, get_hash_str
+            from sglang.srt.mem_cache.hicache_storage import (
+                HiCacheFile,
+                HiCacheStorageConfig,
+                get_hash_str,
+            )
+
+            if is_dp_attention_enabled():
+                self.tp_rank = get_attention_tp_rank()
+                self.tp_size = get_attention_tp_size()
+            else:
+                self.tp_rank = get_tensor_model_parallel_rank()
+                self.tp_size = get_tensor_model_parallel_world_size()
+
+            self.storage_config = HiCacheStorageConfig(
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                is_mla_model=isinstance(self.mem_pool_host, MLATokenToKVPoolHost),
+            )
 
             if storage_backend == "file":
-                self.storage_backend = HiCacheFile(is_mla=self.is_mla)
+                self.storage_backend = HiCacheFile(self.storage_config)
                 self.get_hash_str = get_hash_str
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
@@ -260,7 +284,7 @@ class HiCacheController:
                     get_hash_str_mooncake,
                 )
 
-                self.storage_backend = MooncakeStore(is_mla=self.is_mla)
+                self.storage_backend = MooncakeStore(storage_config=self.storage_config)
                 self.get_hash_str = get_hash_str_mooncake
                 self.storage_backend.register_buffer(self.mem_pool_host.kv_buffer)
                 assert self.mem_pool_host.layout == "page_first"
@@ -279,7 +303,7 @@ class HiCacheController:
                     )
                 dtype = mem_pool_host.dtype
                 self.storage_backend = HiCacheHF3FS.from_env_config(
-                    bytes_per_page, dtype
+                    bytes_per_page, dtype, self.storage_config
                 )
                 self.get_hash_str = get_hash_str
             else:
@@ -403,9 +427,9 @@ class HiCacheController:
     @property
     def backup_skip(self):
         return (
-            self.is_mla
-            and get_tensor_model_parallel_rank() != 0
-            # todo: only support file and mooncake
+            self.storage_config.is_mla_model
+            and self.storage_config.tp_rank != 0
+            # todo: only support file, mooncake
             and self.storage_backend_type in ["file", "mooncake"]
         )
 

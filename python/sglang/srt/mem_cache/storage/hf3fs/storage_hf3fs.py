@@ -11,12 +11,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    is_dp_attention_enabled,
-)
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
 
 logger = logging.getLogger(__name__)
@@ -172,19 +167,16 @@ class HiCacheHF3FS(HiCacheStorage):
 
     @staticmethod
     def from_env_config(
-        bytes_per_page: int, dtype: torch.dtype, rank: int = None
+        bytes_per_page: int,
+        dtype: torch.dtype,
+        storage_config: HiCacheStorageConfig = None,
     ) -> "HiCacheHF3FS":
         from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
             Hf3fsGlobalMetadataClient,
             Hf3fsLocalMetadataClient,
         )
 
-        if rank is None:
-            rank = (
-                get_attention_tp_rank()
-                if is_dp_attention_enabled()
-                else get_tensor_model_parallel_rank()
-            )
+        rank = storage_config.tp_rank if storage_config is not None else 0
 
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:

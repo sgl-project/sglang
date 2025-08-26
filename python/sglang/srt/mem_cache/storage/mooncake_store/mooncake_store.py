@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 128 * 1024 * 1024  # 128 MB
@@ -96,7 +96,7 @@ class MooncakeStoreConfig:
 
 
 class MooncakeStore(HiCacheStorage):
-    def __init__(self, is_mla: bool = False):
+    def __init__(self, storage_config: HiCacheStorageConfig = None):
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as e:
@@ -126,7 +126,11 @@ class MooncakeStore(HiCacheStorage):
             logger.info("Connect to Mooncake store successfully.")
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
-            self.is_mla = is_mla
+
+            if storage_config is not None:
+                self.is_mla = storage_config.is_mla_model
+            else:
+                self.is_mla = False
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
