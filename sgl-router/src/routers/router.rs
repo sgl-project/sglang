@@ -267,41 +267,6 @@ impl Router {
         }
     }
 
-    fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
-        let sync_client = reqwest::blocking::Client::new();
-        let mut req_builder = sync_client.get(format!("{}/get_server_info", worker_url));
-        if let Some(key) = api_key {
-            req_builder = req_builder.bearer_auth(key);
-        }
-
-        match req_builder.send() {
-            Ok(res) => {
-                if res.status().is_success() {
-                    let server_info = res
-                        .text()
-                        .map_err(|e| format!("failed to read text from response: {}", e))?;
-
-                    let server_info: serde_json::Value = serde_json::from_str(&server_info)
-                        .map_err(|e| format!("failed to decode JSON: {}", e))?;
-
-                    let dp_size = server_info
-                        .get("dp_size")
-                        .and_then(|v| v.as_u64())
-                        .ok_or_else(|| String::from("dp_size not found or not an u64"))?;
-
-                    Ok(if dp_size > usize::MAX as u64 {
-                        return Err(format!("dp_size is too large: {}", dp_size));
-                    } else {
-                        dp_size as usize
-                    })
-                } else {
-                    Err(format!("unexpected status code: {}", res.status()))
-                }
-            }
-            Err(e) => Err(format!("error response: {}", e)),
-        }
-    }
-
     // Given a list of workers, return a list of workers with dp_rank as suffix
     fn get_dp_aware_workers(
         worker_urls: &[String],
@@ -310,7 +275,7 @@ impl Router {
         let mut dp_aware_workers: Vec<String> = Vec::new();
 
         for url in worker_urls {
-            match Self::get_worker_dp_size(url, api_key) {
+            match <BasicWorker as Worker>::get_dp_size(url, api_key) {
                 Ok(dp_size) => {
                     for i in 0..dp_size {
                         dp_aware_workers.push(format!("{}@{}", url, i));
