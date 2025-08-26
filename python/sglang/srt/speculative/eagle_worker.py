@@ -108,15 +108,15 @@ class EAGLEWorker(TpModelWorker):
         if self.speculative_algorithm.is_eagle3():
             if server_args.speculative_draft_vocab_path is not None:
                 logger.warning(
-                    "Speculative vocab frequency specified, but EAGLE3 models already have this. Ignoring the specified vocab frequency."
+                    "Speculative draft vocab specified, but EAGLE3 models already have this. Ignoring the specified draft vocab."
                 )
-            if server_args.speculative_vocab_threshold is not None:
+            if server_args.speculative_draft_vocab_threshold is not None:
                 logger.warning(
-                    "Speculative vocab threshold specified, but EAGLE3 models already have this. Ignoring the specified vocab threshold."
+                    "Speculative draft vocab threshold specified, but EAGLE3 models already have this. Ignoring the specified draft vocab threshold."
                 )
             self.hot_token_id = None
         elif server_args.speculative_draft_vocab_path is not None:
-            self.hot_token_id = load_draft_vocab(server_args.speculative_draft_vocab_path, server_args.speculative_vocab_threshold)
+            self.hot_token_id = load_draft_vocab(server_args.speculative_draft_vocab_path, server_args.speculative_draft_vocab_threshold)
             server_args.json_model_override_args = (
                 f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
             )
@@ -992,7 +992,7 @@ class EAGLEWorker(TpModelWorker):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
 
-def load_draft_vocab(speculative_draft_vocab_path_path: str, speculative_vocab_threshold: Optional[float]):
+def load_draft_vocab(speculative_draft_vocab_path_path: str, speculative_draft_vocab_threshold: Optional[float]):
     # Download if needed
     if not os.path.exists(speculative_draft_vocab_path_path):
         cache_dir = snapshot_download(os.path.dirname(speculative_draft_vocab_path_path), ignore_patterns=["*.bin", "*.safetensors"])
@@ -1000,24 +1000,24 @@ def load_draft_vocab(speculative_draft_vocab_path_path: str, speculative_vocab_t
 
     vocab_freqs = torch.load(speculative_draft_vocab_path_path, weights_only=True)
 
-    if speculative_vocab_threshold is None:
+    if speculative_draft_vocab_threshold is None:
         # Use all tokens provided for the draft model vocabulary
         hot_token_id = torch.arange(len(vocab_freqs), dtype=torch.int64)
-    elif speculative_vocab_threshold >= 1:
+    elif speculative_draft_vocab_threshold >= 1:
         # Keep top-k most frequent tokens for the draft model vocabulary
-        assert int(speculative_vocab_threshold) == speculative_vocab_threshold, f'Expected integer value for top-k selection, got {speculative_vocab_threshold}'
-        hot_token_id = torch.topk(vocab_freqs, speculative_vocab_threshold).indices
-    elif 0 < speculative_vocab_threshold < 1:
-        # Keep tokens until cumulative frequency mass reaches threshold for the draft model vocabulary
+        assert int(speculative_draft_vocab_threshold) == speculative_draft_vocab_threshold, f'Expected integer value for top-k selection, got {speculative_draft_vocab_threshold}'
+        hot_token_id = torch.topk(vocab_freqs, speculative_draft_vocab_threshold).indices
+    elif 0 < speculative_draft_vocab_threshold < 1:
+        # Keep tokens until relative cumulative frequency mass reaches threshold for the draft model vocabulary
         sorted_scores, sorted_indices = torch.sort(vocab_freqs, descending=True)
         cumulative_mass = torch.cumsum(sorted_scores, dim=0)
-        total_mass = cumulative_mass[-1]
-        cutoff = (cumulative_mass / total_mass) < speculative_vocab_threshold
+        relative_cumulative_mass = cumulative_mass / cumulative_mass[-1]
+        cutoff = relative_cumulative_mass < speculative_draft_vocab_threshold
         cutoff_idx = cutoff.sum().item() + 1
         assert isinstance(cutoff_idx, int)
         hot_token_id = sorted_indices[:cutoff_idx]
     else:
-        raise ValueError(f"Invalid threshold: {speculative_vocab_threshold}")
+        raise ValueError(f"Invalid threshold: {speculative_draft_vocab_threshold}")
 
     return hot_token_id
 

@@ -177,7 +177,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_draft_vocab_path: Optional[str] = None
-    speculative_vocab_threshold: Optional[float] = None
+    speculative_draft_vocab_threshold: Optional[float] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -1475,10 +1475,10 @@ class ServerArgs:
             default=ServerArgs.speculative_draft_vocab_path,
         )
         parser.add_argument(
-            "--speculative-vocab-threshold",
+            "--speculative-draft-vocab-threshold",
             type=float,
             help="The vocabulary pruning threshold for the draft model. If >= 1, keep top N most frequent tokens. If < 1, keep tokens until cumulative relative frequency mass reaches threshold. If None, use entire vocabulary from path.",
-            default=ServerArgs.speculative_vocab_threshold,
+            default=ServerArgs.speculative_draft_vocab_threshold,
         )
 
         # Expert parallelism
