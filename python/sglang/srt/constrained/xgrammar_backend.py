@@ -162,12 +162,16 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
 
-        # Create TokenizerInfo with model's EOS tokens as the authoritative stop tokens
-        # This ensures consistency between what the model considers EOS and what XGrammar uses
-        tokenizer_info = TokenizerInfo.from_huggingface(
-            tokenizer, vocab_size=vocab_size, stop_token_ids=model_eos_token_ids
-        )
-        override_stop_tokens = None
+        if hasattr(tokenizer, "init_xgrammar"):
+            # For special tokenizer
+            tokenizer_info, override_stop_tokens = tokenizer.init_xgrammar()
+        else:
+            # Create TokenizerInfo with model's EOS tokens as the authoritative stop tokens
+            # This ensures consistency between what the model considers EOS and what XGrammar uses
+            tokenizer_info = TokenizerInfo.from_huggingface(
+                tokenizer, vocab_size=vocab_size, stop_token_ids=model_eos_token_ids
+            )
+            override_stop_tokens = None
 
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size

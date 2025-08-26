@@ -157,10 +157,6 @@ def cutlass_fused_experts_fp8(
     rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
     rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
-    if not is_sm100_supported():
-        rep_a1_scales = per_group_transpose(rep_a1_scales, expert_offsets)
-        w1_scale = w1_scale.contiguous()
-
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
 
@@ -192,9 +188,6 @@ def cutlass_fused_experts_fp8(
     silu_and_mul(c1, intermediate)
 
     intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
-    if not is_sm100_supported():
-        a2_scale = per_group_transpose(a2_scale, expert_offsets)
-        w2_scale = w2_scale.contiguous()
 
     fp8_blockwise_scaled_grouped_mm(
         c2,
