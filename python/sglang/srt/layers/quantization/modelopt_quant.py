@@ -883,15 +883,34 @@ class SglangCommBackend(CommBackend):
         return gathered.cpu().tolist()
 
     def allgather_bytes(self, data: bytes):
-        # return torch.distributed.broadcast_object_list(
-        result = [data] * self.Get_size()
-        torch.distributed.all_gather_object(result, data)
-        # print(result)
+        device_id = torch.cuda.current_device()
+        device_str = f"cuda:{device_id}"
+        local_tensor = torch.ByteTensor(list(data)).unsqueeze(0).to(device_str)
+        gathered = self._group.all_gather(local_tensor, dim=0)
+        result = [bytes(gathered[i].cpu().tolist()) for i in range(self.Get_size())]
         return result
 
-    def Split(self, color: int, key: int) -> "SglangCommBackend":
-        return self
+    def allgather(self, data: int | bytes):
+        device = f"cuda:{torch.cuda.current_device()}"
 
+        if isinstance(data, int):
+            # Handle integer case
+            local_tensor = torch.tensor([data], device=device, dtype=torch.int32)
+            gathered = self._group.all_gather(local_tensor)
+            return [int(x.item()) for x in gathered]
+
+        elif isinstance(data, bytes):
+            # Handle bytes case
+            local_tensor = torch.ByteTensor(list(data)).unsqueeze(0).to(device)
+            gathered = self._group.all_gather(local_tensor, dim=0)
+            return [bytes(gathered[i].cpu().tolist()) for i in range(self.Get_size())]
+
+        else:
+            raise TypeError(f"Unsupported type for allgather: {type(data)}")
+
+    def Split(self, color: int, key: int) -> 'vLLMCommBackend':
+        # vLLM handles this automatically via its groups
+        return self
 
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
