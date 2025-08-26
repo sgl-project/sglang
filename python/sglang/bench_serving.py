@@ -4,10 +4,7 @@
 """
 Benchmark online serving with dynamic requests.
 
-Usage:
-python3 -m sglang.bench_serving --backend sglang --num-prompt 10
-
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
+Please refer to https://docs.sglang.ai/developer_guide/bench_serving.html for details.
 """
 
 import argparse

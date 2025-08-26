@@ -1,4 +1,4 @@
-## Bench Serving Guide (sglang.bench_serving)
+## Bench Serving Guide
 
 This guide explains how to benchmark online serving throughput and latency using `python -m sglang.bench_serving`. It supports multiple inference backends via OpenAI-compatible and native endpoints, and produces both console metrics and optional JSONL outputs.
 
@@ -29,6 +29,10 @@ If `--base-url` is provided, requests are sent to it. Otherwise, `--host` and `-
 ### Quick start
 
 Run a basic benchmark against an sglang server exposing `/generate`:
+
+```bash
+python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
+```
 
 ```bash
 python3 -m sglang.bench_serving \
@@ -79,6 +83,23 @@ Random Image dataset flags (for `random-image`):
 
 - `--random-image-num-images`: Number of images per request
 - `--random-image-resolution`: Image resolution; supports presets (1080p, 720p, 360p) or custom 'heightxwidth' format (e.g., 1080x1920, 512x768)
+
+For example, to benchmark random-image dataset with 3 images per request, 500 prompts, 512 input length, and 512 output length, you can run:
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-3B-Instruct --disable-radix-cache
+```
+
+```bash
+python -m sglang.bench_serving \
+    --backend sglang-oai-chat \
+    --dataset-name random-image \
+    --num-prompts 500 \
+    --random-image-num-images 3 \
+    --random-image-resolution 720p \
+    --random-input-len 512 \
+    --random-output-len 512
+```
 
 ### Choosing model and tokenizer
 
