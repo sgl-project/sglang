@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
-    model_path: str
+    model_path: str = "default"
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
