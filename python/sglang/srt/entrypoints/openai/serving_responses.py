@@ -866,6 +866,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         async for ctx in result_generator:
 
+            # If the yielded context doesn't have the harmony streaming interface,
+            # skip per-turn handling and just drain.
+            if not hasattr(ctx, "is_expecting_start"):
+                continue
+
             if ctx.is_expecting_start():
                 current_output_index += 1
                 sent_output_item_added = False
