@@ -87,6 +87,7 @@ class TransferInfo:
     dst_kv_indices: npt.NDArray[np.int32]
     dst_aux_index: int
     required_dst_info_num: int
+    prefix_cache_len: int
     is_dummy: bool
 
     @classmethod
@@ -95,9 +96,11 @@ class TransferInfo:
             is_dummy = True
             dst_kv_indices = np.array([], dtype=np.int32)
             dst_aux_index = None
+            prefix_cache_len = 0
         else:
             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
             dst_aux_index = int(msg[5].decode("ascii"))
+            prefix_cache_len = int(msg[7].decode("ascii"))
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -107,6 +110,7 @@ class TransferInfo:
             dst_kv_indices=dst_kv_indices,
             dst_aux_index=dst_aux_index,
             required_dst_info_num=int(msg[6].decode("ascii")),
+            prefix_cache_len=prefix_cache_len,
             is_dummy=is_dummy,
         )
 
@@ -319,6 +323,9 @@ class MooncakeKVManager(BaseKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
+        if prefill_kv_indices.size == 0:
+            return 0
+
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -435,6 +442,10 @@ class MooncakeKVManager(BaseKVManager):
         each page to ensure correctness for any page_size and head-slicing configuration.
         This may introduce performance overhead (increased TTFT) for long sequences.
         """
+
+        if prefill_kv_indices.size == 0:
+            return 0
+
         # Extract configuration
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         src_kv_item_len = self.kv_args.kv_item_lens[0]
@@ -1126,6 +1137,22 @@ class MooncakeKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
     ):
+        if self.bootstrap_room in self.kv_mgr.transfer_infos:
+            session_id = next(iter(self.kv_mgr.transfer_infos[self.bootstrap_room]))
+            decode_prefix_cache_len = self.kv_mgr.transfer_infos[self.bootstrap_room][
+                session_id
+            ].prefix_cache_len
+            if decode_prefix_cache_len >= self.curr_idx + len(kv_indices):
+                if decode_prefix_cache_len == self.num_kv_indices:
+                    kv_indices = np.empty(0, dtype=np.int32)
+                    self.curr_idx = decode_prefix_cache_len
+                else:
+                    self.curr_idx += len(kv_indices)
+                    return
+            elif decode_prefix_cache_len > self.curr_idx:
+                kv_indices = kv_indices[decode_prefix_cache_len - self.curr_idx :]
+                self.curr_idx = decode_prefix_cache_len
+
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
@@ -1467,7 +1494,12 @@ class MooncakeKVReceiver(BaseKVReceiver):
         )
         return sock, lock
 
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def init(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        prefix_cache_len: int = 0,
+    ):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
@@ -1482,6 +1514,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
                         str(self.required_dst_info_num).encode("ascii"),
+                        str(prefix_cache_len // self.kv_mgr.kv_args.page_size).encode(
+                            "ascii"
+                        ),
                     ]
                 )
         self.init_time = time.time()
