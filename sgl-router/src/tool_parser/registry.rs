@@ -1,4 +1,5 @@
 use crate::tool_parser::json_parser::JsonParser;
+use crate::tool_parser::llama_parser::LlamaParser;
 use crate::tool_parser::mistral_parser::MistralParser;
 use crate::tool_parser::pythonic_parser::PythonicParser;
 use crate::tool_parser::qwen_parser::QwenParser;
@@ -108,6 +109,9 @@ impl ParserRegistry {
 
         // Pythonic parser - [func(arg=val)] format
         self.register_parser("pythonic", Arc::new(PythonicParser::new()));
+
+        // Llama parser - <|python_tag|>{...} or plain JSON format
+        self.register_parser("llama", Arc::new(LlamaParser::new()));
     }
 
     /// Register default model mappings

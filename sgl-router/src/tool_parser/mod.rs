@@ -3,6 +3,7 @@
 /// This module provides infrastructure for parsing tool calls from various model formats.
 pub mod errors;
 pub mod json_parser;
+pub mod llama_parser;
 pub mod mistral_parser;
 pub mod partial_json;
 pub mod python_literal_parser;
@@ -19,6 +20,7 @@ mod tests;
 // Re-export commonly used types
 pub use errors::{ToolParserError, ToolParserResult};
 pub use json_parser::JsonParser;
+pub use llama_parser::LlamaParser;
 pub use mistral_parser::MistralParser;
 pub use pythonic_parser::PythonicParser;
 pub use qwen_parser::QwenParser;
