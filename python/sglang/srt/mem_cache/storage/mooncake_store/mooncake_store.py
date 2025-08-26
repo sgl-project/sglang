@@ -116,10 +116,10 @@ class MooncakeStore(HiCacheStorage):
             logger.info("Mooncake store warmup successfully.")
 
             if storage_config is not None:
-                self.is_mla = storage_config.is_mla_model
+                self.is_mla_backend = storage_config.is_mla_model
                 self.local_rank = storage_config.tp_rank
             else:
-                self.is_mla = False
+                self.is_mla_backend = False
                 self.local_rank = 0
 
         except ValueError as e:
@@ -128,7 +128,6 @@ class MooncakeStore(HiCacheStorage):
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
-
 
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex

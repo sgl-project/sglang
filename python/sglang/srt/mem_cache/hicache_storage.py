@@ -10,17 +10,6 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    is_dp_attention_enabled,
-)
-
-
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
     hasher = hashlib.sha256()
 
@@ -38,6 +27,8 @@ class HiCacheStorageConfig:
     tp_rank: int
     tp_size: int
     is_mla_model: bool
+    model_name: Optional[str]
+    extra_config: Optional[dict] = None
 
 
 class HiCacheStorage(ABC):
