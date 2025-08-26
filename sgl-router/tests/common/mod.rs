@@ -16,6 +16,7 @@ pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         config.clone(),
         reqwest::Client::new(),
         config.max_concurrent_requests,
+        config.rate_limit_tokens_per_second,
     ))
 }
 
