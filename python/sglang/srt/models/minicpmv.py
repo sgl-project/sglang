@@ -23,6 +23,7 @@
 
 import types
 from functools import partial
+from itertools import chain
 from typing import (
     Any,
     Callable,
@@ -1203,7 +1204,6 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         prefix: str = "",
     ) -> nn.Module:
         llm = Qwen3ForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
-        # 函数补丁，qwen3没有实现对应函数
         llm.get_input_embeddings = types.MethodType(
             lambda self: self.model.get_input_embeddings(), llm
         )
