@@ -866,6 +866,24 @@ class ResponsesResponse(BaseModel):
     tool_choice: str = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
+    # OpenAI compatibility fields. not all are used at the moment.
+    # Recommend checking https://platform.openai.com/docs/api-reference/responses
+    error: Optional[dict] = None
+    incomplete_details: Optional[dict] = None
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = None
+    previous_response_id: Optional[str] = None
+    reasoning: Optional[dict] = (
+        None  # {"effort": Optional[str], "summary": Optional[str]}
+    )
+    store: Optional[bool] = None
+    temperature: Optional[float] = None
+    text: Optional[dict] = None  # e.g. {"format": {"type": "text"}}
+    top_p: Optional[float] = None
+    truncation: Optional[str] = None
+    user: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
     @classmethod
     def from_request(
         cls,
@@ -880,6 +898,39 @@ class ResponsesResponse(BaseModel):
         usage: Optional[UsageInfo],
     ) -> "ResponsesResponse":
         """Create a response from a request."""
+
+        # Determine if the output is plain text only to set text.format
+        def _is_text_only(
+            items: List[
+                Union[
+                    ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall
+                ]
+            ]
+        ) -> bool:
+            if not items:
+                return False
+            for it in items:
+                # Any tool call or reasoning item implies not pure text
+                if isinstance(it, ResponseReasoningItem) or isinstance(
+                    it, ResponseFunctionToolCall
+                ):
+                    return False
+                # For messages, ensure all parts are output_text
+                try:
+                    if getattr(it, "type", None) == "message":
+                        contents = getattr(it, "content", []) or []
+                        for c in contents:
+                            if getattr(c, "type", None) != "output_text":
+                                return False
+                    else:
+                        # Unknown structured item
+                        return False
+                except Exception:
+                    return False
+            return True
+
+        text_format = {"format": {"type": "text"}} if _is_text_only(output) else None
+
         return cls(
             id=request.request_id,
             created_at=created_time,
@@ -890,6 +941,23 @@ class ResponsesResponse(BaseModel):
             parallel_tool_calls=request.parallel_tool_calls or True,
             tool_choice=request.tool_choice,
             tools=request.tools,
+            # fields for parity with v1/responses
+            error=None,
+            incomplete_details=None,
+            instructions=request.instructions,
+            max_output_tokens=request.max_output_tokens,
+            previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
+            reasoning={
+                "effort": request.reasoning.effort if request.reasoning else None,
+                "summary": None,
+            },
+            store=request.store,
+            temperature=request.temperature,
+            text=text_format,  # TODO(v): Expand coverage per https://platform.openai.com/docs/api-reference/responses/list
+            top_p=request.top_p,
+            truncation=request.truncation,
+            user=request.user,
+            metadata=request.metadata or {},
         )
 
 

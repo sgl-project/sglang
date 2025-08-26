@@ -123,6 +123,39 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
+    # error helpers dedicated for v1/responses
+    def create_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+        param: Optional[str] = None,
+    ) -> ORJSONResponse:
+        nested_error = {
+            "message": message,
+            "type": err_type,
+            "param": param,
+            "code": status_code,
+        }
+        return ORJSONResponse(content={"error": nested_error}, status_code=status_code)
+
+    def create_streaming_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+    ) -> str:
+        return json.dumps(
+            {
+                "error": {
+                    "message": message,
+                    "type": err_type,
+                    "param": None,
+                    "code": status_code,
+                }
+            }
+        )
+
     def _request_id_prefix(self) -> str:
         return "resp_"
 
