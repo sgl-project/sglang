@@ -9,7 +9,6 @@ from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule_update,
 )
-from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 from torch import nn
 
 from sglang.srt.configs.qwen3_hybrid_moe import Qwen3HybridMoeConfig
@@ -21,23 +20,16 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.attention.mamba.mamba_mixer2 import (
-    MambaMixer2,
-    extra_groups_for_head_shards,
-)
 from sglang.srt.layers.attention.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba.utils import RMSNorm as RMSNormGated
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    attn_tp_all_gather,
-    attn_tp_reduce_scatter,
-    dp_gather_partial,
-    dp_scatter,
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_local_attention_dp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -586,6 +578,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         # Qwen3HybridMoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
+        self.layer_id = layer_id
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -662,118 +655,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen3HybridMixerDecoderLayer(nn.Module):
-
-    def __init__(
-        self,
-        config: Qwen3HybridMoeConfig,
-        layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
-    ) -> None:
-        super().__init__()
-        self.config = config
-        self.mamba2 = MambaMixer2(
-            layer_idx=layer_id,
-            hidden_size=config.hidden_size,
-            ssm_state_size=config.mamba2_state_dim,
-            conv_kernel_size=config.mamba2_conv_dim,
-            intermediate_size=config.mamba2_expand * config.hidden_size,
-            use_conv_bias=config.mamba2_conv_bias,
-            use_bias=config.mamba2_proj_bias,
-            n_groups=config.mamba2_ngroups,
-            num_heads=config.mamba2_nheads,
-            head_dim=config.mamba2_head_dim,
-            rms_norm_eps=1e-5,  # config.rms_norm_eps,
-            activation=config.hidden_act,
-            chunk_size=config.mamba2_chunk_size,
-            quant_config=quant_config,
-        )
-
-        # Qwen3HybridMoE all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_previous_layer_sparse = True
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-        )
-
-        if self.is_layer_sparse:
-            self.mlp = Qwen2MoeSparseMoeBlock(
-                layer_id=layer_id, config=config, quant_config=quant_config
-            )
-        else:
-            self.mlp = Qwen2MoeMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-            )
-        if getattr(
-            config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)
-        ):
-            logger.warning_once(
-                "Using Gemma RMSNorm for input normalization and post attn normalization."
-            )
-            self.input_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
-            self.post_attention_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
-        else:
-            self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_attention_layernorm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
-
-        self.layer_id = layer_id
-
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        mamba_cache_params: MambaCacheParams,
-        sequence_idx: Optional[torch.Tensor] = None,
-        forward_batch: Optional[ForwardBatch] = None,
-        **kwargs,
-    ):
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.mamba2(
-                hidden_states,
-                mamba_cache_params,
-                sequence_idx,
-                forward_batch=forward_batch,
-            )
-
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-
-        hidden_states = self.mlp(hidden_states, forward_batch)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-
-        return hidden_states, residual
-
-
 class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
     def __init__(
@@ -812,6 +693,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.layer_id = layer_id
 
         self.attn_output_gate = getattr(config, "attn_output_gate", False)
         if self.attn_output_gate:
@@ -1020,7 +902,6 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
 ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen3HybridAttentionDecoderLayer,
-    "mamba": Qwen3HybridMixerDecoderLayer,
     "linear_attention": Qwen3HybridLinearDecoderLayer,
 }
 
@@ -1041,7 +922,7 @@ class Qwen3HybridMoeModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
         )
 
         def get_layer(idx: int, prefix: str):
@@ -1110,9 +991,7 @@ class Qwen3HybridMoeModel(nn.Module):
                 num_attn += 1
 
             layer_mamba_cache_params = None
-            if isinstance(
-                layer, (Qwen3HybridMixerDecoderLayer, Qwen3HybridLinearDecoderLayer)
-            ):
+            if isinstance(layer, Qwen3HybridLinearDecoderLayer):
                 layer_mamba_cache_params = mamba_cache_params.at_layer_id(i - num_attn)
 
             hidden_states, residual = layer(
@@ -1201,37 +1080,6 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         )
         return conv_state_shape, temporal_state_shape
 
-    def _get_mamba_cache_shape(self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-        world_size = get_attention_tp_size()
-        hidden_size = self.config.hidden_size
-
-        conv_state_shape, temporal_state_shape = None, None
-
-        intermediate_size = self.config.mamba2_expand * hidden_size
-
-        # if n_groups is not divisible by world_size, need to extend the shards
-        # to ensure all groups needed by a head is sharded along with it
-        n_groups = self.config.mamba2_ngroups + extra_groups_for_head_shards(
-            self.config.mamba2_ngroups, world_size
-        )
-
-        # - heads and n_groups are TP-ed
-        conv_dim = intermediate_size + 2 * n_groups * self.config.mamba2_state_dim
-        conv_state_shape = (
-            divide(conv_dim, world_size),
-            self.config.mamba2_conv_dim - 1,
-        )
-
-        # These are not TP-ed as they depend on A, dt_bias, D
-        # - they are typically small
-        #   e.g., (h_heads, d_head, d_state) = (128, 64, 128)
-        temporal_state_shape = (
-            divide(self.config.mamba2_nheads, world_size),
-            self.config.mamba2_head_dim,
-            self.config.mamba2_state_dim,
-        )
-        return conv_state_shape, temporal_state_shape
-
     def init_mamba_cache_once(self):
         if self.mamba_cache is not None:
             return
@@ -1243,11 +1091,8 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
             )
             conv_state_shape, temporal_state_shape = self._get_linear_cache_shape()
         else:
-            num_mamba_layers = sum(
-                type_value == HybridLayerType.mamba2.value
-                for type_value in layers_block_type_value
-            )
-            conv_state_shape, temporal_state_shape = self._get_mamba_cache_shape()
+            raise NotImplementedError("Only hybrid linear attention is supported now.")
+
         self.mamba_cache = MambaCacheManager(
             torch.bfloat16,
             torch.float32,

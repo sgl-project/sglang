@@ -3,7 +3,6 @@
 from typing import List, Optional, Tuple, Union
 
 import torch
-from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
 # Added by the IBM Team, 2024
 from sgl_kernel import rmsnorm
@@ -23,6 +22,7 @@ from sglang.srt.layers.attention.mamba.ops.causal_conv1d import (
 )
 from sglang.srt.layers.attention.mamba.ops.mamba_ssm import selective_state_update
 from sglang.srt.layers.attention.mamba.ops.ssd_combined import mamba_chunk_scan_combined
+from sglang.srt.layers.attention.mamba.utils import RMSNorm as RMSNormGated
 
 # from vllm.forward_context import get_forward_context
 # from vllm.model_executor.custom_op import CustomOp

@@ -639,7 +639,7 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
             extend_start_loc=self.extend_start_loc[bs],
-        )                
+        )
 
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
