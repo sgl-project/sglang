@@ -229,6 +229,15 @@ python -m sglang_router.launch_router \
     --prefill-selector app=sglang component=prefill \
     --decode-selector app=sglang component=decode \
     --service-discovery-namespace sglang-system
+
+# in lws case, such as tp16(1 leader pod, 1 worker pod)
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --service-discovery \
+    --prefill-selector app=sglang component=prefill role=leader\
+    --decode-selector app=sglang component=decode role=leader\
+    --service-discovery-namespace sglang-system
 ```
 
 #### Kubernetes Pod Configuration
