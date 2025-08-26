@@ -910,12 +910,11 @@ class ResponsesResponse(BaseModel):
             if not items:
                 return False
             for it in items:
-                # Any tool call or reasoning item implies not pure text
+                # tool call -> not pure text.
                 if isinstance(it, ResponseReasoningItem) or isinstance(
                     it, ResponseFunctionToolCall
                 ):
                     return False
-                # For messages, ensure all parts are output_text
                 try:
                     if getattr(it, "type", None) == "message":
                         contents = getattr(it, "content", []) or []
@@ -923,7 +922,7 @@ class ResponsesResponse(BaseModel):
                             if getattr(c, "type", None) != "output_text":
                                 return False
                     else:
-                        # Unknown structured item
+                        # unk
                         return False
                 except Exception:
                     return False

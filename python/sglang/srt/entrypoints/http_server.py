@@ -305,9 +305,8 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
 
     For /v1/responses, emit OpenAI-style nested error envelope:
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
-    Other endpoints retain legacy behavior.
     """
-    # Only adjust format for Responses API
+    # adjust fmt for responses api
     if request.url.path.startswith("/v1/responses"):
         nested_error = {
             "message": exc.detail,
@@ -319,7 +318,6 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
             content={"error": nested_error}, status_code=exc.status_code
         )
 
-    # Legacy behavior for non-/v1/responses endpoints
     error = ErrorResponse(
         object="error",
         message=exc.detail,
