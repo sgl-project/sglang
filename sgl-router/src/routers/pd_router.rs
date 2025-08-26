@@ -809,9 +809,11 @@ impl PDRouter {
     }
 
     async fn handle_decode_error_response(
+        &self,
         res: reqwest::Response,
         context: &PDRequestContext,
-        decode_url: &str,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
     ) -> Response {
         let status = res.status();
 
@@ -834,13 +836,16 @@ impl PDRouter {
             let sse_data = format!("data: {{'error': {}}}", serde_json::to_string(&error_payload).unwrap_or_default());
             let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
 
-            Self::create_streaming_response(
+            let decode_url = decode.url().to_string();
+            self.create_streaming_response(
                 error_stream,
                 status,
                 None,
                 context.return_logprob,
-                Some(decode_url.to_string()),
+                Some(decode_url),
                 Some(response_headers),
+                prefill,
+                decode,
             )
         } else {
             // Handle non-streaming error response
@@ -929,7 +934,7 @@ impl PDRouter {
                             status
                         );
 
-                        return PDRouter::handle_decode_error_response(res, &context, decode.url()).await;
+                        return self.handle_decode_error_response(res, &context, prefill, decode).await;
                     }
 
                     // Process prefill response for logprobs
@@ -1073,7 +1078,7 @@ impl PDRouter {
                             status
                         );
 
-                        PDRouter::handle_decode_error_response(res, &context, decode.url()).await
+                        self.handle_decode_error_response(res, &context, prefill, decode).await
                     } else if context.is_stream {
                         // Streaming response without logprobs - direct passthrough
                         let decode_url = decode.url().to_string();
