@@ -84,7 +84,9 @@ Random Image dataset flags (for `random-image`):
 - `--random-image-num-images`: Number of images per request
 - `--random-image-resolution`: Image resolution; supports presets (1080p, 720p, 360p) or custom 'heightxwidth' format (e.g., 1080x1920, 512x768)
 
-For example, to benchmark random-image dataset with 3 images per request, 500 prompts, 512 input length, and 512 output length, you can run:
+### Examples
+
+1. To benchmark random-image dataset with 3 images per request, 500 prompts, 512 input length, and 512 output length, you can run:
 
 ```bash
 python -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-3B-Instruct --disable-radix-cache
@@ -99,6 +101,22 @@ python -m sglang.bench_serving \
     --random-image-resolution 720p \
     --random-input-len 512 \
     --random-output-len 512
+```
+
+2. To benchmark random dataset with 3000 prompts, 1024 input length, and 1024 output length, you can run:
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen2.5-3B-Instruct
+```
+
+```bash
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --dataset-name random \
+    --num-prompts 3000 \
+    --random-input 1024 \
+    --random-output 1024 \
+    --random-range-ratio 0.5
 ```
 
 ### Choosing model and tokenizer
