@@ -55,6 +55,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Decrement the load counter
     fn decrement_load(&self);
 
+    /// Reset the load counter to 0 (for sync/recovery)
+    fn reset_load(&self) {
+        // Default implementation - does nothing
+        // Workers that track load should override this
+    }
+
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
 
@@ -311,13 +317,7 @@ impl Worker for BasicWorker {
 
         // Use the shared client with a custom timeout for this request
         let health_result = match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    true
-                } else {
-                    false
-                }
-            }
+            Ok(response) => response.status().is_success(),
             Err(_) => false,
         };
 
@@ -368,6 +368,10 @@ impl Worker for BasicWorker {
                 current.checked_sub(1)
             })
             .ok();
+    }
+
+    fn reset_load(&self) {
+        self.load_counter.store(0, Ordering::Relaxed);
     }
 
     fn processed_requests(&self) -> usize {
@@ -453,6 +457,10 @@ impl Worker for DPAwareWorker {
 
     fn decrement_load(&self) {
         self.base_worker.decrement_load();
+    }
+
+    fn reset_load(&self) {
+        self.base_worker.reset_load();
     }
 
     fn processed_requests(&self) -> usize {
@@ -571,6 +579,7 @@ impl WorkerFactory {
     }
 
     /// Create workers from URLs with automatic type detection
+    #[allow(clippy::type_complexity)]
     pub fn create_from_urls(
         regular_urls: Vec<String>,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -830,6 +839,10 @@ pub fn start_health_checker(
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
+        // Counter for periodic load reset (every 10 health check cycles)
+        let mut check_count = 0u64;
+        const LOAD_RESET_INTERVAL: u64 = 10;
+
         loop {
             interval.tick().await;
 
@@ -839,6 +852,8 @@ pub fn start_health_checker(
                 break;
             }
 
+            check_count += 1;
+
             // Check health of all workers
             let workers_to_check = match workers.read() {
                 Ok(guard) => guard.iter().map(|w| w.clone_worker()).collect::<Vec<_>>(),
@@ -847,6 +862,22 @@ pub fn start_health_checker(
                     continue;
                 }
             };
+
+            // Periodically reset load counters to prevent drift
+            // Only do this when we believe all workers should be idle
+            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
+                let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
+                // Only reset if load appears to be very low (likely drift)
+                if max_load <= 2 {
+                    tracing::debug!(
+                        "Resetting load counters to prevent drift (max_load: {})",
+                        max_load
+                    );
+                    for worker in &workers_to_check {
+                        worker.reset_load();
+                    }
+                }
+            }
 
             // Perform health checks concurrently
             let health_checks = workers_to_check.iter().map(|worker| {
@@ -1202,12 +1233,6 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
-
-        // Final state should be deterministic (last write wins)
-        // We can't predict the exact final state due to scheduling,
-        // but we can verify no data corruption occurred
-        let final_health = worker.is_healthy();
-        assert!(final_health == true || final_health == false);
     }
 
     // Test WorkerFactory

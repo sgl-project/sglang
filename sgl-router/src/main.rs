@@ -70,6 +70,7 @@ Examples:
     --decode http://127.0.0.3:30003 \
     --decode http://127.0.0.4:30004 \
     --prefill-policy cache_aware --decode-policy power_of_two
+
 "#)]
 struct CliArgs {
     /// Host address to bind the router server
@@ -266,6 +267,11 @@ struct CliArgs {
     /// Health check endpoint path
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
+
+    // IGW (Inference Gateway) configuration
+    /// Enable Inference Gateway mode
+    #[arg(long, default_value_t = false)]
+    enable_igw: bool,
 }
 
 impl CliArgs {
@@ -307,7 +313,12 @@ impl CliArgs {
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         // Determine routing mode
-        let mode = if self.pd_disaggregation {
+        let mode = if self.enable_igw {
+            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            }
+        } else if self.pd_disaggregation {
             let decode_urls = self.decode.clone();
 
             // Validate PD configuration if not using service discovery
@@ -406,6 +417,7 @@ impl CliArgs {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
             },
+            enable_igw: self.enable_igw,
         })
     }
 
@@ -487,17 +499,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Host: {}:{}", cli_args.host, cli_args.port);
     println!(
         "Mode: {}",
-        if cli_args.pd_disaggregation {
+        if cli_args.enable_igw {
+            "IGW (Inference Gateway)"
+        } else if cli_args.pd_disaggregation {
             "PD Disaggregated"
         } else {
             "Regular"
         }
     );
-    println!("Policy: {}", cli_args.policy);
 
-    if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
-        println!("Prefill nodes: {:?}", prefill_urls);
-        println!("Decode nodes: {:?}", cli_args.decode);
+    if !cli_args.enable_igw {
+        println!("Policy: {}", cli_args.policy);
+
+        if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
+            println!("Prefill nodes: {:?}", prefill_urls);
+            println!("Decode nodes: {:?}", cli_args.decode);
+        }
     }
 
     // Convert to RouterConfig

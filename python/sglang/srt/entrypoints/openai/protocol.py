@@ -327,7 +327,7 @@ class ToolCall(BaseModel):
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant", "tool"]
+    role: Literal["system", "assistant", "tool", "function"]
     content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
         default=None
     )
@@ -341,9 +341,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
     def _normalize_role(cls, v):
         if isinstance(v, str):
             v_lower = v.lower()
-            if v_lower not in {"system", "assistant", "tool"}:
+            if v_lower not in {"system", "assistant", "tool", "function"}:
                 raise ValueError(
-                    "'role' must be one of 'system', 'assistant', or 'tool' (case-insensitive)."
+                    "'role' must be one of 'system', 'assistant', 'tool', or 'function' (case-insensitive)."
                 )
             return v_lower
         raise ValueError("'role' must be a string")
@@ -737,8 +737,8 @@ class ResponsesRequest(BaseModel):
         else:
             max_tokens = default_max_tokens
 
-        # Avoid exceed the context length by minus 1 token
-        max_tokens -= 1
+        # Avoid exceed the context length by minus 2 token
+        max_tokens -= 2
 
         # Get parameters with defaults
         temperature = self.temperature
