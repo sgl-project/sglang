@@ -2,9 +2,20 @@ import logging
 
 import torch
 
-from sglang.srt.utils import cpu_has_amx_support
+from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+from enum import IntEnum
+
+SGLANG_USE_CPU_INT4_W4A8 = get_bool_env_var("SGLANG_USE_CPU_INT4_W4A8")
+
+
+class CPUMoECompMethod(IntEnum):
+    BF16_GEMM = 0
+    INT8_W8A8_GEMM = 1
+    FP8_W8A16_GEMM = 2
+    INT4_W8A16_GEMM = 3
 
 
 def amx_process_weight_after_loading(weight):
@@ -29,7 +40,7 @@ def dim_is_supported(weight):
 
 
 def _amx_process_weight_after_loading(
-    module, weight_names, transpose_dims=None
+    module, weight_names, transpose_dims=None, qweight_packed_method=None
 ) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
@@ -41,32 +52,63 @@ def _amx_process_weight_after_loading(
             transpose_dims
         ), "len(weight_names) should be equal to len(transpose_dims)"
 
-    for i, weight_name in enumerate(weight_names):
-        weight_tensor = getattr(module, weight_name)
-
-        if transpose_dims and transpose_dims[i]:
-            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
-
-        # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
-        if not dim_is_supported(weight_tensor):
-            logger.warning(
-                f"Unsupported dimension for prepacking for weight '{weight_name}' with shape {weight_tensor.shape} in {module}. "
-                f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
-            )
-            module.use_intel_amx_backend = False
-            return
-
-        packed_weight = torch.nn.Parameter(
-            amx_process_weight_after_loading(weight_tensor),
-            requires_grad=False,
-        )
-        packed_weight.__dict__ = weight_tensor.__dict__
-        setattr(module, weight_name, packed_weight)
-
     module.use_intel_amx_backend = (
         device == torch.device("cpu") and cpu_has_amx_support()
     )
 
+    if qweight_packed_method is None:
+        for i, weight_name in enumerate(weight_names):
+            weight_tensor = getattr(module, weight_name)
+
+            if transpose_dims and transpose_dims[i]:
+                weight_tensor = weight_tensor.transpose(*transpose_dims[i])
+
+            # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
+            if not dim_is_supported(weight_tensor):
+                logger.warning(
+                    f"Unsupported dimension for prepacking for weight '{weight_name}' with shape {weight_tensor.shape} in {module}. "
+                    f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
+                )
+                module.use_intel_amx_backend = False
+                return
+
+            packed_weight = torch.nn.Parameter(
+                amx_process_weight_after_loading(weight_tensor),
+                requires_grad=False,
+            )
+            packed_weight.__dict__ = weight_tensor.__dict__
+            setattr(module, weight_name, packed_weight)
+    else:
+        assert qweight_packed_method in ["awq"]  # TODO: add GPTQ, etc.
+        qweight_tensor = getattr(module, weight_names[0])
+        qzeros_tensor = getattr(module, weight_names[1])
+        scales_tensor = getattr(module, weight_names[2])
+        prefix_list = weight_names[0].split("_")
+        # MoE layers have prefix
+        has_prefix = len(prefix_list) != 1
+        # TODO: support MoE layers for W4A8 path
+        use_w4a8 = SGLANG_USE_CPU_INT4_W4A8 and not has_prefix
+        qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+            qweight, qzeros, scales, use_w4a8
+        )
+        packed_qweight = torch.nn.Parameter(
+            qweight,
+            requires_grad=False,
+        )
+        packed_qzeros = torch.nn.Parameter(
+            qzeros,
+            requires_grad=False,
+        )
+        packed_scales = torch.nn.Parameter(
+            scales,
+            requires_grad=False,
+        )
+        packed_qweight.__dict__ = qweight_tensor.__dict__
+        packed_qzeros.__dict__ = qzeros_tensor.__dict__
+        packed_scales.__dict__ = scales_tensor.__dict__
+        setattr(module, weight_names[0], packed_qweight)
+        setattr(module, weight_names[1], packed_qzeros)
+        setattr(module, weight_names[2], packed_scales)
     if (
         module.use_intel_amx_backend
         and hasattr(module, "bias")
