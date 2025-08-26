@@ -1,5 +1,6 @@
 use crate::tool_parser::json_parser::JsonParser;
 use crate::tool_parser::mistral_parser::MistralParser;
+use crate::tool_parser::pythonic_parser::PythonicParser;
 use crate::tool_parser::qwen_parser::QwenParser;
 use crate::tool_parser::traits::ToolParser;
 use std::collections::HashMap;
@@ -104,6 +105,9 @@ impl ParserRegistry {
 
         // Qwen parser - <tool_call>...</tool_call> format
         self.register_parser("qwen", Arc::new(QwenParser::new()));
+
+        // Pythonic parser - [func(arg=val)] format
+        self.register_parser("pythonic", Arc::new(PythonicParser::new()));
     }
 
     /// Register default model mappings
