@@ -106,6 +106,8 @@ class DetokenizerManager:
             ]
         )
 
+        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
+
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
@@ -133,6 +135,9 @@ class DetokenizerManager:
 
         # Trim stop token.
         if isinstance(matched, int) and isinstance(output, list):
+            # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
+            if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
+                return output
             assert len(output) > 0
             return output[:-1]
         return output

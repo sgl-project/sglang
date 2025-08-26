@@ -23,6 +23,11 @@ GPT‑OSS can call built‑in tools for web search and Python execution. You can
 - Uses the Exa backend for web search.
 - Requires an Exa API key; set `EXA_API_KEY` in your environment. Create a key at `https://exa.ai`.
 
+### Tool & Reasoning Parser
+
+- We support OpenAI Reasoning and Tool Call parser, as well as our SGLang native api for tool call and reasoning. Refer to [reasoning parser](../advanced_features/separate_reasoning.ipynb) and [tool call parser](../advanced_features/function_calling.ipynb) for more details.
+
+
 ## Notes
 
 - Use **Python 3.12** for the demo tools. And install the required `gpt-oss` packages.
@@ -55,7 +60,7 @@ The URLs should be MCP SSE servers that expose server information and well-docum
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:30323/v1",
+    base_url="http://localhost:30000/v1",
     api_key="sk-123456"
 )
 

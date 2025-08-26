@@ -526,6 +526,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

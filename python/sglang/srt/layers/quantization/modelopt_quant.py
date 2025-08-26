@@ -876,7 +876,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             data=torch.empty(
                 layer.num_local_experts,
                 2 * intermediate_size_per_partition,
-                # 2 fp4 items are packed in the input dimension
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
             ),
@@ -895,7 +894,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             data=torch.empty(
                 layer.num_local_experts,
                 hidden_size,
-                # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
             ),
@@ -1212,11 +1210,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w13 weights
             w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
+            del layer.w13_weight_scale
             layer.w13_blockscale_swizzled.data.copy_(w13_blockscale_swizzled)
             layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
 
             # Process w2 weights
             w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
+            del layer.w2_weight_scale
             layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
             layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
