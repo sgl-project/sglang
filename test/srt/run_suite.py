@@ -136,7 +136,8 @@ suites = {
         TestFile("test_full_deepseek_v3.py", 333),
     ],
     "per-commit-8-gpu-b200": [
-        # add more here
+        TestFile("../../sgl-kernel/tests/test_fp4_gemm.py", 60),
+        TestFile("../../sgl-kernel/tests/test_fp4_quantize.py", 60),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
