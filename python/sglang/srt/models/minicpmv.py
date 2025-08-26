@@ -21,8 +21,8 @@
 # limitations under the License.
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
 
-from functools import partial
 import types
+from functools import partial
 from typing import (
     Any,
     Callable,
@@ -58,7 +58,6 @@ from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.llama import LlamaConfig, LlamaForCausalLM
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
-from sglang.srt.models.llama import LlamaConfig, LlamaForCausalLM
 from sglang.srt.utils import add_prefix, flatten_nested_list
 
 RawImageType = Union[Image.Image, torch.Tensor]
@@ -361,36 +360,38 @@ class Resampler2_5(BaseResampler):
 
 class Resampler4_5(BaseResampler):
 
-    def __init__(self,
-                 num_queries: int,
-                 embed_dim: int,
-                 num_heads: int,
-                 kv_dim: Optional[int] = None,
-                 norm_layer: Callable[[int], nn.LayerNorm] = DEFAULT_LN,
-                 max_size: tuple[int, int] = (70, 70),
-                 max_temporal_size=36000,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = "") -> None:
-        super().__init__(num_queries,
-                         embed_dim,
-                         num_heads,
-                         kv_dim,
-                         norm_layer,
-                         quant_config=quant_config,
-                         prefix=prefix)
-        
+    def __init__(
+        self,
+        num_queries: int,
+        embed_dim: int,
+        num_heads: int,
+        kv_dim: Optional[int] = None,
+        norm_layer: Callable[[int], nn.LayerNorm] = DEFAULT_LN,
+        max_size: tuple[int, int] = (70, 70),
+        max_temporal_size=36000,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            num_queries,
+            embed_dim,
+            num_heads,
+            kv_dim,
+            norm_layer,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
         self.max_size = max_size
         self.max_temporal_size = max_temporal_size
-
 
         self._set_2d_pos_cache(self.max_size)
         self._set_temporal_pos_cache(self.max_temporal_size)
         self.apply(self._init_weights)
 
-
-    def get_1d_sincos_pos_embed_from_temporal_size(self,
-                                                   embed_dim : int,
-                                                   pos: np.ndarray):
+    def get_1d_sincos_pos_embed_from_temporal_size(
+        self, embed_dim: int, pos: np.ndarray
+    ):
         """
         embed_dim: output dimension for each position
         pos: a list of positions to be encoded: size (M,)
@@ -398,30 +399,30 @@ class Resampler4_5(BaseResampler):
         """
         assert embed_dim % 2 == 0
         omega = np.arange(embed_dim // 2, dtype=np.float32)
-        omega /= embed_dim / 2.
-        omega = 1. / 10000**omega  # (D/2,)
+        omega /= embed_dim / 2.0
+        omega = 1.0 / 10000**omega  # (D/2,)
 
         pos = pos.reshape(-1)  # (M,)
-        out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+        out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
 
-        emb_sin = np.sin(out) # (M, D/2)
-        emb_cos = np.cos(out) # (M, D/2)
+        emb_sin = np.sin(out)  # (M, D/2)
+        emb_cos = np.cos(out)  # (M, D/2)
 
         emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
         return emb
-    
-    def _set_2d_pos_cache(self,
-                          max_size: tuple[int, int],
-                          device: torch.types.Device = "cpu") -> None:
-        pos_embed_arr = get_2d_sincos_pos_embed(self.embed_dim,
-                                                max_size,
-                                                version=(2, 5))
+
+    def _set_2d_pos_cache(
+        self, max_size: tuple[int, int], device: torch.types.Device = "cpu"
+    ) -> None:
+        pos_embed_arr = get_2d_sincos_pos_embed(
+            self.embed_dim, max_size, version=(2, 5)
+        )
         pos_embed = torch.from_numpy(pos_embed_arr).float().to(device)
         self.register_buffer("pos_embed", pos_embed, persistent=False)
 
-    def _adjust_pos_cache(self,
-                          tgt_sizes: torch.Tensor,
-                          device: torch.types.Device) -> None:
+    def _adjust_pos_cache(
+        self, tgt_sizes: torch.Tensor, device: torch.types.Device
+    ) -> None:
         max_h = tgt_sizes[:, 0].max().item()
         max_w = tgt_sizes[:, 1].max().item()
         assert isinstance(max_h, int) and isinstance(max_w, int)
@@ -432,27 +433,32 @@ class Resampler4_5(BaseResampler):
                 max(max_w, self.max_size[1]),
             )
             self._set_2d_pos_cache(self.max_size, device)
-    
-    def _set_temporal_pos_cache(self,
-                                max_temporal_size: int,
-                                device: torch.types.Device = "cpu") -> None:
+
+    def _set_temporal_pos_cache(
+        self, max_temporal_size: int, device: torch.types.Device = "cpu"
+    ) -> None:
         temporal_size = np.arange(max_temporal_size, dtype=np.float32)
-        pos_embed = torch.from_numpy(self.get_1d_sincos_pos_embed_from_temporal_size(
-            self.embed_dim,
-            temporal_size
-        )).float().to(device)
+        pos_embed = (
+            torch.from_numpy(
+                self.get_1d_sincos_pos_embed_from_temporal_size(
+                    self.embed_dim, temporal_size
+                )
+            )
+            .float()
+            .to(device)
+        )
         self.register_buffer("temporal_pos_embed", pos_embed, persistent=False)
 
-    def _adjust_temporal_pos_cache(self,
-                                   max_temporal_size: int,
-                                   device: torch.types.Device = "cpu"):
+    def _adjust_temporal_pos_cache(
+        self, max_temporal_size: int, device: torch.types.Device = "cpu"
+    ):
         if max_temporal_size > self.max_temporal_size:
             self.max_temporal_size = max_temporal_size
             self._set_temporal_pos_cache(self.max_temporal_size, device)
-    
-    def forward(self, x: torch.Tensor,
-                tgt_sizes: torch.Tensor,
-                temporal_ids=None) -> torch.Tensor:
+
+    def forward(
+        self, x: torch.Tensor, tgt_sizes: torch.Tensor, temporal_ids=None
+    ) -> torch.Tensor:
         assert x.shape[0] == tgt_sizes.shape[0]
         bs = x.shape[0]
 
@@ -477,9 +483,9 @@ class Resampler4_5(BaseResampler):
         max_patch_len = patch_len.max().item()
         assert isinstance(max_patch_len, int)
 
-        key_padding_mask = torch.zeros((bs, max_patch_len),
-                                       dtype=torch.bool,
-                                       device=device)
+        key_padding_mask = torch.zeros(
+            (bs, max_patch_len), dtype=torch.bool, device=device
+        )
 
         x, _ = self.kv_proj(x)  # B * L * D
         x = self.ln_kv(x).permute(1, 0, 2)  # L * B * D
@@ -491,22 +497,29 @@ class Resampler4_5(BaseResampler):
             tgt_h, tgt_w = tgt_sizes[i]
             if temporal_pos_emb:
                 if temporal_ids_flatten[i] == -1:
-                    pos_embed_temporal.append(torch.zeros(self.embed_dim, dtype=dtype, device=device))
+                    pos_embed_temporal.append(
+                        torch.zeros(self.embed_dim, dtype=dtype, device=device)
+                    )
                 else:
-                    pos_embed_temporal.append(self.temporal_pos_embed[temporal_ids_flatten[i]].to(dtype)) # D
+                    pos_embed_temporal.append(
+                        self.temporal_pos_embed[temporal_ids_flatten[i]].to(dtype)
+                    )  # D
 
-            pos_embed_2d.append(self.pos_embed[:tgt_h, :tgt_w, :].reshape((tgt_h * tgt_w, -1)).to(dtype))  # patches * D
-            key_padding_mask[i, patch_len[i]:] = True
+            pos_embed_2d.append(
+                self.pos_embed[:tgt_h, :tgt_w, :].reshape((tgt_h * tgt_w, -1)).to(dtype)
+            )  # patches * D
+            key_padding_mask[i, patch_len[i] :] = True
 
         pos_embed_2d = torch.nn.utils.rnn.pad_sequence(
-            pos_embed_2d, batch_first=True, padding_value=0.0).permute(1, 0, 2)  # BLD => L * B * D
-        
+            pos_embed_2d, batch_first=True, padding_value=0.0
+        ).permute(
+            1, 0, 2
+        )  # BLD => L * B * D
+
         k = x
         v = x + pos_embed_2d
-        
+
         if pos_embed_temporal:
-            # temporal 维度折叠
-            # 时序 embedding
             k += torch.stack(pos_embed_temporal, dim=0)
             bs = len(temporal_ids)
             merge_k = []
@@ -517,16 +530,31 @@ class Resampler4_5(BaseResampler):
             for tp in temporal_ids:
                 end = start + len(tp)
                 # # L * (end-start) * D -> (end-start) * L * D -> 1 * L*(end-start) * D
-                merge_k.append(k[:, start: end, :].permute(1, 0, 2).reshape(-1, self.embed_dim))
-                merge_v.append(v[:, start: end, :].permute(1, 0, 2).reshape(-1, self.embed_dim))
-                merge_key_padding_mask.append(key_padding_mask[start: end, :].reshape(-1, 1))
+                merge_k.append(
+                    k[:, start:end, :].permute(1, 0, 2).reshape(-1, self.embed_dim)
+                )
+                merge_v.append(
+                    v[:, start:end, :].permute(1, 0, 2).reshape(-1, self.embed_dim)
+                )
+                merge_key_padding_mask.append(
+                    key_padding_mask[start:end, :].reshape(-1, 1)
+                )
 
                 start = end
-                            
-            k = torch.nn.utils.rnn.pad_sequence(merge_k, batch_first=True, padding_value=0.0).permute(1, 0, 2)  # L*(end-start)
-            v = torch.nn.utils.rnn.pad_sequence(merge_v, batch_first=True, padding_value=0.0).permute(1, 0, 2)  # L*(end-start)
-            key_padding_mask = torch.nn.utils.rnn.pad_sequence(merge_key_padding_mask, batch_first=True, padding_value=True).squeeze(-1)
-        
+
+            k = torch.nn.utils.rnn.pad_sequence(
+                merge_k, batch_first=True, padding_value=0.0
+            ).permute(
+                1, 0, 2
+            )  # L*(end-start)
+            v = torch.nn.utils.rnn.pad_sequence(
+                merge_v, batch_first=True, padding_value=0.0
+            ).permute(
+                1, 0, 2
+            )  # L*(end-start)
+            key_padding_mask = torch.nn.utils.rnn.pad_sequence(
+                merge_key_padding_mask, batch_first=True, padding_value=True
+            ).squeeze(-1)
 
         out = self.attn(
             self._repeat(q, bs),  # Q * B * D
@@ -1118,6 +1146,7 @@ class MiniCPMV4_0(MiniCPMBaseModel):
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
+
 class MiniCPMV4_5(MiniCPMBaseModel):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -1168,18 +1197,17 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         assert self.version == (4, 0) or self.version == (4, 5)
 
     def init_llm(
-            self,
-            config: Qwen3Config,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
-        ) -> nn.Module:
-            llm = Qwen3ForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
-            # 函数补丁，qwen3没有实现对应函数
-            llm.get_input_embeddings = types.MethodType(
-                lambda self: self.model.get_input_embeddings(),
-                llm
-            )
-            return llm
+        self,
+        config: Qwen3Config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        llm = Qwen3ForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
+        # 函数补丁，qwen3没有实现对应函数
+        llm.get_input_embeddings = types.MethodType(
+            lambda self: self.model.get_input_embeddings(), llm
+        )
+        return llm
 
     def init_vision_module(
         self,
@@ -1281,8 +1309,9 @@ class MiniCPMV4_5(MiniCPMBaseModel):
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
-    
+
 _SUPPORT_VERSION = {(2, 6): MiniCPMV2_6, (4, 0): MiniCPMV4_0, (4, 5): MiniCPMV4_5}
+
 
 class MiniCPMV:
     """
@@ -1317,9 +1346,12 @@ class MiniCPMV:
         instance_class = _SUPPORT_VERSION.get(version)
         if instance_class is None:
             supported_versions = ", ".join(
-                [f"{v[0]}.{v[1]}" for v in sorted(_SUPPORT_VERSION.keys())])
-            raise ValueError(f"Currently, MiniCPMV only supports versions "
-                             f"{supported_versions}. Got version: {version}")
+                [f"{v[0]}.{v[1]}" for v in sorted(_SUPPORT_VERSION.keys())]
+            )
+            raise ValueError(
+                f"Currently, MiniCPMV only supports versions "
+                f"{supported_versions}. Got version: {version}"
+            )
 
         try:
             minicpmv = instance_class(
