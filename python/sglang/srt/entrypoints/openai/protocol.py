@@ -22,6 +22,8 @@ from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseOutputItem,
+    ResponseOutputMessage,
+    ResponseOutputText,
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
