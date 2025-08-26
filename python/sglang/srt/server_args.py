@@ -1471,13 +1471,13 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-draft-vocab-path",
             type=str,
-            help="The path to the draft model's vocabulary. This can be a token frequency file or a vocabulary subset file.",
+            help="The path to the draft model's vocabulary file. If `None`, uses the full draft model vocabulary. Otherwise expects a file with either token IDs or token frequencies to specify a pruned draft model vocabulary.",
             default=ServerArgs.speculative_draft_vocab_path,
         )
         parser.add_argument(
             "--speculative-draft-vocab-threshold",
             type=float,
-            help="The vocabulary pruning threshold for the draft model. If >= 1, keep top N most frequent tokens. If < 1, keep tokens until cumulative relative frequency mass reaches threshold. If None, use entire vocabulary from path.",
+            help="The vocabulary pruning threshold for the draft model. If `None` do not prune the vocabulary. If >= 1, prune to top N most frequent tokens. If < 1, prune tokens until cumulative relative frequency mass reaches threshold.",
             default=ServerArgs.speculative_draft_vocab_threshold,
         )
 

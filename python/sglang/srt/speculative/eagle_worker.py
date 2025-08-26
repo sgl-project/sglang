@@ -992,32 +992,44 @@ class EAGLEWorker(TpModelWorker):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
 
-def load_draft_vocab(speculative_draft_vocab_path_path: str, speculative_draft_vocab_threshold: Optional[float]):
+def load_draft_vocab(draft_vocab_path: str, vocab_threshold: Optional[float]):
+    """Load draft model vocabulary with optional frequency-based pruning.
+
+   Args:
+       draft_vocab_path: Path to vocabulary file (token IDs or frequencies)
+       vocab_threshold: Pruning threshold (None=use all, >=1=top-k, <1=cumulative mass)
+
+   Returns:
+       Tensor of token IDs to use in draft model vocabulary
+   """
     # Download if needed
-    if not os.path.exists(speculative_draft_vocab_path_path):
-        cache_dir = snapshot_download(os.path.dirname(speculative_draft_vocab_path_path), ignore_patterns=["*.bin", "*.safetensors"])
-        speculative_draft_vocab_path_path = os.path.join(cache_dir, os.path.basename(speculative_draft_vocab_path_path))
+    if not os.path.exists(draft_vocab_path):
+        cache_dir = snapshot_download(os.path.dirname(draft_vocab_path), ignore_patterns=["*.bin", "*.safetensors"])
+        draft_vocab_path = os.path.join(cache_dir, os.path.basename(draft_vocab_path))
 
-    vocab_freqs = torch.load(speculative_draft_vocab_path_path, weights_only=True)
+    data = torch.load(draft_vocab_path, weights_only=True)
 
-    if speculative_draft_vocab_threshold is None:
-        # Use all tokens provided for the draft model vocabulary
-        hot_token_id = torch.arange(len(vocab_freqs), dtype=torch.int64)
-    elif speculative_draft_vocab_threshold >= 1:
+    # Case 1: File contains token IDs - no pruning, manually specify the draft vocab
+   if vocab_threshold is None:
+       assert data.dtype.is_integer, f"Expected int64 dtype for token IDs, got {data.dtype}"
+       return data.to(torch.int64)
+
+    # Case 2: File contains token frequencies over the entire vocab - prune the vocab based on the frequencies
+    if vocab_threshold >= 1:
         # Keep top-k most frequent tokens for the draft model vocabulary
-        assert int(speculative_draft_vocab_threshold) == speculative_draft_vocab_threshold, f'Expected integer value for top-k selection, got {speculative_draft_vocab_threshold}'
-        hot_token_id = torch.topk(vocab_freqs, int(speculative_draft_vocab_threshold)).indices
-    elif 0 < speculative_draft_vocab_threshold < 1:
+        assert int(vocab_threshold) == vocab_threshold, f'Expected integer value for top-k selection, got {vocab_threshold}'
+        hot_token_id = torch.topk(data, int(vocab_threshold)).indices
+    elif 0 < vocab_threshold < 1:
         # Keep tokens until relative cumulative frequency mass reaches threshold for the draft model vocabulary
-        sorted_scores, sorted_indices = torch.sort(vocab_freqs, descending=True)
+        sorted_scores, sorted_indices = torch.sort(data, descending=True)
         cumulative_mass = torch.cumsum(sorted_scores, dim=0)
         relative_cumulative_mass = cumulative_mass / cumulative_mass[-1]
-        cutoff = relative_cumulative_mass < speculative_draft_vocab_threshold
+        cutoff = relative_cumulative_mass < vocab_threshold
         cutoff_idx = cutoff.sum().item() + 1
         assert isinstance(cutoff_idx, int)
         hot_token_id = sorted_indices[:cutoff_idx]
     else:
-        raise ValueError(f"Invalid threshold: {speculative_draft_vocab_threshold}")
+        raise ValueError(f"Invalid threshold: {vocab_threshold}")
 
     return hot_token_id
 
