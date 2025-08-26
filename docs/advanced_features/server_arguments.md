@@ -206,7 +206,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-num-draft-tokens` | The number of tokens sampled from the draft model in Speculative Decoding. | None |
 | `--speculative-accept-threshold-single` | Accept a draft token if its probability in the target model is greater than this threshold. | 1.0 |
 | `--speculative-accept-threshold-acc` | The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc). | 1.0 |
-| `--speculative-vocab-freqs` | The path of the draft model's small vocab frequency. | None |
+| `--speculative-draft-vocab-path` | The path of the draft model's small vocab frequency. | None |
 
 ## Expert parallelism
 
