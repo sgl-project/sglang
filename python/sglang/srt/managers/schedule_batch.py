@@ -558,22 +558,17 @@ class Req:
             # shape: (bs, 1)
             self.output_token_logprobs_val = []
             self.output_token_logprobs_idx = []
-            self.output_token_original_logprobs_val = []
             # shape: (bs, k)
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
-            self.output_top_original_logprobs_val = []
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
-            self.output_token_ids_original_logprobs_val = []
         else:
             self.output_token_logprobs_val = self.output_token_logprobs_idx = (
                 self.output_top_logprobs_val
             ) = self.output_top_logprobs_idx = self.output_token_ids_logprobs_val = (
                 self.output_token_ids_logprobs_idx
-            ) = self.output_token_original_logprobs_val = (
-                self.output_top_original_logprobs_val
-            ) = self.output_token_ids_original_logprobs_val = None
+            ) = None
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
 

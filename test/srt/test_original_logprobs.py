@@ -133,6 +133,7 @@ class TestOriginalLogprob(unittest.TestCase):
                     model_path=MODEL_ID,
                     skip_tokenizer_init=True,
                     trust_remote_code=True,
+                    mem_fraction_static=0.60,
                 )
 
                 for prompt in PROMPTS:
@@ -168,31 +169,26 @@ class TestOriginalLogprob(unittest.TestCase):
                         outputs = outputs[0]
                     meta = outputs["meta_info"]
 
-                    # Always check regular logprobs
-                    self.assert_logprobs_block_equal(
-                        hf_log_probs=hf_log_probs,
-                        token_log_probs=meta["output_token_logprobs"],
-                        top_log_probs=meta["output_top_logprobs"],
-                        ids_log_probs=meta["output_token_ids_logprobs"],
-                        random_token_ids=random_token_ids,
-                        tag=f"logprobs SGLang vs HF: {prompt} ({env_val})",
-                    )
-
                     # Check original logprobs only if enabled
                     if env_val.lower() == "true":
                         self.assert_logprobs_block_equal(
                             hf_log_probs=hf_original_log_probs,
-                            token_log_probs=meta["output_token_original_logprobs"],
-                            top_log_probs=meta["output_top_original_logprobs"],
-                            ids_log_probs=meta["output_token_ids_original_logprobs"],
+                            token_log_probs=meta["output_token_logprobs"],
+                            top_log_probs=meta["output_top_logprobs"],
+                            ids_log_probs=meta["output_token_ids_logprobs"],
                             random_token_ids=random_token_ids,
                             tag=f"Original logprobs SGLang vs HF: {prompt} ({env_val})",
                         )
                     else:
-                        # Assert original logprobs are not returned
-                        self.assertNotIn("output_token_original_logprobs", meta)
-                        self.assertNotIn("output_top_original_logprobs", meta)
-                        self.assertNotIn("output_token_ids_original_logprobs", meta)
+                        # Always check regular logprobs
+                        self.assert_logprobs_block_equal(
+                            hf_log_probs=hf_log_probs,
+                            token_log_probs=meta["output_token_logprobs"],
+                            top_log_probs=meta["output_top_logprobs"],
+                            ids_log_probs=meta["output_token_ids_logprobs"],
+                            random_token_ids=random_token_ids,
+                            tag=f"logprobs SGLang vs HF: {prompt} ({env_val})",
+                        )
                 sgl_engine.shutdown()
 
 

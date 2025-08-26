@@ -64,19 +64,16 @@ class LogitsProcessorOutput:
     # The logprobs of the next tokens after applying sampling parameters.                 shape: [#seq]
     next_token_logprobs: Optional[torch.Tensor] = None
     # The original logprobs of the next tokens.                              shape: [#seq]
-    next_token_original_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
     # Since the top-k tokens' index are shared between next_token_top_logprobs_val and next_token_top_logprobs_idx,
     # we can use the same index for next_token_top_logprobs_idx.
-    next_token_top_original_logprobs_val: Optional[List] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     next_token_token_ids_logprobs_val: Optional[List] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
     # Since the token_ids' index are shared between next_token_token_ids_logprobs_val and next_token_token_ids_logprobs_idx,
     # we can use the same index for next_token_token_ids_logprobs_idx.
-    next_token_token_ids_original_logprobs_val: Optional[List] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]

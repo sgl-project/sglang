@@ -790,14 +790,13 @@ class EAGLEWorker(TpModelWorker):
         # dividing it to num_draft_tokens will yield the actual batch index.
         temperatures = temperatures[accepted_indices // num_draft_tokens]
         if RETURN_ORIGINAL_LOGPROB:
-            original_logprobs = torch.nn.functional.log_softmax(
+            logprobs = torch.nn.functional.log_softmax(
                 logits_output.next_token_logits, dim=-1
             )
         else:
-            original_logprobs = None
-        logprobs = torch.nn.functional.log_softmax(
-            logits_output.next_token_logits / temperatures, dim=-1
-        )
+            logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits / temperatures, dim=-1
+            )
         batch_next_token_ids = res.verified_id
         num_tokens_per_req = [accept + 1 for accept in res.accept_length_per_req_cpu]
 
@@ -814,10 +813,8 @@ class EAGLEWorker(TpModelWorker):
             (
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
-                logits_output.next_token_top_original_logprobs_val,
             ) = get_top_logprobs(
                 logprobs,
-                original_logprobs,
                 top_logprobs_nums_repeat_interleaved,
             )
 
@@ -825,10 +822,8 @@ class EAGLEWorker(TpModelWorker):
             (
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
-                logits_output.next_token_token_ids_original_logprobs_val,
             ) = get_token_ids_logprobs(
                 logprobs,
-                original_logprobs,
                 token_ids_logprobs_repeat_interleaved,
             )
 
