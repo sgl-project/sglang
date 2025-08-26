@@ -1244,9 +1244,7 @@ class Scheduler(
                 key_string = req.sampling_params.structural_tag
 
             if isinstance(self.grammar_backend, ReasonerGrammarBackend):
-                enable_thinking = req.sampling_params.enable_thinking
-                if enable_thinking is None:
-                    enable_thinking = True
+                enable_thinking = bool(req.sampling_params.enable_thinking)
                 key = (key_type, key_string, enable_thinking)
             else:
                 key = (key_type, key_string)
