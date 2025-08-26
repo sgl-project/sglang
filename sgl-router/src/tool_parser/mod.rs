@@ -5,7 +5,7 @@ pub mod errors;
 pub mod json_parser;
 pub mod mistral_parser;
 pub mod partial_json;
-
+pub mod qwen_parser;
 pub mod registry;
 pub mod state;
 pub mod traits;
@@ -18,6 +18,7 @@ mod tests;
 pub use errors::{ToolParserError, ToolParserResult};
 pub use json_parser::JsonParser;
 pub use mistral_parser::MistralParser;
+pub use qwen_parser::QwenParser;
 pub use registry::ParserRegistry;
 pub use state::{ParsePhase, ParseState};
 pub use traits::{PartialJsonParser, ToolParser};
