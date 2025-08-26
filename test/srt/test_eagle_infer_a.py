@@ -4,6 +4,7 @@ import requests
 import torch
 
 import sglang as sgl
+from sglang.srt.speculative.eagle_worker import prune_draft_vocab
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -318,6 +319,48 @@ class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
         )
         cls.accept_len_threshold = 1.85
 
+
+class TestVocabPruning(CustomTestCase):
+    def test_topk_prune(self):
+        # Create frequencies: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        vocab_freqs = torch.arange(10, dtype=torch.float32)
+
+        # Select top-1 token (token 9 with highest frequency)
+        ret = prune_draft_vocab(vocab_freqs, 1.0)
+        expected = torch.tensor([9])
+        assert torch.equal(ret, expected)
+
+        # Select top-2 tokens (tokens 9, 8)
+        ret = prune_draft_vocab(vocab_freqs, 2.0)
+        expected = torch.tensor([9, 8])
+        assert torch.equal(ret, expected)
+
+        # Select all tokens
+        ret = prune_draft_vocab(vocab_freqs, float(len(vocab_freqs)))
+        expected = torch.tensor([9, 8, 7, 6, 5, 4, 3, 2, 1, 0])  # Sorted by frequency
+        assert torch.equal(ret, expected)
+
+    def test_prob_mass_prune(self):
+        # Use frequencies where we can predict cumulative mass easily
+        # [1, 1, 1, 1, 1, 1, 1, 1, 1, 9] -> total=18
+        # Token 9 has 9/18 = 50% mass, others have 1/18 each
+        vocab_freqs = torch.ones(10)
+        vocab_freqs[9] = 9.0
+
+        # 0.5 threshold should include only token 9 (exactly 50% mass)
+        ret = prune_draft_vocab(vocab_freqs, 0.5)
+        expected = torch.tensor([9])
+        assert torch.equal(ret, expected)
+
+        # 0.6 threshold should include token 9 + one more
+        ret = prune_draft_vocab(vocab_freqs, 0.51)
+        expected = torch.tensor([9, 0])
+        assert torch.equal(ret, expected)
+
+        # 0.99 threshold should include all tokens
+        ret = prune_draft_vocab(vocab_freqs, 0.99)
+        expected = torch.tensor([9, 0, 1, 2, 3, 4, 5, 6, 7, 8]) # tokens in descending frequency order
+        assert torch.equal(ret, expected)
 
 if __name__ == "__main__":
     unittest.main()

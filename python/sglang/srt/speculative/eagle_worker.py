@@ -118,7 +118,7 @@ class EAGLEWorker(TpModelWorker):
         elif server_args.speculative_draft_vocab_path is not None:
             draft_vocab = load_draft_vocab(server_args.speculative_draft_vocab_path)
 
-            # Optionally prune the draft vocabulary by frequency threshold
+            # Optionally prune the draft vocabulary by frequency
             if server_args.speculative_draft_vocab_threshold is None:
                 pruned_draft_vocab = draft_vocab
             else:
@@ -1018,15 +1018,15 @@ def load_draft_vocab(draft_vocab_path: str, vocab_threshold: Optional[float]):
     return draft_vocab
 
 def prune_draft_vocab(vocab_freqs, vocab_threshold:float):
-   """Prune the draft model vocabulary according to the vocab_threshold.
+    """Prune the draft model vocabulary according to the vocab_threshold.
 
     Args:
         vocab_freqs: The frequencies of all tokens in the vocabulary.
         vocab_threshold: Pruning threshold (>=1=top-k, <1=cumulative mass)
 
-   Returns:
-       Tensor of token IDs for the pruned draft model vocabulary.
-   """
+    Returns:
+        Tensor of token IDs for the pruned draft model vocabulary.
+    """
 
     if vocab_threshold >= 1:
         # Keep top-k most frequent tokens for the draft model vocabulary
