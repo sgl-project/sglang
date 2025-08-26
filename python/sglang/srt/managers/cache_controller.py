@@ -617,7 +617,7 @@ class HiCacheController:
                 )
                 break
             self.mem_pool_host.set_from_flat_data_page(
-                host_indices[operation.completed_tokens],
+                host_indices[i * self.page_size],
                 page_data[i],
             )
             if not operation.increment(self.page_size):
