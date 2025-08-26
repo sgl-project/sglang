@@ -536,7 +536,12 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         # Prefer the SDK's context manager if available; fall back to iterator behavior
         stream_ctx = getattr(client.responses, "stream", None)
         if callable(stream_ctx):
-            with client.responses.stream(**payload) as stream:
+            # ctx manager already implies stream=true, the args below error.
+            # in the future check if this behaviour is implied
+            stream_payload = dict(payload)
+            stream_payload.pop("stream", None)
+            stream_payload.pop("stream_options", None)
+            with client.responses.stream(**stream_payload) as stream:
                 for event in stream:
                     et = getattr(event, "type", None)
                     if et == "response.created":
