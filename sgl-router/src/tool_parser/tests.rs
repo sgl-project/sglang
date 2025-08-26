@@ -4,6 +4,7 @@ use crate::tool_parser::partial_json::{
     compute_diff, find_common_prefix, is_complete_json, PartialJson,
 };
 use crate::tool_parser::traits::ToolParser;
+use crate::tool_parser::types::TokenConfig;
 
 #[test]
 fn test_parse_state_new() {
@@ -299,11 +300,11 @@ async fn test_json_parser_with_parameters() {
 #[tokio::test]
 async fn test_json_parser_with_tokens() {
     // Test with custom wrapper tokens
-    let parser = JsonParser::with_config(
-        vec!["[TOOL_CALLS] [".to_string()],
-        vec!["]".to_string()],
-        ", ".to_string(),
-    );
+    let parser = JsonParser::with_config(TokenConfig {
+        start_tokens: vec!["[TOOL_CALLS] [".to_string()],
+        end_tokens: vec!["]".to_string()],
+        separator: ", ".to_string(),
+    });
 
     let input = r#"[TOOL_CALLS] [{"name": "search", "arguments": {"query": "rust programming"}}]"#;
     let result = parser.parse_complete(input).await.unwrap();
@@ -315,11 +316,11 @@ async fn test_json_parser_with_tokens() {
 #[tokio::test]
 async fn test_multiline_json_with_tokens() {
     // Test that regex with (?s) flag properly handles multi-line JSON
-    let parser = JsonParser::with_config(
-        vec!["<tool>".to_string()],
-        vec!["</tool>".to_string()],
-        ", ".to_string(),
-    );
+    let parser = JsonParser::with_config(TokenConfig {
+        start_tokens: vec!["<tool>".to_string()],
+        end_tokens: vec!["</tool>".to_string()],
+        separator: ", ".to_string(),
+    });
 
     // Pretty-printed multi-line JSON
     let input = r#"<tool>{
@@ -493,11 +494,11 @@ mod failure_cases {
 
     #[tokio::test]
     async fn test_broken_wrapper_tokens() {
-        let parser = JsonParser::with_config(
-            vec!["<tool>".to_string()],
-            vec!["</tool>".to_string()],
-            ", ".to_string(),
-        );
+        let parser = JsonParser::with_config(TokenConfig {
+            start_tokens: vec!["<tool>".to_string()],
+            end_tokens: vec!["</tool>".to_string()],
+            separator: ", ".to_string(),
+        });
 
         // Missing end token
         let input = r#"<tool>{"name": "test", "arguments": {}}"#;
@@ -678,11 +679,11 @@ mod edge_cases {
     #[tokio::test]
     async fn test_multiple_token_pairs_with_conflicts() {
         // Test with overlapping token patterns
-        let parser = JsonParser::with_config(
-            vec!["<<".to_string(), "<tool>".to_string()],
-            vec![">>".to_string(), "</tool>".to_string()],
-            ", ".to_string(),
-        );
+        let parser = JsonParser::with_config(TokenConfig {
+            start_tokens: vec!["<<".to_string(), "<tool>".to_string()],
+            end_tokens: vec![">>".to_string(), "</tool>".to_string()],
+            separator: ", ".to_string(),
+        });
 
         // First pattern
         let input = r#"<<{"name": "test1", "arguments": {}}>>"#;

@@ -50,15 +50,28 @@ impl ParserRegistry {
             }
         }
 
-        // Try prefix matching (e.g., "gpt-4" matches "gpt-*")
-        for (pattern, parser_name) in &self.model_mapping {
-            if pattern.ends_with('*') {
-                let prefix = &pattern[..pattern.len() - 1];
-                if model.starts_with(prefix) {
-                    if let Some(parser) = self.parsers.get(parser_name) {
-                        return Some(parser.clone());
-                    }
+        // Try prefix matching with more specific patterns first
+        // Collect all matching patterns and sort by specificity (longer = more specific)
+        let mut matches: Vec<(&String, &String)> = self
+            .model_mapping
+            .iter()
+            .filter(|(pattern, _)| {
+                if pattern.ends_with('*') {
+                    let prefix = &pattern[..pattern.len() - 1];
+                    model.starts_with(prefix)
+                } else {
+                    false
                 }
+            })
+            .collect();
+
+        // Sort by pattern length in descending order (longer patterns are more specific)
+        matches.sort_by_key(|(pattern, _)| std::cmp::Reverse(pattern.len()));
+
+        // Return the first matching parser
+        for (_, parser_name) in matches {
+            if let Some(parser) = self.parsers.get(parser_name) {
+                return Some(parser.clone());
             }
         }
 
@@ -97,20 +110,32 @@ impl ParserRegistry {
         // Anthropic models
         self.map_model("claude-*", "json");
 
-        // Mistral models (will use json until mistral parser is implemented)
-        self.map_model("mistral-*", "json");
-        self.map_model("mixtral-*", "json");
+        // Mistral models - use Mistral parser
+        self.map_model("mistral-*", "mistral");
+        self.map_model("mixtral-*", "mistral");
 
-        // Qwen models (will use json until qwen parser is implemented)
-        self.map_model("qwen*", "json");
+        // Qwen models - use Qwen parser
+        self.map_model("qwen*", "qwen");
+        self.map_model("Qwen*", "qwen");
 
-        // Llama models (will use json until llama parser is implemented)
+        // Llama models
+        // Llama 4 uses pythonic format
+        self.map_model("llama-4*", "pythonic");
+        self.map_model("meta-llama-4*", "pythonic");
+        // Llama 3.2 uses python_tag format
+        self.map_model("llama-3.2*", "llama");
+        self.map_model("meta-llama-3.2*", "llama");
+        // Other Llama models use JSON
         self.map_model("llama-*", "json");
         self.map_model("meta-llama-*", "json");
+
+        // DeepSeek models - DeepSeek v3 would need custom parser, v2 uses pythonic
+        self.map_model("deepseek-*", "pythonic");
 
         // Other models default to JSON
         self.map_model("gemini-*", "json");
         self.map_model("palm-*", "json");
+        self.map_model("gemma-*", "json");
     }
 
     /// Set the default parser

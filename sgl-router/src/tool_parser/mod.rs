@@ -3,7 +3,9 @@
 /// This module provides infrastructure for parsing tool calls from various model formats.
 pub mod errors;
 pub mod json_parser;
+pub mod mistral_parser;
 pub mod partial_json;
+
 pub mod registry;
 pub mod state;
 pub mod traits;
@@ -15,6 +17,7 @@ mod tests;
 // Re-export commonly used types
 pub use errors::{ToolParserError, ToolParserResult};
 pub use json_parser::JsonParser;
+pub use mistral_parser::MistralParser;
 pub use registry::ParserRegistry;
 pub use state::{ParsePhase, ParseState};
 pub use traits::{PartialJsonParser, ToolParser};
