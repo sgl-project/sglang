@@ -274,6 +274,7 @@ class CudaGraphRunner:
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_lookahead()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -440,11 +441,19 @@ class CudaGraphRunner:
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
+        is_token_num_supported = True
+        if self.model_runner.spec_algorithm.is_lookahead():
+            is_token_num_supported = (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
+            and is_token_num_supported
         )
 
     def capture(self) -> None:
@@ -854,6 +863,30 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+
+        elif self.model_runner.spec_algorithm.is_lookahead():
+            from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+            custom_mask = torch.zeros(
+                (num_tokens * self.num_tokens_per_bs),
+                dtype=torch.bool,
+                device=self.device,
+            )
+
+            spec_info = LookaheadVerifyInput(
+                None,
+                custom_mask,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                self.num_tokens_per_bs
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         return spec_info
 

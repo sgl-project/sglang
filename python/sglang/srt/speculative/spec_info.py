@@ -6,6 +6,7 @@ class SpeculativeAlgorithm(IntEnum):
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
+    LOOKAHEAD = auto()
 
     def is_none(self):
         return self == SpeculativeAlgorithm.NONE
@@ -19,12 +20,16 @@ class SpeculativeAlgorithm(IntEnum):
     def is_standalone(self):
         return self == SpeculativeAlgorithm.STANDALONE
 
+    def is_lookahead(self):
+        return self == SpeculativeAlgorithm.LOOKAHEAD
+
     @staticmethod
     def from_string(name: str):
         name_map = {
             "EAGLE": SpeculativeAlgorithm.EAGLE,
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
             "STANDALONE": SpeculativeAlgorithm.STANDALONE,
+            "LOOKAHEAD": SpeculativeAlgorithm.LOOKAHEAD,
             None: SpeculativeAlgorithm.NONE,
         }
         if name is not None:

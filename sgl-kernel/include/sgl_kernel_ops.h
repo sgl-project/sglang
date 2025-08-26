@@ -456,6 +456,29 @@ void verify_tree_greedy(
     at::Tensor target_predict,
     int64_t cuda_stream = 0);
 
+void reconstruct_indices_from_tree_mask(
+    at::Tensor tree_mask,
+    at::Tensor verified_seq_len,
+    at::Tensor positions,             // mutable
+    at::Tensor retrive_index,         // mutable
+    at::Tensor retrive_next_token,    // mutable
+    at::Tensor retrive_next_sibling,  // mutable
+    int64_t batch_size,
+    int64_t draft_token_num);
+
+void lookahead_verify_tree_greedy(
+    at::Tensor accept_token_num,  // mutable
+    at::Tensor accept_token_ids,  // mutable
+    at::Tensor last_verified_ids, // mutable
+    at::Tensor flatten_index,     // mutable
+    at::Tensor total_accept_num,  // mutable
+    at::Tensor candidates,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    at::Tensor target_predict,
+    int64_t eos_token_id);
+
 void build_tree_kernel_efficient(
     at::Tensor parent_list,
     at::Tensor selected_index,
