@@ -534,6 +534,21 @@ class TokenizedGenerateReqInput:
 
 
 @dataclass
+class BatchTokenizedGenerateReqInput:
+    # The batch of tokenized requests
+    batch: List[TokenizedGenerateReqInput]
+
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, i):
+        return self.batch[i]
+
+    def __iter__(self):
+        return iter(self.batch)
+
+
+@dataclass
 class EmbeddingReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
@@ -666,6 +681,21 @@ class TokenizedEmbeddingReqInput:
     data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
+
+
+@dataclass
+class BatchTokenizedEmbeddingReqInput:
+    # The batch of tokenized embedding requests
+    batch: List[TokenizedEmbeddingReqInput]
+
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, i):
+        return self.batch[i]
+
+    def __iter__(self):
+        return iter(self.batch)
 
 
 @dataclass
