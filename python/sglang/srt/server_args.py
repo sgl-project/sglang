@@ -176,7 +176,8 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
-    speculative_token_map: Optional[str] = None
+    speculative_vocab_freqs: Optional[str] = None
+    speculative_vocab_threshold: Optional[float] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -304,6 +305,7 @@ class ServerArgs:
     enable_flashinfer_trtllm_moe: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
+    speculative_token_map: Optional[str] = None
 
     def __post_init__(self):
         # Check deprecated arguments
@@ -336,6 +338,11 @@ class ServerArgs:
             self.moe_runner_backend = "flashinfer_mxfp4"
             print_deprecated_warning(
                 "NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead."
+            )
+        if self.speculative_token_map:
+            self.speculative_vocab_freqs = self.speculative_token_map
+            print_deprecated_warning(
+                "Note: --speculative-token-map is deprecated. Please set `--speculative-token-map` to `speculative_vocab_freqs` instead."
             )
 
         # Set missing default values
@@ -1462,10 +1469,16 @@ class ServerArgs:
             default=ServerArgs.speculative_accept_threshold_acc,
         )
         parser.add_argument(
-            "--speculative-token-map",
+            "--speculative-vocab-freqs",
             type=str,
-            help="The path of the draft model's small vocab table.",
-            default=ServerArgs.speculative_token_map,
+            help="The path to the token frequency file for speculative decoding vocab pruning.",
+            default=ServerArgs.speculative_vocab_freqs,
+        )
+        parser.add_argument(
+            "--speculative-vocab-threshold",
+            type=float,
+            help="Vocab pruning threshold for speculative decoding. If >= 1, keep top N most frequent tokens. If < 1, keep tokens until cumulative frequency mass reaches this threshold (e.g., 0.95 keeps top 95% of token mass).",
+            default=ServerArgs.speculative_vocab_threshold,
         )
 
         # Expert parallelism

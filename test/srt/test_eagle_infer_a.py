@@ -145,7 +145,7 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
         "speculative_num_steps": 5,
         "speculative_eagle_topk": 4,
         "speculative_num_draft_tokens": 8,
-        "speculative_token_map": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
+        "speculative_vocab_freqs": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
         "mem_fraction_static": 0.7,
         "cuda_graph_max_bs": 5,
         "dtype": "float16",
