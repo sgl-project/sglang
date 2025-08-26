@@ -532,7 +532,7 @@ class TokenizerManager:
                 )
             if self.server_args.chunked_prefill_size != -1:
                 raise ValueError(
-                    "input_embeds is provided while chunked prefill is disabled. "
+                    "input_embeds is provided while chunked prefill is enabled. "
                     "Please add `--chunked-prefill-size -1` when you launch the server "
                     "if you want to use input_embeds as inputs."
                 )
