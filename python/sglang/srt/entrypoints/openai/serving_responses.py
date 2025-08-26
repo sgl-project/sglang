@@ -127,7 +127,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     def create_error_response(
         self,
         message: str,
-        err_type: str = "BadRequestError",
+        err_type: str = "invalid_request_error",
         status_code: int = 400,
         param: Optional[str] = None,
     ) -> ORJSONResponse:
@@ -866,8 +866,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         async for ctx in result_generator:
 
-            # If the yielded context doesn't have the harmony streaming interface,
-            # skip per-turn handling and just drain.
+            # Only process context objects that implement the `is_expecting_start()` method,
+            # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
+            # Contexts without this method are skipped, as they do not represent a new turn
+            # or are not compatible with per-turn handling in the /v1/responses endpoint.
             if not hasattr(ctx, "is_expecting_start"):
                 continue
 

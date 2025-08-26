@@ -869,11 +869,13 @@ class ResponsesResponse(BaseModel):
     # OpenAI compatibility fields. not all are used at the moment.
     # Recommend checking https://platform.openai.com/docs/api-reference/responses
     error: Optional[dict] = None
-    incomplete_details: Optional[dict] = None
+    incomplete_details: Optional[dict] = None  # TODO(v) support this input
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
     previous_response_id: Optional[str] = None
     reasoning: Optional[dict] = (
+        # Unused. No model supports this. For GPT-oss, system prompt sets
+        # the field, not server args.
         None  # {"effort": Optional[str], "summary": Optional[str]}
     )
     store: Optional[bool] = None
@@ -882,7 +884,7 @@ class ResponsesResponse(BaseModel):
     top_p: Optional[float] = None
     truncation: Optional[str] = None
     user: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    metadata: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_request(
@@ -916,15 +918,18 @@ class ResponsesResponse(BaseModel):
                 ):
                     return False
                 try:
-                    if getattr(it, "type", None) == "message":
-                        contents = getattr(it, "content", []) or []
-                        for c in contents:
-                            if getattr(c, "type", None) != "output_text":
+                    if isinstance(it, ResponseOutputText):
+                        continue
+                    elif isinstance(it, ResponseOutputMessage):
+                        if not it.content:
+                            continue
+                        for c in it.content:
+                            if not isinstance(c, ResponseOutputText):
                                 return False
                     else:
-                        # unk
+                        # Unknown type, not considered text-only
                         return False
-                except Exception:
+                except AttributeError:
                     return False
             return True
 
@@ -948,7 +953,7 @@ class ResponsesResponse(BaseModel):
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
                 "effort": request.reasoning.effort if request.reasoning else None,
-                "summary": None,
+                "summary": None,  # unused
             },
             store=request.store,
             temperature=request.temperature,

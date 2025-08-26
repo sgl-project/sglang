@@ -310,7 +310,7 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     if request.url.path.startswith("/v1/responses"):
         nested_error = {
             "message": exc.detail,
-            "type": str(exc.status_code),
+            "type": HTTPStatus(exc.status_code).phrase,
             "param": None,
             "code": exc.status_code,
         }
