@@ -255,6 +255,14 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    # for lookahead only
+    speculative_lookahead_min_match_window_size: int = 1
+    speculative_lookahead_max_match_window_size: int = 10
+    speculative_lookahead_min_bfs_breadth: int = 1
+    speculative_lookahead_max_bfs_breadth: int = 7
+    speculative_lookahead_match_type: Literal["BFS", "PROB"] = "BFS"
+    speculative_lookahead_branch_length: int = 18
+    speculative_lookahead_capacity: int = 10*1000*1000
 
     # Expert parallelism
     ep_size: int = 1
@@ -763,6 +771,17 @@ class ServerArgs:
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
             # assert self.speculative_num_steps < self.speculative_num_draft_tokens
+
+        if self.speculative_algorithm == "LOOKAHEAD":
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+            self.speculative_eagle_topk = self.speculative_lookahead_max_bfs_breadth
+            logger.warning(
+                "The overlap scheduler and mixed chunked prefill are disabled because of "
+                "using lookahead speculative decoding."
+            )
 
         # GGUF
         if (
@@ -1490,7 +1509,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "LOOKAHEAD"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -1533,6 +1552,50 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        # Lookahead speculative decoding
+        parser.add_argument(
+            "--speculative-lookahead-min-match-window-size",
+            type=int,
+            default=ServerArgs.speculative_lookahead_min_match_window_size,
+            help="The minimum window size for pattern matching in lookahead speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-lookahead-max-match-window-size",
+            type=int,
+            default=ServerArgs.speculative_lookahead_max_match_window_size,
+            help="The maximum window size for pattern matching in lookahead speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-lookahead-min-bfs-breadth",
+            type=int,
+            default=ServerArgs.speculative_lookahead_min_bfs_breadth,
+            help="The minimum breadth for BFS (Breadth-First Search) in lookahead speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-lookahead-max-bfs-breadth",
+            type=int,
+            default=ServerArgs.speculative_lookahead_max_bfs_breadth,
+            help="The maximum breadth for BFS (Breadth-First Search) in lookahead speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-lookahead-match-type",
+            type=str,
+            choices=["BFS", "PROB"],
+            default=ServerArgs.speculative_lookahead_match_type,
+            help="The match type for cache tree.",
+        )
+        parser.add_argument(
+            "--speculative-lookahead-branch-length",
+            type=int,
+            default=ServerArgs.speculative_lookahead_branch_length,
+            help="The branch length for lookahead speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-lookahead-capacity",
+            type=int,
+            default=ServerArgs.speculative_lookahead_capacity,
+            help="The cache capacity for lookahead speculative decoding.",
         )
 
         # Expert parallelism
