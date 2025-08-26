@@ -81,12 +81,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"This model supports at most {server_context_length} completion tokens."
             )
 
+        if request.response_format and request.response_format.type == "json_schema":
+            schema = getattr(request.response_format.json_schema, "schema_", None)
+            if schema is None:
+                return "schema_ is required for json_schema response format request."
+
         return None
 
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        reasoning_effort = (
+            request.chat_template_kwargs.pop("reasoning_effort", None)
+            if request.chat_template_kwargs
+            else None
+        )
+        if reasoning_effort is not None:
+            request.reasoning_effort = reasoning_effort
+
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
@@ -135,6 +148,16 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        is_gpt_oss = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
+        )
+
+        # GptOss model needs to keep special tokens for harmony parsing
+        if is_gpt_oss:
+            request.skip_special_tokens = False
+
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
@@ -194,6 +217,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_data,
                 modalities,
             )
+
+            # per the Transformers docs & maintainers, tool call arguments in
+            # assistant-role messages with tool_calls need to be dicts not JSON str -
+            # this is how tool-use chat templates will expect them moving forwards
+            # so, for messages that have tool_calls, parse the string (which we get
+            # from openAI format) to dict
+            if (
+                processed_msg["role"] == "assistant"
+                and "tool_calls" in processed_msg
+                and isinstance(processed_msg["tool_calls"], list)
+            ):
+                for item in processed_msg["tool_calls"]:
+                    if "arguments" in item["function"] and isinstance(
+                        item["function"]["arguments"], str
+                    ):
+                        item["function"]["arguments"] = json.loads(
+                            item["function"]["arguments"]
+                        )
+
             openai_compatible_messages.append(processed_msg)
 
         # Handle assistant prefix for continue_final_message
@@ -723,6 +765,7 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
+            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
         )
 
     def _process_logprobs_tokens(
@@ -858,12 +901,15 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             The boolean value of 'enable_thinking' if found, otherwise False.
         """
-        if (
-            hasattr(request, "chat_template_kwargs")
-            and request.chat_template_kwargs
-            and request.chat_template_kwargs.get("enable_thinking") is not None
-        ):
-            return request.chat_template_kwargs.get("enable_thinking")
+        if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
+            # For Qwen3 models, `enable_thinking` is supported.
+            if request.chat_template_kwargs.get("enable_thinking") is not None:
+                return request.chat_template_kwargs.get("enable_thinking")
+            # For DeepSeek-V3.1 models, `thinking` is supported.
+            elif request.chat_template_kwargs.get("thinking") is not None:
+                return request.chat_template_kwargs.get("thinking")
+            else:
+                return False
         return False
 
     async def _process_tool_call_stream(

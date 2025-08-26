@@ -7,7 +7,7 @@ impl ConfigValidator {
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
         // Check if service discovery is enabled
-        let has_service_discovery = config.discovery.as_ref().map_or(false, |d| d.enabled);
+        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
 
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
@@ -344,11 +344,16 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        // IGW mode is independent - skip other compatibility checks when enabled
+        if config.enable_igw {
+            return Ok(());
+        }
+
         // All policies are now supported for both router types thanks to the unified trait design
         // No mode/policy restrictions needed anymore
 
         // Check if service discovery is enabled for worker count validation
-        let has_service_discovery = config.discovery.as_ref().map_or(false, |d| d.enabled);
+        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
 
         // Only validate worker counts if service discovery is disabled
         if !has_service_discovery {

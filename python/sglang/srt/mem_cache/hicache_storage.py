@@ -13,6 +13,11 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 
 
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
@@ -55,7 +60,7 @@ class HiCacheStorage(ABC):
         keys: List[str],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> List[torch.Tensor | None]:
+    ) -> List[torch.Tensor | None] | int:
         """
         Retrieve values for multiple keys.
         Returns a list of tensors or None for each key.
@@ -91,21 +96,39 @@ class HiCacheStorage(ABC):
         pass
 
     @abstractmethod
-    def exists(self, key: str) -> bool | dict:
+    def exists(self, key: str) -> bool:
         """
         Check if the key exists in the storage.
         Returns True if the key exists, False otherwise.
         """
         pass
 
+    def batch_exists(self, keys: List[str]) -> int:
+        """
+        Check if the keys exist in the storage.
+        return the number of consecutive existing keys from the start.
+        Can be overridden by subclasses for more efficient implementation.
+        """
+        for i in range(len(keys)):
+            if not self.exists(keys[i]):
+                return i
+        return len(keys)
+
 
 class HiCacheFile(HiCacheStorage):
 
-    def __init__(self, file_path: str = "/tmp/hicache"):
+    def __init__(self, file_path: str = "/tmp/hicache", is_mla_backend: bool = False):
         self.file_path = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", file_path)
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-        self.tp_suffix = f"_{tp_rank}_{tp_size}" if tp_size > 1 else ""
+        if is_dp_attention_enabled():
+            tp_rank = get_attention_tp_rank()
+            tp_size = get_attention_tp_size()
+        else:
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = get_tensor_model_parallel_world_size()
+
+        self.tp_suffix = (
+            f"_{tp_rank}_{tp_size}" if tp_size > 1 and not is_mla_backend else ""
+        )
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")

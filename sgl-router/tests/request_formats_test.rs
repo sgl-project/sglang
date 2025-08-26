@@ -41,6 +41,8 @@ impl TestContext {
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
+            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
         };
 
         let mut workers = Vec::new();
@@ -98,7 +100,7 @@ impl TestContext {
         let worker_url = &worker_urls[0];
 
         let response = client
-            .post(&format!("{}{}", worker_url, endpoint))
+            .post(format!("{}{}", worker_url, endpoint))
             .json(&body)
             .send()
             .await
