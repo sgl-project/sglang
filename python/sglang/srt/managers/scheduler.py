@@ -659,9 +659,6 @@ class Scheduler(
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
                 )
-                # self.tp_worker.register_hicache_layer_transfer_counter(
-                #     self.tree_cache.layer_done_counter
-                # )
             else:
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,

@@ -171,14 +171,6 @@ class LMCRadixCache(BasePrefixCache):
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = lambda key: tuple(key[:page_size])
 
-        # self.lmcache_connector = LMCacheLayerwiseConnector(
-        #     sgl_config=model_config,
-        #     tp_size=tp_size,
-        #     rank=rank,
-        #     k_pool=self.token_to_kv_pool_allocator._kvcache.k_buffer,
-        #     v_pool=self.token_to_kv_pool_allocator._kvcache.v_buffer,
-        # )
-
         self.lmcache_connector = LMCacheLayerwiseConnector(
             sgl_config=model_config,
             tp_size=tp_size,
@@ -189,9 +181,10 @@ class LMCRadixCache(BasePrefixCache):
 
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
-
         self.layer_done_executor = LayerTransferExecutor(model_config.num_hidden_layers, self.load_stream, self.lmcache_connector, printable=(rank == 0))
         self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_executor(self.layer_done_executor)
+        self.in_flight_nodes = list()
+        self.node_lock = threading.Lock()
         self.reset()
     
     ##### Public API #####
@@ -203,7 +196,9 @@ class LMCRadixCache(BasePrefixCache):
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.in_flight_nodes = list()
         self._record_all_cleared_event()
+        self.lmcache_connector.reset()
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -261,7 +256,7 @@ class LMCRadixCache(BasePrefixCache):
                 last_host_node=last_node,
             )
 
-        slop_mapping = torch.cat([torch.tensor([-1] * prefix_padding_len, dtype=torch.int64, device=self.device), 
+        slop_mapping = torch.cat([torch.tensor([-1] * len(value), dtype=torch.int64, device=self.device), 
             token_prealloc_indices.detach().clone().to(torch.int64).to(self.device)])
         
         with torch.cuda.stream(self.load_stream):
@@ -272,18 +267,6 @@ class LMCRadixCache(BasePrefixCache):
                     offset=len(value) - prefix_padding_len,
                 )
             )
-        # import time
-        # start_time = time.time()
-        # num_retrieved_tokens = self.lmcache_connector.load_kv(
-        #     LoadMetadata(
-        #         token_ids=key,
-        #         slot_mapping=slop_mapping,
-        #         offset=len(value) - prefix_padding_len,
-        #     )
-        # )
-        # print(f"Line 304: num_retrieved_tokens: {num_retrieved_tokens}")
-        # current_stream = torch.cuda.current_stream()
-        # current_stream.synchronize()
         logger.info(f"num_retrieved_tokens: {num_retrieved_tokens}")
         
         if num_retrieved_tokens > 0:
@@ -343,16 +326,16 @@ class LMCRadixCache(BasePrefixCache):
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
-        with torch.cuda.stream(self.store_stream):
-            self.lmcache_connector.store_kv(
-                StoreMetadata(
-                    last_node=req.last_node,
-                    token_ids=token_ids,
-                    kv_indices=kv_indices,
-                    offset=0,
-                )
-            )
-        self.store_stream.synchronize()
+        # with torch.cuda.stream(self.store_stream):
+        #     self.lmcache_connector.store_kv(
+        #         StoreMetadata(
+        #             last_node=req.last_node,
+        #             token_ids=token_ids,
+        #             kv_indices=kv_indices,
+        #             offset=0,
+        #         )
+        #     )
+        # self.store_stream.synchronize()
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
@@ -367,14 +350,19 @@ class LMCRadixCache(BasePrefixCache):
         self.dec_lock_ref(req.last_node)
 
         # Store to LMCache
-        # self.inc_lock_ref(req.last_node)
-        # store_metadata = StoreMetadata(
-        #     last_node=req.last_node,
-        #     token_ids=token_ids,
-        #     kv_indices=kv_indices,
-        #     offset=0,
-        # )
-        # self.store_queue.put(store_metadata)
+        _, new_last_node, _, _ = self.match_prefix(token_ids)
+        self.inc_lock_ref(new_last_node)
+        store_metadata = StoreMetadata(
+            last_node=new_last_node,
+            token_ids=token_ids,
+            kv_indices=kv_indices,
+            offset=0,
+        )
+        with torch.cuda.stream(self.store_stream):
+            self.lmcache_connector.store_kv(store_metadata)
+        assert new_last_node is not None
+        with self.node_lock:
+            self.in_flight_nodes.append(new_last_node)
 
     def cache_unfinished_req(self, req: Req):
         """Cache request when it is unfinished."""
@@ -431,6 +419,12 @@ class LMCRadixCache(BasePrefixCache):
     def evict(self, num_tokens: int):
         if self.disable:
             return
+
+        self.store_stream.synchronize()
+        with self.node_lock:
+            for node in self.in_flight_nodes:
+                self.dec_lock_ref(node)
+            self.in_flight_nodes = list()
 
         leaves = self._collect_leaves()
         heapq.heapify(leaves)
@@ -674,7 +668,7 @@ class LMCRadixCache(BasePrefixCache):
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())
-            
+
     def take_events(self):
         """Atomically takes all events and clears the queue.
 
