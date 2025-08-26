@@ -211,3 +211,78 @@ class HiCacheFile(HiCacheStorage):
             logger.info("Cleared all entries in HiCacheFile storage.")
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
+
+
+class HiCacheTestStorage(HiCacheStorage):
+
+    def __init__(self):
+        self.storage = {}
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        self.tp_suffix = f"_{tp_rank}_{tp_size}" if tp_size > 1 else ""
+
+    def _get_suffixed_key(self, key: str) -> str:
+        return key + self.tp_suffix
+
+    def get(
+        self,
+        key: str,
+        target_location: Optional[torch.Tensor] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> torch.Tensor | None:
+        key = self._get_suffixed_key(key)
+        if key in self.storage:
+            stored_tensor = self.storage[key]
+            if target_location is not None:
+                target_location.copy_(stored_tensor)
+                return target_location
+            return stored_tensor.clone()
+        return None
+
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: Optional[List[torch.Tensor]] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> List[torch.Tensor | None]:
+        if not target_locations:
+            target_locations = [None] * len(keys)
+        return [self.get(key, target) for key, target in zip(keys, target_locations)]
+
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        key = self._get_suffixed_key(key)
+        if value is not None:
+            self.storage[key] = value.clone()
+            return True
+        return False
+
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        if values is None:
+            return False
+        return all(self.set(key, value) for key, value in zip(keys, values))
+
+    def exists(self, key: str) -> bool:
+        key = self._get_suffixed_key(key)
+        return key in self.storage
+
+    def delete(self, key: str) -> bool:
+        key = self._get_suffixed_key(key)
+        if key in self.storage:
+            del self.storage[key]
+            return True
+        return False
+
+    def clear(self) -> None:
+        self.storage.clear()
