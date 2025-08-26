@@ -801,18 +801,6 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
 
-        # 初始化内存日志文件
-        if not hasattr(self, "_memory_log_file"):
-            import datetime
-
-            start_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._memory_log_filename = f"{start_time}_memory_log.txt"
-            self._memory_log_file = open(self._memory_log_filename, "w")
-            self._memory_log_file.write(
-                "timestamp,memory_summary,memory_allocated,memory_reserved\n"
-            )
-            self._memory_log_file.flush()
-
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
