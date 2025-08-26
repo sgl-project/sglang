@@ -33,6 +33,7 @@ from sglang.bench_serving import (
 from sglang.lang.backend.runtime_endpoint import Runtime
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_bool_env_var
 
 
 @dataclasses.dataclass
@@ -420,7 +421,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # handling ModelScope model downloads
-    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() in ("true", "1"):
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE", "false"):
         if os.path.exists(args.model_path):
             print(f"Using local model path: {args.model_path}")
         else:

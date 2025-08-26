@@ -44,10 +44,7 @@ ASSISTANT_SUFFIX = "Assistant:"
 global args
 
 
-# don't want to import sglang package here
-def _get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
+from sglang.srt.utils import get_bool_env_var
 
 
 def _create_bench_client_session():
@@ -598,7 +595,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
 
 def get_model(pretrained_model_name_or_path: str) -> str:
-    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE", "false"):
         import huggingface_hub.constants
         from modelscope import snapshot_download
 
@@ -1386,7 +1383,7 @@ async def benchmark(
         )
 
     # Flush cache
-    if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
+    if ("sglang" in backend and get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
         requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)

@@ -101,6 +101,7 @@ from sglang.srt.utils import (
     add_prometheus_middleware,
     delete_directory,
     get_bool_env_var,
+    get_int_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
@@ -111,7 +112,7 @@ from sglang.version import __version__
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+HEALTH_CHECK_TIMEOUT = get_int_env_var("SGLANG_HEALTH_CHECK_TIMEOUT", 20)
 
 
 # Store global states

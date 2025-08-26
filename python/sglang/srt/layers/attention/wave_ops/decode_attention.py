@@ -17,10 +17,12 @@ from wave_lang.kernel.wave.templates.paged_decode_attention import (
 from wave_lang.kernel.wave.utils.general_utils import get_default_scheduling_params
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 
+from sglang.srt.utils import get_int_env_var
+
 logger = logging.getLogger(__name__)
 import os
 
-dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
+dump_generated_mlir = get_int_env_var("WAVE_DUMP_MLIR", 0)
 
 
 @functools.lru_cache(maxsize=4096)

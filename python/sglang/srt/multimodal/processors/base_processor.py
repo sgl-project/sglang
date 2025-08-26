@@ -13,7 +13,7 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import load_audio, load_image, load_video, logger
+from sglang.srt.utils import get_int_env_var, load_audio, load_image, load_video, logger
 
 
 @dataclasses.dataclass
@@ -161,11 +161,11 @@ class BaseMultimodalProcessor(ABC):
         self.NUM_TOKEN_PER_FRAME = 330
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
+            max_workers=get_int_env_var("SGLANG_IO_WORKERS", 4)
         )
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context("fork"),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            max_workers=get_int_env_var("SGLANG_CPU_WORKERS", os.cpu_count()),
         )
 
         # Mapping from attribute names to modality types

@@ -1377,8 +1377,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        enable_rope_fusion = (
-            os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
+        enable_rope_fusion = get_bool_env_var(
+            "SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1"
         )
         q_len = hidden_states.shape[0]
         q_input = hidden_states.new_empty(

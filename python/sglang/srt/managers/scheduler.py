@@ -149,6 +149,7 @@ from sglang.srt.utils import (
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
+    get_int_env_var,
     get_zmq_socket,
     is_cpu,
     kill_itself_when_parent_died,
@@ -590,7 +591,7 @@ class Scheduler(
                 page_size=self.page_size,
             )
         else:
-            if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
+            if get_bool_env_var("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE"):
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 
@@ -672,7 +673,7 @@ class Scheduler(
             )
         )
 
-        embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
+        embedding_cache_size = get_int_env_var("SGLANG_VLM_CACHE_SIZE_MB", 100)
         init_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_disaggregation(self):

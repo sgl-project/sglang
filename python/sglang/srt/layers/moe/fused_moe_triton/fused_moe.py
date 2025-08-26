@@ -65,7 +65,7 @@ if _is_cuda or _is_hip:
 
 
 logger = logging.getLogger(__name__)
-padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+padding_size = 128 if get_bool_env_var("SGLANG_MOE_PADDING", "0") else 0
 
 
 @triton.jit
