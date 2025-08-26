@@ -4,11 +4,11 @@
 
 namespace {
 
-template <typename scalar_t>
+template <typename scalar_t, typename packed_t>
 void bmm_kernel_impl(
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ mat1,
-    const scalar_t* __restrict__ mat2,
+    const packed_t* __restrict__ mat2,
     int64_t B,
     int64_t M,
     int64_t N,
@@ -67,12 +67,11 @@ void bmm_kernel_impl(
   });
 }
 
-// fp8 bmm
-template <typename scalar_t, typename packed_t>
-void fp8_bmm_kernel_impl(
-    scalar_t* __restrict__ out,
-    const scalar_t* __restrict__ mat1,
-    const packed_t* __restrict__ mat2,
+template <>
+void bmm_kernel_impl(
+    at::BFloat16* __restrict__ out,
+    const at::BFloat16* __restrict__ mat1,
+    const at::Float8_e4m3fn* __restrict__ mat2,
     int64_t B,
     int64_t M,
     int64_t N,
@@ -81,7 +80,7 @@ void fp8_bmm_kernel_impl(
     int64_t mat1_strideM,
     int64_t out_strideB,
     int64_t out_strideM,
-    float scale = 0.f) {
+    float scale) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   const int64_t MB = div_up(M, BLOCK_M);
@@ -91,7 +90,7 @@ void fp8_bmm_kernel_impl(
   int64_t mat2_strideB = N * K;
   int64_t mat2_strideN = K;
 
-  const bool use_brgemm = can_use_brgemm<scalar_t>(M);
+  const bool use_brgemm = can_use_brgemm<at::BFloat16>(M);
 
   // parallel on [B, MB, NB]
   at::parallel_for(0, B * MB * NB, 0, [&](int64_t begin, int64_t end) {
@@ -101,7 +100,7 @@ void fp8_bmm_kernel_impl(
     // for brgemm, use float32 for accumulate
     alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
     // for brgemm when mat2 is float8_e4m3
-    alignas(64) scalar_t Btmp[BLOCK_N * BLOCK_K];
+    alignas(64) at::BFloat16 Btmp[BLOCK_N * BLOCK_K];
 
     for (int i = begin; i < end; ++i) {
       UNUSED(i);
@@ -110,7 +109,7 @@ void fp8_bmm_kernel_impl(
       int nb_start = nb * BLOCK_N;
       int nb_size = std::min(N - nb_start, BLOCK_N);
 
-      fp8_tinygemm_kernel(
+      tinygemm_kernel(
           /*   A */ mat1 + bs * mat1_strideB + mb_start * mat1_strideM,
           /*   B */ mat2 + bs * mat2_strideB + nb_start * mat2_strideN /* nb * BLOCK_N * K */,
           /*   C */ out + bs * out_strideB + mb_start * out_strideM + nb_start,
@@ -175,7 +174,7 @@ void bmm_cpu(
   TORCH_CHECK(out.size(0) == B && out.size(1) == M, "bmm: out shape mismatch!");
   if (!use_fp8_w8a16) {
     AT_DISPATCH_REDUCED_FLOATING_TYPES(mat1.scalar_type(), "bmm_kernel_impl", [&] {
-      bmm_kernel_impl<scalar_t>(
+      bmm_kernel_impl<scalar_t, scalar_t>(
           out.data_ptr<scalar_t>(),
           mat1.data_ptr<scalar_t>(),
           packed_w.data_ptr<scalar_t>(),
@@ -190,13 +189,12 @@ void bmm_cpu(
     });
   } else {  // fp8 bmm
     float scale_val = 0.f;
-    initialize_e4m3_to_16bit_tables<at::BFloat16>();
 
     auto scale_tensor = scale.value();
     TORCH_CHECK(scale_tensor.ndimension() == 0, "bmm: expect scale to be 0-dim tensor.");
     scale_val = scale_tensor.item<float>();
 
-    fp8_bmm_kernel_impl<at::BFloat16, at::Float8_e4m3fn>(
+    bmm_kernel_impl<at::BFloat16, at::Float8_e4m3fn>(
         out.data_ptr<at::BFloat16>(),
         mat1.data_ptr<at::BFloat16>(),
         packed_w.data_ptr<at::Float8_e4m3fn>(),

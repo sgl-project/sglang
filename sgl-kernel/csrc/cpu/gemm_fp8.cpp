@@ -45,6 +45,25 @@ inline void copy_add_stub(
     out[d] = static_cast<scalar_t>(input[d] + bias[d]);
   }
 }
+template <typename scalar_t>
+inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int size, float scale) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+  const fVec vscale = fVec(scale);
+
+  int d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    fVec data0 = fVec::loadu(input + d) * vscale;
+    fVec data1 = fVec::loadu(input + d + fVec::size()) * vscale;
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>(input[d] * scale);
+  }
+}
 
 inline void unpack_B(
     at::BFloat16* __restrict__ Btmp,
@@ -102,6 +121,41 @@ inline void unpack_B(
 #endif
 }
 
+inline void unpack_B(
+    at::BFloat16* __restrict__ Btmp,
+    const at::Float8_e4m3fn* __restrict__ packed_B,
+    int N,
+    int K,
+    int ldb,
+    int ldb_tmp) {
+#if defined(CPU_CAPABILITY_AVX512)
+  // [K/2, N, 2]
+  const int K2 = K >> 1;
+  const int ldb2 = ldb;  // ldb * 2 >> 1;
+  const uint16_t* b_ptr = reinterpret_cast<const uint16_t*>(packed_B);
+
+  // prefetch distance
+  constexpr int PREFETCH_SIZE_K = 64;
+#pragma GCC unroll 4
+  for (int k = 0; k < K2; ++k) {
+    __m512i b8 = _mm512_loadu_si512(b_ptr + k * ldb2);
+    if constexpr (PREFETCH_SIZE_K > 0) {
+      _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2, _MM_HINT_T0);
+    }
+
+    __m256i b8_0 = _mm512_extracti32x8_epi32(b8, 0);
+    __m256i b8_1 = _mm512_extracti32x8_epi32(b8, 1);
+
+    __m512bh bf16_0 = CVT_FP8_TO_BF16(b8_0);
+    __m512bh bf16_1 = CVT_FP8_TO_BF16(b8_1);
+    _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + 0, (__m512i)bf16_0);
+    _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + 32, (__m512i)bf16_1);
+  }
+#else
+  TORCH_CHECK(false, "unpack_B: scalar path not implemented!");
+#endif
+}
+
 template <typename scalar_t, typename packed_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static inline void apply(
@@ -119,6 +173,20 @@ struct tinygemm_kernel_nn {
   }
 };
 
+template <typename scalar_t, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn2 {
+  static inline void apply(
+      const scalar_t* __restrict__ A,
+      const at::Float8_e4m3fn* __restrict__ B,
+      scalar_t* __restrict__ C,
+      float scale,
+      int K,
+      int lda,
+      int ldb,
+      int ldc) {
+    TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
+  }
+};
 #if defined(CPU_CAPABILITY_AVX512)
 template <bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BLOCK_N> {
@@ -220,6 +288,76 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
     Unroll<ROWS * COLS>{}(storec);
   }
 };
+
+template <int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::Float8_e4m3fn* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      float scale,
+      int K,
+      int lda,
+      int ldb,
+      int ldc) {
+    constexpr int ROWS = BLOCK_M;
+    constexpr int COLS = BLOCK_N / 16;
+
+    // prefetch distance
+    constexpr int PREFETCH_SIZE_K = 64;
+
+    __m512bh va;
+    __m512bh vb[COLS];
+    __m512 vc[ROWS * COLS];
+
+    const __m512 vscale = _mm512_set1_ps(scale);
+
+    auto loadc = [&](auto i) { vc[i] = _mm512_setzero_ps(); };
+    Unroll<ROWS * COLS>{}(loadc);
+
+    const int K2 = K >> 1;
+    const int lda2 = lda >> 1;
+    const int ldb2 = ldb;  // ldb * 2 >> 1;
+    const float* a_ptr = reinterpret_cast<const float*>(A);
+    const uint16_t* b_ptr = reinterpret_cast<const uint16_t*>(B);
+
+    auto compute = [&](auto i, int k) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+
+      if constexpr (col == 0) {
+        va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
+      }
+      if constexpr (row == 0) {
+        if constexpr (col % 2 == 0) {
+          __m512i b8 = _mm512_loadu_si512(b_ptr + k * ldb2 + col * 16);
+          if constexpr (PREFETCH_SIZE_K > 0) {
+            _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
+          }
+          vb[col + 0] = CVT_FP8_TO_BF16(_mm512_extracti32x8_epi32(b8, 0));
+          vb[col + 1] = CVT_FP8_TO_BF16(_mm512_extracti32x8_epi32(b8, 1));
+        }
+      }
+      vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
+    };
+    for (int k = 0; k < K2; ++k) {
+      Unroll<ROWS * COLS>{}(compute, k);
+    }
+
+    auto storec = [&](auto i) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+      // for COLS = 2, 4 use 512bit store
+      if constexpr (col % 2 == 0) {
+        __m512 vc0 = _mm512_mul_ps(vc[row * COLS + col + 0], vscale);
+        __m512 vc1 = _mm512_mul_ps(vc[row * COLS + col + 1], vscale);
+        _mm512_storeu_si512(
+            reinterpret_cast<__m512i*>((C + row * ldc + col * 16)), (__m512i)(_mm512_cvtne2ps_pbh(vc1, vc0)));
+      }
+    };
+    Unroll<ROWS * COLS>{}(storec);
+  }
+};
 #endif
 
 #define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                                   \
@@ -234,6 +372,10 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
       ldb,                                                                            \
       ldc,                                                                            \
       block_size_K);
+
+#define LAUNCH_TINYGEMM_KERNEL_NN2(MB_SIZE, NB_SIZE)      \
+  tinygemm_kernel_nn2<scalar_t, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, scale, K, lda, ldb, ldc);
 
 template <typename scalar_t, typename packed_t, bool has_bias>
 struct brgemm {
@@ -254,6 +396,8 @@ struct brgemm {
     TORCH_CHECK(false, "struct brgemm: primary template not implemented!");
   }
 };
+template <typename scalar_t>
+struct brgemm2 {};
 
 template <bool has_bias>
 struct brgemm<at::BFloat16, at::Float8_e4m3fn, has_bias> {
@@ -292,6 +436,42 @@ struct brgemm<at::BFloat16, at::Float8_e4m3fn, has_bias> {
       } else {
         copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
       }
+    }
+  }
+};
+
+template <>
+struct brgemm2<at::BFloat16> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::Float8_e4m3fn* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      at::BFloat16* __restrict__ Btmp,
+      float* __restrict__ Ctmp,
+      float scale,
+      int M,
+      int N,
+      int K,
+      int lda,
+      int ldb,
+      int ldc) {
+    constexpr int BLOCK_N = block_size_n();
+
+    // [BLOCK_K, BLOCK_N] -> [BLOCK_K / 2, BLOCK_N * 2]
+    const int ldb_tmp = block_size_n();
+
+    // accumulate across K per BLOCK_K
+    for (int k = 0; k < K; k += BLOCK_K) {
+      int kb_size = std::min(BLOCK_K, K - k);
+      unpack_B(Btmp, B + k * ldb, N, kb_size, ldb, ldb_tmp);
+
+      const bool add_C = (k != 0);
+      at::native::cpublas::brgemm(M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
+    }
+
+    // copy from Ctmp to C and mul scale
+    for (int m = 0; m < M; ++m) {
+      copy_mul_stub(C + m * ldc, Ctmp + m * BLOCK_N, N, scale);
     }
   }
 };
@@ -349,7 +529,103 @@ void tinygemm_kernel(
     }
   }
 }
+template <typename scalar_t>
+void tinygemm_kernel2(
+    const scalar_t* __restrict__ A,
+    const at::Float8_e4m3fn* __restrict__ B,
+    scalar_t* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    float* __restrict__ Ctmp,
+    float scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg) {
+  if (brg) {
+    brgemm2<scalar_t>::apply(A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc);
+    return;
+  }
 
+  // pattern: 1-8-8
+  if (M == 1) {
+    constexpr int64_t BLOCK_N = 128;
+    const int64_t NB = div_up(N, BLOCK_N);
+    int64_t mb_start = 0;
+
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
+
+      switch (nb_size >> 4) {
+        case 2:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 32);
+          break;
+        case 4:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 64);
+          break;
+        case 6:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 96);
+          break;
+        case 8:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 128);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, 1x", "nb_size");
+      }
+    }
+    return;
+  }
+
+  // pattern: 1-4-16
+  constexpr int64_t BLOCK_M = 4;
+  constexpr int64_t BLOCK_N = 64;
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+  for (int64_t mb = 0; mb < MB; ++mb) {
+    int64_t mb_start = mb * BLOCK_M;
+    int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
+
+      switch (mb_size << 4 | nb_size >> 4) {
+        // mb_size = 1
+        case 0x12:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 32);
+          break;
+        case 0x14:
+          LAUNCH_TINYGEMM_KERNEL_NN2(1, 64);
+          break;
+        // mb_size = 2
+        case 0x22:
+          LAUNCH_TINYGEMM_KERNEL_NN2(2, 32);
+          break;
+        case 0x24:
+          LAUNCH_TINYGEMM_KERNEL_NN2(2, 64);
+          break;
+        // mb_size = 3
+        case 0x32:
+          LAUNCH_TINYGEMM_KERNEL_NN2(3, 32);
+          break;
+        case 0x34:
+          LAUNCH_TINYGEMM_KERNEL_NN2(3, 64);
+          break;
+        // mb_size = 4
+        case 0x42:
+          LAUNCH_TINYGEMM_KERNEL_NN2(4, 32);
+          break;
+        case 0x44:
+          LAUNCH_TINYGEMM_KERNEL_NN2(4, 64);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+      }
+    }
+  }
+}
 template <typename scalar_t>
 void fp8_scaled_mm_kernel_impl(
     scalar_t* __restrict__ out,
@@ -444,7 +720,23 @@ void tinygemm_kernel(
     int64_t block_size_K) {
   tinygemm_kernel<scalar_t, false>(A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K);
 }
-
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const at::Float8_e4m3fn* __restrict__ B,
+    scalar_t* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    float* __restrict__ Ctmp,
+    float scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg) {
+  tinygemm_kernel2<scalar_t>(A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, brg);
+}
 #define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE)    \
   template void tinygemm_kernel<TYPE>(         \
       const TYPE* __restrict__ A,              \
@@ -462,8 +754,25 @@ void tinygemm_kernel(
       bool brg,                                \
       int64_t block_size_K)
 
+#define INSTANTIATE_TINYGEMM_TEMPLATE2(TYPE)   \
+  template void tinygemm_kernel<TYPE>(         \
+      const TYPE* __restrict__ A,              \
+      const at::Float8_e4m3fn* __restrict__ B, \
+      TYPE* __restrict__ C,                    \
+      TYPE* __restrict__ Btmp,                 \
+      float* __restrict__ Ctmp,                \
+      float scale,                             \
+      int64_t M,                               \
+      int64_t N,                               \
+      int64_t K,                               \
+      int64_t lda,                             \
+      int64_t ldb,                             \
+      int64_t ldc,                             \
+      bool brg)
+
 INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
 INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
+INSTANTIATE_TINYGEMM_TEMPLATE2(at::BFloat16);
 
 at::Tensor fp8_scaled_mm_cpu(
     at::Tensor& mat1,

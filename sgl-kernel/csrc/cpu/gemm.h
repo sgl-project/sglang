@@ -56,27 +56,6 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
-// global float8 LUT
-alignas(64) static uint16_t e4m3_to_16bit[256];
-
-template <typename T>
-static void initialize_e4m3_to_16bit_tables() {
-  // run only once
-  static bool initialized_16bit = false;
-  if (!initialized_16bit) {
-    std::cout << "\n@@@@ doing lut init ..." << std::endl;
-    for (uint8_t u8 = 0; u8 < 256; ++u8) {
-      auto value = static_cast<T>(c10::bit_cast<c10::Float8_e4m3fn>(u8));
-      uint16_t value_bits = c10::bit_cast<uint16_t>(value);
-      e4m3_to_16bit[u8] = value_bits;
-      if (u8 == 255) {
-        break;
-      }
-    }
-    initialized_16bit = true;
-  }
-}
-
 // pack weight to vnni format
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
@@ -221,10 +200,10 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K);
 
-template <typename scalar_t, typename packed_t>
-void fp8_tinygemm_kernel(
+template <typename scalar_t>
+void tinygemm_kernel(
     const scalar_t* __restrict__ A,
-    const packed_t* __restrict__ B,
+    const at::Float8_e4m3fn* __restrict__ B,
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
