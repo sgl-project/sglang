@@ -648,7 +648,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert saw_completed, "Did not observe response.completed"
         assert isinstance(aggregated_text, str)
         assert len(aggregated_text) >= 0
-        assert final_usage_ok or True
+        assert final_usage_ok or True  # final_usage's stats are not done for now
 
     def test_response_completion(self):
         resp = self.run_response(temperature=0, max_output_tokens=16)
@@ -664,7 +664,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert saw_created
         assert saw_in_progress
         assert saw_completed
-        assert final_usage_ok or True
+        assert final_usage_ok or True  # final_usage's stats are not done for now
 
     def test_regex(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
