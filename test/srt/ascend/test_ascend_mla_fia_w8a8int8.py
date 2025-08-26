@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -39,11 +40,12 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
             "--quantization",
             "w8a8_int8",
             "--tp-size",
-            4,
+            2,
             "--disable-radix-cache",
         ]
 
     def test_a_gsm8k(self):
+        os.environ["ASCEND_USE_FIA"] = "true"
         for model in self.models:
             with self.subTest(model=model):
                 print(f"##=== Testing accuracy: {model} ===##")
