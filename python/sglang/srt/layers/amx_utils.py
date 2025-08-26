@@ -6,6 +6,15 @@ from sglang.srt.utils import cpu_has_amx_support
 
 logger = logging.getLogger(__name__)
 
+from enum import IntEnum
+
+
+class CPUMoECompMethod(IntEnum):
+    BF16_GEMM = 0
+    INT8_W8A8_GEMM = 1
+    FP8_W8A16_GEMM = 2
+    INT4_W8A16_GEMM = 3
+
 
 def amx_process_weight_after_loading(weight):
     if weight.device != torch.device("cpu"):
