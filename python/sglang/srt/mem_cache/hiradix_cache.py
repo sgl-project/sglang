@@ -536,6 +536,8 @@ class HiRadixCache(RadixCache):
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
+        while not last_host_node.backuped:
+            last_host_node = last_host_node.parent
 
         return MatchResult(
             device_indices=value,
