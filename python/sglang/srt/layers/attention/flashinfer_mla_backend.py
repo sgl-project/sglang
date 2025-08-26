@@ -471,7 +471,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
     def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        self.mha_chunk_kv_cache.update_wrapper(forward_batch)
+        self.mha_ragged_runner.update_wrapper(forward_batch)
 
     def forward_extend(
         self,
