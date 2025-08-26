@@ -116,10 +116,17 @@ class EAGLEWorker(TpModelWorker):
                 )
             self.hot_token_id = None
         elif server_args.speculative_draft_vocab_path is not None:
-            self.hot_token_id = load_draft_vocab(server_args.speculative_draft_vocab_path, server_args.speculative_draft_vocab_threshold)
-            server_args.json_model_override_args = (
-                f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
-            )
+            draft_vocab = load_draft_vocab(server_args.speculative_draft_vocab_path)
+
+            # Optionally prune the draft vocabulary by frequency threshold
+            if server_args.speculative_draft_vocab_threshold is None:
+                pruned_draft_vocab = draft_vocab
+            else:
+                draft_vocab_freqs = draft_vocab
+                pruned_draft_vocab = prune_draft_vocab(draft_vocab_freqs, server_args.speculative_draft_vocab_threshold)
+
+            self.hot_token_id = pruned_draft_vocab
+            server_args.json_model_override_args = (f'{{"hot_vocab_size": {len(self.hot_token_id)}}}')
         else:
             self.hot_token_id = None
 
@@ -993,35 +1000,41 @@ class EAGLEWorker(TpModelWorker):
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
 
 def load_draft_vocab(draft_vocab_path: str, vocab_threshold: Optional[float]):
-    """Load draft model vocabulary with optional frequency-based pruning.
+    """Load draft model vocabulary.
 
-   Args:
-       draft_vocab_path: Path to vocabulary file (token IDs or frequencies)
-       vocab_threshold: Pruning threshold (None=use all, >=1=top-k, <1=cumulative mass)
+    Args:
+        draft_vocab_path: Path to vocabulary file (token IDs or frequencies)
 
-   Returns:
-       Tensor of token IDs to use in draft model vocabulary
+    Returns:
+        Tensor of token IDs or token frequencies for the draft model vocabulary
    """
     # Download if needed
     if not os.path.exists(draft_vocab_path):
         cache_dir = snapshot_download(os.path.dirname(draft_vocab_path), ignore_patterns=["*.bin", "*.safetensors"])
         draft_vocab_path = os.path.join(cache_dir, os.path.basename(draft_vocab_path))
 
-    data = torch.load(draft_vocab_path, weights_only=True)
+    draft_vocab = torch.load(draft_vocab_path, weights_only=True)
+    assert draft_vocab.dtype.is_integer, f"Expected int64 dtype for draft vocab, got {draft_vocab.dtype}"
+    return draft_vocab
 
-    # Case 1: File contains token IDs - no pruning, manually specify the draft vocab
-   if vocab_threshold is None:
-       assert data.dtype.is_integer, f"Expected int64 dtype for token IDs, got {data.dtype}"
-       return data.to(torch.int64)
+def prune_draft_vocab(vocab_freqs, vocab_threshold:float):
+   """Prune the draft model vocabulary according to the vocab_threshold.
 
-    # Case 2: File contains token frequencies over the entire vocab - prune the vocab based on the frequencies
+    Args:
+        vocab_freqs: The frequencies of all tokens in the vocabulary.
+        vocab_threshold: Pruning threshold (>=1=top-k, <1=cumulative mass)
+
+   Returns:
+       Tensor of token IDs for the pruned draft model vocabulary.
+   """
+
     if vocab_threshold >= 1:
         # Keep top-k most frequent tokens for the draft model vocabulary
         assert int(vocab_threshold) == vocab_threshold, f'Expected integer value for top-k selection, got {vocab_threshold}'
-        hot_token_id = torch.topk(data, int(vocab_threshold)).indices
+        hot_token_id = torch.topk(vocab_freqs, int(vocab_threshold)).indices
     elif 0 < vocab_threshold < 1:
         # Keep tokens until relative cumulative frequency mass reaches threshold for the draft model vocabulary
-        sorted_scores, sorted_indices = torch.sort(data, descending=True)
+        sorted_scores, sorted_indices = torch.sort(vocab_freqs, descending=True)
         cumulative_mass = torch.cumsum(sorted_scores, dim=0)
         relative_cumulative_mass = cumulative_mass / cumulative_mass[-1]
         cutoff = relative_cumulative_mass < vocab_threshold
