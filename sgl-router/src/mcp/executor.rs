@@ -16,13 +16,14 @@ impl SimpleExecutor {
     pub async fn execute_tool(
         &self,
         tool_call: ToolCall,
+        tool_name: &str,
         connection: &mut LocalConnection,
     ) -> MCPResult<ToolResult> {
         let start_time = Instant::now();
 
         let result = timeout(
             self.timeout,
-            self.execute_tool_internal(tool_call.clone(), connection),
+            self.execute_tool_internal(tool_call.clone(), tool_name, connection),
         )
         .await
         .map_err(|_| {
@@ -53,15 +54,9 @@ impl SimpleExecutor {
     async fn execute_tool_internal(
         &self,
         tool_call: ToolCall,
+        tool_name: &str,
         connection: &mut LocalConnection,
     ) -> MCPResult<serde_json::Value> {
-        // Remove the server prefix from the tool name (e.g., "server:tool" -> "tool")
-        let tool_name = if let Some(colon_pos) = tool_call.name.rfind(':') {
-            tool_call.name[colon_pos + 1..].to_string()
-        } else {
-            tool_call.name.clone()
-        };
-
         let request = MCPRequest {
             jsonrpc: "2.0".to_string(),
             id: uuid::Uuid::new_v4().to_string(),

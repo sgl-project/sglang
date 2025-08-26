@@ -48,18 +48,18 @@ impl MCPToolHandler {
         self.validate_tool_call(&tool_call).await?;
 
         // Parse the tool name to extract server_id and tool_name
-        let (server_id, _tool_name) = self.parse_tool_name(&tool_call.name)?;
+        let (server_id, tool_name) = self.parse_tool_name(&tool_call.name)?;
 
         // Get the connection for this server
         let mut connections = self.connections.write().await;
-        let connection = connections
-            .get_mut(&server_id)
-            .ok_or_else(|| {
-                MCPError::ConnectionError(format!("Server '{}' not found", server_id))
-            })?;
+        let connection = connections.get_mut(&server_id).ok_or_else(|| {
+            MCPError::ConnectionError(format!("Server '{}' not found", server_id))
+        })?;
 
-        // Execute the tool using the connection
-        self.executor.execute_tool(tool_call, connection).await
+        // Execute the tool using the connection, passing the parsed tool name
+        self.executor
+            .execute_tool(tool_call, &tool_name, connection)
+            .await
     }
 
     pub async fn get_available_tools(&self) -> MCPResult<ToolRegistry> {

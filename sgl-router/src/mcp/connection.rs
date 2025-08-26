@@ -40,7 +40,11 @@ impl LocalConnection {
             ));
         }
 
-        debug!("Connecting to MCP server: {} {}", self.command, self.args.join(" "));
+        debug!(
+            "Connecting to MCP server: {} {}",
+            self.command,
+            self.args.join(" ")
+        );
 
         let child = Command::new(&self.command)
             .args(&self.args)
@@ -61,7 +65,11 @@ impl LocalConnection {
 
     pub async fn disconnect(&mut self) -> MCPResult<()> {
         if let Some(mut process) = self.process.take() {
-            debug!("Disconnecting MCP server: {} {}", self.command, self.args.join(" "));
+            debug!(
+                "Disconnecting MCP server: {} {}",
+                self.command,
+                self.args.join(" ")
+            );
 
             // Attempt to kill the process
             if let Err(e) = process.kill().await {
@@ -72,7 +80,10 @@ impl LocalConnection {
             // Wait for the process to exit to avoid zombie processes
             if let Err(e) = process.wait().await {
                 // Log error but don't fail - we've done our best to clean up
-                warn!("Error waiting for MCP process '{}' to exit: {}", self.command, e);
+                warn!(
+                    "Error waiting for MCP process '{}' to exit: {}",
+                    self.command, e
+                );
             } else {
                 debug!("MCP process '{}' terminated successfully", self.command);
             }

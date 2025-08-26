@@ -284,6 +284,41 @@ async fn test_proper_disconnect_cleanup() {
 }
 
 #[tokio::test]
+async fn test_tool_name_parsing_consistency() {
+    let handler = MCPToolHandler::new_dev_mode().await.unwrap();
+
+    // Add a server
+    handler
+        .add_local_server(
+            "test-server".to_string(),
+            "echo".to_string(),
+            vec!["test".to_string()],
+        )
+        .await
+        .unwrap();
+
+    // Test normal case: "server:tool"
+    let result = handler
+        .execute_tool(ToolCall {
+            name: "test-server:file_read".to_string(),
+            arguments: serde_json::json!({"path": "/test"}),
+        })
+        .await;
+    assert!(result.is_ok());
+
+    // Test that tool validation works - this should fail because the tool doesn't exist
+    let result = handler
+        .execute_tool(ToolCall {
+            name: "test-server:nonexistent_tool".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .await;
+    assert!(result.is_err());
+
+    // The parsing logic is now centralized in the handler and consistent
+}
+
+#[tokio::test]
 async fn test_empty_tool_name_validation() {
     let handler = MCPToolHandler::new_dev_mode().await.unwrap();
 
