@@ -835,15 +835,23 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason["matched"] = None
             try:
                 text, call_info_list = parser.parse_non_stream(text)
-                tool_calls = [
-                    ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:24]}",
-                        function=FunctionResponse(
-                            name=call_info.name, arguments=call_info.parameters
-                        ),
+                tool_calls = []
+                for call_info in call_info_list:
+                    # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
+                    if tool_call_parser == "kimi_k2" and call_info.name is not None:
+                        tool_id = f"functions.{call_info.name}:{call_info.tool_index}"
+                    else:
+                        tool_id = f"call_{uuid.uuid4().hex[:24]}"
+
+                    tool_calls.append(
+                        ToolCall(
+                            id=tool_id,
+                            index=getattr(call_info, "tool_index", None),
+                            function=FunctionResponse(
+                                name=call_info.name, arguments=call_info.parameters
+                            ),
+                        )
                     )
-                    for call_info in call_info_list
-                ]
                 return tool_calls, text, finish_reason
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
@@ -954,7 +962,11 @@ class OpenAIServingChat(OpenAIServingBase):
             # Tool call ID should be generated only once per tool call
             if call_item.name:
                 # First chunk: include ID and function name
-                tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                if self.tokenizer_manager.server_args.tool_call_parser == "kimi_k2":
+                    # Align with Kimi-K2 format: functions.{name}:{index}
+                    tool_call_id = f"functions.{call_item.name}:{call_item.tool_index}"
+                else:
+                    tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
                 function_name = call_item.name
             else:
                 # Subsequent chunks: null ID and name for argument deltas

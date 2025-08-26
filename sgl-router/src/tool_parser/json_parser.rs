@@ -7,7 +7,7 @@ use crate::tool_parser::{
     partial_json::PartialJson,
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamResult, TokenConfig, ToolCall},
 };
 
 /// JSON format parser for tool calls
@@ -19,12 +19,8 @@ use crate::tool_parser::{
 ///
 /// Supports configurable token markers for different models
 pub struct JsonParser {
-    /// Token(s) that mark the start of tool calls
-    start_tokens: Vec<String>,
-    /// Token(s) that mark the end of tool calls
-    end_tokens: Vec<String>,
-    /// Separator between multiple tool calls (reserved for future use)
-    _separator: String,
+    /// Token configuration for parsing
+    token_config: TokenConfig,
     /// Parser for handling incomplete JSON during streaming
     partial_json: PartialJson,
     /// Regex patterns for extracting content between tokens
@@ -34,23 +30,18 @@ pub struct JsonParser {
 impl JsonParser {
     /// Create a new JSON parser with default configuration
     pub fn new() -> Self {
-        Self::with_config(
-            vec![], // No wrapper tokens by default
-            vec![],
-            ", ".to_string(),
-        )
+        Self::with_config(TokenConfig {
+            start_tokens: vec![],
+            end_tokens: vec![],
+            separator: ", ".to_string(),
+        })
     }
 
     /// Create a parser with custom token configuration
-    pub fn with_config(
-        start_tokens: Vec<String>,
-        end_tokens: Vec<String>,
-        separator: String,
-    ) -> Self {
+    pub fn with_config(config: TokenConfig) -> Self {
         // Build extraction patterns for each token pair
-        let extractors = start_tokens
-            .iter()
-            .zip(end_tokens.iter())
+        let extractors: Vec<Regex> = config
+            .iter_pairs()
             .filter_map(|(start, end)| {
                 if !start.is_empty() && !end.is_empty() {
                     // Use (?s) flag to enable DOTALL mode so . matches newlines
@@ -64,9 +55,7 @@ impl JsonParser {
             .collect();
 
         Self {
-            start_tokens,
-            end_tokens,
-            _separator: separator,
+            token_config: config,
             partial_json: PartialJson::default(),
             extractors,
         }
@@ -74,26 +63,90 @@ impl JsonParser {
 
     /// Extract JSON content from text, handling wrapper tokens if configured
     fn extract_json_content<'a>(&self, text: &'a str) -> &'a str {
-        let mut content = text.trim();
+        let mut content = text;
 
-        // Try each extractor pattern
+        // Try each extractor pattern (for tokens with both start and end)
         for extractor in &self.extractors {
             if let Some(captures) = extractor.captures(content) {
                 if let Some(matched) = captures.get(1) {
-                    content = matched.as_str().trim();
-                    break;
+                    return matched.as_str().trim();
                 }
             }
         }
 
         // Handle special case where there's a start token but no end token
-        for (start, end) in self.start_tokens.iter().zip(self.end_tokens.iter()) {
+        for (start, end) in self.token_config.iter_pairs() {
             if !start.is_empty() && end.is_empty() {
-                content = content.strip_prefix(start).unwrap_or(content);
+                // Find the start token and extract everything after it
+                if let Some(pos) = content.find(start) {
+                    content = &content[pos + start.len()..];
+                    return content.trim();
+                }
             }
         }
 
-        content
+        content.trim()
+    }
+
+    /// Try to extract a JSON object or array from text that may contain other content
+    fn extract_json_from_text(&self, text: &str) -> Option<String> {
+        // Look for JSON object starting with {
+        if let Some(start) = text.find('{') {
+            let mut depth = 0;
+            let mut in_string = false;
+            let mut escape_next = false;
+
+            for (i, ch) in text[start..].char_indices() {
+                if escape_next {
+                    escape_next = false;
+                    continue;
+                }
+
+                match ch {
+                    '\\' if in_string => escape_next = true,
+                    '"' if !in_string => in_string = true,
+                    '"' if in_string => in_string = false,
+                    '{' if !in_string => depth += 1,
+                    '}' if !in_string => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(text[start..start + i + 1].to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Look for JSON array starting with [
+        if let Some(start) = text.find('[') {
+            let mut depth = 0;
+            let mut in_string = false;
+            let mut escape_next = false;
+
+            for (i, ch) in text[start..].char_indices() {
+                if escape_next {
+                    escape_next = false;
+                    continue;
+                }
+
+                match ch {
+                    '\\' if in_string => escape_next = true,
+                    '"' if !in_string => in_string = true,
+                    '"' if in_string => in_string = false,
+                    '[' if !in_string => depth += 1,
+                    ']' if !in_string => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(text[start..start + i + 1].to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        None
     }
 
     /// Parse a single JSON object into a ToolCall
@@ -167,13 +220,16 @@ impl JsonParser {
     /// Check if text contains potential tool call markers
     fn has_tool_markers(&self, text: &str) -> bool {
         // If no start tokens configured, check for JSON structure
-        if self.start_tokens.is_empty() {
+        if self.token_config.start_tokens.is_empty() {
             // For JSON, we just need to see the start of an object or array
             return text.contains('{') || text.contains('[');
         }
 
         // Check for any start token
-        self.start_tokens.iter().any(|token| text.contains(token))
+        self.token_config
+            .start_tokens
+            .iter()
+            .any(|token| text.contains(token))
     }
 }
 
@@ -193,6 +249,15 @@ impl ToolParser for JsonParser {
         match serde_json::from_str::<Value>(json_content) {
             Ok(value) => self.parse_json_value(&value),
             Err(_) => {
+                // If no wrapper tokens configured and parse failed,
+                // try to extract JSON from mixed text
+                if self.token_config.start_tokens.is_empty() {
+                    if let Some(extracted) = self.extract_json_from_text(text) {
+                        if let Ok(value) = serde_json::from_str::<Value>(&extracted) {
+                            return self.parse_json_value(&value);
+                        }
+                    }
+                }
                 // Not valid JSON, return empty
                 Ok(vec![])
             }
@@ -341,11 +406,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_with_wrapper_tokens() {
-        let parser = JsonParser::with_config(
-            vec!["<tool>".to_string()],
-            vec!["</tool>".to_string()],
-            ", ".to_string(),
-        );
+        let parser = JsonParser::with_config(TokenConfig {
+            start_tokens: vec!["<tool>".to_string()],
+            end_tokens: vec!["</tool>".to_string()],
+            separator: ", ".to_string(),
+        });
 
         let input = r#"<tool>{"name": "test", "arguments": {}}</tool>"#;
         let result = parser.parse_complete(input).await.unwrap();
