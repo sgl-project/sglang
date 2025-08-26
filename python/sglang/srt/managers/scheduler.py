@@ -2544,6 +2544,13 @@ class Scheduler(
                 message="The role of this server is now PREFILL.",
             )
 
+    def convert_disaggregation_resources(self):
+        """convert the p/d resources to d/p resources."""
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.convert_prefill_resources()
+        else:
+            self.convert_decode_resources()
+
     def get_print_prefix(self):
         prefix = ""
         if self.attn_dp_rank is not None:
@@ -2617,14 +2624,12 @@ def start_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs):
                 scheduler.event_loop_pp_disagg_prefill()
             else:
                 scheduler.event_loop_normal_disagg_prefill()
-        scheduler.flush_prefill_resources()
 
     elif disaggregation_mode == DisaggregationMode.DECODE:
         if scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_decode()
         else:
             scheduler.event_loop_normal_disagg_decode()
-        scheduler.flush_decode_resources()
 
 
 def run_scheduler_process(
@@ -2692,6 +2697,7 @@ def run_scheduler_process(
         else:
             while True:
                 start_scheduler_event_loop(scheduler, server_args)
+                scheduler.convert_disaggregation_resources()
 
     except Exception:
         traceback = get_exception_traceback()

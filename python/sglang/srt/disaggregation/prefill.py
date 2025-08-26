@@ -869,12 +869,12 @@ class SchedulerDisaggregationPrefillMixin:
             )
         return data
 
-    def flush_prefill_resources(self: Scheduler) -> None:
-        """Flush prefill resources"""
+    def convert_prefill_resources(self: Scheduler) -> None:
+        """convert prefill resources to decode resources."""
         if not self.server_args.enable_pd_convert:
             return
         del self.stop_prefill_event
-        logger.info("Flushing prefill resources...")
+        logger.info("Converting prefill resources...")
 
         del self.req_to_metadata_buffer_idx_allocator
         del self.disagg_metadata_buffers

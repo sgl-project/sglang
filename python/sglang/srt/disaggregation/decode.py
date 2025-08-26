@@ -904,8 +904,8 @@ class SchedulerDisaggregationDecodeMixin:
         )  # the requests which kv has arrived
         self.waiting_queue.extend(alloc_reqs)
 
-    def flush_decode_resources(self: Scheduler):
-        """Flush decode resources"""
+    def convert_decode_resources(self: Scheduler):
+        """convert decode resources to prefill resources."""
         if not self.server_args.enable_pd_convert:
             return
         del self.stop_decode_event
