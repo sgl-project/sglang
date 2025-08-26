@@ -519,6 +519,10 @@ class SchedulerOutputProcessorMixin:
                 output_token_ids_logprobs_idx
             ) = None
 
+        uncond_req_to_cond_rid = {
+            uncond: cond_rid for cond_rid, uncond in self.cfg_rid_to_uncond.items()
+        }
+
         for req in reqs:
             if req is skip_req:
                 continue
@@ -528,6 +532,10 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if req.finished():
+                # If this is the unconditioned half of a CFG request, drop the pair from bookkeeping
+                if req in uncond_req_to_cond_rid:
+                    del self.cfg_rid_to_uncond[uncond_req_to_cond_rid[req]]
+
                 if req.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice
                     # because of the one additional delayed token. This "continue" prevented the dummy output.
@@ -551,6 +559,10 @@ class SchedulerOutputProcessorMixin:
                         if not self.model_config.is_multimodal_gen
                         else False
                     )
+
+            # If this is the unconditioned half of a CFG request, don't add to output
+            if req in uncond_req_to_cond_rid:
+                continue
 
             if should_output:
                 send_token_offset = req.send_token_offset
