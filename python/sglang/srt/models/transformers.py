@@ -164,6 +164,7 @@ class TransformersForCausalLM(nn.Module):
 
         # Attention modifications (assumes 1 attention op per hidden layer)
         tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = tp_size
 
         # MLP modifications
         self.tensor_parallel(tp_size)
@@ -213,7 +214,7 @@ class TransformersForCausalLM(nn.Module):
         """
         tp_plan = getattr(self.model.config, "base_model_tp_plan", None) or {}
 
-        if not tp_plan and self.tp_size > 1:
+        if not tp_plan and tp_size > 1:
             raise ValueError(
                 f"{type(self.model)} does not support tensor parallel yet!"
             )
