@@ -318,7 +318,7 @@ class ReasoningParser:
 
         if model_type.lower() == "qwen3":
             is_hybrid = True
-            
+
         # Only pass force_reasoning if explicitly set, let detectors use their defaults
         kwargs = {"stream_reasoning": stream_reasoning}
         if force_reasoning is not None:
