@@ -89,18 +89,18 @@ def _amx_process_weight_after_loading(
         # TODO: support MoE layers for W4A8 path
         use_w4a8 = SGLANG_USE_CPU_INT4_W4A8 and not has_prefix
         qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-            qweight, qzeros, scales, use_w4a8
+            qweight_tensor, qzeros_tensor, scales_tensor, use_w4a8
         )
         packed_qweight = torch.nn.Parameter(
-            qweight,
+            qweight.detach(),
             requires_grad=False,
         )
         packed_qzeros = torch.nn.Parameter(
-            qzeros,
+            qzeros.detach(),
             requires_grad=False,
         )
         packed_scales = torch.nn.Parameter(
-            scales,
+            scales.detach(),
             requires_grad=False,
         )
         packed_qweight.__dict__ = qweight_tensor.__dict__
