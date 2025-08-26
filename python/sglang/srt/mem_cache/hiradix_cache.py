@@ -460,20 +460,13 @@ class HiRadixCache(RadixCache):
             if min_list_size == 0:
                 free_request_ids.clear()
             else:
-                list_value = torch.tensor(
-                    free_request_ids + [0] * (max_list_size - list_size),
-                    dtype=torch.int,
-                )
-                list_values = [
-                    torch.zeros_like(list_value) for _ in range(self.tp_world_size)
-                ]
-                torch.distributed.all_gather(
-                    list_values,
-                    list_value,
+                gathered_free_ids = [None for _ in range(self.tp_world_size)]
+                torch.distributed.all_gather_object(
+                    gathered_free_ids,
+                    free_request_ids,
                     group=self.tp_group,
                 )
-                list_values = [v.tolist() for v in list_values]
-                set_values = [set(v[:s]) for s, v in zip(list_sizes, list_values)]
+                set_values = [set(free_ids) for free_ids in gathered_free_ids]
                 intersection = set.intersection(*set_values)
                 free_request_ids = list(intersection)
 
