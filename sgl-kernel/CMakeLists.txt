@@ -165,7 +165,6 @@ set(SGL_KERNEL_CUDA_FLAGS
 )
 
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
-option(SGL_KERNEL_ENABLE_SM101A           "Enable SM101A"           OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
@@ -179,13 +178,6 @@ if (ENABLE_BELOW_SM90)
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" AND SGL_KERNEL_ENABLE_SM101A)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_101,code=sm_101"
-        "-gencode=arch=compute_101a,code=sm_101a"
-    )
-endif()
-
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
@@ -193,6 +185,23 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
         "-gencode=arch=compute_120,code=sm_120"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
+
+    # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
+    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_110,code=sm_110"
+            "-gencode=arch=compute_110a,code=sm_110a"
+            "-gencode=arch=compute_121,code=sm_121"
+            "-gencode=arch=compute_121a,code=sm_121a"
+            "--compress-mode=size"
+        )
+    else()
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_101,code=sm_101"
+            "-gencode=arch=compute_101a,code=sm_101a"
+        )
+    endif()
+
 else()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-use_fast_math"
