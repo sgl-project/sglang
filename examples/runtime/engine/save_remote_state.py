@@ -14,8 +14,7 @@ python save_remote_state.py \
 Then, the model can be loaded with
 
 llm = Engine(
-    model_path="/path/to/save",
-    --remote-model-url [protocol]://[host]:[port]/[model_name],
+    model_path="[protocol]://[host]:[port]/[model_name]",
     tensor_parallel_size=8,
 )
 """
