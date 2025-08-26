@@ -58,8 +58,6 @@ class AscendKVManager(MooncakeKVManager):
             for layer_id in range(num_layers)
         ]
 
-        assert layers_params is not None
-
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
