@@ -116,9 +116,9 @@ async fn test_empty_and_whitespace_variations() {
     let cases = vec![
         r#"  {"name":"compact","arguments":{}}  "#,
         r#"
-        
+
         {"name": "spaced", "arguments": {}}
-        
+
         "#,
         r#"	{"name": "tabbed", "arguments": {}}	"#, // tabs
     ];
