@@ -406,116 +406,78 @@ impl PDRouter {
             .await?;
         }
 
-        let prefill_workers: Vec<Box<dyn Worker>> = if dp_aware {
-            prefill_urls
-                .into_iter()
-                .flat_map(|(url, port)| {
-                    // get url dp size
-                    let dp_size = match <DPAwareWorker as Worker>::get_dp_size(&url, &api_key) {
-                        Ok(size) => size,
-                        Err(e) => {
-                            panic!("Failed to get DP size for {}: {}", url, e);
-                        }
-                    };
-                    // create dp size workers
-                    (0..dp_size)
-                        .map(|dp_rank| {
-                            let mut worker = DPAwareWorker::new(
-                                url.clone(),
-                                dp_rank,
-                                dp_size,
-                                WorkerType::Prefill {
-                                    bootstrap_port: port,
-                                },
-                            );
-                            worker.base_worker = worker.base_worker
-                                .with_circuit_breaker_config(core_cb_config.clone())
-                                .with_health_config(HealthConfig {
-                                    timeout_secs: health_check_config.timeout_secs,
-                                    check_interval_secs: health_check_config.check_interval_secs,
-                                    endpoint: health_check_config.endpoint.clone(),
-                                    failure_threshold: health_check_config.failure_threshold,
-                                    success_threshold: health_check_config.success_threshold,
-                                });
-                            Box::new(worker) as Box<dyn Worker>
-                        })
-                        .collect::<Vec<Box<dyn Worker>>>()
-                })
-                .collect()
-        } else {
-            prefill_urls
-                .into_iter()
-                .map(|(url, port)| {
-                    let worker = BasicWorker::new(
-                        url,
-                        WorkerType::Prefill {
-                            bootstrap_port: port,
-                        },
-                    )
-                    .with_circuit_breaker_config(core_cb_config.clone())
-                    .with_health_config(HealthConfig {
-                        timeout_secs: health_check_config.timeout_secs,
-                        check_interval_secs: health_check_config.check_interval_secs,
-                        endpoint: health_check_config.endpoint.clone(),
-                        failure_threshold: health_check_config.failure_threshold,
-                        success_threshold: health_check_config.success_threshold,
-                    });
-                    Box::new(worker) as Box<dyn Worker>
-                })
-                .collect()
+        // Helper function to create workers with proper error handling
+        let create_workers = |urls: Vec<(String, Option<u16>)>, is_prefill: bool, dp_aware: bool| -> Result<Vec<Box<dyn Worker>>, String> {
+            if dp_aware {
+                urls.into_iter()
+                    .map(|(url, port)| {
+                        // get url dp size
+                        let dp_size = <DPAwareWorker as Worker>::get_dp_size(&url, &api_key)
+                            .map_err(|e| format!("Failed to get DP size for {}: {}", url, e))?;
+                        // create dp size workers
+                        let workers: Result<Vec<Box<dyn Worker>>, String> = (0..dp_size)
+                            .map(|dp_rank| {
+                                let worker_type = if is_prefill {
+                                    WorkerType::Prefill {
+                                        bootstrap_port: port,
+                                    }
+                                } else {
+                                    WorkerType::Decode
+                                };
+                                let mut worker = DPAwareWorker::new(
+                                    url.clone(),
+                                    dp_rank,
+                                    dp_size,
+                                    worker_type,
+                                );
+                                worker.base_worker = worker.base_worker
+                                    .with_circuit_breaker_config(core_cb_config.clone())
+                                    .with_health_config(HealthConfig {
+                                        timeout_secs: health_check_config.timeout_secs,
+                                        check_interval_secs: health_check_config.check_interval_secs,
+                                        endpoint: health_check_config.endpoint.clone(),
+                                        failure_threshold: health_check_config.failure_threshold,
+                                        success_threshold: health_check_config.success_threshold,
+                                    });
+                                Ok(Box::new(worker) as Box<dyn Worker>)
+                            })
+                            .collect();
+                        workers
+                    })
+                    .collect::<Result<Vec<Vec<Box<dyn Worker>>>, String>>()
+                    .map(|nested| nested.into_iter().flatten().collect())
+            } else {
+                Ok(urls
+                    .into_iter()
+                    .map(|(url, port)| {
+                        let worker_type = if is_prefill {
+                            WorkerType::Prefill {
+                                bootstrap_port: port,
+                            }
+                        } else {
+                            WorkerType::Decode
+                        };
+                        let worker = BasicWorker::new(url, worker_type)
+                            .with_circuit_breaker_config(core_cb_config.clone())
+                            .with_health_config(HealthConfig {
+                                timeout_secs: health_check_config.timeout_secs,
+                                check_interval_secs: health_check_config.check_interval_secs,
+                                endpoint: health_check_config.endpoint.clone(),
+                                failure_threshold: health_check_config.failure_threshold,
+                                success_threshold: health_check_config.success_threshold,
+                            });
+                        Box::new(worker) as Box<dyn Worker>
+                    })
+                    .collect())
+            }
         };
 
-        let decode_workers: Vec<Box<dyn Worker>> = if dp_aware {
-            decode_urls
-                .into_iter()
-                .flat_map(|url| {
-                    // get url dp size
-                    let dp_size = match <DPAwareWorker as Worker>::get_dp_size(&url, &api_key) {
-                        Ok(size) => size,
-                        Err(e) => {
-                            panic!("Failed to get DP size for {}: {}", url, e);
-                        }
-                    };
-                    // create dp size workers
-                    (0..dp_size)
-                        .map(|dp_rank| {
-                            let mut worker = DPAwareWorker::new(
-                                url.clone(),
-                                dp_rank,
-                                dp_size,
-                                WorkerType::Decode,
-                            );
-                            worker.base_worker = worker.base_worker
-                                .with_circuit_breaker_config(core_cb_config.clone())
-                                .with_health_config(HealthConfig {
-                                    timeout_secs: health_check_config.timeout_secs,
-                                    check_interval_secs: health_check_config.check_interval_secs,
-                                    endpoint: health_check_config.endpoint.clone(),
-                                    failure_threshold: health_check_config.failure_threshold,
-                                    success_threshold: health_check_config.success_threshold,
-                                });
-                            Box::new(worker) as Box<dyn Worker>
-                        })
-                        .collect::<Vec<Box<dyn Worker>>>()
-                })
-                .collect()
-        } else {
-            decode_urls
-                .into_iter()
-                .map(|url| {
-                    let worker = BasicWorker::new(url, WorkerType::Decode)
-                        .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(HealthConfig {
-                            timeout_secs: health_check_config.timeout_secs,
-                            check_interval_secs: health_check_config.check_interval_secs,
-                            endpoint: health_check_config.endpoint.clone(),
-                            failure_threshold: health_check_config.failure_threshold,
-                            success_threshold: health_check_config.success_threshold,
-                        });
-                    Box::new(worker) as Box<dyn Worker>
-                })
-                .collect()
-        };
+        let prefill_workers: Vec<Box<dyn Worker>> = create_workers(prefill_urls, true, dp_aware)?;
+        let decode_workers: Vec<Box<dyn Worker>> = create_workers(
+            decode_urls.into_iter().map(|url| (url, None)).collect(),
+            false,
+            dp_aware
+        )?;
 
         let all_urls: Vec<String> = prefill_workers
             .iter()
