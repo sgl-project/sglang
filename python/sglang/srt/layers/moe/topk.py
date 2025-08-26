@@ -256,10 +256,7 @@ class TopK(CustomOp):
                 sm_first=not self.topk_config.renormalize,
             )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
-        elif not self.force_topk and (
-            should_use_flashinfer_trtllm_moe()
-            or get_moe_runner_backend().is_flashinfer_mxfp4()
-        ):
+        elif not self.force_topk and should_use_flashinfer_trtllm_moe():
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
