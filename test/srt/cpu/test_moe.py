@@ -34,7 +34,7 @@ class CPUMoECompMethod(IntEnum):
     BF16_GEMM = 0
     INT8_W8A8_GEMM = 1
     FP8_W8A16_GEMM = 2
-    INT4_W8A16_GEMM = 3
+    INT4_W4A16_GEMM = 3
 
 
 def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
@@ -343,7 +343,7 @@ class TestFusedExperts(CustomTestCase):
             topk_weight,
             topk_ids.to(torch.int32),
             False,
-            CPUMoECompMethod.INT4_W8A16_GEMM,
+            CPUMoECompMethod.INT4_W4A16_GEMM,
             awq_w13_scales_pack,
             awq_w2_scales_pack,
             awq_w13_zero_pack,

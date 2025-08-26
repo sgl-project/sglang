@@ -1098,7 +1098,7 @@ at::Tensor fused_experts_cpu(
   //    BF16_GEMM = 0
   //    INT8_W8A8_GEMM = 1
   //    FP8_W8A16_GEMM = 2
-  //    INT4_W8A16_GEMM = 3
+  //    INT4_W4A16_GEMM = 3
 
   if (moe_comp_method == 1) {
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
