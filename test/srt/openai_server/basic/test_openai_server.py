@@ -443,7 +443,6 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
         )
-        # OpenAI SDK expects base_url ending with /v1 and resource-relative paths
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
@@ -451,7 +450,6 @@ class TestOpenAIServerv1Responses(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    # ---- helpers (liberal args per spec) ----
     def run_response(
         self,
         input_text: str = "The capital of France is",
@@ -485,7 +483,6 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         }
         if metadata is not None:
             payload["metadata"] = metadata
-        # Remove Nones to avoid client validation issues
         payload = {k: v for k, v in payload.items() if v is not None}
         return client.responses.create(**payload)
 
@@ -526,18 +523,14 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             payload["metadata"] = metadata
         payload = {k: v for k, v in payload.items() if v is not None}
 
-        # Stream events; collect outputs and event flags
         aggregated_text = ""
         saw_created = False
         saw_in_progress = False
         saw_completed = False
         final_usage_ok = False
 
-        # Prefer the SDK's context manager if available; fall back to iterator behavior
         stream_ctx = getattr(client.responses, "stream", None)
         if callable(stream_ctx):
-            # ctx manager already implies stream=true, the args below error.
-            # in the future check if this behaviour is implied
             stream_payload = dict(payload)
             stream_payload.pop("stream", None)
             stream_payload.pop("stream_options", None)
@@ -575,10 +568,8 @@ class TestOpenAIServerv1Responses(CustomTestCase):
                                 )
                         except Exception:
                             pass
-                # Also ensure the SDK returns a final response
                 _ = stream.get_final_response()
         else:
-            # Fallback to generator-style (if client supports .create(..., stream=True))
             generator = client.responses.create(**payload)
             for event in generator:
                 et = getattr(event, "type", None)
@@ -601,7 +592,6 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             final_usage_ok,
         )
 
-    # Optionally mirror chat stream helper if needed for parity
     def run_chat_completion_stream(self, logprobs=None, parallel_sample_num=1):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         generator = client.chat.completions.create(
@@ -617,19 +607,16 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             stream_options={"include_usage": True},
             n=parallel_sample_num,
         )
-        # Just drain to validate streaming path is active
         for _ in generator:
             pass
 
     # ---- tests ----
     def test_response(self):
         resp = self.run_response(temperature=0, max_output_tokens=32)
-        # Basic object shape
         assert resp.id
         assert resp.object == "response"
         assert resp.created_at
         assert isinstance(resp.model, str)
-        # Output content exists
         assert isinstance(resp.output, list)
         assert resp.status in (
             "completed",
@@ -643,13 +630,10 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             assert resp.usage.prompt_tokens >= 0
             assert resp.usage.completion_tokens >= 0
             assert resp.usage.total_tokens >= 0
-        # Parity fields (should be present and null/None on success)
-        # Depending on SDK serialization, attributes may be omitted if None
         if hasattr(resp, "error"):
             assert resp.error is None
         if hasattr(resp, "incomplete_details"):
             assert resp.incomplete_details is None
-        # If present and text-only, optional text.format parity
         if getattr(resp, "text", None):
             fmt = resp.text.get("format") if isinstance(resp.text, dict) else None
             if fmt:
@@ -663,10 +647,8 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert saw_in_progress, "Did not observe response.in_progress"
         assert saw_completed, "Did not observe response.completed"
         assert isinstance(aggregated_text, str)
-        # We expect some text in most cases even with small models
         assert len(aggregated_text) >= 0
-        # Validate streaming usage remapping if present
-        assert final_usage_ok or True  # Relax: only assert if the SDK exposes it
+        assert final_usage_ok or True
 
     def test_response_completion(self):
         resp = self.run_response(temperature=0, max_output_tokens=16)
@@ -685,8 +667,6 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert final_usage_ok or True
 
     def test_regex(self):
-        # Keep this identical to existing test, exercising regex via chat.completions.
-        # The Responses API does not expose regex directly in this implementation.
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
@@ -717,7 +697,6 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert isinstance(js_obj["population"], int)
 
     def test_error(self):
-        # Invalid previous_response_id should trigger a 400 with nested error envelope
         url = f"{self.base_url}/responses"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -731,14 +710,12 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         r = requests.post(url, headers=headers, json=payload)
         self.assertEqual(r.status_code, 400)
         body = r.json()
-        # Validate nested error envelope
         self.assertIn("error", body)
         self.assertIn("message", body["error"])
         self.assertIn("type", body["error"])
         self.assertIn("code", body["error"])
 
     def test_penalty(self):
-        # Exercise frequency_penalty via /v1/responses directly
         url = f"{self.base_url}/responses"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -762,7 +739,6 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             self.assertIn("total_tokens", body["usage"])
 
     def test_response_prefill(self):
-        # Reuse the existing chat.completions prefill pattern.
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
