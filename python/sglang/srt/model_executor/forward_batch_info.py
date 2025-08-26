@@ -525,14 +525,14 @@ class ForwardBatch:
                         device=model_runner.device,
                     )
                 else:
-                    mrope_position_deltas = (
-                        mm_input.mrope_position_delta
-                        .flatten()
-                        .to(model_runner.device, non_blocking=True)
+                    mrope_position_deltas = mm_input.mrope_position_delta.flatten().to(
+                        model_runner.device, non_blocking=True
                     )
                     mrope_positions_list[batch_idx] = (
-                        mrope_position_deltas + self.seq_lens[batch_idx] - 1
-                    ).unsqueeze(0).repeat(3, 1)
+                        (mrope_position_deltas + self.seq_lens[batch_idx] - 1)
+                        .unsqueeze(0)
+                        .repeat(3, 1)
+                    )
             elif self.forward_mode.is_extend():
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
