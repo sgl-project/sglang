@@ -971,11 +971,10 @@ class AbortReq:
     rid: str = ""
     # Whether to abort all requests
     abort_all: bool = False
-
-    rids: Optional[Union[List[str], str]] = None
-
+    # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
-
+    # used in MultiTokenzierManager mode
+    rids: Optional[Union[List[str], str]] = None
     def __post_init__(self):
         self.rids = self.rid
 
