@@ -20,16 +20,22 @@ The radix tree data structure for managing the KV cache.
 """
 
 import heapq
-import time
-from collections import defaultdict
-from functools import partial
-from typing import TYPE_CHECKING, List, Optional
-from queue import Queue, Empty
 import threading
-from dataclasses import dataclass
+import time
 import traceback
+from collections import defaultdict
+from dataclasses import dataclass
+from functools import partial
+from queue import Empty, Queue
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
+from lmcache.integration.sglang.sglang_adapter import (
+    LMCacheConnector,
+    LMCacheLayerwiseConnector,
+    LoadMetadata,
+    StoreMetadata,
+)
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -39,13 +45,13 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from lmcache.integration.sglang.sglang_adapter import LMCacheLayerwiseConnector, StoreMetadata, LoadMetadata, LMCacheConnector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.configs.model_config import ModelConfig
 
 import logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -107,6 +113,7 @@ class TreeNode:
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
 
+
 def _key_match_page_size1(key0: List, key1: List):
     i = 0
     for k0, k1 in zip(key0, key1):
@@ -114,6 +121,7 @@ def _key_match_page_size1(key0: List, key1: List):
             break
         i += 1
     return i
+
 
 def _key_match_paged(key0: List, key1: List, page_size: int):
     min_len = min(len(key0), len(key1))
@@ -125,6 +133,7 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
         i += page_size
 
     return i
+
 
 class LayerTransferExecutor:
     def __init__(self, num_layers, load_stream, lmc_connector, printable=False):
@@ -139,7 +148,8 @@ class LayerTransferExecutor:
         self.load_stream.synchronize()
         with self.load_stream:
             self.lmc_connector.load_kv_layerwise(layer_id)
-        
+
+
 class LMCRadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -181,12 +191,19 @@ class LMCRadixCache(BasePrefixCache):
 
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
-        self.layer_done_executor = LayerTransferExecutor(model_config.num_hidden_layers, self.load_stream, self.lmcache_connector, printable=(rank == 0))
-        self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_executor(self.layer_done_executor)
+        self.layer_done_executor = LayerTransferExecutor(
+            model_config.num_hidden_layers,
+            self.load_stream,
+            self.lmcache_connector,
+            printable=(rank == 0),
+        )
+        self.token_to_kv_pool_allocator.get_kvcache().register_layer_transfer_executor(
+            self.layer_done_executor
+        )
         self.in_flight_nodes = list()
         self.node_lock = threading.Lock()
         self.reset()
-    
+
     ##### Public API #####
 
     def reset(self):
@@ -234,7 +251,7 @@ class LMCRadixCache(BasePrefixCache):
 
         uncached_paged_aligned_len = len(key) - len(value)
         chunk_size = self.lmcache_connector.chunk_size()
-        
+
         if uncached_paged_aligned_len == 0:
             return MatchResult(
                 device_indices=value,
@@ -243,12 +260,17 @@ class LMCRadixCache(BasePrefixCache):
             )
 
         prefix_padding_len = len(value) % chunk_size
-            
-        if self.token_to_kv_pool_allocator.available_size() < uncached_paged_aligned_len:
+
+        if (
+            self.token_to_kv_pool_allocator.available_size()
+            < uncached_paged_aligned_len
+        ):
             self.evict(uncached_paged_aligned_len)
-        
+
         # Since the uncached tokens are page-aligned, we do not need to introduce kernel call
-        token_prealloc_indices = self.token_to_kv_pool_allocator.alloc(uncached_paged_aligned_len)
+        token_prealloc_indices = self.token_to_kv_pool_allocator.alloc(
+            uncached_paged_aligned_len
+        )
         if token_prealloc_indices is None:
             return MatchResult(
                 device_indices=value,
@@ -256,9 +278,13 @@ class LMCRadixCache(BasePrefixCache):
                 last_host_node=last_node,
             )
 
-        slop_mapping = torch.cat([torch.tensor([-1] * len(value), dtype=torch.int64, device=self.device), 
-            token_prealloc_indices.detach().clone().to(torch.int64).to(self.device)])
-        
+        slop_mapping = torch.cat(
+            [
+                torch.tensor([-1] * len(value), dtype=torch.int64, device=self.device),
+                token_prealloc_indices.detach().clone().to(torch.int64).to(self.device),
+            ]
+        )
+
         with torch.cuda.stream(self.load_stream):
             num_retrieved_tokens = self.lmcache_connector.start_load_kv(
                 LoadMetadata(
@@ -268,22 +294,40 @@ class LMCRadixCache(BasePrefixCache):
                 )
             )
         logger.info(f"num_retrieved_tokens: {num_retrieved_tokens}")
-        
+
         if num_retrieved_tokens > 0:
-            self.token_to_kv_pool_allocator.free(token_prealloc_indices[(num_retrieved_tokens - prefix_padding_len):])
+            self.token_to_kv_pool_allocator.free(
+                token_prealloc_indices[(num_retrieved_tokens - prefix_padding_len) :]
+            )
         else:
             self.token_to_kv_pool_allocator.free(token_prealloc_indices)
-            
-        # Get a new node for the retreived tokens
+
+        # Get a new node for the retrieved tokens
         if num_retrieved_tokens > 0:
             new_node = TreeNode()
-            new_node.key = key[len(value):len(value) + (num_retrieved_tokens - prefix_padding_len)]
-            new_node.value = token_prealloc_indices[:num_retrieved_tokens - prefix_padding_len]
+            new_node.key = key[
+                len(value) : len(value) + (num_retrieved_tokens - prefix_padding_len)
+            ]
+            new_node.value = token_prealloc_indices[
+                : num_retrieved_tokens - prefix_padding_len
+            ]
             new_node.parent = last_node
-            last_node.children[self.get_child_key_fn(key[len(value):len(value) + (num_retrieved_tokens - prefix_padding_len)])] = new_node
+            last_node.children[
+                self.get_child_key_fn(
+                    key[
+                        len(value) : len(value)
+                        + (num_retrieved_tokens - prefix_padding_len)
+                    ]
+                )
+            ] = new_node
             last_node = new_node
-            value = torch.cat([value, token_prealloc_indices[:num_retrieved_tokens - prefix_padding_len]])
-            self.evictable_size_ += (num_retrieved_tokens - prefix_padding_len)
+            value = torch.cat(
+                [
+                    value,
+                    token_prealloc_indices[: num_retrieved_tokens - prefix_padding_len],
+                ]
+            )
+            self.evictable_size_ += num_retrieved_tokens - prefix_padding_len
             self._record_store_event(last_node.parent)
             self._record_store_event(last_node)
 
@@ -325,17 +369,6 @@ class LMCRadixCache(BasePrefixCache):
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
-
-        # with torch.cuda.stream(self.store_stream):
-        #     self.lmcache_connector.store_kv(
-        #         StoreMetadata(
-        #             last_node=req.last_node,
-        #             token_ids=token_ids,
-        #             kv_indices=kv_indices,
-        #             offset=0,
-        #         )
-        #     )
-        # self.store_stream.synchronize()
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
