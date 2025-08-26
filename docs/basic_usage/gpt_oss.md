@@ -72,8 +72,9 @@ tools = [
 # Reasoning level example
 response = client.responses.create(
     model="openai/gpt-oss-120b",
-    instructions="You are a helpful assistant. Reasoning: high",  # also supports "medium" or "low"
-    input="In one sentence, explain what embeddings are.",
+    instructions="You are a helpful assistant."
+    reasoning_effort="high" # Supports high, medium, or low
+    input="In one sentence, explain the transformer architecture.",
 )
 print("====== reasoning: high ======")
 print(response.output_text)
