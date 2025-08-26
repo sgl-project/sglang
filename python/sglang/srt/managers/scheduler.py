@@ -1759,8 +1759,8 @@ class Scheduler(
         return batch
 
     def _run_fake_extend_batch(self, batch: ScheduleBatch):
-        if self.prepare_dp_attn_flag:
-            idle_batch, _ = self.prepare_dp_attn_batch(None)
+        if self.prepare_mlp_sync_flag:
+            idle_batch = self.prepare_mlp_sync_batch(None)
         else:
             idle_batch = None
         if idle_batch:  # launch an idle batch instead

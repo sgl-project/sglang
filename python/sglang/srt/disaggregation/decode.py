@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import threading
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -51,7 +52,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import get_int_env_var, require_mlp_sync
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -722,7 +723,9 @@ class SchedulerDisaggregationDecodeMixin:
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
-                self.process_batch_result(tmp_batch, tmp_result, batch.launch_done if batch else None)
+                self.process_batch_result(
+                    tmp_batch, tmp_result, batch.launch_done if batch else None
+                )
 
             if batch is None and (
                 len(self.waiting_queue)
@@ -733,16 +736,6 @@ class SchedulerDisaggregationDecodeMixin:
                 self.self_check_during_idle()
 
             self.last_batch = batch
-            self.last_batch_in_queue = last_batch_in_queue
-
-    def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
-        batch = self.prepare_mlp_sync_batch(batch)
-        result = None
-        if batch:
-            result = self.run_batch(batch)
-            if not delay_process:
-                self.process_batch_result(batch, result)
-        return batch, result
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
@@ -788,7 +781,7 @@ class SchedulerDisaggregationDecodeMixin:
             if self.prepare_mlp_sync_flag:
                 # in dp, idle batch is created if ret is None.
                 # for fake prefill, the dp batch is also idle and created in run_batch
-                ret, _ = self.prepare_dp_attn_batch(ret)
+                ret = self.prepare_mlp_sync_batch(ret)
 
         return ret
 

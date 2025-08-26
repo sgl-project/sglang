@@ -285,7 +285,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
 
-            if require_mlp_sync(self.server_args):
+            if self.prepare_mlp_sync_flag:
                 batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
 
@@ -317,7 +317,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
 
-            if require_mlp_sync(self.server_args):
+            if self.prepare_mlp_sync_flag:
                 batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
             if batch:
