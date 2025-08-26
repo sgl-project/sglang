@@ -258,12 +258,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
-        self.flashinfer_mla_disable_ragged = global_server_args_dict[
-            "flashinfer_mla_disable_ragged"
-        ]
-
-    def is_mha_chunk_supported(self):
-        return not self.flashinfer_mla_disable_ragged
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -296,19 +290,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
             self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify)
         else:
-            if forward_batch.num_prefix_chunks is not None:
-                self.mha_ragged_runner.update_wrapper(forward_batch)
-            else:
-                self.indices_updater_prefill.update(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_sum,
-                    forward_batch.extend_prefix_lens,
-                    prefill_wrapper_paged=self.prefill_wrapper_paged,
-                )
-                self.forward_metadata = PrefillMetadata(
-                    self.prefill_wrapper_paged,
-                )
+            prefix_lens = forward_batch.extend_prefix_lens
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
+                prefix_lens,
+                prefill_wrapper_paged=self.prefill_wrapper_paged,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrapper_paged,
+            )
 
     def init_cuda_graph_state(
         self,
@@ -477,6 +469,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
+        """Init the metadata for a forward pass."""
+        self.mha_chunk_kv_cache.update_wrapper(forward_batch)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -488,10 +484,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if forward_batch.num_prefix_chunks is not None:
-            assert forward_batch.attn_attend_prefix_cache is not None
-            assert not forward_batch.forward_mode.is_target_verify()
-            assert not forward_batch.forward_mode.is_draft_extend()
+        if (
+            forward_batch.attn_attend_prefix_cache is not None
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend()
+        ):
             assert q_rope is None
             assert k_rope is None
             return self.mha_ragged_runner.forward(q, k, v, layer, forward_batch)

@@ -340,9 +340,6 @@ class FlashAttentionBackend(AttentionBackend):
             else None
         )
 
-    def is_mha_chunk_supported(self):
-        return True
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()

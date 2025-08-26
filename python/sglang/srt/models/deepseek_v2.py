@@ -43,6 +43,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.mha_chunk_prefix.tuned import tuned_dispatch_mha_chunk
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -893,11 +894,27 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
 
+        self.flashinfer_mla_disable_ragged = global_server_args_dict[
+            "flashinfer_mla_disable_ragged"
+        ]
+        self.disable_chunked_prefix_cache = global_server_args_dict[
+            "disable_chunked_prefix_cache"
+        ]
+
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
         )
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
+        )
+
+        # TODO: Design a finer way to determine the threshold
+        self.chunked_prefix_cache_threshold = get_int_env_var(
+            "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
+        )
+
+        self.chunked_prefix_cache_use_tuned = get_bool_env_var(
+            "SGL_CHUNKED_PREFIX_CACHE_USE_TUNED", "false"
         )
 
         # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
@@ -974,13 +991,27 @@ class DeepseekV2AttentionMLA(nn.Module):
                 else:
                     return AttnForwardMethod.MLA
 
-        # Determine attention backend used by current forward batch
-        if forward_batch.forward_mode.is_decode_or_idle():
-            attention_backend = global_server_args_dict["decode_attention_backend"]
-        else:
-            attention_backend = global_server_args_dict["prefill_attention_backend"]
-        self.current_attention_backend = attention_backend
+        def _dispatch_mha_chunk():
+            if forward_batch.extend_prefix_lens_cpu is None:
+                return False
+            sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
+            if sum_extend_prefix_lens != 0 and self.disable_chunked_prefix_cache:
+                return False
+            if self.chunked_prefix_cache_use_tuned:
+                rst = tuned_dispatch_mha_chunk(
+                    self.current_attention_backend,
+                    self.num_local_heads,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.seq_lens_cpu,
+                )
+                if rst is not None:
+                    return rst
+            return (
+                sum_extend_prefix_lens == 0
+                or sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
+            )
 
+        attention_backend = self.current_attention_backend
         if attention_backend == "ascend":
             return AttnForwardMethod.MLA
         elif (
@@ -990,7 +1021,18 @@ class DeepseekV2AttentionMLA(nn.Module):
             or attention_backend == "trtllm_mla"
             or attention_backend == "cutlass_mla"
         ):
-            if forward_batch.num_prefix_chunks is not None:
+            # Use MHA with chunked KV cache when prefilling on long sequences.
+            # Flashinfer MLA: Do not absorb when enabling ragged prefill
+            disable_ragged = (
+                attention_backend == "flashinfer" or attention_backend == "flashmla"
+            ) and self.flashinfer_mla_disable_ragged
+            if (
+                not disable_ragged
+                and forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+                and _dispatch_mha_chunk()
+            ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return _dispatch_mla_subtype()
@@ -1059,7 +1101,18 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, None, forward_batch, None
 
-        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        # Determine attention backend used by current forward batch
+        if forward_batch.forward_mode.is_decode_or_idle():
+            attention_backend = global_server_args_dict["decode_attention_backend"]
+        else:
+            attention_backend = global_server_args_dict["prefill_attention_backend"]
+        self.current_attention_backend = attention_backend
+
+        if forward_batch.attn_forward_method is None:
+            forward_batch.attn_forward_method = self.dispatch_attn_forward_method(
+                forward_batch
+            )
+        attn_forward_method = forward_batch.attn_forward_method
 
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
@@ -1682,6 +1735,12 @@ class DeepseekV2AttentionMLA(nn.Module):
 
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        # Only initialize the info once
+        if forward_batch.num_prefix_chunks is None:
+            forward_batch.prepare_chunked_prefix_cache_info(q.device)
+            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
+                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)

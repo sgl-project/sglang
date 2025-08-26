@@ -223,7 +223,7 @@ class ForwardBatch:
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether the kv cache needs to be attended in current pass
     attn_attend_prefix_cache: Optional[bool] = None
-    # Number of prefix cache chunks, None when mha chunk is disabled
+    # Number of prefix cache chunks
     num_prefix_chunks: Optional[int] = None
     # Index of current chunk, used by attention backend
     prefix_chunk_idx: Optional[int] = None
@@ -244,6 +244,7 @@ class ForwardBatch:
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether lse needs to be returned
     mha_return_lse: Optional[bool] = None
+    attn_forward_method: Optional["AttnForwardMethod"] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None

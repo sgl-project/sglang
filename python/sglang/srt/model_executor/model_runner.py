@@ -53,7 +53,6 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.layers.attention.mha_chunk_prefix.utils import MhaChunkHelper
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -1427,7 +1426,6 @@ class ModelRunner:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
-        self.mha_chunk_helper = MhaChunkHelper(self)
 
     def _get_attention_backend(self):
         """Init attention kernel backend."""
@@ -1661,13 +1659,6 @@ class ModelRunner:
         device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
         tensor_parallel(self.model, device_mesh)
 
-    def init_mha_chunk_prefix(self, forward_batch: ForwardBatch):
-        run_mha_chunk = self.mha_chunk_helper.dispatch_mha_chunk(forward_batch)
-        if not run_mha_chunk:
-            forward_batch.num_prefix_chunks = None
-            return
-        forward_batch.prepare_chunked_prefix_cache_info(self.device)
-
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -1694,7 +1685,6 @@ class ModelRunner:
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         if not skip_attn_backend_init:
-            self.init_mha_chunk_prefix(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
 
         kwargs = {}
