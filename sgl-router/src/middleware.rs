@@ -447,7 +447,10 @@ pub async fn concurrency_limit_middleware(
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
         let response = next.run(request).await;
-        // Token is automatically returned to bucket when request completes
+
+        // Return the token to the bucket
+        token_bucket.return_tokens(1.0).await;
+
         response
     } else {
         // No tokens available, try to queue if enabled
@@ -470,7 +473,10 @@ pub async fn concurrency_limit_middleware(
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
                             let response = next.run(request).await;
-                            // Token is automatically returned when request completes
+
+                            // Return the token to the bucket
+                            token_bucket.return_tokens(1.0).await;
+
                             response
                         }
                         Ok(Err(status)) => {

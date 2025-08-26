@@ -32,6 +32,13 @@ impl TokenBucket {
         let capacity = capacity as f64;
         let refill_rate = refill_rate as f64;
 
+        // Ensure refill_rate is not zero to prevent division by zero
+        let refill_rate = if refill_rate > 0.0 {
+            refill_rate
+        } else {
+            1.0 // Default to 1 token per second if zero
+        };
+
         Self {
             inner: Arc::new(Mutex::new(TokenBucketInner {
                 tokens: capacity, // Start full
