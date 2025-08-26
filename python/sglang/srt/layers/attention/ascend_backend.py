@@ -406,9 +406,16 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
     ):
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
-            )
+            if self.use_mla:
+                k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+                k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
 
         if self.graph_mode:
             return self.forward_decode_graph(
@@ -442,6 +449,9 @@ class AscendAttnBackend(AttentionBackend):
         else:
             if (self.use_fia) and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
+                num_tokens = q.shape[0]
+                kv_c = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                k_pe = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
                 kv_c = kv_c.view(
                     -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
                 )
