@@ -37,6 +37,12 @@ pub struct RouterConfig {
     pub request_id_headers: Option<Vec<String>>,
     /// Maximum concurrent requests allowed (for rate limiting)
     pub max_concurrent_requests: usize,
+    /// Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)
+    pub queue_size: usize,
+    /// Maximum time (in seconds) a request can wait in queue before timing out
+    pub queue_timeout_secs: u64,
+    /// Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    pub rate_limit_tokens_per_second: Option<usize>,
     /// CORS allowed origins
     pub cors_allowed_origins: Vec<String>,
     /// Retry configuration
@@ -320,6 +326,9 @@ impl Default for RouterConfig {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 256,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -466,6 +475,9 @@ mod tests {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -899,6 +911,9 @@ mod tests {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -956,6 +971,9 @@ mod tests {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1009,6 +1027,9 @@ mod tests {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            queue_size: 100,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
         };
 
         assert!(config.has_service_discovery());

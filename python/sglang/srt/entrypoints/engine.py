@@ -23,8 +23,10 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import random
 import signal
 import threading
+import time
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
@@ -654,6 +656,11 @@ def _set_envs_and_config(server_args: ServerArgs):
     # flashinfer uses this environment variable for various kernels from MoE to quant kernels
     os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
+    # Can also be passed as argument
+    os.environ["SGLANG_RUN_ID"] = (
+        f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
+    )
+
     # Set prometheus env vars
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()
@@ -665,7 +672,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.11.post3",
+            "0.2.14.post1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
