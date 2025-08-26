@@ -1471,7 +1471,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-draft-vocab-path",
             type=str,
-            help="The path to the draft model's vocabulary file. If `None`, uses the full draft model vocabulary. Otherwise expects a file with either token IDs or token frequencies to specify a pruned draft model vocabulary.",
+            help="The path to the draft model's vocabulary file. If `None`, uses the full draft model vocabulary. Otherwise expects a file with either token IDs or token frequencies.",
             default=ServerArgs.speculative_draft_vocab_path,
         )
         parser.add_argument(
