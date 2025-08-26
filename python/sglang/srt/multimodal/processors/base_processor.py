@@ -1,6 +1,7 @@
 import concurrent
 import concurrent.futures
 import dataclasses
+import hashlib
 import multiprocessing as mp
 import os
 import re
@@ -9,11 +10,137 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import transformers
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import load_audio, load_image, load_video, logger
+from sglang.srt.utils import (
+    get_bool_env_var,
+    load_audio,
+    load_image,
+    load_video,
+    logger,
+)
+
+CACHED_IMAGE_MAX_NUM = 64
+QWEN2_VL_PATCH_SIZE = 196.0
+QWEN2_PER_TOKEN_PATCH_NUM = 4
+QWEN2_PATCH_SIZE = 14
+
+VISION_START_TOKEN = 151652
+IMG_PAD_TOKEN = 151655
+VISION_END_TOKEN = 151653
+
+
+def fast_image_hash(img: Image.Image, hash_type: str = "int") -> int | str:
+    small_img = img.resize((8, 8), Image.Resampling.BILINEAR).convert("L")
+    pixel_data = small_img.tobytes()
+    hash_obj = hashlib.md5(pixel_data)
+
+    if hash_type == "int":
+        return int.from_bytes(hash_obj.digest(), byteorder="little", signed=False)
+    else:
+        return hash_obj.hexdigest()
+
+
+def image_to_int(img: Image.Image) -> int:
+    img_bytes = img.tobytes()
+    hash_obj = hashlib.md5(img_bytes)
+    hash_bytes = hash_obj.digest()
+    return int.from_bytes(hash_bytes, byteorder="big")
+
+
+class FIFOHashTable:
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+        self.hash_map = {}
+        self.order = []
+
+    def add(self, key: int, value):
+        if key in self.hash_map:
+            self.order.remove(key)
+        self.hash_map[key] = value
+        self.order.append(key)
+        if len(self.hash_map) > self.max_size:
+            oldest_key = self.order.pop(0)
+            return oldest_key
+        return None
+
+    def get(self, key: int):
+        return self.hash_map.get(key)
+
+    def size(self):
+        return len(self.hash_map)
+
+    def erase(self, key: int):
+        self.hash_map.pop(key)
+
+
+def operate_substrings(original_str, target_sub, indices, replace_str=""):
+
+    positions = []
+    start = 0
+    target_len = len(target_sub)
+    while True:
+        pos = original_str.find(target_sub, start)
+        if pos == -1:
+            break
+        positions.append(pos)
+        start = pos + target_len
+
+    for idx in indices:
+        if idx < 0 or idx >= len(positions):
+            raise ValueError(f"invalid {idx} idx can only be 0 ~ {len(positions)-1}")
+    unique_indices = sorted(list(set(indices)))
+
+    result = original_str
+    offset = 0
+    replace_len = len(replace_str)
+    delta = replace_len - target_len
+
+    for idx in unique_indices:
+        original_pos = positions[idx]
+        current_pos = original_pos + offset
+
+        if replace_str:
+            result = (
+                result[:current_pos] + replace_str + result[current_pos + target_len :]
+            )
+        else:
+            result = result[:current_pos] + result[current_pos + target_len :]
+
+        offset += delta
+
+    return result
+
+
+def get_img_height_in_tensor(img: Image):
+    ret = int((img.size[0] * img.size[1]) / QWEN2_VL_PATCH_SIZE)
+    if ret < 1:
+        raise ValueError("invalid image height")
+    return ret
+
+
+def insert_input_ids(input_ids, target_id, forbid_id_before_target, insert_ids):
+    target_positions = (input_ids[0] == target_id).nonzero().squeeze(dim=1)
+    for pos in target_positions:
+        if pos == 0 or input_ids[0][pos - 1] != forbid_id_before_target:
+            new_length = len(input_ids[0]) + len(insert_ids) - 1
+            new_tensor = torch.empty(
+                1,
+                new_length,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            new_tensor[0][:pos] = input_ids[0][:pos]
+            new_tensor[0][pos : pos + len(insert_ids)] = torch.tensor(
+                insert_ids, dtype=input_ids.dtype, device=input_ids.device
+            )
+            new_tensor[0][pos + len(insert_ids) :] = input_ids[0][pos + 1 :]
+            return new_tensor
+
+    return input_ids
 
 
 @dataclasses.dataclass
@@ -206,6 +333,8 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
+        self.hash_table = FIFOHashTable(CACHED_IMAGE_MAX_NUM)
+
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
     ) -> dict:
@@ -233,18 +362,152 @@ class BaseMultimodalProcessor(ABC):
             and not self.server_args.disable_fast_image_processor
         ):
             kwargs["device"] = "cuda"
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="pt",
-            **kwargs,
+
+        cache_mm_image_items = get_bool_env_var("SGL_CACHE_MM_IMAGE")
+        is_qwen2_processor = isinstance(
+            processor.image_processor,
+            transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast,
         )
-        # move feature tensors to cpu
-        for feature_name in self.FEATURE_NAMES:
-            if feature_name in result and isinstance(
-                result[feature_name], torch.Tensor
-            ):
-                result[feature_name] = result[feature_name].to("cpu")
+
+        if cache_mm_image_items and is_qwen2_processor:
+
+            to_replace_str = "<|vision_start|><|image_pad|><|vision_end|>"
+            repalce_str = "<|vision_end|>"
+            v_start_token, img_pad_token, v_end_token = (
+                VISION_START_TOKEN,
+                IMG_PAD_TOKEN,
+                VISION_END_TOKEN,
+            )
+
+            img_hash_keys = []
+            img_heights = []
+            new_processed_imgs = []
+            new_processed_img_idxes = []
+            img_token_nums = []
+            remove_image_idx = []
+            processed_img_heights = []
+            for img_idx in range(len(images)):
+                hash_key = image_to_int(images[img_idx])
+                img_hash_keys.append(hash_key)
+                img_height = get_img_height_in_tensor(images[img_idx])
+                img_token_num = int(img_height / QWEN2_PER_TOKEN_PATCH_NUM)
+
+                if img_token_num < 1:
+                    raise ValueError("invalid img token num")
+
+                if self.hash_table.get(hash_key) is None:
+                    new_processed_img_idxes.append(img_idx)
+                    new_processed_imgs.append(images[img_idx])
+                else:
+                    remove_image_idx.append(img_idx)
+
+                img_heights.append(img_height)
+                img_token_nums.append(img_token_num)
+
+            processed_text = operate_substrings(
+                input_text, to_replace_str, remove_image_idx, repalce_str
+            )
+            kwargs["images"] = (
+                new_processed_imgs if len(new_processed_imgs) != 0 else None
+            )
+            result = processor.__call__(
+                text=[processed_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+
+            for feature_name in self.FEATURE_NAMES:
+                if feature_name in result and isinstance(
+                    result[feature_name], torch.Tensor
+                ):
+                    result[feature_name] = result[feature_name].to("cpu")
+
+            start_height = 0
+            end_height = 0
+            tensor_lists = []
+            image_grid_thw_lists = []
+            use_cache_mark = []
+            delete_keys = []
+            for img_idx in range(len(images)):
+                # cache Tensor
+                if img_idx in new_processed_img_idxes:
+                    img_height = img_heights[img_idx]
+                    processed_img_heights.append(img_height)
+             
+                    start_height = end_height
+                    end_height = start_height + img_height
+                    to_cache_tensor = result["pixel_values"][start_height:end_height]
+                    delete_key = self.hash_table.add(
+                        img_hash_keys[img_idx], to_cache_tensor
+                    )
+                    if delete_key:
+                        delete_keys.append(delete_key)
+                    tensor_lists.append(to_cache_tensor)
+                    image_grid_thw_lists.append(
+                        [
+                            1,
+                            int(images[img_idx].size[1] // QWEN2_PATCH_SIZE),
+                            int(images[img_idx].size[0] // QWEN2_PATCH_SIZE),
+                        ]
+                    )
+                    use_cache_mark.append(False)
+                # add input ids and insert tensor
+                else:
+                    cached_tensor = self.hash_table.get(img_hash_keys[img_idx])
+                    assert isinstance(
+                        cached_tensor, torch.Tensor
+                    ), "invalid cached_tensor"
+                    # tensor_lists.append(cached_tensor)
+                    insert_cached_ids = (
+                        [v_start_token]
+                        + img_token_nums[img_idx] * [img_pad_token]
+                        + [v_end_token]
+                    )
+                    result["input_ids"] = insert_input_ids(
+                        result["input_ids"],
+                        v_end_token,
+                        img_pad_token,
+                        insert_cached_ids,
+                    )
+                    image_grid_thw_lists.append(
+                        [
+                            1,
+                            int(images[img_idx].size[1] // QWEN2_PATCH_SIZE),
+                            int(images[img_idx].size[0] // QWEN2_PATCH_SIZE),
+                        ]
+                    )
+                    use_cache_mark.append(True)
+            # result["pixel_values"] = torch.concat(tensor_lists, dim = 0)
+            send_pixel_values = (
+                torch.concat(tensor_lists, dim=0) if len(tensor_lists) > 0 else None
+            )
+            proxy_pixel_values = {}
+            proxy_pixel_values["send_data"] = send_pixel_values
+            proxy_pixel_values["use_cache_mark"] = use_cache_mark
+            proxy_pixel_values["hash_keys"] = img_hash_keys
+            proxy_pixel_values["img_heights"] = processed_img_heights
+            proxy_pixel_values["delete_keys"] = delete_keys
+            result["image_grid_thw"] = torch.Tensor(image_grid_thw_lists).to(
+                torch.int32
+            )
+            result["pixel_values"] = proxy_pixel_values
+            for delete_key in delete_keys:
+                self.hash_table.erase(delete_key)
+
+        else:
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+            # move feature tensors to cpu
+            for feature_name in self.FEATURE_NAMES:
+                if feature_name in result and isinstance(
+                    result[feature_name], torch.Tensor
+                ):
+                    result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
