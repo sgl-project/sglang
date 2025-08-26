@@ -1,5 +1,5 @@
 // clang-format off
-// adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_fwd.cu 
+// adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_fwd.cu
 // and https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_update.cu
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -109,7 +109,7 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
 
     TORCH_CHECK(x.is_cuda());
     TORCH_CHECK(weight.is_cuda());
-    
+
     const bool varlen = query_start_loc.has_value() ? true : false;
     const auto sizes = x.sizes();
     const int batch_size = varlen ? query_start_loc.value().sizes()[0] - 1 : sizes[0];
@@ -162,7 +162,7 @@ void causal_conv1d_fwd(const at::Tensor &x, const at::Tensor &weight,
     ConvParamsBase params;
     set_conv_params_fwd(params, batch_size, dim, seqlen, width, x, weight, out,
                         bias_,
-                        silu_activation, 
+                        silu_activation,
                         pad_slot_id,
                         query_start_loc,
                         cache_indices,
@@ -420,8 +420,8 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
         out += kChunkSize;
 
         int final_state_position =  ((seqlen - (kWidth - 1)) - (n_chunks - 1) * kChunkSize);
-        // in case the final state is separated between the last "smem_exchange" and 
-        // and the one before it (chunk = n_chunks - 1 and chunk = n_chunks - 2), 
+        // in case the final state is separated between the last "smem_exchange" and
+        // and the one before it (chunk = n_chunks - 1 and chunk = n_chunks - 2),
         // (which occurs when `final_state_position` is a non-positivie index)
         // we load the correct data from smem_exchange from both chunks, the last chunk iteration and the one before it
         if (conv_states != nullptr && final_state_position < 0 && seqlen > kWidth){
@@ -445,12 +445,12 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
         }
     }
     // Final state is stored in the smem_exchange last token slot,
-    // in case seqlen < kWidth, we would need to take the final state from the 
+    // in case seqlen < kWidth, we would need to take the final state from the
     // initial state which is stored in conv_states
     // in case seqlen > kWidth, we would need to load the last kWidth - 1 data
     // and load it into conv_state accordingly
     int last_thread =  ((seqlen - (kWidth - 1)) - (n_chunks - 1) * kChunkSize) / kNElts;
-    if (conv_states != nullptr && tidx == last_thread) { 
+    if (conv_states != nullptr && tidx == last_thread) {
         input_t x_vals_load[kNElts * 2] = {0};
         // in case we are on the first kWidth tokens
         if (last_thread == 0 && seqlen < kWidth){
@@ -465,7 +465,7 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
             }
             #pragma unroll
             for (int w = 0; w < kWidth - 1; ++w){
-                if (offset + w >= 0) 
+                if (offset + w >= 0)
                     conv_states[w] = x_vals_load[offset + w ];
             }
         }
@@ -473,7 +473,7 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
             // in case the final state is in between the threads data
             const int offset = ((seqlen - (kWidth - 1)) % (kNElts));
             if ((offset + kWidth - 2) >= kNElts && (last_thread + 1 < kNThreads)){
-                // In case last_thread == kNThreads - 1, accessing last_thread + 1 will result in a 
+                // In case last_thread == kNThreads - 1, accessing last_thread + 1 will result in a
                 // illegal access error on H100.
                 // Therefore, we access last_thread + 1, only if the final state data sits there
                 reinterpret_cast<vec_t *>(x_vals_load)[1] = smem_exchange[last_thread + 1];
@@ -484,7 +484,7 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
                 conv_states[w] = x_vals_load[offset + w ];
             }
         }
-        
+
     }
 }
 
@@ -571,7 +571,7 @@ void causal_conv1d_update_kernel(ConvParamsBase params) {
     if (conv_state_batch_coord == params.pad_slot_id){
         return;
     }
-    input_t *conv_state = reinterpret_cast<input_t *>(params.conv_state_ptr) 
+    input_t *conv_state = reinterpret_cast<input_t *>(params.conv_state_ptr)
         + conv_state_batch_coord * params.conv_state_batch_stride
         + channel_id * params.conv_state_c_stride;
 

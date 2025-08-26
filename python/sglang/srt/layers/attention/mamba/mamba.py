@@ -1,17 +1,18 @@
-from typing import List, Tuple
-from typing import Callable
+from typing import Callable, List, Tuple
+
 import torch
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
+
 
 def mamba_v2_sharded_weight_loader(
     shard_spec: List[Tuple[int, int, float]],
     tp_size: int,
     tp_rank: int,
 ) -> LoaderFunction:
-    """Create a weight loader for mamba v2. This ensures that the projections 
-    are correctly sharded so that they can be split into x, B, C. It also 
-    ensures the the all the groups corresponding to a head shard is placed 
+    """Create a weight loader for mamba v2. This ensures that the projections
+    are correctly sharded so that they can be split into x, B, C. It also
+    ensures the the all the groups corresponding to a head shard is placed
     together with it.
     """
 
@@ -51,12 +52,13 @@ def mamba_v2_sharded_weight_loader(
             #   seem to handle slices well.
             # https://github.com/python/mypy/issues/2410
             param.data[
-                boundary:(boundary + take),  # type: ignore[misc]
-                ...] = loaded_weight[loaded_start_idx:(  # type: ignore[misc]
-                    loaded_start_idx + take)]  # type: ignore[misc]
+                boundary : (boundary + take), ...  # type: ignore[misc]
+            ] = loaded_weight[
+                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
+            ]  # type: ignore[misc]
 
             # move indexing boundaries
             boundary += shard_size
-            loaded_boundary += (full_dim - extra)
+            loaded_boundary += full_dim - extra
 
     return loader

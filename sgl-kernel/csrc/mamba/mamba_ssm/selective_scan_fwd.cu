@@ -168,7 +168,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
         }
         u += kChunkSize;
         delta += kChunkSize;
-    
+
         float delta_vals[kNRows][kNItems], delta_u_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
@@ -235,7 +235,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 for (int i = 0; i < kNItems; ++i) {
                     thread_data[i] = make_float2(exp2f(delta_vals[r][i] * A_val[r]),
                                                  !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i]);
-                    
+
                     if (seqlen % (kNItems * kNThreads) != 0) {  // So that the last state is correct
                         if (threadIdx.x * kNItems + i >= seqlen - chunk * kChunkSize) {
                             thread_data[i] = make_float2(1.f, 0.f);
@@ -267,7 +267,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 }
             }
         }
-        
+
         input_t *out = reinterpret_cast<input_t *>(params.out_ptr) + sequence_start_index * params.out_batch_stride
             + dim_id * kNRows * params.out_d_stride + chunk * kChunkSize;
         __syncthreads();
@@ -333,7 +333,7 @@ template<typename input_t, typename weight_t>
 void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream) {
 
     #ifndef USE_ROCM
-        if (params.seqlen <= 128) {           
+        if (params.seqlen <= 128) {
             selective_scan_fwd_launch<32, 4, input_t, weight_t>(params, stream);
         } else if (params.seqlen <= 256) {
             selective_scan_fwd_launch<32, 8, input_t, weight_t>(params, stream);
@@ -405,7 +405,7 @@ void set_ssm_params_fwd(SSMParamsBase &params,
                         const std::optional<at::Tensor>& D,
                         const std::optional<at::Tensor>& delta_bias,
                         const torch::Tensor ssm_states,
-                        bool has_z, 
+                        bool has_z,
                         bool delta_softplus,
                         const std::optional<at::Tensor>& query_start_loc,
                         const std::optional<at::Tensor>& cache_indices,
@@ -558,7 +558,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
     if (varlen) {
         CHECK_SHAPE(B, n_groups, dstate, seqlen);
     } else {
-        CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen); 
+        CHECK_SHAPE(B, batch_size, n_groups, dstate, seqlen);
     }
     TORCH_CHECK(B.stride(-1) == 1 || B.size(-1) == 1);
 
@@ -566,7 +566,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
     if (varlen) {
         CHECK_SHAPE(C, n_groups, dstate, seqlen);
     } else {
-        CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen); 
+        CHECK_SHAPE(C, batch_size, n_groups, dstate, seqlen);
     }
     TORCH_CHECK(C.stride(-1) == 1 || C.size(-1) == 1);
 
@@ -608,7 +608,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
         TORCH_CHECK(cache_indices_.is_cuda());
         CHECK_SHAPE(cache_indices_, batch_size);
     }
-   
+
 
     at::Tensor z, out_z;
     const bool has_z = z_.has_value();
@@ -646,7 +646,7 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
                        pad_slot_id
                        );
 
-    
+
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)u.get_device()};
@@ -655,4 +655,3 @@ void selective_scan_fwd(const torch::Tensor &u, const torch::Tensor &delta,
         selective_scan_fwd_cuda<input_t, weight_t>(params, stream);
     });
 }
-

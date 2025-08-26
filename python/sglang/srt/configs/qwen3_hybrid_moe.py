@@ -14,11 +14,11 @@
 # limitations under the License.
 """Qwen3Hybrid model configuration"""
 
+import enum
+
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
-import enum
-
 
 logger = logging.get_logger(__name__)
 
@@ -268,17 +268,19 @@ class Qwen3HybridMoeConfig(PretrainedConfig):
         self.full_attention_interval = full_attention_interval
         self.mamba2_interval = mamba2_interval
         self.linear_attention_interval = linear_attention_interval
-        
+
         # mamba2 part
         self.mamba2_expand = mamba2_expand
         self.mamba2_d_inner = mamba2_expand * self.hidden_size
         if self.mamba2_d_inner % mamba2_head_dim != 0:
             raise ValueError("mamba2_head_dim must divide mamba2_expand * hidden_size")
-        
+
         self.mamba2_head_dim = mamba2_head_dim
         self.mamba2_nheads = mamba2_nheads
         if self.mamba2_head_dim * self.mamba2_nheads != self.mamba2_d_inner:
-            raise ValueError("The dimensions for the Mamba2 head state do not match the model mamba2 d_inner")
+            raise ValueError(
+                "The dimensions for the Mamba2 head state do not match the model mamba2 d_inner"
+            )
 
         self.mamba2_ngroups = mamba2_ngroups
         self.mamba2_state_dim = mamba2_state_dim
@@ -299,8 +301,7 @@ class Qwen3HybridMoeConfig(PretrainedConfig):
         self.output_gate_type = output_gate_type
         self.share_norm = share_norm
         self.output_norm_size = output_norm_size
-        
-        
+
         # MoE arguments
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
@@ -317,25 +318,28 @@ class Qwen3HybridMoeConfig(PretrainedConfig):
         self.time_step_min = 0.001
         self.time_step_max = 0.1
         self.time_step_floor = 1e-4
-        
+
         self.rescale_prenorm_residual = rescale_prenorm_residual
         self.position_embedding_type = position_embedding_type
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-    
+
     @property
     def layers_block_type(self):
         layer_type_list = []
 
         for l in range(self.num_hidden_layers):
-            if (l + 1) % self.full_attention_interval == 0 and self.hybrid_full_attention:
+            if (
+                l + 1
+            ) % self.full_attention_interval == 0 and self.hybrid_full_attention:
                 layer_type_list.append(HybridLayerType.full_attention.value)
-            elif (l + 1) % self.linear_attention_interval == 0 and self.hybrid_linear_attention:
+            elif (
+                l + 1
+            ) % self.linear_attention_interval == 0 and self.hybrid_linear_attention:
                 layer_type_list.append(HybridLayerType.linear_attention.value)
             elif (l + 1) % self.mamba2_interval == 0 and self.hybrid_mamba2:
                 layer_type_list.append(HybridLayerType.mamba2.value)
-    
+
         return layer_type_list
-        

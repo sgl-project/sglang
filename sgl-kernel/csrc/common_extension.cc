@@ -473,7 +473,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool silu_activation,"
       "int pad_slot_id) -> ()");
   m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
-
 }
 
 REGISTER_EXTENSION(common_ops)

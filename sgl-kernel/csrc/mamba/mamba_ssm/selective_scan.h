@@ -70,7 +70,7 @@ struct SSMParamsBase {
 
 #ifndef USE_ROCM
 
-    constexpr size_t custom_max(std::initializer_list<size_t> ilist) 
+    constexpr size_t custom_max(std::initializer_list<size_t> ilist)
     {
         return std::max(ilist);
     }
@@ -81,7 +81,7 @@ struct SSMParamsBase {
     }
 
 #else
-    constexpr size_t custom_max(std::initializer_list<size_t> ilist) 
+    constexpr size_t custom_max(std::initializer_list<size_t> ilist)
     {
         return *std::max_element(ilist.begin(), ilist.end());
     }
@@ -215,7 +215,7 @@ inline __device__ void load_input(typename Ktraits::input_t *u,
             #ifdef USE_ROCM
                 , Ktraits::kNThreads * Ktraits::kNLoads
             #endif
-            
+
        );
     } else {
         typename Ktraits::BlockLoadT(smem_load).Load(u, u_vals, seqlen, 0.f);

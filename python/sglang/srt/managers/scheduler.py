@@ -111,8 +111,8 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
-    global_server_args_dict,
     global_scheduler_batch_dict,
+    global_server_args_dict,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -817,13 +817,15 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
-                #(yizhang2077) hook manba here
+                # (yizhang2077) hook manba here
                 global_scheduler_batch_dict["request_ids_to_seq_ids"].clear()
                 result = self.run_batch(batch)
-                 #(yizhang2077) hook manba here
+                # (yizhang2077) hook manba here
                 global_scheduler_batch_dict["finished_requests_ids"].clear()
                 self.process_batch_result(batch, result)
-                global_scheduler_batch_dict["finished_requests_ids"].update(global_scheduler_batch_dict["retracted_requests_ids"])
+                global_scheduler_batch_dict["finished_requests_ids"].update(
+                    global_scheduler_batch_dict["retracted_requests_ids"]
+                )
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -845,7 +847,7 @@ class Scheduler(
 
             if batch:
                 batch.launch_done = threading.Event()
-                 #(yizhang2077) hook manba here
+                # (yizhang2077) hook manba here
                 global_scheduler_batch_dict["request_ids_to_seq_ids"].clear()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
@@ -858,10 +860,12 @@ class Scheduler(
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
-                     #(yizhang2077) hook manba here
+                    # (yizhang2077) hook manba here
                     global_scheduler_batch_dict["finished_requests_ids"].clear()
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
-                    global_scheduler_batch_dict["finished_requests_ids"].update(global_scheduler_batch_dict["retracted_requests_ids"])
+                    global_scheduler_batch_dict["finished_requests_ids"].update(
+                        global_scheduler_batch_dict["retracted_requests_ids"]
+                    )
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -869,13 +873,15 @@ class Scheduler(
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
-                 #(yizhang2077) hook manba here
+                # (yizhang2077) hook manba here
                 global_scheduler_batch_dict["finished_requests_ids"].clear()
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
                     tmp_batch, tmp_result, batch.launch_done if batch else None
                 )
-                global_scheduler_batch_dict["finished_requests_ids"].update(global_scheduler_batch_dict["retracted_requests_ids"])
+                global_scheduler_batch_dict["finished_requests_ids"].update(
+                    global_scheduler_batch_dict["retracted_requests_ids"]
+                )
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1821,7 +1827,7 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none():
-                #(yizhang2077) hook Mamba here
+                # (yizhang2077) hook Mamba here
                 for req in batch.reqs:
                     global_scheduler_batch_dict["request_ids_to_seq_ids"][req.rid] = [0]
 

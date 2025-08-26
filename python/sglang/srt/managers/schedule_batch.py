@@ -629,7 +629,7 @@ class Req:
             self.multimodal_inputs.merge(image_inputs)
 
     def finished(self) -> bool:
-        #(yizhang2077) hook mamba here
+        # (yizhang2077) hook mamba here
         if self.finished_reason is not None:
             global_scheduler_batch_dict["finished_requests_ids"].add(self.rid)
         # Whether request reached finished condition
@@ -1767,8 +1767,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
-            finished_requests_ids=copy.deepcopy(global_scheduler_batch_dict["finished_requests_ids"]),
-            request_ids_to_seq_ids=copy.deepcopy(global_scheduler_batch_dict["request_ids_to_seq_ids"])
+            finished_requests_ids=copy.deepcopy(
+                global_scheduler_batch_dict["finished_requests_ids"]
+            ),
+            request_ids_to_seq_ids=copy.deepcopy(
+                global_scheduler_batch_dict["request_ids_to_seq_ids"]
+            ),
         )
 
     def copy(self):
@@ -1915,6 +1919,7 @@ class ModelWorkerBatch:
     finished_requests_ids: Optional[Set] = None
     request_ids_to_seq_ids: Optional[Dict] = None
 
+
 @triton.jit
 def write_req_to_token_pool_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
@@ -2024,6 +2029,7 @@ def get_last_loc_triton(
         BLOCK_SIZE,
     )
     return result
+
 
 # (yizhang2077) hook for mamba
 global_scheduler_batch_dict: Dict[str, Any] = {

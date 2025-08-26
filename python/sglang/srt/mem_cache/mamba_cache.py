@@ -3,7 +3,11 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import torch
-from sglang.srt.managers.schedule_batch import global_server_args_dict, global_scheduler_batch_dict
+
+from sglang.srt.managers.schedule_batch import (
+    global_scheduler_batch_dict,
+    global_server_args_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -11,6 +15,7 @@ DEFAULT_PAD_SLOT_ID = -1
 
 import triton
 import triton.language as tl
+
 
 @dataclass
 class MambaCacheParams:
@@ -22,7 +27,7 @@ class MambaCacheParams:
         return MambaCacheParams(
             self.conv_state[layer_id],
             self.ssm_state[layer_id],
-            self.state_indices_tensor
+            self.state_indices_tensor,
         )
 
 
@@ -34,19 +39,22 @@ class MambaCacheManager:
         num_mamba_layers: int,
         conv_state_shape: Tuple[int, int],
         temporal_state_shape: Tuple[int, int],
-        pad_slot_id: int = DEFAULT_PAD_SLOT_ID):
+        pad_slot_id: int = DEFAULT_PAD_SLOT_ID,
+    ):
 
         # Determine max batch size to set size of MambaCache
         max_batch_size = global_server_args_dict["max_running_requests"]
 
-        conv_state = torch.empty(size=(num_mamba_layers, max_batch_size + 1) +
-                                 conv_state_shape,
-                                 dtype=conv_dtype,
-                                 device="cuda")
-        temporal_state = torch.empty(size=(num_mamba_layers, max_batch_size + 1) +
-                                     temporal_state_shape,
-                                     dtype=ssm_dtype,
-                                     device="cuda")
+        conv_state = torch.empty(
+            size=(num_mamba_layers, max_batch_size + 1) + conv_state_shape,
+            dtype=conv_dtype,
+            device="cuda",
+        )
+        temporal_state = torch.empty(
+            size=(num_mamba_layers, max_batch_size + 1) + temporal_state_shape,
+            dtype=ssm_dtype,
+            device="cuda",
+        )
 
         self.mamba_cache = (conv_state, temporal_state)
 
@@ -67,47 +75,47 @@ class MambaCacheManager:
 
             self._release_finished_requests(finished_requests_ids)
             state_indices = self._prepare_current_run_mamba_cache(
-                request_ids_to_seq_ids, finished_requests_ids)
+                request_ids_to_seq_ids, finished_requests_ids
+            )
 
-            state_indices_tensor = torch.as_tensor(state_indices,
-                                                   dtype=torch.int32,
-                                                   device="cuda")
+            state_indices_tensor = torch.as_tensor(
+                state_indices, dtype=torch.int32, device="cuda"
+            )
             mamba_cache_tensors = self.mamba_cache
 
         else:
             # CUDA graph capturing runs
-            (mamba_cache_tensors,
-             state_indices_tensor) = kwargs["seqlen_agnostic_capture_inputs"]
+            (mamba_cache_tensors, state_indices_tensor) = kwargs[
+                "seqlen_agnostic_capture_inputs"
+            ]
 
         return MambaCacheParams(
-            mamba_cache_tensors[0],
-            mamba_cache_tensors[1],
-            state_indices_tensor
+            mamba_cache_tensors[0], mamba_cache_tensors[1], state_indices_tensor
         )
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
         """
-        Copy the relevant state_indices into the CUDA graph input buffer 
+        Copy the relevant state_indices into the CUDA graph input buffer
         """
         assert all(
-            key in kwargs
-            for key in ["request_ids_to_seq_ids", "finished_requests_ids"])
+            key in kwargs for key in ["request_ids_to_seq_ids", "finished_requests_ids"]
+        )
         finished_requests_ids = kwargs["finished_requests_ids"]
         request_ids_to_seq_ids = kwargs["request_ids_to_seq_ids"]
 
         assert "seqlen_agnostic_capture_inputs" in input_buffers
-        _, input_state_indices_buffer = input_buffers[
-            "seqlen_agnostic_capture_inputs"]
+        _, input_state_indices_buffer = input_buffers["seqlen_agnostic_capture_inputs"]
 
         self._release_finished_requests(finished_requests_ids)
         state_indices = self._prepare_current_run_mamba_cache(
-            request_ids_to_seq_ids, finished_requests_ids)
-        cuda_graph_pad_len = input_state_indices_buffer.shape[0] - len(
-            state_indices)
+            request_ids_to_seq_ids, finished_requests_ids
+        )
+        cuda_graph_pad_len = input_state_indices_buffer.shape[0] - len(state_indices)
         state_indices.extend([self.pad_slot_id] * cuda_graph_pad_len)
 
         input_state_indices_buffer.copy_(
-            torch.as_tensor(state_indices, dtype=torch.int32, device="cuda"))
+            torch.as_tensor(state_indices, dtype=torch.int32, device="cuda")
+        )
 
     def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
         """
@@ -115,19 +123,19 @@ class MambaCacheManager:
         The buffer is used to maintain the Mamba Cache during the CUDA graph
         replay runs.
         """
-        state_indices_tensor = torch.as_tensor([self.pad_slot_id] * batch_size,
-                                               dtype=torch.int32,
-                                               device="cuda")
+        state_indices_tensor = torch.as_tensor(
+            [self.pad_slot_id] * batch_size, dtype=torch.int32, device="cuda"
+        )
         return (self.mamba_cache, state_indices_tensor)
 
     def _copy_mamba_cache(self, from_index: int, to_index: int):
         assert len(self.mamba_cache) > 0
         for cache_t in self.mamba_cache:
-            cache_t[:, to_index].copy_(cache_t[:, from_index],
-                                       non_blocking=True)
+            cache_t[:, to_index].copy_(cache_t[:, from_index], non_blocking=True)
 
-    def _assign_seq_id_to_cache_index(self, cur_rid: str, seq_id: int,
-                                      finished_requests_ids) -> int:
+    def _assign_seq_id_to_cache_index(
+        self, cur_rid: str, seq_id: int, finished_requests_ids
+    ) -> int:
         """
         Assign (req_id,seq_id) pair to a `destination_index` index, if
         already occupied, move the occupying index to a free index.
@@ -137,42 +145,40 @@ class MambaCacheManager:
             return self.pad_slot_id
         elif cur_rid not in self.mamba_cache_indices_mapping:
             destination_index = self.free_cache_indices.pop()
-            self.mamba_cache_indices_mapping[cur_rid] = {
-                seq_id: destination_index
-            }
+            self.mamba_cache_indices_mapping[cur_rid] = {seq_id: destination_index}
             return destination_index
-        elif seq_id not in (seq_ids2indices :=
-                            self.mamba_cache_indices_mapping[cur_rid]):
+        elif seq_id not in (
+            seq_ids2indices := self.mamba_cache_indices_mapping[cur_rid]
+        ):
             # parallel sampling , where n > 1, assume prefill have
             # already happened, so we copy the
             # existing cache into the siblings seq_ids caches
             index_exists = next(iter(seq_ids2indices.values()))
             # case of decoding n>1, copy prefill cache to decoding indices
             destination_index = self.free_cache_indices.pop()
-            self._copy_mamba_cache(from_index=index_exists,
-                                   to_index=destination_index)
-            self.mamba_cache_indices_mapping[cur_rid][
-                seq_id] = destination_index
+            self._copy_mamba_cache(from_index=index_exists, to_index=destination_index)
+            self.mamba_cache_indices_mapping[cur_rid][seq_id] = destination_index
             return destination_index
         else:
             # already exists
             return self.mamba_cache_indices_mapping[cur_rid][seq_id]
 
     def _prepare_current_run_mamba_cache(
-            self, request_ids_to_seq_ids: Dict[str, list[int]],
-            finished_requests_ids: List[str]) -> List[int]:
+        self,
+        request_ids_to_seq_ids: Dict[str, list[int]],
+        finished_requests_ids: List[str],
+    ) -> List[int]:
         return [
-            self._assign_seq_id_to_cache_index(req_id, seq_id,
-                                               finished_requests_ids)
+            self._assign_seq_id_to_cache_index(req_id, seq_id, finished_requests_ids)
             for req_id, seq_ids in request_ids_to_seq_ids.items()
             for seq_id in seq_ids
         ]
 
-    def _release_finished_requests(self,
-                                   finished_seq_groups_req_ids: List[str]):
+    def _release_finished_requests(self, finished_seq_groups_req_ids: List[str]):
         for req_id in finished_seq_groups_req_ids:
             if req_id in self.mamba_cache_indices_mapping:
                 for seq_id in self.mamba_cache_indices_mapping[req_id]:
                     self.free_cache_indices.append(
-                        self.mamba_cache_indices_mapping[req_id][seq_id])
+                        self.mamba_cache_indices_mapping[req_id][seq_id]
+                    )
                 self.mamba_cache_indices_mapping.pop(req_id)
