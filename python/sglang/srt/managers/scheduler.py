@@ -14,7 +14,6 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
-import gc
 import logging
 import os
 import signal
