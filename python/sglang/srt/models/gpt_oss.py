@@ -1115,11 +1115,23 @@ class GptOssForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
         not_loaded_params = [k for k, v in params_checker.items() if not v]
+
         if tp_rank == 0:
-            if len(not_loaded_params) > 0:
-                raise Exception(f"Not all parameters loaded: {not_loaded_params}")
+            # Heuristic: If the number of requested weights is much smaller than the total
+            # model parameters (< 10%), we assume it's a dynamic RL update.
+            is_rl_update = (len(weights) < len(params_dict) * 0.1)
+
+            if is_rl_update:
+                # RL update: Partial success is allowed, but complete failure (0 loaded) is an error.
+                num_params_updated = len(params_dict) - len(not_loaded_params)
+                if len(weights) > 0 and num_params_updated == 0:
+                    raise Exception("RL weight update failed completely. 0 weights were successfully loaded.")
+                logging.info(f"RL weight update complete. Updated {num_params_updated} parameters.")
             else:
-                logging.info("All parameters loaded successfully.")
+                # Full load: All parameters must be loaded, none can be missing.
+                if not_loaded_params:
+                    raise Exception(f"Not all parameters loaded: {not_loaded_params}")
+                logging.info("Model initialization successful. All parameters have been loaded.")
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
