@@ -8,7 +8,8 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.test_intel_amx_attention_backend import intel_amx_benchmark
+from test_intel_amx_attention_backend import intel_amx_benchmark
+
 from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
