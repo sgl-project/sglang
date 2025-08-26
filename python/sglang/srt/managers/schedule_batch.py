@@ -71,6 +71,7 @@ from sglang.srt.utils import flatten_nested_list, support_triton
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -835,6 +836,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
     is_hybrid: bool = False
+    eos_token_id: int|None = None
 
     # Batch configs
     model_config: ModelConfig = None
@@ -916,7 +918,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -967,6 +969,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
         )
+
+    @property
+    def eos_id(self) -> int:
+        # TODO: support multiple eos token ids
+        if self.eos_token_id is None and len(self.reqs) > 0:
+            self.eos_token_id = self.reqs[0].tokenizer.eos_token_id
+        return self.eos_token_id
 
     def batch_size(self):
         return len(self.reqs)
@@ -1558,7 +1567,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone() or self.spec_algorithm.is_lookahead():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
@@ -1784,6 +1793,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            eos_id=self.eos_id,
             hicache_consumer_index=self.hicache_consumer_index,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -1873,6 +1883,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 class ModelWorkerBatch:
     # The batch id
     bid: int
+    eos_id: int
     # The forward mode
     forward_mode: ForwardMode
     # The input ids
@@ -1933,7 +1944,7 @@ class ModelWorkerBatch:
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput, LookaheadVerifyInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1

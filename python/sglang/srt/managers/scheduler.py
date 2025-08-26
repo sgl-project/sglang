@@ -365,6 +365,18 @@ class Scheduler(
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
+        elif self.spec_algorithm.is_lookahead():
+            from sglang.srt.speculative.lookahead_worker import LOOKAHEADWorker
+
+            self.draft_worker = LOOKAHEADWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
         else:
             self.draft_worker = None
 
@@ -710,8 +722,8 @@ class Scheduler(
             else (
                 server_args.speculative_num_draft_tokens
                 + (
-                    server_args.speculative_eagle_topk
-                    * server_args.speculative_num_steps
+                    (server_args.speculative_eagle_topk or 1)
+                    * (server_args.speculative_num_steps or 1)
                 )
             )
         )
@@ -754,7 +766,7 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 draft_token_to_kv_pool=(
                     None
-                    if self.draft_worker is None
+                    if not self.spec_algorithm.is_eagle()
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
@@ -791,7 +803,7 @@ class Scheduler(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 draft_token_to_kv_pool=(
                     None
-                    if self.draft_worker is None
+                    if not self.spec_algorithm.is_eagle()
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
@@ -1850,7 +1862,7 @@ class Scheduler(
                     can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
                 bs = batch.batch_size()
-                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
+                self.spec_num_total_accepted_tokens += num_accepted_tokens - bs
                 self.spec_num_total_forward_ct += bs
                 self.num_generated_tokens += num_accepted_tokens
 
@@ -2204,9 +2216,8 @@ class Scheduler(
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
 
-            if not self.spec_algorithm.is_none():
-                self.draft_worker.model_runner.req_to_token_pool.clear()
-                self.draft_worker.model_runner.token_to_kv_pool_allocator.clear()
+            if self.draft_worker:
+                self.draft_worker.reset()
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0

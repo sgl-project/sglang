@@ -318,6 +318,7 @@ set(SOURCES
     "csrc/kvcacheio/transfer.cu"
 
     "csrc/speculative/eagle_utils.cu"
+    "csrc/speculative/lookahead_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
 

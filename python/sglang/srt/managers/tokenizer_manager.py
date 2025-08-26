@@ -82,6 +82,7 @@ from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicat
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_gc_warning,
     dataclass_to_string_truncated,
@@ -164,6 +165,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
+
+        speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        self.reserve_input_token_num = (
+            0
+            if speculative_algorithm.is_none()
+            else server_args.speculative_num_draft_tokens
+        )
 
         if self.model_config.is_multimodal:
             import_processors()
@@ -586,6 +596,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         _max_req_len = self.context_len
 
         input_token_num = len(input_ids) if input_ids is not None else 0
+        input_token_num += self.reserve_input_token_num
         if input_token_num >= self.context_len:
             if self.server_args.allow_auto_truncate:
                 logger.warning(

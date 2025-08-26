@@ -1385,7 +1385,7 @@ class ModelRunner:
         if self.is_hybrid_gdn:
             max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size)
 
-        if not self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_eagle():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
