@@ -60,7 +60,7 @@ FetchContent_Populate(repo-fmt)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        cabi
+    GIT_TAG        sgl-kernel
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
