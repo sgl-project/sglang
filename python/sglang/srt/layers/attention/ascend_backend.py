@@ -9,6 +9,7 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_bool_env_var
@@ -63,6 +64,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -177,7 +179,7 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if self.use_fia or layer.qk_head_dim > 128:
+            if self.use_fia:
                 """FIA will support multi-bs in the later version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 attn_output = torch.empty(
@@ -207,26 +209,61 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             else:
-                query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-                attn_output = torch.empty(
-                    (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),
-                    dtype=query.dtype,
-                    device=query.device,
-                )
+                if layer.qk_head_dim <= 128:
+                    query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+                    attn_output = torch.empty(
+                        (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                        dtype=query.dtype,
+                        device=query.device,
+                    )
 
-                torch_npu._npu_flash_attention_qlens(
-                    query=query,
-                    key_cache=k_cache,
-                    value_cache=v_cache,
-                    mask=self.mask,
-                    block_table=self.forward_metadata.block_tables,
-                    seq_len=self.forward_metadata.extend_seq_lens_cpu_int,
-                    context_lens=self.forward_metadata.seq_lens_cpu_int,
-                    scale_value=layer.scaling,
-                    num_heads=layer.tp_q_head_num,
-                    num_kv_heads=layer.tp_k_head_num,
-                    out=attn_output,
-                )
+                    torch_npu._npu_flash_attention_qlens(
+                        query=query,
+                        key_cache=k_cache,
+                        value_cache=v_cache,
+                        mask=self.mask,
+                        block_table=self.forward_metadata.block_tables,
+                        seq_len=self.forward_metadata.extend_seq_lens_cpu_int,
+                        context_lens=self.forward_metadata.seq_lens_cpu_int,
+                        scale_value=layer.scaling,
+                        num_heads=layer.tp_q_head_num,
+                        num_kv_heads=layer.tp_k_head_num,
+                        out=attn_output,
+                    )
+                else:
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        attn_output = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        attn_output = torch.empty_like(q)
+
+                    use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
+                    q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                    o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+                    causal = True
+                    if (
+                        layer.is_cross_attention
+                        or layer.attn_type == AttentionType.ENCODER_ONLY
+                    ):
+                        causal = False
+
+                    self.native_attn._run_sdpa_forward_extend(
+                        q_,
+                        o_,
+                        k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                        v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        forward_batch.req_to_token_pool.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        forward_batch.extend_prefix_lens,
+                        forward_batch.extend_seq_lens,
+                        scaling=layer.scaling,
+                        enable_gqa=use_gqa,
+                        causal=causal,
+                    )
         else:
             assert (
                 layer.qk_head_dim != layer.v_head_dim
