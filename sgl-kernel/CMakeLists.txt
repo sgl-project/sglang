@@ -78,7 +78,7 @@ FetchContent_Populate(repo-triton)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        9220fb3443b5a5d274f00ca5552f798e225239b7
+    GIT_TAG        018b551825c8e5579206e6eb9d3229fa679202b3
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -157,6 +157,7 @@ set(SGL_KERNEL_CUDA_FLAGS
 )
 
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+option(SGL_KERNEL_ENABLE_SM101A           "Enable SM101A"           OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
@@ -170,12 +171,17 @@ if (ENABLE_BELOW_SM90)
     )
 endif()
 
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" AND SGL_KERNEL_ENABLE_SM101A)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_101,code=sm_101"
+        "-gencode=arch=compute_101a,code=sm_101a"
+    )
+endif()
+
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_101,code=sm_101"
-        "-gencode=arch=compute_101a,code=sm_101a"
         "-gencode=arch=compute_120,code=sm_120"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
@@ -261,12 +267,6 @@ set(SOURCES
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
     "csrc/moe/marlin_moe_wna16/ops.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
