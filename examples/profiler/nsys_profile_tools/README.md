@@ -35,10 +35,13 @@ profiling and analyzing nsys profile output.
 
 ## Notes
 
-- Make sure you have pandas installed.
+- Make sure you have pandas installed. Any version is fine.
 - Make sure [nsys](https://developer.nvidia.com/nsight-systems/get-started) is
 installed, and specify the path to the `nsys` command with `--nsys_cmd` if it
- is not in your PATH.
+ is not in your PATH. The nsys version must be >= the nsys profile version that
+ was used to collect the traces when profiling the server, so that nsys can
+ process the nsys-rep that was generated.
+
 - For more details on available engines and models, see the help string in
   the script or run:
 
@@ -65,12 +68,18 @@ To analyze the GPU cycles of for example, a llama-3.1-8B model with sglang:
      generation starts.
    - DURATION: how many seconds for nsys profile to run before generating the
      profile. This should be > the duration of the run.
+2. After the server starts, run the client load generation command. Once the
+test completes, after DURATION amount of time, nsys profile will generate an
+nsys_res.nsys-rep file and shut down the server.
 
-2. Run again, this time without collecting the profile, and get the total run
-   time in seconds. This value will be used by the script to calculate the
+3. Run step #1 again, this time starting up the server without collecting the
+profile.
+
+4. Run step #2 again, and record the total time to complete the test in
+seconds. This value will be used by the script to calculate the
    CPU(non-GPU) seconds for the analysis.
 
-3. Say the run elapsed time is 132 seconds, from step #2. Run script to
+5. Say the run elapsed time from step #4 is 132 seconds. Run script to
    analyze:
 
    ```bash
