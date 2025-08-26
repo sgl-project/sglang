@@ -715,14 +715,13 @@ class DefaultModelLoader(BaseModelLoader):
             original_param_dict[name] = p.data
 
         # Recover the parameter to the state before first loading
-        for name, (
-            shape,
-            stride,
-            dtype,
-            nbytes,
-        ) in model.original_weights_rebuild_keys.items():
+        for name, rebuild_info in model.original_weights_rebuild_keys.items():
             if name in existing_params:
-                existing_params[name].data = torch.empty(shape, dtype=dtype)
+                existing_params[name].data = torch.empty(
+                    rebuild_info["shape"],
+                    dtype=rebuild_info["dtype"],
+                    device=existing_params[name].device,
+                )
 
         # Restore weight loaders
         for k, loader_k in model.recorded_loader.items():
