@@ -737,10 +737,11 @@ class DefaultModelLoader(BaseModelLoader):
         # Manually conducting process weights after loading
         # Note: We don't need to call load_weights_and_postprocess here because
         # first_time_load_weights already loaded the weights, we just need to process them
+        target_device = next(model.parameters()).device
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
-                with device_loading_context(module, None):
+                with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 
         # Mark as already called
