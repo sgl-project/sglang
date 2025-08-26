@@ -1006,7 +1006,7 @@ def load_draft_vocab(speculative_draft_vocab_path_path: str, speculative_draft_v
     elif speculative_draft_vocab_threshold >= 1:
         # Keep top-k most frequent tokens for the draft model vocabulary
         assert int(speculative_draft_vocab_threshold) == speculative_draft_vocab_threshold, f'Expected integer value for top-k selection, got {speculative_draft_vocab_threshold}'
-        hot_token_id = torch.topk(vocab_freqs, speculative_draft_vocab_threshold).indices
+        hot_token_id = torch.topk(vocab_freqs, int(speculative_draft_vocab_threshold)).indices
     elif 0 < speculative_draft_vocab_threshold < 1:
         # Keep tokens until relative cumulative frequency mass reaches threshold for the draft model vocabulary
         sorted_scores, sorted_indices = torch.sort(vocab_freqs, descending=True)
