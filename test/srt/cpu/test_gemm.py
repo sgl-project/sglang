@@ -211,13 +211,13 @@ class TestGemm(CustomTestCase):
                     awq_weight, awq_zero, awq_scales, True
                 )
             )
-            target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu_with_quant(
+            target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
                 x,
                 packed_weight,
-                packed_scales,
                 packed_zero,
+                packed_scales,
                 bias,
-                torch.bfloat16,
+                w4a8,
             )
         else:
             packed_weight, packed_zero, packed_scales = (
@@ -226,7 +226,7 @@ class TestGemm(CustomTestCase):
                 )
             )
             target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
-                x, packed_weight, packed_zero, packed_scales, bias
+                x, packed_weight, packed_zero, packed_scales, bias, w4a8
             )
         atol = rtol = precision[ref_res.dtype]
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)

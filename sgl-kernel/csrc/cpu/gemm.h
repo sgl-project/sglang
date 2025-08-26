@@ -68,6 +68,15 @@ at::Tensor convert_weight_packed(at::Tensor& weight);
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales, bool is_w4a8);
 
+// int4 gemm with act quant
+at::Tensor int4_scaled_mm_cpu_with_quant(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& weight_scales,
+    const at::Tensor& weight_qzeros,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType output_dtype);
+
 // moe implementations for int8 w8a8
 template <typename scalar_t>
 void fused_experts_int8_kernel_impl(

@@ -783,3 +783,18 @@ at::Tensor int4_scaled_mm_cpu(
 
   return out;
 }
+
+// int4 gemm dispatch
+at::Tensor int4_scaled_mm_cpu(
+    at::Tensor& x,
+    at::Tensor& w,
+    at::Tensor& w_zeros,
+    at::Tensor& w_scales,
+    std::optional<at::Tensor> bias,
+    bool is_w4a8) {
+  if (!is_w4a8) {
+    return int4_scaled_mm_cpu(x, w, w_zeros, w_scales, bias);
+  } else {
+    return int4_scaled_mm_cpu_with_quant(x, w, w_scales, w_zeros, bias, x.scalar_type());
+  }
+}
