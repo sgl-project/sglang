@@ -56,6 +56,14 @@ __all__ = ["CompressedTensorsLinearMethod"]
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
 
+# VLM models need to adapt to VisionAttention (attn.qkv -> attn.qkv_proj)
+_VLM_NEEDS_QKV_PROJ_ADAPTATION: List[str] = [
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "internvl_chat",
+    "glm4v",
+]
+
 
 class DeviceCapability(NamedTuple):
     major: int
@@ -91,7 +99,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         super().__init__()
 
         # Adapt to VisionAttention
-        if model_type in ["qwen2_vl", "qwen2_5_vl"]:
+        if model_type in _VLM_NEEDS_QKV_PROJ_ADAPTATION:
             self.ignore = [
                 (
                     name.replace(r"attn.qkv", r"attn.qkv_proj")
