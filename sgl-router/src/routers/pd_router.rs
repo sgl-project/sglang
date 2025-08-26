@@ -1243,10 +1243,19 @@ impl PDRouter {
         let decode_workers = self.decode_workers.clone();
 
         tokio::spawn(async move {
+            // Use a flag to track whether stream completed successfully
+            let mut stream_completed = false;
+
             futures_util::pin_mut!(stream);
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        // Check for stream end marker to decrement load early
+                        let is_done = chunk
+                            .as_ref()
+                            .windows(12)
+                            .any(|window| window == b"data: [DONE]");
+
                         let result = if return_logprob && prefill_logprobs.is_some() {
                             // Try to merge logprobs
                             Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -1256,6 +1265,12 @@ impl PDRouter {
                         };
 
                         if tx.send(Ok(result)).is_err() {
+                            break;
+                        }
+
+                        // If we see the done marker, decrement load immediately
+                        if is_done {
+                            stream_completed = true;
                             break;
                         }
                     }
@@ -1270,20 +1285,30 @@ impl PDRouter {
                 }
             }
 
-            // Decrement load after streaming is complete
+            // Always decrement load after streaming (either completes or errors)
+            // Find and decrement prefill worker
             if let Ok(prefill_workers_guard) = prefill_workers.read() {
                 for worker in prefill_workers_guard.iter() {
                     if worker.url() == prefill_url.as_str() {
                         worker.decrement_load();
+                        debug!(
+                            "Decremented load for prefill worker: {} (stream_completed: {})",
+                            prefill_url, stream_completed
+                        );
                         break;
                     }
                 }
             }
 
+            // Find and decrement decode worker
             if let Ok(decode_workers_guard) = decode_workers.read() {
                 for worker in decode_workers_guard.iter() {
                     if worker.url() == decode_url_str.as_str() {
                         worker.decrement_load();
+                        debug!(
+                            "Decremented load for decode worker: {} (stream_completed: {})",
+                            decode_url_str, stream_completed
+                        );
                         break;
                     }
                 }
