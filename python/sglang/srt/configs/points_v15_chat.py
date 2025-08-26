@@ -25,6 +25,6 @@ class POINTSV15ChatConfig(PretrainedConfig):
             llm_config = Qwen2Config()
         elif isinstance(llm_config, dict):
             llm_config = Qwen2Config(**llm_config)
-
-
+            
+        self.llm_config = llm_config
         self.hidden_size = self.llm_config.hidden_size

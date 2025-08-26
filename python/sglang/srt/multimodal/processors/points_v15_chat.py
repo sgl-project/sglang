@@ -183,7 +183,7 @@ class POINTSV15ChatProcessor(SGLangBaseProcessor):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
 
