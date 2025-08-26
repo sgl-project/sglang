@@ -1906,6 +1906,8 @@ def apply_rotary_pos_emb_npu(
     sin: torch.Tensor,
     unsqueeze_dim=1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if q.shape[1] != 128:
+        return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim)
     cos = cos.unsqueeze(unsqueeze_dim)
     cos = torch.transpose(cos, 1, 2)
     sin = sin.unsqueeze(unsqueeze_dim)
