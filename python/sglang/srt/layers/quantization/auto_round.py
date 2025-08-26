@@ -179,7 +179,6 @@ class AutoRoundConfig(QuantizationConfig):
 
         # 5. Fallback
         return get_config(layer_name, quantized)
-        
 
     def check_quantized(self, weight_bits: int) -> bool:
         return weight_bits < 16

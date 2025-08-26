@@ -261,5 +261,3 @@ python3 -m sglang.launch_server \
 - [Torchao: PyTorch Architecture Optimization](https://github.com/pytorch/ao)
 - [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)
 - [auto-round](https://github.com/intel/auto-round)
-
-

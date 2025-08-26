@@ -38,7 +38,7 @@ except ImportError as e:
         ExpertsInt8Config
     ) = GGUFConfig = GPTQMarlin24Config = MarlinConfig = QQQConfig = Int8TpuConfig = (
         DummyConfig
-    ) = AutoRoundConfig
+    )
 
 
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
