@@ -108,29 +108,6 @@ Several limitations currently affect offline quantized model loading in sglang, 
 
     Quantized MoE models may encounter inference issues due to kernel limitations (e.g., lack of support for mlp.gate layer quantization). To avoid such errors, please skip quantizing gate layers when processing quantization to MoE modules.
 
-    <details>
-        <summary>MoE failure cases</summary>
-    Qwen3-30B-A3B:
-
-    GPTQ format:  Accuracy is nearly zero due to the error:
-        ```
-        Capture CUDA graph failed: Apply router weight on input is not supported for fused Marlin MoE method
-        ```
-
-    AWQ format:  Symmetric quantization Fails with:
-        ```
-        KeyError: 'model.layers.13.mlp.experts.w2_qzeros'
-        ```
-        Asymmetric quantization Also results in near-zero accuracy.
-
-    DeepSeek-MoE-16B-Base
-
-    Fails with:
-        ```
-        ValueError: The input size is not aligned with the quantized weight shape. This can be caused by too large tensor parallel size.
-        ``` The same issue occurs with both AWQ and GPTQ formats.
-    </details>
-
 
 3. Limited Support for Quantized VLMs
     <details>
