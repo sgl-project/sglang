@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu
+python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu_torch_compile_cpu
 """
 
 import copy
@@ -26,11 +26,13 @@ class TestCPUGraph(CustomTestCase):
 
     @intel_amx_benchmark(
         extra_args=[
+            "--batch-size",
+            "1",
             "--mem-fraction-static",
             "0.05",
             "--enable-torch-compile",
             "--torch-compile-max-bs",
-            "4",
+            "1",
         ],
         min_throughput=10,
     )
@@ -58,7 +60,7 @@ class TestCPUGraph(CustomTestCase):
                 "--disable-overlap-schedule",
                 "--enable-torch-compile",
                 "--torch-compile-max-bs",
-                "4",
+                "1",
                 "--tp",
                 f"{n_numa_node}",
             ],
