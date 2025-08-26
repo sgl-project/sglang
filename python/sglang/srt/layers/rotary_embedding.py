@@ -1876,7 +1876,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(
+def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
@@ -1907,7 +1907,7 @@ def apply_rotary_pos_emb_npu(
     unsqueeze_dim=1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if q.shape[1] != 128:
-        return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim)
+        return apply_rotary_pos_emb_native(q, k, cos, sin, unsqueeze_dim)
     cos = cos.unsqueeze(unsqueeze_dim)
     cos = torch.transpose(cos, 1, 2)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -1922,6 +1922,8 @@ def apply_rotary_pos_emb_npu(
 
 if _is_npu:
     apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+else:
+    apply_rotary_pos_emb = apply_rotary_pos_emb_native
 
 
 def get_rope_cpu(
