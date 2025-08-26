@@ -1427,10 +1427,7 @@ class ModelRunner:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
-        num_local_heads = (
-            self.model_config.num_attention_heads // get_attention_tp_size()
-        )
-        self.mha_chunk_helper = MhaChunkHelper(num_local_heads)
+        self.mha_chunk_helper = MhaChunkHelper(self)
 
     def _get_attention_backend(self):
         """Init attention kernel backend."""

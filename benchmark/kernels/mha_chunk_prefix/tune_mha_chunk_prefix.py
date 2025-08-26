@@ -159,8 +159,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         latent_cache: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        forward_batch.attn_attend_prefix_cache = None
-        forward_batch.mha_return_lse = None
         k_nope, k_pe = latent_cache.unsqueeze(1).split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
@@ -266,15 +264,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         k[..., self.qk_nope_head_dim :] = k_pe
 
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
-        # Only initialize the info once
-        if forward_batch.num_prefix_chunks is None:
-            if has_extend_prefix:
-                forward_batch.prepare_chunked_prefix_cache_info(q.device)
-            else:
-                forward_batch.num_prefix_chunks = 0
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
-
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
@@ -434,24 +423,33 @@ class DeepseekAttnWrapper(torch.nn.Module):
         forward_batch: ForwardBatch,
         num_iters: int = 10,
     ):
+        forward_batch.num_prefix_chunks = None
+        forward_batch.attn_attend_prefix_cache = None
+        forward_batch.mha_return_lse = None
+        self.attn_backend.init_forward_metadata(forward_batch)
+        latencies_mla: List[float] = []
+        for _ in range(3):
+            self.self_attn.forward_absorb(q, latent_cache, forward_batch)
+        for _ in range(num_iters):
+            torch.cuda.synchronize()
+            time0 = time.perf_counter()
+            self.self_attn.forward_absorb(q, latent_cache, forward_batch)
+            torch.cuda.synchronize()
+            time1 = time.perf_counter()
+            latencies_mla.append((time1 - time0))
+
+        forward_batch.prepare_chunked_prefix_cache_info(self.device)
+        self.attn_backend.init_forward_metadata(forward_batch)
+        latencies_mha: List[float] = []
         for _ in range(3):
             self.self_attn.forward_normal_chunked_kv(q, latent_cache, forward_batch)
-            self.self_attn.forward_absorb(q, latent_cache, forward_batch)
-
-        latencies_mha: List[float] = []
-        latencies_mla: List[float] = []
         for _ in range(num_iters):
             torch.cuda.synchronize()
             time0 = time.perf_counter()
             self.self_attn.forward_normal_chunked_kv(q, latent_cache, forward_batch)
             torch.cuda.synchronize()
             time1 = time.perf_counter()
-
-            self.self_attn.forward_absorb(q, latent_cache, forward_batch)
-            torch.cuda.synchronize()
-            time2 = time.perf_counter()
             latencies_mha.append((time1 - time0))
-            latencies_mla.append((time2 - time1))
         return (
             min(latencies_mla) * 1000000,
             min(latencies_mha) * 1000000,
@@ -504,8 +502,6 @@ class DeepseekAttnWrapper(torch.nn.Module):
         ret.extend_num_tokens = sum(extend_lens)
         ret.extend_prefix_lens_cpu = prefix_lens
         ret.extend_seq_lens_cpu = extend_lens
-
-        self.attn_backend.init_forward_metadata(ret)
 
         q = torch.randn(
             (sum(extend_lens), self.self_attn.num_local_heads, self.qk_head_dim),
