@@ -1,4 +1,6 @@
 use crate::tool_parser::json_parser::JsonParser;
+use crate::tool_parser::mistral_parser::MistralParser;
+use crate::tool_parser::qwen_parser::QwenParser;
 use crate::tool_parser::traits::ToolParser;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,7 +99,11 @@ impl ParserRegistry {
         // JSON parser - most common format
         self.register_parser("json", Arc::new(JsonParser::new()));
 
-        // Note: Additional parsers (mistral, qwen, llama) will be added in later phases
+        // Mistral parser - [TOOL_CALLS] [...] format
+        self.register_parser("mistral", Arc::new(MistralParser::new()));
+
+        // Qwen parser - <tool_call>...</tool_call> format
+        self.register_parser("qwen", Arc::new(QwenParser::new()));
     }
 
     /// Register default model mappings
