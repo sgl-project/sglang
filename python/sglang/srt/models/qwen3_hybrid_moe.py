@@ -205,13 +205,12 @@ def fused_qkvzba_split_reshape_cat(
 
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-@triton.jit(do_not_specialize=["batch"])
+@triton.jit
 def fused_gdn_gating_kernel(
     g,
     A_log,
     a,
     dt_bias,
-    batch,
     seq_len,
     NUM_HEADS: tl.constexpr,
     beta: tl.constexpr,
@@ -221,15 +220,16 @@ def fused_gdn_gating_kernel(
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
     off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
-    blk_A_log = tl.load(A_log + head_off)
-    blk_a = tl.load(a + off)
-    blk_bias = tl.load(dt_bias + head_off)
+    mask = head_off < NUM_HEADS
+    blk_A_log = tl.load(A_log + head_off, mask=mask)
+    blk_a = tl.load(a + off, mask=mask)
+    blk_bias = tl.load(dt_bias + head_off, mask=mask)
     x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
     softplus_x = tl.where(
         beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    tl.store(g + off, blk_g.to(g.dtype.element_ty))
+    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
 
 
 def fused_gdn_gating(
@@ -244,7 +244,7 @@ def fused_gdn_gating(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty_like(a, dtype=torch.float32)
     fused_gdn_gating_kernel[grid](
-        g, A_log, a, dt_bias, batch, seq_len, num_heads, beta, threshold, 8, num_warps=1
+        g, A_log, a, dt_bias, seq_len, num_heads, beta, threshold, 8, num_warps=1
     )
     return g
 
@@ -627,7 +627,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         mamba_cache_params: MambaCacheParams,
-        sequence_idx: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
@@ -638,7 +637,9 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.linear_attn(
-                hidden_states, forward_batch, mamba_cache_params, sequence_idx
+                hidden_states,
+                forward_batch,
+                mamba_cache_params,
             )
 
         # Fully Connected
