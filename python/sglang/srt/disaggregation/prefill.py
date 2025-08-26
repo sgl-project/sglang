@@ -161,9 +161,10 @@ class PrefillBootstrapQueue:
 
         dest_tp_ranks = [self.tp_rank]
 
+        bootstrap_addr = maybe_wrap_ipv6_address(req.bootstrap_host) if req.bootstrap_host is not None else req.bootstrap_host
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{maybe_wrap_ipv6_address(req.bootstrap_host)}:{self.bootstrap_port}",
+            bootstrap_addr=f"{bootstrap_addr}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,

@@ -248,9 +248,10 @@ class DecodePreallocQueue:
                     self.transfer_backend, KVClassType.RECEIVER
                 )
 
+            bootstrap_addr = maybe_wrap_ipv6_address(req.bootstrap_host) if req.bootstrap_host is not None else req.bootstrap_host
             kv_receiver = kv_receiver_class(
                 mgr=self.kv_manager,
-                bootstrap_addr=f"{maybe_wrap_ipv6_address(req.bootstrap_host)}:{req.bootstrap_port}",
+                bootstrap_addr=f"{bootstrap_addr}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
                 data_parallel_rank=req.data_parallel_rank,
             )
