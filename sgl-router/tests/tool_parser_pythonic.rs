@@ -159,7 +159,7 @@ async fn test_pythonic_real_world_llama4() {
     // Actual output from Llama 4 model
     let input = r#"I'll help you with multiple tasks. Let me search for information and perform calculations.
 
-[web_search(query="latest Rust features", max_results=3, safe_search=True), 
+[web_search(query="latest Rust features", max_results=3, safe_search=True),
  calculate(expression="42 * 3.14159", precision=2),
  get_weather(city="San Francisco", units="fahrenheit", include_forecast=False)]
 
