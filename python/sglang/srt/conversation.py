@@ -958,6 +958,25 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="points-v15-chat",
+        system_message="",
+        system_template="",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
+        video_token="<|vision_start|><|video_pad|><|vision_end|>",
+    )
+)
+
+@register_conv_template_matching_function
+def match_points_v15_chat(model_path: str):
+    if re.search(r"points", model_path, re.IGNORECASE):
+        return "points-v15-chat"
+
 
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
