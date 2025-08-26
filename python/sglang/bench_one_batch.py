@@ -77,6 +77,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
+from sglang.srt.layers.moe import initialize_moe_config
 
 
 @dataclasses.dataclass
@@ -509,6 +510,8 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
+    initialize_moe_config(server_args)
+
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)
