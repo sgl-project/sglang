@@ -20,6 +20,7 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import gc
 import logging
 from collections import deque
 from dataclasses import dataclass
@@ -46,6 +47,8 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_policy import SchedulePolicy
+from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
@@ -121,6 +124,12 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
+
+    def set_prealloc_size(self, pre_alloc_size: int):
+        # if pre_alloc_size is 0, change the free_slots to right size
+        # can only be used in enable_pd_convert mode
+        self.free_slots = list(range(self.size + pre_alloc_size))
+        self.pre_alloc_size = pre_alloc_size
 
 
 @dataclass
@@ -539,6 +548,14 @@ class DecodePreallocQueue:
 
         return kv_loc
 
+    def __del__(self):
+        if len(self.queue) > 0 or len(self.retracted_queue) > 0:
+            raise RuntimeError(
+                "This could not happen, cause we should have flushed cache before releasing the queue"
+            )
+        self.kv_manager.stop_all_threads()
+        del self.kv_manager
+
 
 class DecodeTransferQueue:
     """
@@ -675,7 +692,7 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
-        while True:
+        while not self.stop_decode_event.is_set():
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
@@ -718,7 +735,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch: Optional[ScheduleBatch] = None
         self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
-        while True:
+        while not self.stop_decode_event.is_set():
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
@@ -890,3 +907,48 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
         self.waiting_queue.extend(alloc_reqs)
+
+    def flush_decode_resources(self: Scheduler):
+        """Flush decode resources"""
+        if not self.server_args.enable_pd_convert:
+            return
+        del self.stop_decode_event
+
+        logger.info("Flushing decode resources...")
+
+        del self.req_to_metadata_buffer_idx_allocator
+        del self.disagg_metadata_buffers
+
+        # get the right model_runner
+        if isinstance(self.tp_worker, TpModelWorkerClient):
+            model_runner = self.tp_worker.worker.model_runner
+        else:
+            model_runner = self.tp_worker.model_runner
+
+        # release queues and kv_manager
+        del self.disagg_decode_transfer_queue
+        del self.disagg_decode_prealloc_queue
+
+        # reuse the cuda graph runner for prefill to decode
+        model_runner.server_args = self.server_args
+        self.decode_graph_runner = model_runner.graph_runner
+        self.decode_cuda_graph_mem_usage = model_runner.cuda_graph_mem_usage
+        model_runner.init_device_graphs()
+        self.req_to_token_pool.set_prealloc_size(0)
+
+        self.disaggregation_mode = DisaggregationMode.PREFILL
+
+        # reinitialize the tree cache for prefill, as prefill may use radix_cache or hiradix_cache
+        if not self.server_args.disable_radix_cache:
+            self.policy.tree_cache = None
+            del self.tree_cache
+            del self.policy
+            self.init_memory_pool_and_cache()
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
+        self.init_disaggregation()
+        gc.collect()
+        torch.cuda.empty_cache()

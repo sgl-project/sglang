@@ -70,6 +70,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     CloseSessionReqInput,
+    ConvertDisaggregationRoleReqInput,
+    ConvertDisaggregationRoleReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -537,6 +539,7 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (ConvertDisaggregationRoleReqInput, self.convert_disaggregation_role),
             ]
         )
 
@@ -687,6 +690,7 @@ class Scheduler(
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
+            self.stop_decode_event = threading.Event()
             buffer_size = (self.req_to_token_pool.size) * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
@@ -736,6 +740,8 @@ class Scheduler(
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
+            self.stop_prefill_event = threading.Event()
+
             buffer_size = self.max_running_requests * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
@@ -2495,6 +2501,92 @@ class Scheduler(
         else:
             del self.sessions[session_id]
 
+    def convert_disaggregation_role(self, recv_req: ConvertDisaggregationRoleReqInput):
+        """Convert the disaggregation role of the scheduler."""
+        if recv_req.clean_connection_pool:
+            kv_manager = self.disagg_decode_prealloc_queue.kv_manager
+            kv_manager._handle_node_failure(recv_req.clean_connection_pool)
+            with kv_manager.session_pool_lock:
+                if recv_req.clean_connection_pool in kv_manager.session_pool:
+                    del kv_manager.session_pool[recv_req.clean_connection_pool]
+            return ConvertDisaggregationRoleReqOutput(
+                success=True,
+                message="clean connection pool successfully.",
+            )
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # disaggregation
+            self.server_args.disaggregation_bootstrap_port = None
+            self.server_args.disaggregation_decode_dp = None
+            self.server_args.disaggregation_decode_tp = None
+            # tree cache
+            self.server_args.disable_radix_cache = True
+            self.enable_hierarchical_cache = False
+            # cuda graph
+            self.server_args.disable_cuda_graph = recv_req.disable_cuda_graph
+            if recv_req.cuda_graph_max_bs:
+                # ServerArgs init will set cuda_graph_max_bs to a num.
+                self.server_args.cuda_graph_max_bs = recv_req.cuda_graph_max_bs
+            self.server_args.cuda_graph_bs = recv_req.cuda_graph_bs
+            self.server_args.disable_cuda_graph_padding = (
+                recv_req.disable_cuda_graph_padding
+            )
+            self.server_args.enable_profile_cuda_graph = (
+                recv_req.enable_profile_cuda_graph
+            )
+            self.server_args.disaggregation_mode = "decode"
+            self.server_args.__post_init__()
+            # stop prefill event loop
+            self.stop_prefill_event.set()
+            return ConvertDisaggregationRoleReqOutput(
+                success=True,
+                message="The role of this server is now DECODE.",
+            )
+        else:
+            # disaggregation
+            self.server_args.disaggregation_bootstrap_port = recv_req.bootstrap_port
+            self.server_args.disaggregation_decode_dp = (
+                recv_req.disaggregation_decode_dp
+            )
+            self.server_args.disaggregation_decode_tp = (
+                recv_req.disaggregation_decode_tp
+            )
+            self.server_args.disaggregation_prefill_pp = (
+                recv_req.disaggregation_prefill_pp
+            )
+            # tree cache
+            self.server_args.disable_radix_cache = recv_req.disable_radix_cache
+            self.enable_hierarchical_cache = recv_req.enable_hierarchical_cache
+            self.server_args.enable_hierarchical_cache = (
+                recv_req.enable_hierarchical_cache
+            )
+            if self.enable_hierarchical_cache:
+                self.server_args.hicache_ratio = recv_req.hicache_ratio
+                self.server_args.hicache_size = recv_req.hicache_size
+                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+                self.server_args.hicache_io_backend = recv_req.hicache_io_backend
+                self.enable_hicache_storage = (
+                    recv_req.hicache_storage_backend is not None
+                )
+                self.server_args.hicache_storage_backend = (
+                    recv_req.hicache_storage_backend
+                )
+                self.server_args.hicache_storage_prefetch_policy = (
+                    recv_req.hicache_storage_prefetch_policy
+                )
+                self.server_args.hicache_mem_layout = recv_req.hicache_mem_layout
+            # cuda graph
+            self.server_args.disable_cuda_graph = True
+
+            self.server_args.disaggregation_mode = "prefill"
+            self.server_args.__post_init__()
+            # stop decode event loop
+            self.stop_decode_event.set()
+            return ConvertDisaggregationRoleReqOutput(
+                success=True,
+                message="The role of this server is now PREFILL.",
+            )
+
     def get_print_prefix(self):
         prefix = ""
         if self.attn_dp_rank is not None:
@@ -2564,6 +2656,34 @@ def is_work_request(recv_req):
     )
 
 
+def start_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs):
+    disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+
+    if disaggregation_mode == DisaggregationMode.NULL:
+        if server_args.pp_size > 1:
+            scheduler.event_loop_pp()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap()
+        else:
+            scheduler.event_loop_normal()
+    elif disaggregation_mode == DisaggregationMode.PREFILL:
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_prefill()
+        else:
+            if server_args.pp_size > 1:
+                scheduler.event_loop_pp_disagg_prefill()
+            else:
+                scheduler.event_loop_normal_disagg_prefill()
+        scheduler.flush_prefill_resources()
+
+    elif disaggregation_mode == DisaggregationMode.DECODE:
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_decode()
+        else:
+            scheduler.event_loop_normal_disagg_decode()
+        scheduler.flush_decode_resources()
+
+
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -2624,28 +2744,11 @@ def run_scheduler_process(
             }
         )
 
-        disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
-        if disaggregation_mode == DisaggregationMode.NULL:
-            if server_args.pp_size > 1:
-                scheduler.event_loop_pp()
-            elif scheduler.enable_overlap:
-                scheduler.event_loop_overlap()
-            else:
-                scheduler.event_loop_normal()
-        elif disaggregation_mode == DisaggregationMode.PREFILL:
-            if scheduler.enable_overlap:
-                scheduler.event_loop_overlap_disagg_prefill()
-            else:
-                if server_args.pp_size > 1:
-                    scheduler.event_loop_pp_disagg_prefill()
-                else:
-                    scheduler.event_loop_normal_disagg_prefill()
-
-        elif disaggregation_mode == DisaggregationMode.DECODE:
-            if scheduler.enable_overlap:
-                scheduler.event_loop_overlap_disagg_decode()
-            else:
-                scheduler.event_loop_normal_disagg_decode()
+        if not server_args.enable_pd_convert:
+            start_scheduler_event_loop(scheduler, server_args)
+        else:
+            while True:
+                start_scheduler_event_loop(scheduler, server_args)
 
     except Exception:
         traceback = get_exception_traceback()
