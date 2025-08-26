@@ -162,6 +162,9 @@ suites = {
 # Add AMD tests
 suite_amd = {
     "per-commit-amd": [
+        TestFile("hicache/test_hicache.py", 116),
+        TestFile("hicache/test_hicache_mla.py", 127),
+        TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
@@ -235,15 +238,6 @@ suite_amd = {
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_patch_torch.py", 19),
-        TestFile(
-            "hicache/test_hicache.py", 116
-        ),  # 1-gpu test for larger host memory budget
-        TestFile(
-            "hicache/test_hicache_mla.py", 127
-        ),  # 1-gpu test for larger host memory budget
-        TestFile(
-            "hicache/test_hicache_storage.py", 127
-        ),  # 1-gpu test for larger host memory budget
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
