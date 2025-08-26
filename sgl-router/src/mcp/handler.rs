@@ -35,7 +35,7 @@ impl MCPToolHandler {
         command: String,
         args: Vec<String>,
     ) -> MCPResult<()> {
-        let mut connection = LocalConnection::new(command, args);
+        let mut connection = LocalConnection::new(command, args, &self.config);
         connection.connect().await?;
 
         let mut connections = self.connections.write().await;

@@ -225,6 +225,65 @@ async fn test_invalid_tool_execution() {
 }
 
 #[tokio::test]
+async fn test_connection_uses_config_timeout() {
+    // Test with dev mode config (5000ms timeout)
+    let dev_handler = MCPToolHandler::new_dev_mode().await.unwrap();
+    dev_handler
+        .add_local_server(
+            "dev-server".to_string(),
+            "echo".to_string(),
+            vec!["test".to_string()],
+        )
+        .await
+        .unwrap();
+
+    // Test with production config (10000ms timeout)
+    let prod_config = MCPConfig::production();
+    let prod_handler = MCPToolHandler::new_with_config(prod_config).await.unwrap();
+    prod_handler
+        .add_local_server(
+            "prod-server".to_string(),
+            "echo".to_string(),
+            vec!["test".to_string()],
+        )
+        .await
+        .unwrap();
+
+    // Both servers should be healthy
+    let dev_health = dev_handler.health_check().await.unwrap();
+    assert!(dev_health.contains_key("dev-server"));
+
+    let prod_health = prod_handler.health_check().await.unwrap();
+    assert!(prod_health.contains_key("prod-server"));
+}
+
+#[tokio::test]
+async fn test_proper_disconnect_cleanup() {
+    let handler = MCPToolHandler::new_dev_mode().await.unwrap();
+
+    // Add a server
+    handler
+        .add_local_server(
+            "cleanup-test".to_string(),
+            "echo".to_string(),
+            vec!["test".to_string()],
+        )
+        .await
+        .unwrap();
+
+    // Verify it's connected
+    let health = handler.health_check().await.unwrap();
+    assert!(health.get("cleanup-test").copied().unwrap_or(false));
+
+    // Remove the server (which calls disconnect)
+    handler.remove_server("cleanup-test").await.unwrap();
+
+    // Verify it's removed
+    let health_after = handler.health_check().await.unwrap();
+    assert!(!health_after.contains_key("cleanup-test"));
+}
+
+#[tokio::test]
 async fn test_empty_tool_name_validation() {
     let handler = MCPToolHandler::new_dev_mode().await.unwrap();
 

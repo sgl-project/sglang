@@ -5,6 +5,7 @@ use crate::mcp::{MCPError, MCPResult};
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
+use tracing::{debug, warn};
 
 pub struct LocalConnection {
     process: Option<Child>,
@@ -15,12 +16,12 @@ pub struct LocalConnection {
 }
 
 impl LocalConnection {
-    pub fn new(command: String, args: Vec<String>) -> Self {
+    pub fn new(command: String, args: Vec<String>, config: &crate::mcp::MCPConfig) -> Self {
         // Store command and args separately instead of joining them
         let connection_info = ConnectionInfo {
             connection_type: ConnectionType::Stdio,
             endpoint: format!("{} {}", command, args.join(" ")), // Only for display/logging
-            timeout_ms: 5000,
+            timeout_ms: config.connection_timeout_ms,
         };
 
         Self {
@@ -39,6 +40,8 @@ impl LocalConnection {
             ));
         }
 
+        debug!("Connecting to MCP server: {} {}", self.command, self.args.join(" "));
+
         let child = Command::new(&self.command)
             .args(&self.args)
             .stdin(Stdio::piped())
@@ -48,16 +51,31 @@ impl LocalConnection {
             .map_err(|e| MCPError::ConnectionError(format!("Failed to spawn process: {}", e)))?;
 
         self.process = Some(child);
+        debug!("MCP process '{}' spawned successfully", self.command);
 
         self.discover_tools().await?;
+        debug!("Tool discovery completed for '{}'", self.command);
 
         Ok(())
     }
 
     pub async fn disconnect(&mut self) -> MCPResult<()> {
         if let Some(mut process) = self.process.take() {
-            let _ = process.kill().await;
-            let _ = process.wait().await;
+            debug!("Disconnecting MCP server: {} {}", self.command, self.args.join(" "));
+
+            // Attempt to kill the process
+            if let Err(e) = process.kill().await {
+                // Log warning but continue - process might have already exited
+                warn!("Failed to kill MCP process '{}': {}", self.command, e);
+            }
+
+            // Wait for the process to exit to avoid zombie processes
+            if let Err(e) = process.wait().await {
+                // Log error but don't fail - we've done our best to clean up
+                warn!("Error waiting for MCP process '{}' to exit: {}", self.command, e);
+            } else {
+                debug!("MCP process '{}' terminated successfully", self.command);
+            }
         }
         Ok(())
     }
