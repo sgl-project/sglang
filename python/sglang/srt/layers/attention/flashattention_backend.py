@@ -2187,7 +2187,6 @@ def _prepare_swa_spec_page_table_kernel(
     b_stride_n,
     LEN_A: tl.constexpr,
     LEN_B: tl.constexpr,
-    LEN_OUT: tl.constexpr,
     REPEAT_STEP: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -2200,24 +2199,39 @@ def _prepare_swa_spec_page_table_kernel(
     seq_len_b = tl.load(seq_len_b_ptr + idx_b)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    in_bounds_out = offs_n < seq_len_a + seq_len_b
+    total_len = seq_len_a + seq_len_b
 
-    in_a = offs_n < seq_len_a
-    in_b = (offs_n >= seq_len_a) & (offs_n < seq_len_a + seq_len_b)
-    offs_b = offs_n - seq_len_a
+    if pid_n * BLOCK_N >= total_len:
+        return
 
-    a_ptr = src_a_ptr + idx_a * a_stride_m + offs_n * a_stride_n
-    b_ptr = src_b_ptr + idx_b * b_stride_m + offs_b * b_stride_n
+    mask = offs_n < total_len
     dst = dst_ptr + pid_m * dst_stride_m + offs_n * dst_stride_n
 
-    a_mask = in_a & (offs_n < LEN_A)
-    b_mask = in_b & (offs_b < LEN_B)
+    if (pid_n + 1) * BLOCK_N < seq_len_a:
+        a_ptr = src_a_ptr + idx_a * a_stride_m + offs_n * a_stride_n
+        a_mask = mask & (offs_n < LEN_A)
+        val = tl.load(a_ptr, mask=a_mask, other=0)
+        tl.store(dst, val, mask=mask)
+    elif pid_n * BLOCK_N >= seq_len_a:
+        offs_b = offs_n - seq_len_a
+        b_ptr = src_b_ptr + idx_b * b_stride_m + offs_b * b_stride_n
+        b_mask = mask & (offs_b < LEN_B)
+        val = tl.load(b_ptr, mask=b_mask, other=0)
+        tl.store(dst, val, mask=mask)
+    else:
+        # mixed part
+        a_offs = offs_n
+        a_mask = (a_offs < seq_len_a) & (a_offs < LEN_A)
+        a_ptr = src_a_ptr + idx_a * a_stride_m + a_offs * a_stride_n
+        a_val = tl.load(a_ptr, mask=a_mask, other=0)
 
-    a_val = tl.load(a_ptr, mask=a_mask, other=0)
-    b_val = tl.load(b_ptr, mask=b_mask, other=0)
+        b_offs = offs_n - seq_len_a
+        b_mask = (b_offs >= 0) & (b_offs < seq_len_b) & (b_offs < LEN_B)
+        b_ptr = src_b_ptr + idx_b * b_stride_m + b_offs * b_stride_n
+        b_val = tl.load(b_ptr, mask=b_mask, other=0)
 
-    out_val = tl.where(in_a, a_val, tl.where(in_b, b_val, 0))
-    tl.store(dst, out_val, mask=in_bounds_out)
+        result = tl.where(offs_n < seq_len_a, a_val, b_val)
+        tl.store(dst, result, mask=mask)
 
 
 def prepare_swa_spec_page_table_triton(
@@ -2254,7 +2268,6 @@ def prepare_swa_spec_page_table_triton(
         page_table_b.stride(1),
         LEN_A=LEN_A,
         LEN_B=LEN_B,
-        LEN_OUT=LEN_OUT,
         REPEAT_STEP=REPEAT_STEP,
         BLOCK_N=BLOCK_N,
         num_warps=4,
