@@ -607,43 +607,45 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         # Check if already called to prevent duplicate processing
-        if getattr(model, 'process_weights_after_loading_already_called', False):
-            logger.debug('process_weights_after_loading already called for model %s', model)
+        if getattr(model, "process_weights_after_loading_already_called", False):
+            logger.debug(
+                "process_weights_after_loading already called for model %s", model
+            )
             return
 
         # Save original weight state for potential reloading
-        if not hasattr(model, 'original_weights_rebuild_keys'):
+        if not hasattr(model, "original_weights_rebuild_keys"):
             model.original_weights_rebuild_keys = {}
             for name, p in model.named_parameters():
                 model.original_weights_rebuild_keys[name] = {
-                    'shape': p.shape, 
-                    'stride': p.stride(), 
-                    'dtype': p.dtype, 
-                    'nbytes': p.untyped_storage().nbytes()
+                    "shape": p.shape,
+                    "stride": p.stride(),
+                    "dtype": p.dtype,
+                    "nbytes": p.untyped_storage().nbytes(),
                 }
 
         # Record weight loaders for potential reloading
         recorded_loader_keys = [
-            'weight_loader',
-            'load_qkv_weight',
-            'load_row_parallel_weight',
-            'load_merged_column_weight',
-            'output_dim',
-            'input_dim',
-            '_assert_and_load',
+            "weight_loader",
+            "load_qkv_weight",
+            "load_row_parallel_weight",
+            "load_merged_column_weight",
+            "output_dim",
+            "input_dim",
+            "_assert_and_load",
         ]
-        
+
         recorded_loader = {k: dict() for k in recorded_loader_keys}
         for name, p in model.named_parameters():
             for key in recorded_loader_keys:
                 if hasattr(p, key):
                     attr = getattr(p, key)
                     if not callable(attr):
-                        recorded_loader[key][name] = attr 
+                        recorded_loader[key][name] = attr
                     elif p is attr.__self__:
-                        recorded_loader[key][name] = attr.__func__ 
+                        recorded_loader[key][name] = attr.__func__
                     else:
-                        recorded_loader[key][name] = attr 
+                        recorded_loader[key][name] = attr
         model.recorded_loader = recorded_loader
 
         # Load weights first
@@ -670,9 +672,9 @@ class DefaultModelLoader(BaseModelLoader):
     def reset_model_weights_state(model):
         """Reset the model's weight state to allow re-quantization."""
         model.process_weights_after_loading_already_called = False
-        
+
         # Restore original weight state if available
-        if hasattr(model, 'original_weights_rebuild_keys'):
+        if hasattr(model, "original_weights_rebuild_keys"):
             for name, rebuild_info in model.original_weights_rebuild_keys.items():
                 if hasattr(model, name):
                     param = getattr(model, name)
@@ -682,9 +684,9 @@ class DefaultModelLoader(BaseModelLoader):
                         # to handle more complex cases like quantized parameters
                         try:
                             new_data = torch.empty(
-                                rebuild_info['shape'], 
-                                dtype=rebuild_info['dtype'],
-                                device=param.device
+                                rebuild_info["shape"],
+                                dtype=rebuild_info["dtype"],
+                                device=param.device,
                             )
                             param.data = new_data
                         except Exception as e:
@@ -697,25 +699,30 @@ class DefaultModelLoader(BaseModelLoader):
         """Reload weights with proper state management for multiple loading scenarios."""
         # Reset the model state to allow re-quantization
         DefaultModelLoader.reset_model_weights_state(model)
-        
+
         # Preserve workspace if exists
         for _, module in model.named_modules():
-            if torch.is_tensor(getattr(module, 'workspace', None)):
-                setattr(module, f'preserved_workspace', getattr(module, 'workspace'))
-        
+            if torch.is_tensor(getattr(module, "workspace", None)):
+                setattr(module, f"preserved_workspace", getattr(module, "workspace"))
+
         existing_params = dict(model.named_parameters())
-        
+
         # Preserve original data, so that after parameter loading, we can put the parameter
         # in the original tensor
         original_param_dict = {}
         for name, p in existing_params.items():
             original_param_dict[name] = p.data
-        
+
         # Recover the parameter to the state before first loading
-        for name, (shape, stride, dtype, nbytes) in model.original_weights_rebuild_keys.items():
+        for name, (
+            shape,
+            stride,
+            dtype,
+            nbytes,
+        ) in model.original_weights_rebuild_keys.items():
             if name in existing_params:
-                existing_params[name].data = torch.empty(shape, dtype=dtype) 
-        
+                existing_params[name].data = torch.empty(shape, dtype=dtype)
+
         # Restore weight loaders
         for k, loader_k in model.recorded_loader.items():
             for n, loader in loader_k.items():
@@ -723,10 +730,10 @@ class DefaultModelLoader(BaseModelLoader):
                     # Simple binding for now - in a full implementation you might need
                     # a more sophisticated binding mechanism
                     setattr(existing_params[n], k, loader)
-        
+
         # After recovering, the weight loading can be called as usual
         updated_params = first_time_load_weights(weights)
-        
+
         # Manually conducting process weights after loading
         # Note: We don't need to call load_weights_and_postprocess here because
         # first_time_load_weights already loaded the weights, we just need to process them
@@ -735,38 +742,45 @@ class DefaultModelLoader(BaseModelLoader):
             if quant_method is not None:
                 with device_loading_context(module, None):
                     quant_method.process_weights_after_loading(module)
-        
+
         # Mark as already called
         model.process_weights_after_loading_already_called = True
-        
-        # Put the value of the newly created tensor to the original tensor 
+
+        # Put the value of the newly created tensor to the original tensor
         for name, p in model.named_parameters():
-            assert name in original_param_dict, f'param {name} is not in original_param_dict'
-            assert original_param_dict[name].dtype == p.data.dtype, f'param {name} dtype mismatch: {original_param_dict[name].dtype} vs {p.data.dtype}'
-            assert original_param_dict[name].numel() == p.data.numel(), f'param {name} numel() mismatch: {original_param_dict[name].numel()} vs {p.data.numel()}'
-            
+            assert (
+                name in original_param_dict
+            ), f"param {name} is not in original_param_dict"
+            assert (
+                original_param_dict[name].dtype == p.data.dtype
+            ), f"param {name} dtype mismatch: {original_param_dict[name].dtype} vs {p.data.dtype}"
+            assert (
+                original_param_dict[name].numel() == p.data.numel()
+            ), f"param {name} numel() mismatch: {original_param_dict[name].numel()} vs {p.data.numel()}"
+
             if name in updated_params:
                 strided_data = torch.as_strided(
-                    p.data, 
-                    original_param_dict[name].shape, 
-                    original_param_dict[name].stride()
+                    p.data,
+                    original_param_dict[name].shape,
+                    original_param_dict[name].stride(),
                 )
                 original_param_dict[name].copy_(strided_data)
-            
+
             del p.data
             p.data = original_param_dict[name]
-        
+
         del original_param_dict
         del existing_params
         import gc
+
         gc.collect()
-        
+
         # Restore workspace
         for _, module in model.named_modules():
-            if torch.is_tensor(getattr(module, 'workspace', None)):
-                setattr(module, 'workspace', getattr(module, 'preserved_workspace'))
-                delattr(module, 'preserved_workspace')
-        
+            if torch.is_tensor(getattr(module, "workspace", None)):
+                setattr(module, "workspace", getattr(module, "preserved_workspace"))
+                delattr(module, "preserved_workspace")
+
         return updated_params
 
 
