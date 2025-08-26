@@ -1881,16 +1881,44 @@ def kill_itself_when_parent_died():
 
 
 def set_uvicorn_logging_configs():
-    from uvicorn.config import LOGGING_CONFIG
+    """Configure Uvicorn logging with environment variable overrides.
 
-    LOGGING_CONFIG["formatters"]["default"][
-        "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
-    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    LOGGING_CONFIG["formatters"]["access"][
-        "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
-    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    Allows customization of log formats through environment variables:
+    - SGLANG_UVICORN_DEFAULT_FORMAT: Format for default logs
+    - SGLANG_UVICORN_ACCESS_FORMAT: Format for access logs
+    - SGLANG_UVICORN_DATE_FORMAT: Date format for all logs
+    """
+    from uvicorn.config import LOGGING_CONFIG
+    import os
+
+    # Define constants for environment variable names to improve maintainability
+    default_format_env = "SGLANG_UVICORN_DEFAULT_FORMAT"
+    access_format_env = "SGLANG_UVICORN_ACCESS_FORMAT"
+    date_format_env = "SGLANG_UVICORN_DATE_FORMAT"
+
+    # Default log format (can be overridden by env var)
+    default_fmt = os.getenv(
+        default_format_env,
+        "[%(asctime)s] %(levelprefix)s %(message)s"
+    )
+
+    # Access log format (can be overridden by env var)
+    access_fmt = os.getenv(
+        access_format_env,
+        '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
+
+    # Date format for all logs (can be overridden by env var)
+    date_fmt = os.getenv(
+        date_format_env,
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    # Apply the configurations
+    LOGGING_CONFIG["formatters"]["default"]["fmt"] = default_fmt
+    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = date_fmt
+    LOGGING_CONFIG["formatters"]["access"]["fmt"] = access_fmt
+    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = date_fmt
 
 
 def get_ip() -> str:
