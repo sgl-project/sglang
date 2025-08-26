@@ -107,6 +107,13 @@ impl QwenParser {
 
         // Check for partial end token
         let end_token = "\n</tool_call>";
+        // Only check if buffer ends with a partial match (not the complete token without newline)
+        // If buffer ends with "</tool_call>", that's not a partial token - it's missing the newline
+        if buffer.ends_with("</tool_call>") {
+            // This is a complete end tag, just missing the leading newline
+            // Not a partial token situation
+            return None;
+        }
         // Use inclusive range to check if entire buffer could be a prefix
         (1..=end_token.len().min(buffer.len()))
             .find(|&i| end_token.starts_with(&buffer[buffer.len() - i..]))
