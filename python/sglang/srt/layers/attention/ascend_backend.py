@@ -179,7 +179,7 @@ class AscendAttnBackend(AttentionBackend):
 
             if self.use_fia or layer.qk_head_dim > 128:
                 """FIA will support multi-bs in the later version of CANN"""
-                q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 attn_output = torch.empty(
                     (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
                     device=q.device,
@@ -207,7 +207,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             else:
-                query = q.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
+                query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
                 attn_output = torch.empty(
                     (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),
                     dtype=query.dtype,
