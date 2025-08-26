@@ -797,6 +797,8 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
                 )
 
                 return FlashInferFP4MoE
+            elif quantization == "mxfp4":
+                return FusedMoE
         except:
             pass
 
