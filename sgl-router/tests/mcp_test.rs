@@ -34,8 +34,6 @@ async fn test_mcp_server_initialization() {
     let stats = server.get_tool_stats();
     assert_eq!(stats.total_tools, 0);
     assert_eq!(stats.total_servers, 0);
-    assert_eq!(stats.categories, 0);
-    assert_eq!(stats.parameters, 0);
 }
 
 #[tokio::test]
@@ -334,15 +332,9 @@ async fn test_connection_type_detection() {
     assert!(session.connection_info().contains("HTTP"));
     assert!(session.is_ready(), "HTTP session should be ready");
 
-    let stdio_session = ToolSession::new_stdio("python server.py".to_string()).await;
-    assert!(stdio_session.is_ok(), "Should create stdio session");
-
-    let stdio = stdio_session.unwrap();
-    assert!(stdio.connection_info().contains("Stdio"));
-    assert!(
-        !stdio.is_ready(),
-        "Stdio session should not be ready (not implemented)"
-    );
+    // Stdio sessions are no longer supported - test invalid URL handling
+    let invalid_session = ToolSession::new("invalid-url".to_string()).await;
+    assert!(invalid_session.is_err(), "Should reject non-HTTP URLs");
 }
 
 // Integration Pattern Tests

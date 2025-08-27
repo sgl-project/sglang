@@ -37,22 +37,6 @@ impl From<reqwest::Error> for MCPError {
     }
 }
 
-// ===== Config =====
-#[derive(Clone, Debug)]
-pub struct MCPConfig {
-    pub connection_timeout_ms: u64,
-    pub dev_mode: bool,
-}
-
-impl MCPConfig {
-    pub fn dev_mode() -> Self {
-        Self {
-            connection_timeout_ms: 30000,
-            dev_mode: true,
-        }
-    }
-}
-
 // ===== MCP Protocol Types =====
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MCPRequest {
@@ -114,32 +98,31 @@ pub type ToolResult = serde_json::Value; // Python uses dict
 
 // ===== Connection Types =====
 #[derive(Debug, Clone)]
-pub enum ConnectionType {
-    Http(String),  // HTTP/SSE URL
-    Stdio(String), // Command to run (e.g., "python server.py")
+pub struct HttpConnection {
+    pub url: String,
 }
 
 // ===== Tool Session =====
 pub struct ToolSession {
-    pub connection: ConnectionType,
+    pub connection: HttpConnection,
     pub client: reqwest::Client,
-    pub process: Option<tokio::process::Child>,
     pub session_initialized: bool,
 }
 
 impl ToolSession {
     pub async fn new(connection_str: String) -> MCPResult<Self> {
-        let connection =
-            if connection_str.starts_with("http://") || connection_str.starts_with("https://") {
-                ConnectionType::Http(connection_str)
-            } else {
-                ConnectionType::Stdio(connection_str)
-            };
+        if !connection_str.starts_with("http://") && !connection_str.starts_with("https://") {
+            return Err(MCPError::InvalidURL(format!(
+                "Only HTTP/HTTPS URLs are supported: {}",
+                connection_str
+            )));
+        }
 
         let mut session = Self {
-            connection,
+            connection: HttpConnection {
+                url: connection_str,
+            },
             client: reqwest::Client::new(),
-            process: None,
             session_initialized: false,
         };
 
@@ -149,24 +132,7 @@ impl ToolSession {
     }
 
     pub async fn new_http(url: String) -> MCPResult<Self> {
-        let mut session = Self {
-            connection: ConnectionType::Http(url),
-            client: reqwest::Client::new(),
-            process: None,
-            session_initialized: false,
-        };
-
-        session.initialize().await?;
-        Ok(session)
-    }
-
-    pub async fn new_stdio(command: String) -> MCPResult<Self> {
-        Ok(Self {
-            connection: ConnectionType::Stdio(command),
-            client: reqwest::Client::new(),
-            process: None,
-            session_initialized: false,
-        })
+        Self::new(url).await
     }
 
     /// Initialize the session
@@ -185,38 +151,28 @@ impl ToolSession {
             })),
         };
 
-        match &self.connection {
-            ConnectionType::Http(url) => {
-                let response = self
-                    .client
-                    .post(url)
-                    .header("Content-Type", "application/json")
-                    .json(&init_request)
-                    .send()
-                    .await
-                    .map_err(|e| MCPError::ConnectionError(format!("Initialize failed: {}", e)))?;
+        let response = self
+            .client
+            .post(&self.connection.url)
+            .header("Content-Type", "application/json")
+            .json(&init_request)
+            .send()
+            .await
+            .map_err(|e| MCPError::ConnectionError(format!("Initialize failed: {}", e)))?;
 
-                let mcp_response: MCPResponse = response.json().await.map_err(|e| {
-                    MCPError::SerializationError(format!(
-                        "Failed to parse initialize response: {}",
-                        e
-                    ))
-                })?;
+        let mcp_response: MCPResponse = response.json().await.map_err(|e| {
+            MCPError::SerializationError(format!("Failed to parse initialize response: {}", e))
+        })?;
 
-                if let Some(error) = mcp_response.error {
-                    return Err(MCPError::ProtocolError(format!(
-                        "Initialize error: {}",
-                        error.message
-                    )));
-                }
-
-                self.session_initialized = true;
-                Ok(())
-            }
-            ConnectionType::Stdio(_) => Err(MCPError::ProtocolError(
-                "Stdio initialization not yet implemented".to_string(),
-            )),
+        if let Some(error) = mcp_response.error {
+            return Err(MCPError::ProtocolError(format!(
+                "Initialize error: {}",
+                error.message
+            )));
         }
+
+        self.session_initialized = true;
+        Ok(())
     }
 
     /// Call a tool using MCP tools/call
@@ -249,53 +205,39 @@ impl ToolSession {
             })),
         };
 
-        match &self.connection {
-            ConnectionType::Http(url) => {
-                let response = self
-                    .client
-                    .post(url)
-                    .header("Content-Type", "application/json")
-                    .json(&request)
-                    .send()
-                    .await
-                    .map_err(|e| MCPError::ConnectionError(format!("Tool call failed: {}", e)))?;
+        let response = self
+            .client
+            .post(&self.connection.url)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| MCPError::ConnectionError(format!("Tool call failed: {}", e)))?;
 
-                let mcp_response: MCPResponse = response.json().await.map_err(|e| {
-                    MCPError::SerializationError(format!("Failed to parse tool response: {}", e))
-                })?;
+        let mcp_response: MCPResponse = response.json().await.map_err(|e| {
+            MCPError::SerializationError(format!("Failed to parse tool response: {}", e))
+        })?;
 
-                if let Some(error) = mcp_response.error {
-                    return Err(MCPError::ToolExecutionError(format!(
-                        "Tool '{}' failed: {}",
-                        name, error.message
-                    )));
-                }
-
-                mcp_response.result.ok_or_else(|| {
-                    MCPError::ProtocolError("No result in tool response".to_string())
-                })
-            }
-
-            ConnectionType::Stdio(_command) => Err(MCPError::ProtocolError(
-                "Stdio tool calls not yet implemented".to_string(),
-            )),
+        if let Some(error) = mcp_response.error {
+            return Err(MCPError::ToolExecutionError(format!(
+                "Tool '{}' failed: {}",
+                name, error.message
+            )));
         }
+
+        mcp_response
+            .result
+            .ok_or_else(|| MCPError::ProtocolError("No result in tool response".to_string()))
     }
 
     /// Check if session is ready for tool calls
     pub fn is_ready(&self) -> bool {
-        match &self.connection {
-            ConnectionType::Http(_) => self.session_initialized,
-            ConnectionType::Stdio(_) => false, // Stdio not supported
-        }
+        self.session_initialized
     }
 
     /// Get connection info
     pub fn connection_info(&self) -> String {
-        match &self.connection {
-            ConnectionType::Http(url) => format!("HTTP: {}", url),
-            ConnectionType::Stdio(cmd) => format!("Stdio: {}", cmd),
-        }
+        format!("HTTP: {}", self.connection.url)
     }
 }
 
