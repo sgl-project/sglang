@@ -217,6 +217,7 @@ class ServerArgs:
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
+    hicache_storage_backend_extra_config: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -639,10 +640,6 @@ class ServerArgs:
                 else:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
-                    )
-                if self.page_size != 1 and self.attention_backend == "flashinfer":
-                    raise ValueError(
-                        "Speculative decoding with page_size != 1 is not supported. Please set page_size to 1."
                     )
 
             # Auto choose parameters
@@ -1652,6 +1649,12 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_prefetch_policy,
             help="Control when prefetching from the storage backend should stop.",
         )
+        parser.add_argument(
+            "--hicache-storage-backend-extra-config",
+            type=str,
+            default=ServerArgs.hicache_storage_backend_extra_config,
+            help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+        )
 
         # Double Sparsity
         parser.add_argument(
@@ -2282,6 +2285,7 @@ class ServerArgs:
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
+
         elif "Llama4" in model_arch:
             assert self.attention_backend in {
                 "fa3",
