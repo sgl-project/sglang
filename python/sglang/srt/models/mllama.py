@@ -18,7 +18,7 @@ import sglang.srt.distributed.parallel_state as ps
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm  # SGLang fused RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -478,21 +478,6 @@ class MllamaVisionModel(nn.Module):
         return hidden_state
 
 
-class MllamaTextRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 class MllamaTextCrossAttention(nn.Module):
@@ -537,10 +522,8 @@ class MllamaTextCrossAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        # vllm.model_executor.layers.layernorm.RMSNorm has precision issue,
-        # use huggingface's instead
-        self.q_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.scaling = self.head_dim**-0.5
 
         self.attn = RadixAttention(
@@ -573,10 +556,10 @@ class MllamaTextCrossAttention(nn.Module):
             _, k, v = qkv_enc.split(
                 [self.q_local_size, self.kv_local_size, self.kv_local_size], dim=-1
             )
-            k = k.view(-1, self.num_local_key_value_heads, self.head_dim)
+            k = k.reshape(-1, self.num_local_key_value_heads, self.head_dim)
             v = v.view(-1, self.num_local_key_value_heads, self.head_dim)
             k = self.k_norm(k)
-        q = q.view(-1, self.num_local_heads, self.head_dim)
+        q = q.reshape(-1, self.num_local_heads, self.head_dim)
         q = self.q_norm(q)
 
         output = self.attn(q, k, v, forward_batch)
