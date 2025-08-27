@@ -1,8 +1,6 @@
-use crate::tool_parser::json_parser::JsonParser;
-use crate::tool_parser::llama_parser::LlamaParser;
-use crate::tool_parser::mistral_parser::MistralParser;
-use crate::tool_parser::pythonic_parser::PythonicParser;
-use crate::tool_parser::qwen_parser::QwenParser;
+use crate::tool_parser::parsers::{
+    JsonParser, LlamaParser, MistralParser, PythonicParser, QwenParser,
+};
 use crate::tool_parser::traits::ToolParser;
 use std::collections::HashMap;
 use std::sync::Arc;

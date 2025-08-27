@@ -291,7 +291,8 @@ impl ToolParser for JsonParser {
                         // Clear buffer since we consumed everything
                         state.buffer.clear();
 
-                        // Return the first tool as complete (simplified for Phase 2)
+                        // Return the first tool as complete
+                        // TODO simplified version, address more complex version
                         if let Some(tool) = tools.into_iter().next() {
                             return Ok(StreamResult::ToolComplete(tool));
                         }
@@ -299,7 +300,7 @@ impl ToolParser for JsonParser {
                 } else {
                     // Partial JSON, try to extract tool name
                     if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
-                        // Simple implementation for Phase 2
+                        // TODO simplified version, address more complex version
                         // Just return the tool name once we see it
                         if !state.in_string {
                             state.in_string = true; // Use as a flag for "name sent"
@@ -430,12 +431,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_parse() {
-        // Phase 2 simplified streaming test
         // Just verify that streaming eventually produces a complete tool call
         let parser = JsonParser::new();
         let mut state = ParseState::new();
 
-        // Send complete JSON in one go (simplified for Phase 2)
+        // Send complete JSON in one go
+        // TODO simplified version, address more complex version
         let full_json = r#"{"name": "get_weather", "arguments": {"location": "SF"}}"#;
 
         let result = parser
