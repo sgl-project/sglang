@@ -994,7 +994,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.current_attention_backend = attention_backend
 
         if attention_backend == "ascend":
-            return AttnForwardMethod.MLA
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+            ):
+                return AttnForwardMethod.MHA
+            else:
+                return AttnForwardMethod.MLA
         elif (
             attention_backend == "flashinfer"
             or attention_backend == "fa3"
@@ -1292,6 +1299,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             or self.current_attention_backend == "flashinfer"
             or self.current_attention_backend == "cutlass_mla"
             or self.current_attention_backend == "trtllm_mla"
+            or self.current_attention_backend == "ascend"
         ):
             extra_args = {}
             if self._fuse_rope_for_trtllm_mla(forward_batch):

@@ -23,6 +23,7 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,20 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
         }
+
+        # Handle response_format constraints
+        if request.response_format and request.response_format.type == "json_schema":
+            sampling_params["json_schema"] = convert_json_schema_to_str(
+                request.response_format.json_schema.schema_
+            )
+        elif request.response_format and request.response_format.type == "json_object":
+            sampling_params["json_schema"] = '{"type": "object"}'
+        elif (
+            request.response_format and request.response_format.type == "structural_tag"
+        ):
+            sampling_params["structural_tag"] = convert_json_schema_to_str(
+                request.response_format.model_dump(by_alias=True)
+            )
 
         return sampling_params
 
