@@ -2093,7 +2093,6 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
-        ic(attrs, args)
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
