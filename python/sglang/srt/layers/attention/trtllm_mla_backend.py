@@ -278,7 +278,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         # Update stored max_seq_len so subsequent kernel calls use the correct value
-        metadata.max_seq_len = int(seq_lens.max().item())
+        # Prefer CPU tensor to avoid GPU synchronization when available.
+        if seq_lens_cpu is not None:
+            metadata.max_seq_len = int(seq_lens_cpu.max().item())
+        else:
+            metadata.max_seq_len = int(seq_lens.max().item())
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -307,8 +311,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.seq_lens.device,
         )
 
-        # Precompute actual max(seq_lens) for forward batch
-        max_seq_len_val = int(torch.max(forward_batch.seq_lens).item())
+        max_seq_len_val = int(max_seq)
         self.forward_metadata = TRTLLMMLADecodeMetadata(
             self.workspace_buffer, block_kv_indices, max_seq_len_val
         )
