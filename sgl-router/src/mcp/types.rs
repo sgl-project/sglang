@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
+use uuid;
 
 // ===== Errors =====
 #[derive(Error, Debug)]
@@ -191,13 +192,7 @@ impl ToolSession {
 
         let request = MCPRequest {
             jsonrpc: "2.0".to_string(),
-            id: format!(
-                "call_{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis()
-            ),
+            id: format!("call_{}", uuid::Uuid::new_v4()),
             method: "tools/call".to_string(),
             params: Some(json!({
                 "name": name,
@@ -243,8 +238,8 @@ impl ToolSession {
 
 // ===== Multi-Tool Session Manager =====
 pub struct MultiToolSessionManager {
-    sessions: HashMap<String, ToolSession>,
-    server_urls: HashMap<String, String>, // tool_name -> server_url mapping
+    sessions: HashMap<String, ToolSession>, // server_url -> session
+    tool_to_server: HashMap<String, String>, // tool_name -> server_url mapping
 }
 
 impl Default for MultiToolSessionManager {
@@ -258,31 +253,33 @@ impl MultiToolSessionManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
-            server_urls: HashMap::new(),
+            tool_to_server: HashMap::new(),
         }
     }
 
-    /// Add tools from an MCP server (similar to Python's tool_session_ctxs creation)
+    /// Add tools from an MCP server (optimized to share sessions per server)
     pub async fn add_tools_from_server(
         &mut self,
         server_url: String,
         tool_names: Vec<String>,
     ) -> MCPResult<()> {
-        for tool_name in tool_names {
-            // Store server URL mapping
-            self.server_urls
-                .insert(tool_name.clone(), server_url.clone());
-
-            // Create session for this tool
+        // Create one session per server URL (if not already exists)
+        if !self.sessions.contains_key(&server_url) {
             let session = ToolSession::new(server_url.clone()).await?;
-            self.sessions.insert(tool_name, session);
+            self.sessions.insert(server_url.clone(), session);
+        }
+
+        // Map all tools to this server URL
+        for tool_name in tool_names {
+            self.tool_to_server.insert(tool_name, server_url.clone());
         }
         Ok(())
     }
 
     /// Get session for a specific tool
     pub fn get_session(&self, tool_name: &str) -> Option<&ToolSession> {
-        self.sessions.get(tool_name)
+        let server_url = self.tool_to_server.get(tool_name)?;
+        self.sessions.get(server_url)
     }
 
     /// Execute tool with automatic session management
@@ -291,10 +288,14 @@ impl MultiToolSessionManager {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> MCPResult<serde_json::Value> {
-        let session = self
-            .sessions
+        let server_url = self
+            .tool_to_server
             .get(tool_name)
-            .ok_or_else(|| MCPError::ToolNotFound(format!("No session for tool: {}", tool_name)))?;
+            .ok_or_else(|| MCPError::ToolNotFound(format!("No mapping for tool: {}", tool_name)))?;
+
+        let session = self.sessions.get(server_url).ok_or_else(|| {
+            MCPError::ToolNotFound(format!("No session for server: {}", server_url))
+        })?;
 
         session.call_tool(tool_name, arguments).await
     }
@@ -314,23 +315,19 @@ impl MultiToolSessionManager {
 
     /// Get all available tool names
     pub fn list_tools(&self) -> Vec<String> {
-        self.sessions.keys().cloned().collect()
+        self.tool_to_server.keys().cloned().collect()
     }
 
     /// Check if tool is available
     pub fn has_tool(&self, tool_name: &str) -> bool {
-        self.sessions.contains_key(tool_name)
+        self.tool_to_server.contains_key(tool_name)
     }
 
     /// Get session statistics
     pub fn session_stats(&self) -> SessionStats {
         let total_sessions = self.sessions.len();
         let ready_sessions = self.sessions.values().filter(|s| s.is_ready()).count();
-        let unique_servers = self
-            .server_urls
-            .values()
-            .collect::<std::collections::HashSet<_>>()
-            .len();
+        let unique_servers = self.sessions.len(); // Now sessions = servers
 
         SessionStats {
             total_sessions,

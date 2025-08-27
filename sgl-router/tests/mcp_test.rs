@@ -143,9 +143,13 @@ async fn test_multi_tool_session_manager() {
     }
 
     let stats = session_manager.session_stats();
-    assert_eq!(stats.total_sessions, available_tools.len());
-    assert_eq!(stats.ready_sessions, available_tools.len());
-    assert_eq!(stats.unique_servers, 1);
+    // After optimization: 1 session per server (not per tool)
+    assert_eq!(stats.total_sessions, 1); // One session for the mock server
+    assert_eq!(stats.ready_sessions, 1); // One ready session
+    assert_eq!(stats.unique_servers, 1); // One unique server
+
+    // But we still have all tools available
+    assert_eq!(session_manager.list_tools().len(), available_tools.len());
 }
 
 #[tokio::test]

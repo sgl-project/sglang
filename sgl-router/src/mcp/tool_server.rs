@@ -26,7 +26,8 @@ impl MCPToolServer {
         }
     }
 
-    /// Add tool server
+    /// Clears all existing tool servers and adds new ones from the provided URL(s).
+    /// URLs can be a single string or multiple comma-separated strings.
     pub async fn add_tool_server(&mut self, server_url: String) -> MCPResult<()> {
         let tool_urls: Vec<&str> = server_url.split(",").collect();
         let mut successful_connections = 0;
@@ -52,31 +53,27 @@ impl MCPToolServer {
             match self.connect_to_server(&formatted_url).await {
                 Ok((_init_response, tools_response)) => {
                     // Process tools with validation
-                    let processed_tools = post_process_tools_description(tools_response);
+                    let tools_obj = post_process_tools_description(tools_response);
 
                     // Tool storage with conflict detection
-                    if let Ok(tools_obj) =
-                        serde_json::from_value::<ListToolsResponse>(processed_tools.clone())
-                    {
-                        for tool in &tools_obj.tools {
-                            let tool_name = &tool.name;
+                    for tool in &tools_obj.tools {
+                        let tool_name = &tool.name;
 
-                            // Check for duplicate tools
-                            if self.tool_descriptions.contains_key(tool_name) {
-                                tracing::warn!(
-                                    "Tool {} already exists. Ignoring duplicate tool from server {}",
-                                    tool_name,
-                                    formatted_url
-                                );
-                                continue;
-                            }
-
-                            // Store individual tool descriptions
-                            let tool_json = json!(tool);
-                            self.tool_descriptions
-                                .insert(tool_name.clone(), tool_json.clone());
-                            self.urls.insert(tool_name.clone(), formatted_url.clone());
+                        // Check for duplicate tools
+                        if self.tool_descriptions.contains_key(tool_name) {
+                            tracing::warn!(
+                                "Tool {} already exists. Ignoring duplicate tool from server {}",
+                                tool_name,
+                                formatted_url
+                            );
+                            continue;
                         }
+
+                        // Store individual tool descriptions
+                        let tool_json = json!(tool);
+                        self.tool_descriptions
+                            .insert(tool_name.clone(), tool_json.clone());
+                        self.urls.insert(tool_name.clone(), formatted_url.clone());
                     }
 
                     successful_connections += 1;
@@ -373,7 +370,7 @@ pub fn parse_sse_event(event: &str) -> MCPResult<Option<Value>> {
 }
 
 /// Schema adaptation matching Python's trim_schema()
-fn trim_schema(mut schema: Value) -> Value {
+fn trim_schema(schema: &mut Value) {
     if let Some(obj) = schema.as_object_mut() {
         // Remove title and null defaults
         obj.remove("title");
@@ -430,20 +427,20 @@ fn trim_schema(mut schema: Value) -> Value {
         if let Some(properties) = obj.get_mut("properties") {
             if let Some(props_obj) = properties.as_object_mut() {
                 for (_, value) in props_obj.iter_mut() {
-                    *value = trim_schema(value.clone());
+                    trim_schema(value);
                 }
             }
         }
 
         // Handle nested schemas in items (for arrays)
         if let Some(items) = obj.get_mut("items") {
-            *items = trim_schema(items.clone());
+            trim_schema(items);
         }
 
         // Handle nested schemas in additionalProperties
         if let Some(additional_props) = obj.get_mut("additionalProperties") {
             if additional_props.is_object() {
-                *additional_props = trim_schema(additional_props.clone());
+                trim_schema(additional_props);
             }
         }
 
@@ -451,7 +448,7 @@ fn trim_schema(mut schema: Value) -> Value {
         if let Some(pattern_props) = obj.get_mut("patternProperties") {
             if let Some(pattern_obj) = pattern_props.as_object_mut() {
                 for (_, value) in pattern_obj.iter_mut() {
-                    *value = trim_schema(value.clone());
+                    trim_schema(value);
                 }
             }
         }
@@ -460,20 +457,18 @@ fn trim_schema(mut schema: Value) -> Value {
         if let Some(all_of) = obj.get_mut("allOf") {
             if let Some(array) = all_of.as_array_mut() {
                 for item in array.iter_mut() {
-                    *item = trim_schema(item.clone());
+                    trim_schema(item);
                 }
             }
         }
     }
-
-    schema
 }
 
 /// Tool processing with filtering
-fn post_process_tools_description(mut tools_response: ListToolsResponse) -> Value {
+fn post_process_tools_description(mut tools_response: ListToolsResponse) -> ListToolsResponse {
     // Adapt schemas for Harmony
     for tool in &mut tools_response.tools {
-        tool.input_schema = trim_schema(tool.input_schema.clone());
+        trim_schema(&mut tool.input_schema);
     }
 
     // Tool filtering based on annotations
@@ -533,7 +528,7 @@ fn post_process_tools_description(mut tools_response: ListToolsResponse) -> Valu
         );
     }
 
-    serde_json::to_value(tools_response).unwrap_or(json!({}))
+    tools_response
 }
 
 // Tests moved to tests/mcp_comprehensive_test.rs for better organization
