@@ -59,7 +59,7 @@ async fn test_mistral_nested_json() {
 async fn test_mistral_with_text_after() {
     let parser = MistralParser::new();
     let input = r#"[TOOL_CALLS] [{"name": "test", "arguments": {}}]
-    
+
 And here's some text after the tool call that should be ignored."#;
 
     let result = parser.parse_complete(input).await.unwrap();
