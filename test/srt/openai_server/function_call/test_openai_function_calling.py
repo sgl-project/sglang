@@ -16,6 +16,8 @@ from sglang.test.test_utils import (
 
 
 class TestOpenAIServerFunctionCalling(CustomTestCase):
+<<<<<<< HEAD
+=======
     # NOTE: this system_message is for Llama3.2 system prompt. Without this,
     # sometimes Llama3.2 gives a different tool call format such as:
     # '<|python_tag|>{"type": "function", "function": "add", "parameters": {"a": "3", "b": "5"}}'
@@ -30,6 +32,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         "Do not use variables.\n\n"
     )
 
+>>>>>>> origin/main
     @classmethod
     def setUpClass(cls):
         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -87,6 +90,11 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             }
         ]
 
+<<<<<<< HEAD
+        messages = [{"role": "user", "content": "Compute (3+5)"}]
+        response = client.chat.completions.create(
+            model=self.model,
+=======
         messages = [
             {"role": "system", "content": self.SYSTEM_MESSAGE},
             {"role": "user", "content": "Compute (3+5)"},
@@ -94,6 +102,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         response = client.chat.completions.create(
             model=self.model,
             max_tokens=2048,
+>>>>>>> origin/main
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -110,6 +119,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         function_name = tool_calls[0].function.name
         assert function_name == "add", "Function name should be 'add'"
 
+<<<<<<< HEAD
+=======
     # This unit test is too difficult for default model. Mark it as optional unit tests so it won't trigger unless specified.
     def _test_function_calling_multiturn(self):
         """
@@ -188,6 +199,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             "8" in final_response.choices[0].message.content
         ), "tool_call response should have the sum 8 in the content"
 
+>>>>>>> origin/main
     def test_function_calling_streaming_simple(self):
         """
         Test: Whether the function name can be correctly recognized in streaming mode.
@@ -221,6 +233,12 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             }
         ]
 
+<<<<<<< HEAD
+        messages = [{"role": "user", "content": "What is the temperature in Paris?"}]
+
+        response_stream = client.chat.completions.create(
+            model=self.model,
+=======
         messages = [
             {"role": "system", "content": self.SYSTEM_MESSAGE},
             {
@@ -232,6 +250,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         response_stream = client.chat.completions.create(
             model=self.model,
             max_tokens=2048,
+>>>>>>> origin/main
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -262,6 +281,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             "Target function name 'get_current_weather' was not found in the streaming chunks",
         )
 
+<<<<<<< HEAD
+=======
         finish_reason = chunks[-1].choices[0].finish_reason
         self.assertEqual(
             finish_reason,
@@ -269,6 +290,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             "Final response of function calling should have finish_reason 'tool_calls'",
         )
 
+>>>>>>> origin/main
     def test_function_calling_streaming_args_parsing(self):
         """
         Test: Whether the function call arguments returned in streaming mode can be correctly concatenated into valid JSON.
@@ -303,13 +325,20 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
 
         messages = [
+<<<<<<< HEAD
+            {"role": "user", "content": "Please sum 5 and 7, just call the function."}
+=======
             {"role": "system", "content": self.SYSTEM_MESSAGE},
             {"role": "user", "content": "Please sum 5 and 7, just call the function."},
+>>>>>>> origin/main
         ]
 
         response_stream = client.chat.completions.create(
             model=self.model,
+<<<<<<< HEAD
+=======
             max_tokens=2048,
+>>>>>>> origin/main
             messages=messages,
             temperature=0.9,
             top_p=0.9,
@@ -318,9 +347,14 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         )
 
         argument_fragments = []
+<<<<<<< HEAD
+        function_name = None
+        for chunk in response_stream:
+=======
         chunks = list(response_stream)
         function_name = None
         for chunk in chunks:
+>>>>>>> origin/main
             choice = chunk.choices[0]
             if choice.delta.tool_calls:
                 tool_call = choice.delta.tool_calls[0]
@@ -337,6 +371,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             "No parameter fragments were returned in the function call",
         )
 
+<<<<<<< HEAD
+=======
         finish_reason = chunks[-1].choices[0].finish_reason
         self.assertEqual(
             finish_reason,
@@ -344,6 +380,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             "Final response of function calling should have finish_reason 'tool_calls'",
         )
 
+>>>>>>> origin/main
         # Check whether the concatenated JSON is valid
         try:
             args_obj = json.loads(joined_args)
@@ -394,7 +431,10 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
         response = client.chat.completions.create(
             model=self.model,
+<<<<<<< HEAD
+=======
             max_tokens=2048,
+>>>>>>> origin/main
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -463,7 +503,10 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         messages = [{"role": "user", "content": "What is the capital of France?"}]
         response = client.chat.completions.create(
             model=self.model,
+<<<<<<< HEAD
+=======
             max_tokens=2048,
+>>>>>>> origin/main
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -551,7 +594,10 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         messages = [{"role": "user", "content": "What is the capital of France?"}]
         response = client.chat.completions.create(
             model=self.model,
+<<<<<<< HEAD
+=======
             max_tokens=2048,
+>>>>>>> origin/main
             messages=messages,
             temperature=0.8,
             top_p=0.8,
@@ -571,6 +617,8 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         )
         self.assertIn("city", args_obj, "Function arguments should have 'city'")
 
+<<<<<<< HEAD
+=======
     def test_streaming_multiple_choices_finish_reason(self):
         """
         Test: Verify that each choice gets its own finish_reason chunk in streaming mode with n > 1.
@@ -776,6 +824,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                 f"Expected finish_reason 'stop' or 'length' for index {index}, got {reasons[-1]}",
             )
 
+>>>>>>> origin/main
 
 class TestOpenAIPythonicFunctionCalling(CustomTestCase):
     PYTHONIC_TOOLS = [
@@ -913,6 +962,8 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
         )
 
 
+<<<<<<< HEAD
+=======
 # Skip for ci test
 # class TestGLM45ServerFunctionCalling(TestOpenAIServerFunctionCalling):
 #     @classmethod
@@ -949,5 +1000,6 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
 #         self._test_function_calling_multiturn()
 
 
+>>>>>>> origin/main
 if __name__ == "__main__":
     unittest.main()

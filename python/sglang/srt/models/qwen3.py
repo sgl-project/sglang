@@ -1,4 +1,8 @@
 # Adapted from qwen2.py
+<<<<<<< HEAD
+
+=======
+>>>>>>> origin/main
 import logging
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -327,8 +331,13 @@ class Qwen3ForCausalLM(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
+<<<<<<< HEAD
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
+=======
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
+>>>>>>> origin/main
 
     @torch.no_grad()
     def forward(
@@ -366,6 +375,8 @@ class Qwen3ForCausalLM(nn.Module):
         else:
             return hidden_states
 
+<<<<<<< HEAD
+=======
     @torch.no_grad()
     def forward_split_prefill(
         self,
@@ -407,6 +418,7 @@ class Qwen3ForCausalLM(nn.Module):
 
         return result
 
+>>>>>>> origin/main
     @property
     def start_layer(self):
         return self.model.start_layer

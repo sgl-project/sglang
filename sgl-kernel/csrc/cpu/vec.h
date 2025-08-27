@@ -16,6 +16,8 @@ inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, c
   return at::vec::convert_from_float<scalar_t>(a, b);
 }
 
+<<<<<<< HEAD
+=======
 // allow f16, bf16
 template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 1>
 inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const scalar_t* __restrict__ data) {
@@ -35,6 +37,7 @@ inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const fl
   return std::make_tuple(x0, x1);
 }
 
+>>>>>>> origin/main
 #if defined(CPU_CAPABILITY_AVX512)
 
 // `at::vec::convert_from_float<>` from PyTorch doesn't have avx512-bf16 intrinsics

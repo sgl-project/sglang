@@ -1,11 +1,15 @@
 import pytest
 import torch
+<<<<<<< HEAD
+from sgl_kernel import scaled_fp4_quant
+=======
 from sgl_kernel import (
     scaled_fp4_grouped_quant,
     scaled_fp4_quant,
     silu_and_mul,
     silu_and_mul_scaled_fp4_grouped_quant,
 )
+>>>>>>> origin/main
 
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
 
@@ -171,6 +175,8 @@ def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
     torch.testing.assert_close(scale_ans, scale_ref)
 
 
+<<<<<<< HEAD
+=======
 @pytest.mark.skipif(
     skip_condition, reason="Nvfp4 Requires compute capability of 10 or above."
 )
@@ -249,5 +255,6 @@ def test_silu_and_mul_quantize_to_fp4_grouped(shape: tuple[int, int]) -> None:
         torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
 
 
+>>>>>>> origin/main
 if __name__ == "__main__":
     pytest.main([__file__])

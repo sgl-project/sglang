@@ -25,6 +25,17 @@ class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
     def __init__(self):
+<<<<<<< HEAD
+        # initialize properties used for state when parsing tool calls in
+        self._buffer = ""
+        # streaming mode
+        self.prev_tool_call_arr: List[Dict] = []
+        self.current_tool_id: int = -1
+        self.current_tool_name_sent: bool = False
+        self.streamed_args_for_tool: List[str] = (
+            []
+        )  # map what has been streamed for each tool so far to a list
+=======
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
         self._buffer = ""
@@ -44,10 +55,17 @@ class BaseFormatDetector(ABC):
         self.streamed_args_for_tool: List[str] = []
 
         # Token configuration (override in subclasses)
+>>>>>>> origin/main
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
 
+<<<<<<< HEAD
+    def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
+        tool_indices = {
+            tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
+        }
+=======
     def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
         """
         Get a mapping of tool names to their indices in the tools list.
@@ -68,6 +86,7 @@ class BaseFormatDetector(ABC):
 
     def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
+>>>>>>> origin/main
         if not isinstance(action, list):
             action = [action]
 
@@ -156,7 +175,15 @@ class BaseFormatDetector(ABC):
 
         # Build tool indices if not already built
         if not hasattr(self, "_tool_indices"):
+<<<<<<< HEAD
+            self._tool_indices = {
+                tool.function.name: i
+                for i, tool in enumerate(tools)
+                if tool.function and tool.function.name
+            }
+=======
             self._tool_indices = self._get_tool_indices(tools)
+>>>>>>> origin/main
 
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
@@ -316,6 +343,12 @@ class BaseFormatDetector(ABC):
 
     @abstractmethod
     def has_tool_call(self, text: str) -> bool:
+<<<<<<< HEAD
+        raise NotImplementedError()
+
+    @abstractmethod
+    def structure_info(self) -> _GetInfoFunc:
+=======
         """
         Check if the given text contains function call markers specific to this format.
         """
@@ -337,10 +370,13 @@ class BaseFormatDetector(ABC):
         Returns:
             A function that takes a tool name (str) and returns StructureInfo
         """
+>>>>>>> origin/main
         raise NotImplementedError()
 
     @abstractmethod
     def build_ebnf(self, tools: List[Tool]) -> str:
+<<<<<<< HEAD
+=======
         """
         Build an EBNF grammar for constrained generation of function calls.
 
@@ -364,4 +400,5 @@ class BaseFormatDetector(ABC):
             Most implementations use EBNFComposer.build_ebnf() utility with
             format-specific parameters rather than writing EBNF from scratch.
         """
+>>>>>>> origin/main
         raise NotImplementedError()

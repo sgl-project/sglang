@@ -1,8 +1,15 @@
+<<<<<<< HEAD
+from typing import Optional
+
+import torch
+from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
+=======
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 from sgl_kernel.utils import get_cuda_stream, is_arch_support_pdl
+>>>>>>> origin/main
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -41,7 +48,11 @@ def rmsnorm(
     if out is None:
         out = torch.empty_like(input)
     if enable_pdl is None:
+<<<<<<< HEAD
+        enable_pdl = is_hopper_arch()
+=======
         enable_pdl = is_arch_support_pdl()
+>>>>>>> origin/main
     torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
@@ -77,7 +88,11 @@ def fused_add_rmsnorm(
         If None, will be automatically enabled on Hopper architecture.
     """
     if enable_pdl is None:
+<<<<<<< HEAD
+        enable_pdl = is_hopper_arch()
+=======
         enable_pdl = is_arch_support_pdl()
+>>>>>>> origin/main
     torch.ops.sgl_kernel.fused_add_rmsnorm.default(
         input, residual, weight, eps, enable_pdl
     )
@@ -117,7 +132,11 @@ def gemma_rmsnorm(
     if out is None:
         out = torch.empty_like(input)
     if enable_pdl is None:
+<<<<<<< HEAD
+        enable_pdl = is_hopper_arch()
+=======
         enable_pdl = is_arch_support_pdl()
+>>>>>>> origin/main
     torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
@@ -153,7 +172,11 @@ def gemma_fused_add_rmsnorm(
         If None, will be automatically enabled on Hopper architecture.
     """
     if enable_pdl is None:
+<<<<<<< HEAD
+        enable_pdl = is_hopper_arch()
+=======
         enable_pdl = is_arch_support_pdl()
+>>>>>>> origin/main
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
         input, residual, weight, eps, enable_pdl
     )
@@ -180,7 +203,11 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
+<<<<<<< HEAD
+    torch.ops.sgl_kernel.silu_and_mul.default(out, input, get_cuda_stream())
+=======
     torch.ops.sgl_kernel.silu_and_mul.default(out, input)
+>>>>>>> origin/main
     return out
 
 
@@ -195,7 +222,11 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
             device=input.device,
             dtype=input.dtype,
         )
+<<<<<<< HEAD
+    torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input, get_cuda_stream())
+=======
     torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input)
+>>>>>>> origin/main
     return out
 
 
@@ -210,6 +241,12 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
+<<<<<<< HEAD
+    torch.ops.sgl_kernel.gelu_and_mul.default(out, input, get_cuda_stream())
+    return out
+
+
+=======
     torch.ops.sgl_kernel.gelu_and_mul.default(out, input)
     return out
 
@@ -263,6 +300,7 @@ class FusedSetKVBufferArg:
     cache_loc: torch.Tensor
 
 
+>>>>>>> origin/main
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -270,8 +308,11 @@ def apply_rope_with_cos_sin_cache_inplace(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
+<<<<<<< HEAD
+=======
     fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     enable_pdl: Optional[bool] = None,
+>>>>>>> origin/main
 ) -> None:
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
@@ -298,9 +339,12 @@ def apply_rope_with_cos_sin_cache_inplace(
 
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+<<<<<<< HEAD
+=======
     fused_set_kv_buffer_arg : FusedSetKVBufferArg
         Fuse the set-kv-buffer operation into this kernel
 
+>>>>>>> origin/main
     Note
     ----
     The rotary dimension is determined by the cosine cache and sine cache.
@@ -308,6 +352,17 @@ def apply_rope_with_cos_sin_cache_inplace(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
+<<<<<<< HEAD
+    torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
+        query.view(query.shape[0], -1, head_size),
+        key.view(key.shape[0], -1, head_size),
+        query.view(query.shape[0], -1, head_size),
+        key.view(key.shape[0], -1, head_size),
+        cos_sin_cache,
+        positions.long(),
+        (not is_neox),
+        get_cuda_stream(),
+=======
     if enable_pdl is None:
         # the non-fused branch does not yet support PDL, but after we switch to our impl for that branch it will
         enable_pdl = is_arch_support_pdl() and (fused_set_kv_buffer_arg is not None)
@@ -366,4 +421,5 @@ def downcast_fp8(
 ) -> None:
     torch.ops.sgl_kernel.downcast_fp8(
         k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset, get_cuda_stream()
+>>>>>>> origin/main
     )

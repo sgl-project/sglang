@@ -24,9 +24,18 @@ jobs:
 
       - name: Install dependencies
         run: |
+<<<<<<< HEAD
+          bash scripts/ci_install_dependency.sh
+          pip install -r docs/requirements.txt
+          apt-get update
+          apt-get install -y pandoc
+          apt-get update && apt-get install -y parallel retry
+
+=======
           bash scripts/ci/ci_install_dependency.sh
           pip install -r docs/requirements.txt
           apt-get update && apt-get install -y pandoc parallel retry
+>>>>>>> origin/main
           ln -sf "$(which python3)" /usr/bin/python
 
       - name: Setup Jupyter Kernel
@@ -41,7 +50,11 @@ jobs:
           make compile
 
 
+<<<<<<< HEAD
+  finish:
+=======
   notebook-finish:
+>>>>>>> origin/main
     needs: [
       run-all-notebooks
     ]

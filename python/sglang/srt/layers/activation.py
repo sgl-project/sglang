@@ -33,7 +33,10 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+<<<<<<< HEAD
+=======
     is_hip,
+>>>>>>> origin/main
     is_npu,
     set_weight_attrs,
 )
@@ -43,12 +46,18 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+<<<<<<< HEAD
+
+if _is_cuda:
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+=======
 _is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
+>>>>>>> origin/main
 
 if is_npu():
     import torch_npu
@@ -114,6 +123,8 @@ class NewGELU(CustomOp):
         return self.forward_native(x)
 
 
+<<<<<<< HEAD
+=======
 class ReLU2(nn.Module):
     """
     Applies the squared Rectified Linear Unit function.
@@ -125,11 +136,17 @@ class ReLU2(nn.Module):
         return x * x
 
 
+>>>>>>> origin/main
 class QuickGELU(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(1.702 * x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+<<<<<<< HEAD
+        # TODO(zhyncs): Implement the CUDA kernel for QuickGELU in sgl-kernel
+        return self.forward_native(x)
+
+=======
         return self.forward_native(x)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
@@ -137,6 +154,7 @@ class QuickGELU(CustomOp):
         gelu_quick(x, out)
         return out
 
+>>>>>>> origin/main
 
 class ScaledActivation(nn.Module):
     """An activation function with post-scale parameters.
@@ -183,8 +201,11 @@ class ScaledActivation(nn.Module):
 _ACTIVATION_REGISTRY = {
     "gelu": nn.GELU(),
     "gelu_pytorch_tanh": nn.GELU(approximate="tanh"),
+<<<<<<< HEAD
+=======
     "gelu_new": NewGELU(),
     "relu2": ReLU2(),
+>>>>>>> origin/main
 }
 
 
@@ -230,8 +251,14 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         return nn.Identity()
 
 
+<<<<<<< HEAD
+if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
+    logger.info(
+        "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
+=======
 if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip):
     logger.info(
         "sgl-kernel is not available on Non-NV, Non-AMD platforms or Non-AMX CPUs. Fallback to other kernel libraries."
+>>>>>>> origin/main
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul

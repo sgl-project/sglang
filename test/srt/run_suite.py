@@ -13,6 +13,13 @@ class TestFile:
 
 suites = {
     "per-commit": [
+<<<<<<< HEAD
+        TestFile("models/lora/test_lora.py", 200),
+        TestFile("models/lora/test_lora_backend.py", 99),
+        TestFile("models/lora/test_multi_lora_backend.py", 60),
+        TestFile("models/lora/test_lora_cuda_graph.py", 250),
+        TestFile("models/lora/test_lora_update.py", 400),
+=======
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
@@ -24,6 +31,7 @@ suites = {
         TestFile("lora/test_lora_update.py", 400),
         TestFile("lora/test_lora_qwen3.py", 97),
         TestFile("lora/test_lora_radix_cache.py", 100),
+>>>>>>> origin/main
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -42,6 +50,10 @@ suites = {
         TestFile("openai_server/basic/test_serving_embedding.py", 10),
         TestFile("openai_server/basic/test_openai_embedding.py", 141),
         TestFile("openai_server/basic/test_openai_server.py", 149),
+<<<<<<< HEAD
+        TestFile("openai_server/features/test_cache_report.py", 100),
+=======
+>>>>>>> origin/main
         TestFile("openai_server/features/test_enable_thinking.py", 70),
         TestFile("openai_server/features/test_json_constrained.py", 98),
         TestFile("openai_server/features/test_json_mode.py", 90),
@@ -54,6 +66,14 @@ suites = {
         TestFile("openai_server/validation/test_matched_stop.py", 60),
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
+<<<<<<< HEAD
+        TestFile("test_abort.py", 51),
+        TestFile("test_block_int8.py", 22),
+        TestFile("test_create_kvindices.py", 2),
+        TestFile("test_chunked_prefill.py", 313),
+        TestFile("test_eagle_infer_a.py", 370),
+        TestFile("test_eagle_infer_b.py", 270),
+=======
         TestFile("quant/test_block_int8.py", 22),
         TestFile("quant/test_fp8_kernel.py", 8),
         TestFile("quant/test_int8_kernel.py", 8),
@@ -66,10 +86,25 @@ suites = {
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
+>>>>>>> origin/main
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
         # TestFile("test_flashmla.py", 352),
+<<<<<<< HEAD
+        TestFile("test_fp8_kernel.py", 8),
+        TestFile("test_function_call_parser.py", 10),
+        TestFile("test_fused_moe.py", 30),
+        TestFile("test_hicache.py", 116),
+        TestFile("test_hicache_mla.py", 127),
+        TestFile("test_hidden_states.py", 55),
+        TestFile("test_int8_kernel.py", 8),
+        TestFile("test_input_embeddings.py", 38),
+        TestFile("test_jinja_template_utils.py", 1),
+        TestFile("test_metrics.py", 32),
+        TestFile("test_mla.py", 167),
+        TestFile("test_mla_deepseek_v3.py", 342),
+=======
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_gpt_oss_1gpu.py", 600),
@@ -82,6 +117,7 @@ suites = {
         TestFile("test_metrics.py", 32),
         TestFile("test_mla.py", 167),
         TestFile("test_mla_deepseek_v3.py", 700),
+>>>>>>> origin/main
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
@@ -92,14 +128,21 @@ suites = {
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
         TestFile("test_regex_constrained.py", 64),
+<<<<<<< HEAD
+        TestFile("test_retract_decode.py", 54),
+=======
         TestFile("test_reasoning_parser.py", 5),
         TestFile("test_retract_decode.py", 54),
         TestFile("test_request_queue_validation.py", 30),
+>>>>>>> origin/main
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_srt_endpoint.py", 130),
+<<<<<<< HEAD
+=======
         TestFile("test_start_profile.py", 60),
+>>>>>>> origin/main
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
@@ -108,6 +151,37 @@ suites = {
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_triton_moe_channel_fp8_kernel.py", 25),
         TestFile("test_triton_sliding_window.py", 250),
+<<<<<<< HEAD
+        TestFile("test_update_weights_from_disk.py", 114),
+        TestFile("test_update_weights_from_tensor.py", 48),
+        TestFile("test_vertex_endpoint.py", 31),
+        TestFile("test_vision_chunked_prefill.py", 175),
+        TestFile("test_vlm_input_format.py", 300),
+        TestFile("test_vision_openai_server_a.py", 584),
+        TestFile("test_vision_openai_server_b.py", 556),
+        TestFile("test_w8a8_quantization.py", 46),
+        TestFile("test_reasoning_parser.py", 5),
+    ],
+    "per-commit-amd": [
+        TestFile("models/lora/test_lora_backend.py", 99),
+        TestFile("models/lora/test_multi_lora_backend.py", 60),
+        TestFile("models/lora/test_lora_cuda_graph.py", 250),
+        TestFile("test_mla.py", 242),
+        TestFile("test_mla_deepseek_v3.py", 221),
+        TestFile("test_torch_compile.py", 76),
+        TestFile("test_torch_compile_moe.py", 172),
+        TestFile("models/test_qwen_models.py", 82),
+        TestFile("models/test_reward_models.py", 132),
+        TestFile("openai_server/basic/test_openai_embedding.py", 141),
+        TestFile("openai_server/features/test_enable_thinking.py", 70),
+        TestFile("openai_server/features/test_reasoning_content.py", 89),
+        TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
+        TestFile("openai_server/validation/test_request_length_validation.py", 31),
+        TestFile("test_abort.py", 51),
+        TestFile("test_block_int8.py", 22),
+        TestFile("test_create_kvindices.py", 2),
+        TestFile("test_chunked_prefill.py", 313),
+=======
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_vlm_input_format.py", 300),
@@ -199,21 +273,62 @@ suite_amd = {
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_ebnf_constrained.py", 108),
+>>>>>>> origin/main
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_input_embeddings.py", 38),
+<<<<<<< HEAD
+        TestFile("test_metrics.py", 32),
+=======
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
         TestFile("test_mla.py", 242),
         TestFile("test_mla_deepseek_v3.py", 221),
+>>>>>>> origin/main
         TestFile("test_no_chunked_prefill.py", 108),
         # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
+<<<<<<< HEAD
+        TestFile("test_retract_decode.py", 54),
+        TestFile("test_server_args.py", 1),
+        TestFile("test_skip_tokenizer_init.py", 117),
+        TestFile("test_torch_native_attention_backend.py", 123),
+        TestFile("test_triton_attention_backend.py", 150),
+        TestFile("test_update_weights_from_disk.py", 114),
+        TestFile("test_vertex_endpoint.py", 31),
+        # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
+        TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_rope_rocm.py", 3),
+    ],
+    "per-commit-npu": [
+        TestFile("test_ascend_attention_backend.py", 400),
+    ],
+    "per-commit-2-gpu": [
+        TestFile("models/lora/test_lora_tp.py", 116),
+        TestFile("test_data_parallelism.py", 73),
+        TestFile("test_dp_attention.py", 137),
+        TestFile("test_mla_tp.py", 170),
+        TestFile("test_patch_torch.py", 19),
+        TestFile("test_update_weights_from_distributed.py", 103),
+        TestFile("test_release_memory_occupation.py", 44),
+    ],
+    "per-commit-2-gpu-amd": [
+        TestFile("models/lora/test_lora_tp.py", 116),
+        TestFile("test_data_parallelism.py", 73),
+        TestFile("test_mla_tp.py", 170),
+        TestFile("test_patch_torch.py", 19),
+        TestFile("test_update_weights_from_distributed.py", 103),
+    ],
+    "per-commit-4-gpu": [
+        TestFile("test_local_attn.py", 250),
+        TestFile("test_pp_single_node.py", 150),
+        TestFile("test_multi_instance_release_memory_occupation.py", 64),
+=======
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_retract_decode.py", 54),
         TestFile("test_reasoning_parser.py", 5),
@@ -235,10 +350,28 @@ suite_amd = {
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_patch_torch.py", 19),
+>>>>>>> origin/main
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
     ],
+<<<<<<< HEAD
+    "per-commit-8-gpu": [
+        # Disabled deepep tests temporarily because it takes too much time.
+        # TODO: re-enable them after reducing the test time with compilation cache and smaller models.
+        # TestFile("test_deepep_intranode.py", 50),
+        # TestFile("test_deepep_low_latency.py", 50),
+        # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
+        # Disabled because it hangs on the CI.
+        # TestFile("test_moe_ep.py", 181),
+        TestFile("test_disaggregation.py", 270),
+        TestFile("test_disaggregation_different_tp.py", 155),
+        TestFile("test_full_deepseek_v3.py", 463),
+    ],
+    "per-commit-8-gpu-amd": [
+        TestFile("test_full_deepseek_v3.py", 250),
+    ],
+=======
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
     ],
@@ -249,6 +382,7 @@ suite_amd = {
 
 # Add Intel Xeon tests
 suite_xeon = {
+>>>>>>> origin/main
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
         TestFile("cpu/test_binding.py"),
@@ -264,6 +398,23 @@ suite_xeon = {
         TestFile("cpu/test_topk.py"),
         TestFile("test_intel_amx_attention_backend.py"),
     ],
+<<<<<<< HEAD
+    "nightly": [
+        TestFile("test_nightly_gsm8k_eval.py"),
+    ],
+    "nightly-amd": [
+        TestFile("test_nightly_gsm8k_eval_amd.py"),
+    ],
+    "vllm_dependency_test": [
+        TestFile("test_awq.py"),
+        TestFile("test_bnb.py"),
+        TestFile("test_gguf.py", 78),
+        TestFile("test_gptqmodel_dynamic.py", 72),
+        TestFile("test_vllm_dependency.py"),
+    ],
+}
+
+=======
 }
 
 # Add Ascend NPU tests
@@ -287,6 +438,7 @@ suites.update(suite_amd)
 suites.update(suite_xeon)
 suites.update(suite_ascend)
 
+>>>>>>> origin/main
 
 def auto_partition(files, rank, size):
     """

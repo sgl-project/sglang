@@ -12,8 +12,11 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
+<<<<<<< HEAD
+=======
 import base64
 import io
+>>>>>>> origin/main
 import json
 import os
 import pickle
@@ -73,7 +76,11 @@ class RequestFuncInput:
     output_len: int
     model: str
     lora_name: str
+<<<<<<< HEAD
+    image_data: str
+=======
     image_data: Optional[List[str]]
+>>>>>>> origin/main
     extra_request_body: Dict[str, Any]
 
 
@@ -291,6 +298,18 @@ async def async_request_openai_chat_completions(
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
     if request_func_input.image_data:
+<<<<<<< HEAD
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": request_func_input.image_data},
+                    },
+                    {"type": "text", "text": request_func_input.prompt},
+                ],
+=======
         # Build multi-image content: a list of image_url entries followed by the text
         content_items = [
             {
@@ -304,6 +323,7 @@ async def async_request_openai_chat_completions(
             {
                 "role": "user",
                 "content": content_items,
+>>>>>>> origin/main
             },
         ]
     else:
@@ -502,7 +522,11 @@ async def async_request_sglang_generate(
             **request_func_input.extra_request_body,
         }
 
+<<<<<<< HEAD
+        # Add image data if available
+=======
         # Add image data if available (list of image urls/base64)
+>>>>>>> origin/main
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
 
@@ -653,7 +677,11 @@ def get_dataset(args, tokenizer):
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
+<<<<<<< HEAD
+    elif args.dataset_name.startswith("random"):
+=======
     elif args.dataset_name.startswith("random") and args.dataset_name != "random-image":
+>>>>>>> origin/main
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -664,6 +692,8 @@ def get_dataset(args, tokenizer):
             random_sample=args.dataset_name == "random",
             return_text=not tokenize_prompt,
         )
+<<<<<<< HEAD
+=======
     elif args.dataset_name == "random-image":
         assert not tokenize_prompt, "random-image does not support --tokenize-prompt"
         input_requests = sample_random_image_requests(
@@ -676,6 +706,7 @@ def get_dataset(args, tokenizer):
             apply_chat_template=args.apply_chat_template,
             image_resolution=args.random_image_resolution,
         )
+>>>>>>> origin/main
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
         input_requests = sample_generated_shared_prefix_requests(
@@ -807,7 +838,11 @@ class DatasetRow:
     prompt: str
     prompt_len: int
     output_len: int
+<<<<<<< HEAD
+    image_data: Optional[str] = None
+=======
     image_data: Optional[List[str]] = None
+>>>>>>> origin/main
 
 
 def sample_mmmu_requests(
@@ -831,9 +866,15 @@ def sample_mmmu_requests(
         List of tuples (prompt, prompt_token_len, output_token_len).
     """
     try:
+<<<<<<< HEAD
+        import base64
+        import io
+
+=======
         import io
 
         import pybase64
+>>>>>>> origin/main
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
@@ -881,11 +922,19 @@ def sample_mmmu_requests(
                     if image.mode == "RGBA":
                         image = image.convert("RGB")
 
+<<<<<<< HEAD
+                    # Encode image to base64
+                    buffered = io.BytesIO()
+                    image.save(buffered, format="JPEG")
+                    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                    image_data = f"data:image/jpeg;base64,{img_str}"
+=======
                     # Encode image to base64 (save as PNG to support palette/alpha modes)
                     buffered = io.BytesIO()
                     image.save(buffered, format="PNG")
                     img_str = pybase64.b64encode(buffered.getvalue()).decode("utf-8")
                     image_data = f"data:image/png;base64,{img_str}"
+>>>>>>> origin/main
                 else:
                     continue
 
@@ -930,7 +979,11 @@ def sample_mmmu_requests(
                         prompt=prompt,
                         prompt_len=prompt_len,
                         output_len=output_len,
+<<<<<<< HEAD
+                        image_data=image_data,
+=======
                         image_data=[image_data],
+>>>>>>> origin/main
                     )
                 )
 
@@ -1130,6 +1183,8 @@ def sample_random_requests(
     return input_requests
 
 
+<<<<<<< HEAD
+=======
 def parse_random_image_resolution(image_resolution: str) -> Tuple[int, int]:
     """Parse image resolution into (width, height).
 
@@ -1256,6 +1311,7 @@ def sample_random_image_requests(
     return dataset
 
 
+>>>>>>> origin/main
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = list(tokenizer.get_vocab().values())
@@ -1722,6 +1778,9 @@ async def benchmark(
         output_file_name = args.output_file
     else:
         now = datetime.now().strftime("%m%d")
+<<<<<<< HEAD
+        if args.dataset_name.startswith("random"):
+=======
         if args.dataset_name == "random-image":
             output_file_name = (
                 f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
@@ -1729,6 +1788,7 @@ async def benchmark(
                 f"{args.random_image_resolution}.jsonl"
             )
         elif args.dataset_name.startswith("random"):
+>>>>>>> origin/main
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
@@ -1968,6 +2028,9 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
+<<<<<<< HEAD
+        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu"],
+=======
         choices=[
             "sharegpt",
             "random",
@@ -1976,6 +2039,7 @@ if __name__ == "__main__":
             "mmmu",
             "random-image",
         ],
+>>>>>>> origin/main
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -2028,6 +2092,8 @@ if __name__ == "__main__":
         help="Range of sampled ratio of input/output length, "
         "used only for random dataset.",
     )
+<<<<<<< HEAD
+=======
     # random-image dataset args
     parser.add_argument(
         "--random-image-num-images",
@@ -2044,6 +2110,7 @@ if __name__ == "__main__":
             "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
         ),
     )
+>>>>>>> origin/main
     parser.add_argument(
         "--request-rate",
         type=float,

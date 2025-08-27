@@ -1,7 +1,11 @@
 import logging
 import re
 from functools import lru_cache
+<<<<<<< HEAD
+from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict, Union
+=======
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
+>>>>>>> origin/main
 
 import torch
 from torch import nn
@@ -25,7 +29,10 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
+<<<<<<< HEAD
+=======
     Modality,
+>>>>>>> origin/main
     MultimodalDataItem,
     MultimodalInputs,
     flatten_nested_list,
@@ -265,7 +272,11 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         # Process images one by one to handle flatten_batch=True constraint in vision_tower
+<<<<<<< HEAD
+        all_pixel_values = flatten_nested_list([item.pixel_values for item in items])
+=======
         all_pixel_values = flatten_nested_list([item.feature for item in items])
+>>>>>>> origin/main
         vision_outputs_list = []
 
         for pixel_values_batch in all_pixel_values:
@@ -316,7 +327,13 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             audio_features (`torch.Tensor`): Audio feature tensor of shape `(num_audios, audio_length, embed_dim)`).
         """
         # Extract audio features and masks from items
+<<<<<<< HEAD
+        all_input_features = flatten_nested_list(
+            [item.input_features for item in items]
+        )
+=======
         all_input_features = flatten_nested_list([item.feature for item in items])
+>>>>>>> origin/main
         all_input_features_mask = flatten_nested_list(
             [~item.input_features_mask for item in items]
         )  # Note(Xinyuan): reverse the mask according to the HF implementation
@@ -433,10 +450,15 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
+<<<<<<< HEAD
+            image_data_embedding_func=self.get_image_feature,
+            audio_data_embedding_func=self.get_audio_feature,
+=======
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
                 Modality.AUDIO: self.get_audio_feature,
             },
+>>>>>>> origin/main
             positions=positions,
             per_layer_inputs=per_layer_inputs,
         )
@@ -492,6 +514,8 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             loaded_params.add(name)
         return loaded_params
 
+<<<<<<< HEAD
+=======
     lora_pattern = re.compile(
         r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
     )
@@ -530,5 +554,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         else:
             raise NotImplementedError()
 
+>>>>>>> origin/main
 
 EntryClass = Gemma3nForConditionalGeneration

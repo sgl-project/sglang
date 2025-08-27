@@ -5,10 +5,14 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+<<<<<<< HEAD
+from sglang.srt.two_batch_overlap import compute_split_seq_index
+=======
 from sglang.srt.two_batch_overlap import (
     compute_split_seq_index,
     compute_split_token_index,
 )
+>>>>>>> origin/main
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -36,8 +40,12 @@ class TestTwoBatchOverlap(unittest.TestCase):
                 "--dp",
                 "2",
                 "--enable-dp-attention",
+<<<<<<< HEAD
+                "--enable-deepep-moe",
+=======
                 "--moe-a2a-backend",
                 "deepep",
+>>>>>>> origin/main
                 "--deepep-mode",
                 "normal",
                 "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
@@ -76,21 +84,48 @@ class TestTwoBatchOverlap(unittest.TestCase):
 
 
 class TestTwoBatchOverlapUnitTest(unittest.TestCase):
+<<<<<<< HEAD
+    # TODO change tests when having 6328
+    def test_compute_split_seq_index(self):
+=======
     def test_compute_split_seq_and_token_index(self):
+>>>>>>> origin/main
         for num_tokens, expect in [
             (0, 0),
             (100, 50),
             (99, 49),
         ]:
             actual = compute_split_seq_index(
+<<<<<<< HEAD
+                forward_mode=ForwardMode.DECODE, num_tokens=num_tokens, extend_lens=None
+=======
                 forward_mode=ForwardMode.DECODE,
                 num_tokens=num_tokens,
                 extend_lens=None,
                 token_num_per_seq=1,
+>>>>>>> origin/main
             )
             self.assertEqual(actual, expect)
 
         for extend_lens, expect in [
+<<<<<<< HEAD
+            ([], 0),
+            ([42], 0),
+            ([42, 999], 1),
+            ([999, 42], 1),
+            ([4096, 4096, 4096, 4096], 2),
+            ([4095, 4096, 4096, 4096, 1], 2),
+            ([1, 4095, 4096, 4096, 4096], 3),
+            ([4097, 4096, 4096, 4095, 1], 2),
+            ([1, 1, 1, 1, 99999], 4),
+            ([99999, 1, 1, 1, 1], 1),
+        ]:
+            actual = compute_split_seq_index(
+                forward_mode=ForwardMode.EXTEND,
+                num_tokens=None,
+                extend_lens=extend_lens,
+            )
+=======
             ([], (0, 0)),
             ([42], (0, 21)),
             ([42, 999], (1, 520)),
@@ -116,6 +151,7 @@ class TestTwoBatchOverlapUnitTest(unittest.TestCase):
                 token_num_per_seq=None,
             )
             actual = (actual_seq_idx, actual_token_idx)
+>>>>>>> origin/main
             print(f"{extend_lens=} {expect=} {actual=}")
             self.assertEqual(actual, expect)
 
@@ -137,8 +173,12 @@ class TestQwen3TwoBatchOverlap(TestTwoBatchOverlap):
                 "--dp",
                 "2",
                 "--enable-dp-attention",
+<<<<<<< HEAD
+                "--enable-deepep-moe",
+=======
                 "--moe-a2a-backend",
                 "deepep",
+>>>>>>> origin/main
                 "--deepep-mode",
                 "normal",
                 "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph

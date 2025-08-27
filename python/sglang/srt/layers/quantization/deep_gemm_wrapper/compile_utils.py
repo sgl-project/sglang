@@ -148,7 +148,11 @@ def _compile_grouped_gemm_nt_f8f8bf16_masked_one(
         "NUM_MATH_THREADS_PER_GROUP": num_math_threads_per_group,
         "N": n,
         "K": k,
+<<<<<<< HEAD
+        "NUM_GROUPS": 1,
+=======
         "NUM_GROUPS": num_groups,
+>>>>>>> origin/main
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
         "BLOCK_K": block_k,

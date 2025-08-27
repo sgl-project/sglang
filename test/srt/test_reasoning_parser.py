@@ -180,6 +180,8 @@ class TestDeepSeekR1Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "I think this is the answer")
         self.assertEqual(result.normal_text, "The final answer is 42.")
 
+<<<<<<< HEAD
+=======
     def test_detect_and_parse_with_start_token(self):
         """Test parsing deepseek-ai/DeepSeek-R1-0528 format, which generates the <think> token."""
         text = "<think>I need to think about this.</think>The answer is 42."
@@ -188,6 +190,7 @@ class TestDeepSeekR1Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "I need to think about this.")
         self.assertEqual(result.normal_text, "The answer is 42.")
 
+>>>>>>> origin/main
 
 class TestQwen3Detector(CustomTestCase):
     def setUp(self):
@@ -215,6 +218,8 @@ class TestQwen3Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
 
 
+<<<<<<< HEAD
+=======
 class TestQwen3ForcedReasoningDetector(CustomTestCase):
     def setUp(self):
         self.detector = Qwen3Detector(force_reasoning=True)
@@ -261,6 +266,7 @@ class TestQwen3ForcedReasoningDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "The answer is 42.")
 
 
+>>>>>>> origin/main
 class TestKimiDetector(CustomTestCase):
     def setUp(self):
         self.detector = KimiDetector()
@@ -452,6 +458,8 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertEqual(reasoning, "")
         self.assertEqual(normal, "Just the answer.")
 
+<<<<<<< HEAD
+=======
     def test_qwen3_forced_reasoning_complete_response(self):
         """Test complete Qwen3-ForcedReasoning response parsing."""
         parser = ReasoningParser("qwen3", force_reasoning=True)
@@ -598,6 +606,7 @@ class TestBufferLossBugFix(CustomTestCase):
         self.assertTrue(detector._in_reasoning)
         self.assertTrue(detector.stripped_think_start)
 
+>>>>>>> origin/main
 
 if __name__ == "__main__":
     unittest.main()

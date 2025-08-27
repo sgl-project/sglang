@@ -6,7 +6,10 @@ from tqdm import tqdm
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+<<<<<<< HEAD
+=======
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+>>>>>>> origin/main
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.utils import is_hip
@@ -133,10 +136,25 @@ class TestFusedMOE(CustomTestCase):
                     input_scale=a2_scale,
                 )
 
+<<<<<<< HEAD
+            sglang_output = fused_moe(
+                a,
+                w1,
+                w2,
+                score,
+                topk,
+                renormalize=False,
+                use_fp8_w8a8=True,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+=======
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
                 topk_config=TopKConfig(top_k=topk, renormalize=False),
+>>>>>>> origin/main
             )
 
             torch_output = self.torch_naive_moe(
@@ -150,6 +168,8 @@ class TestFusedMOE(CustomTestCase):
                 a1_scale,
                 a2_scale,
             )
+<<<<<<< HEAD
+=======
 
             sglang_output = fused_moe(
                 a,
@@ -162,6 +182,7 @@ class TestFusedMOE(CustomTestCase):
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
             )
+>>>>>>> origin/main
             torch.testing.assert_close(
                 sglang_output, torch_output, rtol=rtol, atol=atol
             )
@@ -171,6 +192,9 @@ class TestFusedMOE(CustomTestCase):
             w2 = self.create_random_cuda_tensor((e, k, n), dtype)
             score = self.create_random_cuda_tensor((m, e), dtype)
 
+<<<<<<< HEAD
+            triton_output = fused_moe(a, w1, w2, score, topk, renormalize=False)
+=======
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
@@ -178,6 +202,7 @@ class TestFusedMOE(CustomTestCase):
             )
 
             triton_output = fused_moe(a, w1, w2, topk_output)
+>>>>>>> origin/main
             torch_output = self.torch_naive_moe(a, w1, w2, score, topk)
             torch.testing.assert_close(
                 triton_output, torch_output, rtol=rtol, atol=atol

@@ -1,6 +1,10 @@
 # Production Metrics
 
+<<<<<<< HEAD
+SGLang exposes the following metrics via Prometheus. The metrics are namespaced by `$name` (the model name).
+=======
 SGLang exposes the following metrics via Prometheus. You can enable it by adding `--enable-metrics` when you launch the server.
+>>>>>>> origin/main
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 

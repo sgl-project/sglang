@@ -65,10 +65,16 @@ def run_eval(args):
 
     sampler = ChatCompletionSampler(
         model=args.model,
+<<<<<<< HEAD
+        max_tokens=2048,
+        base_url=base_url,
+        temperature=getattr(args, "temperature", 0.0),
+=======
         max_tokens=getattr(args, "max_tokens", 2048),
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+>>>>>>> origin/main
     )
 
     # Run eval
@@ -121,9 +127,13 @@ if __name__ == "__main__":
     parser.add_argument("--eval-name", type=str, default="mmlu")
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
+<<<<<<< HEAD
+    parser.add_argument("--temperature", type=float, default=0.0)
+=======
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--reasoning-effort", type=str)
+>>>>>>> origin/main
     args = parser.parse_args()
 
     run_eval(args)

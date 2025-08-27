@@ -24,7 +24,11 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         set_custom_all_reduce,
     )
     from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+<<<<<<< HEAD
+    from sglang.srt.layers.quantization import get_dynamic_override
+=======
     from sglang.srt.layers.quantization.utils import get_dynamic_override
+>>>>>>> origin/main
     from sglang.srt.model_loader import get_model
     from sglang.srt.server_args import PortArgs, ServerArgs
 
@@ -51,12 +55,22 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         model_config=model_config, load_config=load_config, device_config=device_config
     )
 
+<<<<<<< HEAD
+    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
+    from vllm.model_executor.layers.quantization.gptq_marlin import (
+        GPTQMarlinLinearMethod,
+    )
+
+    from sglang.srt.layers.linear import UnquantizedLinearMethod
+
+=======
     from sglang.srt.layers.linear import UnquantizedLinearMethod
     from sglang.srt.layers.quantization.gptq import (
         GPTQLinearMethod,
         GPTQMarlinLinearMethod,
     )
 
+>>>>>>> origin/main
     linear_method_cls = (
         GPTQMarlinLinearMethod if use_marlin_kernel else (GPTQLinearMethod)
     )
@@ -161,7 +175,11 @@ class TestGPTQModelDynamicWithMarlin(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+<<<<<<< HEAD
+            other_args=["--dtype", "float16"],
+=======
             other_args=["--dtype", "bfloat16"],
+>>>>>>> origin/main
         )
 
     @classmethod

@@ -239,6 +239,10 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 #endif
 }
 
+<<<<<<< HEAD
+// Use UE4M3 by default.
+template <class Type, bool UE8M0_SF = false>
+=======
 __device__ __forceinline__ float silu(const float& val) {
   return val / (1.0f + __expf(-val));
 }
@@ -268,6 +272,7 @@ inline __device__ void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type
 
 // Use UE4M3 by default.
 template <class Type, bool UE8M0_SF = false, bool SMALL_NUM_EXPERTS = false>
+>>>>>>> origin/main
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(512, 4) cvt_fp16_to_fp4(
@@ -282,15 +287,36 @@ cvt_fp16_to_fp4(
     uint32_t* SFout,
     uint32_t* input_offset_by_experts,
     uint32_t* output_scale_offset_by_experts,
+<<<<<<< HEAD
+    int n_experts) {
+=======
     int32_t* mask,
     int n_experts,
     bool low_latency) {
+>>>>>>> origin/main
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
   static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
 
   // Input tensor row/col loops.
+<<<<<<< HEAD
+  for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x) {
+    for (int colIdx = threadIdx.x; colIdx < numCols / CVT_FP4_ELTS_PER_THREAD; colIdx += blockDim.x) {
+      int64_t inOffset = rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
+      PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+      // Get the output tensor offset.
+      // Same as inOffset because 8 elements are packed into one uint32_t.
+      int64_t outOffset = inOffset;
+      auto& out_pos = out[outOffset];
+
+      // Find index within the experts.
+      int rowIdx_in_expert = 0;
+      int expert_idx = 0;
+      for (int i = 0; i < n_experts; i++) {
+        if (rowIdx >= input_offset_by_experts[i] && rowIdx < input_offset_by_experts[i + 1]) {
+          rowIdx_in_expert = rowIdx - input_offset_by_experts[i];
+=======
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
   // TODO(kaixih@nvidia): For now, we assume mask is used together with
@@ -316,10 +342,30 @@ cvt_fp16_to_fp4(
         uint32_t next_offset = __ldca(&input_offset_by_experts[i + 1]);
         if (rowIdx >= current_offset && rowIdx < next_offset) {
           rowIdx_in_expert = rowIdx - current_offset;
+>>>>>>> origin/main
           expert_idx = i;
           break;
         }
       }
+<<<<<<< HEAD
+
+      // Get the global scaling factor, which will be applied to the SF.
+      // Note SFScale is the same as next GEMM's alpha, which is
+      // (448.f / (Alpha_A / 6.f)).
+      float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
+
+      int factor = CVT_FP4_SF_VEC_SIZE * 4;
+      // The actual output_scales dim is computed from the padded numCols.
+      int32_t numCols_padded = (numCols + factor - 1) / factor * factor;
+      int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
+      uint32_t* SFout_in_expert = SFout + output_scale_offset_by_experts[expert_idx] * numCols_SFout;
+
+      auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+          rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
+
+      out_pos = cvt_warp_fp16_to_fp4<Type, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+    }
+=======
     } else {
       // Load input offsets into registers first, then do the computation.
       // Local array size set to 17 because of register limit.
@@ -486,6 +532,7 @@ cvt_fp16_to_fp4(
         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
     out_pos = cvt_warp_fp16_to_fp4<Type, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+>>>>>>> origin/main
   }
 #endif
 }
@@ -498,7 +545,10 @@ void quant_impl(
     void* input_global_scale,
     void* input_offset_by_experts,
     void* output_scale_offset_by_experts,
+<<<<<<< HEAD
+=======
     void* mask,
+>>>>>>> origin/main
     int m_topk,
     int k,
     int n_experts,
@@ -511,6 +561,23 @@ void quant_impl(
 
   // Grid, Block size.
   // Each thread converts 8 values.
+<<<<<<< HEAD
+  dim3 block(std::min(int(k / ELTS_PER_THREAD), 512));
+  // Get number of blocks per SM (assume we can fully utilize the SM).
+  int const numBlocksPerSM = 2048 / block.x;
+  dim3 grid(std::min(int(m_topk), multiProcessorCount * numBlocksPerSM));
+
+  cvt_fp16_to_fp4<T, false><<<grid, block, 0, stream>>>(
+      m_topk,
+      k,
+      reinterpret_cast<T*>(input),
+      reinterpret_cast<float*>(input_global_scale),
+      reinterpret_cast<uint32_t*>(output),
+      reinterpret_cast<uint32_t*>(output_scale),
+      reinterpret_cast<uint32_t*>(input_offset_by_experts),
+      reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
+      n_experts);
+=======
   int const workSizePerRow = k / ELTS_PER_THREAD;
   int const totalWorkSize = m_topk * workSizePerRow;
   dim3 block(std::min(workSizePerRow, 512));
@@ -579,6 +646,7 @@ void quant_impl(
           /* bool low_latency */ true);
     }
   }
+>>>>>>> origin/main
 }
 
 /*Quantization entry for fp4 experts quantization*/
@@ -651,7 +719,10 @@ void scaled_fp4_experts_quant_sm100a(
         input_global_scale.data_ptr(),
         input_offset_by_experts.data_ptr(),
         output_scale_offset_by_experts.data_ptr(),
+<<<<<<< HEAD
+=======
         nullptr,  // mask
+>>>>>>> origin/main
         m_topk,
         k,
         n_experts,
@@ -664,6 +735,8 @@ void scaled_fp4_experts_quant_sm100a(
         input_global_scale.data_ptr(),
         input_offset_by_experts.data_ptr(),
         output_scale_offset_by_experts.data_ptr(),
+<<<<<<< HEAD
+=======
         nullptr,  // mask
         m_topk,
         k,
@@ -750,6 +823,7 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
         input_offset_by_experts.data_ptr(),
         output_scale_offset_by_experts.data_ptr(),
         mask.data_ptr(),
+>>>>>>> origin/main
         m_topk,
         k,
         n_experts,

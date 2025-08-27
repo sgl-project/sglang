@@ -7,7 +7,11 @@ impl ConfigValidator {
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
         // Check if service discovery is enabled
+<<<<<<< HEAD
+        let has_service_discovery = config.discovery.as_ref().map_or(false, |d| d.enabled);
+=======
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
+>>>>>>> origin/main
 
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
@@ -23,12 +27,15 @@ impl ConfigValidator {
 
         Self::validate_compatibility(config)?;
 
+<<<<<<< HEAD
+=======
         // Validate effective retry/CB configs (respect disable flags)
         let retry_cfg = config.effective_retry_config();
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
+>>>>>>> origin/main
         Ok(())
     }
 
@@ -47,8 +54,11 @@ impl ConfigValidator {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
+<<<<<<< HEAD
+=======
                 prefill_policy,
                 decode_policy,
+>>>>>>> origin/main
             } => {
                 // Only require URLs if service discovery is disabled
                 if !has_service_discovery {
@@ -86,6 +96,8 @@ impl ConfigValidator {
                         }
                     }
                 }
+<<<<<<< HEAD
+=======
 
                 // Validate optional prefill and decode policies
                 if let Some(p_policy) = prefill_policy {
@@ -94,6 +106,7 @@ impl ConfigValidator {
                 if let Some(d_policy) = decode_policy {
                     Self::validate_policy(d_policy)?;
                 }
+>>>>>>> origin/main
             }
         }
         Ok(())
@@ -269,6 +282,30 @@ impl ConfigValidator {
         Ok(())
     }
 
+<<<<<<< HEAD
+    /// Validate compatibility between different configuration sections
+    fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        // Check mode and policy compatibility
+        match (&config.mode, &config.policy) {
+            (RoutingMode::Regular { .. }, PolicyConfig::PowerOfTwo { .. }) => {
+                // PowerOfTwo is only supported in PD mode
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "PowerOfTwo policy is only supported in PD disaggregated mode"
+                        .to_string(),
+                });
+            }
+            (RoutingMode::PrefillDecode { .. }, PolicyConfig::RoundRobin) => {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "RoundRobin policy is not supported in PD disaggregated mode"
+                        .to_string(),
+                });
+            }
+            _ => {}
+        }
+
+        // Check if service discovery is enabled for worker count validation
+        let has_service_discovery = config.discovery.as_ref().map_or(false, |d| d.enabled);
+=======
     /// Validate retry configuration
     fn validate_retry(retry: &RetryConfig) -> ConfigResult<()> {
         if retry.max_retries < 1 {
@@ -354,6 +391,7 @@ impl ConfigValidator {
 
         // Check if service discovery is enabled for worker count validation
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
+>>>>>>> origin/main
 
         // Only validate worker counts if service discovery is disabled
         if !has_service_discovery {
@@ -366,6 +404,8 @@ impl ConfigValidator {
                     });
                 }
             }
+<<<<<<< HEAD
+=======
 
             // For PD mode, validate that policies have sufficient workers
             if let RoutingMode::PrefillDecode {
@@ -403,6 +443,7 @@ impl ConfigValidator {
             return Err(ConfigError::IncompatibleConfig {
                 reason: "DP-aware routing is not compatible with service discovery".to_string(),
             });
+>>>>>>> origin/main
         }
 
         Ok(())
@@ -561,8 +602,11 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
                 decode_urls: vec!["http://decode:8000".to_string()],
+<<<<<<< HEAD
+=======
                 prefill_policy: None,
                 decode_policy: None,
+>>>>>>> origin/main
             },
             PolicyConfig::Random,
         );
@@ -571,19 +615,34 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
+    fn test_validate_incompatible_policy() {
+        // RoundRobin with PD mode
+=======
     fn test_validate_roundrobin_with_pd_mode() {
         // RoundRobin with PD mode is now supported
+>>>>>>> origin/main
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
+<<<<<<< HEAD
+=======
                 prefill_policy: None,
                 decode_policy: None,
+>>>>>>> origin/main
             },
             PolicyConfig::RoundRobin,
         );
 
         let result = ConfigValidator::validate(&config);
+<<<<<<< HEAD
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("RoundRobin policy is not supported in PD disaggregated mode"));
+=======
         assert!(result.is_ok());
     }
 
@@ -608,11 +667,16 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+>>>>>>> origin/main
     }
 
     #[test]
     fn test_validate_power_of_two_with_regular_mode() {
+<<<<<<< HEAD
+        // PowerOfTwo with Regular mode should fail
+=======
         // PowerOfTwo with Regular mode is now supported
+>>>>>>> origin/main
         let config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec![
@@ -626,6 +690,13 @@ mod tests {
         );
 
         let result = ConfigValidator::validate(&config);
+<<<<<<< HEAD
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("PowerOfTwo policy is only supported in PD disaggregated mode"));
+=======
         assert!(result.is_ok());
     }
 
@@ -683,5 +754,6 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+>>>>>>> origin/main
     }
 }

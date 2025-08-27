@@ -43,7 +43,10 @@ class TestEnableThinking(CustomTestCase):
                 "qwen3",
             ],
         )
+<<<<<<< HEAD
+=======
         cls.additional_chat_kwargs = {}
+>>>>>>> origin/main
 
     @classmethod
     def tearDownClass(cls):
@@ -60,7 +63,10 @@ class TestEnableThinking(CustomTestCase):
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": True},
+<<<<<<< HEAD
+=======
                 **self.additional_chat_kwargs,
+>>>>>>> origin/main
             },
         )
 
@@ -84,7 +90,10 @@ class TestEnableThinking(CustomTestCase):
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": False},
+<<<<<<< HEAD
+=======
                 **self.additional_chat_kwargs,
+>>>>>>> origin/main
             },
         )
 
@@ -110,7 +119,10 @@ class TestEnableThinking(CustomTestCase):
                 "separate_reasoning": True,
                 "stream": True,
                 "chat_template_kwargs": {"enable_thinking": True},
+<<<<<<< HEAD
+=======
                 **self.additional_chat_kwargs,
+>>>>>>> origin/main
             },
             stream=True,
         )
@@ -155,7 +167,10 @@ class TestEnableThinking(CustomTestCase):
                 "separate_reasoning": True,
                 "stream": True,
                 "chat_template_kwargs": {"enable_thinking": False},
+<<<<<<< HEAD
+=======
                 **self.additional_chat_kwargs,
+>>>>>>> origin/main
             },
             stream=True,
         )
@@ -189,6 +204,8 @@ class TestEnableThinking(CustomTestCase):
         )
 
 
+<<<<<<< HEAD
+=======
 # Skip for ci test
 # class TestGLM45EnableThinking(TestEnableThinking):
 #     @classmethod
@@ -239,5 +256,6 @@ class TestEnableThinking(CustomTestCase):
 #             ]
 #         }
 
+>>>>>>> origin/main
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,10 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/qwen.py#L1
 
+<<<<<<< HEAD
+=======
 import time
+>>>>>>> origin/main
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -287,6 +290,8 @@ class QWenLMHeadModel(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+<<<<<<< HEAD
+=======
     @torch.no_grad()
     def forward_split_prefill(
         self,
@@ -323,6 +328,7 @@ class QWenLMHeadModel(nn.Module):
 
         return result
 
+>>>>>>> origin/main
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

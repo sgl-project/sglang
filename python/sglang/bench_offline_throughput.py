@@ -418,6 +418,8 @@ if __name__ == "__main__":
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
+<<<<<<< HEAD
+=======
 
     # handling ModelScope model downloads
     if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() in ("true", "1"):
@@ -438,6 +440,7 @@ if __name__ == "__main__":
                 print(f"ModelScope download failed: {str(e)}")
                 raise e
 
+>>>>>>> origin/main
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 

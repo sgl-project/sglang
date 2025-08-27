@@ -8,12 +8,23 @@ import unittest
 
 from test_vision_openai_server_common import *
 
+<<<<<<< HEAD
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+=======
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+>>>>>>> origin/main
     popen_launch_server,
 )
 
 
+<<<<<<< HEAD
+class TestQwen2VLServer(TestOpenAIVisionServer):
+=======
 class TestLlava(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
@@ -30,6 +41,7 @@ class TestLlava(ImageOpenAITestMixin):
 
 
 class TestQwen2VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+>>>>>>> origin/main
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
@@ -42,15 +54,23 @@ class TestQwen2VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
+<<<<<<< HEAD
+                "0.4",
+=======
                 "0.35",
                 "--cuda-graph-max-bs",
                 "4",
+>>>>>>> origin/main
             ],
         )
         cls.base_url += "/v1"
 
 
+<<<<<<< HEAD
+class TestQwen2_5_VLServer(TestOpenAIVisionServer):
+=======
 class TestQwen2_5_VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+>>>>>>> origin/main
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -63,9 +83,13 @@ class TestQwen2_5_VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
+<<<<<<< HEAD
+                "0.4",
+=======
                 "0.35",
                 "--cuda-graph-max-bs",
                 "4",
+>>>>>>> origin/main
             ],
         )
         cls.base_url += "/v1"
@@ -85,9 +109,13 @@ class TestVLMContextLengthIssue(CustomTestCase):
             other_args=[
                 "--context-length",
                 "300",
+<<<<<<< HEAD
+                "--mem-fraction-static=0.80",
+=======
                 "--mem-fraction-static=0.75",
                 "--cuda-graph-max-bs",
                 "4",
+>>>>>>> origin/main
             ],
         )
         cls.base_url += "/v1"
@@ -128,6 +156,27 @@ class TestVLMContextLengthIssue(CustomTestCase):
         )
 
 
+<<<<<<< HEAD
+class TestMllamaServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
+
+
+class TestMinicpmvServer(TestOpenAIVisionServer):
+=======
 # Note(Xinyuan): mllama is not stable for now, skip for CI
 # class TestMllamaServer(TestOpenAIVisionServer):
 #     @classmethod
@@ -145,6 +194,7 @@ class TestVLMContextLengthIssue(CustomTestCase):
 
 
 class TestMinicpmvServer(ImageOpenAITestMixin):
+>>>>>>> origin/main
     @classmethod
     def setUpClass(cls):
         cls.model = "openbmb/MiniCPM-V-2_6"
@@ -157,15 +207,23 @@ class TestMinicpmvServer(ImageOpenAITestMixin):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
+<<<<<<< HEAD
+                "0.4",
+=======
                 "0.35",
                 "--cuda-graph-max-bs",
                 "4",
+>>>>>>> origin/main
             ],
         )
         cls.base_url += "/v1"
 
 
+<<<<<<< HEAD
+class TestInternVL2_5Server(TestOpenAIVisionServer):
+=======
 class TestInternVL2_5Server(ImageOpenAITestMixin):
+>>>>>>> origin/main
     @classmethod
     def setUpClass(cls):
         cls.model = "OpenGVLab/InternVL2_5-2B"
@@ -175,16 +233,24 @@ class TestInternVL2_5Server(ImageOpenAITestMixin):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+<<<<<<< HEAD
+            other_args=["--trust-remote-code"],
+=======
             other_args=[
                 "--trust-remote-code",
                 "--cuda-graph-max-bs",
                 "4",
             ],
+>>>>>>> origin/main
         )
         cls.base_url += "/v1"
 
 
+<<<<<<< HEAD
+class TestMinicpmoServer(TestOpenAIVisionServer):
+=======
 class TestMinicpmoServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
+>>>>>>> origin/main
     @classmethod
     def setUpClass(cls):
         cls.model = "openbmb/MiniCPM-o-2_6"
@@ -197,13 +263,25 @@ class TestMinicpmoServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
+<<<<<<< HEAD
+                "0.7",
+=======
                 "0.65",
                 "--cuda-graph-max-bs",
                 "4",
+>>>>>>> origin/main
             ],
         )
         cls.base_url += "/v1"
 
+<<<<<<< HEAD
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        self._test_audio_ambient_completion()
+
+
+if __name__ == "__main__":
+=======
 
 class TestMimoVLServer(ImageOpenAITestMixin):
     @classmethod
@@ -318,4 +396,5 @@ if __name__ == "__main__":
         VideoOpenAITestMixin,
         AudioOpenAITestMixin,
     )
+>>>>>>> origin/main
     unittest.main()

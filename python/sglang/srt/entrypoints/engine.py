@@ -23,10 +23,15 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+<<<<<<< HEAD
+import signal
+import threading
+=======
 import random
 import signal
 import threading
 import time
+>>>>>>> origin/main
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
@@ -48,9 +53,15 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+<<<<<<< HEAD
+    ImageDataItem,
+    InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
+=======
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
+>>>>>>> origin/main
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -69,11 +80,18 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
+<<<<<<< HEAD
+=======
     get_bool_env_var,
+>>>>>>> origin/main
     get_zmq_socket,
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
+<<<<<<< HEAD
+    maybe_set_triton_cache_manager,
+=======
+>>>>>>> origin/main
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
@@ -96,8 +114,13 @@ class Engine(EngineBase):
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
+<<<<<<< HEAD
+    1. The HTTP server, Engine, and TokenizerManager both run in the main process.
+    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+=======
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication (IPC) is handled via the ZMQ library, with each process using a different port.
+>>>>>>> origin/main
     """
 
     def __init__(self, **kwargs):
@@ -150,9 +173,19 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/sglang/srt/utils.py:load_image for more details.
+<<<<<<< HEAD
+        image_data: Optional[
+            Union[
+                List[List[ImageDataItem]],
+                List[ImageDataItem],
+                ImageDataItem,
+            ]
+        ] = None,
+=======
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+>>>>>>> origin/main
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -185,8 +218,11 @@ class Engine(EngineBase):
             input_ids=input_ids,
             sampling_params=sampling_params,
             image_data=image_data,
+<<<<<<< HEAD
+=======
             audio_data=audio_data,
             video_data=video_data,
+>>>>>>> origin/main
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -231,9 +267,19 @@ class Engine(EngineBase):
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/sglang/srt/utils.py:load_image for more details.
+<<<<<<< HEAD
+        image_data: Optional[
+            Union[
+                List[List[ImageDataItem]],
+                List[ImageDataItem],
+                ImageDataItem,
+            ]
+        ] = None,
+=======
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+>>>>>>> origin/main
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -262,14 +308,21 @@ class Engine(EngineBase):
                     f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
                 )
 
+<<<<<<< HEAD
+        logger.info(f"data_parallel_rank: {data_parallel_rank}")
+=======
         logger.debug(f"data_parallel_rank: {data_parallel_rank}")
+>>>>>>> origin/main
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
             sampling_params=sampling_params,
             image_data=image_data,
+<<<<<<< HEAD
+=======
             audio_data=audio_data,
             video_data=video_data,
+>>>>>>> origin/main
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -293,20 +346,34 @@ class Engine(EngineBase):
     def encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+<<<<<<< HEAD
+        image_data: Optional[
+            Union[
+                List[List[Union[Image, str]]],
+                List[Union[Image, str]],
+                Union[Image, str],
+            ]
+        ] = None,
+=======
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+>>>>>>> origin/main
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
         """
+<<<<<<< HEAD
+        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+=======
         obj = EmbeddingReqInput(
             text=prompt,
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
         )
+>>>>>>> origin/main
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = loop.run_until_complete(generator.__anext__())
@@ -315,9 +382,13 @@ class Engine(EngineBase):
     async def async_encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+<<<<<<< HEAD
+        image_data: Optional[Union[List[str], str]] = None,
+=======
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+>>>>>>> origin/main
     ) -> Dict:
         """
         Asynchronous version of encode method.
@@ -325,12 +396,16 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
         """
+<<<<<<< HEAD
+        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+=======
         obj = EmbeddingReqInput(
             text=prompt,
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
         )
+>>>>>>> origin/main
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
 
@@ -453,6 +528,13 @@ class Engine(EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
+<<<<<<< HEAD
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=[
+                MultiprocessingSerializer.serialize(named_tensors)
+                for _ in range(self.server_args.tp_size)
+            ],
+=======
         if load_format == "flattened_bucket":
             serialized_named_tensors = named_tensors
         else:
@@ -462,11 +544,15 @@ class Engine(EngineBase):
             ]
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=serialized_named_tensors,
+>>>>>>> origin/main
             load_format=load_format,
             flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
+<<<<<<< HEAD
+=======
 
+>>>>>>> origin/main
         return loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
@@ -500,13 +586,20 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
+<<<<<<< HEAD
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+=======
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
+>>>>>>> origin/main
         """Load a new LoRA adapter without re-launching the engine."""
 
         obj = LoadLoRAAdapterReqInput(
             lora_name=lora_name,
             lora_path=lora_path,
+<<<<<<< HEAD
+=======
             pinned=pinned,
+>>>>>>> origin/main
         )
 
         loop = asyncio.get_event_loop()
@@ -538,6 +631,8 @@ class Engine(EngineBase):
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
 
+<<<<<<< HEAD
+=======
     def freeze_gc(self):
         """
         To maintain a high performance server with low latency, we want to reduce the
@@ -554,6 +649,7 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.tokenizer_manager.freeze_gc())
 
+>>>>>>> origin/main
     """
     Execute an RPC call on all scheduler processes.
     """
@@ -648,6 +744,13 @@ class Engine(EngineBase):
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+<<<<<<< HEAD
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+=======
     os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if not server_args.enable_symm_mem:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
@@ -660,6 +763,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["SGLANG_RUN_ID"] = (
         f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
     )
+>>>>>>> origin/main
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -668,15 +772,55 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set ulimit
     set_ulimit()
 
+<<<<<<< HEAD
+    # Fix triton bugs
+    if server_args.tp_size * server_args.dp_size > 1:
+        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
+        maybe_set_triton_cache_manager()
+
+=======
+>>>>>>> origin/main
     # Check flashinfer version
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
+<<<<<<< HEAD
+            "0.2.7.post1",
+=======
             "0.2.14.post1",
+>>>>>>> origin/main
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
+<<<<<<< HEAD
+    if _is_cuda:
+        assert_pkg_version(
+            "sgl-kernel",
+            "0.2.4",
+            "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+        )
+
+    def sigchld_handler(signum, frame):
+        pid, exitcode = os.waitpid(0, os.WNOHANG)
+        if exitcode != 0:
+            logger.warning(
+                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
+            )
+
+    signal.signal(signal.SIGCHLD, sigchld_handler)
+
+    # Register the signal handler.
+    # The child processes will send SIGQUIT to this process when any error happens
+    # This process then clean up the whole process tree
+    def sigquit_handler(signum, frame):
+        logger.error(
+            "Received sigquit from a child process. It usually means the child failed."
+        )
+        kill_process_tree(os.getpid())
+
+    signal.signal(signal.SIGQUIT, sigquit_handler)
+=======
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
@@ -697,6 +841,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             kill_process_tree(os.getpid())
 
         signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+>>>>>>> origin/main
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
@@ -751,7 +896,10 @@ def _launch_subprocesses(
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
+<<<<<<< HEAD
+=======
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+>>>>>>> origin/main
                 proc = mp.Process(
                     target=run_scheduler_process,
                     args=(
@@ -759,11 +907,17 @@ def _launch_subprocesses(
                         port_args,
                         gpu_id,
                         tp_rank,
+<<<<<<< HEAD
+                        pp_rank,
+                        None,
+                        writer,
+=======
                         moe_ep_rank,
                         pp_rank,
                         None,
                         writer,
                         None,
+>>>>>>> origin/main
                     ),
                 )
 
@@ -794,9 +948,13 @@ def _launch_subprocesses(
             # When using `Engine` as a Python API, we don't want to block here.
             return None, None, None
 
+<<<<<<< HEAD
+        launch_dummy_health_check_server(server_args.host, server_args.port)
+=======
         launch_dummy_health_check_server(
             server_args.host, server_args.port, server_args.enable_metrics
         )
+>>>>>>> origin/main
 
         for proc in scheduler_procs:
             proc.join()

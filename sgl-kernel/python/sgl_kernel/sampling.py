@@ -383,6 +383,8 @@ def min_p_sampling_from_probs(
     return _min_p_sampling_from_probs_internal(
         probs, indices, *_to_tensor_scalar_tuple(min_p), deterministic, generator
     )
+<<<<<<< HEAD
+=======
 
 
 def _top_k_mask_logits_internal(
@@ -541,3 +543,4 @@ def top_k_top_p_sampling_from_logits(
         )
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
+>>>>>>> origin/main

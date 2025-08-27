@@ -25,6 +25,9 @@ jobs:
 
       - name: Install dependencies
         run: |
+<<<<<<< HEAD
+          bash scripts/ci_install_rust.sh
+=======
           bash scripts/ci/ci_install_rust.sh
 
       - name: Run lint
@@ -32,6 +35,7 @@ jobs:
           source "$HOME/.cargo/env"
           cd sgl-router/
           cargo clippy --all-targets --all-features -- -D warnings
+>>>>>>> origin/main
 
       - name: Run fmt
         run: |
@@ -53,7 +57,11 @@ jobs:
           cargo check --benches
 
       - name: Quick benchmark sanity check
+<<<<<<< HEAD
+        timeout-minutes: 10
+=======
         timeout-minutes: 15
+>>>>>>> origin/main
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
@@ -62,19 +70,27 @@ jobs:
 
   e2e-python:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+<<<<<<< HEAD
+    runs-on: 2-gpu-runner
+=======
     runs-on: BM.A10.4
     timeout-minutes: 30
+>>>>>>> origin/main
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install rust dependencies
         run: |
+<<<<<<< HEAD
+          bash scripts/ci_install_rust.sh
+=======
           bash scripts/ci/ci_install_rust.sh
 
       - name: Install SGLang dependencies
         run: |
           sudo bash scripts/ci/ci_install_dependency.sh
+>>>>>>> origin/main
 
       - name: Build python binding
         run: |

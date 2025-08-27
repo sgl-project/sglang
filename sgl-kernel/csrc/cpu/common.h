@@ -47,6 +47,8 @@ namespace {
     }                                                            \
   }()
 
+<<<<<<< HEAD
+=======
 // dispatch with mixed dtypes (TYPE1, TYPE2):
 //   TYPE1: the primary dtype (input, output, weight);
 //   TYPE2: the secondary dtype (bias, etc.).
@@ -86,6 +88,7 @@ namespace {
     }                                                              \
   }()
 
+>>>>>>> origin/main
 #define UNUSED(x) (void)(x)
 
 #define CHECK_CPU(x) TORCH_CHECK(x.device().type() == at::kCPU, #x " must be a CPU tensor")

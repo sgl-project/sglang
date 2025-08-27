@@ -1,4 +1,8 @@
+<<<<<<< HEAD
+# DeepSeek V3 Support
+=======
 # DeepSeek V3.1/V3/R1 Support
+>>>>>>> origin/main
 
 The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVIDIA and AMD GPUs **from day one**. SGLang also supports [MLA optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#deepseek-multi-head-latent-attention-mla-throughput-optimizations) and [DP attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models), making SGLang one of the best open-source LLM engines for running DeepSeek models. SGLang is the inference engine recommended by the official [DeepSeek team](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended).
 
@@ -33,7 +37,11 @@ Add [performance optimization options](#performance-optimization-options) as nee
 
 ```bash
 # Installation
+<<<<<<< HEAD
+pip install "sglang[all]>=0.4.9"
+=======
 pip install "sglang[all]>=0.5.1.post2"
+>>>>>>> origin/main
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
@@ -50,9 +58,13 @@ Add [performance optimization options](#performance-optimization-options) as nee
 - [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models): For high QPS scenarios, add the `--enable-dp-attention` argument to boost throughput.
 - [Torch.compile Optimization](https://lmsys.org/blog/2024-09-04-sglang-v0-3/#torchcompile-latency-optimizations): Add `--enable-torch-compile` argument to enable it. This will take some time while server starts. The maximum batch size for torch.compile optimization can be controlled with `--torch-compile-max-bs`. It's recommended to set it between `1` and `8`. (e.g., `--torch-compile-max-bs 8`)
 
+<<<<<<< HEAD
+### Example: Sending requests with OpenAI API
+=======
 ### Usage: Chat with DeepSeek
 
 #### DeepSeek V3/R1
+>>>>>>> origin/main
 
 ```python3
 import openai
@@ -72,6 +84,8 @@ response = client.chat.completions.create(
 print(response)
 ```
 
+<<<<<<< HEAD
+=======
 #### DeepSeek V3.1
 On top of the basic usage similar to the DeepSeek V3/R1 example, DeepSeek V3.1 supports a request-level thinking/non-thinking toggle. Simply switch the `"thinking"` field in `extra_body={"chat_template_kwargs": {"thinking": True}}` to enable/disable the thinking mode.
 
@@ -148,6 +162,7 @@ Finally, I need to make sure that this is the correct answer. Yes, Paris is inde
 ```
 * The response contains `</think>` thinking trace and model was able to derive the correct answer from it.
 
+>>>>>>> origin/main
 ### Example: Serving with two H20\*8 nodes
 
 For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `10.0.0.1`, and the second node's IP is `10.0.0.2`. Please **use the first node's IP** for both commands.
@@ -256,8 +271,11 @@ python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1
 
 ### Example: Serving with 8 A100/A800 with AWQ Quantization
 
+<<<<<<< HEAD
+=======
 **Recommended Usage**
 
+>>>>>>> origin/main
 Add `--quantization moe_wna16` flag to enable moe wna16 kernel for better performance.
 One example is as follows:
 
@@ -265,6 +283,8 @@ One example is as follows:
 python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization moe_wna16
 ```
 
+<<<<<<< HEAD
+=======
 Alternatively, you can use `--quantization awq_marlin` as follows:
 
 ```bash
@@ -272,6 +292,7 @@ python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --
 ```
 
 Note that `awq_marlin` only supports `float16` now, which may lead to some precision loss.
+>>>>>>> origin/main
 
 ### Example: Serving with 16 A100/A800 with int8 Quantization
 

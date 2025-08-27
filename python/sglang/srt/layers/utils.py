@@ -1,6 +1,9 @@
 import logging
 import re
+<<<<<<< HEAD
+=======
 from functools import lru_cache
+>>>>>>> origin/main
 
 import torch
 
@@ -36,11 +39,16 @@ class PPMissingLayer(torch.nn.Identity):
         return (input,) if self.return_tuple else input
 
 
+<<<<<<< HEAD
+=======
 @lru_cache(maxsize=1)
+>>>>>>> origin/main
 def is_sm100_supported(device=None) -> bool:
     return (torch.cuda.get_device_capability(device)[0] == 10) and (
         torch.version.cuda >= "12.8"
     )
+<<<<<<< HEAD
+=======
 
 
 @lru_cache(maxsize=1)
@@ -48,3 +56,4 @@ def is_sm90_supported(device=None) -> bool:
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
     )
+>>>>>>> origin/main

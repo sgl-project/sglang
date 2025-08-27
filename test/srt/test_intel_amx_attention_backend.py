@@ -3,20 +3,27 @@ Usage:
 python3 -m unittest test_intel_amx_attention_backend.TestIntelAMXAttnBackend.test_mmlu
 """
 
+<<<<<<< HEAD
+import unittest
+=======
 import os
 import unittest
 from functools import wraps
+>>>>>>> origin/main
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+<<<<<<< HEAD
+=======
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
     DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8,
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8,
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
+>>>>>>> origin/main
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -26,6 +33,17 @@ from sglang.test.test_utils import (
 )
 
 
+<<<<<<< HEAD
+class TestIntelAMXAttnBackend(CustomTestCase):
+    def test_latency(self):
+        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+            DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+            [
+                "--attention-backend",
+                "intel_amx",
+                "--mem-fraction-static",
+                "0.05",
+=======
 def intel_amx_benchmark(extra_args=None, min_throughput=None):
     def decorator(test_func):
         @wraps(test_func)
@@ -33,10 +51,22 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
             common_args = [
                 "--attention-backend",
                 "intel_amx",
+>>>>>>> origin/main
                 "--disable-radix",
                 "--trust-remote-code",
                 "--batch-size",
                 "4",
+<<<<<<< HEAD
+            ],
+        )
+
+        print(f"{prefill_latency=}")
+        print(f"{decode_throughput=}")
+        print(f"{decode_latency=}")
+
+        if is_in_ci():
+            self.assertGreater(decode_throughput, 10)
+=======
             ]
             full_args = common_args + (extra_args or [])
 
@@ -95,6 +125,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
     )
     def test_latency_w8a8_moe_model(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE
+>>>>>>> origin/main
 
     def test_mmlu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -122,9 +153,15 @@ class TestIntelAMXAttnBackend(CustomTestCase):
                 num_examples=64,
                 num_threads=32,
             )
+<<<<<<< HEAD
+
+            metrics = run_eval(args)
+            self.assertGreater(metrics["score"], 0.5)
+=======
             metrics = run_eval(args)
             if is_in_ci():
                 self.assertGreater(metrics["score"], 0.45)
+>>>>>>> origin/main
         finally:
             kill_process_tree(process.pid)
 

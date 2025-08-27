@@ -136,6 +136,10 @@ def torch_w8a8_per_column_moe(a, w1_q, w2_q, w1_s, w2_s, b, routed_scaling_facto
 
 def scaled_weight(weight, scales):
     E, N, K = weight.shape
+<<<<<<< HEAD
+    weight_block = (
+        weight.view(E, N // BLOCK_N, BLOCK_N, K // BLOCK_K, BLOCK_K)
+=======
     pad_N = (BLOCK_N - (N % BLOCK_N)) % BLOCK_N
     pad_K = (BLOCK_K - (K % BLOCK_K)) % BLOCK_K
 
@@ -144,10 +148,19 @@ def scaled_weight(weight, scales):
 
     weight_block = (
         weight.view(E, math.ceil(N / BLOCK_N), BLOCK_N, math.ceil(K / BLOCK_K), BLOCK_K)
+>>>>>>> origin/main
         .permute(0, 1, 3, 2, 4)
         .float()
         .contiguous()
     )
+<<<<<<< HEAD
+    return (
+        (weight_block * scales.view(E, N // BLOCK_N, K // BLOCK_K, 1, 1))
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .view(E, N, K)
+    )
+=======
 
     weight_scaled = (
         (
@@ -163,6 +176,7 @@ def scaled_weight(weight, scales):
     else:
         weight_scaled = weight_scaled.view(E, N, K)
     return weight_scaled
+>>>>>>> origin/main
 
 
 def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):

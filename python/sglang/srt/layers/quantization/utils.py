@@ -1,5 +1,22 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/quant_utils.py
 
+<<<<<<< HEAD
+from types import MappingProxyType
+from typing import List, Mapping, Tuple, Union
+
+import torch
+
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
+
+_is_cuda = is_cuda()
+_is_npu = is_npu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+
+if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
+    from vllm._custom_ops import scaled_fp8_quant
+=======
 from __future__ import annotations
 
 import re
@@ -42,6 +59,7 @@ def get_scalar_types():
 
 
 ScalarType, scalar_types = get_scalar_types()
+>>>>>>> origin/main
 
 
 def is_layer_skipped(
@@ -146,10 +164,13 @@ def requantize_with_max_scale(
     return max_w_scale, weight
 
 
+<<<<<<< HEAD
+=======
 def update_tensor_inplace(old: torch.Tensor, new: torch.Tensor) -> None:
     old.copy_(new)
 
 
+>>>>>>> origin/main
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/layer_utils.py
 # Newly generated tensors need to replace existing tensors that are
 # already registered as parameters by vLLM (and won't be freed)
@@ -174,6 +195,8 @@ def replace_parameter(
         if not isinstance(new, torch.nn.Parameter):
             new = torch.nn.Parameter(new, requires_grad=False)
         mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
+<<<<<<< HEAD
+=======
 
 
 def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
@@ -549,3 +572,4 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
         g_idx.to(device=orig_device),
         sort_indices.to(device=orig_device),
     )
+>>>>>>> origin/main

@@ -38,7 +38,10 @@ struct EvictionEntry {
 
 impl Eq for EvictionEntry {}
 
+<<<<<<< HEAD
+=======
 #[allow(clippy::non_canonical_partial_ord_impl)]
+>>>>>>> origin/main
 impl PartialOrd for EvictionEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.timestamp.cmp(&other.timestamp))
@@ -75,19 +78,26 @@ fn shared_prefix_count(a: &str, b: &str) -> usize {
         }
     }
 
+<<<<<<< HEAD
+    return i;
+=======
     i
+>>>>>>> origin/main
 }
 
 fn slice_by_chars(s: &str, start: usize, end: usize) -> String {
     s.chars().skip(start).take(end - start).collect()
 }
 
+<<<<<<< HEAD
+=======
 impl Default for Tree {
     fn default() -> Self {
         Self::new()
     }
 }
 
+>>>>>>> origin/main
 impl Tree {
     /*
     Thread-safe multi tenant radix tree
@@ -159,11 +169,19 @@ impl Tree {
                         parent: RwLock::new(Some(Arc::clone(&curr))),
                     });
 
+<<<<<<< HEAD
+                    // Increment char count when creating new node with tenant
+=======
                     // Attach tenant to the new node (map is empty here) and increment count once
+>>>>>>> origin/main
                     self.tenant_char_count
                         .entry(tenant.to_string())
                         .and_modify(|count| *count += curr_text_count)
                         .or_insert(curr_text_count);
+<<<<<<< HEAD
+
+=======
+>>>>>>> origin/main
                     new_node
                         .tenant_last_access_time
                         .insert(tenant.to_string(), timestamp_ms);
@@ -219,6 +237,19 @@ impl Tree {
 
                         prev = Arc::clone(&new_node);
 
+<<<<<<< HEAD
+                        // Increment char count for the tenant in the new split node
+                        if !prev.tenant_last_access_time.contains_key(tenant) {
+                            self.tenant_char_count
+                                .entry(tenant.to_string())
+                                .and_modify(|count| *count += matched_text_count)
+                                .or_insert(matched_text_count);
+                        }
+
+                        prev.tenant_last_access_time
+                            .insert(tenant.to_string(), timestamp_ms);
+
+=======
                         // Atomically attach tenant to the new split node and increment count once
                         match prev.tenant_last_access_time.entry(tenant.to_string()) {
                             Entry::Vacant(v) => {
@@ -233,11 +264,24 @@ impl Tree {
                             }
                         }
 
+>>>>>>> origin/main
                         curr_idx += shared_count;
                     } else {
                         // move to next node
                         prev = Arc::clone(&matched_node);
 
+<<<<<<< HEAD
+                        // Increment char count when adding tenant to existing node
+                        if !prev.tenant_last_access_time.contains_key(tenant) {
+                            self.tenant_char_count
+                                .entry(tenant.to_string())
+                                .and_modify(|count| *count += matched_node_text_count)
+                                .or_insert(matched_node_text_count);
+                        }
+
+                        prev.tenant_last_access_time
+                            .insert(tenant.to_string(), timestamp_ms);
+=======
                         // Atomically attach tenant to existing node and increment count once
                         match prev.tenant_last_access_time.entry(tenant.to_string()) {
                             Entry::Vacant(v) => {
@@ -251,6 +295,7 @@ impl Tree {
                                 o.insert(timestamp_ms);
                             }
                         }
+>>>>>>> origin/main
                         curr_idx += shared_count;
                     }
                 }
@@ -272,6 +317,31 @@ impl Tree {
 
             curr = prev.clone();
 
+<<<<<<< HEAD
+            match curr.children.entry(first_char) {
+                Entry::Occupied(entry) => {
+                    let matched_node = entry.get().clone();
+                    let shared_count =
+                        shared_prefix_count(&matched_node.text.read().unwrap(), &curr_text);
+
+                    let matched_node_text_count = matched_node.text.read().unwrap().chars().count();
+
+                    if shared_count == matched_node_text_count {
+                        // Full match with current node's text, continue to next node
+                        curr_idx += shared_count;
+                        prev = Arc::clone(&matched_node);
+                    } else {
+                        // Partial match, stop here
+                        curr_idx += shared_count;
+                        prev = Arc::clone(&matched_node);
+                        break;
+                    }
+                }
+                Entry::Vacant(_) => {
+                    // No match found, stop here
+                    break;
+                }
+=======
             if let Some(entry) = curr.children.get(&first_char) {
                 let matched_node = entry.value().clone();
                 let matched_text_guard = matched_node.text.read().unwrap();
@@ -292,6 +362,7 @@ impl Tree {
             } else {
                 // No match found, stop here
                 break;
+>>>>>>> origin/main
             }
         }
 
@@ -339,6 +410,37 @@ impl Tree {
 
             curr = prev.clone();
 
+<<<<<<< HEAD
+            match curr.children.entry(first_char) {
+                Entry::Occupied(entry) => {
+                    let matched_node = entry.get().clone();
+
+                    // Only continue matching if this node belongs to the specified tenant
+                    if !matched_node.tenant_last_access_time.contains_key(tenant) {
+                        break;
+                    }
+
+                    let shared_count =
+                        shared_prefix_count(&matched_node.text.read().unwrap(), &curr_text);
+
+                    let matched_node_text_count = matched_node.text.read().unwrap().chars().count();
+
+                    if shared_count == matched_node_text_count {
+                        // Full match with current node's text, continue to next node
+                        curr_idx += shared_count;
+                        prev = Arc::clone(&matched_node);
+                    } else {
+                        // Partial match, stop here
+                        curr_idx += shared_count;
+                        prev = Arc::clone(&matched_node);
+                        break;
+                    }
+                }
+                Entry::Vacant(_) => {
+                    // No match found, stop here
+                    break;
+                }
+=======
             if let Some(entry) = curr.children.get(&first_char) {
                 let matched_node = entry.value().clone();
 
@@ -365,6 +467,7 @@ impl Tree {
             } else {
                 // No match found, stop here
                 break;
+>>>>>>> origin/main
             }
         }
 
@@ -450,11 +553,20 @@ impl Tree {
 
             // Decrement when removing tenant from node
             if node.tenant_last_access_time.contains_key(&tenant) {
+<<<<<<< HEAD
+                self.tenant_char_count
+                    .entry(tenant.clone())
+                    .and_modify(|count| {
+                        if *count > 0 {
+                            *count -= node.text.read().unwrap().chars().count();
+                        }
+=======
                 let node_len = node.text.read().unwrap().chars().count();
                 self.tenant_char_count
                     .entry(tenant.clone())
                     .and_modify(|count| {
                         *count = count.saturating_sub(node_len);
+>>>>>>> origin/main
                     });
             }
 
@@ -463,11 +575,17 @@ impl Tree {
 
             // Remove empty nodes
             if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
+<<<<<<< HEAD
+                if let Some(parent) = node.parent.write().unwrap().as_ref() {
+                    let first_char = node.text.read().unwrap().chars().next().unwrap();
+                    parent.children.remove(&first_char);
+=======
                 if let Some(parent) = node.parent.read().unwrap().as_ref() {
                     let text_guard = node.text.read().unwrap();
                     if let Some(first_char) = text_guard.chars().next() {
                         parent.children.remove(&first_char);
                     }
+>>>>>>> origin/main
                 }
             }
 
@@ -514,17 +632,26 @@ impl Tree {
             // remove empty nodes
             if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
                 if let Some(parent) = curr.parent.read().unwrap().as_ref() {
+<<<<<<< HEAD
+                    let first_char = curr.text.read().unwrap().chars().next().unwrap();
+                    parent.children.remove(&first_char);
+=======
                     let text_guard = curr.text.read().unwrap();
                     if let Some(first_char) = text_guard.chars().next() {
                         parent.children.remove(&first_char);
                     }
+>>>>>>> origin/main
                 }
             }
 
             // add parent to queue if it becomes a leaf
             if let Some(parent) = curr.parent.read().unwrap().as_ref() {
                 if Tree::leaf_of(parent).contains(&tenant.to_string()) {
+<<<<<<< HEAD
+                    queue.push_back(Arc::clone(&parent));
+=======
                     queue.push_back(Arc::clone(parent));
+>>>>>>> origin/main
                 }
             }
         }
@@ -660,15 +787,26 @@ impl Tree {
         }
 
         println!("{result}");
+<<<<<<< HEAD
+
+        return;
+=======
+>>>>>>> origin/main
     }
 }
 
 //  Unit tests
 #[cfg(test)]
 mod tests {
+<<<<<<< HEAD
+    use rand::distributions::Alphanumeric;
+    use rand::distributions::DistString;
+    use rand::thread_rng;
+=======
     use rand::distr::Alphanumeric;
     use rand::distr::SampleString;
     use rand::rng as thread_rng;
+>>>>>>> origin/main
     use rand::Rng;
     use std::thread;
     use std::time::Instant;
@@ -863,8 +1001,13 @@ mod tests {
         // spawn 3 threads for insert
         let tree_clone = Arc::clone(&tree);
 
+<<<<<<< HEAD
+        let texts = vec!["hello", "apple", "banana"];
+        let tenants = vec!["tenant1", "tenant2", "tenant3"];
+=======
         let texts = ["hello", "apple", "banana"];
         let tenants = ["tenant1", "tenant2", "tenant3"];
+>>>>>>> origin/main
 
         let mut handles = vec![];
 
@@ -917,12 +1060,22 @@ mod tests {
         // spawn 3 threads for insert
         let tree_clone = Arc::clone(&tree);
 
+<<<<<<< HEAD
+        let texts = vec!["apple", "apabc", "acbdeds"];
+
+        let mut handles = vec![];
+
+        for i in 0..3 {
+            let tree_clone = Arc::clone(&tree_clone);
+            let text = texts[i];
+=======
         static TEXTS: [&str; 3] = ["apple", "apabc", "acbdeds"];
 
         let mut handles = vec![];
 
         for text in TEXTS.iter() {
             let tree_clone = Arc::clone(&tree_clone);
+>>>>>>> origin/main
             let tenant = "tenant0";
 
             let handle = thread::spawn(move || {
@@ -942,13 +1095,23 @@ mod tests {
 
         let tree_clone = Arc::clone(&tree);
 
+<<<<<<< HEAD
+        for i in 0..3 {
+            let tree_clone = Arc::clone(&tree_clone);
+            let text = texts[i];
+=======
         for text in TEXTS.iter() {
             let tree_clone = Arc::clone(&tree_clone);
+>>>>>>> origin/main
             let tenant = "tenant0";
 
             let handle = thread::spawn(move || {
                 let (matched_text, matched_tenant) = tree_clone.prefix_match(text);
+<<<<<<< HEAD
+                assert_eq!(matched_text, text);
+=======
                 assert_eq!(matched_text, *text);
+>>>>>>> origin/main
                 assert_eq!(matched_tenant, tenant);
             });
 
@@ -963,13 +1126,21 @@ mod tests {
 
     #[test]
     fn test_group_prefix_insert_match_concurrent() {
+<<<<<<< HEAD
+        let prefix = vec![
+=======
         static PREFIXES: [&str; 4] = [
+>>>>>>> origin/main
             "Clock strikes midnight, I'm still wide awake",
             "Got dreams bigger than these city lights",
             "Time waits for no one, gotta make my move",
             "Started from the bottom, that's no metaphor",
         ];
+<<<<<<< HEAD
+        let suffix = vec![
+=======
         let suffixes = [
+>>>>>>> origin/main
             "Got too much to prove, ain't got time to lose",
             "History in the making, yeah, you can't erase this",
         ];
@@ -977,10 +1148,17 @@ mod tests {
 
         let mut handles = vec![];
 
+<<<<<<< HEAD
+        for i in 0..prefix.len() {
+            for j in 0..suffix.len() {
+                let tree_clone = Arc::clone(&tree);
+                let text = format!("{} {}", prefix[i], suffix[j]);
+=======
         for (i, prefix) in PREFIXES.iter().enumerate() {
             for suffix in suffixes.iter() {
                 let tree_clone = Arc::clone(&tree);
                 let text = format!("{} {}", prefix, suffix);
+>>>>>>> origin/main
                 let tenant = format!("tenant{}", i);
 
                 let handle = thread::spawn(move || {
@@ -999,6 +1177,19 @@ mod tests {
         tree.pretty_print();
 
         // check matching using multi threads
+<<<<<<< HEAD
+
+        let mut handles = vec![];
+
+        for i in 0..prefix.len() {
+            let tree_clone = Arc::clone(&tree);
+            let text = prefix[i];
+
+            let handle = thread::spawn(move || {
+                let (matched_text, matched_tenant) = tree_clone.prefix_match(text);
+                let tenant = format!("tenant{}", i);
+                assert_eq!(matched_text, text);
+=======
         let mut handles = vec![];
 
         for (i, prefix) in PREFIXES.iter().enumerate() {
@@ -1008,6 +1199,7 @@ mod tests {
                 let (matched_text, matched_tenant) = tree_clone.prefix_match(prefix);
                 let tenant = format!("tenant{}", i);
                 assert_eq!(matched_text, *prefix);
+>>>>>>> origin/main
                 assert_eq!(matched_tenant, tenant);
             });
 
@@ -1024,13 +1216,21 @@ mod tests {
     fn test_mixed_concurrent_insert_match() {
         // ensure it does not deadlock instead of doing correctness check
 
+<<<<<<< HEAD
+        let prefix = vec![
+=======
         static PREFIXES: [&str; 4] = [
+>>>>>>> origin/main
             "Clock strikes midnight, I'm still wide awake",
             "Got dreams bigger than these city lights",
             "Time waits for no one, gotta make my move",
             "Started from the bottom, that's no metaphor",
         ];
+<<<<<<< HEAD
+        let suffix = vec![
+=======
         let suffixes = [
+>>>>>>> origin/main
             "Got too much to prove, ain't got time to lose",
             "History in the making, yeah, you can't erase this",
         ];
@@ -1038,10 +1238,17 @@ mod tests {
 
         let mut handles = vec![];
 
+<<<<<<< HEAD
+        for i in 0..prefix.len() {
+            for j in 0..suffix.len() {
+                let tree_clone = Arc::clone(&tree);
+                let text = format!("{} {}", prefix[i], suffix[j]);
+=======
         for (i, prefix) in PREFIXES.iter().enumerate() {
             for suffix in suffixes.iter() {
                 let tree_clone = Arc::clone(&tree);
                 let text = format!("{} {}", prefix, suffix);
+>>>>>>> origin/main
                 let tenant = format!("tenant{}", i);
 
                 let handle = thread::spawn(move || {
@@ -1053,11 +1260,21 @@ mod tests {
         }
 
         // check matching using multi threads
+<<<<<<< HEAD
+
+        for i in 0..prefix.len() {
+            let tree_clone = Arc::clone(&tree);
+            let text = prefix[i];
+
+            let handle = thread::spawn(move || {
+                let (_matched_text, _matched_tenant) = tree_clone.prefix_match(text);
+=======
         for prefix in PREFIXES.iter() {
             let tree_clone = Arc::clone(&tree);
 
             let handle = thread::spawn(move || {
                 let (_matched_text, _matched_tenant) = tree_clone.prefix_match(prefix);
+>>>>>>> origin/main
             });
 
             handles.push(handle);
@@ -1075,14 +1292,24 @@ mod tests {
         // use .chars() to get the iterator of the utf-8 value
         let tree = Arc::new(Tree::new());
 
+<<<<<<< HEAD
+        let test_pairs = vec![
+=======
         static TEST_PAIRS: [(&str, &str); 3] = [
+>>>>>>> origin/main
             ("你好嗎", "tenant1"),
             ("你好喔", "tenant2"),
             ("你心情好嗎", "tenant3"),
         ];
 
         // Insert sequentially
+<<<<<<< HEAD
+        for i in 0..test_pairs.len() {
+            let text = test_pairs[i].0;
+            let tenant = test_pairs[i].1;
+=======
         for (text, tenant) in TEST_PAIRS.iter() {
+>>>>>>> origin/main
             tree.insert(text, tenant);
         }
 
@@ -1090,10 +1317,17 @@ mod tests {
 
         // Test sequentially
 
+<<<<<<< HEAD
+        for i in 0..test_pairs.len() {
+            let (matched_text, matched_tenant) = tree.prefix_match(test_pairs[i].0);
+            assert_eq!(matched_text, test_pairs[i].0);
+            assert_eq!(matched_tenant, test_pairs[i].1);
+=======
         for (text, tenant) in TEST_PAIRS.iter() {
             let (matched_text, matched_tenant) = tree.prefix_match(text);
             assert_eq!(matched_text, *text);
             assert_eq!(matched_tenant, *tenant);
+>>>>>>> origin/main
         }
     }
 
@@ -1101,7 +1335,11 @@ mod tests {
     fn test_utf8_split_concurrent() {
         let tree = Arc::new(Tree::new());
 
+<<<<<<< HEAD
+        let test_pairs = vec![
+=======
         static TEST_PAIRS: [(&str, &str); 3] = [
+>>>>>>> origin/main
             ("你好嗎", "tenant1"),
             ("你好喔", "tenant2"),
             ("你心情好嗎", "tenant3"),
@@ -1110,11 +1348,21 @@ mod tests {
         // Create multiple threads for insertion
         let mut handles = vec![];
 
+<<<<<<< HEAD
+        for i in 0..test_pairs.len() {
+            let tree_clone = Arc::clone(&tree);
+            let text = test_pairs[i].0.to_string();
+            let tenant = test_pairs[i].1.to_string();
+
+            let handle = thread::spawn(move || {
+                tree_clone.insert(&text, &tenant);
+=======
         for (text, tenant) in TEST_PAIRS.iter() {
             let tree_clone = Arc::clone(&tree);
 
             let handle = thread::spawn(move || {
                 tree_clone.insert(text, tenant);
+>>>>>>> origin/main
             });
 
             handles.push(handle);
@@ -1130,6 +1378,17 @@ mod tests {
         // Create multiple threads for matching
         let mut handles = vec![];
 
+<<<<<<< HEAD
+        for i in 0..test_pairs.len() {
+            let tree_clone = Arc::clone(&tree);
+            let text = test_pairs[i].0.to_string();
+            let tenant = test_pairs[i].1.to_string();
+
+            let handle = thread::spawn(move || {
+                let (matched_text, matched_tenant) = tree_clone.prefix_match(&text);
+                assert_eq!(matched_text, text);
+                assert_eq!(matched_tenant, tenant);
+=======
         for (text, tenant) in TEST_PAIRS.iter() {
             let tree_clone = Arc::clone(&tree);
 
@@ -1137,6 +1396,7 @@ mod tests {
                 let (matched_text, matched_tenant) = tree_clone.prefix_match(text);
                 assert_eq!(matched_text, *text);
                 assert_eq!(matched_tenant, *tenant);
+>>>>>>> origin/main
             });
 
             handles.push(handle);
@@ -1191,7 +1451,11 @@ mod tests {
         let max_size: usize = 100;
 
         // Define prefixes
+<<<<<<< HEAD
+        let prefixes = vec!["aqwefcisdf", "iajsdfkmade", "kjnzxcvewqe", "iejksduqasd"];
+=======
         let prefixes = ["aqwefcisdf", "iajsdfkmade", "kjnzxcvewqe", "iejksduqasd"];
+>>>>>>> origin/main
 
         // Insert strings with shared prefixes
         for _i in 0..100 {
@@ -1249,27 +1513,45 @@ mod tests {
         for thread_id in 0..4 {
             let tree = Arc::clone(&tree);
             let handle = thread::spawn(move || {
+<<<<<<< HEAD
+                let mut rng = rand::thread_rng();
+=======
                 let mut rng = rand::rng();
+>>>>>>> origin/main
                 let tenant = format!("tenant{}", thread_id + 1);
                 let prefix = format!("prefix{}", thread_id);
 
                 while start_time.elapsed() < test_duration {
                     // Random decision: match or insert (70% match, 30% insert)
+<<<<<<< HEAD
+                    if rng.gen_bool(0.7) {
+                        // Perform match operation
+                        let random_len = rng.gen_range(3..10);
+=======
                     if rng.random_bool(0.7) {
                         // Perform match operation
                         let random_len = rng.random_range(3..10);
+>>>>>>> origin/main
                         let search_str = format!("{}{}", prefix, random_string(random_len));
                         let (_matched, _) = tree.prefix_match(&search_str);
                     } else {
                         // Perform insert operation
+<<<<<<< HEAD
+                        let random_len = rng.gen_range(5..15);
+=======
                         let random_len = rng.random_range(5..15);
+>>>>>>> origin/main
                         let insert_str = format!("{}{}", prefix, random_string(random_len));
                         tree.insert(&insert_str, &tenant);
                         // println!("Thread {} inserted: {}", thread_id, insert_str);
                     }
 
                     // Small random sleep to vary timing
+<<<<<<< HEAD
+                    thread::sleep(Duration::from_millis(rng.gen_range(10..100)));
+=======
                     thread::sleep(Duration::from_millis(rng.random_range(10..100)));
+>>>>>>> origin/main
                 }
             });
             handles.push(handle);

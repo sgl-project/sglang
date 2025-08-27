@@ -17,7 +17,10 @@ import time
 
 import requests
 
+<<<<<<< HEAD
+=======
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+>>>>>>> origin/main
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -53,9 +56,13 @@ class CompileArgs:
 
 
 @warmup("compile-deep-gemm")
+<<<<<<< HEAD
+async def warm_up_compile(tokenizer_manager: TokenizerManager):
+=======
 async def warm_up_compile(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
+>>>>>>> origin/main
     print("\nGenerate warm up request for compiling DeepGEMM...\n")
     generate_req_input = GenerateReqInput(
         input_ids=[0, 1, 2, 3],
@@ -65,10 +72,13 @@ async def warm_up_compile(
             "ignore_eos": True,
         },
     )
+<<<<<<< HEAD
+=======
     if disaggregation_mode != "null":
         generate_req_input.bootstrap_room = 0
         generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
+>>>>>>> origin/main
     await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 

@@ -1,9 +1,13 @@
 """Common utilities for testing and benchmarking"""
 
 import argparse
+<<<<<<< HEAD
+import copy
+=======
 import asyncio
 import copy
 import json
+>>>>>>> origin/main
 import logging
 import os
 import random
@@ -15,11 +19,17 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
+<<<<<<< HEAD
+from types import SimpleNamespace
+from typing import Callable, List, Optional, Tuple
+
+=======
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
+>>>>>>> origin/main
 import numpy as np
 import requests
 import torch
@@ -27,6 +37,11 @@ import torch.nn.functional as F
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
+<<<<<<< HEAD
+from sglang.lang.backend.openai import OpenAI
+from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+=======
+>>>>>>> origin/main
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -61,12 +76,15 @@ DEFAULT_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST_FP8 = (
 DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
     "nvidia/Llama-3.1-8B-Instruct-FP8"
 )
+<<<<<<< HEAD
+=======
 DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8 = "Qwen/Qwen3-1.7B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
 
 # W8A8 models
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE = "nytopop/Qwen3-30B-A3B.w8a8"
+>>>>>>> origin/main
 
 # EAGLE
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
@@ -84,13 +102,20 @@ DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
 DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+<<<<<<< HEAD
+=======
 DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
+>>>>>>> origin/main
 
 # Nightly tests
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
+<<<<<<< HEAD
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
+=======
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,zai-org/GLM-4.5-Air-FP8"
+>>>>>>> origin/main
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -111,6 +136,8 @@ def is_in_amd_ci():
     return get_bool_env_var("SGLANG_AMD_CI")
 
 
+<<<<<<< HEAD
+=======
 def _use_cached_default_models(model_repo: str):
     cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
     if cache_dir and model_repo:
@@ -120,6 +147,7 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
+>>>>>>> origin/main
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
         5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
@@ -355,16 +383,22 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
         help="Device type (auto/cuda/rocm/cpu). Auto will detect available platforms",
     )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
+<<<<<<< HEAD
+=======
     parser.add_argument("--raw-result-file", type=str)
+>>>>>>> origin/main
     args = parser.parse_args()
 
     return args
 
 
 def select_sglang_backend(args: argparse.Namespace):
+<<<<<<< HEAD
+=======
     from sglang.lang.backend.openai import OpenAI
     from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 
+>>>>>>> origin/main
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_encoding = False
@@ -441,6 +475,8 @@ def get_call_select(args: argparse.Namespace):
     return func
 
 
+<<<<<<< HEAD
+=======
 def _get_default_models():
     import inspect
 
@@ -466,6 +502,7 @@ def try_cached_model(model_repo: str):
     return model_dir if model_dir else model_repo
 
 
+>>>>>>> origin/main
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -726,7 +763,10 @@ def get_benchmark_args(
     seed: int = 0,
     device="auto",
     pd_separated: bool = False,
+<<<<<<< HEAD
+=======
     lora_name=None,
+>>>>>>> origin/main
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -754,7 +794,11 @@ def get_benchmark_args(
         extra_request_body=None,
         apply_chat_template=False,
         profile=None,
+<<<<<<< HEAD
+        lora_name=None,
+=======
         lora_name=lora_name,
+>>>>>>> origin/main
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
@@ -777,8 +821,11 @@ def run_bench_serving(
     need_warmup=False,
     seed: int = 0,
     device="auto",
+<<<<<<< HEAD
+=======
     background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
     lora_name: Optional[str] = None,
+>>>>>>> origin/main
 ):
     if device == "auto":
         device = auto_config_device()
@@ -806,6 +853,16 @@ def run_bench_serving(
         disable_ignore_eos=disable_ignore_eos,
         seed=seed,
         device=device,
+<<<<<<< HEAD
+    )
+
+    try:
+        if need_warmup:
+            warmup_args = copy.deepcopy(args)
+            warmup_args.num_prompts = 16
+            run_benchmark(warmup_args)
+        res = run_benchmark(args)
+=======
         lora_name=lora_name,
     )
 
@@ -835,6 +892,7 @@ def run_bench_serving(
 
     try:
         res = asyncio.run(_run())
+>>>>>>> origin/main
     finally:
         kill_process_tree(process.pid)
 
@@ -1311,6 +1369,8 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 raise
 
 
+<<<<<<< HEAD
+=======
 def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
     """Sends generate request serially and returns status codes. Max concurrency is 1."""
 
@@ -1363,6 +1423,7 @@ async def send_concurrent_generate_requests(
     return await asyncio.gather(*tasks)
 
 
+>>>>>>> origin/main
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
         max_retry = int(
@@ -1372,6 +1433,8 @@ class CustomTestCase(unittest.TestCase):
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
+<<<<<<< HEAD
+=======
 
 
 def dump_bench_raw_result(
@@ -1404,3 +1467,4 @@ def dump_bench_raw_result(
 def _ensure_remove_suffix(text: str, suffix: str):
     assert text.endswith(suffix)
     return text.removesuffix(suffix)
+>>>>>>> origin/main

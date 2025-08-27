@@ -13,21 +13,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+<<<<<<< HEAD
+import concurrent.futures
+import logging
+import math
+import threading
+=======
 import logging
 import math
 import threading
 import time
+>>>>>>> origin/main
 from queue import Empty, Full, PriorityQueue, Queue
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+<<<<<<< HEAD
+=======
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 
+>>>>>>> origin/main
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
+<<<<<<< HEAD
+=======
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -39,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
+>>>>>>> origin/main
 logger = logging.getLogger(__name__)
 
 
@@ -136,7 +149,11 @@ class TransferBuffer:
     """
 
     def __init__(
+<<<<<<< HEAD
+        self, stop_event, buffer_count: int = 3, max_buffer_size: int = 1000
+=======
         self, stop_event, buffer_count: int = 3, max_buffer_size: int = 1024
+>>>>>>> origin/main
     ) -> None:
         self.stop_event = stop_event
         self.buffers = Queue(maxsize=buffer_count)
@@ -173,6 +190,8 @@ class TransferBuffer:
         self.buffers.queue.clear()
 
 
+<<<<<<< HEAD
+=======
 class StorageOperation:
     counter = 0
 
@@ -228,6 +247,7 @@ class PrefetchOperation(StorageOperation):
         return self._done_flag
 
 
+>>>>>>> origin/main
 class HiCacheController:
 
     def __init__(
@@ -235,6 +255,10 @@ class HiCacheController:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
         page_size: int,
+<<<<<<< HEAD
+        load_cache_event: threading.Event = None,
+        write_policy: str = "write_through_selective",
+=======
         tp_group: torch.distributed.ProcessGroup,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
@@ -243,12 +267,15 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
+>>>>>>> origin/main
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
+<<<<<<< HEAD
+=======
         self.io_backend = io_backend
 
         self.enable_storage = False
@@ -331,6 +358,7 @@ class HiCacheController:
                 self.backup_tp_group = torch.distributed.new_group(
                     group_ranks, backend="gloo"
                 )
+>>>>>>> origin/main
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
@@ -359,11 +387,25 @@ class HiCacheController:
         self.load_stream = torch.cuda.Stream()
 
         self.write_thread = threading.Thread(
+<<<<<<< HEAD
+            target=(
+                self.write_thread_func_buffer
+                if self.page_size == 1
+                else self.write_thread_func_direct
+            ),
+            daemon=True,
+=======
             target=self.write_thread_func_direct, daemon=True
+>>>>>>> origin/main
         )
         self.load_thread = threading.Thread(
             target=self.load_thread_func_layer_by_layer, daemon=True
         )
+<<<<<<< HEAD
+        self.write_thread.start()
+        self.load_thread.start()
+
+=======
 
         self.write_thread.start()
         self.load_thread.start()
@@ -418,6 +460,7 @@ class HiCacheController:
             extra_config=extra_config,
         )
 
+>>>>>>> origin/main
     def reset(self):
         self.stop_event.set()
         self.write_thread.join()
@@ -429,6 +472,16 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.queue.clear()
         self.ack_load_queue.queue.clear()
+<<<<<<< HEAD
+
+        self.write_thread = threading.Thread(
+            target=(
+                self.write_thread_func_buffer
+                if self.page_size == 1
+                else self.write_thread_func_direct
+            ),
+            daemon=True,
+=======
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
@@ -439,6 +492,7 @@ class HiCacheController:
 
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
+>>>>>>> origin/main
         )
         self.load_thread = threading.Thread(
             target=self.load_thread_func_layer_by_layer, daemon=True
@@ -447,6 +501,8 @@ class HiCacheController:
         self.write_thread.start()
         self.load_thread.start()
 
+<<<<<<< HEAD
+=======
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
@@ -457,6 +513,7 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+>>>>>>> origin/main
     def write(
         self,
         device_indices: torch.Tensor,
@@ -470,7 +527,10 @@ class HiCacheController:
         if host_indices is None:
             return None
         self.mem_pool_host.protect_write(host_indices)
+<<<<<<< HEAD
+=======
         torch.cuda.current_stream().synchronize()
+>>>>>>> origin/main
         self.write_queue.put(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -496,6 +556,8 @@ class HiCacheController:
         )
         return device_indices
 
+<<<<<<< HEAD
+=======
     def move_indices(self, host_indices, device_indices):
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
@@ -507,6 +569,7 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
+>>>>>>> origin/main
     def write_thread_func_direct(self):
         """
         Directly write through KV caches to host memory without buffering.
@@ -515,11 +578,18 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.write_queue.get(block=True, timeout=1)
+<<<<<<< HEAD
+                self.mem_pool_host.write_page_all_layers(
+                    operation.host_indices,
+                    operation.device_indices,
+                    self.mem_pool_device,
+=======
                 host_indices, device_indices = self.move_indices(
                     operation.host_indices, operation.device_indices
                 )
                 self.mem_pool_host.backup_from_device_all_layer(
                     self.mem_pool_device, host_indices, device_indices, self.io_backend
+>>>>>>> origin/main
                 )
                 self.write_stream.synchronize()
                 self.mem_pool_host.complete_io(operation.host_indices)
@@ -531,6 +601,30 @@ class HiCacheController:
             except Exception as e:
                 logger.error(e)
 
+<<<<<<< HEAD
+    def load_thread_func_direct(self):
+        """
+        Directly load KV caches from host memory to device memory without buffering.
+        """
+        torch.cuda.set_stream(self.load_stream)
+        while not self.stop_event.is_set():
+            try:
+                operation = self.load_queue.get(block=True, timeout=1)
+                operation.data = self.mem_pool_host.get_flat_data(
+                    operation.host_indices
+                )
+                self.mem_pool_device.transfer(operation.device_indices, operation.data)
+                self.mem_pool_host.complete_io(operation.host_indices)
+                for node_id in operation.node_ids:
+                    if node_id != 0:
+                        self.ack_load_queue.put(node_id)
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(e)
+
+=======
+>>>>>>> origin/main
     def load_thread_func_layer_by_layer(self):
         """
         Load KV caches from host memory to device memory layer by layer.
@@ -555,6 +649,24 @@ class HiCacheController:
 
             # start layer-wise KV cache transfer from CPU to GPU
             self.layer_done_counter.reset()
+<<<<<<< HEAD
+            for i in range(self.mem_pool_host.layer_num):
+                if self.page_size == 1:
+                    flat_data = self.mem_pool_host.get_flat_data_by_layer(
+                        batch_operation.host_indices, i
+                    )
+                    self.mem_pool_device.transfer_per_layer(
+                        batch_operation.device_indices, flat_data, i
+                    )
+                else:
+                    self.mem_pool_host.load_page_per_layer(
+                        batch_operation.host_indices,
+                        batch_operation.device_indices,
+                        self.mem_pool_device,
+                        i,
+                    )
+                    self.load_stream.synchronize()
+=======
             host_indices, device_indices = self.move_indices(
                 batch_operation.host_indices, batch_operation.device_indices
             )
@@ -567,6 +679,7 @@ class HiCacheController:
                     self.io_backend,
                 )
                 self.load_stream.synchronize()
+>>>>>>> origin/main
                 self.layer_done_counter.increment()
 
             self.mem_pool_host.complete_io(batch_operation.host_indices)
@@ -574,6 +687,151 @@ class HiCacheController:
                 if node_id != 0:
                     self.ack_load_queue.put(node_id)
 
+<<<<<<< HEAD
+    def write_aux_func(self, no_wait=False):
+        """
+        Auxiliary function to prepare the buffer for write operations.
+        """
+        torch.cuda.set_stream(self.write_stream)
+
+        def _to_op(op_):
+            assert op_.device_indices.is_cuda, "Device indices should be on GPU"
+            op_.data = self.mem_pool_device.get_flat_data(op_.device_indices).to(
+                self.mem_pool_host.device
+            )
+            self.write_buffer.put(op_)
+            return op_
+
+        buffer = None
+        while not self.stop_event.is_set():
+            try:
+                operation = self.write_queue.get(block=True, timeout=1)
+                factor = (
+                    len(operation.device_indices) // self.write_buffer.max_buffer_size
+                )
+
+                if factor >= 1:
+                    if buffer is not None:
+                        _to_op(buffer)
+                        buffer = None
+
+                    if factor < 2:
+                        _to_op(operation)
+                    else:
+                        split_ops = operation.split(factor)
+                        for op_ in split_ops:
+                            _to_op(op_)
+                    continue
+
+                if buffer is None:
+                    buffer = operation
+                else:
+                    buffer.merge(operation)
+                if (
+                    no_wait
+                    or len(buffer.host_indices) >= self.write_buffer.max_buffer_size
+                    or self.write_queue.empty()
+                    or self.write_buffer.empty()
+                ):
+                    _to_op(buffer)
+                    buffer = None
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(e)
+
+    def load_aux_func(self):
+        """
+        Auxiliary function to prepare the buffer for load operations.
+        """
+
+        def _pin_op(op_, put=True):
+            op_.data = (
+                self.mem_pool_host.get_flat_data(op_.host_indices)
+                .contiguous()
+                .pin_memory()
+            )
+            if put:
+                self.load_buffer.put(op_)
+            return op_
+
+        buffer = None
+        while not self.stop_event.is_set():
+            try:
+                operation = self.load_queue.get(block=True, timeout=1)
+                factor = len(operation.host_indices) // self.load_buffer.max_buffer_size
+
+                if factor >= 1:
+                    if buffer is not None:
+                        _pin_op(buffer)
+                        buffer = None
+
+                    if factor < 2:
+                        _pin_op(operation)
+                    else:
+                        split_ops = operation.split(factor)
+                        split_args = [(op_, True) for op_ in split_ops[:-1]]
+                        split_args.append((split_ops[-1], False))
+                        # Spawn threads to pin each op concurrently
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            pinned_ops = list(
+                                executor.map(
+                                    lambda x: _pin_op(x[0], put=x[1]), split_args
+                                )
+                            )
+                        # preserve the order of last op to ensure correct ack
+                        self.load_buffer.put(pinned_ops[-1])
+                    continue
+
+                if buffer is None:
+                    buffer = operation
+                else:
+                    buffer.merge(operation)
+                if (
+                    len(buffer.host_indices) >= self.load_buffer.max_buffer_size
+                    or self.load_queue.empty()
+                    or self.load_buffer.empty()
+                ):
+                    _pin_op(buffer)
+                    buffer = None
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(e)
+
+    # todo (zhiqiang): double buffering to be deprecated
+    def write_thread_func_buffer(self):
+        aux_thread = threading.Thread(target=self.write_aux_func, daemon=True)
+        aux_thread.start()
+
+        while not self.stop_event.is_set():
+            operation = self.write_buffer.get()
+            if operation is None:
+                continue
+            self.mem_pool_host.assign_flat_data(operation.host_indices, operation.data)
+            self.mem_pool_host.complete_io(operation.host_indices)
+            for node_id in operation.node_ids:
+                if node_id != 0:
+                    self.ack_write_queue.put(node_id)
+        aux_thread.join()
+
+    def load_thread_func_buffer(self):
+        torch.cuda.set_stream(self.load_stream)
+        aux_thread = threading.Thread(target=self.load_aux_func, daemon=True)
+        aux_thread.start()
+        while not self.stop_event.is_set():
+            operation = self.load_buffer.get()
+            if operation is None:
+                continue
+            self.mem_pool_device.transfer(operation.device_indices, operation.data)
+            self.mem_pool_host.complete_io(operation.host_indices)
+            for node_id in operation.node_ids:
+                if node_id != 0:
+                    self.ack_load_queue.put(node_id)
+        aux_thread.join()
+
+=======
+>>>>>>> origin/main
     def evict_device(
         self, device_indices: torch.Tensor, host_indices: torch.Tensor
     ) -> int:
@@ -597,6 +855,8 @@ class HiCacheController:
             raise ValueError(
                 f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
             )
+<<<<<<< HEAD
+=======
 
     def prefetch(
         self,
@@ -920,3 +1180,4 @@ class HiCacheController:
 
             except Empty:
                 continue
+>>>>>>> origin/main

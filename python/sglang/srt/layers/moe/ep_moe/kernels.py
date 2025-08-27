@@ -6,7 +6,10 @@ import triton
 
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import ceil_div, dispose_tensor, is_cuda
+<<<<<<< HEAD
+=======
 from sglang.utils import is_in_ci
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +150,10 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
 
 def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+<<<<<<< HEAD
+=======
 
+>>>>>>> origin/main
     seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
 
@@ -160,6 +166,11 @@ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     compute_src2dst_triton_kernel[grid](
         reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE
     )
+<<<<<<< HEAD
+    return reorder_topk_ids, src2dst, seg_indptr
+
+
+=======
 
     return reorder_topk_ids, src2dst, seg_indptr
 
@@ -220,6 +231,7 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
                 tl.store(dst_ptr + offset, out_data, mask=mask)
 
 
+>>>>>>> origin/main
 @triton.jit
 def pre_reorder_triton_kernel(
     input_ptr,
@@ -236,8 +248,12 @@ def pre_reorder_triton_kernel(
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
+<<<<<<< HEAD
+    src_idx = tl.program_id(0)
+=======
     src_idx_int32 = tl.program_id(0)
     src_idx = src_idx_int32.to(tl.int64)
+>>>>>>> origin/main
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
@@ -256,8 +272,12 @@ def pre_reorder_triton_kernel(
             else:
                 scale = 1.0
 
+<<<<<<< HEAD
+            dst_idx = tl.load(src2dst_ptr + idx)
+=======
             dst_idx_int32 = tl.load(src2dst_ptr + idx)
             dst_idx = dst_idx_int32.to(tl.int64)
+>>>>>>> origin/main
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
                 offset = start_offset + vec
@@ -582,6 +602,8 @@ def post_reorder_triton_kernel(
 
 
 @triton.jit
+<<<<<<< HEAD
+=======
 def post_reorder_triton_kernel_for_cutlass_moe(
     down_output_ptr,
     output_ptr,
@@ -625,6 +647,7 @@ def post_reorder_triton_kernel_for_cutlass_moe(
 
 
 @triton.jit
+>>>>>>> origin/main
 def compute_m_range(
     pid,
     batch_size,
@@ -1104,7 +1127,11 @@ def ep_gather(
     input_index: torch.Tensor,
     output_tensor: torch.Tensor,
 ):
+<<<<<<< HEAD
+    BLOCK_D = 1024  # block size of quantization
+=======
     BLOCK_D = 1024 if not is_in_ci() else 128  # block size of quantization
+>>>>>>> origin/main
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]

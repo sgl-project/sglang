@@ -58,14 +58,21 @@ class TpModelWorkerClient:
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+<<<<<<< HEAD
+=======
         moe_ep_rank: int,
+>>>>>>> origin/main
         pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
     ):
         # Load the model
         self.worker = TpModelWorker(
+<<<<<<< HEAD
+            server_args, gpu_id, tp_rank, pp_rank, dp_rank, nccl_port
+=======
             server_args, gpu_id, tp_rank, moe_ep_rank, pp_rank, dp_rank, nccl_port
+>>>>>>> origin/main
         )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
@@ -103,6 +110,8 @@ class TpModelWorkerClient:
     def get_worker_info(self):
         return self.worker.get_worker_info()
 
+<<<<<<< HEAD
+=======
     def get_tokens_per_layer_info(self):
         return self.worker.get_tokens_per_layer_info()
 
@@ -114,6 +123,7 @@ class TpModelWorkerClient:
     def is_hybrid(self) -> bool:
         return self.worker.is_hybrid
 
+>>>>>>> origin/main
     def get_pad_input_ids_func(self):
         return self.worker.get_pad_input_ids_func()
 
@@ -288,9 +298,12 @@ class TpModelWorkerClient:
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
         return self.worker.unload_lora_adapter(recv_req)
 
+<<<<<<< HEAD
+=======
     def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
         return self.worker.can_run_lora_batch(lora_ids)
 
+>>>>>>> origin/main
     def __delete__(self):
         self.input_queue.put((None, None))
         self.copy_queue.put((None, None, None))

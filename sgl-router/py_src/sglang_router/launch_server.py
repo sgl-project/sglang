@@ -158,7 +158,10 @@ def main():
         default=31000,
         help="Base port number for data parallel workers",
     )
+<<<<<<< HEAD
+=======
     # No extra retry/CB flags here; RouterArgs.add_cli_args already defines them with router- prefix
+>>>>>>> origin/main
 
     args = parser.parse_args()
     server_args = ServerArgs.from_cli_args(args)

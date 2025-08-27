@@ -27,6 +27,8 @@ python -m sglang.launch_server --model-path microsoft/Phi-4-multimodal-instruct 
 python -m benchmark/mmmu/bench_sglang.py --concurrency 8 --lora-path vision
 ```
 
+<<<<<<< HEAD
+=======
 You can use `--response-answer-regex` to specify how to extract the answer from the response string. E.g.,
 ```
 python3 -m sglang.launch_server --model-path zai-org/GLM-4.1V-9B-Thinking --reasoning-parser glm45
@@ -39,6 +41,7 @@ You can use `--extra-request-body` to specify additional OpenAI request paramete
 python3 bench_sglang.py --extra-request-body '{"max_new_tokens": 128, "temperature": 0.01}'
 ```
 
+>>>>>>> origin/main
 ### Evaluate hf
 
 ```

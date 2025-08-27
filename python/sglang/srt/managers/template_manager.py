@@ -21,7 +21,10 @@ and code completion templates, eliminating global state and improving modularity
 import json
 import logging
 import os
+<<<<<<< HEAD
+=======
 import re
+>>>>>>> origin/main
 from typing import Optional
 
 from sglang.srt.code_completion_parser import (
@@ -54,8 +57,12 @@ class TemplateManager:
     def __init__(self):
         self._chat_template_name: Optional[str] = None
         self._completion_template_name: Optional[str] = None
+<<<<<<< HEAD
+        self._jinja_template_content_format: Optional[str] = None
+=======
         self._jinja_template_content_format: Optional[str] = "openai"
         self._force_reasoning: bool = False
+>>>>>>> origin/main
 
     @property
     def chat_template_name(self) -> Optional[str]:
@@ -72,6 +79,10 @@ class TemplateManager:
         """Get the detected template content format ('string' or 'openai' or None)."""
         return self._jinja_template_content_format
 
+<<<<<<< HEAD
+    def load_chat_template(
+        self, tokenizer_manager, chat_template_arg: str, model_path: str
+=======
     @property
     def force_reasoning(self) -> bool:
         """
@@ -100,12 +111,33 @@ class TemplateManager:
 
     def load_chat_template(
         self, tokenizer_manager, chat_template_arg: Optional[str], model_path: str
+>>>>>>> origin/main
     ) -> None:
         """
         Load a chat template from various sources.
 
         Args:
             tokenizer_manager: The tokenizer manager instance
+<<<<<<< HEAD
+            chat_template_arg: Template name or file path
+            model_path: Path to the model
+        """
+        logger.info(f"Loading chat template: {chat_template_arg}")
+
+        if not chat_template_exists(chat_template_arg):
+            if not os.path.exists(chat_template_arg):
+                raise RuntimeError(
+                    f"Chat template {chat_template_arg} is not a built-in template name "
+                    "or a valid chat template file path."
+                )
+
+            if chat_template_arg.endswith(".jinja"):
+                self._load_jinja_template(tokenizer_manager, chat_template_arg)
+            else:
+                self._load_json_chat_template(chat_template_arg)
+        else:
+            self._chat_template_name = chat_template_arg
+=======
             chat_template_arg: Template name, file path, or None to auto-detect
             model_path: Path to the model
         """
@@ -162,6 +194,7 @@ class TemplateManager:
             self._load_jinja_template(tokenizer_manager, chat_template_arg)
         else:
             self._load_json_chat_template(chat_template_arg)
+>>>>>>> origin/main
 
     def guess_chat_template_from_model_path(self, model_path: str) -> None:
         """
@@ -212,7 +245,14 @@ class TemplateManager:
             completion_template: Optional completion template name/path
         """
         # Load chat template
+<<<<<<< HEAD
+        if chat_template:
+            self.load_chat_template(tokenizer_manager, chat_template, model_path)
+        else:
+            self.guess_chat_template_from_model_path(model_path)
+=======
         self.load_chat_template(tokenizer_manager, chat_template, model_path)
+>>>>>>> origin/main
 
         # Load completion template
         if completion_template:
@@ -229,7 +269,11 @@ class TemplateManager:
             chat_template
         )
         logger.info(
+<<<<<<< HEAD
+            f"Detected chat template content format: {self._jinja_template_content_format}"
+=======
             f"Detected user specified Jinja chat template with content format: {self._jinja_template_content_format}"
+>>>>>>> origin/main
         )
 
     def _load_json_chat_template(self, template_path: str) -> None:
@@ -287,6 +331,8 @@ class TemplateManager:
                 override=True,
             )
         self._completion_template_name = template["name"]
+<<<<<<< HEAD
+=======
 
     def _resolve_hf_chat_template(self, tokenizer_manager) -> Optional[str]:
         """
@@ -306,3 +352,4 @@ class TemplateManager:
 
         logger.debug("No HuggingFace chat template found")
         return None
+>>>>>>> origin/main

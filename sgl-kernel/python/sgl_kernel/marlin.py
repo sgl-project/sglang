@@ -7,8 +7,13 @@ def gptq_marlin_repack(
     size_k,
     size_n,
     num_bits,
+<<<<<<< HEAD
+):
+    torch.ops.sgl_kernel.gptq_marlin_repack.default(
+=======
 ) -> torch.Tensor:
     return torch.ops.sgl_kernel.gptq_marlin_repack(
+>>>>>>> origin/main
         b_q_weight,
         perm,
         size_k,

@@ -450,6 +450,8 @@ register_chat_template(
 
 register_chat_template(
     ChatTemplate(
+<<<<<<< HEAD
+=======
         name="interns1",
         default_system_prompt="You are an AI assistant whose name is Intern-S1 (书生大模型).\n- Intern-S1 (书生大模型) is a vision-language model that is developed by Shanghai AI Laboratory (上海人工智能实验室).  It is designed to be helpful, honest, and harmless.\n- Intern-S1 (书生大模型) can understand and communicate fluently in the language chosen by the user such as English and 中文.\nYou are an expert reasoner with extensive experience in all areas. You approach problems through systematic thinking and rigorous reasoning. Your response should reflect deep understanding and precise logical thinking, making your solution path and reasoning clear to others. Please put your thinking process within <think>...</think> tags.",
         role_prefix_and_suffix={
@@ -463,6 +465,7 @@ register_chat_template(
 
 register_chat_template(
     ChatTemplate(
+>>>>>>> origin/main
         name="granite-3-instruct",
         default_system_prompt=None,
         role_prefix_and_suffix={
@@ -505,6 +508,8 @@ register_chat_template(
     )
 )
 
+<<<<<<< HEAD
+=======
 # Reference: https://huggingface.co/docs/transformers/main/model_doc/glm4_v#usage-example
 register_chat_template(
     ChatTemplate(
@@ -521,6 +526,7 @@ register_chat_template(
     )
 )
 
+>>>>>>> origin/main
 
 @register_chat_template_matching_function
 def match_deepseek(model_path: str):
@@ -578,8 +584,11 @@ def match_chat_ml(model_path: str):
         return "chatml"
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
+<<<<<<< HEAD
+=======
     if re.search(r"glm[-_]?4(\.\d+)?v", model_path, re.IGNORECASE):
         return "glm-4v"
+>>>>>>> origin/main
     if re.search(r"qwen.*(chat|instruct)", model_path, re.IGNORECASE) and not re.search(
         r"llava", model_path, re.IGNORECASE
     ):
@@ -640,6 +649,8 @@ def match_internvl_chat(model_path: str):
         return "internvl-2-5"
 
 
+<<<<<<< HEAD
+=======
 @register_chat_template_matching_function
 def match_interns1_chat(model_path: str):
     if re.search(r"intern-s1", model_path, re.IGNORECASE):
@@ -648,6 +659,7 @@ def match_interns1_chat(model_path: str):
         return "interns1"
 
 
+>>>>>>> origin/main
 if __name__ == "__main__":
     messages = [
         {"role": "system", "content": None},  # None means default

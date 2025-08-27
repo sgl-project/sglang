@@ -32,7 +32,11 @@ try:
         mha_batch_prefill_func,
         paged_attention_ragged,
     )
+<<<<<<< HEAD
+    from aiter.mla import mla_decode_fwd
+=======
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+>>>>>>> origin/main
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
@@ -52,8 +56,15 @@ class ForwardMetadata:
     kv_indices: torch.Tensor
     qo_indptr: torch.Tensor
     kv_last_page_len: torch.Tensor
+<<<<<<< HEAD
+    max_extend_len: int
+    max_prefix_extend_len: int
+    max_q_len: int
+    max_kv_len: int
+=======
     max_q_len: int
     max_kv_len: Optional[int]
+>>>>>>> origin/main
 
 
 global_workspace_buffer = None
@@ -69,17 +80,23 @@ class AiterAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__()
+<<<<<<< HEAD
+=======
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             extend_attention_fwd,
         )
 
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+>>>>>>> origin/main
 
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+<<<<<<< HEAD
+=======
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+>>>>>>> origin/main
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -162,13 +179,21 @@ class AiterAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
         qo_indptr = None
         kv_last_page_len = None
+<<<<<<< HEAD
+        max_extend_len = None
+=======
         max_q_len = None
+>>>>>>> origin/main
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
+<<<<<<< HEAD
+                kv_indices = torch.zeros(
+=======
                 kv_indices = torch.empty(
+>>>>>>> origin/main
                     forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
                 )
                 create_flashinfer_kv_indices_triton[(bs,)](
@@ -188,19 +213,49 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr = self.qo_indptr_[: bs + 1]
                 qo_indptr[1 : bs + 1] = torch.cumsum(self.kv_last_page_len[:bs], dim=0)
                 kv_last_page_len = self.kv_last_page_len[:bs]
+<<<<<<< HEAD
+                max_extend_len = 1
+=======
                 max_q_len = 1
+>>>>>>> origin/main
 
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
                 kv_indices,
                 qo_indptr,
                 kv_last_page_len,
+<<<<<<< HEAD
+                max_extend_len,
+                None,
+                None,
+=======
                 max_q_len,
+>>>>>>> origin/main
                 None,
             )
 
         elif forward_batch.forward_mode.is_draft_extend():
             if self.use_mla:
+<<<<<<< HEAD
+                prefix_lens = forward_batch.extend_prefix_lens
+                self.mla_indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    prefix_lens,
+                    prefix_lens.sum().item(),
+                    forward_batch.extend_seq_lens,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=None,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    self.mla_indices_updater_prefill.kv_indptr,
+                    self.mla_indices_updater_prefill.kv_indices,
+                    self.mla_indices_updater_prefill.qo_indptr,
+                    self.mla_indices_updater_prefill.kv_last_page_len,
+                    self.mla_indices_updater_prefill.max_extend_len,
+                    self.mla_indices_updater_prefill.max_prefix_extend_len,
+                    None,
+                    None,
+=======
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
                         forward_batch.req_pool_indices,
@@ -217,6 +272,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.kv_last_page_len[:bs],
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
+>>>>>>> origin/main
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -232,11 +288,35 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.kv_indices,
                     None,
                     None,
+<<<<<<< HEAD
+                    None,
+                    None,
+=======
+>>>>>>> origin/main
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
                 )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
+<<<<<<< HEAD
+                prefix_lens = forward_batch.extend_prefix_lens
+                self.mla_indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    prefix_lens,
+                    prefix_lens.sum().item(),
+                    forward_batch.extend_seq_lens,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=None,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    self.mla_indices_updater_prefill.kv_indptr,
+                    self.mla_indices_updater_prefill.kv_indices,
+                    self.mla_indices_updater_prefill.qo_indptr,
+                    self.mla_indices_updater_prefill.kv_last_page_len,
+                    self.mla_indices_updater_prefill.max_extend_len,
+                    self.mla_indices_updater_prefill.max_prefix_extend_len,
+                    None,
+=======
                 draft_num = spec_info.draft_token_num
                 kv_lens = forward_batch.seq_lens + draft_num
                 kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
@@ -273,6 +353,7 @@ class AiterAttnBackend(AttentionBackend):
                     # self.mla_indices_updater_prefill.kv_last_page_len,
                     self.kv_last_page_len[:bs],
                     draft_num,
+>>>>>>> origin/main
                     None,
                 )
             else:
@@ -289,6 +370,11 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.kv_indices,
                     None,
                     None,
+<<<<<<< HEAD
+                    None,
+                    None,
+=======
+>>>>>>> origin/main
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
                 )
@@ -299,6 +385,18 @@ class AiterAttnBackend(AttentionBackend):
                 extend_no_prefix = False
             else:
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+<<<<<<< HEAD
+
+            if self.use_mla:
+                self.mla_indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    prefix_lens,
+                    prefix_lens.sum().item(),
+                    forward_batch.extend_seq_lens,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=None,
+                )
+=======
             if self.use_mla:
                 self.mla_indices_updater_prefill.update(
                     forward_batch.req_pool_indices,
@@ -312,13 +410,22 @@ class AiterAttnBackend(AttentionBackend):
                 self.mla_indices_updater_prefill.kv_indptr += (
                     self.mla_indices_updater_prefill.qo_indptr
                 )
+>>>>>>> origin/main
                 self.forward_metadata = ForwardMetadata(
                     self.mla_indices_updater_prefill.kv_indptr,
                     self.mla_indices_updater_prefill.kv_indices,
                     self.mla_indices_updater_prefill.qo_indptr,
+<<<<<<< HEAD
+                    self.mla_indices_updater_prefill.kv_last_page_len,
+                    self.mla_indices_updater_prefill.max_extend_len,
+                    self.mla_indices_updater_prefill.max_prefix_extend_len,
+                    None,
+                    None,
+=======
                     self.kv_last_page_len[:bs],
                     self.mla_indices_updater_prefill.max_q_len,
                     self.mla_indices_updater_prefill.max_kv_len,
+>>>>>>> origin/main
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -334,6 +441,11 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.kv_indices,
                     None,
                     None,
+<<<<<<< HEAD
+                    None,
+                    None,
+=======
+>>>>>>> origin/main
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
                 )
@@ -374,7 +486,11 @@ class AiterAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             qo_indptr = None
             kv_last_page_len = None
+<<<<<<< HEAD
+            max_extend_len = None
+=======
             max_q_len = None
+>>>>>>> origin/main
 
             if spec_info is None:
                 kv_indptr = self.kv_indptr
@@ -398,15 +514,26 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr[1 : bs + 1] = torch.cumsum(
                     self.cuda_graph_kv_last_page_len[:bs], dim=0
                 )
+<<<<<<< HEAD
+                max_extend_len = 1
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+=======
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
+>>>>>>> origin/main
 
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
                 kv_indices,
                 qo_indptr,
                 kv_last_page_len,
+<<<<<<< HEAD
+                max_extend_len,
+                None,
+                None,
+=======
                 max_q_len,
+>>>>>>> origin/main
                 None,
             )
 
@@ -432,15 +559,27 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+<<<<<<< HEAD
+
+                max_extend_len = self.num_draft_tokens
+                kv_last_page_len = None
+=======
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = self.num_draft_tokens
+>>>>>>> origin/main
 
                 self.forward_metadata = ForwardMetadata(
                     kv_indptr,
                     kv_indices,
                     qo_indptr,
                     kv_last_page_len,
+<<<<<<< HEAD
+                    max_extend_len,
+                    None,
+                    None,
+=======
                     max_q_len,
+>>>>>>> origin/main
                     None,
                 )
             else:
@@ -458,6 +597,14 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.kv_indices,
                     None,
                     None,
+<<<<<<< HEAD
+                    None,
+                    None,
+                    self.indices_updater_prefill.max_q_len,
+                    self.indices_updater_prefill.max_kv_len,
+                )
+
+=======
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
                 )
@@ -493,6 +640,7 @@ class AiterAttnBackend(AttentionBackend):
                 max_q_len,
                 None,
             )
+>>>>>>> origin/main
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -527,6 +675,15 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
 
         elif forward_mode.is_target_verify():
+<<<<<<< HEAD
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_sum,
+                prefix_lens=None,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=spec_info,
+=======
             bs = len(req_pool_indices)
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -565,6 +722,7 @@ class AiterAttnBackend(AttentionBackend):
                 None,
                 kv_indices,
                 self.req_to_token.stride(0),
+>>>>>>> origin/main
             )
         else:
             raise ValueError("Invalid forward mode")
@@ -600,10 +758,18 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
         if self.use_mla:
+<<<<<<< HEAD
+            max_extend_len = self.forward_metadata.max_extend_len
+            max_prefix_extend_len = self.forward_metadata.max_prefix_extend_len
+            kv_indptr = self.forward_metadata.kv_indptr
+            kv_indices = self.forward_metadata.kv_indices
+            kv_last_page_lens = self.forward_metadata.kv_last_page_len
+=======
             max_q_len = self.forward_metadata.max_q_len
             max_kv_len = self.forward_metadata.max_kv_len
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
+>>>>>>> origin/main
             qo_indptr = self.forward_metadata.qo_indptr
             K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             V_Buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -621,8 +787,13 @@ class AiterAttnBackend(AttentionBackend):
                     v,
                     qo_indptr,
                     qo_indptr,
+<<<<<<< HEAD
+                    max_extend_len,
+                    max_extend_len,
+=======
                     max_q_len,
                     max_q_len,
+>>>>>>> origin/main
                     softmax_scale=layer.scaling,
                     causal=True,
                 )
@@ -668,12 +839,19 @@ class AiterAttnBackend(AttentionBackend):
                     v,
                     qo_indptr,
                     kv_indptr,
+<<<<<<< HEAD
+                    max_extend_len,
+                    max_prefix_extend_len,
+=======
                     max_q_len,
                     max_kv_len,
+>>>>>>> origin/main
                     softmax_scale=layer.scaling,
                     causal=True,
                 )
                 return o
+<<<<<<< HEAD
+=======
             elif forward_batch.forward_mode.is_target_verify():
                 o = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
                 mla_decode_fwd(
@@ -733,6 +911,7 @@ class AiterAttnBackend(AttentionBackend):
                 raise ValueError(
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
+>>>>>>> origin/main
         else:
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
@@ -790,7 +969,11 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata.kv_indptr,
                 self.forward_metadata.kv_indices,
                 self.forward_metadata.kv_last_page_len,
+<<<<<<< HEAD
+                self.forward_metadata.max_extend_len,
+=======
                 self.forward_metadata.max_q_len,
+>>>>>>> origin/main
                 layer.scaling,
                 layer.logit_cap,
             )
@@ -848,6 +1031,14 @@ class AiterIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.update = self.update_single_wrapper
 
+<<<<<<< HEAD
+        # get the last index of the pool
+        self.pool_size = (
+            model_runner.token_to_kv_pool.size + model_runner.token_to_kv_pool.page_size
+        ) - 1
+
+=======
+>>>>>>> origin/main
         self.kv_indices = None
         self.max_q_len = 0
         self.max_kv_len = 0
@@ -892,8 +1083,14 @@ class AiterIndicesUpdaterPrefill:
             # but the 0 location will be made nan (noqa) in cuda graph capture mode
             # this will cause the output tensor value becomes nan
             # WA is to assure that last index of pool not changed
+<<<<<<< HEAD
+            kv_indices = torch.full(
+                (paged_kernel_lens_sum + 128,),
+                self.pool_size,
+=======
             kv_indices = torch.empty(
                 paged_kernel_lens_sum + 256,
+>>>>>>> origin/main
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
@@ -907,9 +1104,12 @@ class AiterIndicesUpdaterPrefill:
                 self.req_to_token.shape[1],
             )
 
+<<<<<<< HEAD
+=======
             token_num = kv_indptr[-1]
             kv_indices[token_num:] = kv_indices[0]
 
+>>>>>>> origin/main
             self.max_kv_len = torch.max(paged_kernel_lens).item()
 
             extend_lens = seq_lens - prefix_lens
@@ -944,17 +1144,29 @@ class AiterMlaIndicesUpdaterPrefill:
         self.kv_indices = None
         self.qo_indptr = None
         self.kv_last_page_len = None
+<<<<<<< HEAD
+        self.max_extend_len = 0
+        self.max_prefix_extend_len = 0
+=======
         self.max_q_len = 0
         self.max_kv_len = 0
+>>>>>>> origin/main
 
     def update(
         self,
         req_pool_indices: torch.Tensor,
+<<<<<<< HEAD
+        prefix_lens: torch.Tensor,
+        prefix_lens_sum: int,
+        extend_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+=======
         kv_lens: torch.Tensor,
         kv_lens_sum: int,
         extend_lens: torch.Tensor,
         max_q_len: int,
         max_kv_len: int,
+>>>>>>> origin/main
         spec_info: Optional[SpecInfo],
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
@@ -963,6 +1175,18 @@ class AiterMlaIndicesUpdaterPrefill:
     def update_single_wrapper(
         self,
         req_pool_indices: torch.Tensor,
+<<<<<<< HEAD
+        prefix_lens: torch.Tensor,
+        prefix_lens_sum: int,
+        extend_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        spec_info: Optional[SpecInfo],
+    ):
+
+        paged_kernel_lens = prefix_lens
+        paged_kernel_lens_sum = prefix_lens_sum
+
+=======
         kv_lens: torch.Tensor,
         kv_lens_sum: int,
         extend_lens: torch.Tensor,
@@ -970,23 +1194,35 @@ class AiterMlaIndicesUpdaterPrefill:
         max_kv_len: int,
         spec_info: Optional[SpecInfo],
     ):
+>>>>>>> origin/main
         bs = len(req_pool_indices)
 
         kv_indptr = self.attn_backend.kv_indptr
 
         if spec_info is None:
             # Normal extend
+<<<<<<< HEAD
+            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum,
+=======
             kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
                 kv_lens_sum,
+>>>>>>> origin/main
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
+<<<<<<< HEAD
+                paged_kernel_lens,
+=======
                 kv_lens,
+>>>>>>> origin/main
                 kv_indptr,
                 None,
                 kv_indices,
@@ -996,12 +1232,24 @@ class AiterMlaIndicesUpdaterPrefill:
             qo_indptr = self.attn_backend.qo_indptr
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
+<<<<<<< HEAD
+
+            max_extend_len = torch.max(extend_lens).item()
+            max_prefix_extend_len = torch.max(extend_lens + paged_kernel_lens).item()
+            kv_indptr += qo_indptr
+=======
+>>>>>>> origin/main
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
+<<<<<<< HEAD
+                    paged_kernel_lens,
+                    paged_kernel_lens_sum,
+=======
                     kv_lens,
                     kv_lens_sum,
+>>>>>>> origin/main
                     self.req_to_token,
                 )
             )
@@ -1009,6 +1257,10 @@ class AiterMlaIndicesUpdaterPrefill:
         self.kv_indptr = kv_indptr
         self.kv_indices = kv_indices
         self.qo_indptr = qo_indptr
+<<<<<<< HEAD
+        self.max_extend_len = max_extend_len
+        self.max_prefix_extend_len = max_prefix_extend_len
+=======
         self.max_q_len = max_q_len
         self.max_kv_len = max_kv_len
 
@@ -1152,3 +1404,4 @@ class AiterMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+>>>>>>> origin/main

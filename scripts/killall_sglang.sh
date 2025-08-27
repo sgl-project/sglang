@@ -27,6 +27,10 @@ else
         lsof /dev/nvidia* | awk '{print $2}' | xargs kill -9 2>/dev/null
     fi
 
+<<<<<<< HEAD
+
+=======
+>>>>>>> origin/main
     # Show GPU status after clean up
     nvidia-smi
 fi

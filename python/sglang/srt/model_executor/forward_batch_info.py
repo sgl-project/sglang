@@ -38,6 +38,8 @@ import torch
 import triton
 import triton.language as tl
 
+<<<<<<< HEAD
+=======
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -45,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
 )
+>>>>>>> origin/main
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import (
     flatten_nested_list,
@@ -55,7 +58,10 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+<<<<<<< HEAD
+=======
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+>>>>>>> origin/main
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -86,9 +92,12 @@ class ForwardMode(IntEnum):
     # It is now used for triggering the sampling_info_done event for the first prefill batch.
     DUMMY_FIRST = auto()
 
+<<<<<<< HEAD
+=======
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
+>>>>>>> origin/main
     def is_prefill(self):
         return self.is_extend()
 
@@ -109,9 +118,12 @@ class ForwardMode(IntEnum):
     def is_idle(self):
         return self == ForwardMode.IDLE
 
+<<<<<<< HEAD
+=======
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
+>>>>>>> origin/main
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
@@ -135,8 +147,13 @@ class ForwardMode(IntEnum):
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
 
+<<<<<<< HEAD
+    def is_decode_or_idle(self):
+        return self == ForwardMode.DECODE or self == ForwardMode.IDLE
+=======
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
+>>>>>>> origin/main
 
 
 @total_ordering
@@ -181,9 +198,12 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+<<<<<<< HEAD
+=======
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
+>>>>>>> origin/main
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
@@ -193,7 +213,10 @@ class ForwardBatch:
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # For logits and logprobs post processing
+<<<<<<< HEAD
+=======
     next_token_logits_buffer: torch.Tensor = None
+>>>>>>> origin/main
     temp_scaled_logprobs: bool = False
     temperature: torch.Tensor = None
     top_p_normalized_logprobs: bool = False
@@ -212,6 +235,8 @@ class ForwardBatch:
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
+<<<<<<< HEAD
+=======
     # For split prefill
     # intermediate values for split prefill
     hidden_states: torch.Tensor = None
@@ -220,6 +245,7 @@ class ForwardBatch:
     # current split index of layer
     split_index: int = 0
 
+>>>>>>> origin/main
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether the kv cache needs to be attended in current pass
     attn_attend_prefix_cache: Optional[bool] = None
@@ -241,9 +267,12 @@ class ForwardBatch:
     prefix_chunk_num_tokens: Optional[List[int]] = None
     # KV Indices for each chunk
     prefix_chunk_kv_indices: Optional[List[torch.Tensor]] = None
+<<<<<<< HEAD
+=======
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether lse needs to be returned
     mha_return_lse: Optional[bool] = None
+>>>>>>> origin/main
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -255,10 +284,17 @@ class ForwardBatch:
     encoder_out_cache_loc: Optional[torch.Tensor] = None
 
     # For LoRA
+<<<<<<< HEAD
+    lora_paths: Optional[List[str]] = None
+
+    # For input embeddings
+    input_embeds: Optional[torch.tensor] = None
+=======
     lora_ids: Optional[List[str]] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
+>>>>>>> origin/main
 
     # For cross-encoder model
     token_type_ids: Optional[torch.Tensor] = None
@@ -277,14 +313,21 @@ class ForwardBatch:
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+<<<<<<< HEAD
+=======
     # The padding mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
+>>>>>>> origin/main
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
     # this will be recomputed in LogitsMetadata.from_forward_batch
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
+<<<<<<< HEAD
+    gathered_buffer: Optional[torch.Tensor] = None
+=======
     global_dp_buffer_len: Optional[int] = None
+>>>>>>> origin/main
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -304,7 +347,11 @@ class ForwardBatch:
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+<<<<<<< HEAD
+    tbo_children: Optional[List["ForwardBatch"]] = None
+=======
     tbo_children: Optional[List[ForwardBatch]] = None
+>>>>>>> origin/main
 
     @classmethod
     def init_new(
@@ -328,14 +375,21 @@ class ForwardBatch:
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
+<<<<<<< HEAD
+=======
             orig_seq_lens=batch.orig_seq_lens,
+>>>>>>> origin/main
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
+<<<<<<< HEAD
+            lora_paths=batch.lora_paths,
+=======
             lora_ids=batch.lora_ids,
+>>>>>>> origin/main
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
@@ -359,6 +413,22 @@ class ForwardBatch:
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
 
+<<<<<<< HEAD
+        # For DP attention
+        if batch.global_num_tokens is not None:
+
+            spec_num_draft_tokens = (
+                batch.spec_num_draft_tokens
+                if batch.spec_num_draft_tokens is not None
+                else 1
+            )
+            global_num_tokens = [
+                x * spec_num_draft_tokens for x in batch.global_num_tokens
+            ]
+            global_num_tokens_for_logprob = [
+                x * spec_num_draft_tokens for x in batch.global_num_tokens_for_logprob
+            ]
+=======
         # For MLP sync
         if batch.global_num_tokens is not None:
             from sglang.srt.speculative.eagle_utils import (
@@ -391,6 +461,7 @@ class ForwardBatch:
             else:
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+>>>>>>> origin/main
 
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
@@ -402,8 +473,20 @@ class ForwardBatch:
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
 
+<<<<<<< HEAD
+            sum_len = sum(global_num_tokens)
+            ret.gathered_buffer = torch.zeros(
+                (sum_len, model_runner.model_config.hidden_size),
+                dtype=model_runner.dtype,
+                device=device,
+            )
+
+        if ret.forward_mode.is_idle():
+            ret.positions = torch.empty((0,), device=device)
+=======
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+>>>>>>> origin/main
             TboForwardBatchPreparer.prepare(
                 ret, is_draft_worker=model_runner.is_draft_worker
             )
@@ -428,12 +511,25 @@ class ForwardBatch:
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
+<<<<<<< HEAD
+            if support_triton(model_runner.server_args.attention_backend):
+                positions, ret.extend_start_loc = compute_position_triton(
+                    ret.extend_prefix_lens,
+                    ret.extend_seq_lens,
+                    ret.extend_num_tokens,
+                )
+            else:
+                positions, ret.extend_start_loc = compute_position_torch(
+                    ret.extend_prefix_lens, ret.extend_seq_lens
+                )
+=======
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
             )
+>>>>>>> origin/main
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
@@ -444,7 +540,11 @@ class ForwardBatch:
             ret._compute_mrope_positions(model_runner, batch)
 
         # Init lora information
+<<<<<<< HEAD
+        if model_runner.server_args.lora_paths is not None:
+=======
         if model_runner.server_args.enable_lora:
+>>>>>>> origin/main
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         TboForwardBatchPreparer.prepare(
@@ -492,6 +592,10 @@ class ForwardBatch:
             for mm_input in self.mm_inputs
         )
 
+<<<<<<< HEAD
+    def contains_mm_inputs(self) -> bool:
+        return self.contains_audio_inputs() or self.contains_image_inputs()
+=======
     def contains_video_inputs(self) -> bool:
         if self.mm_inputs is None:
             return False
@@ -506,6 +610,7 @@ class ForwardBatch:
             or self.contains_video_inputs()
             or self.contains_image_inputs()
         )
+>>>>>>> origin/main
 
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -599,6 +704,8 @@ class ForwardBatch:
             )
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
+<<<<<<< HEAD
+=======
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:
             return torch.cat(
@@ -779,6 +886,7 @@ class ForwardBatch:
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
 
+>>>>>>> origin/main
     # Here we suppose the length of each chunk is equal
     # For example, if we have 4 sequences with prefix length [256, 512, 768, 1024], prefix_chunk_len = 256
     # num_prefix_chunks = cdiv(1024, 256) = 4
@@ -873,7 +981,11 @@ class ForwardBatch:
 
 
 def enable_num_token_non_padded(server_args):
+<<<<<<< HEAD
+    return server_args.enable_ep_moe or server_args.enable_deepep_moe
+=======
     return get_moe_expert_parallel_world_size() > 1
+>>>>>>> origin/main
 
 
 class PPProxyTensors:
@@ -906,6 +1018,8 @@ class PPProxyTensors:
         return f"PPProxyTensors(tensors={self.tensors})"
 
 
+<<<<<<< HEAD
+=======
 def compute_position(
     attn_backend: str,
     extend_prefix_lens: torch.Tensor,
@@ -925,6 +1039,7 @@ def compute_position(
     return positions, extend_start_loc
 
 
+>>>>>>> origin/main
 def compute_position_triton(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
 ):

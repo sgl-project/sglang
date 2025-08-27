@@ -27,6 +27,8 @@ void scaled_fp4_experts_quant_sm100a(
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts);
 
+<<<<<<< HEAD
+=======
 void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     torch::Tensor& output,
     torch::Tensor& output_scale,
@@ -36,6 +38,7 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     torch::Tensor const& output_scale_offset_by_experts,
     torch::Tensor const& mask);
 
+>>>>>>> origin/main
 #endif
 
 void scaled_fp4_quant(
@@ -59,6 +62,8 @@ void scaled_fp4_experts_quant(
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 experts quantization kernel");
 }
+<<<<<<< HEAD
+=======
 
 void silu_and_mul_scaled_fp4_experts_quant(
     torch::Tensor& output,
@@ -74,3 +79,4 @@ void silu_and_mul_scaled_fp4_experts_quant(
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 experts quantization kernel");
 }
+>>>>>>> origin/main

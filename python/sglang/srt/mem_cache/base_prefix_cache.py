@@ -1,5 +1,9 @@
 from abc import ABC, abstractmethod
+<<<<<<< HEAD
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Tuple
+=======
 from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
+>>>>>>> origin/main
 
 import torch
 
@@ -56,12 +60,21 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
+<<<<<<< HEAD
+    def dec_lock_ref(self, node: Any):
+=======
     def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
+>>>>>>> origin/main
         pass
 
     def evictable_size(self):
         return 0
 
+<<<<<<< HEAD
+    def protected_size(self):
+        return 0
+
+=======
     def full_evictable_size(self):
         return 0
 
@@ -77,6 +90,7 @@ class BasePrefixCache(ABC):
     def swa_protected_size(self):
         return 0
 
+>>>>>>> origin/main
     def total_size(self):
         raise NotImplementedError()
 

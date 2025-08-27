@@ -229,8 +229,11 @@ def get_quant_config(
                     f"Unsupported quantization config"
                     f" found for {model_config.quantization} in {f}."
                 )
+<<<<<<< HEAD
+=======
         elif model_config.quantization == "w8a8_int8":
             config["packed_modules_mapping"] = packed_modules_mapping
+>>>>>>> origin/main
 
     return quant_cls.from_config(config)
 
@@ -843,6 +846,8 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
                 return None
             return remapped_name
 
+<<<<<<< HEAD
+=======
     quark_scale_names = {
         ".q_proj.output_scale": ".attn.q_scale",
         ".k_proj.output_scale": ".attn.k_scale",
@@ -853,6 +858,7 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
         if name.endswith(quark_scale_name):
             return name.replace(quark_scale_name, sglang_scale_name)
 
+>>>>>>> origin/main
     # If there were no matches, return the untouched param name
     return name
 

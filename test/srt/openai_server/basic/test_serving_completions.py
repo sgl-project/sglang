@@ -95,6 +95,8 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.sc.tokenizer_manager.tokenizer.decode.return_value = "decoded"
         self.assertEqual(self.sc._prepare_echo_prompts(req), ["decoded"])
 
+<<<<<<< HEAD
+=======
     # ---------- response_format handling ----------
     def test_response_format_json_object(self):
         """Test that response_format json_object is correctly processed in sampling params."""
@@ -152,6 +154,7 @@ class ServingCompletionTestCase(unittest.TestCase):
         # (but might have json_schema from the legacy json_schema field)
         self.assertIsNone(sampling_params.get("structural_tag"))
 
+>>>>>>> origin/main
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

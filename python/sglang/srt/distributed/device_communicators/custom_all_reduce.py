@@ -4,18 +4,30 @@ import ctypes
 import logging
 import os
 from contextlib import contextmanager
+<<<<<<< HEAD
+from functools import wraps
+from typing import Any, Callable, List, Optional, TypeVar, Union
+=======
 from typing import Any, List, Optional, Union
+>>>>>>> origin/main
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+<<<<<<< HEAD
+from typing_extensions import ParamSpec
+=======
+>>>>>>> origin/main
 
 from sglang.srt import _custom_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
+<<<<<<< HEAD
+=======
     is_full_nvlink,
     is_weak_contiguous,
+>>>>>>> origin/main
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.utils import is_cuda, is_hip
@@ -25,6 +37,26 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
+<<<<<<< HEAD
+if _is_cuda:
+    try:
+        import pynvml
+    except ImportError as e:
+        logger.warning("Failed to import pynvml with %r", e)
+
+if _is_hip:
+    try:
+        from amdsmi import (
+            AmdSmiException,
+            amdsmi_get_processor_handles,
+            amdsmi_init,
+            amdsmi_shut_down,
+            amdsmi_topo_get_link_type,
+        )
+    except ImportError as e:
+        logger.warning("Failed to import amdsmi with %r", e)
+=======
+>>>>>>> origin/main
 
 try:
     if ops.use_vllm_custom_allreduce and not _is_hip:
@@ -40,6 +72,73 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+<<<<<<< HEAD
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    @wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        if _is_hip:
+            try:
+                amdsmi_init()
+                return fn(*args, **kwargs)
+            finally:
+                amdsmi_shut_down()
+        else:
+            pynvml.nvmlInit()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                pynvml.nvmlShutdown()
+
+    return wrapper
+
+
+@with_nvml_context
+def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
+    if _is_hip:
+        """
+        query if the set of gpus are fully connected by xgmi (1 hop)
+        """
+        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
+        for i, handle in enumerate(handles):
+            for j, peer_handle in enumerate(handles):
+                if i < j:
+                    try:
+                        link_type = amdsmi_topo_get_link_type(handle, peer_handle)
+                        # type is 2 for XGMI
+                        if link_type["hops"] != 1 or link_type["type"] != 2:
+                            return False
+                    except AmdSmiException as error:
+                        logger.error("AMD 1 hop XGMI detection failed.", exc_info=error)
+                        return False
+        return True
+    else:
+        """
+        query if the set of gpus are fully connected by nvlink (1 hop)
+        """
+        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+        for i, handle in enumerate(handles):
+            for j, peer_handle in enumerate(handles):
+                if i < j:
+                    try:
+                        p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                            handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
+                        )
+                        if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                            return False
+                    except pynvml.NVMLError:
+                        logger.exception(
+                            "NVLink detection failed. This is normal if your"
+                            " machine has no NVLink equipped."
+                        )
+                        return False
+        return True
+
+=======
+>>>>>>> origin/main
 
 def _can_p2p(rank: int, world_size: int) -> bool:
     # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
@@ -55,6 +154,16 @@ def _can_p2p(rank: int, world_size: int) -> bool:
     return True
 
 
+<<<<<<< HEAD
+def is_weak_contiguous(inp: torch.Tensor):
+    return inp.is_contiguous() or (
+        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
+        == inp.numel() * inp.element_size()
+    )
+
+
+=======
+>>>>>>> origin/main
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     _MAX_CAR_SIZE = 8192 * 1024
@@ -398,7 +507,11 @@ class CustomAllreduce:
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
+<<<<<<< HEAD
+                return torch.empty_like(input)
+=======
                 return torch.zeros_like(input)
+>>>>>>> origin/main
         else:
             if _is_hip:
                 # note: outside of cuda graph context,

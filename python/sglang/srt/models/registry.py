@@ -83,7 +83,11 @@ def import_model_classes():
             try:
                 module = importlib.import_module(name)
             except Exception as e:
+<<<<<<< HEAD
+                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+=======
                 logger.warning(f"Ignore import error when loading {name}: {e}")
+>>>>>>> origin/main
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass

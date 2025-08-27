@@ -82,5 +82,9 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
     int num_splits,
     std::optional<bool> pack_gqa_,
+<<<<<<< HEAD
+    int const sm_margin);
+=======
     int const sm_margin,
     std::optional<const at::Tensor>& sinks_);
+>>>>>>> origin/main

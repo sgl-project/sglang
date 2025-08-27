@@ -187,6 +187,13 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
         shard_id = tp_rank if shard_id == "q" else tp_rank // num_heads
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+<<<<<<< HEAD
+        if not use_presharded_weights:
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, shard_id * shard_size, shard_size
+            )
+
+=======
 
         if _is_cpu:
             from sglang.srt.model_loader.weight_utils import (
@@ -208,6 +215,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim, shard_id * shard_size, shard_size
                 )
 
+>>>>>>> origin/main
         assert (
             param_data.shape == loaded_weight.shape
         ), f"{param_data.shape=}, {loaded_weight.shape=}"

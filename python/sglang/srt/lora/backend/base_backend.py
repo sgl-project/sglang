@@ -5,6 +5,25 @@ import torch
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
+<<<<<<< HEAD
+def get_fuse_output_add_from_name(name: str) -> bool:
+    mapping = {
+        "triton": True,
+        "flashinfer": False,
+    }
+    return mapping.get(name, False)
+
+
+def get_fuse_stacked_lora_b_from_name(name: str) -> bool:
+    mapping = {
+        "triton": True,
+        "flashinfer": False,
+    }
+    return mapping.get(name, False)
+
+
+=======
+>>>>>>> origin/main
 class BaseLoRABackend:
     """Base class for different Lora backends.
        Each backend has its own implementation of Lora kernels.
@@ -12,11 +31,21 @@ class BaseLoRABackend:
     Args:
         name: name of backend
         batch_info: information of current batch for use
+<<<<<<< HEAD
+        fuse_output_add: if set to True, the output buffer for storing result will be passed in when doing lora_b forward,
+                                 and the operation of adding will be fused into kernel
+=======
+>>>>>>> origin/main
     """
 
     def __init__(self, name: str, batch_info: LoRABatchInfo = None):
         self.name = name
         self.batch_info = batch_info
+<<<<<<< HEAD
+        self.fuse_output_add = get_fuse_output_add_from_name(name)
+        self.fuse_stacked_lora_b = get_fuse_stacked_lora_b_from_name(name)
+=======
+>>>>>>> origin/main
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -106,8 +135,14 @@ def get_backend_from_name(name: str) -> BaseLoRABackend:
 
         return TritonLoRABackend
     elif name == "flashinfer":
+<<<<<<< HEAD
+        from sglang.srt.lora.backend.flashinfer_backend import FlashInferLoRABackend
+
+        return FlashInferLoRABackend
+=======
         raise ValueError(
             "FlashInfer LoRA backend has been deprecated, please use `triton` instead."
         )
+>>>>>>> origin/main
     else:
         raise ValueError(f"Invalid backend: {name}")

@@ -8,6 +8,11 @@ suites = {
         TestFile("test_srt_backend.py"),
         # Skip this due to some OPENAI_API_KEY issues
         # "test_openai_backend.py",
+<<<<<<< HEAD
+        TestFile("test_separate_reasoning.py"),
+        TestFile("test_separate_reasoning_execution.py"),
+=======
+>>>>>>> origin/main
     ],
 }
 

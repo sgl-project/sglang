@@ -186,7 +186,11 @@ class LlavaBaseForCausalLM(nn.Module):
                 bs = forward_batch.batch_size
                 pixel_values = flatten_nested_list(
                     [
+<<<<<<< HEAD
+                        [item.pixel_values for item in image_inputs[i].mm_items]
+=======
                         [item.feature for item in image_inputs[i].mm_items]
+>>>>>>> origin/main
                         for i in range(bs)
                         if need_vision[i]
                     ]
@@ -656,6 +660,13 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         self, auto_model_type: Type[AutoModel]
     ) -> Dict[str, str]:
         mapping = {}
+<<<<<<< HEAD
+        for config_cls, archs in auto_model_type._model_mapping.items():
+            if isinstance(archs, tuple):
+                mapping[config_cls.__name__] = tuple(arch.__name__ for arch in archs)
+            else:
+                mapping[config_cls.__name__] = archs.__name__
+=======
         for config_cls in auto_model_type._model_mapping.keys():
             archs = auto_model_type._model_mapping.get(config_cls, None)
             if archs is not None:
@@ -665,6 +676,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
                     )
                 else:
                     mapping[config_cls.__name__] = archs.__name__
+>>>>>>> origin/main
         return mapping
 
     def __init__(
@@ -757,7 +769,11 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched
+<<<<<<< HEAD
+            pixel_values, image_sizes = item.pixel_values, item.image_sizes
+=======
             pixel_values, image_sizes = item.feature, item.image_sizes
+>>>>>>> origin/main
             image_outputs = self.vision_tower(
                 pixel_values, image_sizes, output_hidden_states=True
             )
@@ -791,9 +807,13 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             forward_batch=forward_batch,
             get_embedding=get_embedding,
             language_model=self.language_model,
+<<<<<<< HEAD
+            image_data_embedding_func=self.get_image_feature,
+=======
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
             },
+>>>>>>> origin/main
             placeholder_tokens=None,  # using mm_item.pad_value
             positions=positions,
         )

@@ -6,8 +6,11 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
+<<<<<<< HEAD
+=======
 import asyncio
 import json
+>>>>>>> origin/main
 import unittest
 import uuid
 from typing import Optional
@@ -199,6 +202,8 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(params["min_new_tokens"], 5)
             self.assertEqual(params["stop"], ["</s>"])
 
+<<<<<<< HEAD
+=======
     async def test_unstreamed_tool_args_completion(self):
         """Test that remaining tool call arguments are sent when generation finishes."""
 
@@ -421,6 +426,7 @@ class ServingChatTestCase(unittest.TestCase):
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:0")
 
+>>>>>>> origin/main
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

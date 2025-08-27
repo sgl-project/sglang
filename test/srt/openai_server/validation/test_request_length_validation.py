@@ -79,7 +79,11 @@ class TestRequestLengthValidation(CustomTestCase):
             )
 
         self.assertIn(
+<<<<<<< HEAD
+            "Requested token count exceeds the model's maximum context",
+=======
             "max_completion_tokens is too large",
+>>>>>>> origin/main
             str(cm.exception),
         )
 

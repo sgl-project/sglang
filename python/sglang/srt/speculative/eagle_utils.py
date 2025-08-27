@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+<<<<<<< HEAD
+=======
 import copy
+>>>>>>> origin/main
 import logging
 import os
 import time
@@ -49,8 +52,11 @@ SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 
+<<<<<<< HEAD
+=======
 TREE_SPEC_KERNEL_AVAILABLE = "tree_speculative_sampling_target_only" in globals()
 
+>>>>>>> origin/main
 
 @dataclass
 class EagleDraftInput:
@@ -73,6 +79,11 @@ class EagleDraftInput:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
+<<<<<<< HEAD
+    def prepare_for_extend(self, batch: ScheduleBatch):
+        if batch.forward_mode.is_idle():
+            return
+=======
     # Shape info for padding
     num_tokens_per_batch: int = -1
     num_tokens_for_logprob_per_batch: int = -1
@@ -87,6 +98,7 @@ class EagleDraftInput:
         if batch.forward_mode.is_idle():
             return
 
+>>>>>>> origin/main
         # Prefill only generate 1 token.
         assert len(self.verified_id) == len(batch.seq_lens)
 
@@ -108,7 +120,11 @@ class EagleDraftInput:
         capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
+<<<<<<< HEAD
+            verified_id=None,
+=======
             verified_id=torch.empty((0,), device=device, dtype=torch.int32),
+>>>>>>> origin/main
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
@@ -122,10 +138,14 @@ class EagleDraftInput:
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
+<<<<<<< HEAD
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND
+=======
 
         if batch.forward_mode.is_idle():
             return
 
+>>>>>>> origin/main
         batch.input_ids = self.verified_id
         batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
@@ -179,6 +199,13 @@ class EagleDraftInput:
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
+<<<<<<< HEAD
+    def filter_batch(self, new_indices: torch.Tensor):
+        self.topk_p = self.topk_p[: len(new_indices)]
+        self.topk_index = self.topk_index[: len(new_indices)]
+        self.hidden_states = self.hidden_states[: len(new_indices)]
+        self.verified_id = self.verified_id[: len(new_indices)]
+=======
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
@@ -197,6 +224,7 @@ class EagleDraftInput:
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
+>>>>>>> origin/main
 
     def merge_batch(self, spec_info: EagleDraftInput):
         if self.hidden_states is None:
@@ -345,7 +373,11 @@ class EagleVerifyInput:
     def verify(
         self,
         batch: ScheduleBatch,
+<<<<<<< HEAD
+        logits_output: torch.Tensor,
+=======
         logits_output: LogitsProcessorOutput,
+>>>>>>> origin/main
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
@@ -392,11 +424,14 @@ class EagleVerifyInput:
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
 
+<<<<<<< HEAD
+=======
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
             # NOTE: retrive_index are the indices of the requests that are kept.
             sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
 
+>>>>>>> origin/main
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(
@@ -425,6 +460,10 @@ class EagleVerifyInput:
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
+<<<<<<< HEAD
+        # Sample tokens
+        if batch.sampling_info.is_all_greedy:
+=======
         # Sample tokens. Force greedy sampling on AMD
         is_all_greedy = sampling_info.is_all_greedy
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
@@ -434,6 +473,7 @@ class EagleVerifyInput:
             )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
+>>>>>>> origin/main
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
 
@@ -462,6 +502,14 @@ class EagleVerifyInput:
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * draft_token_num, vocab_size)
+<<<<<<< HEAD
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, self.draft_token_num, dim=0
+                ),
+            )
+=======
             if not torch.all(sampling_info.top_ps == 1.0):
                 target_probs = top_p_renorm_prob(
                     target_probs,
@@ -469,6 +517,7 @@ class EagleVerifyInput:
                         sampling_info.top_ps, self.draft_token_num, dim=0
                     ),
                 )
+>>>>>>> origin/main
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
             draft_probs = torch.zeros(
@@ -636,6 +685,15 @@ class EagleVerifyInput:
                 batch.out_cache_loc = tgt_cache_loc
             batch.seq_lens.add_(accept_length + 1)
 
+<<<<<<< HEAD
+            draft_input = EagleDraftInput()
+            draft_input.hidden_states = batch.spec_info.hidden_states[accept_index]
+            draft_input.verified_id = verified_id
+            draft_input.accept_length = accept_length
+            draft_input.accept_length_cpu = accept_length.tolist()
+            draft_input.seq_lens_for_draft_extend = batch.seq_lens
+            draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices
+=======
             draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
                 verified_id=verified_id,
@@ -644,6 +702,7 @@ class EagleVerifyInput:
                 seq_lens_for_draft_extend=batch.seq_lens,
                 req_pool_indices_for_draft_extend=batch.req_pool_indices,
             )
+>>>>>>> origin/main
 
             return EagleVerifyOutput(
                 draft_input=draft_input,
@@ -666,6 +725,10 @@ class EagleVerifyInput:
                 batch.seq_lens.add_(accept_length + 1)
 
             accept_length_cpu = accept_length.tolist()
+<<<<<<< HEAD
+            draft_input = EagleDraftInput()
+=======
+>>>>>>> origin/main
             if len(unfinished_accept_index) > 0:
                 unfinished_accept_index = torch.cat(unfinished_accept_index)
                 unfinished_index_device = torch.tensor(
@@ -696,6 +759,20 @@ class EagleVerifyInput:
                         next_power_of_2(self.draft_token_num),
                     )
 
+<<<<<<< HEAD
+                draft_input.hidden_states = batch.spec_info.hidden_states[
+                    unfinished_accept_index
+                ]
+                draft_input.verified_id = predict[unfinished_accept_index]
+                draft_input.accept_length_cpu = draft_input_accept_length_cpu
+                draft_input.accept_length = accept_length[unfinished_index_device]
+                draft_input.seq_lens_for_draft_extend = batch.seq_lens[
+                    unfinished_index_device
+                ]
+                draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices[
+                    unfinished_index_device
+                ]
+=======
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
@@ -716,6 +793,7 @@ class EagleVerifyInput:
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
+>>>>>>> origin/main
 
             return EagleVerifyOutput(
                 draft_input=draft_input,

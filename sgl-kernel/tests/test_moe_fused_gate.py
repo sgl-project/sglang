@@ -10,6 +10,10 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
     list(range(1, 10))
     + [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
 )
+<<<<<<< HEAD
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.bfloat16])
+=======
+>>>>>>> origin/main
 @pytest.mark.parametrize(
     "params",
     [
@@ -19,6 +23,15 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
     ],
 )
 @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
+<<<<<<< HEAD
+def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_experts):
+    num_experts, num_expert_group, topk_group, topk = params
+
+    torch.manual_seed(seq_length)
+    tensor = torch.rand((seq_length, num_experts)).to(dtype).cuda()
+    scores = tensor.clone()
+    bias = torch.rand(num_experts).to(dtype).cuda()
+=======
 @pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
 def test_moe_fused_gate_combined(
     seq_length, params, num_fused_shared_experts, apply_routed_scaling_factor_on_output
@@ -30,6 +43,7 @@ def test_moe_fused_gate_combined(
     tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="cuda")
     scores = tensor.clone()
     bias = torch.rand(num_experts, dtype=dtype, device="cuda")
+>>>>>>> origin/main
     topk = topk + num_fused_shared_experts
 
     output, indices = moe_fused_gate(
@@ -40,7 +54,10 @@ def test_moe_fused_gate_combined(
         topk=topk,
         num_fused_shared_experts=num_fused_shared_experts,
         routed_scaling_factor=2.5,
+<<<<<<< HEAD
+=======
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+>>>>>>> origin/main
     )
     ref_output, ref_indices = biased_grouped_topk(
         scores,
@@ -50,9 +67,15 @@ def test_moe_fused_gate_combined(
         renormalize=True,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
+<<<<<<< HEAD
+        compiled=False,
+        num_fused_shared_experts=num_fused_shared_experts,
+        routed_scaling_factor=2.5,
+=======
         num_fused_shared_experts=num_fused_shared_experts,
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+>>>>>>> origin/main
     )
 
     # When num_fused_shared_experts > 0, ignore the comparison of the last topk dimension

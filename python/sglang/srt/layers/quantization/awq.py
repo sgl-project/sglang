@@ -1,4 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
+<<<<<<< HEAD
+import logging
+from typing import Any, Dict, List, Optional
+
+import torch
+
+from sglang.srt.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
+from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sgl_kernel import awq_dequantize
+=======
 from __future__ import annotations
 
 import logging
@@ -57,13 +76,17 @@ elif _is_hip:
     warnings.warn(f"HIP does not support fused_marlin_moe currently.")
 else:
     warnings.warn(f"Only CUDA and HIP support AWQ currently.")
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
 
+<<<<<<< HEAD
+=======
 ScalarType, scalar_types = get_scalar_types()
 
 
+>>>>>>> origin/main
 def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
 
@@ -125,7 +148,11 @@ class AWQConfig(QuantizationConfig):
         ]
 
     @classmethod
+<<<<<<< HEAD
+    def from_config(cls, config: Dict[str, Any]) -> "AWQConfig":
+=======
     def from_config(cls, config: Dict[str, Any]) -> AWQConfig:
+>>>>>>> origin/main
         weight_bits = cls.get_from_keys(config, ["w_bit", "bits"])
         group_size = cls.get_from_keys(config, ["q_group_size", "group_size"])
         zero_point = cls.get_from_keys(config, ["zero_point"])
@@ -136,8 +163,12 @@ class AWQConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
+<<<<<<< HEAD
+    ) -> Optional["LinearMethodBase"]:
+=======
     ) -> Optional[LinearMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+>>>>>>> origin/main
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
@@ -146,6 +177,8 @@ class AWQConfig(QuantizationConfig):
         return None
 
 
+<<<<<<< HEAD
+=======
 class AWQMarlinConfig(QuantizationConfig):
     """Config class for AWQ Marlin"""
 
@@ -316,6 +349,7 @@ class AWQMarlinConfig(QuantizationConfig):
         )
 
 
+>>>>>>> origin/main
 class AWQLinearMethod(LinearMethodBase):
     """Linear method for AWQ.
 
@@ -410,12 +444,18 @@ class AWQLinearMethod(LinearMethodBase):
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
+<<<<<<< HEAD
+
+=======
+>>>>>>> origin/main
         out = awq_dequantize(qweight, scales, qzeros)
         out = torch.matmul(reshaped_x, out)
 
         if bias is not None:
             out.add_(bias)
         return out.reshape(out_shape)
+<<<<<<< HEAD
+=======
 
 
 class AWQMarlinLinearMethod(LinearMethodBase):
@@ -768,3 +808,4 @@ class AWQMoEMethod(FusedMoEMethodBase):
             w2_zeros=layer.w2_qzeros,
             num_bits=self.quant_config.weight_bits,
         ).to(orig_dtype)
+>>>>>>> origin/main

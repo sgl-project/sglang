@@ -3,7 +3,10 @@ import torch
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
+<<<<<<< HEAD
+=======
     transfer_kv_direct,
+>>>>>>> origin/main
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
@@ -101,6 +104,20 @@ def test_transfer_kv(
                 dst_pool_kernel[layer_idx_to_test],
                 src_indices_device,
                 dst_indices_device,
+<<<<<<< HEAD
+                io_backend="kernel",
+                page_size=page_size,
+                item_size=item_size,
+            )
+            transfer_kv_per_layer_mla(
+                src_pool_host[layer_idx_to_test],
+                dst_pool_direct[layer_idx_to_test],
+                src_indices_host,
+                dst_indices_device,
+                io_backend="direct",
+                page_size=page_size,
+                item_size=item_size,
+=======
                 item_size=item_size * dtype.itemsize,
             )
             transfer_kv_direct(
@@ -109,6 +126,7 @@ def test_transfer_kv(
                 src_indices_host,
                 dst_indices_device,
                 page_size=page_size,
+>>>>>>> origin/main
             )
         else:
             for layer_id in range(num_layers):
@@ -118,6 +136,31 @@ def test_transfer_kv(
                     src_indices_host,
                     dst_indices_device,
                 )
+<<<<<<< HEAD
+            transfer_kv_all_layer_mla(
+                src_pool_host,
+                dst_pool_kernel,
+                src_indices_device,
+                dst_indices_device,
+                io_backend="kernel",
+                page_size=page_size,
+                item_size=item_size,
+                num_layers=num_layers,
+                src_layer_offset=total_items_in_pool * item_size,
+                dst_layer_offset=total_items_in_pool * item_size,
+            )
+            transfer_kv_all_layer_mla(
+                src_pool_host,
+                dst_pool_direct,
+                src_indices_host,
+                dst_indices_device,
+                io_backend="direct",
+                page_size=page_size,
+                item_size=item_size,
+                num_layers=num_layers,
+                src_layer_offset=total_items_in_pool * item_size,
+                dst_layer_offset=total_items_in_pool * item_size,
+=======
             src_layers_device = torch.tensor(
                 [src_pool_host[layer_id].data_ptr() for layer_id in range(num_layers)],
                 dtype=torch.uint64,
@@ -145,6 +188,7 @@ def test_transfer_kv(
                 src_indices_host,
                 dst_indices_device,
                 page_size=page_size,
+>>>>>>> origin/main
             )
         torch.cuda.synchronize()
         torch.testing.assert_close(dst_pool_kernel, dst_pool_ref)
@@ -170,6 +214,22 @@ def test_transfer_kv(
                 dst_v_pool_kernel[layer_idx_to_test],
                 src_indices_device,
                 dst_indices_device,
+<<<<<<< HEAD
+                io_backend="kernel",
+                page_size=page_size,
+                item_size=item_size,
+            )
+            transfer_kv_per_layer(
+                src_k_pool[layer_idx_to_test],
+                dst_k_pool_direct[layer_idx_to_test],
+                src_v_pool[layer_idx_to_test],
+                dst_v_pool_direct[layer_idx_to_test],
+                src_indices_host,
+                dst_indices_device,
+                io_backend="direct",
+                page_size=page_size,
+                item_size=item_size,
+=======
                 item_size=item_size * dtype.itemsize,
             )
             transfer_kv_direct(
@@ -181,6 +241,7 @@ def test_transfer_kv(
                 src_indices_host,
                 dst_indices_device,
                 page_size=page_size,
+>>>>>>> origin/main
             )
         else:
             for layer_id in range(num_layers):
@@ -196,6 +257,35 @@ def test_transfer_kv(
                     src_indices_host,
                     dst_indices_device,
                 )
+<<<<<<< HEAD
+            transfer_kv_all_layer(
+                src_k_pool,
+                dst_k_pool_kernel,
+                src_v_pool,
+                dst_v_pool_kernel,
+                src_indices_device,
+                dst_indices_device,
+                io_backend="kernel",
+                page_size=page_size,
+                item_size=item_size,
+                num_layers=num_layers,
+                src_layer_offset=total_items_in_pool * item_size,
+                dst_layer_offset=total_items_in_pool * item_size,
+            )
+            transfer_kv_all_layer(
+                src_k_pool,
+                dst_k_pool_direct,
+                src_v_pool,
+                dst_v_pool_direct,
+                src_indices_host,
+                dst_indices_device,
+                io_backend="direct",
+                page_size=page_size,
+                item_size=item_size,
+                num_layers=num_layers,
+                src_layer_offset=total_items_in_pool * item_size,
+                dst_layer_offset=total_items_in_pool * item_size,
+=======
 
             src_k_layers_device = torch.tensor(
                 [src_k_pool[layer_id].data_ptr() for layer_id in range(num_layers)],
@@ -241,6 +331,7 @@ def test_transfer_kv(
                 src_indices_host,
                 dst_indices_device,
                 page_size=page_size,
+>>>>>>> origin/main
             )
         torch.cuda.synchronize()
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)

@@ -16,12 +16,18 @@ logger = logging.getLogger(__name__)
 
 class Llama32Detector(BaseFormatDetector):
     """
+<<<<<<< HEAD
+    Detector for Llama 3.2 models.
+    Assumes function call format:
+      <|python_tag|>{"name":"xxx", "arguments":{...}}
+=======
     Detector for Llama 3.2 models with json tool call format.
 
     Format Structure:
     ```
     <python_tag>{"name":"xxx", "arguments":{...}}
     ```
+>>>>>>> origin/main
     """
 
     def __init__(self):

@@ -55,8 +55,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor?  scheduler_metadata,"
       "    int      num_splits,"
       "    bool?    pack_gqa,"
+<<<<<<< HEAD
+      "    int      sm_margin) -> Tensor[]");
+=======
       "    int      sm_margin,"
       "    Tensor?  sinks) -> Tensor[]");
+>>>>>>> origin/main
   m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 }
 

@@ -1,3 +1,9 @@
+<<<<<<< HEAD
+import dataclasses
+import logging
+from dataclasses import replace
+from typing import Dict, List, Optional, Sequence, Union
+=======
 from __future__ import annotations
 
 import copy
@@ -5,6 +11,7 @@ import dataclasses
 import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
+>>>>>>> origin/main
 
 import torch
 
@@ -14,6 +21,16 @@ from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
     ScatterMode,
 )
+<<<<<<< HEAD
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.operations import execute_operations, execute_overlapped_operations
+from sglang.srt.operations_strategy import OperationsStrategy
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
+=======
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -37,6 +54,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _is_hip = is_hip()
+>>>>>>> origin/main
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
@@ -70,7 +88,11 @@ def compute_split_seq_index(
 ) -> Optional[int]:
     if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
+<<<<<<< HEAD
+        return _split_array_by_half_sum(extend_lens)
+=======
         return _split_extend_seqs(extend_lens)
+>>>>>>> origin/main
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
         return (num_tokens // token_num_per_seq) // 2
@@ -81,6 +103,9 @@ def compute_split_seq_index(
         raise NotImplementedError()
 
 
+<<<<<<< HEAD
+def _split_array_by_half_sum(arr: Sequence[int]) -> int:
+=======
 def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
     if extend_lens is None:
         return False
@@ -118,6 +143,7 @@ def _split_array_by_cum_less_than_half(arr: Sequence[int]) -> int:
 
 
 def _split_array_by_balanced_sum(arr: Sequence[int]) -> int:
+>>>>>>> origin/main
     overall_sum = sum(arr)
     left_sum = 0
     min_diff = float("inf")
@@ -136,6 +162,8 @@ def _split_array_by_balanced_sum(arr: Sequence[int]) -> int:
     return best_index
 
 
+<<<<<<< HEAD
+=======
 def _update_device_and_sum_field_from_cpu_field(
     batch: ForwardBatch, cpu_field: str, device_field: str, sum_field: str = None
 ):
@@ -164,6 +192,7 @@ def _update_device_and_sum_field_from_cpu_field(
         setattr(batch, sum_field, sum_value)
 
 
+>>>>>>> origin/main
 def _compute_mask_offset(seq_index: int, spec_info: Optional[EagleVerifyInput]) -> int:
     if seq_index == 0:
         return 0
@@ -257,8 +286,11 @@ def compute_split_token_index(
 ) -> int:
     if forward_mode == ForwardMode.EXTEND:
         assert extend_seq_lens is not None
+<<<<<<< HEAD
+=======
         if _is_two_chunk_split_enabled(extend_seq_lens):
             return sum(extend_seq_lens) // 2
+>>>>>>> origin/main
         return sum(extend_seq_lens[:split_seq_index])
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
@@ -304,7 +336,11 @@ class TboCudaGraphRunnerPlugin:
         self._tbo_children_num_token_non_padded = torch.zeros((2,), dtype=torch.int32)
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
+<<<<<<< HEAD
+        if not global_server_args_dict["enable_two_batch_overlap"]:
+=======
         if not is_tbo_enabled():
+>>>>>>> origin/main
             return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
@@ -358,12 +394,19 @@ class TboDPAttentionPreparer:
     def prepare_all_gather(
         self,
         local_batch: ScheduleBatch,
+<<<<<<< HEAD
+        deepep_mode: DeepEPMode,
+        enable_deepep_moe: bool,
+        enable_two_batch_overlap: bool,
+    ):
+=======
     ):
 
         deepep_mode = get_deepep_mode()
         enable_deepep_moe = get_moe_a2a_backend().is_deepep()
         enable_two_batch_overlap = is_tbo_enabled()
 
+>>>>>>> origin/main
         self.enable_two_batch_overlap = enable_two_batch_overlap
 
         if local_batch is not None:
@@ -391,7 +434,11 @@ class TboDPAttentionPreparer:
                     and not local_batch.forward_mode.is_target_verify()
                 )
                 and enable_deepep_moe
+<<<<<<< HEAD
+                and (resolved_deepep_mode == DeepEPMode.low_latency)
+=======
                 and (resolved_deepep_mode.is_low_latency())
+>>>>>>> origin/main
             )
         else:
             self.local_tbo_split_seq_index = 0
@@ -427,6 +474,17 @@ class TboDPAttentionPreparer:
 
     @staticmethod
     def _compute_global_forward_mode(forward_modes):
+<<<<<<< HEAD
+        converted_forward_modes = [
+            ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
+            for x in forward_modes
+        ]
+        forward_mode_agree = TboDPAttentionPreparer._is_all_same(
+            converted_forward_modes
+        )
+        global_forward_mode = (
+            ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
+=======
         forward_modes_excluding_idle = [
             x for x in forward_modes if x != ForwardMode.IDLE.value
         ]
@@ -439,6 +497,7 @@ class TboDPAttentionPreparer:
         )
         global_forward_mode = (
             ForwardMode(forward_modes_excluding_idle[0]) if forward_mode_agree else None
+>>>>>>> origin/main
         )
         return global_forward_mode, forward_mode_agree
 
@@ -468,6 +527,11 @@ class TboForwardBatchPreparer:
 
         tbo_split_token_index = cls._compute_split_token_index(batch)
 
+<<<<<<< HEAD
+        if _tbo_debug:
+            logger.info(
+                f"TboForwardBatchPreparer.prepare "
+=======
         is_enable_two_chunk = (
             batch.forward_mode == ForwardMode.EXTEND
             and _is_two_chunk_split_enabled(batch.extend_seq_lens_cpu)
@@ -477,6 +541,7 @@ class TboForwardBatchPreparer:
             logger.info(
                 f"TboForwardBatchPreparer.prepare "
                 f"is_enable_two_chunk={is_enable_two_chunk} "
+>>>>>>> origin/main
                 f"tbo_split_seq_index={batch.tbo_split_seq_index} "
                 f"tbo_split_token_index={tbo_split_token_index} "
                 f"extend_seq_lens={batch.extend_seq_lens_cpu} "
@@ -496,11 +561,15 @@ class TboForwardBatchPreparer:
             start_token_index=0,
             end_token_index=tbo_split_token_index,
             start_seq_index=0,
+<<<<<<< HEAD
+            end_seq_index=batch.tbo_split_seq_index,
+=======
             end_seq_index=(
                 batch.tbo_split_seq_index + 1
                 if is_enable_two_chunk
                 else batch.tbo_split_seq_index
             ),
+>>>>>>> origin/main
             output_attn_backend=attn_backend_child_a,
             out_num_token_non_padded=out_num_token_non_padded_a,
         )
@@ -514,6 +583,8 @@ class TboForwardBatchPreparer:
             out_num_token_non_padded=out_num_token_non_padded_b,
         )
 
+<<<<<<< HEAD
+=======
         if is_enable_two_chunk:
             cls.derive_fields_related_to_seq_len_for_two_chunk(
                 batch,
@@ -522,10 +593,13 @@ class TboForwardBatchPreparer:
                 tbo_split_seq_index=batch.tbo_split_seq_index,
             )
 
+>>>>>>> origin/main
         assert batch.tbo_children is None
         batch.tbo_children = [child_a, child_b]
 
     @classmethod
+<<<<<<< HEAD
+=======
     def derive_fields_related_to_seq_len_for_two_chunk(
         cls,
         batch: ForwardBatch,
@@ -588,6 +662,7 @@ class TboForwardBatchPreparer:
         )
 
     @classmethod
+>>>>>>> origin/main
     def filter_batch(
         cls,
         batch: ForwardBatch,
@@ -628,7 +703,11 @@ class TboForwardBatchPreparer:
             "extend_prefix_lens_cpu",
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
+<<<<<<< HEAD
+            "lora_paths",
+=======
             "lora_ids",
+>>>>>>> origin/main
         ]:
             old_value = getattr(batch, key)
             if old_value is None:
@@ -659,19 +738,28 @@ class TboForwardBatchPreparer:
         output_dict["spec_info"] = output_spec_info
         for key in [
             "forward_mode",
+<<<<<<< HEAD
+=======
             "is_extend_in_batch",
+>>>>>>> origin/main
             "return_logprob",
             "req_to_token_pool",
             "token_to_kv_pool",
             "can_run_dp_cuda_graph",
+<<<<<<< HEAD
+=======
             "dp_padding_mode",
+>>>>>>> origin/main
             "global_forward_mode",
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
             "mrope_positions",  # only used by qwen2-vl, thus not care
+<<<<<<< HEAD
+=======
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
+>>>>>>> origin/main
         ]:
             output_dict[key] = getattr(batch, key)
         if not batch.forward_mode.is_target_verify():
@@ -686,12 +774,25 @@ class TboForwardBatchPreparer:
         # TODO improve, e.g. unify w/ `init_raw`
         if (
             global_server_args_dict["moe_dense_tp_size"] == 1
+<<<<<<< HEAD
+            and batch.gathered_buffer is not None
+        ):
+            sum_len = end_token_index - start_token_index
+            gathered_buffer = torch.zeros(
+                (sum_len, batch.gathered_buffer.shape[1]),
+                dtype=batch.gathered_buffer.dtype,
+                device=batch.gathered_buffer.device,
+            )
+        else:
+            gathered_buffer = None
+=======
             and batch.global_dp_buffer_len is not None
         ):
             sum_len = end_token_index - start_token_index
             global_dp_buffer_len = sum_len
         else:
             global_dp_buffer_len = None
+>>>>>>> origin/main
 
         output_dict.update(
             dict(
@@ -709,7 +810,11 @@ class TboForwardBatchPreparer:
                 tbo_children=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
+<<<<<<< HEAD
+                gathered_buffer=gathered_buffer,
+=======
                 global_dp_buffer_len=global_dp_buffer_len,
+>>>>>>> origin/main
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
@@ -721,7 +826,10 @@ class TboForwardBatchPreparer:
                 mm_inputs=None,
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
+<<<<<<< HEAD
+=======
                 next_token_logits_buffer=None,
+>>>>>>> origin/main
             )
         )
 
@@ -827,6 +935,11 @@ def _model_forward_tbo(
     )
     del inputs
 
+<<<<<<< HEAD
+    with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+        operations_strategy.deep_gemm_num_sms
+    ):
+=======
     context = (
         empty_context()
         if _is_hip
@@ -836,6 +949,7 @@ def _model_forward_tbo(
     )
 
     with context:
+>>>>>>> origin/main
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,
             operations_arr=[operations_strategy.operations] * 2,
@@ -962,7 +1076,13 @@ def _model_forward_tbo_merge_outputs(output_a, output_b):
 
 class MaybeTboDeepEPDispatcher:
     def __init__(self, **kwargs):
+<<<<<<< HEAD
+        num_inner_dispatchers = (
+            2 if global_server_args_dict["enable_two_batch_overlap"] else 1
+        )
+=======
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
+>>>>>>> origin/main
         self._inners = [
             DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
         ]
@@ -970,7 +1090,11 @@ class MaybeTboDeepEPDispatcher:
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
 
+<<<<<<< HEAD
+    def dispatch(self, **kwargs):
+=======
     def dispatch(self, **kwargs) -> DispatchOutput:
+>>>>>>> origin/main
         return self._execute("dispatch", **kwargs)
 
     def dispatch_a(self, **kwargs):
@@ -979,7 +1103,11 @@ class MaybeTboDeepEPDispatcher:
     def dispatch_b(self, **kwargs):
         return self._execute("dispatch_b", **kwargs)
 
+<<<<<<< HEAD
+    def combine(self, **kwargs):
+=======
     def combine(self, **kwargs) -> torch.Tensor:
+>>>>>>> origin/main
         return self._execute("combine", **kwargs)
 
     def combine_a(self, **kwargs):

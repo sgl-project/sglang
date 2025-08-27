@@ -1,17 +1,29 @@
+<<<<<<< HEAD
+name: Test Disaggregation Mode
+=======
 name: PR Test (PD Router)
+>>>>>>> origin/main
 
 on:
   push:
     branches: [ main ]
     paths:
       - 'python/sglang/srt/disaggregation/**'
+<<<<<<< HEAD
+      - 'scripts/ci_start_disaggregation_servers.sh'
+=======
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
+>>>>>>> origin/main
       - 'sgl-router/**'
   pull_request:
     branches: [ main ]
     paths:
       - 'python/sglang/srt/disaggregation/**'
+<<<<<<< HEAD
+      - 'scripts/ci_start_disaggregation_servers.sh'
+=======
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
+>>>>>>> origin/main
       - 'sgl-router/**'
   workflow_dispatch:
 
@@ -26,8 +38,12 @@ permissions:
 
 jobs:
   test-disaggregation:
+<<<<<<< HEAD
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+=======
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
+>>>>>>> origin/main
     runs-on: [h200]
     timeout-minutes: 45
 
@@ -40,11 +56,19 @@ jobs:
     - name: Setup Python
       uses: actions/setup-python@v4
       with:
+<<<<<<< HEAD
+        python-version: '3.11'
+
+    - name: Setup Rust
+      run: |
+        bash scripts/ci_install_rust.sh
+=======
         python-version: '3.12'
 
     - name: Setup Rust
       run: |
         bash scripts/ci/ci_install_rust.sh
+>>>>>>> origin/main
 
     - name: Cache Rust dependencies
       uses: actions/cache@v4
@@ -114,12 +138,17 @@ jobs:
     - name: Install SGLang dependencies
       run: |
         echo "Installing SGLang with all extras..."
+<<<<<<< HEAD
+        python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
+        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.4.post2
+=======
         python3 -m pip --no-cache-dir install --upgrade pip
         python3 -m pip --no-cache-dir install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
         python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.5
         python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.1
         python3 -m pip --no-cache-dir install sgl-kernel==0.3.5
+>>>>>>> origin/main
 
     - name: Build and install sgl-router
       run: |
@@ -132,6 +161,116 @@ jobs:
       id: start_servers
       run: |
         echo "Starting disaggregation servers..."
+<<<<<<< HEAD
+        bash scripts/ci_start_disaggregation_servers.sh &
+        SERVER_PID=$!
+        echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
+
+        echo "Waiting for router to become healthy..."
+        TIMEOUT=300
+        ELAPSED=0
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          if curl --connect-timeout 5 --silent http://127.0.0.9:8000 > /dev/null 2>&1; then
+            echo "✓ Router is reachable"
+            break
+          fi
+          if ! ps -p $SERVER_PID > /dev/null; then
+            echo "Error: Server processes failed to start"
+            exit 1
+          fi
+          echo "Waiting for router... (${ELAPSED}s/${TIMEOUT}s)"
+          sleep 10
+          ELAPSED=$((ELAPSED + 10))
+        done
+
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "Error: Router health check timeout after ${TIMEOUT}s"
+          exit 1
+        fi
+
+        echo "✓ Servers started and healthy (PID: $SERVER_PID)"
+
+    - name: Test API functionality
+      timeout-minutes: 5
+      run: |
+        BASE_URL="http://127.0.0.9:8000"
+
+        echo "Testing API completions..."
+        response=$(curl -s -X POST "$BASE_URL/v1/chat/completions" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer test-token" \
+          -d '{
+            "model": "/raid/models/meta-llama/Llama-3.1-8B-Instruct",
+            "messages": [
+              {"role": "user", "content": "Write a Python function to calculate fibonacci numbers recursively"}
+            ],
+            "stream": false,
+            "max_tokens": 100
+          }')
+
+        if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
+          echo "✓ API test passed"
+        else
+          echo "✗ API test failed: $response"
+          exit 1
+        fi
+
+        echo "Testing streaming API..."
+        stream_response=$(timeout 30 curl -s -X POST "$BASE_URL/v1/chat/completions" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer test-token" \
+          -d '{
+            "model": "/raid/models/meta-llama/Llama-3.1-8B-Instruct",
+            "messages": [
+              {"role": "user", "content": "Count from 1 to 5"}
+            ],
+            "stream": true,
+            "max_tokens": 50
+          }')
+
+        if echo "$stream_response" | grep -q "data:"; then
+          echo "✓ Streaming API test passed"
+        else
+          echo "✗ Streaming API test failed"
+          exit 1
+        fi
+
+    - name: Run benchmark test
+      timeout-minutes: 5
+      run: |
+        echo "Running benchmark test..."
+        benchmark_output=$(python3 -m sglang.bench_one_batch_server \
+          --model-path "/raid/models/meta-llama/Llama-3.1-8B-Instruct" \
+          --base-url "http://127.0.0.9:8000" \
+          --batch-size 8 \
+          --input-len 4096 \
+          --output-len 5 \
+          --skip-warmup)
+
+        echo "$benchmark_output"
+
+        # Extract metrics from output
+        latency=$(echo "$benchmark_output" | grep "latency:" | awk '{print $2}' | sed 's/s//')
+        input_throughput=$(echo "$benchmark_output" | grep "input throughput:" | awk '{print $3}')
+        output_throughput=$(echo "$benchmark_output" | grep "output throughput:" | awk '{print $3}')
+
+        # Validate performance (latency<1.5s, input>20k, output>1k)
+        command -v bc >/dev/null || (apt-get update && apt-get install -y bc)
+
+        echo "Performance: ${latency}s | ${input_throughput} | ${output_throughput} tok/s"
+
+        fail=""
+        (( $(echo "$latency > 1.5" | bc -l) )) && fail="Latency too high (${latency}s>1.5s) "
+        (( $(echo "$input_throughput < 20000" | bc -l) )) && fail="${fail}Input too low (${input_throughput}<20k) "
+        (( $(echo "$output_throughput < 1000" | bc -l) )) && fail="${fail}Output too low (${output_throughput}<1k) "
+
+        if [ -n "$fail" ]; then
+          echo "✗ Benchmark failed: $fail"
+          exit 1
+        else
+          echo "✓ Performance validation passed"
+        fi
+=======
         bash scripts/ci/ci_start_disaggregation_servers.sh &
         SERVER_PID=$!
         echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
@@ -392,6 +531,7 @@ jobs:
       with:
         name: genai-bench-results-all-policies
         path: benchmark_**/
+>>>>>>> origin/main
 
     - name: Cleanup servers
       if: always()
@@ -404,6 +544,8 @@ jobs:
         sleep 5
         remaining=$(ps aux | grep -c "sglang.launch_server" || echo "0")
         echo "Cleanup completed. Remaining processes: $remaining"
+<<<<<<< HEAD
+=======
 
   summarize-benchmarks:
     needs: test-disaggregation
@@ -564,3 +706,4 @@ jobs:
         echo "- **SGLang Backend**: Native integration with SGLang serving" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "✅ All policies tested successfully with genai-bench!" >> $GITHUB_STEP_SUMMARY
+>>>>>>> origin/main

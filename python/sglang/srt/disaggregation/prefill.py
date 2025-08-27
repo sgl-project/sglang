@@ -43,6 +43,10 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+<<<<<<< HEAD
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import require_mlp_sync
+=======
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -50,6 +54,7 @@ from sglang.srt.utils import (
     point_to_point_pyobj,
     require_mlp_sync,
 )
+>>>>>>> origin/main
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -108,11 +113,16 @@ class PrefillBootstrapQueue:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
+<<<<<<< HEAD
+        kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
+        kv_args.prefill_pp_size = self.pp_size
+=======
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
         kv_args.prefill_pp_size = self.pp_size
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+>>>>>>> origin/main
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -178,7 +188,11 @@ class PrefillBootstrapQueue:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
+<<<<<<< HEAD
+            prepare_abort(req, message)
+=======
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+>>>>>>> origin/main
             self.scheduler.stream_output([req], req.return_logprob)
             return True
         return False
@@ -214,8 +228,13 @@ class PrefillBootstrapQueue:
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.queue], self.gloo_group
         )
+<<<<<<< HEAD
+        for i, (req, poll) in enumerate(zip(self.queue, polls)):
+
+=======
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
+>>>>>>> origin/main
             if rids_to_check is not None:
                 # if req not in reqs_info_to_check, skip
                 if req.rid not in rids_to_check:
@@ -238,8 +257,11 @@ class PrefillBootstrapQueue:
                 self.scheduler.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
+<<<<<<< HEAD
+=======
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+>>>>>>> origin/main
                 continue
 
             # KV.WaitingForInput - init here
@@ -297,7 +319,13 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_disagg_prefill_inflight_queue()
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+<<<<<<< HEAD
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
+=======
                 self.self_check_during_idle()
+>>>>>>> origin/main
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -345,7 +373,13 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_disagg_prefill_inflight_queue()
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+<<<<<<< HEAD
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
+=======
                 self.self_check_during_idle()
+>>>>>>> origin/main
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -403,10 +437,14 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
+<<<<<<< HEAD
+                if logits_output.hidden_states is not None:
+=======
                 if (
                     logits_output is not None
                     and logits_output.hidden_states is not None
                 ):
+>>>>>>> origin/main
                     last_hidden_index = (
                         hidden_state_offset + extend_input_len_per_req[i] - 1
                     )
@@ -434,6 +472,9 @@ class SchedulerDisaggregationPrefillMixin:
                 self.send_kv_chunk(req, last_chunk=True)
 
                 if req.grammar is not None:
+<<<<<<< HEAD
+                    req.grammar.accept_token(next_token_id)
+=======
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
                     try:
                         req.grammar.accept_token(next_token_id)
@@ -447,6 +488,7 @@ class SchedulerDisaggregationPrefillMixin:
                             error_message,
                             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                         )
+>>>>>>> origin/main
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
@@ -473,7 +515,10 @@ class SchedulerDisaggregationPrefillMixin:
 
         # We need to remove the sync in the following function for overlap schedule.
         self.set_next_batch_sampling_info_done(batch)
+<<<<<<< HEAD
+=======
         self.maybe_send_health_check_signal()
+>>>>>>> origin/main
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -524,8 +569,11 @@ class SchedulerDisaggregationPrefillMixin:
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 done_reqs.append(req)
+<<<<<<< HEAD
+=======
                 if self.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
+>>>>>>> origin/main
             else:
                 assert False, f"Unexpected polling state {poll=}"
 
@@ -616,6 +664,8 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         req.disagg_kv_sender.send(page_indices)
+<<<<<<< HEAD
+=======
 
     # PP
     @DynamicGradMode()
@@ -863,3 +913,4 @@ class SchedulerDisaggregationPrefillMixin:
                 data, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0]
             )
         return data
+>>>>>>> origin/main

@@ -8,13 +8,25 @@ import pickle
 import subprocess
 import sys
 import tempfile
+<<<<<<< HEAD
+from itertools import product
+from typing import Dict, List, Optional, Sequence
+=======
 from functools import wraps
 from itertools import product
 from typing import Callable, Dict, List, Optional, Sequence, TypeVar
+>>>>>>> origin/main
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+<<<<<<< HEAD
+
+from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+
+logger = logging.getLogger(__name__)
+
+=======
 from typing_extensions import ParamSpec
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
@@ -46,6 +58,7 @@ if _is_hip:
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
+>>>>>>> origin/main
 
 def update_environment_variables(envs: Dict[str, str]):
     for k, v in envs.items():
@@ -309,6 +322,8 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
     return _gpu_p2p_access_cache[f"{src}->{tgt}"]
 
 
+<<<<<<< HEAD
+=======
 def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     @wraps(fn)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -377,6 +392,7 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
+>>>>>>> origin/main
 __all__ = ["gpu_p2p_access_check"]
 
 if __name__ == "__main__":

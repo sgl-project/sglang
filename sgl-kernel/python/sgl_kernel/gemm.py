@@ -1,7 +1,13 @@
+<<<<<<< HEAD
+from typing import List, Optional, Tuple
+
+import torch
+=======
 from typing import Optional, Tuple
 
 import torch
 from sgl_kernel.scalar_type import ScalarType
+>>>>>>> origin/main
 from sgl_kernel.utils import _get_cache_buf, get_cuda_stream
 
 
@@ -205,6 +211,11 @@ def scaled_fp4_quant(
     rounded_m = ((m + 128 - 1) // 128) * 128
     scale_n = n // block_size
     rounded_n = ((scale_n + 4 - 1) // 4) * 4
+<<<<<<< HEAD
+    output_scale = torch.empty(
+        (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
+    )
+=======
     # padded part should be zeroed out
     if rounded_n > scale_n:
         output_scale = torch.zeros(
@@ -214,6 +225,7 @@ def scaled_fp4_quant(
         output_scale = torch.empty(
             (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
         )
+>>>>>>> origin/main
 
     torch.ops.sgl_kernel.scaled_fp4_quant.default(
         output, input, output_scale, input_global_scale
@@ -269,13 +281,20 @@ def qserve_w4a8_per_group_gemm(
 def dsv3_router_gemm(
     hidden_states: torch.Tensor,
     router_weights: torch.Tensor,
+<<<<<<< HEAD
+=======
     out_dtype: torch.dtype = torch.bfloat16,
+>>>>>>> origin/main
 ) -> torch.Tensor:
     output = torch.empty(
         hidden_states.shape[0],
         router_weights.shape[0],
         device=hidden_states.device,
+<<<<<<< HEAD
+        dtype=torch.float32,
+=======
         dtype=out_dtype,
+>>>>>>> origin/main
     )
     torch.ops.sgl_kernel.dsv3_router_gemm(
         output,
@@ -295,6 +314,8 @@ def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
     return output_tensor
 
 
+<<<<<<< HEAD
+=======
 def scaled_fp4_grouped_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -431,6 +452,7 @@ def silu_and_mul_scaled_fp4_grouped_quant(
     return output, output_scales
 
 
+>>>>>>> origin/main
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -480,6 +502,14 @@ def scaled_fp4_experts_quant(
     output = torch.empty(
         m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
     )
+<<<<<<< HEAD
+    output_scales = torch.empty(
+        MAX_TOKENS_PER_EXPERT * topk,
+        padded_k,
+        dtype=torch.int32,
+        device=input_tensor.device,
+    )
+=======
     # padded part should be zeroed out
     if padded_k > scales_k:
         output_scales = torch.zeros(
@@ -495,6 +525,7 @@ def scaled_fp4_experts_quant(
             dtype=torch.int32,
             device=input_tensor.device,
         )
+>>>>>>> origin/main
     torch.ops.sgl_kernel.scaled_fp4_experts_quant.default(
         output,
         output_scales,
@@ -505,6 +536,8 @@ def scaled_fp4_experts_quant(
     )
     output_scales = output_scales.view(torch.float8_e4m3fn)
     return output, output_scales
+<<<<<<< HEAD
+=======
 
 
 # GPTQ kernels
@@ -564,3 +597,4 @@ def gptq_gemm(
 
 def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
     torch.torch.ops.sgl_kernel.gptq_shuffle(q_weight, q_perm, bit)
+>>>>>>> origin/main

@@ -4,7 +4,11 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Union
 
+<<<<<<< HEAD
+from fastapi import Request
+=======
 from fastapi import HTTPException, Request
+>>>>>>> origin/main
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
@@ -45,10 +49,14 @@ class OpenAIServingBase(ABC):
                 return await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+<<<<<<< HEAD
+
+=======
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
+>>>>>>> origin/main
         except Exception as e:
             logger.exception(f"Error in request: {e}")
             return self.create_error_response(

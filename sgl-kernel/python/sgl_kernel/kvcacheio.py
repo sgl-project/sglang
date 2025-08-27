@@ -1,5 +1,8 @@
+<<<<<<< HEAD
+=======
 from typing import List
 
+>>>>>>> origin/main
 import torch
 
 
@@ -10,10 +13,38 @@ def transfer_kv_per_layer(
     dst_v: torch.Tensor,
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
+<<<<<<< HEAD
+    io_backend: str,
+    page_size: int,
+=======
+>>>>>>> origin/main
     item_size: int,
     block_quota: int = 2,
     num_warps_per_block: int = 32,
 ):
+<<<<<<< HEAD
+    if io_backend == "kernel":
+        torch.ops.sgl_kernel.transfer_kv_per_layer(
+            src_k,
+            dst_k,
+            src_v,
+            dst_v,
+            src_indices,
+            dst_indices,
+            item_size,
+            block_quota,
+            num_warps_per_block,
+        )
+    elif io_backend == "direct":
+        torch.ops.sgl_kernel.transfer_kv_per_layer_direct(
+            src_k, dst_k, src_v, dst_v, src_indices, dst_indices, page_size
+        )
+    else:
+        raise ValueError(f"Unsupported io backend")
+
+
+def transfer_kv_all_layer(
+=======
     torch.ops.sgl_kernel.transfer_kv_per_layer(
         src_k,
         dst_k,
@@ -28,12 +59,45 @@ def transfer_kv_per_layer(
 
 
 def transfer_kv_per_layer_pf_lf(
+>>>>>>> origin/main
     src_k: torch.Tensor,
     dst_k: torch.Tensor,
     src_v: torch.Tensor,
     dst_v: torch.Tensor,
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
+<<<<<<< HEAD
+    io_backend: str,
+    page_size: int,
+    item_size: int,
+    num_layers: int,
+    src_layer_offset: int,
+    dst_layer_offset: int,
+    block_quota: int = 2,
+    num_warps_per_block: int = 32,
+):
+    if io_backend == "kernel":
+        torch.ops.sgl_kernel.transfer_kv_all_layer(
+            src_k,
+            dst_k,
+            src_v,
+            dst_v,
+            src_indices,
+            dst_indices,
+            item_size,
+            num_layers,
+            src_layer_offset,
+            dst_layer_offset,
+            block_quota,
+            num_warps_per_block,
+        )
+    elif io_backend == "direct":
+        torch.ops.sgl_kernel.transfer_kv_all_layer_direct(
+            src_k, dst_k, src_v, dst_v, src_indices, dst_indices, page_size, num_layers
+        )
+    else:
+        raise ValueError(f"Unsupported io backend")
+=======
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
@@ -119,6 +183,7 @@ def transfer_kv_direct(
     torch.ops.sgl_kernel.transfer_kv_direct(
         src_layers, dst_layers, src_indices, dst_indices, page_size
     )
+>>>>>>> origin/main
 
 
 def transfer_kv_per_layer_mla(
@@ -126,10 +191,36 @@ def transfer_kv_per_layer_mla(
     dst: torch.Tensor,
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
+<<<<<<< HEAD
+    io_backend: str,
+    page_size: int,
+=======
+>>>>>>> origin/main
     item_size: int,
     block_quota: int = 2,
     num_warps_per_block: int = 32,
 ):
+<<<<<<< HEAD
+    if io_backend == "kernel":
+        torch.ops.sgl_kernel.transfer_kv_per_layer_mla(
+            src,
+            dst,
+            src_indices,
+            dst_indices,
+            item_size,
+            block_quota,
+            num_warps_per_block,
+        )
+    elif io_backend == "direct":
+        torch.ops.sgl_kernel.transfer_kv_per_layer_mla_direct(
+            src, dst, src_indices, dst_indices, page_size
+        )
+    else:
+        raise ValueError(f"Unsupported io backend")
+
+
+def transfer_kv_all_layer_mla(
+=======
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla(
         src,
         dst,
@@ -142,10 +233,41 @@ def transfer_kv_per_layer_mla(
 
 
 def transfer_kv_per_layer_mla_pf_lf(
+>>>>>>> origin/main
     src: torch.Tensor,
     dst: torch.Tensor,
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
+<<<<<<< HEAD
+    io_backend: str,
+    page_size: int,
+    item_size: int,
+    num_layers: int,
+    src_layer_offset: int,
+    dst_layer_offset: int,
+    block_quota: int = 2,
+    num_warps_per_block: int = 32,
+):
+    if io_backend == "kernel":
+        torch.ops.sgl_kernel.transfer_kv_all_layer_mla(
+            src,
+            dst,
+            src_indices,
+            dst_indices,
+            item_size,
+            num_layers,
+            src_layer_offset,
+            dst_layer_offset,
+            block_quota,
+            num_warps_per_block,
+        )
+    elif io_backend == "direct":
+        torch.ops.sgl_kernel.transfer_kv_all_layer_mla_direct(
+            src, dst, src_indices, dst_indices, page_size, num_layers
+        )
+    else:
+        raise ValueError(f"Unsupported io backend")
+=======
     layer_id: int,
     item_size: int,
     src_layout_dim: int,
@@ -209,3 +331,4 @@ def transfer_kv_all_layer_mla_lf_pf(
         block_quota,
         num_warps_per_block,
     )
+>>>>>>> origin/main

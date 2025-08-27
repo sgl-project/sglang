@@ -40,6 +40,16 @@ class RouterArgs:
 
     # Routing policy
     policy: str = "cache_aware"
+<<<<<<< HEAD
+    worker_startup_timeout_secs: int = 300
+    worker_startup_check_interval: int = 10
+    cache_threshold: float = 0.5
+    balance_abs_threshold: int = 32
+    balance_rel_threshold: float = 1.0001
+    eviction_interval: int = 60
+    max_tree_size: int = 2**24
+    max_payload_size: int = 256 * 1024 * 1024  # 256MB default for large batches
+=======
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
     worker_startup_timeout_secs: int = 600
@@ -52,6 +62,7 @@ class RouterArgs:
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     dp_aware: bool = False
     api_key: Optional[str] = None
+>>>>>>> origin/main
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
     # Service discovery configuration
@@ -66,6 +77,8 @@ class RouterArgs:
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
+<<<<<<< HEAD
+=======
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
@@ -99,6 +112,7 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+>>>>>>> origin/main
 
     @staticmethod
     def add_cli_args(
@@ -134,8 +148,12 @@ class RouterArgs:
         parser.add_argument(
             "--worker-urls",
             type=str,
+<<<<<<< HEAD
+            nargs="+",
+=======
             nargs="*",
             default=[],
+>>>>>>> origin/main
             help="List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)",
         )
 
@@ -145,6 +163,9 @@ class RouterArgs:
             type=str,
             default=RouterArgs.policy,
             choices=["random", "round_robin", "cache_aware", "power_of_two"],
+<<<<<<< HEAD
+            help="Load balancing policy to use. Note: power_of_two is only available in PD disaggregated mode",
+=======
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         parser.add_argument(
@@ -160,6 +181,7 @@ class RouterArgs:
             default=None,
             choices=["random", "round_robin", "cache_aware", "power_of_two"],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
+>>>>>>> origin/main
         )
 
         # PD-specific arguments
@@ -170,11 +192,18 @@ class RouterArgs:
         )
         parser.add_argument(
             f"--{prefix}prefill",
+<<<<<<< HEAD
+            nargs=2,
+            action="append",
+            metavar=("URL", "BOOTSTRAP_PORT"),
+            help="Prefill server URL and bootstrap port. Can be specified multiple times. BOOTSTRAP_PORT can be 'none' for no bootstrap port.",
+=======
             nargs="+",
             action="append",
             help="Prefill server URL and optional bootstrap port. Can be specified multiple times. "
             "Format: --prefill URL [BOOTSTRAP_PORT]. "
             "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
+>>>>>>> origin/main
         )
         parser.add_argument(
             f"--{prefix}decode",
@@ -232,6 +261,8 @@ class RouterArgs:
             help="Maximum payload size in bytes",
         )
         parser.add_argument(
+<<<<<<< HEAD
+=======
             f"--{prefix}dp-aware",
             action="store_true",
             help="Enable data parallelism aware schedule",
@@ -243,6 +274,7 @@ class RouterArgs:
             help="The api key used for the authorization with the worker.  Useful when the dp aware scheduling strategy is enaled.",
         )
         parser.add_argument(
+>>>>>>> origin/main
             f"--{prefix}log-dir",
             type=str,
             default=None,
@@ -302,6 +334,8 @@ class RouterArgs:
             default="127.0.0.1",
             help="Host address to bind the Prometheus metrics server",
         )
+<<<<<<< HEAD
+=======
         parser.add_argument(
             f"--{prefix}request-id-headers",
             type=str,
@@ -433,6 +467,7 @@ class RouterArgs:
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
         )
+>>>>>>> origin/main
 
     @classmethod
     def from_cli_args(
@@ -460,8 +495,11 @@ class RouterArgs:
             prefill_urls=prefill_urls,
             decode_urls=decode_urls,
             policy=getattr(args, f"{prefix}policy"),
+<<<<<<< HEAD
+=======
             prefill_policy=getattr(args, f"{prefix}prefill_policy", None),
             decode_policy=getattr(args, f"{prefix}decode_policy", None),
+>>>>>>> origin/main
             worker_startup_timeout_secs=getattr(
                 args, f"{prefix}worker_startup_timeout_secs"
             ),
@@ -474,8 +512,11 @@ class RouterArgs:
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
+<<<<<<< HEAD
+=======
             dp_aware=getattr(args, f"{prefix}dp_aware", False),
             api_key=getattr(args, f"{prefix}api_key", None),
+>>>>>>> origin/main
             log_dir=getattr(args, f"{prefix}log_dir", None),
             log_level=getattr(args, f"{prefix}log_level", None),
             service_discovery=getattr(args, f"{prefix}service_discovery", False),
@@ -493,6 +534,8 @@ class RouterArgs:
             bootstrap_port_annotation="sglang.ai/bootstrap-port",  # Mooncake-specific annotation
             prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
             prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
+<<<<<<< HEAD
+=======
             request_id_headers=getattr(args, f"{prefix}request_id_headers", None),
             request_timeout_secs=getattr(
                 args, f"{prefix}request_timeout_secs", RouterArgs.request_timeout_secs
@@ -554,6 +597,7 @@ class RouterArgs:
             health_check_endpoint=getattr(
                 args, f"{prefix}health_check_endpoint", RouterArgs.health_check_endpoint
             ),
+>>>>>>> origin/main
         )
 
     @staticmethod
@@ -572,16 +616,34 @@ class RouterArgs:
     def _parse_prefill_urls(prefill_list):
         """Parse prefill URLs from --prefill arguments.
 
+<<<<<<< HEAD
+        Format: --prefill URL BOOTSTRAP_PORT
+        Example: --prefill http://prefill1:8080 9000 --prefill http://prefill2:8080 none
+=======
         Format: --prefill URL [BOOTSTRAP_PORT]
         Example:
             --prefill http://prefill1:8080 9000  # With bootstrap port
             --prefill http://prefill2:8080 none  # Explicitly no bootstrap port
             --prefill http://prefill3:8080       # Defaults to no bootstrap port
+>>>>>>> origin/main
         """
         if not prefill_list:
             return []
 
         prefill_urls = []
+<<<<<<< HEAD
+        for url, bootstrap_port_str in prefill_list:
+            # Handle 'none' as None
+            if bootstrap_port_str.lower() == "none":
+                bootstrap_port = None
+            else:
+                try:
+                    bootstrap_port = int(bootstrap_port_str)
+                except ValueError:
+                    raise ValueError(
+                        f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
+                    )
+=======
         for prefill_args in prefill_list:
 
             url = prefill_args[0]
@@ -602,6 +664,7 @@ class RouterArgs:
             else:
                 # No bootstrap port specified, default to None
                 bootstrap_port = None
+>>>>>>> origin/main
 
             prefill_urls.append((url, bootstrap_port))
 
@@ -660,6 +723,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
                 if not router_args.decode_urls:
                     raise ValueError("PD disaggregation mode requires --decode")
 
+<<<<<<< HEAD
+=======
             # Warn about policy usage in PD mode
             if (
                 router_args.prefill_policy
@@ -689,6 +754,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
                     f"and --decode-policy '{router_args.decode_policy}' for decode nodes."
                 )
 
+>>>>>>> origin/main
         # Create router with unified constructor
         router = Router(
             worker_urls=(
@@ -707,8 +773,11 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
             max_payload_size=router_args.max_payload_size,
+<<<<<<< HEAD
+=======
             dp_aware=router_args.dp_aware,
             api_key=router_args.api_key,
+>>>>>>> origin/main
             log_dir=router_args.log_dir,
             log_level=router_args.log_level,
             service_discovery=router_args.service_discovery,
@@ -719,7 +788,10 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             decode_selector=router_args.decode_selector,
             prometheus_port=router_args.prometheus_port,
             prometheus_host=router_args.prometheus_host,
+<<<<<<< HEAD
+=======
             request_timeout_secs=router_args.request_timeout_secs,
+>>>>>>> origin/main
             pd_disaggregation=router_args.pd_disaggregation,
             prefill_urls=(
                 router_args.prefill_urls if router_args.pd_disaggregation else None
@@ -727,6 +799,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             decode_urls=(
                 router_args.decode_urls if router_args.pd_disaggregation else None
             ),
+<<<<<<< HEAD
+=======
             prefill_policy=(
                 policy_from_str(router_args.prefill_policy)
                 if router_args.prefill_policy
@@ -759,6 +833,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             health_check_timeout_secs=router_args.health_check_timeout_secs,
             health_check_interval_secs=router_args.health_check_interval_secs,
             health_check_endpoint=router_args.health_check_endpoint,
+>>>>>>> origin/main
         )
 
         router.start()
@@ -790,6 +865,14 @@ Examples:
   # Regular mode
   python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
 
+<<<<<<< HEAD
+  # PD disaggregated mode
+  python -m sglang_router.launch_router --pd-disaggregation \\
+    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 none \\
+    --decode http://decode1:8001 --decode http://decode2:8001 \\
+    --policy cache_aware
+
+=======
   # PD disaggregated mode with same policy for both
   python -m sglang_router.launch_router --pd-disaggregation \\
     --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 \\
@@ -809,6 +892,7 @@ Examples:
     --decode http://decode1:8001 --decode http://decode2:8001 \\
     --prefill-policy cache_aware --decode-policy power_of_two
 
+>>>>>>> origin/main
     """,
         formatter_class=CustomHelpFormatter,
     )

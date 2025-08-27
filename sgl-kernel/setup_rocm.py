@@ -36,18 +36,27 @@ def _get_version():
 operator_namespace = "sgl_kernel"
 include_dirs = [
     root / "include",
+<<<<<<< HEAD
+=======
     root / "include" / "impl",
+>>>>>>> origin/main
     root / "csrc",
 ]
 
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
+<<<<<<< HEAD
+    "csrc/moe/moe_align_kernel.cu",
+    "csrc/moe/moe_topk_softmax_kernels.cu",
+    "csrc/torch_extension_rocm.cc",
+=======
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
+>>>>>>> origin/main
     "csrc/speculative/eagle_utils.cu",
 ]
 
@@ -72,10 +81,13 @@ if amdgpu_target not in ["gfx942", "gfx950"]:
     )
     sys.exit(1)
 
+<<<<<<< HEAD
+=======
 fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
 )
 
+>>>>>>> origin/main
 hipcc_flags = [
     "-DNDEBUG",
     f"-DOPERATOR_NAMESPACE={operator_namespace}",
@@ -83,10 +95,17 @@ hipcc_flags = [
     "-Xcompiler",
     "-fPIC",
     "-std=c++17",
+<<<<<<< HEAD
+    "-D__HIP_PLATFORM_AMD__=1",
+    f"--amdgpu-target={amdgpu_target}",
+    "-DENABLE_BF16",
+    "-DENABLE_FP8",
+=======
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
     fp8_macro,
+>>>>>>> origin/main
 ]
 
 ext_modules = [

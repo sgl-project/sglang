@@ -44,10 +44,17 @@ per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output
   }
 }
 
+<<<<<<< HEAD
+template <typename T>
+__global__ void per_tensor_quant_fp8_kernel(
+    const T* __restrict__ input,
+    FP8_TYPE* __restrict__ output,
+=======
 template <typename T, typename DST_DTYPE>
 __global__ void per_tensor_quant_fp8_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output,
+>>>>>>> origin/main
     const float* __restrict__ scale,
     const int64_t num_elements) {
   const int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -65,12 +72,21 @@ __global__ void per_tensor_quant_fp8_kernel(
     vec_t input_vec;
     input_vec.cast_load(input + i * VEC_SIZE);
 
+<<<<<<< HEAD
+    FP8_TYPE output_arr[VEC_SIZE];
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      float val = fmax(fmin(static_cast<float>(input_vec[j]) * scale_val, FP8_E4M3_MAX), -FP8_E4M3_MAX);
+#ifndef USE_ROCM
+      output_arr[j] = static_cast<FP8_TYPE>(val);
+=======
     DST_DTYPE output_arr[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       float val = fmax(fmin(static_cast<float>(input_vec[j]) * scale_val, FP8_E4M3_MAX), -FP8_E4M3_MAX);
 #if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
       output_arr[j] = static_cast<DST_DTYPE>(val);
+>>>>>>> origin/main
 #else
       output_arr[j] = c10::Float8_e4m3fnuz(
           __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
@@ -83,8 +99,13 @@ __global__ void per_tensor_quant_fp8_kernel(
   const int32_t remaining_start = num_vec_elems * VEC_SIZE;
   for (int32_t idx = remaining_start + gid; idx < num_elements; idx += grid_size) {
     float val = fmax(-FP8_E4M3_MAX, fmin(static_cast<float>(input[idx]) * scale_val, FP8_E4M3_MAX));
+<<<<<<< HEAD
+#ifndef USE_ROCM
+    output[idx] = static_cast<FP8_TYPE>(val);
+=======
 #if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
     output[idx] = static_cast<DST_DTYPE>(val);
+>>>>>>> origin/main
 #else
     output[idx] = c10::Float8_e4m3fnuz(
         __hip_cvt_float_to_fp8(val, fp8::fp8_type::__default_saturation, fp8::fp8_type::__default_interpret),
@@ -113,9 +134,15 @@ void sgl_per_tensor_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch
           static_cast<scalar_t*>(input.data_ptr()), static_cast<float*>(output_s.data_ptr()), num_elements);
     }
 
+<<<<<<< HEAD
+    per_tensor_quant_fp8_kernel<scalar_t><<<grid, block, 0, stream>>>(
+        static_cast<scalar_t*>(input.data_ptr()),
+        static_cast<FP8_TYPE*>(output_q.data_ptr()),
+=======
     per_tensor_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(
         static_cast<scalar_t*>(input.data_ptr()),
         static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+>>>>>>> origin/main
         static_cast<float*>(output_s.data_ptr()),
         num_elements);
     return true;

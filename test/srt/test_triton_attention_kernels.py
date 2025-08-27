@@ -2,7 +2,10 @@ import random
 import unittest
 
 import torch
+<<<<<<< HEAD
+=======
 import torch.nn.functional as F
+>>>>>>> origin/main
 
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     decode_attention_fwd,
@@ -19,6 +22,8 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
 from sglang.test.test_utils import CustomTestCase
 
 
+<<<<<<< HEAD
+=======
 def extend_attention_fwd_torch(
     q: torch.Tensor,  # [extend_tokens, H_Q, D]
     k: torch.Tensor,  # [extend_tokens, H_KV, D]
@@ -93,6 +98,7 @@ def extend_attention_fwd_torch(
         o[q_start:q_end] = torch.einsum("qhk,khd->qhd", attn_weights, v_full_hq)
 
 
+>>>>>>> origin/main
 class TestTritonAttention(CustomTestCase):
 
     def _set_all_seeds(self, seed):
@@ -255,6 +261,8 @@ class TestTritonAttention(CustomTestCase):
         for value in attention_values:
             self._test_extend_attention_once(19, 12331, 12, 4, value)
 
+<<<<<<< HEAD
+=======
     def _test_extend_attention_sliding_window_once(
         self, B, N_CTX, H_Q, H_KV, D, WINDOW_SIZE
     ):
@@ -364,6 +372,7 @@ class TestTritonAttention(CustomTestCase):
                 19, 12331, 64, 8, 128, window_size
             )
 
+>>>>>>> origin/main
     def _test_context_attention_once(self, head_dim, is_causal):
         # Set up a simple test case
         num_heads = 4

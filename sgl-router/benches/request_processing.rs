@@ -1,4 +1,14 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+<<<<<<< HEAD
+use serde_json::{from_str, to_string, to_vec};
+use std::time::Instant;
+
+use sglang_router_rs::openai_api_types::{
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
+    SamplingParams, StringOrArray, UserMessageContent,
+};
+use sglang_router_rs::request_adapter::{RouteableRequest, ToPdRequest};
+=======
 use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
@@ -133,11 +143,17 @@ fn default_completion_request() -> CompletionRequest {
         other: serde_json::Map::new(),
     }
 }
+>>>>>>> origin/main
 
 // Sample request data for benchmarks
 fn create_sample_generate_request() -> GenerateRequest {
     GenerateRequest {
         text: Some("Write a story about artificial intelligence".to_string()),
+<<<<<<< HEAD
+        input_ids: None,
+        prompt: None,
+=======
+>>>>>>> origin/main
         parameters: Some(GenerateParameters {
             max_new_tokens: Some(100),
             temperature: Some(0.8),
@@ -155,7 +171,12 @@ fn create_sample_generate_request() -> GenerateRequest {
             repetition_penalty: Some(1.0),
             ..Default::default()
         }),
+<<<<<<< HEAD
+        stream: false,
+        return_logprob: false,
+=======
         ..default_generate_request()
+>>>>>>> origin/main
     }
 }
 
@@ -181,10 +202,28 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
         temperature: Some(0.7),
         top_p: Some(1.0),
         n: Some(1),
+<<<<<<< HEAD
+        stream: false,
+        stop: None,
+        presence_penalty: Some(0.0),
+        frequency_penalty: Some(0.0),
+        logit_bias: None,
+        logprobs: false,
+        top_logprobs: None,
+        user: None,
+        response_format: None,
+        seed: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: Some(true),
+        function_call: None,
+        functions: None,
+=======
         presence_penalty: Some(0.0),
         frequency_penalty: Some(0.0),
         parallel_tool_calls: Some(true),
         ..default_chat_completion_request()
+>>>>>>> origin/main
     }
 }
 
@@ -192,14 +231,31 @@ fn create_sample_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "text-davinci-003".to_string(),
         prompt: StringOrArray::String("Complete this sentence: The future of AI is".to_string()),
+<<<<<<< HEAD
+        suffix: None,
+=======
+>>>>>>> origin/main
         max_tokens: Some(50),
         temperature: Some(0.8),
         top_p: Some(1.0),
         n: Some(1),
+<<<<<<< HEAD
+        stream: false,
+        logprobs: None,
+        echo: false,
+        stop: None,
+        presence_penalty: Some(0.0),
+        frequency_penalty: Some(0.0),
+        best_of: Some(1),
+        logit_bias: None,
+        user: None,
+        seed: None,
+=======
         presence_penalty: Some(0.0),
         frequency_penalty: Some(0.0),
         best_of: Some(1),
         ..default_completion_request()
+>>>>>>> origin/main
     }
 }
 
@@ -223,7 +279,10 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
             name: None,
             tool_calls: None,
             function_call: None,
+<<<<<<< HEAD
+=======
             reasoning_content: None,
+>>>>>>> origin/main
         });
     }
 
@@ -235,6 +294,23 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         temperature: Some(0.7),
         top_p: Some(0.95),
         n: Some(1),
+<<<<<<< HEAD
+        stream: false,
+        stop: None,
+        presence_penalty: Some(0.1),
+        frequency_penalty: Some(0.1),
+        logit_bias: None,
+        logprobs: false,
+        top_logprobs: Some(5),
+        user: Some("benchmark_user".to_string()),
+        response_format: None,
+        seed: Some(42),
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: Some(true),
+        function_call: None,
+        functions: None,
+=======
         presence_penalty: Some(0.1),
         frequency_penalty: Some(0.1),
         top_logprobs: Some(5),
@@ -242,6 +318,7 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         seed: Some(42),
         parallel_tool_calls: Some(true),
         ..default_chat_completion_request()
+>>>>>>> origin/main
     }
 }
 
@@ -332,14 +409,48 @@ fn bench_json_deserialization(c: &mut Criterion) {
     group.finish();
 }
 
+<<<<<<< HEAD
+// Benchmark request adaptation from OpenAI to PD format
+fn bench_request_adaptation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("request_adaptation");
+=======
 // Benchmark bootstrap injection (replaces request adaptation)
 fn bench_bootstrap_injection(c: &mut Criterion) {
     let mut group = c.benchmark_group("bootstrap_injection");
+>>>>>>> origin/main
 
     let generate_req = create_sample_generate_request();
     let chat_req = create_sample_chat_completion_request();
     let completion_req = create_sample_completion_request();
     let large_chat_req = create_large_chat_completion_request();
+<<<<<<< HEAD
+
+    group.bench_function("generate_to_pd", |b| {
+        b.iter(|| {
+            let pd_req = black_box(generate_req.clone()).to_pd_request();
+            black_box(pd_req);
+        });
+    });
+
+    group.bench_function("chat_completion_to_pd", |b| {
+        b.iter(|| {
+            let pd_req = black_box(chat_req.clone()).to_pd_request();
+            black_box(pd_req);
+        });
+    });
+
+    group.bench_function("completion_to_pd", |b| {
+        b.iter(|| {
+            let pd_req = black_box(completion_req.clone()).to_pd_request();
+            black_box(pd_req);
+        });
+    });
+
+    group.bench_function("large_chat_completion_to_pd", |b| {
+        b.iter(|| {
+            let pd_req = black_box(large_chat_req.clone()).to_pd_request();
+            black_box(pd_req);
+=======
     let worker = create_test_worker();
     let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
 
@@ -392,15 +503,22 @@ fn bench_bootstrap_injection(c: &mut Criterion) {
             };
             let json = to_value(black_box(&request_with_bootstrap)).unwrap();
             black_box(json);
+>>>>>>> origin/main
         });
     });
 
     group.finish();
 }
 
+<<<<<<< HEAD
+// Benchmark regular routing (RouteableRequest methods)
+fn bench_regular_routing(c: &mut Criterion) {
+    let mut group = c.benchmark_group("regular_routing");
+=======
 // Benchmark direct JSON routing (replaces regular routing)
 fn bench_direct_json_routing(c: &mut Criterion) {
     let mut group = c.benchmark_group("direct_json_routing");
+>>>>>>> origin/main
 
     let generate_req = create_sample_generate_request();
     let chat_req = create_sample_chat_completion_request();
@@ -408,6 +526,9 @@ fn bench_direct_json_routing(c: &mut Criterion) {
 
     group.bench_function("generate_to_json", |b| {
         b.iter(|| {
+<<<<<<< HEAD
+            let json = black_box(&generate_req).to_json().unwrap();
+=======
             let json = to_value(black_box(&generate_req)).unwrap();
             black_box(json);
         });
@@ -416,34 +537,54 @@ fn bench_direct_json_routing(c: &mut Criterion) {
     group.bench_function("generate_to_json_string", |b| {
         b.iter(|| {
             let json = to_string(black_box(&generate_req)).unwrap();
+>>>>>>> origin/main
             black_box(json);
         });
     });
 
     group.bench_function("generate_to_bytes", |b| {
         b.iter(|| {
+<<<<<<< HEAD
+            let bytes = black_box(&generate_req).to_bytes().unwrap();
+=======
             let bytes = to_vec(black_box(&generate_req)).unwrap();
+>>>>>>> origin/main
             black_box(bytes);
         });
     });
 
     group.bench_function("chat_completion_to_json", |b| {
         b.iter(|| {
+<<<<<<< HEAD
+            let json = black_box(&chat_req).to_json().unwrap();
+=======
             let json = to_value(black_box(&chat_req)).unwrap();
+>>>>>>> origin/main
             black_box(json);
         });
     });
 
+<<<<<<< HEAD
+    group.bench_function("chat_completion_to_bytes", |b| {
+        b.iter(|| {
+            let bytes = black_box(&chat_req).to_bytes().unwrap();
+            black_box(bytes);
+=======
     group.bench_function("chat_completion_to_json_string", |b| {
         b.iter(|| {
             let json = to_string(black_box(&chat_req)).unwrap();
             black_box(json);
+>>>>>>> origin/main
         });
     });
 
     group.bench_function("completion_to_json", |b| {
         b.iter(|| {
+<<<<<<< HEAD
+            let json = black_box(&completion_req).to_json().unwrap();
+=======
             let json = to_value(black_box(&completion_req)).unwrap();
+>>>>>>> origin/main
             black_box(json);
         });
     });
@@ -458,22 +599,51 @@ fn bench_throughput_by_size(c: &mut Criterion) {
     // Create requests of different sizes
     let small_generate = GenerateRequest {
         text: Some("Hi".to_string()),
+<<<<<<< HEAD
+        input_ids: None,
+        prompt: None,
+        parameters: None,
+        sampling_params: None,
+        stream: false,
+        return_logprob: false,
+=======
         ..default_generate_request()
+>>>>>>> origin/main
     };
 
     let medium_generate = GenerateRequest {
         text: Some("Write a medium length story about AI".repeat(10)),
+<<<<<<< HEAD
+        input_ids: None,
+        prompt: None,
+        parameters: None,
+        sampling_params: None,
+        stream: false,
+        return_logprob: false,
+=======
         ..default_generate_request()
+>>>>>>> origin/main
     };
 
     let large_generate = GenerateRequest {
         text: Some("Write a very long and detailed story about artificial intelligence and its impact on society".repeat(100)),
+<<<<<<< HEAD
+        input_ids: None,
+        prompt: None,
+        parameters: None,
+        sampling_params: None,
+        stream: false,
+        return_logprob: false,
+    };
+
+=======
         ..default_generate_request()
     };
 
     let worker = create_test_worker();
     let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
 
+>>>>>>> origin/main
     for (name, req) in [
         ("small", &small_generate),
         ("medium", &medium_generate),
@@ -481,7 +651,10 @@ fn bench_throughput_by_size(c: &mut Criterion) {
     ] {
         let json = to_string(req).unwrap();
         let size_bytes = json.len();
+<<<<<<< HEAD
+=======
         let hostname_clone = hostname.clone();
+>>>>>>> origin/main
 
         group.throughput(Throughput::Bytes(size_bytes as u64));
         group.bench_with_input(BenchmarkId::new("serialize", name), &req, |b, req| {
@@ -502,6 +675,14 @@ fn bench_throughput_by_size(c: &mut Criterion) {
             },
         );
 
+<<<<<<< HEAD
+        group.bench_with_input(BenchmarkId::new("adapt_to_pd", name), &req, |b, req| {
+            b.iter(|| {
+                let pd_req = (*req).clone().to_pd_request();
+                black_box(pd_req);
+            });
+        });
+=======
         group.bench_with_input(
             BenchmarkId::new("bootstrap_inject", name),
             &req,
@@ -519,25 +700,39 @@ fn bench_throughput_by_size(c: &mut Criterion) {
                 });
             },
         );
+>>>>>>> origin/main
     }
 
     group.finish();
 }
 
+<<<<<<< HEAD
+// Benchmark full round-trip: deserialize -> adapt -> serialize
+=======
 // Benchmark full round-trip: deserialize -> inject bootstrap -> serialize
+>>>>>>> origin/main
 fn bench_full_round_trip(c: &mut Criterion) {
     let mut group = c.benchmark_group("full_round_trip");
 
     let generate_json = to_string(&create_sample_generate_request()).unwrap();
     let chat_json = to_string(&create_sample_chat_completion_request()).unwrap();
     let completion_json = to_string(&create_sample_completion_request()).unwrap();
+<<<<<<< HEAD
+=======
     let worker = create_test_worker();
     let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
+>>>>>>> origin/main
 
     group.bench_function("generate_openai_to_pd_pipeline", |b| {
         b.iter(|| {
             // Deserialize OpenAI request
             let req: GenerateRequest = from_str(black_box(&generate_json)).unwrap();
+<<<<<<< HEAD
+            // Adapt to PD format
+            let pd_req = req.to_pd_request();
+            // Serialize PD request
+            let pd_json = to_string(&pd_req).unwrap();
+=======
             // Create wrapper with bootstrap fields
             let request_with_bootstrap = RequestWithBootstrap {
                 original: &req,
@@ -547,6 +742,7 @@ fn bench_full_round_trip(c: &mut Criterion) {
             };
             // Serialize final request
             let pd_json = to_string(&request_with_bootstrap).unwrap();
+>>>>>>> origin/main
             black_box(pd_json);
         });
     });
@@ -554,6 +750,10 @@ fn bench_full_round_trip(c: &mut Criterion) {
     group.bench_function("chat_completion_openai_to_pd_pipeline", |b| {
         b.iter(|| {
             let req: ChatCompletionRequest = from_str(black_box(&chat_json)).unwrap();
+<<<<<<< HEAD
+            let pd_req = req.to_pd_request();
+            let pd_json = to_string(&pd_req).unwrap();
+=======
             let request_with_bootstrap = RequestWithBootstrap {
                 original: &req,
                 bootstrap_host: hostname.clone(),
@@ -561,6 +761,7 @@ fn bench_full_round_trip(c: &mut Criterion) {
                 bootstrap_room: generate_room_id(),
             };
             let pd_json = to_string(&request_with_bootstrap).unwrap();
+>>>>>>> origin/main
             black_box(pd_json);
         });
     });
@@ -568,6 +769,10 @@ fn bench_full_round_trip(c: &mut Criterion) {
     group.bench_function("completion_openai_to_pd_pipeline", |b| {
         b.iter(|| {
             let req: CompletionRequest = from_str(black_box(&completion_json)).unwrap();
+<<<<<<< HEAD
+            let pd_req = req.to_pd_request();
+            let pd_json = to_string(&pd_req).unwrap();
+=======
             let request_with_bootstrap = RequestWithBootstrap {
                 original: &req,
                 bootstrap_host: hostname.clone(),
@@ -575,10 +780,20 @@ fn bench_full_round_trip(c: &mut Criterion) {
                 bootstrap_room: generate_room_id(),
             };
             let pd_json = to_string(&request_with_bootstrap).unwrap();
+>>>>>>> origin/main
             black_box(pd_json);
         });
     });
 
+<<<<<<< HEAD
+    group.bench_function("generate_regular_routing_pipeline", |b| {
+        b.iter(|| {
+            // Deserialize OpenAI request
+            let req: GenerateRequest = from_str(black_box(&generate_json)).unwrap();
+            // Convert to JSON for regular routing
+            let routing_json = req.to_json().unwrap();
+            black_box(routing_json);
+=======
     group.bench_function("generate_direct_json_pipeline", |b| {
         b.iter(|| {
             // Deserialize OpenAI request
@@ -587,6 +802,7 @@ fn bench_full_round_trip(c: &mut Criterion) {
             let routing_json = to_value(&req).unwrap();
             let json_string = to_string(&routing_json).unwrap();
             black_box(json_string);
+>>>>>>> origin/main
         });
     });
 
@@ -601,7 +817,10 @@ fn benchmark_summary(c: &mut Criterion) {
 
     // Quick performance overview
     let generate_req = create_sample_generate_request();
+<<<<<<< HEAD
+=======
     let worker = create_test_worker();
+>>>>>>> origin/main
 
     println!("\nQuick Performance Overview:");
 
@@ -625,6 +844,18 @@ fn benchmark_summary(c: &mut Criterion) {
         deserialize_time
     );
 
+<<<<<<< HEAD
+    // Measure adaptation
+    let start = Instant::now();
+    for _ in 0..1000 {
+        let _ = black_box(generate_req.clone().to_pd_request());
+    }
+    let adapt_time = start.elapsed().as_nanos() / 1000;
+    println!("  * PD Adaptation (avg):     {:>8} ns/req", adapt_time);
+
+    // Calculate ratios
+    let total_pipeline = serialize_time + deserialize_time + adapt_time;
+=======
     // Measure bootstrap injection (replaces adaptation)
     let (hostname, bootstrap_port) = get_bootstrap_info(&worker);
     let start = Instant::now();
@@ -642,12 +873,25 @@ fn benchmark_summary(c: &mut Criterion) {
 
     // Calculate ratios
     let total_pipeline = serialize_time + deserialize_time + inject_time;
+>>>>>>> origin/main
     println!("  * Total Pipeline (avg):    {:>8} ns/req", total_pipeline);
 
     println!("\nPerformance Insights:");
     if deserialize_time > serialize_time * 2 {
         println!("  • Deserialization is significantly faster than serialization");
     }
+<<<<<<< HEAD
+    if adapt_time < serialize_time / 10 {
+        println!(
+            "  • PD adaptation overhead is negligible ({:.1}% of serialization)",
+            (adapt_time as f64 / serialize_time as f64) * 100.0
+        );
+    }
+    if total_pipeline < 10_000 {
+        println!("  • Total pipeline latency is excellent (< 10μs)");
+    }
+
+=======
     if inject_time < serialize_time / 10 {
         println!(
             "  • Bootstrap injection overhead is negligible ({:.1}% of serialization)",
@@ -664,6 +908,7 @@ fn benchmark_summary(c: &mut Criterion) {
     println!("  • Automatic field preservation (no manual mapping)");
     println!("  • Direct JSON manipulation improves performance");
 
+>>>>>>> origin/main
     println!("\nRecommendations:");
     if serialize_time > deserialize_time {
         println!("  • Focus optimization efforts on serialization rather than deserialization");
@@ -681,8 +926,13 @@ criterion_group!(
     benchmark_summary,
     bench_json_serialization,
     bench_json_deserialization,
+<<<<<<< HEAD
+    bench_request_adaptation,
+    bench_regular_routing,
+=======
     bench_bootstrap_injection,
     bench_direct_json_routing,
+>>>>>>> origin/main
     bench_throughput_by_size,
     bench_full_round_trip
 );

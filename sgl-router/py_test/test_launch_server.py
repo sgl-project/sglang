@@ -30,6 +30,8 @@ def popen_launch_router(
     service_discovery_namespace: str = None,
     prometheus_port: int = None,
     prometheus_host: str = None,
+<<<<<<< HEAD
+=======
     dp_aware: bool = False,
     # Router retry/CB tuning (optional)
     router_retry_max_retries: int = None,
@@ -41,6 +43,7 @@ def popen_launch_router(
     router_cb_success_threshold: int = None,
     router_cb_timeout_duration_secs: int = None,
     router_cb_window_duration_secs: int = None,
+>>>>>>> origin/main
 ):
     """
     Launch the router server process.
@@ -60,7 +63,10 @@ def popen_launch_router(
         service_discovery_namespace: Kubernetes namespace to watch for pods. If None, watches all namespaces.
         prometheus_port: Port to expose Prometheus metrics. If None, Prometheus metrics are disabled.
         prometheus_host: Host address to bind the Prometheus metrics server.
+<<<<<<< HEAD
+=======
         dp_aware: Enable data parallelism aware routing strategy.
+>>>>>>> origin/main
     """
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -81,12 +87,18 @@ def popen_launch_router(
         "5",
         "--router-policy",
         policy,
+<<<<<<< HEAD
+=======
         "--allow-auto-truncate",
+>>>>>>> origin/main
     ]
 
     if api_key is not None:
         command.extend(["--api-key", api_key])
+<<<<<<< HEAD
+=======
         command.extend(["--router-api-key", api_key])
+>>>>>>> origin/main
 
     if max_payload_size is not None:
         command.extend(["--router-max-payload-size", str(max_payload_size)])
@@ -114,6 +126,8 @@ def popen_launch_router(
     if log_dir is not None:
         command.extend(["--log-dir", log_dir])
 
+<<<<<<< HEAD
+=======
     if dp_aware:
         command.append("--router-dp-aware")
 
@@ -132,6 +146,7 @@ def popen_launch_router(
     _add("--router-cb-timeout-duration-secs", router_cb_timeout_duration_secs)
     _add("--router-cb-window-duration-secs", router_cb_window_duration_secs)
 
+>>>>>>> origin/main
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
     start_time = time.perf_counter()
@@ -159,7 +174,10 @@ def popen_launch_server(
     model: str,
     base_url: str,
     timeout: float,
+<<<<<<< HEAD
+=======
     api_key: str = None,
+>>>>>>> origin/main
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -178,9 +196,12 @@ def popen_launch_server(
         "1",
     ]
 
+<<<<<<< HEAD
+=======
     if api_key is not None:
         command.extend(["--api-key", api_key])
 
+>>>>>>> origin/main
     process = subprocess.Popen(command, stdout=None, stderr=None)
 
     # intentionally don't wait and defer the job to the router health check
@@ -251,7 +272,11 @@ class TestLaunchServer(unittest.TestCase):
 
         metrics = run_eval(args)
         score = metrics["score"]
+<<<<<<< HEAD
+        THRESHOLD = 0.65
+=======
         THRESHOLD = 0.635
+>>>>>>> origin/main
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
@@ -274,7 +299,11 @@ class TestLaunchServer(unittest.TestCase):
         )
         self.other_process.append(worker_process)
 
+<<<<<<< HEAD
+        # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
+=======
         # 2. use /add_worker api to add it to the router. It will be used by the router after it is healthy
+>>>>>>> origin/main
         with requests.Session() as session:
             response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
             print(f"status code: {response.status_code}, response: {response.text}")
@@ -291,7 +320,11 @@ class TestLaunchServer(unittest.TestCase):
         )
         metrics = run_eval(args)
         score = metrics["score"]
+<<<<<<< HEAD
+        THRESHOLD = 0.65
+=======
         THRESHOLD = 0.635
+>>>>>>> origin/main
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
@@ -305,7 +338,11 @@ class TestLaunchServer(unittest.TestCase):
         # 5. run mmlu again
         metrics = run_eval(args)
         score = metrics["score"]
+<<<<<<< HEAD
+        THRESHOLD = 0.65
+=======
         THRESHOLD = 0.635
+>>>>>>> origin/main
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
@@ -329,7 +366,11 @@ class TestLaunchServer(unittest.TestCase):
         )
         self.other_process.append(worker_process)
 
+<<<<<<< HEAD
+        # 2. use /add_worker api to add it the the router. It will be used by router after it is healthy
+=======
         # 2. use /add_worker api to add it to the router. It will be used by the router after it is healthy
+>>>>>>> origin/main
         with requests.Session() as session:
             response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
             print(f"status code: {response.status_code}, response: {response.text}")
@@ -358,14 +399,22 @@ class TestLaunchServer(unittest.TestCase):
         )
         metrics = run_eval(args)
         score = metrics["score"]
+<<<<<<< HEAD
+        THRESHOLD = 0.65
+=======
         THRESHOLD = 0.635
+>>>>>>> origin/main
         passed = score >= THRESHOLD
         msg = f"MMLU test {'passed' if passed else 'failed'} with score {score:.3f} (threshold: {THRESHOLD})"
         self.assertGreaterEqual(score, THRESHOLD, msg)
 
     def test_4_payload_size(self):
         print("Running test_4_payload_size...")
+<<<<<<< HEAD
+        # Start router with 3MB limit
+=======
         # Start router with 1MB limit
+>>>>>>> origin/main
         self.process = popen_launch_router(
             self.model,
             self.base_url,
@@ -423,7 +472,11 @@ class TestLaunchServer(unittest.TestCase):
             api_key="correct_api_key",
         )
 
+<<<<<<< HEAD
+        # # Test case 1: request without api key should fail
+=======
         # Test case 1: request without api key should fail
+>>>>>>> origin/main
         with requests.Session() as session:
             response = session.post(
                 f"{self.base_url}/generate",
@@ -462,6 +515,8 @@ class TestLaunchServer(unittest.TestCase):
                 response.status_code, 200, "Request with correct api key should succeed"
             )
 
+<<<<<<< HEAD
+=======
     def test_6_mmlu_with_dp_aware(self):
         print("Running test_6_mmlu_with_dp_aware...")
         # DP size = 2
@@ -730,6 +785,7 @@ class TestLaunchServer(unittest.TestCase):
                 f"Request with correct api key should succeed but got status {response.status_code}",
             )
 
+>>>>>>> origin/main
 
 if __name__ == "__main__":
     unittest.main()

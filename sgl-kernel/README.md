@@ -5,11 +5,14 @@
 [![PyPI](https://img.shields.io/pypi/v/sgl-kernel)](https://pypi.org/project/sgl-kernel)
 
 ## Installation
+<<<<<<< HEAD
+=======
 For CUDA 12.1 and above:
 
 ```bash
 pip3 install sgl-kernel
 ```
+>>>>>>> origin/main
 
 For CUDA 11.8:
 
@@ -17,6 +20,14 @@ For CUDA 11.8:
 pip3 install sgl-kernel -i https://docs.sglang.ai/whl/cu118
 ```
 
+<<<<<<< HEAD
+For CUDA 12.1 or CUDA 12.4:
+
+```bash
+pip3 install sgl-kernel
+```
+=======
+>>>>>>> origin/main
 ## Build from source
 
 Development build:
@@ -58,6 +69,8 @@ And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLE
 CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .
 ```
 
+<<<<<<< HEAD
+=======
 ### ⚠️ Compilation Issue with `sgl-kernel` and CUDA 12.6
 
 When compiling `sgl-kernel` with FlashAttention on a Hopper GPU using CUDA 12.6, you may encounter a segmentation fault:
@@ -117,6 +130,7 @@ sudo bash update_ptxas.sh 12.6
 ptxas --version
 ```
 
+>>>>>>> origin/main
 # Developer Guide
 
 ## Development Environment Setup

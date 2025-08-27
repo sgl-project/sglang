@@ -97,7 +97,13 @@ def bench_deepgemm(
     )
 
     def run_deepgemm():
+<<<<<<< HEAD
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+            x_fp8, y_fp8, out, m_indices
+        )
+=======
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(x_fp8, y_fp8, out, m_indices)
+>>>>>>> origin/main
 
     # warmup
     for _ in range(num_warmup):

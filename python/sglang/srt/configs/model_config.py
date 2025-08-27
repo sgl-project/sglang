@@ -25,14 +25,21 @@ from transformers import PretrainedConfig
 from sglang.srt.hf_transformers_utils import (
     get_config,
     get_context_length,
+<<<<<<< HEAD
+    get_hf_text_config,
+=======
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
+>>>>>>> origin/main
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, is_hip
+<<<<<<< HEAD
+=======
 from sglang.utils import is_in_ci
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +62,11 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
+<<<<<<< HEAD
+        model_override_args: Optional[str] = None,
+=======
         model_override_args: str = "{}",
+>>>>>>> origin/main
         is_embedding: Optional[bool] = None,
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
@@ -63,6 +74,17 @@ class ModelConfig:
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
+<<<<<<< HEAD
+        impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+    ) -> None:
+
+        self.model_path = model_path
+        self.revision = revision
+        self.quantization = quantization
+        self.impl = impl
+
+        # Parse args
+=======
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
         # Parse args
@@ -71,6 +93,7 @@ class ModelConfig:
         self.quantization = quantization
         self.model_impl = model_impl
 
+>>>>>>> origin/main
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
@@ -85,6 +108,8 @@ class ModelConfig:
             **kwargs,
         )
 
+<<<<<<< HEAD
+=======
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -92,6 +117,7 @@ class ModelConfig:
             **kwargs,
         )
 
+>>>>>>> origin/main
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
@@ -113,7 +139,10 @@ class ModelConfig:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
+<<<<<<< HEAD
+=======
                 "Step3VLForConditionalGeneration",
+>>>>>>> origin/main
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
@@ -129,6 +158,10 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+<<<<<<< HEAD
+        if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
+            self.hf_config.architectures[0] = "MiMoMTP"
+=======
         if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
@@ -140,6 +173,7 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
 
+>>>>>>> origin/main
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
@@ -167,6 +201,21 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
+<<<<<<< HEAD
+                if get_bool_env_var(
+                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
+                ):
+                    logger.warning(
+                        f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
+                        f"This may lead to incorrect model outputs or CUDA errors."
+                    )
+                    self.context_len = context_length
+                else:
+                    raise ValueError(
+                        f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
+                        f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
+                        f"To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+=======
                 reason = "Target model's" if is_draft_model else "User-specified"
                 msg = (
                     f"Warning: {reason} context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
@@ -181,6 +230,7 @@ class ModelConfig:
                 else:
                     raise ValueError(
                         f"{msg} To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+>>>>>>> origin/main
                     )
             else:
                 self.context_len = context_length
@@ -270,14 +320,28 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+<<<<<<< HEAD
+=======
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
+>>>>>>> origin/main
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization
         self._verify_quantization()
 
+<<<<<<< HEAD
+        # Cache attributes
+        self.hf_eos_token_id = self.get_hf_eos_token_id()
+
+        config = self.hf_config
+
+        # multimodal
+        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
+            config, "image_token_index", None
+        )
+=======
         # Verify dual-chunk attention config
         self._verify_dual_chunk_attention_config()
 
@@ -288,6 +352,7 @@ class ModelConfig:
         self.image_token_id = getattr(
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
+>>>>>>> origin/main
 
     @staticmethod
     def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
@@ -302,6 +367,12 @@ class ModelConfig:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
+<<<<<<< HEAD
+            impl=server_args.impl,
+            **kwargs,
+        )
+
+=======
             model_impl=server_args.model_impl,
             **kwargs,
         )
@@ -313,6 +384,7 @@ class ModelConfig:
         total_num_attention_heads = self.num_attention_heads
         return max(1, total_num_attention_heads // tensor_parallel_size)
 
+>>>>>>> origin/main
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
         """Returns the total number of KV heads."""
@@ -343,6 +415,8 @@ class ModelConfig:
                 "kv_n_heads",
                 self.hf_config.num_attention_heads,
             )
+<<<<<<< HEAD
+=======
         if self.hf_config.model_type in ["nemotron-nas"]:
             nkvh = {
                 self.hf_config.num_attention_heads // block.attention.n_heads_in_group
@@ -356,6 +430,7 @@ class ModelConfig:
                     "Variable GQA (VGQA) is not yet supported for nemotron-nas in sglang"
                 )
             return next(iter(nkvh))
+>>>>>>> origin/main
 
         attributes = [
             # For Falcon:
@@ -365,8 +440,11 @@ class ModelConfig:
             "num_key_value_heads",
             # For ChatGLM:
             "multi_query_group_num",
+<<<<<<< HEAD
+=======
             # For Step3
             "num_attention_groups",
+>>>>>>> origin/main
         ]
         for attr in attributes:
             num_kv_heads = getattr(self.hf_text_config, attr, None)
@@ -405,6 +483,9 @@ class ModelConfig:
                 if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
                     quant_cfg = modelopt_quant_config
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
+<<<<<<< HEAD
+                quant_cfg = modelopt_quant_config
+=======
                 quant_config_file = os.path.join(
                     self.model_path, "hf_quant_config.json"
                 )
@@ -416,6 +497,7 @@ class ModelConfig:
                     quant_cfg = {"quant_method": "w4afp8"}
                 else:
                     quant_cfg = modelopt_quant_config
+>>>>>>> origin/main
         return quant_cfg
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
@@ -429,9 +511,12 @@ class ModelConfig:
             "compressed-tensors",
             "fbgemm_fp8",
             "w8a8_fp8",
+<<<<<<< HEAD
+=======
             "petit_nvfp4",
             "quark",
             "mxfp4",
+>>>>>>> origin/main
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -448,12 +533,18 @@ class ModelConfig:
             "w8a8_fp8",
             "moe_wna16",
             "qoq",
+<<<<<<< HEAD
+        ]
+        compatible_quantization_methods = {
+            "modelopt_fp4": ["modelopt"],
+=======
             "w4afp8",
             "petit_nvfp4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
+>>>>>>> origin/main
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -464,9 +555,13 @@ class ModelConfig:
         quant_cfg = self._parse_quant_hf_config()
 
         if quant_cfg is not None:
+<<<<<<< HEAD
+            quant_method = quant_cfg.get("quant_method", "").lower()
+=======
             quant_method = quant_cfg.get(
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
+>>>>>>> origin/main
 
             # Detect which checkpoint is it
             for _, method in QUANTIZATION_METHODS.items():
@@ -513,6 +608,13 @@ class ModelConfig:
                     self.quantization,
                 )
 
+<<<<<<< HEAD
+    def get_hf_eos_token_id(self) -> Optional[Set[int]]:
+        eos_ids = getattr(self.hf_config, "eos_token_id", None)
+        if eos_ids:
+            # it can be either int or list of int
+            eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+=======
     def _verify_dual_chunk_attention_config(self) -> None:
         if hasattr(self.hf_config, "dual_chunk_attention_config"):
             # Try loading the sparse attention config
@@ -548,6 +650,7 @@ class ModelConfig:
                     else set(generation_eos_ids)
                 )
                 eos_ids = eos_ids | generation_eos_ids
+>>>>>>> origin/main
         return eos_ids
 
     def maybe_pull_model_tokenizer_from_remote(self) -> None:
@@ -657,7 +760,10 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
+<<<<<<< HEAD
+=======
         or "Qwen3ForSequenceClassification" in model_architectures
+>>>>>>> origin/main
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
         or "Contriever" in model_architectures
@@ -675,8 +781,11 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
+<<<<<<< HEAD
+=======
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+>>>>>>> origin/main
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
@@ -695,10 +804,15 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
+<<<<<<< HEAD
+    "Phi4MMForCausalLM",
+    "VILAForConditionalGeneration",
+=======
     "InternS1ForConditionalGeneration",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
+>>>>>>> origin/main
 ]
 
 
@@ -776,6 +890,12 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
     else:
+<<<<<<< HEAD
+        raise ValueError(
+            "get_hybrid_layer_ids is only implemented for Llama4ForConditionalGeneration"
+        )
+=======
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
+>>>>>>> origin/main
     return swa_attention_layer_ids, full_attention_layer_ids

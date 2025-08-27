@@ -1,3 +1,19 @@
+<<<<<<< HEAD
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==========================582====================================================
+=======
+>>>>>>> origin/main
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -10,25 +26,36 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
+<<<<<<< HEAD
+from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
+=======
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+>>>>>>> origin/main
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
+<<<<<<< HEAD
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+=======
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
+>>>>>>> origin/main
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+<<<<<<< HEAD
+=======
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
+>>>>>>> origin/main
 from sglang.utils import logger
 
 
@@ -43,6 +70,10 @@ class InternAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
+<<<<<<< HEAD
+
+=======
+>>>>>>> origin/main
         self.scale = self.head_dim**-0.5
 
         self.attn = VisionAttention(
@@ -53,16 +84,29 @@ class InternAttention(nn.Module):
             use_qkv_parallel=True,
             quant_config=quant_config,
             dropout=getattr(config, "dropout", 0.0),
+<<<<<<< HEAD
+            proj_bias=getattr(config, "qkv_bias", True),
+=======
             qkv_bias=getattr(config, "qkv_bias", False)
             or getattr(config, "attention_bias", False),
             num_dummy_heads=getattr(config, "num_dummy_heads", 0),
             qk_normalization=getattr(config, "qk_normalization", False)
             or getattr(config, "use_qk_norm", False),
+>>>>>>> origin/main
             flatten_batch=False,
         )
 
         self.proj_drop = nn.Dropout(config.dropout)
 
+<<<<<<< HEAD
+        self.qk_normalization = config.qk_normalization
+
+        if self.qk_normalization:
+            self.q_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.k_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+
+=======
+>>>>>>> origin/main
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -78,6 +122,10 @@ class InternVisionEmbeddings(nn.Module):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
+<<<<<<< HEAD
+        self.image_size = config.image_size
+        self.patch_size = config.patch_size
+=======
         self.image_size = (
             config.image_size
             if isinstance(config.image_size, int)
@@ -88,6 +136,7 @@ class InternVisionEmbeddings(nn.Module):
             if isinstance(config.patch_size, int)
             else config.patch_size[0]
         )
+>>>>>>> origin/main
 
         self.class_embedding = nn.Parameter(
             torch.randn(1, 1, self.embed_dim),
@@ -194,7 +243,11 @@ class InternVisionEncoderLayer(nn.Module):
         self.embed_dim = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.norm_type = config.norm_type
+<<<<<<< HEAD
+        self.attn = InternAttention(config)
+=======
         self.attn = InternAttention(config=config, quant_config=quant_config)
+>>>>>>> origin/main
         self.mlp = InternMLP(config)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
         self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
@@ -412,7 +465,11 @@ class InternVLChatModel(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+<<<<<<< HEAD
+
+=======
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
+>>>>>>> origin/main
         image_size = config.force_image_size or config.vision_config.image_size
         patch_size = config.vision_config.patch_size
         self.patch_size = patch_size
@@ -441,10 +498,13 @@ class InternVLChatModel(nn.Module):
             self.language_model = InternLM2ForCausalLM(
                 config=config.llm_config, quant_config=quant_config
             )
+<<<<<<< HEAD
+=======
         elif config.llm_config.architectures[0] == "Qwen3MoeForCausalLM":
             self.language_model = Qwen3MoeForCausalLM(
                 config=config.llm_config, quant_config=quant_config
             )
+>>>>>>> origin/main
         else:
             raise NotImplementedError(
                 f"{config.llm_config.architectures[0]} is not implemented."
@@ -509,7 +569,11 @@ class InternVLChatModel(nn.Module):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
+<<<<<<< HEAD
+        pixel_values = torch.cat([item.pixel_values for item in items])
+=======
         pixel_values = torch.cat([item.feature for item in items])
+>>>>>>> origin/main
         image_features = self.extract_feature(pixel_values)
         return image_features
 
@@ -526,9 +590,13 @@ class InternVLChatModel(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
+<<<<<<< HEAD
+            image_data_embedding_func=self.get_image_feature,
+=======
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
             },
+>>>>>>> origin/main
             positions=positions,
         )
 
@@ -545,7 +613,10 @@ class InternVLChatModel(nn.Module):
         return helper.pad_input_tokens(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+<<<<<<< HEAD
+=======
         expert_params_mapping = []
+>>>>>>> origin/main
         if "InternLM2ForCausalLM" in self.config.llm_config.architectures:
             stacked_params_mapping = [
                 # (param_name, shard_name, shard_id)
@@ -561,6 +632,8 @@ class InternVLChatModel(nn.Module):
                 ("gate_up_proj", "gate_proj", 0),
                 ("gate_up_proj", "up_proj", 1),
             ]
+<<<<<<< HEAD
+=======
         elif "Qwen3MoeForCausalLM" in self.config.llm_config.architectures:
             stacked_params_mapping = [
                 # (param_name, shard_name, shard_id)
@@ -578,12 +651,18 @@ class InternVLChatModel(nn.Module):
                 num_experts=self.config.num_experts,
             )
 
+>>>>>>> origin/main
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+<<<<<<< HEAD
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+=======
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -596,6 +675,7 @@ class InternVLChatModel(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if "mlp.experts" in name:
                     continue
+>>>>>>> origin/main
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -610,6 +690,32 @@ class InternVLChatModel(nn.Module):
                     name = name.replace(r"attn.", r"attn.attn.")
                     name = name.replace(r"qkv.", r"qkv_proj.")
 
+<<<<<<< HEAD
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                if "wqkv" in name:
+                    config = self.config
+                    kv_groups = config.num_attention_heads // config.num_key_value_heads
+                    head_dim = config.hidden_size // config.num_attention_heads
+                    loaded_weight = loaded_weight.view(
+                        -1, 2 + kv_groups, head_dim, loaded_weight.shape[-1]
+                    )
+                    wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1], dim=1)
+                    wq = wq.reshape(-1, wq.shape[-1])
+                    wk = wk.reshape(-1, wk.shape[-1])
+                    wv = wv.reshape(-1, wv.shape[-1])
+                    weight_loader = param.weight_loader
+                    weight_loader(param, wq, "q")
+                    weight_loader(param, wk, "k")
+                    weight_loader(param, wv, "v")
+                else:
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+=======
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
@@ -659,6 +765,7 @@ class InternVLChatModel(nn.Module):
                             )
                         weight_loader(param, loaded_weight)
 
+>>>>>>> origin/main
             loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:

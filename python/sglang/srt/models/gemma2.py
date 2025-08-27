@@ -190,7 +190,10 @@ class Gemma2DecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+<<<<<<< HEAD
+=======
         self.layer_id = layer_id
+>>>>>>> origin/main
         self.hidden_size = config.hidden_size
         self.self_attn = Gemma2Attention(
             layer_id=layer_id,
@@ -381,6 +384,41 @@ class Gemma2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
 
+<<<<<<< HEAD
+    def get_hidden_dim(self, module_name):
+        # return input_dim, output_dim
+        if module_name in ["q_proj", "qkv_proj"]:
+            return (
+                self.config.hidden_size,
+                self.config.head_dim * self.config.num_attention_heads,
+            )
+        elif module_name in ["o_proj"]:
+            return (
+                self.config.head_dim * self.config.num_attention_heads,
+                self.config.hidden_size,
+            )
+        elif module_name in ["kv_proj"]:
+            return (
+                self.config.hidden_size,
+                self.config.head_dim * self.config.num_key_value_heads,
+            )
+        elif module_name == "gate_up_proj":
+            return self.config.hidden_size, self.config.intermediate_size
+        elif module_name == "down_proj":
+            return self.config.intermediate_size, self.config.hidden_size
+        else:
+            raise NotImplementedError()
+
+    def get_module_name(self, name):
+        params_mapping = {
+            "q_proj": "qkv_proj",
+            "k_proj": "qkv_proj",
+            "v_proj": "qkv_proj",
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+        }
+        return params_mapping.get(name, name)
+=======
     @torch.no_grad()
     def forward_split_prefill(
         self,
@@ -431,6 +469,7 @@ class Gemma2ForCausalLM(nn.Module):
             result = None
 
         return result
+>>>>>>> origin/main
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)

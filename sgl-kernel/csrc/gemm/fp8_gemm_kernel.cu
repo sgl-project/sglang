@@ -48,7 +48,10 @@ limitations under the License.
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
+<<<<<<< HEAD
+=======
 #include "math.hpp"
+>>>>>>> origin/main
 #include "utils.h"
 
 using namespace cute;
@@ -1020,6 +1023,10 @@ void sm100_fp8_dispatch_bias(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
+<<<<<<< HEAD
+  using CTAShape = Shape<_256, _128, _64>;
+  using ClusterShape = Shape<_2, _2, _1>;
+=======
   using CTAShapeDefault = Shape<_256, _128, _64>;
   using ClusterShapeDefault = Shape<_2, _2, _1>;
 
@@ -1032,6 +1039,7 @@ void sm100_fp8_dispatch_bias(
   using CTAShape16 = Shape<_64, _64, _128>;
   using ClusterShape16 = Shape<_1, _4, _1>;
 
+>>>>>>> origin/main
   using MainloopScheduleType = cutlass::gemm::collective::KernelScheduleAuto;
   using EpilogueScheduleType = cutlass::epilogue::collective::EpilogueScheduleAuto;
   using TileSchedulerType = void;
@@ -1040,6 +1048,32 @@ void sm100_fp8_dispatch_bias(
   using ElementOutput = OutType;
   using AccumElementType = float;
 
+<<<<<<< HEAD
+  if (bias) {
+    using Gemm = DeviceGemmFp8RowwiseSm100<
+        ElementInput,
+        ElementOutput,
+        AccumElementType,
+        CTAShape,
+        ClusterShape,
+        MainloopScheduleType,
+        EpilogueScheduleType,
+        TileSchedulerType,
+        true>;
+    return launch_sm100_fp8_scaled_mm<Gemm, true>(out, a, b, scales_a, scales_b, bias);
+  } else {
+    using Gemm = DeviceGemmFp8RowwiseSm100<
+        ElementInput,
+        ElementOutput,
+        AccumElementType,
+        CTAShape,
+        ClusterShape,
+        MainloopScheduleType,
+        EpilogueScheduleType,
+        TileSchedulerType,
+        false>;
+    return launch_sm100_fp8_scaled_mm<Gemm, false>(out, a, b, scales_a, scales_b, bias);
+=======
   // Gemm type with bias
   using BiasGemmDefault = DeviceGemmFp8RowwiseSm100<
       ElementInput,
@@ -1155,6 +1189,7 @@ void sm100_fp8_dispatch_bias(
     } else {
       return launch_sm100_fp8_scaled_mm<GemmDefault, false>(out, a, b, scales_a, scales_b, bias);
     }
+>>>>>>> origin/main
   }
 }
 
@@ -1182,7 +1217,11 @@ torch::Tensor fp8_scaled_mm(
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
   TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
   TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
+<<<<<<< HEAD
+  TORCH_CHECK(mat_b.stride(0) == 1, "mat_a must be a column major tensor");
+=======
   TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
+>>>>>>> origin/main
   TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
 
   TORCH_CHECK(

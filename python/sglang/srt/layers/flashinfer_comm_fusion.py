@@ -1,15 +1,23 @@
 import logging
+<<<<<<< HEAD
+from typing import Tuple
+=======
 from typing import Optional, Tuple
+>>>>>>> origin/main
 
 import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+<<<<<<< HEAD
+from sglang.srt.utils import is_flashinfer_available
+=======
 from sglang.srt.utils import (
     direct_register_custom_op,
     is_flashinfer_available,
     supports_custom_op,
 )
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +104,11 @@ _workspace_manager = FlashInferWorkspaceManager()
 
 
 def ensure_workspace_initialized(
+<<<<<<< HEAD
+    max_token_num: int = 1024, hidden_dim: int = 4096, use_fp32_lamport: bool = False
+=======
     max_token_num: int = 2048, hidden_dim: int = 4096, use_fp32_lamport: bool = False
+>>>>>>> origin/main
 ):
     """Ensure workspace is initialized"""
     if not is_flashinfer_available() or _flashinfer_comm is None:
@@ -123,13 +135,22 @@ def ensure_workspace_initialized(
     return _workspace_manager.initialized
 
 
+<<<<<<< HEAD
+def flashinfer_allreduce_add_rmsnorm(
+=======
 def flashinfer_allreduce_residual_rmsnorm(
+>>>>>>> origin/main
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
+<<<<<<< HEAD
+    max_token_num: int = 1024,
+    use_oneshot: bool = True,
+=======
     max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
+>>>>>>> origin/main
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -200,6 +221,8 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+<<<<<<< HEAD
+=======
 def fake_flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -224,6 +247,7 @@ if supports_custom_op():
     )
 
 
+>>>>>>> origin/main
 def cleanup_flashinfer_workspace():
     global _workspace_manager
     if _workspace_manager is not None:

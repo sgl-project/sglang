@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 class MistralDetector(BaseFormatDetector):
     """
+<<<<<<< HEAD
+    Detector for Mistral models.
+    Assumes function call format:
+      [TOOL_CALLS] [{"name":"func1", "arguments":{...}}, {"name":"func2", "arguments":{...}}]
+=======
     Detector for Mistral model function call format.
 
     The Mistral format uses a simple bracket-delimited structure with JSON arrays
@@ -28,6 +33,7 @@ class MistralDetector(BaseFormatDetector):
     ```
 
     Reference: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default
+>>>>>>> origin/main
     """
 
     def __init__(self):

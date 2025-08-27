@@ -11,7 +11,10 @@ The eval output will be logged
 
 import argparse
 import asyncio
+<<<<<<< HEAD
+=======
 import re
+>>>>>>> origin/main
 import sys
 import time
 import traceback
@@ -126,6 +129,10 @@ async def eval_mmmu(args) -> None:
     client = openai.AsyncOpenAI(
         api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1"
     )
+<<<<<<< HEAD
+    semaphore = asyncio.Semaphore(args.concurrency)
+=======
+>>>>>>> origin/main
     start = time.perf_counter()
     base_url = f"http://127.0.0.1:{args.port}"
 
@@ -139,6 +146,18 @@ async def eval_mmmu(args) -> None:
 
         samples = samples[: args.profile_number]
 
+<<<<<<< HEAD
+    tasks = [
+        process_sample_with_semaphore(
+            semaphore, client, sample, sampling_params, lora_path
+        )
+        for sample in samples
+    ]
+
+    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+        sample, response = await coro
+        process_result(response, sample, answer_dict, out_samples)
+=======
     if args.concurrency == 1:
         # For concurrency == 1, run in sequential mode to ensure consistent order
         # this is mainly for profiling
@@ -179,6 +198,7 @@ async def eval_mmmu(args) -> None:
                 answer_dict,
                 out_samples,
             )
+>>>>>>> origin/main
 
     if args.profile:
         print("Stopping profiler...")
@@ -187,6 +207,11 @@ async def eval_mmmu(args) -> None:
             print("Profiler stopped")
 
     print(f"Benchmark time: {time.perf_counter() - start}")
+<<<<<<< HEAD
+    args.output_path = f"./val_sglang.json"
+    save_json(args.output_path, out_samples)
+    eval_result(model_answer_path=args.output_path, answer_dict=answer_dict)
+=======
     args.output_path = "./answer_sglang.json"
     save_json(args.output_path, out_samples)
     eval_result(
@@ -194,6 +219,7 @@ async def eval_mmmu(args) -> None:
         answer_dict=answer_dict,
         eval_output_path="./val_sglang.json",
     )
+>>>>>>> origin/main
 
 
 def parse_args():

@@ -1,8 +1,16 @@
+<<<<<<< HEAD
+import json
+import logging
+from dataclasses import dataclass
+from typing import List, Optional
+
+=======
 import logging
 from typing import List, Optional
 
 from sglang.srt.utils import get_bool_env_var, get_free_port, maybe_wrap_ipv6_address
 
+>>>>>>> origin/main
 logger = logging.getLogger(__name__)
 
 
@@ -27,9 +35,13 @@ class MooncakeTransferEngine:
             hostname=self.hostname,
             device_name=self.ib_device,
         )
+<<<<<<< HEAD
+        self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
+=======
         self.session_id = (
             f"{maybe_wrap_ipv6_address(self.hostname)}:{self.engine.get_rpc_port()}"
         )
+>>>>>>> origin/main
 
     def register(self, ptr, length):
         try:
@@ -51,6 +63,8 @@ class MooncakeTransferEngine:
         if ret_value != 0:
             logger.debug("Mooncake memory deregistration %s failed.", ptr)
 
+<<<<<<< HEAD
+=======
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
         """Batch register multiple memory regions."""
         try:
@@ -80,12 +94,21 @@ class MooncakeTransferEngine:
             logger.debug("Mooncake batch memory deregistration failed.")
         return ret_value
 
+>>>>>>> origin/main
     def initialize(
         self,
         hostname: str,
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
+<<<<<<< HEAD
+        ret_value = self.engine.initialize(
+            hostname,
+            "P2PHANDSHAKE",
+            "rdma",
+            device_name if device_name is not None else "",
+        )
+=======
         if get_bool_env_var("ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE", "false"):
             hostname += f":{get_free_port()}:npu_{self.gpu_id}"
             ret_value = self.engine.initialize(
@@ -101,6 +124,7 @@ class MooncakeTransferEngine:
                 "rdma",
                 device_name if device_name is not None else "",
             )
+>>>>>>> origin/main
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")

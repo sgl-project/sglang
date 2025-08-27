@@ -31,12 +31,18 @@ from sglang.srt.managers.io_struct import (
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+<<<<<<< HEAD
+=======
     FreezeGCReq,
+>>>>>>> origin/main
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
+<<<<<<< HEAD
+=======
     freeze_gc,
+>>>>>>> origin/main
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
@@ -102,19 +108,29 @@ class DetokenizerManager:
                 (BatchEmbeddingOut, self.handle_batch_embedding_out),
                 (BatchTokenIDOut, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
+<<<<<<< HEAD
+            ]
+        )
+
+=======
                 (FreezeGCReq, self.handle_freeze_gc_req),
             ]
         )
 
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
 
+>>>>>>> origin/main
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
+<<<<<<< HEAD
+            self.send_to_tokenizer.send_pyobj(output)
+=======
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+>>>>>>> origin/main
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -135,9 +151,12 @@ class DetokenizerManager:
 
         # Trim stop token.
         if isinstance(matched, int) and isinstance(output, list):
+<<<<<<< HEAD
+=======
             # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
             if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
                 return output
+>>>>>>> origin/main
             assert len(output) > 0
             return output[:-1]
         return output
@@ -225,7 +244,11 @@ class DetokenizerManager:
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
+<<<<<<< HEAD
+            output_ids=None,
+=======
             output_ids=recv_obj.decode_ids,
+>>>>>>> origin/main
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
@@ -256,10 +279,13 @@ class DetokenizerManager:
             cached_tokens=recv_obj.cached_tokens,
         )
 
+<<<<<<< HEAD
+=======
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")
         return None
 
+>>>>>>> origin/main
 
 class LimitedCapacityDict(OrderedDict):
     def __init__(self, capacity: int, *args, **kwargs):

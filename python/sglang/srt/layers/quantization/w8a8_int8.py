@@ -1,3 +1,6 @@
+<<<<<<< HEAD
+from typing import Any, Callable, Dict, List, Optional
+=======
 from __future__ import annotations
 
 import importlib
@@ -15,10 +18,26 @@ from typing import (
     Union,
     cast,
 )
+>>>>>>> origin/main
 
 import torch
 from torch.nn.parameter import Parameter
 
+<<<<<<< HEAD
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.linear import LinearMethodBase
+from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+=======
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -44,19 +63,25 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_npu,
+>>>>>>> origin/main
     set_weight_attrs,
     use_intel_amx_backend,
 )
 
+<<<<<<< HEAD
+=======
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
+>>>>>>> origin/main
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
+<<<<<<< HEAD
+=======
 _is_npu = is_npu()
 
 if _is_npu:
@@ -179,6 +204,7 @@ def npu_fused_experts(
     if len(original_shape) == 3:
         final_hidden_states = final_hidden_states.view(original_shape)
     return final_hidden_states
+>>>>>>> origin/main
 
 
 class W8A8Int8Config(QuantizationConfig):
@@ -188,6 +214,18 @@ class W8A8Int8Config(QuantizationConfig):
     - Activation: dynamic, per-token, symmetric
     """
 
+<<<<<<< HEAD
+    def __init__(self):
+        pass
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 75
+=======
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         self.quant_description = quant_config
@@ -230,6 +268,7 @@ class W8A8Int8Config(QuantizationConfig):
             )
         else:
             return 75
+>>>>>>> origin/main
 
     @classmethod
     def get_name(self) -> str:
@@ -237,6 +276,13 @@ class W8A8Int8Config(QuantizationConfig):
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
+<<<<<<< HEAD
+        return []
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "W8A8Int8Config":
+        return cls()
+=======
         filenames = []
         if _is_npu:
             filenames.append("quant_model_description.json")
@@ -245,11 +291,18 @@ class W8A8Int8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
         return cls(config)
+>>>>>>> origin/main
 
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
+<<<<<<< HEAD
+    ) -> Optional["QuantizeMethodBase"]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+=======
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -287,12 +340,15 @@ class W8A8Int8Config(QuantizationConfig):
             prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
             return UnquantizedLinearMethod()
+>>>>>>> origin/main
         if isinstance(layer, LinearBase):
             return W8A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return W8A8Int8MoEMethod(self)
         return None
 
+<<<<<<< HEAD
+=======
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
     ):
@@ -324,6 +380,7 @@ class W8A8Int8Config(QuantizationConfig):
         assert is_skipped is not None
         return is_skipped
 
+>>>>>>> origin/main
     def get_scaled_act_names(self) -> List[str]:
         return []
 
@@ -398,7 +455,11 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         )
 
 
+<<<<<<< HEAD
+class W8A8Int8MoEMethod:
+=======
 class W8A8Int8MoEMethod(FusedMoEMethodBase):
+>>>>>>> origin/main
     """MoE method for INT8.
     Supports loading INT8 checkpoints with static weight scale and
     dynamic/static activation scale.
@@ -409,7 +470,29 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
+<<<<<<< HEAD
+    def __new__(cls, *args, **kwargs):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
+
+        if not hasattr(cls, "_initialized"):
+            original_init = cls.__init__
+            new_cls = type(
+                cls.__name__,
+                (FusedMoEMethodBase,),
+                {
+                    "__init__": original_init,
+                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
+                },
+            )
+            obj = super(new_cls, new_cls).__new__(new_cls)
+            obj.__init__(*args, **kwargs)
+            return obj
+        return super().__new__(cls)
+
+    def __init__(self, quant_config):
+=======
     def __init__(self, quant_config: W8A8Int8Config):
+>>>>>>> origin/main
         self.quant_config = quant_config
 
     def create_weights(
@@ -487,6 +570,42 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+<<<<<<< HEAD
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        from sglang.srt.layers.moe.topk import select_experts
+
+        # Expert selection
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
+        if use_intel_amx_backend(layer):
+=======
         topk_output: TopKOutput,
         moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
@@ -499,6 +618,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             x, topk_weights = apply_topk_weights_cpu(
                 moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
+>>>>>>> origin/main
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
@@ -520,14 +640,26 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             x,
             layer.w13_weight,
             layer.w2_weight,
+<<<<<<< HEAD
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=inplace,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+=======
             topk_output=topk_output,
             moe_runner_config=moe_runner_config,
+>>>>>>> origin/main
             use_int8_w8a8=True,
             per_channel_quant=True,
             w1_scale=(layer.w13_weight_scale),
             w2_scale=(layer.w2_weight_scale),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+<<<<<<< HEAD
+            no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
+=======
         )
 
 
@@ -989,4 +1121,5 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
+>>>>>>> origin/main
         )

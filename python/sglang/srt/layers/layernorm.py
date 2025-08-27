@@ -27,7 +27,10 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+<<<<<<< HEAD
+=======
     supports_custom_op,
+>>>>>>> origin/main
 )
 
 _is_cuda = is_cuda()
@@ -62,15 +65,21 @@ class RMSNorm(CustomOp):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+<<<<<<< HEAD
+=======
         var_hidden_size: Optional[int] = None,
+>>>>>>> origin/main
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+<<<<<<< HEAD
+=======
         self.hidden_size = hidden_size
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
+>>>>>>> origin/main
         if _use_aiter:
             self._forward_method = self.forward_aiter
 
@@ -79,8 +88,11 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+<<<<<<< HEAD
+=======
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
+>>>>>>> origin/main
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
@@ -146,6 +158,9 @@ class RMSNorm(CustomOp):
             x = x + residual.to(torch.float32)
             residual = x.to(orig_dtype)
 
+<<<<<<< HEAD
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+=======
         hidden_size = x.shape[-1]
         if hidden_size != self.hidden_size:
             raise ValueError(
@@ -165,6 +180,7 @@ class RMSNorm(CustomOp):
             x_var = x[..., : self.variance_size_override]
 
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+>>>>>>> origin/main
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = (x * self.weight).to(orig_dtype)
         if residual is None:
@@ -200,6 +216,13 @@ class RMSNorm(CustomOp):
         if residual is not None:
             from sglang.srt.distributed import get_tensor_model_parallel_world_size
             from sglang.srt.layers.flashinfer_comm_fusion import (
+<<<<<<< HEAD
+                flashinfer_allreduce_add_rmsnorm,
+            )
+
+            if get_tensor_model_parallel_world_size() > 1:
+                fused_result = flashinfer_allreduce_add_rmsnorm(
+=======
                 flashinfer_allreduce_residual_rmsnorm,
             )
 
@@ -211,6 +234,7 @@ class RMSNorm(CustomOp):
 
             if get_tensor_model_parallel_world_size() > 1:
                 fused_result = fused_op(
+>>>>>>> origin/main
                     input_tensor=x,
                     residual=residual,
                     weight=self.weight,

@@ -12,6 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 
+<<<<<<< HEAD
+import math
+from typing import Callable, Optional
+=======
 from __future__ import annotations
 
 import logging
@@ -26,21 +30,34 @@ from typing import (
     TypeGuard,
     runtime_checkable,
 )
+>>>>>>> origin/main
 
 import torch
 import torch.nn.functional as F
 
+<<<<<<< HEAD
+from sglang.srt.eplb import expert_location_dispatch
+from sglang.srt.eplb.expert_distribution import (
+    ExpertDistributionRecorder,
+    get_global_expert_distribution_recorder,
+)
+=======
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+>>>>>>> origin/main
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+<<<<<<< HEAD
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+=======
 from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
 )
+>>>>>>> origin/main
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -51,6 +68,14 @@ from sglang.srt.utils import (
     is_npu,
 )
 
+<<<<<<< HEAD
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+_is_npu = is_npu()
+=======
 try:
     from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
 except ImportError:
@@ -64,6 +89,7 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+>>>>>>> origin/main
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -75,6 +101,8 @@ if _use_aiter:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+<<<<<<< HEAD
+=======
 if _is_npu:
     import torch_npu
 
@@ -340,6 +368,7 @@ class TopK(CustomOp):
 
 
 # ------------------------------- TopK implementation -------------------------------------
+>>>>>>> origin/main
 
 
 def fused_topk_torch_native(
@@ -368,15 +397,22 @@ def fused_topk_cpu(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+<<<<<<< HEAD
+):
+    return torch.ops.sgl_kernel.topk_softmax_cpu(
+=======
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
+>>>>>>> origin/main
         hidden_states=hidden_states,
         gating_output=gating_output,
         topk=topk,
         renormalize=renormalize,
     )
+<<<<<<< HEAD
+=======
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
@@ -393,6 +429,7 @@ def apply_topk_weights_cpu(need_apply, topk_weights, inputs):
     )  # clear topk_weights as already applied
 
     return inputs, topk_weights
+>>>>>>> origin/main
 
 
 def fused_topk(
@@ -431,13 +468,21 @@ def grouped_topk_gpu(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+<<<<<<< HEAD
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+=======
     num_expert_group: Optional[int] = None,
     topk_group: Optional[int] = None,
+>>>>>>> origin/main
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+<<<<<<< HEAD
+=======
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+>>>>>>> origin/main
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -461,6 +506,9 @@ def grouped_topk_gpu(
         .reshape(num_token, -1)
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+<<<<<<< HEAD
+    topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+=======
     # TODO: NPU can't support directly evaluating a comparison for now
     topk_weights, topk_ids = torch.topk(
         tmp_scores,
@@ -468,6 +516,7 @@ def grouped_topk_gpu(
         dim=-1,
         sorted=(True if num_fused_shared_experts > 0 else False),
     )
+>>>>>>> origin/main
     if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
             low=num_experts,
@@ -485,8 +534,11 @@ def grouped_topk_gpu(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
+<<<<<<< HEAD
+=======
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
+>>>>>>> origin/main
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
@@ -499,15 +551,24 @@ def grouped_topk_cpu(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+<<<<<<< HEAD
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+=======
     num_expert_group: Optional[int] = None,
     topk_group: Optional[int] = None,
+>>>>>>> origin/main
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+<<<<<<< HEAD
+):
+=======
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
     assert not apply_routed_scaling_factor_on_output
+>>>>>>> origin/main
     assert expert_location_dispatch_info is None
     return torch.ops.sgl_kernel.grouped_topk_cpu(
         hidden_states,
@@ -522,20 +583,31 @@ def grouped_topk_cpu(
     )
 
 
+<<<<<<< HEAD
+=======
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+>>>>>>> origin/main
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
     topk: int,
     renormalize: bool,
+<<<<<<< HEAD
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+=======
     num_expert_group: Optional[int] = None,
     topk_group: Optional[int] = None,
+>>>>>>> origin/main
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+<<<<<<< HEAD
+=======
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+>>>>>>> origin/main
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -561,6 +633,9 @@ def biased_grouped_topk_impl(
     tmp_scores = scores_for_choice.masked_fill(
         ~score_mask.bool(), float("-inf")
     )  # [n, e]
+<<<<<<< HEAD
+    _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+=======
     # TODO: NPU can't support directly evaluating a comparison for now
     _, topk_ids = torch.topk(
         tmp_scores,
@@ -568,6 +643,7 @@ def biased_grouped_topk_impl(
         dim=-1,
         sorted=(True if num_fused_shared_experts > 0 else False),
     )
+>>>>>>> origin/main
     topk_weights = scores.gather(1, topk_ids)
 
     if num_fused_shared_experts:
@@ -587,8 +663,11 @@ def biased_grouped_topk_impl(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
+<<<<<<< HEAD
+=======
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
+>>>>>>> origin/main
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
@@ -625,13 +704,22 @@ def biased_grouped_topk_gpu(
     correction_bias: torch.Tensor,
     topk: int,
     renormalize: bool,
+<<<<<<< HEAD
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    compiled: bool = True,
+=======
     num_expert_group: Optional[int] = None,
     topk_group: Optional[int] = None,
+>>>>>>> origin/main
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+<<<<<<< HEAD
+=======
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+>>>>>>> origin/main
 ):
     assert (
         routed_scaling_factor is not None
@@ -644,14 +732,21 @@ def biased_grouped_topk_gpu(
         and is_power_of_two(correction_bias.shape[0])
     ):
         topk_weights, topk_ids = moe_fused_gate(
+<<<<<<< HEAD
+            gating_output,
+=======
             gating_output.to(dtype=torch.float32),
+>>>>>>> origin/main
             correction_bias,
             num_expert_group,
             topk_group,
             topk,
             num_fused_shared_experts,
             routed_scaling_factor,
+<<<<<<< HEAD
+=======
             apply_routed_scaling_factor_on_output,
+>>>>>>> origin/main
         )
         # TODO merge into kernel
         if (expert_location_dispatch_info is not None) or (
@@ -662,7 +757,10 @@ def biased_grouped_topk_gpu(
             )
         return topk_weights, topk_ids
     elif _use_aiter:
+<<<<<<< HEAD
+=======
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
+>>>>>>> origin/main
         token = gating_output.shape[0]
         device = gating_output.device
         assert (
@@ -671,7 +769,11 @@ def biased_grouped_topk_gpu(
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
+<<<<<<< HEAD
+            gating_output,
+=======
             gating_output.to(dtype=torch.float32),
+>>>>>>> origin/main
             correction_bias,
             topk_weights,
             topk_ids,
@@ -682,7 +784,18 @@ def biased_grouped_topk_gpu(
         )
         return topk_weights, topk_ids
     else:
+<<<<<<< HEAD
+        biased_grouped_topk_fn = (
+            torch.compile(
+                biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
+            )
+            if compiled
+            else biased_grouped_topk_impl
+        )
+        return biased_grouped_topk_fn(
+=======
         return biased_grouped_topk_impl(
+>>>>>>> origin/main
             hidden_states,
             gating_output,
             correction_bias,
@@ -694,7 +807,10 @@ def biased_grouped_topk_gpu(
             routed_scaling_factor=routed_scaling_factor,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+<<<<<<< HEAD
+=======
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+>>>>>>> origin/main
         )
 
 
@@ -704,17 +820,27 @@ def biased_grouped_topk_cpu(
     correction_bias: torch.Tensor,
     topk: int,
     renormalize: bool,
+<<<<<<< HEAD
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+=======
     num_expert_group: Optional[int] = None,
     topk_group: Optional[int] = None,
+>>>>>>> origin/main
     compiled: bool = True,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+<<<<<<< HEAD
+):
+    assert expert_location_dispatch_info is None
+=======
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
     assert expert_location_dispatch_info is None
     assert not apply_routed_scaling_factor_on_output, "Not implemented"
+>>>>>>> origin/main
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
         gating_output,
@@ -733,7 +859,10 @@ if _is_cpu and _is_cpu_amx_available:
     biased_grouped_topk = biased_grouped_topk_cpu
     grouped_topk = grouped_topk_cpu
     fused_topk_native = fused_topk_cpu
+<<<<<<< HEAD
+=======
     fused_topk = fused_topk_cpu
+>>>>>>> origin/main
 else:
     biased_grouped_topk = biased_grouped_topk_gpu
     grouped_topk = grouped_topk_gpu
@@ -743,6 +872,21 @@ else:
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
+<<<<<<< HEAD
+    top_k: int,
+    use_grouped_topk: bool,
+    renormalize: bool,
+    topk_group: Optional[int] = None,
+    num_expert_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
+    custom_routing_function: Optional[Callable] = None,
+    correction_bias: Optional[torch.Tensor] = None,
+    torch_native: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+):
+=======
     topk_config: TopKConfig,
     *,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -763,6 +907,7 @@ def select_experts(
         topk_config.apply_routed_scaling_factor_on_output
     )
 
+>>>>>>> origin/main
     router_logits, correction_bias = (
         expert_location_dispatch.transform_select_experts_inputs(
             router_logits=router_logits,
@@ -787,7 +932,10 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
+<<<<<<< HEAD
+=======
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+>>>>>>> origin/main
             )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
@@ -802,14 +950,20 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
+<<<<<<< HEAD
+=======
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+>>>>>>> origin/main
             )
     elif torch_native and custom_routing_function is None:
         assert (
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in fused_topk_native"
         assert expert_location_dispatch_info is None
+<<<<<<< HEAD
+=======
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
+>>>>>>> origin/main
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -817,7 +971,10 @@ def select_experts(
             renormalize=renormalize,
         )
     elif custom_routing_function is None:
+<<<<<<< HEAD
+=======
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
+>>>>>>> origin/main
         # Qwen3MOE uses fused_topk
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
@@ -832,7 +989,10 @@ def select_experts(
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in custom_routing_function"
         assert expert_location_dispatch_info is None
+<<<<<<< HEAD
+=======
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
+>>>>>>> origin/main
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -842,4 +1002,8 @@ def select_experts(
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
+<<<<<<< HEAD
+    return topk_weights, topk_ids
+=======
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+>>>>>>> origin/main

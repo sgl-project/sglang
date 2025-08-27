@@ -91,6 +91,12 @@ class LlamaMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
+<<<<<<< HEAD
+    def forward(self, x, forward_batch=None):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+=======
     def forward(
         self,
         x,
@@ -103,6 +109,7 @@ class LlamaMLP(nn.Module):
             x,
             skip_all_reduce=use_reduce_scatter,
         )
+>>>>>>> origin/main
         return x
 
 
@@ -488,6 +495,8 @@ class LlamaForCausalLM(nn.Module):
         else:
             return hidden_states
 
+<<<<<<< HEAD
+=======
     @torch.no_grad()
     def forward_split_prefill(
         self,
@@ -529,6 +538,7 @@ class LlamaForCausalLM(nn.Module):
 
         return result
 
+>>>>>>> origin/main
     @property
     def start_layer(self):
         return self.model.start_layer
@@ -540,6 +550,34 @@ class LlamaForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+<<<<<<< HEAD
+    def get_hidden_dim(self, module_name):
+        # return input_dim, output_dim
+        if module_name in ["q_proj", "o_proj", "qkv_proj"]:
+            return self.config.hidden_size, self.config.hidden_size
+        elif module_name in ["kv_proj"]:
+            return self.config.hidden_size, self.config.hidden_size // (
+                self.config.num_attention_heads // self.config.num_key_value_heads
+            )
+        elif module_name == "gate_up_proj":
+            return self.config.hidden_size, self.config.intermediate_size
+        elif module_name == "down_proj":
+            return self.config.intermediate_size, self.config.hidden_size
+        else:
+            raise NotImplementedError()
+
+    def get_module_name(self, name):
+        params_mapping = {
+            "q_proj": "qkv_proj",
+            "k_proj": "qkv_proj",
+            "v_proj": "qkv_proj",
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+        }
+        return params_mapping.get(name, name)
+
+=======
+>>>>>>> origin/main
     def get_module_name_from_weight_name(self, name):
         for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
             if weight_name in name:
@@ -599,8 +637,11 @@ class LlamaForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+<<<<<<< HEAD
+=======
                 if name not in params_dict:
                     continue
+>>>>>>> origin/main
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)

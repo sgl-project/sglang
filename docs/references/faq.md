@@ -1,3 +1,8 @@
+<<<<<<< HEAD
+# Frequently Asked Questions
+
+## The results are not deterministic, even with a temperature of 0
+=======
 # Troubleshooting and Frequently Asked Questions
 
 ## Troubleshooting
@@ -21,6 +26,7 @@ This error may result from kernel errors or out-of-memory issues:
 ## Frequently Asked Questions
 
 ### The results are not deterministic, even with a temperature of 0
+>>>>>>> origin/main
 
 You may notice that when you send the same request twice, the results from the engine will be slightly different, even when the temperature is set to 0.
 

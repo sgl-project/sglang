@@ -67,7 +67,10 @@ def find_nccl_library() -> str:
 
 ncclResult_t = ctypes.c_int
 ncclComm_t = ctypes.c_void_p
+<<<<<<< HEAD
+=======
 ncclWindow_t = ctypes.c_void_p
+>>>>>>> origin/main
 
 
 class ncclUniqueId(ctypes.Structure):
@@ -206,6 +209,8 @@ class NCCLLibrary:
                 cudaStream_t,
             ],
         ),
+<<<<<<< HEAD
+=======
         # ncclResult_t  ncclReduce(
         #   const void* sendbuff, void* recvbuff, size_t count,
         #   ncclDataType_t datatype, ncclRedOp_t op, int root,
@@ -226,6 +231,7 @@ class NCCLLibrary:
                 cudaStream_t,
             ],
         ),
+>>>>>>> origin/main
         # ncclResult_t  ncclReduceScatter(
         #   const void* sendbuff, void* recvbuff, size_t count,
         #   ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
@@ -298,6 +304,8 @@ class NCCLLibrary:
         # it is better not to call it at all.
         # ncclResult_t  ncclCommDestroy(ncclComm_t comm);
         Function("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
+<<<<<<< HEAD
+=======
         # ncclResult_t ncclGroupStart();
         Function("ncclGroupStart", ncclResult_t, []),
         # ncclResult_t ncclGroupEnd();
@@ -319,6 +327,7 @@ class NCCLLibrary:
         ),
         # ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win);
         Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
+>>>>>>> origin/main
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -354,10 +363,14 @@ class NCCLLibrary:
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
+<<<<<<< HEAD
+            for func in NCCLLibrary.exported_functions:
+=======
             exported_functions = NCCLLibrary.exported_functions
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
             for func in exported_functions:
+>>>>>>> origin/main
                 f = getattr(self.lib, func.name)
                 f.restype = func.restype
                 f.argtypes = func.argtypes
@@ -373,6 +386,12 @@ class NCCLLibrary:
             error_str = self.ncclGetErrorString(result)
             raise RuntimeError(f"NCCL error: {error_str}")
 
+<<<<<<< HEAD
+    def ncclGetVersion(self) -> str:
+        version = ctypes.c_int()
+        self.NCCL_CHECK(self._funcs["ncclGetVersion"](ctypes.byref(version)))
+        version_str = str(version.value)
+=======
     def ncclGetRawVersion(self) -> int:
         version = ctypes.c_int()
         self.NCCL_CHECK(self._funcs["ncclGetVersion"](ctypes.byref(version)))
@@ -381,6 +400,7 @@ class NCCLLibrary:
 
     def ncclGetVersion(self) -> str:
         version_str = str(self.ncclGetRawVersion())
+>>>>>>> origin/main
         # something like 21903 --> "2.19.3"
         major = version_str[0].lstrip("0")
         minor = version_str[1:3].lstrip("0")
@@ -424,6 +444,8 @@ class NCCLLibrary:
             )
         )
 
+<<<<<<< HEAD
+=======
     def ncclReduce(
         self,
         sendbuff: buffer_type,
@@ -446,6 +468,7 @@ class NCCLLibrary:
             )
         )
 
+>>>>>>> origin/main
     def ncclReduceScatter(
         self,
         sendbuff: buffer_type,
@@ -531,6 +554,8 @@ class NCCLLibrary:
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))
 
+<<<<<<< HEAD
+=======
     def ncclCommWindowRegister(
         self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int
     ) -> ncclWindow_t:
@@ -551,6 +576,7 @@ class NCCLLibrary:
     def ncclGroupEnd(self) -> None:
         self.NCCL_CHECK(self._funcs["ncclGroupEnd"]())
 
+>>>>>>> origin/main
 
 __all__ = [
     "NCCLLibrary",

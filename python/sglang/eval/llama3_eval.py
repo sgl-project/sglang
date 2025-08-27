@@ -12,6 +12,10 @@ from dataclasses import dataclass
 import httpx
 import numpy as np
 import openai
+<<<<<<< HEAD
+import transformers
+=======
+>>>>>>> origin/main
 from datasets import load_dataset
 from openai import AsyncOpenAI
 from tqdm import tqdm

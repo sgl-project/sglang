@@ -56,6 +56,16 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
                     "if the model is custom)."
                 )
             model_module = auto_modules["AutoModel"]
+<<<<<<< HEAD
+        if model_config.impl == ModelImpl.TRANSFORMERS:
+            if not model_module.is_backend_compatible():
+                raise ValueError(
+                    f"The Transformers implementation of {arch} is not "
+                    "compatible with vLLM."
+                )
+            architectures[i] = "TransformersForCausalLM"
+        if model_config.impl == ModelImpl.AUTO:
+=======
         if model_config.model_impl == ModelImpl.TRANSFORMERS:
             if not model_module.is_backend_compatible():
                 raise ValueError(
@@ -64,6 +74,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
                 )
             architectures[i] = "TransformersForCausalLM"
         if model_config.model_impl == ModelImpl.AUTO:
+>>>>>>> origin/main
             if not model_module.is_backend_compatible():
                 raise ValueError(
                     f"{arch} has no SGlang implementation and the Transformers "
@@ -97,7 +108,11 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     supported_archs = ModelRegistry.get_supported_archs()
     is_native_supported = any(arch in supported_archs for arch in architectures)
 
+<<<<<<< HEAD
+    if not is_native_supported or model_config.impl == ModelImpl.TRANSFORMERS:
+=======
     if not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
+>>>>>>> origin/main
         architectures = resolve_transformers_arch(model_config, architectures)
 
     return ModelRegistry.resolve_model_cls(architectures)

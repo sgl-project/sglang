@@ -3,8 +3,12 @@ from __future__ import annotations
 import functools
 import logging
 from contextlib import contextmanager
+<<<<<<< HEAD
+from typing import TYPE_CHECKING, List
+=======
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
+>>>>>>> origin/main
 
 import torch
 import triton
@@ -12,21 +16,36 @@ import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
+<<<<<<< HEAD
+=======
     get_tensor_model_parallel_rank,
+>>>>>>> origin/main
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 
+<<<<<<< HEAD
+=======
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
 
+>>>>>>> origin/main
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+<<<<<<< HEAD
+_ATTN_TP_GROUP = None
+_ATTN_TP_RANK = None
+_ATTN_TP_SIZE = None
+_ATTN_DP_RANK = None
+_ATTN_DP_SIZE = None
+_LOCAL_ATTN_DP_SIZE = None
+_LOCAL_ATTN_DP_RANK = None
+=======
 _ATTN_TP_GROUP: Optional[GroupCoordinator] = None
 _ATTN_TP_RANK: Optional[int] = None
 _ATTN_TP_SIZE: Optional[int] = None
@@ -148,6 +167,7 @@ def get_local_dp_buffer_len() -> int:
 
 def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
+>>>>>>> origin/main
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
@@ -179,6 +199,20 @@ def compute_dp_attention_local_info(
 
 
 def initialize_dp_attention(
+<<<<<<< HEAD
+    enable_dp_attention: bool,
+    tp_rank: int,
+    tp_size: int,
+    dp_size: int,
+    moe_dense_tp_size: int,
+    pp_size: int,
+):
+    global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE
+    global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK
+
+    from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
+
+=======
     server_args: ServerArgs,
     model_config: ModelConfig,
 ):
@@ -197,6 +231,7 @@ def initialize_dp_attention(
 
     _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
+>>>>>>> origin/main
     _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size
     )
@@ -231,6 +266,10 @@ def initialize_dp_attention(
         group_name="attention_tp",
     )
 
+<<<<<<< HEAD
+
+def get_attention_tp_group():
+=======
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
@@ -243,36 +282,61 @@ def is_dp_attention_enabled() -> bool:
 
 
 def get_attention_tp_group() -> GroupCoordinator:
+>>>>>>> origin/main
     assert _ATTN_TP_GROUP is not None, "dp attention not initialized!"
     return _ATTN_TP_GROUP
 
 
+<<<<<<< HEAD
+def get_attention_tp_rank():
+=======
 def get_attention_tp_rank() -> int:
+>>>>>>> origin/main
     assert _ATTN_TP_RANK is not None, "dp attention not initialized!"
     return _ATTN_TP_RANK
 
 
+<<<<<<< HEAD
+def get_attention_tp_size():
+=======
 def get_attention_tp_size() -> int:
+>>>>>>> origin/main
     assert _ATTN_TP_SIZE is not None, "dp attention not initialized!"
     return _ATTN_TP_SIZE
 
 
+<<<<<<< HEAD
+def get_attention_dp_rank():
+=======
 def get_attention_dp_rank() -> int:
+>>>>>>> origin/main
     assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
     return _ATTN_DP_RANK
 
 
+<<<<<<< HEAD
+def get_attention_dp_size():
+=======
 def get_attention_dp_size() -> int:
+>>>>>>> origin/main
     assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
     return _ATTN_DP_SIZE
 
 
+<<<<<<< HEAD
+def get_local_attention_dp_rank():
+=======
 def get_local_attention_dp_rank() -> int:
+>>>>>>> origin/main
     assert _LOCAL_ATTN_DP_RANK is not None, "dp attention not initialized!"
     return _LOCAL_ATTN_DP_RANK
 
 
+<<<<<<< HEAD
+def get_local_attention_dp_size():
+=======
 def get_local_attention_dp_size() -> int:
+>>>>>>> origin/main
     assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
     return _LOCAL_ATTN_DP_SIZE
 
@@ -298,7 +362,11 @@ def disable_dp_size():
         _ATTN_DP_SIZE = old_dp_size
 
 
+<<<<<<< HEAD
+def get_dp_local_info(forward_batch: ForwardBatch):
+=======
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
+>>>>>>> origin/main
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
     dp_rank = get_attention_dp_rank()
 
@@ -357,7 +425,11 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
+<<<<<<< HEAD
+def _dp_gather(
+=======
 def _dp_gather_via_all_reduce(
+>>>>>>> origin/main
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -374,6 +446,16 @@ def _dp_gather_via_all_reduce(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
+<<<<<<< HEAD
+        # NOTE: During draft extend, the gathered_buffer is padded to num_tokens * (speculative_num_steps + 1).
+        # But the size of local_tokens is total accepted tokens. We need to reduce the local_num_tokens to the
+        # actual size of the accepted tokens.
+        if forward_batch.forward_mode.is_draft_extend():
+            shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
+            local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
+
+=======
+>>>>>>> origin/main
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
@@ -392,6 +474,8 @@ def _dp_gather_via_all_reduce(
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
+<<<<<<< HEAD
+=======
 def _dp_gather_via_all_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -428,6 +512,7 @@ def _dp_gather(
         )
 
 
+>>>>>>> origin/main
 def dp_gather_partial(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -461,11 +546,32 @@ def dp_scatter(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
 
+<<<<<<< HEAD
+        # NOTE: During draft extend, the gathered_buffer is padded to num_tokens * (speculative_num_steps + 1).
+        # But the size of local_tokens is total accepted tokens. We need to reduce the local_num_tokens to the
+        # actual size of the accepted tokens.
+        if forward_batch.forward_mode.is_draft_extend():
+            shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
+            local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
+
+=======
+>>>>>>> origin/main
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
 
 
+<<<<<<< HEAD
+def attn_tp_reduce_scatter(
+    output: torch.Tensor,
+    input_list: List[torch.Tensor],
+):
+    return get_attention_tp_group().reduce_scatter(output, input_list)
+
+
+def attn_tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
+    return get_attention_tp_group().all_gather(input_, output_tensor_list=output_list)
+=======
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
         get_tp_group().reduce_scatter_tensor(output, input)
@@ -487,3 +593,4 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+>>>>>>> origin/main

@@ -3,6 +3,10 @@ Unit tests for Jinja chat template utils.
 """
 
 import unittest
+<<<<<<< HEAD
+from unittest.mock import patch
+=======
+>>>>>>> origin/main
 
 from sglang.srt.jinja_template_utils import (
     detect_jinja_template_content_format,
@@ -60,6 +64,8 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         result = detect_jinja_template_content_format("")
         self.assertEqual(result, "string")
 
+<<<<<<< HEAD
+=======
     def test_detect_msg_content_pattern(self):
         """Test detection of template with msg.content pattern (should be 'openai' format)."""
         msg_content_pattern = """
@@ -140,6 +146,7 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         result = detect_jinja_template_content_format(msg_content_pattern)
         self.assertEqual(result, "openai")
 
+>>>>>>> origin/main
     def test_process_content_openai_format(self):
         """Test content processing for openai format."""
         msg_dict = {
@@ -155,17 +162,28 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+<<<<<<< HEAD
+=======
         video_data = []
+>>>>>>> origin/main
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
+<<<<<<< HEAD
+            msg_dict, "openai", image_data, audio_data, modalities
+=======
             msg_dict, "openai", image_data, video_data, audio_data, modalities
+>>>>>>> origin/main
         )
 
         # Check that image_data was extracted
         self.assertEqual(len(image_data), 1)
+<<<<<<< HEAD
+        self.assertEqual(image_data[0], "http://example.com/image.jpg")
+=======
         self.assertEqual(image_data[0].url, "http://example.com/image.jpg")
+>>>>>>> origin/main
 
         # Check that content was normalized
         expected_content = [
@@ -191,12 +209,19 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+<<<<<<< HEAD
+=======
         video_data = []
+>>>>>>> origin/main
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
+<<<<<<< HEAD
+            msg_dict, "string", image_data, audio_data, modalities
+=======
             msg_dict, "string", image_data, video_data, audio_data, modalities
+>>>>>>> origin/main
         )
 
         # For string format, should flatten to text only
@@ -220,12 +245,19 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+<<<<<<< HEAD
+=======
         video_data = []
+>>>>>>> origin/main
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
+<<<<<<< HEAD
+            msg_dict, "openai", image_data, audio_data, modalities
+=======
             msg_dict, "openai", image_data, video_data, audio_data, modalities
+>>>>>>> origin/main
         )
 
         # Check that audio_data was extracted
@@ -244,12 +276,19 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         msg_dict = {"role": "user", "content": "Hello world"}
 
         image_data = []
+<<<<<<< HEAD
+=======
         video_data = []
+>>>>>>> origin/main
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
+<<<<<<< HEAD
+            msg_dict, "openai", image_data, audio_data, modalities
+=======
             msg_dict, "openai", image_data, video_data, audio_data, modalities
+>>>>>>> origin/main
         )
 
         # Should pass through unchanged
@@ -271,12 +310,19 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+<<<<<<< HEAD
+=======
         video_data = []
+>>>>>>> origin/main
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
+<<<<<<< HEAD
+            msg_dict, "openai", image_data, audio_data, modalities
+=======
             msg_dict, "openai", image_data, video_data, audio_data, modalities
+>>>>>>> origin/main
         )
 
         # Check that modalities was extracted
@@ -293,12 +339,19 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+<<<<<<< HEAD
+=======
         video_data = []
+>>>>>>> origin/main
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
+<<<<<<< HEAD
+            msg_dict, "string", image_data, audio_data, modalities
+=======
             msg_dict, "string", image_data, video_data, audio_data, modalities
+>>>>>>> origin/main
         )
 
         # None values should be filtered out

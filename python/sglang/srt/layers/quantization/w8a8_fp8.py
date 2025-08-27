@@ -1,14 +1,24 @@
+<<<<<<< HEAD
+from typing import Any, Callable, Dict, List, Optional
+=======
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+>>>>>>> origin/main
 
 import torch
 from torch.nn.parameter import Parameter
 
+<<<<<<< HEAD
+from sglang.srt.layers.linear import LinearMethodBase
+from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
+from sglang.srt.layers.quantization.base_config import (
+=======
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
+>>>>>>> origin/main
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -25,10 +35,13 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.utils import set_weight_attrs
 
+<<<<<<< HEAD
+=======
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
+>>>>>>> origin/main
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
@@ -71,7 +84,11 @@ class W8A8Fp8Config(QuantizationConfig):
         return []
 
     @classmethod
+<<<<<<< HEAD
+    def from_config(cls, config: Dict[str, Any]) -> "W8A8Fp8Config":
+=======
     def from_config(cls, config: Dict[str, Any]) -> W8A8Fp8Config:
+>>>>>>> origin/main
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = (
             "compressed-tensors" in quant_method or "w8a8_fp8" in quant_method
@@ -82,7 +99,11 @@ class W8A8Fp8Config(QuantizationConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
+<<<<<<< HEAD
+    ) -> Optional["QuantizeMethodBase"]:
+=======
     ) -> Optional[QuantizeMethodBase]:
+>>>>>>> origin/main
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
@@ -190,7 +211,11 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         )
 
 
+<<<<<<< HEAD
+class W8A8FP8MoEMethod:
+=======
 class W8A8FP8MoEMethod(FusedMoEMethodBase):
+>>>>>>> origin/main
     """MoE method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
     dynamic/static activation scale.
@@ -201,7 +226,29 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
+<<<<<<< HEAD
+    def __new__(cls, *args, **kwargs):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
+
+        if not hasattr(cls, "_initialized"):
+            original_init = cls.__init__
+            new_cls = type(
+                cls.__name__,
+                (FusedMoEMethodBase,),
+                {
+                    "__init__": original_init,
+                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
+                },
+            )
+            obj = super(new_cls, new_cls).__new__(new_cls)
+            obj.__init__(*args, **kwargs)
+            return obj
+        return super().__new__(cls)
+
+    def __init__(self, quant_config):
+=======
     def __init__(self, quant_config: W8A8Fp8Config):
+>>>>>>> origin/main
         self.quant_config = quant_config
 
     def create_weights(
@@ -270,21 +317,67 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+<<<<<<< HEAD
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        from sglang.srt.layers.moe.topk import select_experts
+
+        # Expert selection
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+=======
         topk_output: StandardTopKOutput,
         moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+>>>>>>> origin/main
 
         return fused_experts(
             x,
             layer.w13_weight,
             layer.w2_weight,
+<<<<<<< HEAD
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=inplace,
+            activation=activation,
+=======
             topk_output=topk_output,
             moe_runner_config=moe_runner_config,
+>>>>>>> origin/main
             use_fp8_w8a8=True,
             per_channel_quant=True,
             w1_scale=(layer.w13_weight_scale),
             w2_scale=(layer.w2_weight_scale),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+<<<<<<< HEAD
+            no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
+=======
+>>>>>>> origin/main
         )

@@ -1,0 +1,96 @@
+name: Release SGLang Kernels (aarch64)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - sgl-kernel/python/sgl_kernel/version.py
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        type: string
+        required: false
+
+concurrency:
+  group: release-sglang-kernels-aarch64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-cu128-aarch64:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: sgl-kernel-release-node
+    strategy:
+      matrix:
+        python-version: ['3.9']
+        cuda-version: ['12.8']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheels
+        run: |
+          cd sgl-kernel
+          chmod +x ./build.sh
+          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" aarch64
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}-aarch64
+          path: sgl-kernel/dist/*
+
+  release:
+    needs: build-cu128-aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-*
+
+      - name: Set tag name
+        id: set_tag_name
+        run: |
+          if [ -z "${{ inputs.tag_name }}" ]; then
+            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
+            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
+          repository: sgl-project/whl
+          token: ${{ secrets.WHL_TOKEN }}
+          files: |
+            sgl-kernel/dist/*
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+        env:
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_kernel_whl_index.py --cuda 128
+
+      - name: Push wheel index
+        run: |
+          cd sgl-whl
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "update whl index"
+          git push

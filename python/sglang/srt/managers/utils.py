@@ -1,3 +1,10 @@
+<<<<<<< HEAD
+import logging
+from http import HTTPStatus
+from typing import Optional
+
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+=======
 from __future__ import annotations
 
 import logging
@@ -11,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +54,8 @@ def validate_input_length(
             return error_msg
 
     return None
+<<<<<<< HEAD
+=======
 
 
 def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
@@ -140,3 +150,4 @@ class DPBalanceMeta:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._manager = None
+>>>>>>> origin/main

@@ -1,7 +1,10 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 
 """Rotary Positional Embeddings."""
+<<<<<<< HEAD
+=======
 import itertools
+>>>>>>> origin/main
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -222,7 +225,10 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+<<<<<<< HEAD
+=======
         fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
+>>>>>>> origin/main
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
@@ -232,6 +238,10 @@ class RotaryEmbedding(CustomOp):
                 head_size=self.head_size,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
+<<<<<<< HEAD
+            )
+        else:
+=======
                 # Compatible with old sgl-kernel
                 **(
                     dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
@@ -243,6 +253,7 @@ class RotaryEmbedding(CustomOp):
             assert (
                 fused_set_kv_buffer_arg is None
             ), "save kv cache is not supported for vllm_rotary_embedding."
+>>>>>>> origin/main
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             self.vllm_rotary_embedding(
                 positions,
@@ -690,7 +701,11 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
 
         # Re-dispatch
+<<<<<<< HEAD
+        if _is_hip or _is_npu:
+=======
         if _is_hip:
+>>>>>>> origin/main
             self._forward_method = self.forward_native
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
@@ -775,6 +790,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             key = key_rot
         return query.to(dtype), key.to(dtype)
 
+<<<<<<< HEAD
+=======
     def forward_npu(
         self,
         positions: torch.Tensor,
@@ -815,6 +832,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             key = key_rot
         return query, key
 
+>>>>>>> origin/main
     def forward_cpu(
         self,
         positions: torch.Tensor,
@@ -997,6 +1015,10 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         self.mrope_section = mrope_section
         if self.mrope_section:
+<<<<<<< HEAD
+            assert sum(self.mrope_section) == rotary_dim // 2
+
+=======
             expected_sum = rotary_dim // 2
             actual_sum = sum(self.mrope_section)
             if actual_sum != expected_sum:
@@ -1030,6 +1052,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 )
 
     @torch.compile(dynamic=True)
+>>>>>>> origin/main
     def forward(
         self,
         positions: torch.Tensor,
@@ -1235,6 +1258,8 @@ class MRotaryEmbedding(RotaryEmbedding):
             mrope_position_deltas = max_position_ids + 1 - s
             return position_ids, mrope_position_deltas
 
+<<<<<<< HEAD
+=======
     # Adapted from https://github.com/vllm-project/vllm/blob/3779eb8c81449b924a23457fc77e45a0e6171178/vllm/model_executor/layers/rotary_embedding.py#L1120
     @staticmethod
     def get_rope_index_glm4v(
@@ -1433,6 +1458,7 @@ class MRotaryEmbedding(RotaryEmbedding):
 
             return position_ids, mrope_position_deltas
 
+>>>>>>> origin/main
     @staticmethod
     def get_next_input_positions(
         mrope_position_delta: int,
@@ -1452,6 +1478,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         )
 
 
+<<<<<<< HEAD
+=======
 class DualChunkRotaryEmbedding(CustomOp):
     """Rotary positional embedding for Dual Chunk Attention."""
 
@@ -1648,6 +1676,7 @@ class DualChunkRotaryEmbedding(CustomOp):
         return s
 
 
+>>>>>>> origin/main
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
@@ -1660,7 +1689,10 @@ def get_rope(
     rope_scaling: Optional[Dict[str, Any]] = None,
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
+<<<<<<< HEAD
+=======
     dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
+>>>>>>> origin/main
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -1672,6 +1704,8 @@ def get_rope(
         rope_scaling_args = tuple(rope_scaling_tuple.items())
     else:
         rope_scaling_args = None
+<<<<<<< HEAD
+=======
 
     if dual_chunk_attention_config is not None:
         dual_chunk_attention_tuple = {
@@ -1683,6 +1717,7 @@ def get_rope(
     else:
         dual_chunk_attention_args = None
 
+>>>>>>> origin/main
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
     key = (
@@ -1692,12 +1727,18 @@ def get_rope(
         base,
         is_neox_style,
         rope_scaling_args,
+<<<<<<< HEAD
+=======
         dual_chunk_attention_args,
+>>>>>>> origin/main
         dtype,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
 
+<<<<<<< HEAD
+    if rope_scaling is None:
+=======
     if dual_chunk_attention_config is not None:
         extra_kwargs = {
             k: v
@@ -1714,6 +1755,7 @@ def get_rope(
             **extra_kwargs,
         )
     elif rope_scaling is None:
+>>>>>>> origin/main
         rotary_emb = RotaryEmbedding(
             head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )

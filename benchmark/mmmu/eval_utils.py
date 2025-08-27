@@ -27,7 +27,12 @@ from tqdm import tqdm
 class EvalArgs:
     seed: int = 42
     split: str = "validation"
+<<<<<<< HEAD
+    # Default setting to make the benchmark available on A100 for most 7B models
+    image_pixels_limit: int = 4300000
+=======
     image_pixels_limit: int = -1
+>>>>>>> origin/main
     result_filename: str = ""
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
@@ -35,7 +40,10 @@ class EvalArgs:
     profile: bool = False
     profile_number: int = 5
     concurrency: int = 1
+<<<<<<< HEAD
+=======
     response_answer_regex: str = "(.*)"
+>>>>>>> origin/main
     lora_path: Optional[str] = None
 
     @staticmethod
@@ -94,12 +102,15 @@ class EvalArgs:
             help="Number of concurrent requests to make during evaluation. Default is 1, which means no concurrency.",
         )
         parser.add_argument(
+<<<<<<< HEAD
+=======
             "--response-answer-regex",
             type=str,
             default=EvalArgs.response_answer_regex,
             help="Specific regex to capture the answer from the response, string",
         )
         parser.add_argument(
+>>>>>>> origin/main
             "--lora-path",
             type=str,
             default=EvalArgs.lora_path,
@@ -196,7 +207,11 @@ def prepare_samples(eval_args: EvalArgs):
         sample = construct_prompt(sample, eval_args.config)
         image = sample["image"]
         width, height = image.size
+<<<<<<< HEAD
+        if width * height >= eval_args.image_pixels_limit:
+=======
         if 0 < eval_args.image_pixels_limit <= width * height:
+>>>>>>> origin/main
             return None, True
         # Use a unique identifier for the image path to avoid potential collisions if indices reset
         image_path = f"{images_path}/image_{sample['id']}.png"
@@ -223,8 +238,11 @@ def prepare_samples(eval_args: EvalArgs):
             elif sample:
                 samples.append(sample)
 
+<<<<<<< HEAD
+=======
     samples.sort(key=lambda x: x["final_input_prompt"])
 
+>>>>>>> origin/main
     print(
         f"Skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
     )
@@ -544,9 +562,13 @@ def process_result(response, sample, answer_dict, out_samples):
     }
 
 
+<<<<<<< HEAD
+def eval_result(model_answer_path, answer_dict):
+=======
 def eval_result(model_answer_path, answer_dict, eval_output_path=None):
     if eval_output_path is None:
         eval_output_path = model_answer_path
+>>>>>>> origin/main
     print("Evaluating...")
     output_dict = json.load(open(model_answer_path))
     # answer_dict = json.load(open(answer_path))
@@ -641,7 +663,11 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
         "acc": overall_acc,
     }
     pprint.pprint(printable_results)
+<<<<<<< HEAD
+    out = model_answer_path
+=======
     out = eval_output_path
+>>>>>>> origin/main
     with open(out, "w", encoding="utf-8") as outfile:
         json.dump(printable_results, outfile)
         print(f"eval out saved to {out}")

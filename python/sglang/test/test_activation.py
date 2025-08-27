@@ -3,12 +3,18 @@ import unittest
 
 import torch
 
+<<<<<<< HEAD
+from sglang.srt.layers.activation import GeluAndMul
+from sglang.test.test_utils import CustomTestCase
+
+=======
 from sglang.srt.layers.activation import GeluAndMul, QuickGELU
 from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
 _is_hip = is_hip()
 
+>>>>>>> origin/main
 
 class TestGeluAndMul(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
@@ -55,6 +61,8 @@ class TestGeluAndMul(CustomTestCase):
                 self._run_gelu_and_mul_test(*params)
 
 
+<<<<<<< HEAD
+=======
 class TestQuickGELU(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
     NUM_TOKENS = [7, 83, 2048]  # batch = sequence length
@@ -101,5 +109,6 @@ class TestQuickGELU(CustomTestCase):
                 self._run_gelu_quick_test(*params)
 
 
+>>>>>>> origin/main
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -9,8 +9,11 @@ import logging
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
+<<<<<<< HEAD
+=======
 from sglang.srt.utils import ImageData
 
+>>>>>>> origin/main
 logger = logging.getLogger(__name__)
 
 # ============================================================================
@@ -102,12 +105,15 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
             if _is_var_or_elems_access(loop_iter, "message", "content"):
                 return "openai"  # Found content iteration → openai format
 
+<<<<<<< HEAD
+=======
             # Also check for patterns like: {%- for item in msg.content -%} or {%- for item in m.content -%}
             if _is_var_or_elems_access(
                 loop_iter, "msg", "content"
             ) or _is_var_or_elems_access(loop_iter, "m", "content"):
                 return "openai"  # Found content iteration → openai format (glm4v)
 
+>>>>>>> origin/main
         return "string"  # No content loops found → string format
     except Exception as e:
         logger.debug(f"Error when parsing AST of Jinja template: {e}")
@@ -118,7 +124,10 @@ def process_content_for_template_format(
     msg_dict: dict,
     content_format: str,
     image_data: list,
+<<<<<<< HEAD
+=======
     video_data: list,
+>>>>>>> origin/main
     audio_data: list,
     modalities: list,
 ) -> dict:
@@ -129,7 +138,10 @@ def process_content_for_template_format(
         msg_dict: Message dictionary with content
         content_format: 'string' or 'openai' (detected via AST analysis)
         image_data: List to append extracted image URLs
+<<<<<<< HEAD
+=======
         video_data: List to append extracted video URLs
+>>>>>>> origin/main
         audio_data: List to append extracted audio URLs
         modalities: List to append modalities
 
@@ -148,22 +160,29 @@ def process_content_for_template_format(
                 chunk_type = chunk.get("type")
 
                 if chunk_type == "image_url":
+<<<<<<< HEAD
+                    image_data.append(chunk["image_url"]["url"])
+=======
                     image_data.append(
                         ImageData(
                             url=chunk["image_url"]["url"],
                             detail=chunk["image_url"].get("detail", "auto"),
                         )
                     )
+>>>>>>> origin/main
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'image' type for template compatibility
                     processed_content_parts.append({"type": "image"})
+<<<<<<< HEAD
+=======
                 elif chunk_type == "video_url":
                     video_data.append(chunk["video_url"]["url"])
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility
                     processed_content_parts.append({"type": "video"})
+>>>>>>> origin/main
                 elif chunk_type == "audio_url":
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type
@@ -178,7 +197,11 @@ def process_content_for_template_format(
         new_msg["content"] = processed_content_parts
         return new_msg
 
+<<<<<<< HEAD
+    else:  # content_format == "string"
+=======
     elif content_format == "string":
+>>>>>>> origin/main
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
         for chunk in msg_dict["content"]:
@@ -192,6 +215,9 @@ def process_content_for_template_format(
         new_msg["content"] = " ".join(text_parts) if text_parts else ""
         new_msg = {k: v for k, v in new_msg.items() if v is not None}
         return new_msg
+<<<<<<< HEAD
+=======
 
     else:
         raise ValueError(f"Invalid content format: {content_format}")
+>>>>>>> origin/main

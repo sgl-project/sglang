@@ -25,14 +25,26 @@
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 
+<<<<<<< HEAD
+#if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
+=======
 
 #if !defined(USE_ROCM) && (!defined(CUDA_VERSION) || CUDA_VERSION < 12040)
+>>>>>>> origin/main
 void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt) {
   TORCH_CHECK(false, "CUDA version must be >= 12.4 for ApplyTokenBitmaskInplace");
 }
 #else
 
 #ifndef CUDART_INF_FP16
+<<<<<<< HEAD
+#define CUDART_INF_FP16 __ushort_as_half((unsigned short)0x7C00U)
+#endif
+
+#ifndef CUDART_INF_BF16
+#define CUDART_INF_BF16 __ushort_as_bfloat16((unsigned short)0x7F80U)
+#endif
+=======
 #ifndef USE_ROCM
 #define CUDART_INF_FP16 __ushort_as_half((unsigned short)0x7C00U)
 #endif
@@ -43,6 +55,7 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
 #define CUDART_INF_BF16 __ushort_as_bfloat16((unsigned short)0x7F80U)
 #endif
 #endif
+>>>>>>> origin/main
 
 constexpr int32_t BITS_PER_BLOCK = 32;
 constexpr int32_t THREADS_PER_THREAD_BLOCK = 256;
@@ -54,20 +67,28 @@ __device__ T NegativeInfinity() {
 
 template <>
 __device__ __half NegativeInfinity<__half>() {
+<<<<<<< HEAD
+  return -CUDART_INF_FP16;
+=======
 #ifdef USE_ROCM
   return __float2half(-INFINITY);
 #else
   return -CUDART_INF_FP16;
 #endif
+>>>>>>> origin/main
 }
 
 template <>
 __device__ __nv_bfloat16 NegativeInfinity<__nv_bfloat16>() {
+<<<<<<< HEAD
+  return -CUDART_INF_BF16;
+=======
 #ifdef USE_ROCM
   return __nv_bfloat16(-INFINITY);
 #else
   return -CUDART_INF_BF16;
 #endif
+>>>>>>> origin/main
 }
 
 template <typename T, typename PackedT>

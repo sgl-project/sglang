@@ -213,6 +213,8 @@ class TestScoreAPI(CustomTestCase):
                     1.0, sum(score_list), 6, "Scores should sum to 1"
                 )
 
+<<<<<<< HEAD
+=======
     def test_score_request_construction(self):
         """Test that scoring requests are constructed to avoid decode phase."""
         from unittest.mock import patch
@@ -295,6 +297,7 @@ class TestScoreAPI(CustomTestCase):
             )
             self.assertFalse(request.stream, "Scoring requests should not stream")
 
+>>>>>>> origin/main
 
 if __name__ == "__main__":
     unittest.main()

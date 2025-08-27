@@ -1,4 +1,8 @@
+<<<<<<< HEAD
+use super::{ConfigError, ConfigResult};
+=======
 use super::ConfigResult;
+>>>>>>> origin/main
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -21,10 +25,13 @@ pub struct RouterConfig {
     pub worker_startup_timeout_secs: u64,
     /// Worker health check interval in seconds
     pub worker_startup_check_interval_secs: u64,
+<<<<<<< HEAD
+=======
     /// Enable data parallelism aware schedule
     pub dp_aware: bool,
     /// The api key used for the authorization with the worker
     pub api_key: Option<String>,
+>>>>>>> origin/main
     /// Service discovery configuration (optional)
     pub discovery: Option<DiscoveryConfig>,
     /// Metrics configuration (optional)
@@ -33,6 +40,8 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     /// Log level (None = info)
     pub log_level: Option<String>,
+<<<<<<< HEAD
+=======
     /// Custom request ID headers to check (defaults to common headers)
     pub request_id_headers: Option<Vec<String>>,
     /// Maximum concurrent requests allowed (for rate limiting)
@@ -60,6 +69,7 @@ pub struct RouterConfig {
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
     #[serde(default)]
     pub enable_igw: bool,
+>>>>>>> origin/main
 }
 
 /// Routing mode configuration
@@ -77,12 +87,15 @@ pub enum RoutingMode {
         prefill_urls: Vec<(String, Option<u16>)>,
         /// Decode worker URLs
         decode_urls: Vec<String>,
+<<<<<<< HEAD
+=======
         /// Optional separate policy for prefill workers
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
         /// Optional separate policy for decode workers
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
+>>>>>>> origin/main
     },
 }
 
@@ -97,6 +110,11 @@ impl RoutingMode {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
+<<<<<<< HEAD
+            } => prefill_urls.len() + decode_urls.len(),
+        }
+    }
+=======
                 ..
             } => prefill_urls.len() + decode_urls.len(),
         }
@@ -123,6 +141,7 @@ impl RoutingMode {
             _ => main_policy,
         }
     }
+>>>>>>> origin/main
 }
 
 /// Policy configuration for routing
@@ -194,7 +213,11 @@ impl Default for DiscoveryConfig {
             enabled: false,
             namespace: None,
             port: 8000,
+<<<<<<< HEAD
+            check_interval_secs: 60,
+=======
             check_interval_secs: 120,
+>>>>>>> origin/main
             selector: HashMap::new(),
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
@@ -203,6 +226,8 @@ impl Default for DiscoveryConfig {
     }
 }
 
+<<<<<<< HEAD
+=======
 /// Retry configuration for request handling
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryConfig {
@@ -287,6 +312,7 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+>>>>>>> origin/main
 /// Metrics configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsConfig {
@@ -314,16 +340,25 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,
+<<<<<<< HEAD
+            max_payload_size: 268_435_456, // 256MB
+            request_timeout_secs: 600,
+            worker_startup_timeout_secs: 300,
+            worker_startup_check_interval_secs: 10,
+=======
             max_payload_size: 536_870_912, // 512MB
             request_timeout_secs: 1800,    // 30 minutes
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
             api_key: None,
+>>>>>>> origin/main
             discovery: None,
             metrics: None,
             log_dir: None,
             log_level: None,
+<<<<<<< HEAD
+=======
             request_id_headers: None,
             max_concurrent_requests: 256,
             queue_size: 100,
@@ -336,6 +371,7 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+>>>>>>> origin/main
         }
     }
 }
@@ -365,7 +401,11 @@ impl RouterConfig {
 
     /// Check if service discovery is enabled
     pub fn has_service_discovery(&self) -> bool {
+<<<<<<< HEAD
+        self.discovery.as_ref().map_or(false, |d| d.enabled)
+=======
         self.discovery.as_ref().is_some_and(|d| d.enabled)
+>>>>>>> origin/main
     }
 
     /// Check if metrics are enabled
@@ -373,6 +413,86 @@ impl RouterConfig {
         self.metrics.is_some()
     }
 
+<<<<<<< HEAD
+    /// Convert to routing PolicyConfig for internal use
+    pub fn to_routing_policy_config(&self) -> ConfigResult<crate::router::PolicyConfig> {
+        match (&self.mode, &self.policy) {
+            (
+                RoutingMode::PrefillDecode {
+                    prefill_urls,
+                    decode_urls,
+                },
+                policy,
+            ) => {
+                // Map policy to PDSelectionPolicy
+                let selection_policy = match policy {
+                    PolicyConfig::Random => crate::pd_types::PDSelectionPolicy::Random,
+                    PolicyConfig::PowerOfTwo { .. } => {
+                        crate::pd_types::PDSelectionPolicy::PowerOfTwo
+                    }
+                    PolicyConfig::CacheAware {
+                        cache_threshold,
+                        balance_abs_threshold,
+                        balance_rel_threshold,
+                        ..
+                    } => crate::pd_types::PDSelectionPolicy::CacheAware {
+                        cache_threshold: *cache_threshold,
+                        balance_abs_threshold: *balance_abs_threshold,
+                        balance_rel_threshold: *balance_rel_threshold,
+                    },
+                    PolicyConfig::RoundRobin => {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: "RoundRobin policy is not supported in PD disaggregated mode"
+                                .to_string(),
+                        });
+                    }
+                };
+
+                Ok(crate::router::PolicyConfig::PrefillDecodeConfig {
+                    selection_policy,
+                    prefill_urls: prefill_urls.clone(),
+                    decode_urls: decode_urls.clone(),
+                    timeout_secs: self.worker_startup_timeout_secs,
+                    interval_secs: self.worker_startup_check_interval_secs,
+                })
+            }
+            (RoutingMode::Regular { .. }, PolicyConfig::Random) => {
+                Ok(crate::router::PolicyConfig::RandomConfig {
+                    timeout_secs: self.worker_startup_timeout_secs,
+                    interval_secs: self.worker_startup_check_interval_secs,
+                })
+            }
+            (RoutingMode::Regular { .. }, PolicyConfig::RoundRobin) => {
+                Ok(crate::router::PolicyConfig::RoundRobinConfig {
+                    timeout_secs: self.worker_startup_timeout_secs,
+                    interval_secs: self.worker_startup_check_interval_secs,
+                })
+            }
+            (
+                RoutingMode::Regular { .. },
+                PolicyConfig::CacheAware {
+                    cache_threshold,
+                    balance_abs_threshold,
+                    balance_rel_threshold,
+                    eviction_interval_secs,
+                    max_tree_size,
+                },
+            ) => Ok(crate::router::PolicyConfig::CacheAwareConfig {
+                cache_threshold: *cache_threshold,
+                balance_abs_threshold: *balance_abs_threshold,
+                balance_rel_threshold: *balance_rel_threshold,
+                eviction_interval_secs: *eviction_interval_secs,
+                max_tree_size: *max_tree_size,
+                timeout_secs: self.worker_startup_timeout_secs,
+                interval_secs: self.worker_startup_check_interval_secs,
+            }),
+            (RoutingMode::Regular { .. }, PolicyConfig::PowerOfTwo { .. }) => {
+                Err(ConfigError::IncompatibleConfig {
+                    reason: "PowerOfTwo policy is only supported in PD disaggregated mode"
+                        .to_string(),
+                })
+            }
+=======
     /// Compute the effective retry config considering disable flag
     pub fn effective_retry_config(&self) -> RetryConfig {
         let mut cfg = self.retry.clone();
@@ -1196,6 +1316,7 @@ mod tests {
         match regular.get_decode_policy(&main_policy) {
             PolicyConfig::RoundRobin => {} // Success
             _ => panic!("Expected RoundRobin for regular mode"),
+>>>>>>> origin/main
         }
     }
 }

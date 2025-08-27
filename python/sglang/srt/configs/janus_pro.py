@@ -284,9 +284,12 @@ class VLMImageProcessor(BaseImageProcessor):
 
 
 class DictOutput(object):
+<<<<<<< HEAD
+=======
     def items(self):
         return self.__dict__.items()
 
+>>>>>>> origin/main
     def keys(self):
         return self.__dict__.keys()
 

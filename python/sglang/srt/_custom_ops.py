@@ -1,6 +1,10 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
 import logging
+<<<<<<< HEAD
+from typing import List, Tuple
+=======
 from typing import List, Optional, Tuple
+>>>>>>> origin/main
 
 import torch
 
@@ -114,6 +118,8 @@ else:
     def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
         return sgl_kernel.allreduce.get_meta_buffer_ipc_handle(inp)
 
+<<<<<<< HEAD
+=======
     # ROCM custom quick allreduce
 
     def init_custom_qr(
@@ -142,6 +148,7 @@ else:
     def qr_max_size() -> int:
         return sgl_kernel.allreduce.qr_max_size()
 
+>>>>>>> origin/main
 
 def mscclpp_generate_unique_id() -> bytes:
     return sgl_kernel.allreduce.mscclpp_generate_unique_id()

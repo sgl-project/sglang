@@ -22,6 +22,19 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
   }
 }
 
+<<<<<<< HEAD
+// todo, structs for different memory layout
+__device__ __forceinline__ int64_t
+get_global_offset_lf(int64_t layer_id, int64_t layer_dim, int64_t page_id, int64_t item_size_bytes) {
+  // layer first
+  return layer_id * layer_dim + page_id * item_size_bytes;
+}
+
+__device__ __forceinline__ int64_t
+get_global_offset_pf(int64_t layer_id, int64_t page_dim, int64_t page_id, int64_t item_size_bytes) {
+  // page first
+  return page_id * page_dim + layer_id * item_size_bytes;
+=======
 template <typename T>
 __device__ __forceinline__ T* get_global_offset_lf(
     T* base,
@@ -56,6 +69,7 @@ __device__ __forceinline__ T* get_global_offset_lf_tbl(
     int64_t page_id,
     int64_t item_size_bytes) {
   return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes;
+>>>>>>> origin/main
 }
 
 template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
@@ -72,25 +86,58 @@ __global__ void transfer_kernel_impl(
     int64_t items_per_warp,
     int64_t item_size_bytes,
     int64_t src_layout_dim,
+<<<<<<< HEAD
+    int64_t dst_layout_dim) {
+=======
     int64_t dst_layout_dim,
     const uintptr_t* __restrict__ src_k_layer_tbl,
     const uintptr_t* __restrict__ dst_k_layer_tbl,
     const uintptr_t* __restrict__ src_v_layer_tbl,
     const uintptr_t* __restrict__ dst_v_layer_tbl) {
+>>>>>>> origin/main
   int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   int32_t lane_id = tid % 32;
   int32_t warp_id = tid / 32;
 
   for (int i = 0; i < items_per_warp; ++i) {
+<<<<<<< HEAD
+    int32_t item_id = warp_id * items_per_warp + i;
+    if (item_id >= num_items) {
+      return;
+=======
     int64_t item_id = warp_id * items_per_warp + i;
     if (item_id >= num_items) {
       break;
+>>>>>>> origin/main
     }
     const int64_t src_page_id = src_indices[item_id];
     const int64_t dst_page_id = dst_indices[item_id];
 
     // Loop over layers if necessary
     for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
+<<<<<<< HEAD
+      // Calculate offsets using the provided function pointers
+      const int64_t src_offset = SrcOffsetFn(layer_id, src_layout_dim, src_page_id, item_size_bytes);
+      const int64_t dst_offset = DstOffsetFn(layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
+
+      if constexpr (IsMLA) {
+        transfer_item_warp(
+            lane_id,
+            static_cast<const char*>(src_k) + src_offset,
+            static_cast<char*>(dst_k) + dst_offset,
+            item_size_bytes);
+      } else {
+        transfer_item_warp(
+            lane_id,
+            static_cast<const char*>(src_k) + src_offset,
+            static_cast<char*>(dst_k) + dst_offset,
+            item_size_bytes);
+        transfer_item_warp(
+            lane_id,
+            static_cast<const char*>(src_v) + src_offset,
+            static_cast<char*>(dst_v) + dst_offset,
+            item_size_bytes);
+=======
       const char* src_ptr = SrcOffsetFn(
           static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
       char* dst_ptr = DstOffsetFn(
@@ -103,6 +150,7 @@ __global__ void transfer_kernel_impl(
         char* dst_v_ptr = DstOffsetFn(
             static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
         transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes);
+>>>>>>> origin/main
       }
     }
   }
@@ -121,26 +169,52 @@ void transfer_kv_launcher(
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t dst_layout_dim,
+<<<<<<< HEAD
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(src_k.scalar_type() == dst_k.scalar_type(), "Source and destination keys must have the same type");
+=======
     const at::Tensor& src_k_layers,
     const at::Tensor& dst_k_layers,
     const at::Tensor& src_v_layers,
     const at::Tensor& dst_v_layers,
     int64_t block_quota,
     int64_t num_warps_per_block) {
+>>>>>>> origin/main
   TORCH_CHECK(src_indices.is_cuda(), "Source indices must be a CUDA tensor");
   TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA tensor");
   TORCH_CHECK(src_indices.scalar_type() == at::kLong, "Source indices must be of type long");
   TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "Destination indices must be of type long");
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
+<<<<<<< HEAD
+
+  if (!IsMLA) {
+    TORCH_CHECK(src_v.scalar_type() == dst_v.scalar_type(), "Source and destination values must have the same type");
+  }
+
+  int dtype_size = src_k.element_size();
+  TORCH_CHECK((item_size * dtype_size) % 8 == 0, "Item byte size must be divisible by 8");
+
+  auto div_up = [](int32_t x, int32_t y) { return (x + y - 1) / y; };
+=======
   TORCH_CHECK(item_size % 8 == 0, "Item byte size must be divisible by 8");
 
   auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
+>>>>>>> origin/main
   const int64_t num_items = src_indices.numel();
   const int64_t items_per_warp = div_up(num_items, block_quota * num_warps_per_block);
   const int32_t num_blocks = div_up(num_items, items_per_warp * num_warps_per_block);
   dim3 grid_dim(num_blocks, 1, 1);
   const int32_t threads_per_block = num_warps_per_block * 32;
 
+<<<<<<< HEAD
+  cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
+  transfer_kernel_impl<SrcOffsetFn, DstOffsetFn, IsMLA><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
+      src_k.data_ptr(),
+      dst_k.data_ptr(),
+      (IsMLA ? nullptr : src_v.data_ptr()),
+      (IsMLA ? nullptr : dst_v.data_ptr()),
+=======
   const void* src_k_ptr = src_k.defined() ? src_k.data_ptr() : nullptr;
   void* dst_k_ptr = dst_k.defined() ? dst_k.data_ptr() : nullptr;
   const void* src_v_ptr = IsMLA || !src_v.defined() ? nullptr : src_v.data_ptr();
@@ -156,12 +230,18 @@ void transfer_kv_launcher(
       dst_k_ptr,
       src_v_ptr,
       dst_v_ptr,
+>>>>>>> origin/main
       src_indices.data_ptr<int64_t>(),
       dst_indices.data_ptr<int64_t>(),
       start_layer_id,
       num_layers_to_process,
       num_items,
       items_per_warp,
+<<<<<<< HEAD
+      item_size * dtype_size,
+      src_layout_dim * dtype_size,
+      dst_layout_dim * dtype_size);
+=======
       item_size,
       src_layout_dim,
       dst_layout_dim,
@@ -169,6 +249,7 @@ void transfer_kv_launcher(
       dst_k_tbl_ptr,
       src_v_tbl_ptr,
       dst_v_tbl_ptr);
+>>>>>>> origin/main
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -182,8 +263,29 @@ void transfer_kv_per_layer(
     int64_t item_size,
     int64_t block_quota,
     int64_t num_warps_per_block) {
+<<<<<<< HEAD
+  transfer_kv_launcher<get_global_offset_lf, get_global_offset_lf, false>(
+      src_k, dst_k, src_v, dst_v, src_indices, dst_indices, 0, 1, item_size, 0, 0, block_quota, num_warps_per_block);
+}
+
+void transfer_kv_all_layer(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t src_layer_offset,
+    int64_t dst_layer_offset,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  transfer_kv_launcher<get_global_offset_lf, get_global_offset_lf, false>(
+=======
   at::Tensor empty;
   transfer_kv_launcher<get_global_offset_lf<const char>, get_global_offset_lf<char>, false>(
+>>>>>>> origin/main
       src_k,
       dst_k,
       src_v,
@@ -191,6 +293,12 @@ void transfer_kv_per_layer(
       src_indices,
       dst_indices,
       0,
+<<<<<<< HEAD
+      num_layers,
+      item_size,
+      src_layer_offset,
+      dst_layer_offset,
+=======
       1,
       item_size,
       0,
@@ -299,6 +407,7 @@ void transfer_kv_all_layer_lf_pf(
       empty,
       src_v_layers,
       empty,
+>>>>>>> origin/main
       block_quota,
       num_warps_per_block);
 }
@@ -311,12 +420,21 @@ void transfer_kv_per_layer_mla(
     int64_t item_size,
     int64_t block_quota,
     int64_t num_warps_per_block) {
+<<<<<<< HEAD
+  at::Tensor empty_tensor = at::Tensor();
+  transfer_kv_launcher<get_global_offset_lf, get_global_offset_lf, true>(
+      src,
+      dst,
+      empty_tensor,
+      empty_tensor,
+=======
   at::Tensor empty;
   transfer_kv_launcher<get_global_offset_lf<const char>, get_global_offset_lf<char>, true>(
       src,
       dst,
       empty,
       empty,
+>>>>>>> origin/main
       src_indices,
       dst_indices,
       0,
@@ -324,6 +442,8 @@ void transfer_kv_per_layer_mla(
       item_size,
       0,
       0,
+<<<<<<< HEAD
+=======
       empty,
       empty,
       empty,
@@ -359,17 +479,35 @@ void transfer_kv_per_layer_mla_pf_lf(
       empty,
       empty,
       empty,
+>>>>>>> origin/main
       block_quota,
       num_warps_per_block);
 }
 
 void transfer_kv_all_layer_mla(
+<<<<<<< HEAD
+    const at::Tensor src,
+    at::Tensor dst,
+=======
     const at::Tensor src_layers,
     const at::Tensor dst_layers,
+>>>>>>> origin/main
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
     int64_t item_size,
     int64_t num_layers,
+<<<<<<< HEAD
+    int64_t src_layer_offset,
+    int64_t dst_layer_offset,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  at::Tensor empty_tensor = at::Tensor();
+  transfer_kv_launcher<get_global_offset_lf, get_global_offset_lf, true>(
+      src,
+      dst,
+      empty_tensor,
+      empty_tensor,
+=======
     int64_t block_quota,
     int64_t num_warps_per_block) {
   TORCH_CHECK(num_layers == src_layers.size(0), "Number of layers in source tensor does not match num_layers");
@@ -379,11 +517,16 @@ void transfer_kv_all_layer_mla(
       empty,
       empty,
       empty,
+>>>>>>> origin/main
       src_indices,
       dst_indices,
       0,
       num_layers,
       item_size,
+<<<<<<< HEAD
+      src_layer_offset,
+      dst_layer_offset,
+=======
       0,
       0,
       src_layers,
@@ -422,13 +565,19 @@ void transfer_kv_all_layer_mla_lf_pf(
       empty,
       empty,
       empty,
+>>>>>>> origin/main
       block_quota,
       num_warps_per_block);
 }
 
 inline void transfer_page_direct(
+<<<<<<< HEAD
+    const at::Tensor src_buffer,
+    at::Tensor dst_buffer,
+=======
     const at::Tensor& src_buffer,
     at::Tensor& dst_buffer,
+>>>>>>> origin/main
     int64_t src_page_index,
     int64_t dst_page_index,
     int64_t page_size) {
@@ -438,6 +587,18 @@ inline void transfer_page_direct(
           /* non_blocking= */ true);
 }
 
+<<<<<<< HEAD
+template <bool IsMLA, bool AllLayers>
+inline void transfer_kv_direct_impl(
+    const at::Tensor& src_k,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v_opt,  // Only used when IsMLA is false (for src_v)
+    at::Tensor& dst_v_opt,        // Only used when IsMLA is false (for dst_v)
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t page_size,
+    int64_t num_layers = 1) {
+=======
 void transfer_kv_direct(
     const std::vector<at::Tensor>& src_layers,
     std::vector<at::Tensor> dst_layers,
@@ -446,6 +607,7 @@ void transfer_kv_direct(
     int64_t page_size) {
   TORCH_CHECK(
       src_layers.size() == dst_layers.size(), "Source and destination layers must have the same number of layers");
+>>>>>>> origin/main
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
   TORCH_CHECK(page_size > 0, "Page size must be positive");
   TORCH_CHECK(src_indices.numel() % page_size == 0, "Source indices size must be divisible by page size");
@@ -453,6 +615,79 @@ void transfer_kv_direct(
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
 
+<<<<<<< HEAD
+  const int64_t num_pages = src_indices_cpu.size(0) / page_size;
+
+  for (const auto i : c10::irange(num_pages)) {
+    auto s_index = src_indices_cpu[i * page_size].item<int64_t>();
+    auto d_index = dst_indices_cpu[i * page_size].item<int64_t>();
+
+    if constexpr (AllLayers) {
+      for (const auto j : c10::irange(num_layers)) {
+        if constexpr (IsMLA) {
+          transfer_page_direct(src_k.select(0, j), dst_k.select(0, j), s_index, d_index, page_size);
+        } else {
+          transfer_page_direct(src_k.select(0, j), dst_k.select(0, j), s_index, d_index, page_size);
+          transfer_page_direct(src_v_opt.select(0, j), dst_v_opt.select(0, j), s_index, d_index, page_size);
+        }
+      }
+    } else {  // Per-layer
+      if constexpr (IsMLA) {
+        transfer_page_direct(src_k, dst_k, s_index, d_index, page_size);
+      } else {
+        transfer_page_direct(src_k, dst_k, s_index, d_index, page_size);
+        transfer_page_direct(src_v_opt, dst_v_opt, s_index, d_index, page_size);
+      }
+    }
+  }
+}
+
+void transfer_kv_per_layer_direct(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size) {
+  transfer_kv_direct_impl<false, false>(src_k, dst_k, src_v, dst_v, src_indices, dst_indices, page_size);
+}
+
+void transfer_kv_all_layer_direct(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size,
+    int64_t num_layers) {
+  transfer_kv_direct_impl<false, true>(src_k, dst_k, src_v, dst_v, src_indices, dst_indices, page_size, num_layers);
+}
+
+void transfer_kv_per_layer_mla_direct(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size) {
+  at::Tensor empty_tensor = at::Tensor();
+
+  transfer_kv_direct_impl<true, false>(src, dst, empty_tensor, empty_tensor, src_indices, dst_indices, page_size);
+}
+
+void transfer_kv_all_layer_mla_direct(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size,
+    int64_t num_layers) {
+  at::Tensor empty_tensor = at::Tensor();
+  transfer_kv_direct_impl<true, true>(
+      src, dst, empty_tensor, empty_tensor, src_indices, dst_indices, page_size, num_layers);
+}
+=======
   const auto num_indices = src_indices_cpu.numel();
   const int64_t num_layers = src_layers.size();
   int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
@@ -483,3 +718,4 @@ void transfer_kv_direct(
     start_index = end_index;
   }
 }
+>>>>>>> origin/main

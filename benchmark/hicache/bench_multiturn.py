@@ -9,7 +9,10 @@ from datetime import datetime
 from typing import Optional
 
 import aiohttp
+<<<<<<< HEAD
+=======
 import numpy as np
+>>>>>>> origin/main
 import requests
 from tqdm.asyncio import tqdm
 
@@ -20,8 +23,11 @@ from sglang.bench_serving import (
     sample_random_requests,
 )
 
+<<<<<<< HEAD
+=======
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
+>>>>>>> origin/main
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -100,6 +106,8 @@ def parse_args():
         default="performance_metrics.jsonl",
         help="File to log performance metrics",
     )
+<<<<<<< HEAD
+=======
     parser.add_argument(
         "--disable-auto-run",
         action="store_true",
@@ -130,6 +138,7 @@ def parse_args():
         help="Tag of a certain run in the log file",
     )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+>>>>>>> origin/main
     return parser.parse_args()
 
 
@@ -141,7 +150,11 @@ async def async_request_sglang_generate(
     """
     Sends a streaming request to the server. Gathers text token-by-token.
     """
+<<<<<<< HEAD
+    async with aiohttp.ClientSession() as session:
+=======
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+>>>>>>> origin/main
         headers = {}
         generated_text = ""
         ttft = 0.0
@@ -152,8 +165,11 @@ async def async_request_sglang_generate(
         try:
             async with session.post(url=url, json=payload, headers=headers) as response:
                 if response.status == 200:
+<<<<<<< HEAD
+=======
                     prompt_tokens = 0
                     cached_tokens = 0
+>>>>>>> origin/main
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
@@ -172,12 +188,15 @@ async def async_request_sglang_generate(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
+<<<<<<< HEAD
+=======
                                     prompt_tokens = (data.get("meta_info") or {}).get(
                                         "prompt_tokens", 0
                                     )
                                     cached_tokens = (data.get("meta_info") or {}).get(
                                         "cached_tokens", 0
                                     )
+>>>>>>> origin/main
 
                                 # Decoding phase
                                 else:
@@ -189,8 +208,11 @@ async def async_request_sglang_generate(
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
+<<<<<<< HEAD
+=======
                     output.prompt_len = prompt_tokens
                     output.cached_tokens = cached_tokens
+>>>>>>> origin/main
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -213,7 +235,10 @@ def gen_payload(prompt, output_len):
             "ignore_eos": True,
         },
         "stream": True,
+<<<<<<< HEAD
+=======
         "stream_options": {"include_usage": True},
+>>>>>>> origin/main
         "lora_path": "",
         "return_logprob": False,
         "logprob_start_len": -1,
@@ -221,9 +246,15 @@ def gen_payload(prompt, output_len):
     return payload
 
 
+<<<<<<< HEAD
+def log_to_jsonl_file(data, file_path="performance_metrics.jsonl"):
+    """Append the data with a timestamp to the specified JSONL file."""
+    timestamped_data = {"timestamp": datetime.now().isoformat(), **data}
+=======
 def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
     """Append the data with a timestamp and tag to the specified JSONL file."""
     timestamped_data = {"timestamp": datetime.now().isoformat(), "tag": tag, **data}
+>>>>>>> origin/main
     try:
         with open(file_path, "a") as file:
             file.write(
@@ -278,6 +309,15 @@ class WorkloadGenerator:
         self.candidate_inputs = sample_random_requests(
             input_len=args.request_length,
             output_len=args.output_length,
+<<<<<<< HEAD
+            num_prompts=args.num_clients * args.num_rounds,
+            range_ratio=1.0,
+            tokenizer=self.tokenizer,
+            dataset_path=args.dataset_path,
+        )
+        self.candidate_inputs = [i.prompt for i in self.candidate_inputs]
+
+=======
             num_prompts=args.num_clients,
             range_ratio=1.0,
             tokenizer=self.tokenizer,
@@ -301,6 +341,7 @@ class WorkloadGenerator:
             random_sample=not args.disable_random_sample,
         )
 
+>>>>>>> origin/main
         init_requests = [
             (i, gen_payload(self.candidate_inputs[i], args.output_length))
             for i in range(args.num_clients)
@@ -309,13 +350,20 @@ class WorkloadGenerator:
             i: {"round": 0, "history": init_requests[i][1]["text"]}
             for i in range(args.num_clients)
         }
+<<<<<<< HEAD
+        self.ready_queue = ReadyQueue(init_requests=init_requests)
+=======
         self.ready_queue = ReadyQueue(
             init_requests=init_requests, policy=args.ready_queue_policy
         )
+>>>>>>> origin/main
         self.candidate_inputs = self.candidate_inputs[args.num_clients :]
 
         self.response_queue = queue.Queue()
         self.pbar = tqdm(total=args.num_clients * args.num_rounds)
+<<<<<<< HEAD
+        self.performance_metrics = {"ttft": [], "latency": []}
+=======
         self.performance_metrics = {
             "ttft": [],
             "latency": [],
@@ -325,6 +373,7 @@ class WorkloadGenerator:
         self.num_rounds = args.num_rounds
         self.max_parallel = args.max_parallel
         self.output_length = args.output_length
+>>>>>>> origin/main
 
     async def handle_request(self, item):
         try:
@@ -339,7 +388,11 @@ class WorkloadGenerator:
     def request_sender(self):
         async def request_loop():
             while True:
+<<<<<<< HEAD
+                if self.sent_requests - self.completed_requests < args.max_parallel:
+=======
                 if self.sent_requests - self.completed_requests < self.max_parallel:
+>>>>>>> origin/main
                     new_request = self.ready_queue.pop()
                     if new_request:
                         asyncio.create_task(self.handle_request(new_request))
@@ -381,6 +434,14 @@ class WorkloadGenerator:
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
                 self.performance_metrics["latency"].append(response.latency)
+<<<<<<< HEAD
+                self.completed_requests += 1
+
+                if self.client_records[client_id]["round"] < args.num_rounds:
+                    self.client_records[client_id][
+                        "history"
+                    ] += self.candidate_inputs.pop()
+=======
                 self.performance_metrics["prompt_len"].append(response.prompt_len)
                 self.performance_metrics["cached_tokens"].append(response.cached_tokens)
                 self.completed_requests += 1
@@ -390,21 +451,29 @@ class WorkloadGenerator:
                     self.client_records[client_id][
                         "history"
                     ] += self.sub_question_inputs.pop().prompt
+>>>>>>> origin/main
                     self.ready_queue.append(
                         (
                             client_id,
                             gen_payload(
                                 self.client_records[client_id]["history"],
+<<<<<<< HEAD
+                                args.output_length,
+=======
                                 self.output_length,
+>>>>>>> origin/main
                             ),
                         )
                     )
             except queue.Empty:
                 if self.pbar.n == self.pbar.total:
                     break
+<<<<<<< HEAD
+=======
             except ValueError as e:
                 print(f"Error processing response for client {client_id}: {e}")
                 continue
+>>>>>>> origin/main
 
     def run(self):
         request_thread = threading.Thread(target=self.request_sender, daemon=True)
@@ -439,12 +508,15 @@ class WorkloadGenerator:
                     len(self.performance_metrics["latency"]) // 2
                 ],
                 "throughput": self.pbar.total / (self.finished_time - self.start_time),
+<<<<<<< HEAD
+=======
                 "cache_hit_rate": (
                     0
                     if sum(self.performance_metrics["prompt_len"]) == 0
                     else sum(self.performance_metrics["cached_tokens"])
                     / sum(self.performance_metrics["prompt_len"])
                 ),
+>>>>>>> origin/main
             },
         }
         print("All requests completed")
@@ -463,14 +535,25 @@ class WorkloadGenerator:
         print(
             f"  Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
+<<<<<<< HEAD
+        log_to_jsonl_file(performance_data, args.log_file)
+=======
         print(f"  Cache Hit Rate: {performance_data['summary']['cache_hit_rate']:.6f}")
         return performance_data
+>>>>>>> origin/main
 
 
 if __name__ == "__main__":
     args = parse_args()
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
+<<<<<<< HEAD
+    for request_rate in [16, 14, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]:
+        args.request_rate = request_rate
+        requests.post(flush_cache_url)
+        time.sleep(1)
+        WorkloadGenerator(args).run()
+=======
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -487,3 +570,4 @@ if __name__ == "__main__":
         time.sleep(1)
         performance_data = WorkloadGenerator(args).run()
         log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)
+>>>>>>> origin/main

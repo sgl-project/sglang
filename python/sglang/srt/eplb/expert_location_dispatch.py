@@ -36,7 +36,10 @@ class ExpertLocationDispatchInfo:
     def init_new(cls, layer_id: int):
         ep_dispatch_algorithm = global_server_args_dict["ep_dispatch_algorithm"]
         expert_location_metadata = get_global_expert_location_metadata()
+<<<<<<< HEAD
+=======
         assert expert_location_metadata is not None
+>>>>>>> origin/main
 
         if ep_dispatch_algorithm is None:
             return None
@@ -67,7 +70,11 @@ def transform_select_experts_inputs(
     info: Optional[ExpertLocationDispatchInfo],
 ):
     if (info is not None) and (info.ep_dispatch_algorithm == "fake"):
+<<<<<<< HEAD
+        router_logits = torch.randn_like(router_logits)
+=======
         router_logits.uniform_(5, 10)
+>>>>>>> origin/main
         if correction_bias is not None:
             correction_bias = torch.zeros_like(correction_bias)
     return router_logits, correction_bias

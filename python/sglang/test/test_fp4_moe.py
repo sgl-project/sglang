@@ -1,15 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
+<<<<<<< HEAD
+import pytest
+import torch
+=======
 from typing import Callable
 
 import pytest
 import torch
 from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+>>>>>>> origin/main
 from sgl_kernel import scaled_fp4_quant
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+<<<<<<< HEAD
+from sglang.srt.layers.moe.topk import select_experts
+=======
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+>>>>>>> origin/main
 
 if torch.cuda.get_device_capability() < (10, 0):
     pytest.skip(
@@ -114,6 +123,18 @@ def torch_moe(a, w1, w2, score, topk, expert_map):
     ).sum(dim=1)
 
 
+<<<<<<< HEAD
+@pytest.mark.parametrize("m,n,k", MNK_FACTORS)
+@pytest.mark.parametrize("e", [40, 64, 256])
+@pytest.mark.parametrize("topk", [1, 6, 8])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_tanh"])
+@torch.inference_mode()
+def test_cutlass_fp4_moe_no_graph(
+    m: int, n: int, k: int, e: int, topk: int, dtype: torch.dtype, activation: str
+):
+
+=======
 def check_moe(
     m: int,
     n: int,
@@ -124,6 +145,7 @@ def check_moe(
     moe_impl: Callable,
     flip_w13: bool,
 ):
+>>>>>>> origin/main
     torch.manual_seed(7)
     a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
     w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
@@ -163,6 +185,51 @@ def check_moe(
 
     score = torch.randn((m, e), device="cuda", dtype=dtype)
 
+<<<<<<< HEAD
+    topk_weights, topk_ids = select_experts(
+        hidden_states=a,
+        router_logits=score,
+        top_k=topk,
+        use_grouped_topk=False,
+        renormalize=False,
+    )
+
+    a1_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
+    a2_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
+    # strides for the cutlass moe_fp4 kernel
+    ab_strides_13 = torch.full(
+        (e,), w1_q.shape[2] * 2, dtype=torch.int64, device=w1_q.device
+    )
+    c_strides_13 = torch.full(
+        (e,), w1_q.shape[1], dtype=torch.int64, device=w1_q.device
+    )
+    ab_strides_2 = torch.full(
+        (e,), w2_q.shape[2] * 2, dtype=torch.int64, device=w2_q.device
+    )
+    c_strides_2 = torch.full((e,), w2_q.shape[1], dtype=torch.int64, device=w2_q.device)
+    params = CutlassMoEParams(
+        CutlassMoEType.BlockscaledFP4,
+        device=a.device,
+        num_experts=e,
+        intermediate_size_per_partition=n,  # n
+        hidden_size=k,
+    )  # k
+    cutlass_output = cutlass_moe_fp4(
+        a=a,
+        a1_gscale=a1_gs,
+        w1_fp4=w1_q,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=(1 / w1_gs),
+        a2_gscale=a2_gs,
+        w2_fp4=w2_q,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=(1 / w2_gs),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        params=params,
+        activation=activation,
+        apply_router_weight_on_input=False,
+=======
     topk_output = select_experts(
         hidden_states=a,
         router_logits=score,
@@ -184,6 +251,7 @@ def check_moe(
         a2_gs=a2_gs,
         w2_blockscale=w2_blockscale,
         w2_alphas=(1 / w2_gs),
+>>>>>>> origin/main
     )
 
     # Reference check:
@@ -222,6 +290,11 @@ def check_moe(
             block_size=quant_blocksize,
         )
 
+<<<<<<< HEAD
+    torch_output = torch_moe(a_in_dtype, w1_d, w2_d, score, topk, None)
+
+    torch.testing.assert_close(torch_output, cutlass_output, atol=1e-1, rtol=1e-1)
+=======
     if flip_w13:
         dim = -2
         size = w1_d.size(dim)
@@ -322,8 +395,12 @@ def test_flashinfer_fp4_moe_no_graph(
         )[0]
 
     check_moe(m, n, k, e, topk, dtype, flashinfer_moe_impl, flip_w13=True)
+>>>>>>> origin/main
 
 
 if __name__ == "__main__":
     test_cutlass_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
+<<<<<<< HEAD
+=======
     test_flashinfer_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)
+>>>>>>> origin/main

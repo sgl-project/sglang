@@ -159,7 +159,10 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         """Test that when some batch items have images and others None, parallel expansion works correctly."""
         req = copy.deepcopy(self.base_req)
         req.text = ["Prompt 1", "Prompt 2", "Prompt 3"]
+<<<<<<< HEAD
+=======
         req.rid = ["id1", "id2", "id3"]
+>>>>>>> origin/main
         req.image_data = [
             ["image1.jpg"],
             None,
@@ -312,6 +315,8 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertFalse(req.is_single)
         self.assertEqual(req.batch_size, 2)
 
+<<<<<<< HEAD
+=======
     def test_input_embeds_with_parallel_sampling(self):
         """Test input_embeds normalization with parallel sampling (n > 1)."""
         # Test single input_embeds with parallel sampling
@@ -377,6 +382,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         for i in range(5):
             self.assertEqual(req.input_embeds[i], [[0.1, 0.2, 0.3]])
 
+>>>>>>> origin/main
     def test_lora_path_normalization(self):
         """Test normalization of lora_path."""
         # Test single lora_path with batch input

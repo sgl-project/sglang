@@ -6,12 +6,18 @@ from xgrammar import GrammarCompiler, TokenizerInfo
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+<<<<<<< HEAD
+from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.pythonic_detector import PythonicDetector
+=======
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+>>>>>>> origin/main
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -497,6 +503,8 @@ class TestEBNFGeneration(unittest.TestCase):
                     },
                 ),
             ),
+<<<<<<< HEAD
+=======
             Tool(
                 type="function",
                 function=Function(
@@ -508,6 +516,7 @@ class TestEBNFGeneration(unittest.TestCase):
                     },
                 ),
             ),
+>>>>>>> origin/main
         ]
 
         self.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
@@ -520,9 +529,12 @@ class TestEBNFGeneration(unittest.TestCase):
         self.llama32_detector = Llama32Detector()
         self.mistral_detector = MistralDetector()
         self.qwen25_detector = Qwen25Detector()
+<<<<<<< HEAD
+=======
         self.qwen3_coder_detector = Qwen3CoderDetector()
         self.kimik2_detector = KimiK2Detector()
         self.glm45_detector = Glm4MoeDetector()
+>>>>>>> origin/main
 
     def test_pythonic_detector_ebnf(self):
         """Test that the PythonicDetector generates valid EBNF."""
@@ -558,6 +570,8 @@ class TestEBNFGeneration(unittest.TestCase):
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
 
+<<<<<<< HEAD
+=======
     def test_kimik2_detector_ebnf(self):
         """Test that the KimiK2Detector generates valid EBNF."""
         ebnf = self.kimik2_detector.build_ebnf(self.tools)
@@ -585,6 +599,7 @@ class TestEBNFGeneration(unittest.TestCase):
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
 
+>>>>>>> origin/main
     def test_llama32_detector_ebnf(self):
         """Test that the Llama32Detector generates valid EBNF."""
         ebnf = self.llama32_detector.build_ebnf(self.tools)
@@ -635,6 +650,8 @@ class TestEBNFGeneration(unittest.TestCase):
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
 
+<<<<<<< HEAD
+=======
     def test_glm45_detector_ebnf(self):
         """Test that the Glm4MoeDetector generates valid EBNF."""
         ebnf = self.glm45_detector.build_ebnf(self.tools)
@@ -683,6 +700,7 @@ class TestEBNFGeneration(unittest.TestCase):
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
 
+>>>>>>> origin/main
     def test_weather_function_optional_parameter_handling(self):
         """Test that weather function with optional unit parameter generates correct EBNF without trailing commas."""
         # Create a weather tool with required location and optional unit
@@ -1230,6 +1248,8 @@ class TestLlama32Detector(unittest.TestCase):
         self.assertTrue(result.normal_text.strip().startswith("Some intro."))
 
 
+<<<<<<< HEAD
+=======
 class TestKimiK2Detector(unittest.TestCase):
 
     def setUp(self):
@@ -2190,5 +2210,6 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertEqual(self.detector._buffer, "")
 
 
+>>>>>>> origin/main
 if __name__ == "__main__":
     unittest.main()

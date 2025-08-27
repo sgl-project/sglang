@@ -122,6 +122,8 @@ __global__ void build_tree_efficient(
   }
 }
 
+<<<<<<< HEAD
+=======
 // parent_list [bs, topk * (depth - 1) + 1)]
 // selected_index [bs, draft_token_num - 1]
 // verified_seq_len [bs]
@@ -211,6 +213,7 @@ __global__ void build_tree_efficient_partial_packed(
   }
 }
 
+>>>>>>> origin/main
 void build_tree_kernel_efficient(
     at::Tensor parent_list,
     at::Tensor selected_index,
@@ -238,6 +241,9 @@ void build_tree_kernel_efficient(
     } else if (draft_token_num > 8) {
       num_bytes_per_item = 2;
     }
+<<<<<<< HEAD
+    throw std::runtime_error("Not implemented");
+=======
     build_tree_efficient_partial_packed<<<grid, block, 0, stream>>>(
         static_cast<int64_t*>(parent_list.data_ptr()),
         static_cast<int64_t*>(selected_index.data_ptr()),
@@ -251,6 +257,7 @@ void build_tree_kernel_efficient(
         int32_t(depth),
         int32_t(draft_token_num),
         num_bytes_per_item);
+>>>>>>> origin/main
   } else {
     build_tree_efficient<<<grid, block, 0, stream>>>(
         static_cast<int64_t*>(parent_list.data_ptr()),

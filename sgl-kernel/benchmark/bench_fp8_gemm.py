@@ -1,12 +1,18 @@
 import argparse
 import copy
 import itertools
+<<<<<<< HEAD
+=======
 from typing import Optional, Tuple
+>>>>>>> origin/main
 
 import torch
 import triton
 from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
+<<<<<<< HEAD
+=======
 from sgl_kernel import sgl_per_tensor_quant_fp8
+>>>>>>> origin/main
 from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
 from vllm._custom_ops import scaled_fp8_quant as vllm_scaled_fp8_quant
 
@@ -71,6 +77,8 @@ WEIGHT_SHAPES = {
 }
 
 
+<<<<<<< HEAD
+=======
 def sglang_scaled_fp8_quant(
     input: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
@@ -86,6 +94,7 @@ def sglang_scaled_fp8_quant(
     return output, scale
 
 
+>>>>>>> origin/main
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
@@ -117,22 +126,34 @@ def benchmark(batch_size, provider, N, K):
     b = torch.ones((N, K), device="cuda") * 5.0
     scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
     scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
+<<<<<<< HEAD
+    a_fp8, scale_a_fp8 = vllm_scaled_fp8_quant(a, scale_a)
+    b_fp8, scale_b_fp8 = vllm_scaled_fp8_quant(b, scale_b)
+    b_fp8 = b_fp8.t()
+=======
+>>>>>>> origin/main
     quantiles = [0.5, 0.2, 0.8]
 
     dtype = torch.float16 if "fp16" in provider else torch.bfloat16
 
     if "vllm-fp8" in provider:
+<<<<<<< HEAD
+=======
         a_fp8, scale_a_fp8 = vllm_scaled_fp8_quant(a, scale_a)
         b_fp8, scale_b_fp8 = vllm_scaled_fp8_quant(b, scale_b)
         b_fp8 = b_fp8.t()
+>>>>>>> origin/main
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: vllm_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype),
             quantiles=quantiles,
         )
     elif "sglang-fp8" in provider:
+<<<<<<< HEAD
+=======
         a_fp8, scale_a_fp8 = sglang_scaled_fp8_quant(a, scale_a)
         b_fp8, scale_b_fp8 = sglang_scaled_fp8_quant(b, scale_b)
         b_fp8 = b_fp8.t()
+>>>>>>> origin/main
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: sgl_scaled_mm(
                 a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=None

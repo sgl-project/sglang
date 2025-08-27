@@ -1,12 +1,20 @@
+<<<<<<< HEAD
+=======
 import json as json_lib
 import logging
 import math
 import os
+>>>>>>> origin/main
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
 import torch
 from torch import nn
+<<<<<<< HEAD
+from transformers import Llama4Config, Llama4VisionModel
+from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
+
+=======
 from transformers import Llama4Config, Llama4VisionConfig
 from transformers.models.llama4.modeling_llama4 import (
     Llama4MultiModalProjector,
@@ -19,6 +27,7 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+>>>>>>> origin/main
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -26,6 +35,15 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
+<<<<<<< HEAD
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix, is_cpu
+
+_is_cpu = is_cpu()
+
+=======
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -415,6 +433,7 @@ class Llama4VisionModel(nn.Module):
 
         return hidden_state
 
+>>>>>>> origin/main
 
 class Llama4ForConditionalGeneration(nn.Module):
     packed_modules_mapping = {
@@ -432,6 +451,10 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
+<<<<<<< HEAD
+        self.vision_model = Llama4VisionModel(config.vision_config)
+        self.multi_modal_projector = Llama4MultiModalProjector(config)
+=======
         # Check if this is a text-only model (modelopt fp8 llama4 has no vision components)
         self.has_vision_weights = self._has_vision_weights(config)
         if not self.has_vision_weights:
@@ -456,16 +479,28 @@ class Llama4ForConditionalGeneration(nn.Module):
         else:
             self.vision_model = None
             self.multi_modal_projector = None
+>>>>>>> origin/main
 
         # Initialize the language model
         from sglang.srt.models.llama4 import Llama4ForCausalLM
 
         self.language_model = Llama4ForCausalLM(
+<<<<<<< HEAD
+            config.text_config,
+=======
             config.text_config if hasattr(config, "text_config") else config,
+>>>>>>> origin/main
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
 
+<<<<<<< HEAD
+        self.logits_processor = LogitsProcessor(config.text_config)
+
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+=======
         self.logits_processor = LogitsProcessor(
             config.text_config if hasattr(config, "text_config") else config
         )
@@ -523,11 +558,24 @@ class Llama4ForConditionalGeneration(nn.Module):
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.padding_pattern.pad_input_tokens(input_ids, mm_inputs)
+>>>>>>> origin/main
 
     def get_image_feature(
         self,
         items: List[MultimodalDataItem],
     ) -> torch.Tensor:
+<<<<<<< HEAD
+        pixel_values = (
+            torch.concat([item.pixel_values for item in items])
+            .to(next(self.vision_model.parameters()).device)
+            .type(next(self.vision_model.parameters()).dtype)
+        )
+
+        image_outputs = self.vision_model(pixel_values, output_hidden_states=False)
+        image_features = image_outputs.last_hidden_state
+        vision_flat = image_features.view(-1, image_features.size(-1))
+        projected_vision_flat = self.multi_modal_projector(vision_flat)
+=======
         # For text-only models, return None or raise an error
         if not self.has_vision or self.vision_model is None:
             raise ValueError("Vision model not available for text-only checkpoint")
@@ -542,6 +590,7 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         projected_vision_flat = self.multi_modal_projector(vision_flat)
 
+>>>>>>> origin/main
         return projected_vision_flat
 
     def forward(
@@ -552,16 +601,23 @@ class Llama4ForConditionalGeneration(nn.Module):
         **kwargs: object,
     ) -> torch.Tensor:
 
+<<<<<<< HEAD
+=======
         # For text-only models, pass None for image_data_embedding_func
         image_embedding_func = self.get_image_feature if self.has_vision else None
 
+>>>>>>> origin/main
         hs = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
+<<<<<<< HEAD
+            image_data_embedding_func=self.get_image_feature,
+=======
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
             },
+>>>>>>> origin/main
             positions=positions,
         )
 
@@ -602,6 +658,10 @@ class Llama4ForConditionalGeneration(nn.Module):
         return name, loaded_weight
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+<<<<<<< HEAD
+
+=======
+>>>>>>> origin/main
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
@@ -614,12 +674,20 @@ class Llama4ForConditionalGeneration(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+<<<<<<< HEAD
+
+        num_experts = self.config.text_config.num_local_experts
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+=======
         num_experts = (
             self.config.text_config.num_local_experts
             if hasattr(self.config, "text_config")
             else self.config.num_local_experts
         )
 
+>>>>>>> origin/main
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -627,6 +695,10 @@ class Llama4ForConditionalGeneration(nn.Module):
             num_experts=num_experts,
         )
 
+<<<<<<< HEAD
+        for name, loaded_weight in weights:
+            if not "vision" in name:
+=======
         loaded_params = set()
 
         for name, loaded_weight in weights:
@@ -638,10 +710,83 @@ class Llama4ForConditionalGeneration(nn.Module):
             if "vision" in name:
                 name = name.replace(".self_attn.o_proj", ".self_attn.proj")
             else:
+>>>>>>> origin/main
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
                     name, loaded_weight
                 )
 
+<<<<<<< HEAD
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                if "vision" in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                if ".experts" in name:
+                    # NOTE: llama4 fp8 has different weight format for experts
+                    if (
+                        "experts.gate_up_proj" not in name
+                        and "experts.down_proj" not in name
+                    ):
+                        for mapping in expert_params_mapping:
+                            param_name, weight_name, expert_id, shard_id = mapping
+                            if weight_name not in name:
+                                continue
+                            name = name.replace(weight_name, param_name)
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
+                            weight_loader(
+                                param,
+                                loaded_weight,
+                                name,
+                                shard_id=shard_id,
+                                expert_id=expert_id,
+                            )
+                            break
+                    else:
+                        if ".gate_up_proj" in name:
+                            name_list = [
+                                name.replace(
+                                    ".experts.gate_up_proj", ".experts.w13_weight"
+                                )
+                            ] * 2
+                            loaded_weight_list = loaded_weight.chunk(2, dim=-1)
+                            shard_id_list = ["w1", "w3"]
+                        else:
+                            name_list = [
+                                name.replace(".experts.down_proj", ".experts.w2_weight")
+                            ]
+                            shard_id_list = ["w2"]
+                            loaded_weight_list = [loaded_weight]
+                        for name, loaded_weight, shard_id in zip(
+                            name_list, loaded_weight_list, shard_id_list
+                        ):
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
+                            for expert_id in range(num_experts):
+                                weight_loader(
+                                    param,
+                                    loaded_weight[expert_id].T,
+                                    name,
+                                    shard_id=shard_id,
+                                    expert_id=expert_id,
+                                )
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+=======
             if self._handle_scale_remapping(name, params_dict):
                 loaded_params.add(name)
                 continue
@@ -931,6 +1076,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         param = params_dict[name]
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         weight_loader(param, loaded_weight)
+>>>>>>> origin/main
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if hasattr(self.language_model, "set_eagle3_layers_to_capture"):

@@ -1,9 +1,14 @@
+<<<<<<< HEAD
+import unittest
+
+=======
 import asyncio
 import itertools
 import unittest
 
 import requests
 
+>>>>>>> origin/main
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -20,6 +25,10 @@ from sglang.test.test_utils import (
 
 
 class TestBenchServing(CustomTestCase):
+<<<<<<< HEAD
+
+=======
+>>>>>>> origin/main
     def test_offline_throughput_default(self):
         res = run_bench_serving(
             model=DEFAULT_MODEL_NAME_FOR_TEST,
@@ -31,7 +40,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_default\n"
+<<<<<<< HEAD
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+=======
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
+>>>>>>> origin/main
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 3050)
@@ -54,12 +67,18 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_non_stream_small_batch_size\n"
+<<<<<<< HEAD
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
+            self.assertGreater(res["output_throughput"], 1050)
+=======
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 1000)
             else:
                 self.assertGreater(res["output_throughput"], 1050)
+>>>>>>> origin/main
 
     def test_offline_throughput_without_radix_cache(self):
         res = run_bench_serving(
@@ -72,7 +91,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_without_radix_cache\n"
+<<<<<<< HEAD
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+=======
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
+>>>>>>> origin/main
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 3050)
@@ -90,7 +113,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_without_chunked_prefill\n"
+<<<<<<< HEAD
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+=======
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
+>>>>>>> origin/main
             )
             self.assertGreater(res["output_throughput"], 2600)
 
@@ -110,7 +137,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_with_triton_attention_backend\n"
+<<<<<<< HEAD
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+=======
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
+>>>>>>> origin/main
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 3500)
@@ -128,7 +159,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_offline_throughput_default_fp8\n"
+<<<<<<< HEAD
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+=======
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
+>>>>>>> origin/main
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 3500)
@@ -146,7 +181,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_online_latency_default\n"
+<<<<<<< HEAD
+                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
+=======
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
+>>>>>>> origin/main
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
             if is_in_amd_ci():
@@ -170,7 +209,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_vlm_offline_throughput\n"
+<<<<<<< HEAD
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+=======
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
+>>>>>>> origin/main
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 2000)
@@ -193,7 +236,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_vlm_online_latency\n"
+<<<<<<< HEAD
+                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
+=======
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
+>>>>>>> origin/main
             )
             self.assertLess(res["median_e2e_latency_ms"], 16500)
             if is_in_amd_ci():
@@ -203,6 +250,8 @@ class TestBenchServing(CustomTestCase):
                 self.assertLess(res["median_ttft_ms"], 100)
             self.assertLess(res["median_itl_ms"], 8)
 
+<<<<<<< HEAD
+=======
     def test_lora_online_latency(self):
         # TODO (lifuhuang): verify LoRA support in AMD.
         if is_in_amd_ci():
@@ -322,6 +371,7 @@ class TestBenchServing(CustomTestCase):
 
         return res
 
+>>>>>>> origin/main
     def test_online_latency_eagle(self):
         res = run_bench_serving(
             model=DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -351,8 +401,13 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_online_latency_eagle\n"
+<<<<<<< HEAD
+                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
+                f'accept_length: {res["accept_length"]:.2f} \n'
+=======
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
                 f"accept_length: {res['accept_length']:.2f} \n"
+>>>>>>> origin/main
             )
             if is_in_amd_ci():
                 self.assertLess(res["median_e2e_latency_ms"], 1800)
@@ -371,7 +426,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_moe_offline_throughput_default\n"
+<<<<<<< HEAD
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+=======
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
+>>>>>>> origin/main
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 2100)
@@ -389,7 +448,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_moe_offline_throughput_without_radix_cache\n"
+<<<<<<< HEAD
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+=======
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
+>>>>>>> origin/main
             )
             if is_in_amd_ci():
                 self.assertGreater(res["output_throughput"], 2100)
@@ -411,7 +474,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_pp_offline_throughput_default_decode\n"
+<<<<<<< HEAD
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+=======
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
+>>>>>>> origin/main
             )
             self.assertGreater(res["output_throughput"], 6700)
 
@@ -436,7 +503,11 @@ class TestBenchServing(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_pp_long_context_latency_prefill\n"
+<<<<<<< HEAD
+                f'input_throughput: {res["input_throughput"]:.2f} ms\n'
+=======
                 f"input_throughput: {res['input_throughput']:.2f} ms\n"
+>>>>>>> origin/main
             )
             self.assertGreater(res["input_throughput"], 4000)
 

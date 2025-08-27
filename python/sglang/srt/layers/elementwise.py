@@ -486,6 +486,8 @@ def gelu_and_mul_triton(
         return out_hidden_states, out_scales
     else:
         return out_hidden_states, None
+<<<<<<< HEAD
+=======
 
 
 # silu on first half of vector
@@ -580,3 +582,4 @@ def silu_and_mul_triton(
         return out_hidden_states, out_scales
     else:
         return out_hidden_states, None
+>>>>>>> origin/main

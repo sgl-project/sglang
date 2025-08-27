@@ -43,6 +43,16 @@ class TestLaunchRouter(unittest.TestCase):
             selector=None,
             service_discovery_port=80,
             service_discovery_namespace=None,
+<<<<<<< HEAD
+            prometheus_port=None,
+            prometheus_host=None,
+            # PD-specific attributes
+            pd_disaggregation=False,
+            prefill=None,
+            decode=None,
+            # Keep worker_urls for regular mode
+            worker_urls=[],
+=======
             dp_aware=False,
             prometheus_port=None,
             prometheus_host=None,
@@ -64,6 +74,7 @@ class TestLaunchRouter(unittest.TestCase):
             cb_window_duration_secs=60,
             disable_retries=False,
             disable_circuit_breaker=False,
+>>>>>>> origin/main
         )
 
     def create_router_args(self, **kwargs):
@@ -103,9 +114,13 @@ class TestLaunchRouter(unittest.TestCase):
 
     def test_launch_router_with_empty_worker_urls(self):
         args = self.create_router_args(worker_urls=[])
+<<<<<<< HEAD
+        self.run_router_process(args)  # Expected error
+=======
         self.run_router_process(
             args
         )  # Should start successfully with empty worker list
+>>>>>>> origin/main
 
     def test_launch_router_with_service_discovery(self):
         # Test router startup with service discovery enabled but no selectors
@@ -124,6 +139,8 @@ class TestLaunchRouter(unittest.TestCase):
         )
         self.run_router_process(args)
 
+<<<<<<< HEAD
+=======
     def test_launch_router_common_with_dp_aware(self):
         args = self.create_router_args(
             worker_urls=["http://localhost:8000"],
@@ -170,6 +187,7 @@ class TestLaunchRouter(unittest.TestCase):
         finally:
             terminate_process(process)
 
+>>>>>>> origin/main
     def test_launch_router_pd_mode_basic(self):
         """Test basic PD router functionality without actually starting servers."""
         # This test just verifies the PD router can be created and configured
@@ -225,17 +243,49 @@ class TestLaunchRouter(unittest.TestCase):
         """Test that policy validation works correctly for PD and regular modes."""
         from sglang_router.launch_router import RouterArgs, launch_router
 
+<<<<<<< HEAD
+        # Test 1: PowerOfTwo is only valid in PD mode
+        args = self.create_router_args(
+            pd_disaggregation=False,
+            policy="power_of_two",
+            worker_urls=["http://localhost:8000"],
+=======
         # Test 1: PowerOfTwo requires at least 2 workers
         args = self.create_router_args(
             pd_disaggregation=False,
             policy="power_of_two",
             worker_urls=["http://localhost:8000"],  # Only 1 worker
+>>>>>>> origin/main
         )
 
         # Should raise error
         with self.assertRaises(ValueError) as cm:
             launch_router(args)
         self.assertIn(
+<<<<<<< HEAD
+            "PowerOfTwo policy is only supported in PD disaggregated mode",
+            str(cm.exception),
+        )
+
+        # Test 2: RoundRobin is not valid in PD mode
+        args = self.create_router_args(
+            pd_disaggregation=True,
+            policy="round_robin",
+            prefill=[["http://prefill1:8080", "9000"]],
+            decode=[["http://decode1:8081"]],
+            worker_urls=[],
+        )
+
+        # Should raise error
+        with self.assertRaises(ValueError) as cm:
+            launch_router(args)
+        self.assertIn(
+            "RoundRobin policy is not supported in PD disaggregated mode",
+            str(cm.exception),
+        )
+
+        # Test 3: Valid combinations should not raise errors
+=======
             "Power-of-two policy requires at least 2 workers",
             str(cm.exception),
         )
@@ -249,23 +299,37 @@ class TestLaunchRouter(unittest.TestCase):
         # This should not raise an error (validation passes)
 
         # Test 3: All policies now work in both modes
+>>>>>>> origin/main
         # Regular mode with RoundRobin
         args = self.create_router_args(
             pd_disaggregation=False,
             policy="round_robin",
             worker_urls=["http://localhost:8000"],
         )
+<<<<<<< HEAD
+        # This should not raise (though it may fail to connect)
+
+        # PD mode with PowerOfTwo
+        args = self.create_router_args(
+            pd_disaggregation=True,
+            policy="power_of_two",
+=======
         # This should not raise validation error
 
         # PD mode with RoundRobin (now supported!)
         args = self.create_router_args(
             pd_disaggregation=True,
             policy="round_robin",
+>>>>>>> origin/main
             prefill=[["http://prefill1:8080", "9000"]],
             decode=[["http://decode1:8081"]],
             worker_urls=[],
         )
+<<<<<<< HEAD
+        # This should not raise (though it may fail to connect)
+=======
         # This should not raise validation error
+>>>>>>> origin/main
 
     def test_pd_service_discovery_args_parsing(self):
         """Test PD service discovery CLI argument parsing."""
@@ -340,6 +404,8 @@ class TestLaunchRouter(unittest.TestCase):
         self.assertEqual(router_args.prefill_selector, {})
         self.assertEqual(router_args.decode_selector, {})
 
+<<<<<<< HEAD
+=======
     def test_empty_worker_urls_args_parsing(self):
         """Test that router accepts no worker URLs and defaults to empty list."""
         import argparse
@@ -359,6 +425,7 @@ class TestLaunchRouter(unittest.TestCase):
         router_args = RouterArgs.from_cli_args(args)
         self.assertEqual(router_args.worker_urls, [])
 
+>>>>>>> origin/main
 
 if __name__ == "__main__":
     unittest.main()

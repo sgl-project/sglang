@@ -9,8 +9,11 @@ import time
 import unittest
 from types import SimpleNamespace
 
+<<<<<<< HEAD
+=======
 import requests
 
+>>>>>>> origin/main
 from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -64,6 +67,8 @@ class TestPPAccuracy(unittest.TestCase):
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
 
+<<<<<<< HEAD
+=======
     def test_logprob(self):
         response = requests.post(
             f"{self.base_url}/generate",
@@ -87,6 +92,7 @@ class TestPPAccuracy(unittest.TestCase):
         assert len(output_token_logprobs) == 16
         assert len(output_top_logprobs) == 16
 
+>>>>>>> origin/main
 
 class TestQwenPPAccuracy(unittest.TestCase):
     @classmethod

@@ -1,14 +1,22 @@
 ARG CUDA_VERSION=12.6.1
+<<<<<<< HEAD
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+
+ARG BUILD_TYPE=all
+=======
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
 
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG DEEPEP_COMMIT=b92d0d4860ce6866cd6d31bfbae937f9a7a3772b
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
+>>>>>>> origin/main
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
     NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+<<<<<<< HEAD
+=======
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
@@ -21,6 +29,7 @@ RUN apt update && apt install wget -y && apt install software-properties-common 
  && update-alternatives --set python3 /usr/bin/python3.12 \
  && wget https://bootstrap.pypa.io/get-pip.py \
  && python3 get-pip.py
+>>>>>>> origin/main
 
 # Set timezone and install all packages
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -29,6 +38,10 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     tzdata \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
+<<<<<<< HEAD
+    python3 python3-pip python3-dev libpython3-dev \
+=======
+>>>>>>> origin/main
     build-essential cmake \
     libopenmpi-dev libnuma1 libnuma-dev \
     libibverbs-dev libibverbs1 libibumad3 \
@@ -44,7 +57,11 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     patchelf \
     nvidia-dkms-550 \
     devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
+<<<<<<< HEAD
+ && ln -sf /usr/bin/python3 /usr/bin/python \
+=======
  && ln -sf /usr/bin/python3.12 /usr/bin/python \
+>>>>>>> origin/main
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
 
@@ -59,6 +76,12 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
 # Fix DeepEP IBGDA symlink
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 
+<<<<<<< HEAD
+# Clone and install SGLang
+WORKDIR /sgl-workspace
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
+ && git clone --depth=1 https://github.com/sgl-project/sglang.git \
+=======
 FROM scratch AS local_src
 COPY . /src
 
@@ -74,10 +97,30 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     fi \
  && rm -rf /tmp/local_src
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
+>>>>>>> origin/main
  && cd sglang \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
       12.8.1) CUINDEX=128 ;; \
+<<<<<<< HEAD
+      *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+    esac \
+ && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
+      python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.5 --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.4/sgl_kernel-0.2.4+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+    fi
+
+# Build and install NVSHMEM + DeepEP
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz \
+ && git clone https://github.com/deepseek-ai/DeepEP.git \
+ && tar -xf nvshmem_src_3.2.5-1.txz && mv nvshmem_src nvshmem \
+ && cd nvshmem \
+ && git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch \
+ && sed -i '1i#include <unistd.h>' examples/moe_shuffle.cu \
+ && rm -f /sgl-workspace/nvshmem_src_3.2.5-1.txz \
+ && NVSHMEM_SHMEM_SUPPORT=0 \
+=======
       12.9.1) CUINDEX=129 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
@@ -102,6 +145,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_SHMEM_SUPPORT=0 \
+>>>>>>> origin/main
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
     NVSHMEM_MPI_SUPPORT=0 \
@@ -109,6 +153,12 @@ RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
+<<<<<<< HEAD
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=90 \
+ && cmake --build build --target install -j \
+ && cd /sgl-workspace/DeepEP \
+ && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
+=======
     cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="90" && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
@@ -126,11 +176,16 @@ RUN cd /sgl-workspace/DeepEP && \
         ;; \
     esac && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
+>>>>>>> origin/main
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
+<<<<<<< HEAD
+    mooncake_transfer_engine==0.3.4.post2 \
+=======
     mooncake-transfer-engine==0.3.5 \
+>>>>>>> origin/main
     pre-commit \
     pytest \
     black \
@@ -138,9 +193,13 @@ RUN python3 -m pip install --no-cache-dir \
     icdiff \
     uv \
     wheel \
+<<<<<<< HEAD
+    scikit-build-core
+=======
     scikit-build-core \
     nixl \
     py-spy
+>>>>>>> origin/main
 
 # Install development tools and utilities
 RUN apt-get update && apt-get install -y \
@@ -317,7 +376,10 @@ set-window-option -g mode-keys vi
 set-option -g escape-time 0
 set-option -g base-index 1
 set-window-option -g mouse on
+<<<<<<< HEAD
+=======
 set -g history-limit 100000
+>>>>>>> origin/main
 EOF
 
 # Configure Git

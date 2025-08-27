@@ -1,4 +1,8 @@
+<<<<<<< HEAD
+use crate::router::Router;
+=======
 use crate::routers::RouterTrait;
+>>>>>>> origin/main
 
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
@@ -10,7 +14,10 @@ use kube::{
 };
 use std::collections::{HashMap, HashSet};
 
+<<<<<<< HEAD
+=======
 use rustls;
+>>>>>>> origin/main
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task;
@@ -41,6 +48,10 @@ impl Default for ServiceDiscoveryConfig {
             check_interval: Duration::from_secs(60),
             port: 8000,      // Standard port for modern services
             namespace: None, // None means watch all namespaces
+<<<<<<< HEAD
+            // PD mode defaults
+=======
+>>>>>>> origin/main
             pd_mode: false,
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
@@ -75,10 +86,18 @@ impl PodInfo {
             return false;
         }
 
+<<<<<<< HEAD
+        pod.metadata.labels.as_ref().map_or(false, |labels| {
+            selector
+                .iter()
+                .all(|(k, v)| labels.get(k).map_or(false, |label_value| label_value == v))
+        })
+=======
         pod.metadata
             .labels
             .as_ref()
             .is_some_and(|labels| selector.iter().all(|(k, v)| labels.get(k) == Some(v)))
+>>>>>>> origin/main
     }
 
     /// Check if a pod should be included in service discovery
@@ -175,7 +194,11 @@ impl PodInfo {
 
 pub async fn start_service_discovery(
     config: ServiceDiscoveryConfig,
+<<<<<<< HEAD
+    router: Arc<Router>,
+=======
     router: Arc<dyn RouterTrait>,
+>>>>>>> origin/main
 ) -> Result<task::JoinHandle<()>, kube::Error> {
     // Don't initialize anything if service discovery is disabled
     if !config.enabled {
@@ -188,8 +211,11 @@ pub async fn start_service_discovery(
         }));
     }
 
+<<<<<<< HEAD
+=======
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+>>>>>>> origin/main
     // Initialize Kubernetes client
     let client = Client::try_default().await?;
 
@@ -210,7 +236,11 @@ pub async fn start_service_discovery(
             .join(",");
 
         info!(
+<<<<<<< HEAD
+            "Starting Kubernetes service discovery in PD mode with prefill_selector: '{}', decode_selector: '{}'",
+=======
             "Starting K8s service discovery | PD mode | prefill: '{}' | decode: '{}'",
+>>>>>>> origin/main
             prefill_selector, decode_selector
         );
     } else {
@@ -222,7 +252,11 @@ pub async fn start_service_discovery(
             .join(",");
 
         info!(
+<<<<<<< HEAD
+            "Starting Kubernetes service discovery with selector: '{}'",
+=======
             "Starting K8s service discovery | selector: '{}'",
+>>>>>>> origin/main
             label_selector
         );
     }
@@ -239,7 +273,11 @@ pub async fn start_service_discovery(
             Api::all(client)
         };
 
+<<<<<<< HEAD
+        info!("Kubernetes service discovery initialized successfully");
+=======
         debug!("K8s service discovery initialized");
+>>>>>>> origin/main
 
         // Create Arcs for configuration data
         let config_arc = Arc::new(config.clone());
@@ -347,7 +385,11 @@ pub async fn start_service_discovery(
 async fn handle_pod_event(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+<<<<<<< HEAD
+    router: Arc<Router>,
+=======
     router: Arc<dyn RouterTrait>,
+>>>>>>> origin/main
     port: u16,
     pd_mode: bool,
 ) {
@@ -376,6 +418,23 @@ async fn handle_pod_event(
 
         if should_add {
             info!(
+<<<<<<< HEAD
+                "Healthy pod found: {} (type: {:?}). Adding worker: {}",
+                pod_info.name, pod_info.pod_type, worker_url
+            );
+
+            let result = if pd_mode && pod_info.pod_type.is_some() {
+                // Use PD-aware worker management
+                if let Some(pod_type) = &pod_info.pod_type {
+                    router
+                        .add_pd_worker(&worker_url, pod_type.clone(), pod_info.bootstrap_port)
+                        .await
+                } else {
+                    Err("Pod type is None in PD mode".to_string())
+                }
+            } else {
+                // Fallback to regular worker management
+=======
                 "Adding pod: {} | type: {:?} | url: {}",
                 pod_info.name, pod_info.pod_type, worker_url
             );
@@ -406,12 +465,18 @@ async fn handle_pod_event(
                 }
             } else {
                 // Regular mode or no pod type specified
+>>>>>>> origin/main
                 router.add_worker(&worker_url).await
             };
 
             match result {
+<<<<<<< HEAD
+                Ok(msg) => {
+                    info!("Successfully added worker: {}", msg);
+=======
                 Ok(_) => {
                     debug!("Worker added: {}", worker_url);
+>>>>>>> origin/main
                 }
                 Err(e) => {
                     error!("Failed to add worker {} to router: {}", worker_url, e);
@@ -428,7 +493,11 @@ async fn handle_pod_event(
 async fn handle_pod_deletion(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+<<<<<<< HEAD
+    router: Arc<Router>,
+=======
     router: Arc<dyn RouterTrait>,
+>>>>>>> origin/main
     port: u16,
     pd_mode: bool,
 ) {
@@ -447,6 +516,24 @@ async fn handle_pod_deletion(
 
     if was_tracked {
         info!(
+<<<<<<< HEAD
+            "Pod deleted: {} (type: {:?}). Removing worker: {}",
+            pod_info.name, pod_info.pod_type, worker_url
+        );
+
+        if pd_mode && pod_info.pod_type.is_some() {
+            // Use PD-aware worker removal
+            if let Some(pod_type) = &pod_info.pod_type {
+                if let Err(e) = router.remove_pd_worker(&worker_url, pod_type.clone()).await {
+                    error!(
+                        "Failed to remove PD worker {} from router: {}",
+                        worker_url, e
+                    );
+                }
+            }
+        } else {
+            // Fallback to regular worker removal
+=======
             "Removing pod: {} | type: {:?} | url: {}",
             pod_info.name, pod_info.pod_type, worker_url
         );
@@ -479,6 +566,7 @@ async fn handle_pod_deletion(
             }
         } else {
             // Regular mode removal
+>>>>>>> origin/main
             router.remove_worker(&worker_url);
         }
     } else {
@@ -494,9 +582,17 @@ async fn handle_pod_deletion(
 #[cfg(test)]
 mod tests {
     use super::*;
+<<<<<<< HEAD
+    use crate::router::Router;
     use k8s_openapi::api::core::v1::{Pod, PodCondition, PodSpec, PodStatus};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use std::sync::RwLock;
+=======
+    use k8s_openapi::api::core::v1::{Pod, PodCondition, PodSpec, PodStatus};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+>>>>>>> origin/main
 
     // Helper function to create a Pod for testing PodInfo::from_pod
     fn create_k8s_pod(
@@ -532,7 +628,10 @@ mod tests {
                     last_transition_time: None,
                     message: None,
                     reason: None,
+<<<<<<< HEAD
+=======
                     observed_generation: None,
+>>>>>>> origin/main
                 };
                 pod_status.conditions = Some(vec![condition]);
             }
@@ -570,7 +669,10 @@ mod tests {
                     last_transition_time: None,
                     message: None,
                     reason: None,
+<<<<<<< HEAD
+=======
                     observed_generation: None,
+>>>>>>> origin/main
                 }]),
                 ..Default::default()
             }),
@@ -578,6 +680,15 @@ mod tests {
     }
 
     // Helper to create a Router instance for testing event handlers
+<<<<<<< HEAD
+    fn create_test_router() -> Arc<Router> {
+        let worker_urls = Arc::new(RwLock::new(Vec::new()));
+        Arc::new(Router::Random {
+            worker_urls,
+            timeout_secs: 5,
+            interval_secs: 1,
+        })
+=======
     async fn create_test_router() -> Arc<dyn RouterTrait> {
         use crate::config::PolicyConfig;
         use crate::policies::PolicyFactory;
@@ -599,6 +710,7 @@ mod tests {
         .await
         .unwrap();
         Arc::new(router) as Arc<dyn RouterTrait>
+>>>>>>> origin/main
     }
 
     // Helper to create a PD config for testing
@@ -900,7 +1012,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_pod_event_add_unhealthy_pod() {
+<<<<<<< HEAD
+        let router = create_test_router();
+=======
         let router = create_test_router().await;
+>>>>>>> origin/main
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "pod1".into(),
@@ -924,12 +1040,21 @@ mod tests {
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
         assert!(!router
             .get_worker_urls()
+<<<<<<< HEAD
+            .read()
+            .unwrap()
+=======
+>>>>>>> origin/main
             .contains(&pod_info.worker_url(port)));
     }
 
     #[tokio::test]
     async fn test_handle_pod_deletion_non_existing_pod() {
+<<<<<<< HEAD
+        let router = create_test_router();
+=======
         let router = create_test_router().await;
+>>>>>>> origin/main
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "pod1".into(),
@@ -951,12 +1076,20 @@ mod tests {
         .await;
 
         assert!(tracked_pods.lock().unwrap().is_empty());
+<<<<<<< HEAD
+        assert!(router.get_worker_urls().read().unwrap().is_empty());
+=======
         assert!(router.get_worker_urls().is_empty());
+>>>>>>> origin/main
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_event_prefill_pod() {
+<<<<<<< HEAD
+        let router = create_test_router();
+=======
         let router = create_test_router().await;
+>>>>>>> origin/main
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "prefill-pod".into(),
@@ -985,7 +1118,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_pd_pod_event_decode_pod() {
+<<<<<<< HEAD
+        let router = create_test_router();
+=======
         let router = create_test_router().await;
+>>>>>>> origin/main
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "decode-pod".into(),
@@ -1012,7 +1149,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_tracked_pod() {
+<<<<<<< HEAD
+        let router = create_test_router();
+=======
         let router = create_test_router().await;
+>>>>>>> origin/main
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "test-pod".into(),
@@ -1046,7 +1187,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_untracked_pod() {
+<<<<<<< HEAD
+        let router = create_test_router();
+=======
         let router = create_test_router().await;
+>>>>>>> origin/main
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "untracked-pod".into(),
@@ -1075,7 +1220,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_unified_handler_regular_mode() {
+<<<<<<< HEAD
+        let router = create_test_router();
+=======
         let router = create_test_router().await;
+>>>>>>> origin/main
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "regular-pod".into(),
@@ -1103,7 +1252,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_unified_handler_pd_mode_with_prefill() {
+<<<<<<< HEAD
+        let router = create_test_router();
+=======
         let router = create_test_router().await;
+>>>>>>> origin/main
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "prefill-pod".into(),
@@ -1131,7 +1284,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_unified_handler_deletion_with_pd_mode() {
+<<<<<<< HEAD
+        let router = create_test_router();
+=======
         let router = create_test_router().await;
+>>>>>>> origin/main
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
             name: "decode-pod".into(),

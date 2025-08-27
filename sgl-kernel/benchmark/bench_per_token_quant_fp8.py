@@ -12,6 +12,8 @@ from sglang.srt.utils import is_hip
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
+<<<<<<< HEAD
+=======
 # Get correct FP8 E4M3 maximum value
 if _is_hip:
     FP8_E4M3_MAX = 224.0  # ROCM uses 224.0
@@ -45,6 +47,7 @@ def torch_per_token_quant_fp8(
 
     return quantized_fp8, scales
 
+>>>>>>> origin/main
 
 def vllm_per_token_quant_fp8(
     input: torch.Tensor,
@@ -62,6 +65,25 @@ def sglang_per_token_quant_fp8(
     return output, scale
 
 
+<<<<<<< HEAD
+def calculate_diff(batch_size: int, seq_len: int):
+    """Calculate difference between VLLM and SGLang implementations."""
+    device = torch.device("cuda")
+    x = torch.rand((batch_size, seq_len), dtype=torch.float16, device=device)
+
+    vllm_out, vllm_scale = vllm_per_token_quant_fp8(x)
+    sglang_out, sglang_scale = sglang_per_token_quant_fp8(x)
+
+    scale_diff = torch.abs(vllm_scale - sglang_scale).mean().item()
+    output_diff = torch.abs(vllm_out.float() - sglang_out.float()).mean().item()
+
+    if torch.allclose(
+        vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
+    ) and torch.allclose(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-5):
+        print("✅ All implementations match")
+    else:
+        print("❌ Implementations differ")
+=======
 def calculate_diff(batch_size: int, seq_len: int, hidden_dim: int):
     """Compare Torch reference, VLLM, and SGLang implementations."""
     device = torch.device("cuda")
@@ -123,28 +145,54 @@ def calculate_diff(batch_size: int, seq_len: int, hidden_dim: int):
     print(f"  Torch vs VLLM:   {'✅' if torch_vllm_match else '❌'}")
     print(f"  Torch vs SGLang: {'✅' if torch_sglang_match else '❌'}")
     print(f"  VLLM vs SGLang:  {'✅' if vllm_sglang_match else '❌'}")
+>>>>>>> origin/main
 
 
 batch_size_range = [16, 32, 64, 128]
 seq_len_range = [64, 128, 256, 512, 1024, 2048, 4096]
+<<<<<<< HEAD
+
+configs = list(itertools.product(batch_size_range, seq_len_range))
+=======
 hidden_dim_range = [1368, 2048, 4096]
 
 configs = list(itertools.product(batch_size_range, seq_len_range, hidden_dim_range))
+>>>>>>> origin/main
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
+<<<<<<< HEAD
+        x_names=["batch_size", "seq_len"],
+        x_vals=configs,
+        line_arg="provider",
+        line_vals=["vllm", "sglang"],
+        line_names=["VLLM", "SGL Kernel"],
+        styles=[("blue", "-"), ("green", "-")],
+=======
         x_names=["batch_size", "seq_len", "hidden_dim"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["torch", "vllm", "sglang"],
         line_names=["Torch Reference", "VLLM", "SGL Kernel"],
         styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+>>>>>>> origin/main
         ylabel="us",
         plot_name="per-token-dynamic-quant-fp8-performance",
         args={},
     )
 )
+<<<<<<< HEAD
+def benchmark_quantization(batch_size, seq_len, provider):
+    dtype = torch.float16
+    device = torch.device("cuda")
+
+    x = torch.randn(batch_size * seq_len, 4096, device=device, dtype=dtype)
+
+    quantiles = [0.5, 0.2, 0.8]
+
+    if provider == "vllm":
+=======
 def benchmark_quantization(batch_size, seq_len, hidden_dim, provider):
     dtype = torch.float16
     device = torch.device("cuda")
@@ -156,6 +204,7 @@ def benchmark_quantization(batch_size, seq_len, hidden_dim, provider):
     if provider == "torch":
         fn = lambda: torch_per_token_quant_fp8(x.clone())
     elif provider == "vllm":
+>>>>>>> origin/main
         fn = lambda: vllm_per_token_quant_fp8(x.clone())
     elif provider == "sglang":
         fn = lambda: sglang_per_token_quant_fp8(x.clone())
@@ -166,6 +215,9 @@ def benchmark_quantization(batch_size, seq_len, hidden_dim, provider):
 
 
 if __name__ == "__main__":
+<<<<<<< HEAD
+    calculate_diff(batch_size=4, seq_len=4096)
+=======
     # Test various hidden dimensions for correctness
     test_dims = [1368, 2048, 4096]
 
@@ -174,4 +226,5 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 60)
     print("Starting performance benchmark...")
+>>>>>>> origin/main
     benchmark_quantization.run(print_data=True)

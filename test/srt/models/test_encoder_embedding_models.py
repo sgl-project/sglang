@@ -27,9 +27,15 @@ from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
 MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5)]
 
+<<<<<<< HEAD
+ATTENTION_BACKEND = ["torch_native", "triton"]
+BATCH_SIZE = [1, 2]
+TORCH_DTYPES = [torch.float32]
+=======
 ATTENTION_BACKEND = ["torch_native", "triton", "flashinfer"]
 BATCH_SIZE = [1, 2]
 TORCH_DTYPES = [torch.float32, torch.float16]
+>>>>>>> origin/main
 sgl_to_st_ratio = []
 
 
@@ -126,6 +132,8 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             for attention_backend in ATTENTION_BACKEND:
                 for batch_size in BATCH_SIZE:
                     for torch_dtype in TORCH_DTYPES:
+<<<<<<< HEAD
+=======
                         # NOTE: FlashInfer currently has limitations with head_dim = 32 or
                         # other dimensions.
                         # The FlashInfer head_dim limitation itself is tracked here:
@@ -139,6 +147,7 @@ class TestEncoderEmbeddingModels(CustomTestCase):
                             ):
                                 continue
 
+>>>>>>> origin/main
                         self.assert_close_prefill_logits(
                             DEFAULT_PROMPTS,
                             model,

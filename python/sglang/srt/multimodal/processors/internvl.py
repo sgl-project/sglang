@@ -6,7 +6,10 @@ from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+<<<<<<< HEAD
+=======
 from sglang.srt.models.interns1 import InternS1ForConditionalGeneration
+>>>>>>> origin/main
 from sglang.srt.models.internvl import InternVLChatModel
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -15,6 +18,14 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 
 class InternVLImageProcessor(BaseMultimodalProcessor):
+<<<<<<< HEAD
+    models = [InternVLChatModel]
+
+    def __init__(self, hf_config, server_args, _image_processor):
+        super().__init__(hf_config, server_args, _image_processor)
+        image_size = hf_config.force_image_size or hf_config.vision_config.image_size
+        patch_size = hf_config.vision_config.patch_size
+=======
     models = [InternVLChatModel, InternS1ForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _image_processor, *args, **kwargs):
@@ -28,10 +39,24 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             image_size = image_size[0]
         if isinstance(patch_size, list):
             patch_size = patch_size[0]
+>>>>>>> origin/main
 
         self.IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
         self.IMG_START_TOKEN = "<img>"
         self.IMG_END_TOKEN = "</img>"
+<<<<<<< HEAD
+        self.IMG_TOKEN = "<image>"
+        self.num_image_token = int(
+            (image_size // patch_size) ** 2 * (hf_config.downsample_ratio**2)
+        )
+
+        tokenizer = self._processor
+        self.img_start_token_id = tokenizer.convert_tokens_to_ids(self.IMG_START_TOKEN)
+        self.img_end_token_id = tokenizer.convert_tokens_to_ids(self.IMG_END_TOKEN)
+        self.img_context_token_id = tokenizer.convert_tokens_to_ids(
+            self.IMG_CONTEXT_TOKEN
+        )
+=======
         self.num_image_token = int(
             (image_size // patch_size) ** 2 * (hf_config.downsample_ratio**2)
         )
@@ -47,6 +72,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             image_token="<IMG_CONTEXT>",
             image_token_id=tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT_TOKEN),
         ).build(_image_processor)
+>>>>>>> origin/main
 
     @staticmethod
     def build_transform(input_size):
@@ -182,12 +208,21 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         return pixel_values, num_patches_list
 
     async def process_mm_data_async(
+<<<<<<< HEAD
+        self, image_data, input_text, request_obj, max_req_input_len, **kwargs
+=======
         self, image_data, input_text, request_obj, **kwargs
+>>>>>>> origin/main
     ):
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
+<<<<<<< HEAD
+            multimodal_tokens=MultimodalSpecialTokens(image_token=self.IMG_TOKEN),
+            max_req_input_len=max_req_input_len,
+=======
             multimodal_tokens=self.mm_tokens,
+>>>>>>> origin/main
             discard_alpha_channel=True,
         )
 
@@ -207,7 +242,11 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             try:
                 # TODO: video input
                 raw_image = process_image_internvl(image)
+<<<<<<< HEAD
+                pixel_value = [raw_image.to(torch.bfloat16).cuda()]
+=======
                 pixel_value = [raw_image.to(torch.bfloat16)]
+>>>>>>> origin/main
                 pixel_values += pixel_value
                 num_patches = raw_image.shape[0]
                 num_patches_list += [num_patches]
@@ -218,15 +257,33 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
 
         pixel_values = torch.cat(pixel_values, dim=0)
 
+<<<<<<< HEAD
+=======
         original_placeholder = "<<<__IMG_CONTEXT_PLACEHOLDER__>>>"
         input_text = input_text.replace(self.IMG_CONTEXT_TOKEN, original_placeholder)
 
+>>>>>>> origin/main
         for idx, num_patches in enumerate(num_patches_list):
             image_tokens = (
                 self.IMG_START_TOKEN
                 + self.IMG_CONTEXT_TOKEN * self.num_image_token * num_patches
                 + self.IMG_END_TOKEN
             )
+<<<<<<< HEAD
+            input_text = input_text.replace("<image>", image_tokens, 1)
+
+        tokenizer = self._processor
+        input_ids = tokenizer(input_text, return_tensors="pt")["input_ids"].flatten()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids,
+            mm_token_id=self.img_context_token_id,
+        )
+        items = [
+            MultimodalDataItem(
+                pixel_values=pixel_values,
+                modality=Modality.IMAGE,
+                image_offsets=image_offsets,
+=======
             input_text = input_text.replace(original_placeholder, image_tokens, 1)
 
         input_text = input_text.replace(original_placeholder, self.IMG_CONTEXT_TOKEN)
@@ -243,6 +300,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
                 feature=pixel_values,
                 modality=Modality.IMAGE,
                 offsets=image_offsets,
+>>>>>>> origin/main
             )
         ]
 
@@ -251,5 +309,9 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             "mm_items": items,
             "im_start_id": self.img_start_token_id,
             "im_end_id": self.img_end_token_id,
+<<<<<<< HEAD
+            "im_token_id": self.img_context_token_id,
+=======
             "im_token_id": self.mm_tokens.image_token_id,
+>>>>>>> origin/main
         }

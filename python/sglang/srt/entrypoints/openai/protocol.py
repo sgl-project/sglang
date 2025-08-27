@@ -14,6 +14,11 @@
 """Pydantic models for OpenAI API protocol"""
 
 import time
+<<<<<<< HEAD
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
+
+=======
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, TypeAlias, Union
@@ -26,6 +31,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
+>>>>>>> origin/main
 from pydantic import (
     BaseModel,
     Field,
@@ -93,7 +99,10 @@ class UsageInfo(BaseModel):
     completion_tokens: Optional[int] = 0
     # only used to return cached tokens when --enable-cache-report is set
     prompt_tokens_details: Optional[Dict[str, int]] = None
+<<<<<<< HEAD
+=======
     reasoning_tokens: Optional[int] = 0
+>>>>>>> origin/main
 
 
 class StreamOptions(BaseModel):
@@ -108,6 +117,8 @@ class JsonSchemaResponseFormat(BaseModel):
     strict: Optional[bool] = False
 
 
+<<<<<<< HEAD
+=======
 class ResponseFormat(BaseModel):
     type: Literal["text", "json_object", "json_schema"]
     json_schema: Optional[JsonSchemaResponseFormat] = None
@@ -125,6 +136,7 @@ class StructuralTagResponseFormat(BaseModel):
     triggers: List[str]
 
 
+>>>>>>> origin/main
 class FileRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/files/create
     file: bytes  # The File object (not file name) to be uploaded
@@ -217,12 +229,20 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+<<<<<<< HEAD
+
+    # For PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
+=======
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+>>>>>>> origin/main
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -258,7 +278,10 @@ class CompletionResponse(BaseModel):
     model: str
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
+<<<<<<< HEAD
+=======
     metadata: Optional[Dict[str, Any]] = None
+>>>>>>> origin/main
 
 
 class CompletionResponseStreamChoice(BaseModel):
@@ -296,10 +319,13 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
 
+<<<<<<< HEAD
+=======
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
 
 
+>>>>>>> origin/main
 class ChatCompletionMessageContentAudioURL(BaseModel):
     url: str
 
@@ -310,11 +336,14 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
+<<<<<<< HEAD
+=======
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
     video_url: ChatCompletionMessageContentVideoURL
 
 
+>>>>>>> origin/main
 class ChatCompletionMessageContentAudioPart(BaseModel):
     type: Literal["audio_url"]
     audio_url: ChatCompletionMessageContentAudioURL
@@ -323,7 +352,10 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentImagePart,
+<<<<<<< HEAD
+=======
     ChatCompletionMessageContentVideoPart,
+>>>>>>> origin/main
     ChatCompletionMessageContentAudioPart,
 ]
 
@@ -345,10 +377,15 @@ class ToolCall(BaseModel):
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
+<<<<<<< HEAD
+    role: Literal["system", "assistant", "tool"]
+    content: Union[str, List[ChatCompletionMessageContentTextPart], None]
+=======
     role: Literal["system", "assistant", "tool", "function"]
     content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
         default=None
     )
+>>>>>>> origin/main
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
@@ -359,9 +396,15 @@ class ChatCompletionMessageGenericParam(BaseModel):
     def _normalize_role(cls, v):
         if isinstance(v, str):
             v_lower = v.lower()
+<<<<<<< HEAD
+            if v_lower not in {"system", "assistant", "tool"}:
+                raise ValueError(
+                    "'role' must be one of 'system', 'assistant', or 'tool' (case-insensitive)."
+=======
             if v_lower not in {"system", "assistant", "tool", "function"}:
                 raise ValueError(
                     "'role' must be one of 'system', 'assistant', 'tool', or 'function' (case-insensitive)."
+>>>>>>> origin/main
                 )
             return v_lower
         raise ValueError("'role' must be a string")
@@ -377,6 +420,26 @@ ChatCompletionMessageParam = Union[
 ]
 
 
+<<<<<<< HEAD
+class ResponseFormat(BaseModel):
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: Optional[JsonSchemaResponseFormat] = None
+
+
+class StructuresResponseFormat(BaseModel):
+    begin: str
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    end: str
+
+
+class StructuralTagResponseFormat(BaseModel):
+    type: Literal["structural_tag"]
+    structures: List[StructuresResponseFormat]
+    triggers: List[str]
+
+
+=======
+>>>>>>> origin/main
 class Function(BaseModel):
     """Function descriptions."""
 
@@ -440,6 +503,8 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+<<<<<<< HEAD
+=======
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
@@ -447,6 +512,7 @@ class ChatCompletionRequest(BaseModel):
         "result in faster responses and fewer tokens used on reasoning in a response. "
         "Currently only supported for OpenAI models.",
     )
+>>>>>>> origin/main
 
     @model_validator(mode="before")
     @classmethod
@@ -519,7 +585,10 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
+<<<<<<< HEAD
+=======
     metadata: Optional[Dict[str, Any]] = None
+>>>>>>> origin/main
 
 
 class DeltaMessage(BaseModel):
@@ -639,6 +708,8 @@ OpenAIServingRequest = Union[
 ]
 
 
+<<<<<<< HEAD
+=======
 # Response API protocol definitions
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
@@ -829,6 +900,7 @@ class RequestResponseMetadata(BaseModel):
     final_usage_info: Optional[UsageInfo] = None
 
 
+>>>>>>> origin/main
 @dataclass
 class MessageProcessingResult:
     """Result of processing chat messages and applying templates.
@@ -851,6 +923,11 @@ class MessageProcessingResult:
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]
     audio_data: Optional[Any]
+<<<<<<< HEAD
+    modalities: List[str]
+    stop: List[str]
+    tool_call_constraint: Optional[Any] = None
+=======
     video_data: Optional[Any]
     modalities: List[str]
     stop: List[str]
@@ -865,3 +942,4 @@ class ResponseReasoningTextContent(BaseModel):
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
 ]
+>>>>>>> origin/main

@@ -318,6 +318,8 @@ class GemmaForCausalLM(nn.Module):
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
 
+<<<<<<< HEAD
+=======
     @torch.no_grad()
     def forward_split_prefill(
         self,
@@ -366,6 +368,7 @@ class GemmaForCausalLM(nn.Module):
 
         return result
 
+>>>>>>> origin/main
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

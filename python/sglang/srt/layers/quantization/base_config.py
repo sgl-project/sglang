@@ -1,17 +1,27 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/base_config.py
+<<<<<<< HEAD
+
+import inspect
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional, Type
+=======
 from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+>>>>>>> origin/main
 
 import torch
 from torch import nn
 
+<<<<<<< HEAD
+=======
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
+>>>>>>> origin/main
 
 class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
@@ -23,14 +33,22 @@ class QuantizeMethodBase(ABC):
         """Create weights for a layer.
 
         The weights will be set as attributes of the layer."""
+<<<<<<< HEAD
+        raise NotImplementedError
+=======
         raise NotImplementedError()
+>>>>>>> origin/main
 
     @abstractmethod
     def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
         """Apply the weights in layer to the input tensor.
 
         Expects create_weights to have been called before on the layer."""
+<<<<<<< HEAD
+        raise NotImplementedError
+=======
         raise NotImplementedError()
+>>>>>>> origin/main
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Process the weight after loading.
@@ -40,6 +58,8 @@ class QuantizeMethodBase(ABC):
         return
 
 
+<<<<<<< HEAD
+=======
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
@@ -106,6 +126,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
 
+>>>>>>> origin/main
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
@@ -117,12 +138,20 @@ class QuantizationConfig(ABC):
     @abstractmethod
     def get_name(self) -> str:
         """Name of the quantization method."""
+<<<<<<< HEAD
+        raise NotImplementedError
+=======
         raise NotImplementedError()
+>>>>>>> origin/main
 
     @abstractmethod
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
         """List of supported activation dtypes."""
+<<<<<<< HEAD
+        raise NotImplementedError
+=======
         raise NotImplementedError()
+>>>>>>> origin/main
 
     @classmethod
     @abstractmethod
@@ -133,19 +162,31 @@ class QuantizationConfig(ABC):
         This requirement is due to the custom CUDA kernels used by the
         quantization method.
         """
+<<<<<<< HEAD
+        raise NotImplementedError
+=======
         raise NotImplementedError()
+>>>>>>> origin/main
 
     @staticmethod
     @abstractmethod
     def get_config_filenames() -> List[str]:
         """List of filenames to search for in the model directory."""
+<<<<<<< HEAD
+        raise NotImplementedError
+=======
         raise NotImplementedError()
+>>>>>>> origin/main
 
     @classmethod
     @abstractmethod
     def from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
         """Create a config class from the model's quantization config."""
+<<<<<<< HEAD
+        raise NotImplementedError
+=======
         raise NotImplementedError()
+>>>>>>> origin/main
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
@@ -188,7 +229,11 @@ class QuantizationConfig(ABC):
             The quantize method. None if the given layer doesn't support quant
             method.
         """
+<<<<<<< HEAD
+        raise NotImplementedError
+=======
         raise NotImplementedError()
+>>>>>>> origin/main
 
     @abstractmethod
     def get_scaled_act_names(self) -> List[str]:
@@ -196,7 +241,11 @@ class QuantizationConfig(ABC):
 
         For now, this is only used by AWQ.
         """
+<<<<<<< HEAD
+        raise NotImplementedError
+=======
         raise NotImplementedError()
+>>>>>>> origin/main
 
 
 def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:

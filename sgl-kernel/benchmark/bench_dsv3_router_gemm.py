@@ -13,6 +13,19 @@ from sgl_kernel import dsv3_router_gemm
         x_vals=[i + 1 for i in range(16)],
         x_log=False,
         line_arg="impl",
+<<<<<<< HEAD
+        line_vals=["torch", "sgl-kernel"],
+        line_names=["torch", "dsv3_router_gemm"],
+        styles=[("blue", "-"), ("orange", "-")],
+        ylabel="TFLOPs",
+        plot_name="input-bf16-output-fp32 dsv3 router gemm throughput",
+        args={},
+    )
+)
+def benchmark(num_tokens, impl):
+    # M: num_tokens, K: hidden_dim, N: num_experts
+    M, K, N = num_tokens, 7168, 256
+=======
         line_vals=["torch-256", "sgl-kernel-256", "torch-384", "sgl-kernel-384"],
         line_names=[
             "torch-256",
@@ -36,12 +49,16 @@ def benchmark_bf16_output(num_tokens, impl):
         N = 384
     else:
         raise ValueError(f"Unknown impl: {impl}")
+>>>>>>> origin/main
 
     mat_a = torch.randn((M, K), dtype=torch.bfloat16, device="cuda").contiguous()
     mat_b = torch.randn((N, K), dtype=torch.bfloat16, device="cuda").contiguous()
 
     quantiles = [0.5, 0.2, 0.8]
 
+<<<<<<< HEAD
+    if impl == "torch":
+=======
     if impl == "torch-256" or impl == "torch-384":
 
         def runner():
@@ -97,14 +114,22 @@ def benchmark_float_output(num_tokens, impl):
     quantiles = [0.5, 0.2, 0.8]
 
     if impl == "torch-256" or impl == "torch-384":
+>>>>>>> origin/main
 
         def runner():
             F.linear(mat_a, mat_b).to(torch.float32)
 
+<<<<<<< HEAD
+    elif impl == "sgl-kernel":
+
+        def runner():
+            dsv3_router_gemm(mat_a, mat_b)
+=======
     elif impl == "sgl-kernel-256" or impl == "sgl-kernel-384":
 
         def runner():
             dsv3_router_gemm(mat_a, mat_b, out_dtype=torch.float32)
+>>>>>>> origin/main
 
     ms, min_ms, max_ms = triton.testing.do_bench(runner, quantiles=quantiles)
 
@@ -119,9 +144,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
 
+<<<<<<< HEAD
+    benchmark.run(print_data=True, show_plots=True, save_path="bench_dsv3_router_gemm")
+=======
     benchmark_bf16_output.run(
         print_data=True, show_plots=True, save_path="bench_dsv3_router_gemm"
     )
     benchmark_float_output.run(
         print_data=True, show_plots=True, save_path="bench_dsv3_router_gemm"
     )
+>>>>>>> origin/main

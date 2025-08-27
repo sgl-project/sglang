@@ -323,6 +323,11 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
             host=f"http://{self.base_host}",
             port=int(self.lb_port),
         )
+<<<<<<< HEAD
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Evaluation metrics: {metrics}")
+        # Expect lots of failure but the server cannot crash
+=======
 
         # Expect lots of failure but the server cannot crash
         try:
@@ -339,6 +344,7 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
             except Exception as health_check_error:
                 # If health check fails, re-raise the original exception
                 raise e from health_check_error
+>>>>>>> origin/main
 
 
 class TestDisaggregationMooncakeSpec(CustomTestCase):

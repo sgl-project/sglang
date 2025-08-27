@@ -15,7 +15,11 @@
 
 from __future__ import annotations
 
+<<<<<<< HEAD
+import base64
+=======
 import asyncio
+>>>>>>> origin/main
 import builtins
 import ctypes
 import dataclasses
@@ -41,11 +45,18 @@ import tempfile
 import threading
 import time
 import traceback
+<<<<<<< HEAD
+import warnings
+from collections import OrderedDict, defaultdict
+from contextlib import contextmanager
+from enum import Enum
+=======
 import uuid
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+>>>>>>> origin/main
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -69,7 +80,10 @@ from typing import (
 
 import numpy as np
 import psutil
+<<<<<<< HEAD
+=======
 import pybase64
+>>>>>>> origin/main
 import requests
 import torch
 import torch.distributed
@@ -85,17 +99,29 @@ from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
+<<<<<<< HEAD
+from triton.runtime.cache import (
+    FileCacheManager,
+    default_cache_dir,
+    default_dump_dir,
+    default_override_dir,
+)
+=======
 from triton.runtime.cache import FileCacheManager
 from typing_extensions import Literal
 
 from sglang.srt.metrics.func_timer import enable_func_timer
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
 
+<<<<<<< HEAD
+=======
 
+>>>>>>> origin/main
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 
@@ -203,7 +229,11 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
+<<<<<<< HEAD
+    return backend not in ["torch_native", "intel_amx"]
+=======
     return backend not in ["torch_native", "intel_amx", "ascend"]
+>>>>>>> origin/main
 
 
 try:
@@ -234,10 +264,13 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
+<<<<<<< HEAD
+=======
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
 
+>>>>>>> origin/main
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
     "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
 )
@@ -438,6 +471,73 @@ def is_pin_memory_available() -> bool:
     return torch.cuda.is_available()
 
 
+<<<<<<< HEAD
+_CPU_OFFLOAD_BYTES = 0
+_CPU_OFFLOAD_MAX_BYTES = 0
+
+
+def set_cpu_offload_max_bytes(max_bytes: int) -> None:
+    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
+    _CPU_OFFLOAD_BYTES = 0
+    _CPU_OFFLOAD_MAX_BYTES = max_bytes
+
+
+def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
+    device = next(module.parameters()).device
+
+    if device == torch.device("cpu"):
+        return module
+
+    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
+    if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
+        return module
+
+    pin_memory = is_pin_memory_available()
+    # offload parameters to CPU
+    # use pin_memory if possible, which helps cudagraph capture speed
+    offloaded_parameters = False
+    for p in module.parameters():
+        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
+            # we use per-parameter offloading
+            # one module might have some parameters offloaded and some not
+            break
+
+        # `torch.empty_like` does not support `pin_memory` argument
+        cpu_data = torch.empty_strided(
+            size=p.data.size(),
+            stride=p.data.stride(),
+            dtype=p.data.dtype,
+            layout=p.data.layout,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        cpu_data.copy_(p.data)
+        p.data = cpu_data
+        _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
+        offloaded_parameters = True
+
+    if offloaded_parameters:
+        original_forward = module.forward
+
+        def forward(*args, **kwargs):
+            module.forward = original_forward
+            device_state = {
+                # here we blindly call `to(device)`
+                # if the parameter is already on the device, it will be a no-op
+                k: v.to(device, non_blocking=True)
+                for k, v in module.state_dict().items()
+            }
+            output = functional_call(module, device_state, args=args, kwargs=kwargs)
+            module.forward = forward
+            return output
+
+        module.forward = forward
+
+    return module
+
+
+=======
+>>>>>>> origin/main
 class LayerFn(Protocol):
 
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
@@ -450,13 +550,19 @@ def make_layers(
     pp_size: Optional[int] = None,
     prefix: str = "",
     return_tuple: bool = False,
+<<<<<<< HEAD
+=======
     offloader_kwargs: Dict[str, Any] = {},
+>>>>>>> origin/main
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
+<<<<<<< HEAD
+=======
     from sglang.srt.offloader import get_offloader
+>>>>>>> origin/main
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
@@ -470,6 +576,12 @@ def make_layers(
     )
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+<<<<<<< HEAD
+        + [
+            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
+            for idx in range(start_layer, end_layer)
+        ]
+=======
         + get_offloader().wrap_modules(
             (
                 layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
@@ -477,6 +589,7 @@ def make_layers(
             ),
             **offloader_kwargs,
         )
+>>>>>>> origin/main
         + [
             PPMissingLayer(return_tuple=return_tuple)
             for _ in range(end_layer, num_hidden_layers)
@@ -567,7 +680,11 @@ def decode_video_base64(video_base64):
     from PIL import Image
 
     # Decode the base64 string
+<<<<<<< HEAD
+    video_bytes = base64.b64decode(video_base64)
+=======
     video_bytes = pybase64.b64decode(video_base64, validate=True)
+>>>>>>> origin/main
 
     # Placeholder for the start indices of each PNG image
     img_starts = []
@@ -642,25 +759,36 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
+<<<<<<< HEAD
+def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarray:
+=======
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
+>>>>>>> origin/main
     # Use soundfile here, since librosa use it under the hood,
     # and librosa will not support audio loading in the future
     import soundfile as sf
     from scipy.signal import resample
 
+<<<<<<< HEAD
+=======
     if sr is None:
         sr = 16000
 
+>>>>>>> origin/main
     # Load audio data
     if isinstance(audio_file, bytes):
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
+<<<<<<< HEAD
+        audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+=======
         audio, original_sr = sf.read(
             BytesIO(pybase64.b64decode(audio_file, validate=True))
         )
+>>>>>>> origin/main
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         response = requests.get(audio_file, stream=True, timeout=timeout)
@@ -684,6 +812,38 @@ def load_audio(
     return audio
 
 
+<<<<<<< HEAD
+def encode_video(video_path, frame_count_limit=None):
+    # Lazy import because decord is not available on some arm platforms.
+    from decord import VideoReader, cpu
+
+    if not os.path.exists(video_path):
+        logger.error(f"Video {video_path} does not exist")
+        return []
+
+    if frame_count_limit == 0:
+        return []
+
+    def uniform_sample(l, n):
+        gap = len(l) / n
+        idxs = [int(i * gap + gap / 2) for i in range(n)]
+        return [l[i] for i in idxs]
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
+    frame_indices = [i for i in range(0, len(vr), sample_fps)]
+    if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
+        frame_indices = uniform_sample(frame_indices, frame_count_limit)
+
+    frames = vr.get_batch(frame_indices).asnumpy()
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
+    return frames
+
+
+def load_image(
+    image_file: Union[Image.Image, str, bytes],
+) -> tuple[Image.Image, tuple[int, int]]:
+=======
 @dataclass
 class ImageData:
     url: str
@@ -696,6 +856,7 @@ def load_image(
     if isinstance(image_file, ImageData):
         image_file = image_file.url
 
+>>>>>>> origin/main
     image = image_size = None
     if isinstance(image_file, Image.Image):
         image = image_file
@@ -704,6 +865,11 @@ def load_image(
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+<<<<<<< HEAD
+        response = requests.get(image_file, stream=True, timeout=timeout).raw
+        image = Image.open(response)
+        response.close()
+=======
         response = requests.get(image_file, stream=True, timeout=timeout)
         try:
             response.raise_for_status()
@@ -711,19 +877,33 @@ def load_image(
             image.load()  # Force loading to avoid issues after closing the stream
         finally:
             response.close()
+>>>>>>> origin/main
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
         image_file = image_file.split(",")[1]
+<<<<<<< HEAD
+        image = Image.open(BytesIO(base64.b64decode(image_file)))
+    elif image_file.startswith("video:"):
+        image_file = image_file.replace("video:", "")
+        image, image_size = decode_video_base64(image_file)
+    elif isinstance(image_file, str):
+        image = Image.open(BytesIO(base64.b64decode(image_file)))
+    else:
+        raise ValueError(f"Invalid image: {image}")
+=======
         image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     elif isinstance(image_file, str):
         image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
         raise ValueError(f"Invalid image: {image_file}")
+>>>>>>> origin/main
 
     return image, image_size
 
 
+<<<<<<< HEAD
+=======
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
     from decord import VideoReader, cpu, gpu
@@ -779,6 +959,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             os.unlink(tmp_file.name)
 
 
+>>>>>>> origin/main
 def suppress_other_loggers():
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -897,6 +1078,51 @@ def monkey_patch_vllm_gguf_config():
     setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
 
 
+<<<<<<< HEAD
+def maybe_set_triton_cache_manager() -> None:
+    """Set environment variable to tell Triton to use a
+    custom cache manager"""
+    cache_manger = os.environ.get("TRITON_CACHE_MANAGER", None)
+    if cache_manger is None:
+        manager = "sglang.srt.utils:CustomCacheManager"
+        logger.debug("Setting Triton cache manager to: %s", manager)
+        os.environ["TRITON_CACHE_MANAGER"] = manager
+
+
+class CustomCacheManager(FileCacheManager):
+    # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
+    def __init__(self, key, override=False, dump=False):
+        from sglang.srt.distributed.parallel_state import get_tp_group
+
+        self.key = key
+        self.lock_path = None
+        if dump:
+            self.cache_dir = default_dump_dir()
+            self.cache_dir = os.path.join(self.cache_dir, self.key)
+            self.lock_path = os.path.join(self.cache_dir, "lock")
+            os.makedirs(self.cache_dir, exist_ok=True)
+        elif override:
+            self.cache_dir = default_override_dir()
+            self.cache_dir = os.path.join(self.cache_dir, self.key)
+        else:
+            # create cache directory if it doesn't exist
+            self.cache_dir = (
+                os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
+            )
+            if self.cache_dir:
+                try:
+                    self.cache_dir = f"{self.cache_dir}_{get_tp_group().local_rank}"
+                except:
+                    self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
+                self.cache_dir = os.path.join(self.cache_dir, self.key)
+                self.lock_path = os.path.join(self.cache_dir, "lock")
+                os.makedirs(self.cache_dir, exist_ok=True)
+            else:
+                raise RuntimeError("Could not create or locate cache dir")
+
+
+=======
+>>>>>>> origin/main
 def set_ulimit(target_soft_limit=65535):
     # number of open files
     resource_type = resource.RLIMIT_NOFILE
@@ -1321,6 +1547,8 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
+<<<<<<< HEAD
+=======
             # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
             # typically in NVIDIA MIG mode.
             if torch.cuda.is_available():
@@ -1328,6 +1556,7 @@ def get_nvgpu_memory_capacity():
                     "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
                 )
                 return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
+>>>>>>> origin/main
             raise ValueError("No GPU memory values found.")
 
         # Return the minimum memory value
@@ -1665,6 +1894,11 @@ def direct_register_custom_op(
     IMPORTANT: the lifetime of the operator is tied to the lifetime of the
     library object. If you want to bind the operator to a different library,
     make sure the library object is alive when the operator is used.
+<<<<<<< HEAD
+    """
+    import torch.library
+
+=======
 
     Note: This function will silently skip registration if the operator
     with the same name is already registered to avoid RuntimeError in
@@ -1688,6 +1922,7 @@ def direct_register_custom_op(
         # Operator doesn't exist, proceed with registration
         pass
 
+>>>>>>> origin/main
     if hasattr(torch.library, "infer_schema"):
         schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
     else:
@@ -1696,6 +1931,13 @@ def direct_register_custom_op(
 
         schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
 
+<<<<<<< HEAD
+    my_lib = target_lib or sglang_lib
+    my_lib.define(op_name + schema_str)
+    my_lib.impl(op_name, op_func, "CUDA")
+    if fake_impl is not None:
+        my_lib._register_fake(op_name, fake_impl)
+=======
     try:
         my_lib.define(op_name + schema_str)
         my_lib.impl(op_name, op_func, "CUDA")
@@ -1712,6 +1954,7 @@ def direct_register_custom_op(
     except AttributeError as error:
         # Always re-raise AttributeError as it indicates missing dependencies
         raise error
+>>>>>>> origin/main
 
 
 def set_gpu_proc_affinity(
@@ -1835,7 +2078,11 @@ class MultiprocessingSerializer:
 
         if output_str:
             # Convert bytes to base64-encoded string
+<<<<<<< HEAD
+            output = base64.b64encode(output).decode("utf-8")
+=======
             output = pybase64.b64encode(output).decode("utf-8")
+>>>>>>> origin/main
 
         return output
 
@@ -1852,7 +2099,11 @@ class MultiprocessingSerializer:
         """
         if isinstance(data, str):
             # Decode base64 string to bytes
+<<<<<<< HEAD
+            data = base64.b64decode(data)
+=======
             data = pybase64.b64decode(data, validate=True)
+>>>>>>> origin/main
 
         return ForkingPickler.loads(data)
 
@@ -1991,6 +2242,8 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
+<<<<<<< HEAD
+=======
 def maybe_wrap_ipv6_address(address: str) -> str:
     if is_valid_ipv6_address(address):
         return f"[{address}]"
@@ -2001,6 +2254,7 @@ def format_tcp_address(ip: str, port: int) -> str:
     return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
 
 
+>>>>>>> origin/main
 def configure_ipv6(dist_init_addr):
     addr = dist_init_addr
     end = addr.find("]")
@@ -2033,7 +2287,18 @@ def configure_ipv6(dist_init_addr):
     return port, host
 
 
+<<<<<<< HEAD
+def rank0_log(msg: str):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.info(msg)
+
+
+def launch_dummy_health_check_server(host, port):
+=======
 def launch_dummy_health_check_server(host, port, enable_metrics):
+>>>>>>> origin/main
     import asyncio
 
     import uvicorn
@@ -2051,11 +2316,14 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         """Check the health of the http server."""
         return Response(status_code=200)
 
+<<<<<<< HEAD
+=======
     # Add prometheus middleware
     if enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
 
+>>>>>>> origin/main
     config = uvicorn.Config(
         app,
         host=host,
@@ -2094,10 +2362,13 @@ def next_power_of_2(n: int):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
+<<<<<<< HEAD
+=======
 def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
+>>>>>>> origin/main
 setattr(triton, "next_power_of_2", next_power_of_2)
 
 
@@ -2190,6 +2461,30 @@ def flatten_nested_list(nested_list):
         return [nested_list]
 
 
+<<<<<<< HEAD
+class DeepEPMode(Enum):
+    normal = "normal"
+    low_latency = "low_latency"
+    auto = "auto"
+
+    def enable_normal(self):
+        return self in [DeepEPMode.normal, DeepEPMode.auto]
+
+    def enable_low_latency(self):
+        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
+
+    def resolve(self, is_extend_in_batch: bool):
+        if self != DeepEPMode.auto:
+            return self
+
+        if is_extend_in_batch:
+            return DeepEPMode.normal
+        else:
+            return DeepEPMode.low_latency
+
+
+=======
+>>>>>>> origin/main
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
     return (
         (forward_mode is not None)
@@ -2307,9 +2602,12 @@ def is_fa3_default_architecture(hf_config):
         "Gemma3ForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
+<<<<<<< HEAD
+=======
         "Glm4MoeForCausalLM",
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
+>>>>>>> origin/main
     }
     return architectures[0] in default_archs
 
@@ -2379,7 +2677,11 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
+<<<<<<< HEAD
+        elif not server_args.enable_deepep_moe:
+=======
         elif server_args.moe_a2a_backend == "none":
+>>>>>>> origin/main
             return True
         else:
             return (
@@ -2395,7 +2697,11 @@ def require_attn_tp_gather(server_args):
     Check if the input of attention is scattered.
     """
     assert server_args.moe_dense_tp_size in [1, None]
+<<<<<<< HEAD
+    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size == 1:
+=======
     if server_args.moe_a2a_backend != "none" or server_args.moe_dense_tp_size == 1:
+>>>>>>> origin/main
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -2565,6 +2871,8 @@ def dynamic_import(func_path: str):
     return func
 
 
+<<<<<<< HEAD
+=======
 def gc_object_counts():
     import gc
 
@@ -2609,6 +2917,7 @@ def freeze_gc(context: str):
     )
 
 
+>>>>>>> origin/main
 def configure_gc_logger():
     logger.info("Enable GC Logger")
 
@@ -2762,6 +3071,8 @@ def lru_cache_frozenset(maxsize=128):
         return wrapper
 
     return decorator
+<<<<<<< HEAD
+=======
 
 
 def apply_module_patch(target_module, target_function, wrappers):
@@ -2988,3 +3299,4 @@ def check_cuda_result(raw_output):
         raise Exception(f"CUDA error: {err}")
 
     return results
+>>>>>>> origin/main

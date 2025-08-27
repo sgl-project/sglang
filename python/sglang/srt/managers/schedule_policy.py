@@ -25,7 +25,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+<<<<<<< HEAD
+=======
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+>>>>>>> origin/main
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
@@ -36,7 +39,11 @@ if TYPE_CHECKING:
 # This can prevent the server from being too conservative.
 # Note that this only clips the estimation in the scheduler but does not change the stop
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
+<<<<<<< HEAD
+CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
+=======
 CLIP_MAX_NEW_TOKENS = int(
+>>>>>>> origin/main
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
 
@@ -305,13 +312,34 @@ class PrefillAdder:
                 [
                     min(
                         (r.sampling_params.max_new_tokens - len(r.output_ids)),
+<<<<<<< HEAD
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
+=======
                         CLIP_MAX_NEW_TOKENS,
+>>>>>>> origin/main
                     )
                     * self.new_token_ratio
                     for r in running_batch.reqs
                 ]
             )
 
+<<<<<<< HEAD
+    @property
+    def rem_total_tokens(self):
+        return (
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
+            - self.rem_total_token_offset
+        )
+
+    @property
+    def cur_rem_tokens(self):
+        return (
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
+            - self.cur_rem_token_offset
+        )
+=======
         self.is_hybrid = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
@@ -349,6 +377,7 @@ class PrefillAdder:
             )
 
         return available_and_evictable - self.cur_rem_token_offset
+>>>>>>> origin/main
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -388,7 +417,11 @@ class PrefillAdder:
             0,
             req.extend_input_len,
             (
+<<<<<<< HEAD
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
+=======
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+>>>>>>> origin/main
                 if not truncated
                 else 0
             ),
@@ -399,6 +432,13 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+<<<<<<< HEAD
+        try:
+            self.tree_cache.inc_lock_ref(last_node)
+            yield None
+        finally:
+            self.tree_cache.dec_lock_ref(last_node)
+=======
         if self.is_hybrid:
             try:
                 swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
@@ -411,6 +451,7 @@ class PrefillAdder:
                 yield None
             finally:
                 self.tree_cache.dec_lock_ref(last_node)
+>>>>>>> origin/main
 
     def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
         # Early exit if no enough tokens for the input tokens
@@ -452,6 +493,18 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
+<<<<<<< HEAD
+        cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
+        tokens_freed = 0
+        for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
+            # tokens_left gives a reservative calculation as the last token is not stored
+            bs = len(self.req_states) - i
+            min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+            # reserve tokens for corner cases
+            if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
+                return AddReqResult.NO_TOKEN
+            tokens_freed += tokens_occupied
+=======
         if not self.is_hybrid:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
@@ -467,6 +520,7 @@ class PrefillAdder:
                 if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
+>>>>>>> origin/main
 
         if (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
@@ -477,7 +531,11 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
+<<<<<<< HEAD
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
+=======
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+>>>>>>> origin/main
             )
         else:
             if self.rem_chunk_tokens == 0:
@@ -499,7 +557,11 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         total_tokens = req.extend_input_len + min(
+<<<<<<< HEAD
+            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
+=======
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+>>>>>>> origin/main
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
@@ -534,17 +596,25 @@ class PrefillAdder:
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
+<<<<<<< HEAD
+                self.tree_cache.inc_lock_ref(req.last_node)
+=======
                 if self.is_hybrid:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
                     self.tree_cache.inc_lock_ref(req.last_node)
+>>>>>>> origin/main
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
                     min(
                         req.sampling_params.max_new_tokens,
+<<<<<<< HEAD
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
+=======
                         CLIP_MAX_NEW_TOKENS,
+>>>>>>> origin/main
                     ),
                 )
             else:
@@ -559,11 +629,15 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
+<<<<<<< HEAD
+                self.tree_cache.inc_lock_ref(req.last_node)
+=======
                 if self.is_hybrid:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
                     self.tree_cache.inc_lock_ref(req.last_node)
+>>>>>>> origin/main
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()

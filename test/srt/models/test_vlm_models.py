@@ -42,6 +42,8 @@ class TestVLMModels(CustomTestCase):
         os.environ["OPENAI_API_KEY"] = cls.api_key
         os.environ["OPENAI_API_BASE"] = f"{cls.base_url}/v1"
 
+<<<<<<< HEAD
+=======
     def _detect_eviction_in_logs(self, log_output):
         """Detect if eviction events occurred in the log output."""
         eviction_keywords = ["Cache eviction: evicted"]
@@ -57,6 +59,7 @@ class TestVLMModels(CustomTestCase):
 
         return eviction_detected, eviction_count
 
+>>>>>>> origin/main
     def run_mmmu_eval(
         self,
         model_version: str,
@@ -106,6 +109,8 @@ class TestVLMModels(CustomTestCase):
             timeout=3600,
         )
 
+<<<<<<< HEAD
+=======
     def _run_vlm_mmmu_test(
         self,
         model,
@@ -240,6 +245,7 @@ class TestVLMModels(CustomTestCase):
 
         return "\n".join(output_lines)
 
+>>>>>>> origin/main
     def test_vlm_mmmu_benchmark(self):
         """Test VLM models against MMMU benchmark."""
         models_to_test = MODELS
@@ -248,6 +254,62 @@ class TestVLMModels(CustomTestCase):
             models_to_test = [random.choice(MODELS)]
 
         for model in models_to_test:
+<<<<<<< HEAD
+            print(f"\nTesting model: {model.model}")
+
+            process = None
+            mmmu_accuracy = 0  # Initialize to handle potential exceptions
+
+            try:
+                # Launch server for testing
+                process = popen_launch_server(
+                    model.model,
+                    base_url=self.base_url,
+                    timeout=self.time_out,
+                    api_key=self.api_key,
+                    other_args=[
+                        "--trust-remote-code",
+                        "--cuda-graph-max-bs",
+                        "32",
+                        "--enable-multimodal",
+                        "--mem-fraction-static",
+                        str(self.parsed_args.mem_fraction_static),  # Use class variable
+                    ],
+                )
+
+                # Run evaluation
+                self.run_mmmu_eval(model.model, "./logs")
+
+                # Get the result file
+                result_file_path = glob.glob("./logs/*.json")[0]
+
+                with open(result_file_path, "r") as f:
+                    result = json.load(f)
+                    print(f"Result \n: {result}")
+                # Process the result
+                mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
+                print(f"Model {model.model} achieved accuracy: {mmmu_accuracy:.4f}")
+
+                # Assert performance meets expected threshold
+                self.assertGreaterEqual(
+                    mmmu_accuracy,
+                    model.mmmu_accuracy,
+                    f"Model {model.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({model.mmmu_accuracy:.4f})",
+                )
+
+            except Exception as e:
+                print(f"Error testing {model.model}: {e}")
+                self.fail(f"Test failed for {model.model}: {e}")
+
+            finally:
+                # Ensure process cleanup happens regardless of success/failure
+                if process is not None and process.poll() is None:
+                    print(f"Cleaning up process {process.pid}")
+                    try:
+                        kill_process_tree(process.pid)
+                    except Exception as e:
+                        print(f"Error killing process: {e}")
+=======
             self._run_vlm_mmmu_test(model, "./logs")
 
     def test_vlm_mmmu_benchmark_with_small_cache(self):
@@ -293,6 +355,7 @@ class TestVLMModels(CustomTestCase):
             # Additional assertion: if eviction was detected, the test passed
             if eviction_detected:
                 print("✅ Eviction logic successfully triggered and detected!")
+>>>>>>> origin/main
 
 
 if __name__ == "__main__":

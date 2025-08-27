@@ -7,6 +7,8 @@ import torch
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+<<<<<<< HEAD
+=======
 @pytest.mark.parametrize("k", [100])
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_sampling_from_probs_logits_top_k_first_alignment(
@@ -55,6 +57,7 @@ def test_top_k_top_p_sampling_from_probs_logits_joint_alignment(
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+>>>>>>> origin/main
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)

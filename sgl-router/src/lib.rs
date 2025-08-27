@@ -2,6 +2,18 @@ use pyo3::prelude::*;
 pub mod config;
 pub mod logging;
 use std::collections::HashMap;
+<<<<<<< HEAD
+pub mod openai_api_types;
+pub mod pd_router;
+pub mod pd_types;
+pub mod prometheus;
+pub mod request_adapter;
+pub mod router;
+pub mod server;
+pub mod service_discovery;
+pub mod tree;
+use crate::prometheus::PrometheusConfig;
+=======
 pub mod core;
 #[cfg(feature = "grpc-client")]
 pub mod grpc;
@@ -17,6 +29,7 @@ pub mod tokenizer;
 pub mod tool_parser;
 pub mod tree;
 use crate::metrics::PrometheusConfig;
+>>>>>>> origin/main
 
 #[pyclass(eq)]
 #[derive(Clone, PartialEq, Debug)]
@@ -24,7 +37,11 @@ pub enum PolicyType {
     Random,
     RoundRobin,
     CacheAware,
+<<<<<<< HEAD
+    PowerOfTwo, // Moved from PD-specific, now shared
+=======
     PowerOfTwo,
+>>>>>>> origin/main
 }
 
 #[pyclass]
@@ -42,20 +59,34 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_payload_size: usize,
+<<<<<<< HEAD
+=======
     dp_aware: bool,
     api_key: Option<String>,
+>>>>>>> origin/main
     log_dir: Option<String>,
     log_level: Option<String>,
     service_discovery: bool,
     selector: HashMap<String, String>,
     service_discovery_port: u16,
     service_discovery_namespace: Option<String>,
+<<<<<<< HEAD
+    // PD service discovery fields
+=======
+>>>>>>> origin/main
     prefill_selector: HashMap<String, String>,
     decode_selector: HashMap<String, String>,
     bootstrap_port_annotation: String,
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
+<<<<<<< HEAD
+    // PD mode flag
+    pd_disaggregation: bool,
+    // PD-specific fields (only used when pd_disaggregation is true)
+    prefill_urls: Option<Vec<(String, Option<u16>)>>,
+    decode_urls: Option<Vec<String>>,
+=======
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
@@ -88,6 +119,7 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<usize>,
+>>>>>>> origin/main
 }
 
 impl Router {
@@ -97,6 +129,13 @@ impl Router {
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
+<<<<<<< HEAD
+        // Determine routing mode
+        let mode = if self.pd_disaggregation {
+            RoutingMode::PrefillDecode {
+                prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
+                decode_urls: self.decode_urls.clone().unwrap_or_default(),
+=======
         // Convert policy helper function
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
             match policy {
@@ -127,6 +166,7 @@ impl Router {
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
                 prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
                 decode_policy: self.decode_policy.as_ref().map(convert_policy),
+>>>>>>> origin/main
             }
         } else {
             RoutingMode::Regular {
@@ -134,8 +174,26 @@ impl Router {
             }
         };
 
+<<<<<<< HEAD
+        // Convert policy
+        let policy = match self.policy {
+            PolicyType::Random => ConfigPolicyConfig::Random,
+            PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
+            PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
+                cache_threshold: self.cache_threshold,
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                eviction_interval_secs: self.eviction_interval_secs,
+                max_tree_size: self.max_tree_size,
+            },
+            PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 5, // Default value
+            },
+        };
+=======
         // Convert main policy
         let policy = convert_policy(&self.policy);
+>>>>>>> origin/main
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -171,12 +229,17 @@ impl Router {
             request_timeout_secs: self.request_timeout_secs,
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
+<<<<<<< HEAD
+=======
             dp_aware: self.dp_aware,
             api_key: self.api_key.clone(),
+>>>>>>> origin/main
             discovery,
             metrics,
             log_dir: self.log_dir.clone(),
             log_level: self.log_level.clone(),
+<<<<<<< HEAD
+=======
             request_id_headers: self.request_id_headers.clone(),
             max_concurrent_requests: self.max_concurrent_requests,
             queue_size: self.queue_size,
@@ -206,6 +269,7 @@ impl Router {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
+>>>>>>> origin/main
         })
     }
 }
@@ -218,6 +282,16 @@ impl Router {
         policy = PolicyType::RoundRobin,
         host = String::from("127.0.0.1"),
         port = 3001,
+<<<<<<< HEAD
+        worker_startup_timeout_secs = 300,
+        worker_startup_check_interval = 10,
+        cache_threshold = 0.50,
+        balance_abs_threshold = 32,
+        balance_rel_threshold = 1.0001,
+        eviction_interval_secs = 60,
+        max_tree_size = 2usize.pow(24),
+        max_payload_size = 256 * 1024 * 1024,  // 256MB default for large batches
+=======
         worker_startup_timeout_secs = 600,
         worker_startup_check_interval = 30,
         cache_threshold = 0.3,
@@ -228,6 +302,7 @@ impl Router {
         max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
         dp_aware = false,
         api_key = None,
+>>>>>>> origin/main
         log_dir = None,
         log_level = None,
         service_discovery = false,
@@ -239,6 +314,13 @@ impl Router {
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
+<<<<<<< HEAD
+        request_timeout_secs = 600,  // Add configurable request timeout
+        pd_disaggregation = false,  // New flag for PD mode
+        prefill_urls = None,
+        decode_urls = None
+    ))]
+=======
         request_timeout_secs = 1800,  // Add configurable request timeout
         request_id_headers = None,  // Custom request ID headers
         pd_disaggregation = false,  // New flag for PD mode
@@ -274,6 +356,7 @@ impl Router {
         rate_limit_tokens_per_second = None,
     ))]
     #[allow(clippy::too_many_arguments)]
+>>>>>>> origin/main
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
@@ -287,8 +370,11 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         max_payload_size: usize,
+<<<<<<< HEAD
+=======
         dp_aware: bool,
         api_key: Option<String>,
+>>>>>>> origin/main
         log_dir: Option<String>,
         log_level: Option<String>,
         service_discovery: bool,
@@ -301,6 +387,11 @@ impl Router {
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
         request_timeout_secs: u64,
+<<<<<<< HEAD
+        pd_disaggregation: bool,
+        prefill_urls: Option<Vec<(String, Option<u16>)>>,
+        decode_urls: Option<Vec<String>>,
+=======
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
@@ -329,6 +420,7 @@ impl Router {
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<usize>,
+>>>>>>> origin/main
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -343,8 +435,11 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             max_payload_size,
+<<<<<<< HEAD
+=======
             dp_aware,
             api_key,
+>>>>>>> origin/main
             log_dir,
             log_level,
             service_discovery,
@@ -357,6 +452,11 @@ impl Router {
             prometheus_port,
             prometheus_host,
             request_timeout_secs,
+<<<<<<< HEAD
+            pd_disaggregation,
+            prefill_urls,
+            decode_urls,
+=======
             request_id_headers,
             pd_disaggregation,
             prefill_urls,
@@ -385,6 +485,7 @@ impl Router {
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,
+>>>>>>> origin/main
         })
     }
 
@@ -402,6 +503,14 @@ impl Router {
             ))
         })?;
 
+<<<<<<< HEAD
+        // Convert to internal policy config
+        let policy_config = router_config
+            .to_routing_policy_config()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+=======
+>>>>>>> origin/main
         // Create service discovery config if enabled
         let service_discovery_config = if self.service_discovery {
             Some(service_discovery::ServiceDiscoveryConfig {
@@ -410,6 +519,10 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
+<<<<<<< HEAD
+                // PD mode configuration
+=======
+>>>>>>> origin/main
                 pd_mode: self.pd_disaggregation,
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
@@ -437,14 +550,22 @@ impl Router {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),
                 port: self.port,
+<<<<<<< HEAD
+                worker_urls: self.worker_urls.clone(),
+                policy_config,
+=======
                 router_config,
+>>>>>>> origin/main
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
+<<<<<<< HEAD
+=======
                 request_id_headers: self.request_id_headers.clone(),
+>>>>>>> origin/main
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
