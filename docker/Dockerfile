@@ -139,7 +139,8 @@ RUN python3 -m pip install --no-cache-dir \
     uv \
     wheel \
     scikit-build-core \
-    nixl
+    nixl \
+    py-spy
 
 # Install development tools and utilities
 RUN apt-get update && apt-get install -y \
