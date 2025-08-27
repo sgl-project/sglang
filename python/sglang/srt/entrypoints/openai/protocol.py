@@ -37,6 +37,7 @@ from typing_extensions import Literal
 
 DEFAULT_MODEL_NAME = "default"
 
+
 class ModelCard(BaseModel):
     """Model cards."""
 
