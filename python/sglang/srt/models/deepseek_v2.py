@@ -130,7 +130,7 @@ _device_sm = get_device_sm()
 
 if _use_aiter:
     from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
-    from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
+    from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm, get_dsv3_gemm_output_zero_allocator_size
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import *
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
 
@@ -2081,26 +2081,17 @@ class DeepseekV2Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
-        if _use_aiter:
-            self.gemm_output_zero_allocator_size = 0
-            self.n_routed_experts = config.n_routed_experts
-
+        self.gemm_output_zero_allocator_size = 0
+        if _use_aiter and config.n_routed_experts == 256 and self.embed_tokens.embedding_dim == 7168:
             num_moe_layers = sum([1 for i in range(len(self.layers)) if isinstance(self.layers[i].mlp, DeepseekV2MoE)])
-            per_layer_size = 0
 
-            assert self.embed_tokens.embedding_dim == 7168, f"SGLANG_DSR1_AITER_TRITON_DECODE_FC1_FUSED_QUANT_GEMM=True option only surrport config.hidden_size == 7168, but got {self.embed_tokens.embedding_dim}, please set SGLANG_DSR1_AITER_TRITON_DECODE_FC1_FUSED_QUANT_GEMM=0"
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
                     allocate_size = self.layers[i].mlp.shared_experts.gate_up_proj.output_size_per_partition
                     break
 
-            per_layer_size += 256 * allocate_size
-
-            assert self.n_routed_experts == 256, f"SGLANG_DSR1_AITER_TRITON_MOEGATE_AITER_GEMM>0 option only support config.n_routed_experts == 256, but got {self.n_routed_experts}, please set SGLANG_DSR1_AITER_TRITON_MOEGATE_AITER_GEMM=0"
-            per_layer_size += 256 * self.n_routed_experts
-
-            self.gemm_output_zero_allocator_size = num_moe_layers * per_layer_size
+            self.gemm_output_zero_allocator_size = get_dsv3_gemm_output_zero_allocator_size(config.n_routed_experts, num_moe_layers, allocate_size, self.embed_tokens.embedding_dim)
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -2422,7 +2413,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
             if _use_aiter and self.quant_config.get_name() == "quark":
-                w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v =quark_post_load_weights(self_attn, w, "mxfp4")
+                w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = quark_post_load_weights(self_attn, w, "mxfp4")
 
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(

@@ -24,3 +24,12 @@ def aiter_dsv3_router_gemm(hidden_states: torch.Tensor, weight: torch.Tensor, ge
         logits = gemm_a16w16(hidden_states, weight)
 
     return logits
+
+
+def get_dsv3_gemm_output_zero_allocator_size(n_routed_experts: int, num_moe_layers: int, allocate_size: int, embedding_dim: int):
+    if embedding_dim != 7168 or n_routed_experts != 256:
+        return 0
+
+    per_layer_size = 256 * (allocate_size + n_routed_experts)
+
+    return num_moe_layers * per_layer_size
