@@ -478,8 +478,6 @@ class MllamaVisionModel(nn.Module):
         return hidden_state
 
 
-
-
 class MllamaTextCrossAttention(nn.Module):
     def __init__(
         self,
@@ -558,9 +556,13 @@ class MllamaTextCrossAttention(nn.Module):
             )
             k = k.reshape(-1, self.num_local_key_value_heads, self.head_dim)
             v = v.view(-1, self.num_local_key_value_heads, self.head_dim)
-            k = self.k_norm(k)
+            k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(
+                -1, self.num_local_key_value_heads, self.head_dim
+            )
         q = q.reshape(-1, self.num_local_heads, self.head_dim)
-        q = self.q_norm(q)
+        q = self.q_norm(q.reshape(-1, self.head_dim)).reshape(
+            -1, self.num_local_heads, self.head_dim
+        )
 
         output = self.attn(q, k, v, forward_batch)
         out, _ = self.o_proj(output)
