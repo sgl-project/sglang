@@ -99,6 +99,9 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Dynamic capacity configuration
+    enable_dynamic_capacity: Optional[bool] = None
+    capacity_update_interval_secs: Optional[int] = None
 
     @staticmethod
     def add_cli_args(
@@ -433,6 +436,18 @@ class RouterArgs:
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
         )
+        parser.add_argument(
+            f"--{prefix}enable-dynamic-capacity",
+            action="store_true",
+            default=None,
+            help="Enable dynamic capacity adjustment based on worker capabilities",
+        )
+        parser.add_argument(
+            f"--{prefix}capacity-update-interval-secs",
+            type=int,
+            default=None,
+            help="Interval for updating capacity based on worker changes (in seconds)",
+        )
 
     @classmethod
     def from_cli_args(
@@ -553,6 +568,12 @@ class RouterArgs:
             ),
             health_check_endpoint=getattr(
                 args, f"{prefix}health_check_endpoint", RouterArgs.health_check_endpoint
+            ),
+            enable_dynamic_capacity=getattr(
+                args, f"{prefix}enable_dynamic_capacity", None
+            ),
+            capacity_update_interval_secs=getattr(
+                args, f"{prefix}capacity_update_interval_secs", None
             ),
         )
 
@@ -759,6 +780,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             health_check_timeout_secs=router_args.health_check_timeout_secs,
             health_check_interval_secs=router_args.health_check_interval_secs,
             health_check_endpoint=router_args.health_check_endpoint,
+            enable_dynamic_capacity=router_args.enable_dynamic_capacity,
+            capacity_update_interval_secs=router_args.capacity_update_interval_secs,
         )
 
         router.start()

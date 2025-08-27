@@ -60,6 +60,12 @@ pub struct RouterConfig {
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
     #[serde(default)]
     pub enable_igw: bool,
+    /// Enable dynamic capacity adjustment based on worker capabilities
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_dynamic_capacity: Option<bool>,
+    /// Interval for updating capacity based on worker changes (in seconds)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity_update_interval_secs: Option<u64>,
 }
 
 /// Routing mode configuration
@@ -336,6 +342,8 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
         }
     }
 }
@@ -450,6 +458,8 @@ mod tests {
     #[test]
     fn test_router_config_serialization() {
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
             },
@@ -741,6 +751,8 @@ mod tests {
     #[test]
     fn test_mode_type() {
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -749,6 +761,8 @@ mod tests {
         assert_eq!(config.mode_type(), "regular");
 
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: vec![],
                 decode_urls: vec![],
@@ -766,6 +780,8 @@ mod tests {
         assert!(!config.has_service_discovery());
 
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             discovery: Some(DiscoveryConfig {
                 enabled: false,
                 ..Default::default()
@@ -775,6 +791,8 @@ mod tests {
         assert!(!config.has_service_discovery());
 
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             discovery: Some(DiscoveryConfig {
                 enabled: true,
                 ..Default::default()
@@ -790,6 +808,8 @@ mod tests {
         assert!(!config.has_metrics());
 
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             metrics: Some(MetricsConfig::default()),
             ..Default::default()
         };
@@ -810,6 +830,8 @@ mod tests {
 
         // Test serialization with large list
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             mode,
             ..Default::default()
         };
@@ -828,6 +850,8 @@ mod tests {
     #[test]
     fn test_unicode_in_config() {
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://работник1".to_string(), "http://工作者2".to_string()],
             },
@@ -852,6 +876,8 @@ mod tests {
     #[test]
     fn test_empty_string_fields() {
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             host: "".to_string(),
             log_dir: Some("".to_string()),
             log_level: Some("".to_string()),
@@ -868,6 +894,8 @@ mod tests {
     #[test]
     fn test_full_pd_mode_config() {
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: vec![
                     ("http://prefill1:8000".to_string(), Some(8001)),
@@ -929,6 +957,8 @@ mod tests {
         selector.insert("app".to_string(), "sglang".to_string());
 
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![
                     "http://worker1:8000".to_string(),
@@ -990,6 +1020,8 @@ mod tests {
         selectors.insert("version".to_string(), "v1".to_string());
 
         let config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
             },

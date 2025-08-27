@@ -1629,6 +1629,28 @@ impl WorkerManagement for PDRouter {
 
         urls
     }
+
+    fn get_all_workers(&self) -> Vec<Arc<dyn crate::core::Worker>> {
+        let mut workers = Vec::new();
+
+        // Add prefill workers
+        if let Ok(prefill_workers) = self.prefill_workers.read() {
+            for worker in prefill_workers.iter() {
+                let worker: Arc<dyn crate::core::Worker> = Arc::from(worker.clone_worker());
+                workers.push(worker);
+            }
+        }
+
+        // Add decode workers
+        if let Ok(decode_workers) = self.decode_workers.read() {
+            for worker in decode_workers.iter() {
+                let worker: Arc<dyn crate::core::Worker> = Arc::from(worker.clone_worker());
+                workers.push(worker);
+            }
+        }
+
+        workers
+    }
 }
 
 #[async_trait]

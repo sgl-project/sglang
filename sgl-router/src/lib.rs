@@ -206,6 +206,8 @@ impl Router {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
         })
     }
 }

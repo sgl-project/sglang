@@ -27,6 +27,7 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
+    pub capacity_manager: Option<Arc<crate::core::CapacityManager>>,
     // Future dependencies can be added here
 }
 
@@ -39,10 +40,24 @@ impl AppContext {
     ) -> Self {
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
+
+        // Create capacity manager if dynamic capacity is enabled
+        let capacity_manager = if router_config.enable_dynamic_capacity.unwrap_or(false) {
+            Some(Arc::new(crate::core::CapacityManager::new(
+                rate_limiter.clone(),
+                std::time::Duration::from_secs(
+                    router_config.capacity_update_interval_secs.unwrap_or(30),
+                ),
+            )))
+        } else {
+            None
+        };
+
         Self {
             client,
             router_config,
             rate_limiter,
+            capacity_manager,
         }
     }
 }
@@ -345,6 +360,26 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "Router ready | workers: {:?}",
         app_state.router.get_worker_urls()
     );
+
+    // Start the capacity manager if enabled
+    if let Some(capacity_manager) = &app_context.capacity_manager {
+        let capacity_manager_clone = capacity_manager.clone();
+        let router_clone = app_state.router.clone();
+
+        // Initialize capacity manager with current workers
+        let workers = router_clone.get_all_workers();
+        capacity_manager_clone.update_workers(workers).await;
+
+        // Start the background update task
+        let handle = capacity_manager_clone.clone().start();
+        tokio::spawn(async move {
+            if let Err(e) = handle.await {
+                error!("Capacity manager task failed: {:?}", e);
+            }
+        });
+
+        info!("Started dynamic capacity manager");
+    }
 
     // Configure request ID headers
     let request_id_headers = config.request_id_headers.clone().unwrap_or_else(|| {

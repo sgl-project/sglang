@@ -162,6 +162,8 @@ mod test_pd_routing {
 
         for (mode, policy) in test_cases {
             let config = RouterConfig {
+                enable_dynamic_capacity: None,
+                capacity_update_interval_secs: None,
                 mode,
                 policy,
                 host: "127.0.0.1".to_string(),

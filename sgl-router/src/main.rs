@@ -272,6 +272,15 @@ struct CliArgs {
     /// Enable Inference Gateway mode
     #[arg(long, default_value_t = false)]
     enable_igw: bool,
+
+    // Dynamic capacity configuration
+    /// Enable dynamic capacity adjustment based on worker capabilities
+    #[arg(long)]
+    enable_dynamic_capacity: Option<bool>,
+
+    /// Interval for updating capacity based on worker changes (in seconds)
+    #[arg(long)]
+    capacity_update_interval_secs: Option<u64>,
 }
 
 impl CliArgs {
@@ -421,6 +430,8 @@ impl CliArgs {
             },
             enable_igw: self.enable_igw,
             rate_limit_tokens_per_second: None,
+            enable_dynamic_capacity: self.enable_dynamic_capacity,
+            capacity_update_interval_secs: self.capacity_update_interval_secs,
         })
     }
 

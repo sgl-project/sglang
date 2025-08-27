@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 
@@ -33,6 +34,9 @@ pub trait WorkerManagement: Send + Sync {
 
     /// Get all worker URLs
     fn get_worker_urls(&self) -> Vec<String>;
+
+    /// Get all workers as trait objects
+    fn get_all_workers(&self) -> Vec<Arc<dyn crate::core::Worker>>;
 }
 
 /// Core trait for all router implementations
