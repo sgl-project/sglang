@@ -25,6 +25,6 @@ pub use types::{FunctionCall, PartialToolCall, StreamResult, TokenConfig, ToolCa
 
 // Re-export parsers for convenience
 pub use parsers::{
-    DeepSeekParser, JsonParser, KimiK2Parser, LlamaParser, MistralParser, PythonicParser,
-    QwenParser, Step3Parser,
+    DeepSeekParser, Glm4MoeParser, GptOssParser, JsonParser, KimiK2Parser, LlamaParser,
+    MistralParser, PythonicParser, QwenParser, Step3Parser,
 };
