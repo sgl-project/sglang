@@ -108,6 +108,23 @@ class JsonSchemaResponseFormat(BaseModel):
     strict: Optional[bool] = False
 
 
+class ResponseFormat(BaseModel):
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: Optional[JsonSchemaResponseFormat] = None
+
+
+class StructuresResponseFormat(BaseModel):
+    begin: str
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    end: str
+
+
+class StructuralTagResponseFormat(BaseModel):
+    type: Literal["structural_tag"]
+    structures: List[StructuresResponseFormat]
+    triggers: List[str]
+
+
 class FileRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/files/create
     file: bytes  # The File object (not file name) to be uploaded
@@ -200,6 +217,7 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -357,23 +375,6 @@ class ChatCompletionMessageUserParam(BaseModel):
 ChatCompletionMessageParam = Union[
     ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam
 ]
-
-
-class ResponseFormat(BaseModel):
-    type: Literal["text", "json_object", "json_schema"]
-    json_schema: Optional[JsonSchemaResponseFormat] = None
-
-
-class StructuresResponseFormat(BaseModel):
-    begin: str
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    end: str
-
-
-class StructuralTagResponseFormat(BaseModel):
-    type: Literal["structural_tag"]
-    structures: List[StructuresResponseFormat]
-    triggers: List[str]
 
 
 class Function(BaseModel):
