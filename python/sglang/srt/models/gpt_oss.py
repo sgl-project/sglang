@@ -1028,10 +1028,6 @@ class GptOssForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        params_checker = {k: False for k, v in params_dict.items()}
-
-        for other_loaded_param_name in other_loaded_param_names:
-            params_checker[other_loaded_param_name] = True
 
         for name, loaded_weight in weights:
             loaded_weight = _WeightCreator.maybe_materialize(loaded_weight)
@@ -1068,7 +1064,6 @@ class GptOssForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                params_checker[name] = True
                 break
             else:
                 for mapping in expert_params_mapping:
@@ -1091,7 +1086,6 @@ class GptOssForCausalLM(nn.Module):
                         name,
                         shard_id=shard_id,
                     )
-                    params_checker[name] = True
                     break
                 else:
                     if name.endswith(".bias") and name not in params_dict:
@@ -1110,28 +1104,8 @@ class GptOssForCausalLM(nn.Module):
                                 param, "weight_loader", default_weight_loader
                             )
                             weight_loader(param, loaded_weight)
-                        params_checker[name] = True
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-
-        not_loaded_params = [k for k, v in params_checker.items() if not v]
-
-        if tp_rank == 0:
-            # Heuristic: If the number of requested weights is much smaller than the total
-            # model parameters (< 10%), we assume it's a dynamic RL update.
-            is_rl_update = (len(weights) < len(params_dict) * 0.1)
-
-            if is_rl_update:
-                # RL update: Partial success is allowed, but complete failure (0 loaded) is an error.
-                num_params_updated = len(params_dict) - len(not_loaded_params)
-                if len(weights) > 0 and num_params_updated == 0:
-                    raise Exception("RL weight update failed completely. 0 weights were successfully loaded.")
-                logging.info(f"RL weight update complete. Updated {num_params_updated} parameters.")
-            else:
-                # Full load: All parameters must be loaded, none can be missing.
-                if not_loaded_params:
-                    raise Exception(f"Not all parameters loaded: {not_loaded_params}")
-                logging.info("Model initialization successful. All parameters have been loaded.")
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
