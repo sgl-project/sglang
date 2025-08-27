@@ -26,6 +26,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils import ImageData
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -45,7 +46,7 @@ class SessionParams:
 
 # Type definitions for multimodal input data
 # Individual data item types for each modality
-ImageDataInputItem = Union[Image, str, Dict]
+ImageDataInputItem = Union[Image, str, ImageData, Dict]
 AudioDataInputItem = Union[str, Dict]
 VideoDataInputItem = Union[str, Dict]
 # Union type for any multimodal data item
@@ -98,22 +99,23 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # Whether to return hidden states
+    return_hidden_states: Union[List[bool], bool] = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
-    # The path to the LoRA
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
+
+    # The path to the LoRA adaptors
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
-
-    # Whether to return hidden states
-    return_hidden_states: Union[List[bool], bool] = False
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -122,6 +124,9 @@ class GenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # For background responses (OpenAI responses API)
+    background: bool = False
 
     def contains_mm_input(self) -> bool:
         return (
@@ -450,6 +455,7 @@ class GenerateReqInput:
             log_metrics=self.log_metrics,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            lora_id=self.lora_id[i] if self.lora_id is not None else None,
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
@@ -500,7 +506,7 @@ class TokenizedGenerateReqInput:
     stream: bool
 
     # LoRA related
-    lora_path: Optional[str] = None  # None means just use the base model
+    lora_id: Optional[str] = None  # None means just use the base model
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
@@ -522,6 +528,24 @@ class TokenizedGenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # For dp balance
+    dp_balance_id: int = -1
+
+
+@dataclass
+class BatchTokenizedGenerateReqInput:
+    # The batch of tokenized requests
+    batch: List[TokenizedGenerateReqInput]
+
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, i):
+        return self.batch[i]
+
+    def __iter__(self):
+        return iter(self.batch)
 
 
 @dataclass
@@ -553,6 +577,9 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+
+    # For background responses (OpenAI responses API)
+    background: bool = False
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -600,6 +627,8 @@ class EmbeddingReqInput:
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
+            elif isinstance(self.sampling_params, dict):
+                self.sampling_params = [self.sampling_params] * self.batch_size
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
@@ -648,6 +677,25 @@ class TokenizedEmbeddingReqInput:
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+    # For dp balance
+    dp_balance_id: int = -1
+
+
+@dataclass
+class BatchTokenizedEmbeddingReqInput:
+    # The batch of tokenized embedding requests
+    batch: List[TokenizedEmbeddingReqInput]
+
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, i):
+        return self.batch[i]
+
+    def __iter__(self):
+        return iter(self.batch)
 
 
 @dataclass
@@ -784,6 +832,8 @@ class UpdateWeightFromDiskReqInput:
     load_format: Optional[str] = None
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
 
 
 @dataclass
@@ -805,6 +855,8 @@ class UpdateWeightsFromDistributedReqInput:
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
 
 
 @dataclass
@@ -828,6 +880,8 @@ class UpdateWeightsFromTensorReqInput:
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
 
 
 @dataclass
@@ -856,6 +910,14 @@ class InitWeightsUpdateGroupReqInput:
 class InitWeightsUpdateGroupReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class UpdateWeightVersionReqInput:
+    # The new weight version
+    new_version: str
+    # Whether to abort all running requests before updating
+    abort_all_requests: bool = True
 
 
 @dataclass
@@ -974,6 +1036,11 @@ class ProfileReqOutput:
 
 
 @dataclass
+class FreezeGCReq:
+    pass
+
+
+@dataclass
 class ConfigureLoggingReq:
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
@@ -1068,6 +1135,8 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+    # Whether to pin the LoRA adapter in memory.
+    pinned: bool = False
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
 
@@ -1076,6 +1145,7 @@ class LoadLoRAAdapterReqInput:
             lora_id=self.lora_id,
             lora_name=self.lora_name,
             lora_path=self.lora_path,
+            pinned=self.pinned,
         )
 
 
@@ -1097,7 +1167,7 @@ class UnloadLoRAAdapterReqInput:
 class LoRAUpdateResult:
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Dict[str, LoRARef] = field(default_factory=dict)
+    loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult

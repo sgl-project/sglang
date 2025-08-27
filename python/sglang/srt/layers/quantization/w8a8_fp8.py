@@ -26,7 +26,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
@@ -269,13 +270,8 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        topk_output: StandardTopKOutput,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
@@ -284,15 +280,11 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight,
             layer.w2_weight,
             topk_output=topk_output,
-            inplace=inplace,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            activation=activation,
+            moe_runner_config=moe_runner_config,
             use_fp8_w8a8=True,
             per_channel_quant=True,
             w1_scale=(layer.w13_weight_scale),
             w2_scale=(layer.w2_weight_scale),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )

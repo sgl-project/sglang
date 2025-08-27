@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import importlib
-from typing import TYPE_CHECKING, Callable, List, Optional
+import importlib.util
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -24,7 +24,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
@@ -116,9 +116,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if use_intel_amx_backend(layer):
-            return torch.ops.sgl_kernel.weight_packed_linear(
+            x_shapes = x.shape
+            if len(x_shapes) == 3:
+                x = x.view(-1, x.shape[-1])
+            output = torch.ops.sgl_kernel.weight_packed_linear(
                 x, layer.weight, bias, True  # is_vnni
             )
+            if len(x_shapes) == 3:
+                output = output.view(x_shapes[0], x_shapes[1], -1)
+            return output
 
         return F.linear(x, layer.weight, bias)
 
@@ -129,14 +135,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def __init__(self, use_triton_kernels: bool = False):
         super().__init__()
         self.use_triton_kernels = use_triton_kernels
+        self.with_bias = False
 
         self.triton_kernel_moe_forward = None
+        self.triton_kernel_moe_with_bias_forward = None
         if torch.cuda.is_available() and has_triton_kernels:
             from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
                 triton_kernel_moe_forward as _tk_forward,
             )
+            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
+                triton_kernel_moe_with_bias_forward as _tk_with_bias_forward,
+            )
 
             self.triton_kernel_moe_forward = _tk_forward
+            self.triton_kernel_moe_with_bias_forward = _tk_with_bias_forward
 
     def create_weights(
         self,
@@ -145,8 +157,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
+        with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        self.with_bias = with_bias
+
         # Fused gate_up_proj (column parallel)
         w13_weight_n, w13_weight_k = 2 * intermediate_size, hidden_size
         if self.use_triton_kernels:
@@ -157,6 +172,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        if self.with_bias:
+            w13_weight_bias = torch.nn.Parameter(
+                torch.empty(num_experts, 2 * intermediate_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_bias", w13_weight_bias)
+            set_weight_attrs(w13_weight_bias, extra_weight_attrs)
 
         # down_proj (row parallel)
         w2_weight_n, w2_weight_k = (
@@ -171,6 +194,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        if self.with_bias:
+            w2_weight_bias = torch.nn.Parameter(
+                torch.empty(num_experts, hidden_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_bias", w2_weight_bias)
+            set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _use_aiter:
@@ -196,31 +227,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
-
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
-
-        if isinstance(layer, EPMoE):
-            return layer.run_moe(
-                hidden_states=x,
-                topk_output=topk_output,
-            )
 
         return self.forward(
             x=x,
             layer=layer,
             topk_output=topk_output,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            inplace=inplace,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
+            moe_runner_config=moe_runner_config,
         )
 
     def forward_cuda(
@@ -228,26 +242,37 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
 
         if self.use_triton_kernels:
-            return self.triton_kernel_moe_forward(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_output=topk_output,
-            )
+            if self.with_bias:
+                assert self.triton_kernel_moe_with_bias_forward is not None
+                return self.triton_kernel_moe_with_bias_forward(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    b1=layer.w13_weight_bias,
+                    b2=layer.w2_weight_bias,
+                    topk_output=topk_output,
+                    moe_runner_config=moe_runner_config,
+                    w1_pcg=None,
+                    w2_pcg=None,
+                )
+            else:
+                assert self.triton_kernel_moe_forward is not None
+                return self.triton_kernel_moe_forward(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_output=topk_output,
+                    moe_runner_config=moe_runner_config,
+                )
         else:
             if _use_aiter:
-                assert not no_combine, "unsupported"
+                assert not moe_runner_config.no_combine, "unsupported"
                 topk_weights, topk_ids, _ = topk_output
-                if apply_router_weight_on_input:
+                if moe_runner_config.apply_router_weight_on_input:
                     assert (
                         topk_weights.dim() == 2
                     ), "`topk_weights` should be in shape (num_tokens, topk)"
@@ -267,7 +292,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     topk_ids,
                     activation=(
                         ActivationType.Silu
-                        if activation == "silu"
+                        if moe_runner_config.activation == "silu"
                         else ActivationType.Gelu
                     ),
                 )
@@ -280,12 +305,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     hidden_states=x,
                     w1=layer.w13_weight,
                     w2=layer.w2_weight,
+                    b1=getattr(layer, "w13_weight_bias", None),
+                    b2=getattr(layer, "w2_weight_bias", None),
                     topk_output=topk_output,
-                    inplace=inplace and not no_combine,
-                    activation=activation,
-                    apply_router_weight_on_input=apply_router_weight_on_input,
-                    no_combine=no_combine,
-                    routed_scaling_factor=routed_scaling_factor,
+                    moe_runner_config=moe_runner_config,
                 )
 
     def forward_cpu(
@@ -293,21 +316,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
-        assert activation == "silu", f"activation = {activation} is not supported."
+        assert (
+            moe_runner_config.activation == "silu"
+        ), f"activation = {moe_runner_config.activation} is not supported."
 
-        if use_intel_amx_backend(layer) and not apply_router_weight_on_input:
+        if (
+            use_intel_amx_backend(layer)
+            and not moe_runner_config.apply_router_weight_on_input
+        ):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
-                apply_router_weight_on_input, topk_weights, x
+                moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
@@ -332,11 +355,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 layer,
                 x,
                 topk_output,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                inplace=inplace,
-                no_combine=no_combine,
-                routed_scaling_factor=routed_scaling_factor,
+                moe_runner_config,
             )
 
     def forward_npu(
@@ -344,12 +363,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
-        *,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 
@@ -357,11 +371,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             layer,
             x,
             topk_output,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            inplace=inplace,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
+            moe_runner_config,
         )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:

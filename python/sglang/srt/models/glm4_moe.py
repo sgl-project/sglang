@@ -23,6 +23,8 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -38,7 +40,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_local_attention_dp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -49,11 +51,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import (
-    DeepEPMoE,
-    get_moe_impl_class,
-    use_flashinfer_trtllm_moe,
-)
+from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -77,13 +77,9 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV2Model,
     DeepseekV2MoE,
 )
-from sglang.srt.two_batch_overlap import (
-    MaybeTboDeepEPDispatcher,
-    model_forward_maybe_tbo,
-)
+from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     BumpAllocator,
-    DeepEPMode,
     LazyValue,
     add_prefix,
     bind_or_assign,
@@ -157,13 +153,13 @@ class Glm4MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None, can_fuse_mlp_allreduce=False):
+    def forward(self, x, forward_batch=None, should_allreduce_fusion=False):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, can_fuse_mlp_allreduce=can_fuse_mlp_allreduce)
+        x, _ = self.down_proj(x, skip_all_reduce=should_allreduce_fusion)
         return x
 
 
@@ -344,7 +340,7 @@ class Glm4MoeGate(nn.Module):
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
         self.e_score_correction_bias = nn.Parameter(
-            torch.empty((config.n_routed_experts))
+            torch.empty((config.n_routed_experts), dtype=torch.float32)
         )
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
@@ -388,6 +384,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
     ):
         nn.Module.__init__(self)
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
@@ -415,19 +412,15 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
         )
 
-        self.topk = (
-            TopK(
-                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
-                renormalize=config.norm_topk_prob,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-            if not use_flashinfer_trtllm_moe
-            else None
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         self.experts = get_moe_impl_class()(
@@ -442,32 +435,6 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
-            **(
-                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
-                if global_server_args_dict["enable_deepep_moe"]
-                else {}
-            ),
-            # Additional args for FusedMoE
-            **(
-                dict(
-                    enable_flashinfer_cutlass_moe=True,
-                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
-                )
-                if global_server_args_dict["enable_flashinfer_cutlass_moe"]
-                else {}
-            ),
-            **(
-                dict(
-                    renormalize=config.norm_topk_prob,
-                    use_grouped_topk=True,
-                    num_expert_group=config.n_group,
-                    num_fused_shared_experts=self.num_fused_shared_experts,
-                    topk_group=config.topk_group,
-                    correction_bias=self.gate.e_score_correction_bias,
-                )
-                if use_flashinfer_trtllm_moe
-                else {}
-            ),
         )
 
         self.shared_experts_is_int8 = False
@@ -482,11 +449,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if global_server_args_dict["enable_deepep_moe"]
-                    else {}
-                ),
+                **(dict(tp_rank=0, tp_size=1) if self.ep_size > 1 else {}),
             )
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
@@ -502,9 +465,9 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
 
         self.top_k = config.num_experts_per_tok
 
-        if global_server_args_dict["enable_deepep_moe"]:
+        if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_tensor_model_parallel_world_size()
+            self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
                 config.n_routed_experts
                 + global_server_args_dict["ep_num_redundant_experts"]
@@ -526,12 +489,89 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
-                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
+                deepep_mode=get_deepep_mode(),
                 async_finish=True,
                 return_recv_hook=True,
             )
 
-        self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
+        self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+
+    def forward_normal_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        shared_output = self._forward_shared_experts(hidden_states)
+
+        with torch.cuda.stream(self.alt_stream):
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+            if not _is_cuda:
+                final_hidden_states *= self.routed_scaling_factor
+        current_stream.wait_stream(self.alt_stream)
+
+        if self.ep_size > 1:
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+            final_hidden_states += shared_output
+        else:
+            final_hidden_states += shared_output
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+        return final_hidden_states
+
+    def forward_normal(
+        self,
+        hidden_states: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        if hasattr(self, "shared_experts") and use_intel_amx_backend(
+            self.shared_experts.gate_up_proj
+        ):
+            return self.forward_cpu(hidden_states, should_allreduce_fusion)
+
+        shared_output = self._forward_shared_experts(hidden_states)
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
+        if not _is_cuda and not _use_aiter:
+            # fused in biased_grouped_topk so we can skip here
+            final_hidden_states *= self.routed_scaling_factor
+        if self.ep_size > 1:
+            if self.tp_size > 1 and not should_allreduce_fusion:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+            if shared_output is not None:
+                final_hidden_states += shared_output
+        else:
+            if shared_output is not None:
+                final_hidden_states += shared_output
+            if self.tp_size > 1 and not should_allreduce_fusion:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+        return final_hidden_states
 
 
 class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
@@ -556,7 +596,6 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
-        self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
         self.self_attn = Glm4MoeAttention(
             hidden_size=self.hidden_size,
@@ -617,6 +656,7 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
         )
 
     def forward(
@@ -665,7 +705,7 @@ class Glm4MoeModel(DeepseekV2Model):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
@@ -680,9 +720,10 @@ class Glm4MoeModel(DeepseekV2Model):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
+        self.pp_group = get_pp_group()
+        self.start_layer = 0
+        self.end_layer = config.num_hidden_layers
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.dp_size = get_local_attention_dp_size()
 
 
 class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
@@ -698,6 +739,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("Glm4MoeForCausalLM")
         self.model = Glm4MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -710,7 +752,6 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
         self.logits_processor = LogitsProcessor(config)
-        self.dp_size = get_local_attention_dp_size()
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -721,7 +762,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
         )
 
     def determine_num_fused_shared_experts(
-        self, architecture: str = "DeepseekV3ForCausalLM"
+        self, architecture: str = "Glm4MoeForCausalLM"
     ):
         self.num_fused_shared_experts = 0
         if global_server_args_dict["disable_shared_experts_fusion"]:
@@ -733,15 +774,11 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
             or self.config.architectures[0] != architecture
-            or self.config.n_routed_experts != 128
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Only GLM-4.5 on NV-platform with capability >= 80 can use shared experts fusion optimization."
-        elif (
-            global_server_args_dict["enable_deepep_moe"]
-            or global_server_args_dict["enable_ep_moe"]
-        ):
-            disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode."
+        elif get_moe_expert_parallel_world_size() > 1:
+            disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization under expert parallelism."
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True
@@ -878,7 +915,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

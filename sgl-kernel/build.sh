@@ -21,12 +21,15 @@ else
    BUILDER_NAME="pytorch/manylinux2_28-builder"
 fi
 
-if [ ${CUDA_VERSION} = "12.8" ]; then
+if [ ${CUDA_VERSION} = "12.9" ]; then
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.7.1 --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION//.}"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129"
+elif [ ${CUDA_VERSION} = "12.8" ]; then
+   DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128"
 else
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.7.1"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126"
 fi
 
 docker run --rm \
@@ -36,6 +39,13 @@ docker run --rm \
    # Install CMake (version >= 3.26) - Robust Installation
    export CMAKE_VERSION_MAJOR=3.31
    export CMAKE_VERSION_MINOR=1
+   # Setting these flags to reduce OOM chance only on ARM
+   if [ \"${ARCH}\" = \"aarch64\" ]; then
+      export CUDA_NVCC_FLAGS=\"-Xcudafe --threads=2\"
+      export MAKEFLAGS='-j2'
+      export CMAKE_BUILD_PARALLEL_LEVEL=2
+      export NINJAFLAGS='-j2'
+   fi
    echo \"Downloading CMake from: https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz\"
    wget https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz
    tar -xzf cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz
@@ -53,7 +63,7 @@ docker run --rm \
    ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so && \
    ${PYTHON_ROOT_PATH}/bin/${TORCH_INSTALL} && \
    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core && \
-   export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0+PTX' && \
+   export TORCH_CUDA_ARCH_LIST='8.0 8.9 9.0+PTX' && \
    export CUDA_VERSION=${CUDA_VERSION} && \
    mkdir -p /usr/lib/${ARCH}-linux-gnu/ && \
    ln -s /usr/local/cuda-${CUDA_VERSION}/targets/${LIBCUDA_ARCH}-linux/lib/stubs/libcuda.so /usr/lib/${ARCH}-linux-gnu/libcuda.so && \

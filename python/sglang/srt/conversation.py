@@ -26,12 +26,16 @@ Key components:
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses
+import json
+import os
 import re
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+from typing_extensions import Literal
+
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import read_system_prompt_from_file
+from sglang.srt.utils import ImageData, read_system_prompt_from_file
 
 
 class SeparatorStyle(IntEnum):
@@ -91,7 +95,7 @@ class Conversation:
     video_token: str = "<video>"
     audio_token: str = "<audio>"
 
-    image_data: Optional[List[str]] = None
+    image_data: Optional[List[ImageData]] = None
     video_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
     stop_token_ids: Optional[int] = None
@@ -381,9 +385,9 @@ class Conversation:
         """Append a new message."""
         self.messages.append([role, message])
 
-    def append_image(self, image: str):
+    def append_image(self, image: str, detail: Literal["auto", "low", "high"]):
         """Append a new image."""
-        self.image_data.append(image)
+        self.image_data.append(ImageData(url=image, detail=detail))
 
     def append_video(self, video: str):
         """Append a new video."""
@@ -623,11 +627,13 @@ def generate_chat_conv(
                         real_content += content.text
                     elif content.type == "image_url":
                         # NOTE: works for llava and intervl2_5
-                        if conv.name in ["internvl-2-5", "interns1"]:
+                        if conv.name in ["internvl-2-5"]:
                             real_content = image_token + real_content
                         else:
                             real_content += image_token
-                        conv.append_image(content.image_url.url)
+                        conv.append_image(
+                            content.image_url.url, content.image_url.detail
+                        )
                     elif content.type == "video_url":
                         real_content += video_token
                         conv.append_video(content.video_url.url)
@@ -813,20 +819,7 @@ register_conv_template(
         sep_style=SeparatorStyle.MPT,
         sep="<|im_end|>\n",
         stop_str=["<|im_end|>", "<|action_end|>"],
-        image_token="<image>",
-    )
-)
-
-register_conv_template(
-    Conversation(
-        name="interns1",
-        system_template="<|im_start|>system\n{system_message}",
-        system_message="You are an AI assistant whose name is Intern-S1 (书生大模型).\n- Intern-S1 (书生大模型) is a vision-language model that is developed by Shanghai AI Laboratory (上海人工智能实验室).  It is designed to be helpful, honest, and harmless.\n- Intern-S1 (书生大模型) can understand and communicate fluently in the language chosen by the user such as English and 中文.\nYou are an expert reasoner with extensive experience in all areas. You approach problems through systematic thinking and rigorous reasoning. Your response should reflect deep understanding and precise logical thinking, making your solution path and reasoning clear to others. Please put your thinking process within <think>...</think> tags.",
-        roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
-        sep_style=SeparatorStyle.MPT,
-        sep="<|im_end|>\n",
-        stop_str=["<|im_end|>", "<|action_end|>"],
-        image_token="<image>",
+        image_token="<IMG_CONTEXT>",
     )
 )
 
@@ -956,20 +949,6 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
-        name="mimo-vl",
-        system_message="You are MiMo, an AI assistant developed by Xiaomi.",
-        system_template="<|im_start|>system\n{system_message}",
-        roles=("<|im_start|>user", "<|im_start|>assistant"),
-        sep="<|im_end|>\n",
-        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
-        stop_str=["<|im_end|>"],
-        image_token="<|vision_start|><|image_pad|><|vision_end|>",
-    )
-)
-
-
-register_conv_template(
-    Conversation(
         name="qwen2-audio",
         system_template="<|im_start|>system\n{system_message}",
         system_message="You are a helpful assistant.",
@@ -981,40 +960,43 @@ register_conv_template(
     )
 )
 
-register_conv_template(
-    Conversation(
-        name="llama_4_vision",
-        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
-        system_template="<|header_start|>system<|header_end|>\n\n{system_message}<|eot|>",
-        roles=("user", "assistant"),
-        sep_style=SeparatorStyle.LLAMA4,
-        sep="",
-        stop_str="<|eot|>",
-        image_token="<|image|>",
-    )
-)
+
+MODEL_TYPE_TO_TEMPLATE = {
+    "internvl_chat": "internvl-2-5",
+    "deepseek_vl_v2": "deepseek-vl2",
+    "multi_modality": "janus-pro",
+    "phi4mm": "phi-4-mm",
+    "minicpmv": "minicpmv",
+    "minicpmo": "minicpmo",
+}
+
+
+def get_model_type(model_path: str) -> Optional[str]:
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        return config.get("model_type")
+    except (IOError, json.JSONDecodeError):
+        return None
 
 
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
     if re.search(r"internvl", model_path, re.IGNORECASE):
         return "internvl-2-5"
-    if re.search(r"intern.*s1", model_path, re.IGNORECASE):
-        return "interns1"
-
-
-@register_conv_template_matching_function
-def match_llama_vision(model_path: str):
-    if re.search(r"llama.*3\.2.*vision", model_path, re.IGNORECASE):
-        return "llama_3_vision"
-    if re.search(r"llama.*4.*", model_path, re.IGNORECASE):
-        return "llama_4_vision"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
 
 @register_conv_template_matching_function
 def match_deepseek_janus_pro(model_path: str):
     if re.search(r"janus", model_path, re.IGNORECASE):
         return "janus-pro"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
 
 @register_conv_template_matching_function
@@ -1024,35 +1006,15 @@ def match_vicuna(model_path: str):
 
 
 @register_conv_template_matching_function
-def match_llama2_chat(model_path: str):
-    if re.search(
-        r"llama-2.*chat|codellama.*instruct",
-        model_path,
-        re.IGNORECASE,
-    ):
-        return "llama-2"
-
-
-@register_conv_template_matching_function
-def match_mistral(model_path: str):
-    if re.search(r"pixtral|(mistral|mixtral).*instruct", model_path, re.IGNORECASE):
-        return "mistral"
-
-
-@register_conv_template_matching_function
 def match_deepseek_vl(model_path: str):
     if re.search(r"deepseek.*vl2", model_path, re.IGNORECASE):
         return "deepseek-vl2"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
 
 @register_conv_template_matching_function
 def match_qwen_chat_ml(model_path: str):
-    if re.search(r"gme.*qwen.*vl", model_path, re.IGNORECASE):
-        return "gme-qwen2-vl"
-    if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
-        return "qwen2-vl"
-    if re.search(r"qwen.*audio", model_path, re.IGNORECASE):
-        return "qwen2-audio"
     if re.search(
         r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,
@@ -1062,44 +1024,17 @@ def match_qwen_chat_ml(model_path: str):
 
 
 @register_conv_template_matching_function
-def match_gemma3_instruct(model_path: str):
-    if re.search(r"gemma-3.*it", model_path, re.IGNORECASE):
-        return "gemma-it"
-
-
-@register_conv_template_matching_function
-def match_openbmb_minicpm(model_path: str):
-    if re.search(r"minicpm-v", model_path, re.IGNORECASE):
-        return "minicpmv"
-    elif re.search(r"minicpm-o", model_path, re.IGNORECASE):
-        return "minicpmo"
-
-
-@register_conv_template_matching_function
-def match_moonshot_kimivl(model_path: str):
-    if re.search(r"kimi.*vl", model_path, re.IGNORECASE):
-        return "kimi-vl"
-
-
-@register_conv_template_matching_function
-def match_devstral(model_path: str):
-    if re.search(r"devstral", model_path, re.IGNORECASE):
-        return "devstral"
+def match_minicpm(model_path: str):
+    match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
+    if match:
+        return f"minicpm{match.group(1).lower()}"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
 
 @register_conv_template_matching_function
 def match_phi_4_mm(model_path: str):
     if "phi-4-multimodal" in model_path.lower():
         return "phi-4-mm"
-
-
-@register_conv_template_matching_function
-def match_vila(model_path: str):
-    if re.search(r"vila", model_path, re.IGNORECASE):
-        return "chatml"
-
-
-@register_conv_template_matching_function
-def match_mimo_vl(model_path: str):
-    if re.search(r"mimo.*vl", model_path, re.IGNORECASE):
-        return "mimo-vl"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
