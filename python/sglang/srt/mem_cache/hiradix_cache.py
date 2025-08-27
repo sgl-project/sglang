@@ -434,9 +434,12 @@ class HiRadixCache(RadixCache):
         if self.prefetch_stop_policy == "best_effort":
             return can_terminate
 
-        completed = (
-            operation.completed_tokens == len(operation.hash_value) * self.page_size
-        )
+        if len(operation.hash_value) == 0:
+            completed = False
+        else:
+            completed = (
+                operation.completed_tokens == len(operation.hash_value) * self.page_size
+            )
 
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
