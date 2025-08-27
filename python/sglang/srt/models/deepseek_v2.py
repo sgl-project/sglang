@@ -235,11 +235,9 @@ class DeepseekV2MLP(nn.Module):
 
         if gemm_output_zero_allocator != None and x.shape[0] <= 256:
             y = gemm_output_zero_allocator.allocate(x.shape[0]*self.gate_up_proj.output_size_per_partition).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
-            gate_up, _ = self.gate_up_proj((x, None, y))
-            gate_up = gate_up.to(x.dtype)
-        else:
-            gate_up, _ = self.gate_up_proj(x)
+            x = (x, None, y)
 
+        gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter

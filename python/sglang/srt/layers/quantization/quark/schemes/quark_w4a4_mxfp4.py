@@ -96,8 +96,6 @@ class QuarkW4A4MXFP4(QuarkScheme):
             elif len(x) == 3:
                 x, x_s, y = x
 
-        out_dtype = x.dtype
-
         use_prequant_kernel = (
             x_s is None and y is not None and layer.weight.shape[0] == y.shape[1]
         )    
@@ -117,6 +115,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
         if use_prequant_kernel:
             gemm_afp4wfp4_pre_quant(x_q, layer.weight, layer.weight_scale, y.dtype, y)
+            y = y.to(x.dtype)
         else:
             gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, self.out_dtype, y)
 
