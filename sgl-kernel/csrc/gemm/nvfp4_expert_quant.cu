@@ -400,6 +400,7 @@ cvt_fp16_to_fp4_expert(
     uint32_t* input_offset_by_experts,
     uint32_t* output_scale_offset_by_experts,
     int32_t* mask,
+    bool use_silu_and_mul,
     int n_experts) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
@@ -435,7 +436,7 @@ cvt_fp16_to_fp4_expert(
   // silu_and_mal. Maybe we want a more general behavior of mask later. In the
   // silu case, the input last dim doubles.
   bool use_mask = mask != nullptr;
-  int actualColsPerRow = use_mask ? colsPerRow * 2 : colsPerRow;
+  int actualColsPerRow = use_silu_and_mul ? colsPerRow * 2 : colsPerRow;
 
   // Each global thread processes one element
   for (int globalIdx = tid_in_expert + input_offset_by_experts[expert_idx] * colsPerRow;
@@ -455,7 +456,7 @@ cvt_fp16_to_fp4_expert(
 
     int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
     PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
-    if (use_mask) {
+    if (use_silu_and_mul) {
       PackedVec in_vec_mul = reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
       silu_and_mul(in_vec, in_vec_mul);
     }
@@ -600,6 +601,7 @@ void quant_impl(
     void* input_offset_by_experts,
     void* output_scale_offset_by_experts,
     void* mask,
+    bool use_silu_and_mul,
     int m_topk,
     int k,
     int n_experts,
@@ -636,6 +638,7 @@ void quant_impl(
         reinterpret_cast<uint32_t*>(input_offset_by_experts),
         reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
         reinterpret_cast<int32_t*>(mask),
+        use_silu_and_mul,
         n_experts);
     return;
   }
@@ -770,6 +773,7 @@ void scaled_fp4_experts_quant_sm100a(
         input_offset_by_experts.data_ptr(),
         output_scale_offset_by_experts.data_ptr(),
         nullptr,  // mask
+        false,  // use_silu_and_mul
         m_topk,
         k,
         n_experts,
@@ -783,6 +787,7 @@ void scaled_fp4_experts_quant_sm100a(
         input_offset_by_experts.data_ptr(),
         output_scale_offset_by_experts.data_ptr(),
         nullptr,  // mask
+        false,  // use_silu_and_mul
         m_topk,
         k,
         n_experts,
@@ -799,7 +804,8 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     torch::Tensor const& input_global_scale,
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts,
-    torch::Tensor const& mask) {
+    torch::Tensor const& mask,
+    bool use_silu_and_mul) {
   CHECK_INPUT(output, "output must be a CUDA tensor");
   CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");
   CHECK_INPUT(input, "input must be a CUDA tensor");
@@ -828,9 +834,11 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
   const int BLOCK_SIZE = 16;
   auto m_topk = input.size(0);
   auto k_by_2 = input.size(1);
-  TORCH_CHECK(k_by_2 % 2 == 0, "k must be a multiple of 2");
-  auto k = k_by_2 / 2;
-  TORCH_CHECK(k % BLOCK_SIZE == 0, "k must be a multiple of 16");
+  auto k = k_by_2;
+  if (use_silu_and_mul) {
+    TORCH_CHECK(k_by_2 % 2 == 0, "k must be a multiple of 2");
+    k = k_by_2 / 2;
+  }
   auto n_experts = input_global_scale.size(0);
   TORCH_CHECK(input_offset_by_experts.size(0) == n_experts + 1);
   TORCH_CHECK(output_scale_offset_by_experts.size(0) == n_experts + 1);
@@ -855,6 +863,7 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
         input_offset_by_experts.data_ptr(),
         output_scale_offset_by_experts.data_ptr(),
         mask.data_ptr(),
+        use_silu_and_mul,
         m_topk,
         k,
         n_experts,
@@ -868,6 +877,7 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
         input_offset_by_experts.data_ptr(),
         output_scale_offset_by_experts.data_ptr(),
         mask.data_ptr(),
+        use_silu_and_mul,
         m_topk,
         k,
         n_experts,

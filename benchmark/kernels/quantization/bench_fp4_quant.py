@@ -18,6 +18,7 @@ def _test_accuracy_once(E, M, K, input_dtype, device):
     out1, blk_scales1 = scaled_fp4_grouped_quant(
         silu_and_mul(x),
         glb_scales,
+        masks,
     )
 
     torch.testing.assert_close(out, out1)
@@ -89,6 +90,7 @@ def benchmark(M, K, provider):
             lambda: scaled_fp4_grouped_quant(
                 silu_and_mul(x),
                 glb_scales,
+                masks,
             ),
             quantiles=quantiles,
         )
