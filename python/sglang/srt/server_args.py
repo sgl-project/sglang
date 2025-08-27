@@ -44,7 +44,7 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
-
+from icecream import ic
 logger = logging.getLogger(__name__)
 
 
@@ -2079,6 +2079,12 @@ class ServerArgs:
             action="store_true",
             help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
         )
+        parser.add_argument(
+            '--speculative-token-map',
+            type=str,
+            help="The path of the draft model's small vocab table.",
+            default=ServerArgs.speculative_token_map,
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -2087,6 +2093,7 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
+        ic(attrs, args)
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
