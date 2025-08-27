@@ -705,7 +705,6 @@ class MLATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_buffer_meta(self, keys, indices):
-        local_rank = get_tensor_model_parallel_rank()
         ptr_list = []
         key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
@@ -719,7 +718,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             )
             ptr_list.append(k_ptr)
             key_ = keys[index // self.page_size]
-            key_list.append(f"{key_}_{local_rank}_k")
+            key_list.append(f"{key_}_k")
         element_size = (
             self.layer_num
             * self.dtype.itemsize
