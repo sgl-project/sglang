@@ -22,16 +22,12 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import threading
 import time
-import traceback
 from collections import defaultdict
-from dataclasses import dataclass
 from functools import partial
-from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from lmcache.integration.sglang.sglang_adapter import (
-    LMCacheConnector,
     LMCacheLayerwiseConnector,
     LoadMetadata,
     StoreMetadata,
@@ -215,7 +211,7 @@ class LMCRadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self.in_flight_nodes = list()
         self._record_all_cleared_event()
-        self.lmcache_connector.reset()
+        # self.lmcache_connector.reset()
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -293,7 +289,7 @@ class LMCRadixCache(BasePrefixCache):
                     offset=len(value) - prefix_padding_len,
                 )
             )
-        logger.info(f"num_retrieved_tokens: {num_retrieved_tokens}")
+        logger.debug(f"num_retrieved_tokens: {num_retrieved_tokens}")
 
         if num_retrieved_tokens > 0:
             self.token_to_kv_pool_allocator.free(
