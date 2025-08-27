@@ -994,11 +994,20 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.current_attention_backend = attention_backend
 
         if attention_backend == "ascend":
-            return AttnForwardMethod.MLA
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+            ):
+                return AttnForwardMethod.MHA
+            else:
+                return AttnForwardMethod.MLA
         elif (
             attention_backend == "flashinfer"
             or attention_backend == "fa3"
             or attention_backend == "flashmla"
+            or attention_backend == "trtllm_mla"
+            or attention_backend == "cutlass_mla"
         ):
             # Use MHA with chunked KV cache when prefilling on long sequences.
             sum_extend_prefix_lens = (
@@ -1290,6 +1299,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             or self.current_attention_backend == "flashinfer"
             or self.current_attention_backend == "cutlass_mla"
             or self.current_attention_backend == "trtllm_mla"
+            or self.current_attention_backend == "ascend"
         ):
             extra_args = {}
             if self._fuse_rope_for_trtllm_mla(forward_batch):
@@ -1994,6 +2004,23 @@ class DeepseekV2Model(nn.Module):
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            offloader_kwargs=dict(
+                submodule_accessor=lambda layer: (
+                    layer.mlp.experts
+                    if isinstance(layer.mlp, DeepseekV2MoE)
+                    else layer.mlp
+                ),
+                whitelist_param_names_creator=lambda module: (
+                    [
+                        "w13_weight",
+                        "w2_weight",
+                        "w13_blockscale_swizzled",
+                        "w2_blockscale_swizzled",
+                    ]
+                    if isinstance(module, FusedMoE)
+                    else []
+                ),
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
