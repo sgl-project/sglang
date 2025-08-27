@@ -397,7 +397,14 @@ class AscendAttnBackend(AttentionBackend):
     ):
         if self.graph_mode:
             return self.forward_decode_graph(
-                q, k, v, layer, forward_batch, save_kv_cache, q_rope=q_rope, k_rope=k_rope
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
             )
 
         if not self.use_mla:
@@ -407,9 +414,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             num_tokens = q.shape[0]
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-                layer.layer_id
-            )
+            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
             if self.use_fia:
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q.view(
@@ -462,9 +467,7 @@ class AscendAttnBackend(AttentionBackend):
             kv_c = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_pe = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if (self.graph_mode or self.use_fia) and (
-                layer.tp_q_head_num // layer.tp_k_head_num
-            ) >= 8:
+            if (self.use_fia) and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
                 """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
                 kv_c = kv_c.view(
                     -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
