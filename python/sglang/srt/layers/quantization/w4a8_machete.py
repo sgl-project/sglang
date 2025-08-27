@@ -32,6 +32,7 @@ from sglang.srt.utils import get_device_capability, set_weight_attrs
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
 
@@ -353,6 +354,7 @@ class MoeW4A8MacheteMethod:
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_output: TopKOutput,
+        moe_runner_config: MoeRunnerConfig,
         *,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
