@@ -14,6 +14,8 @@ pub struct SGLangWorker {
     base: BasicWorker,
     // Cached capacity value
     cached_capacity: Arc<AtomicUsize>,
+    // Shared HTTP client for making requests
+    http_client: reqwest::Client,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -29,22 +31,23 @@ struct ServerInfo {
 impl SGLangWorker {
     /// Create a new SGLang worker
     pub fn new(url: String, worker_type: WorkerType) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("Failed to create HTTP client");
+
         Self {
             base: BasicWorker::new(url, worker_type),
             cached_capacity: Arc::new(AtomicUsize::new(0)),
+            http_client,
         }
     }
 
     /// Fetch capacity information from the SGLang backend
     async fn fetch_capacity(&self) -> Option<usize> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .ok()?;
-
         let url = format!("{}/get_server_info", self.base.url());
 
-        match client.get(&url).send().await {
+        match self.http_client.get(&url).send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     match response.json::<ServerInfo>().await {
