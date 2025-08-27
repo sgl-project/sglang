@@ -1,5 +1,5 @@
 use crate::tool_parser::parsers::{
-    JsonParser, LlamaParser, MistralParser, PythonicParser, QwenParser,
+    DeepSeekParser, JsonParser, LlamaParser, MistralParser, PythonicParser, QwenParser,
 };
 use crate::tool_parser::traits::ToolParser;
 use std::collections::HashMap;
@@ -110,6 +110,9 @@ impl ParserRegistry {
 
         // Llama parser - <|python_tag|>{...} or plain JSON format
         self.register_parser("llama", Arc::new(LlamaParser::new()));
+
+        // DeepSeek V3 parser - Unicode tokens with JSON blocks
+        self.register_parser("deepseek", Arc::new(DeepSeekParser::new()));
     }
 
     /// Register default model mappings
@@ -141,7 +144,11 @@ impl ParserRegistry {
         self.map_model("llama-*", "json");
         self.map_model("meta-llama-*", "json");
 
-        // DeepSeek models - DeepSeek v3 would need custom parser, v2 uses pythonic
+        // DeepSeek models
+        // DeepSeek V3 uses custom Unicode token format
+        self.map_model("deepseek-v3*", "deepseek");
+        self.map_model("deepseek-ai/DeepSeek-V3*", "deepseek");
+        // DeepSeek V2 uses pythonic format
         self.map_model("deepseek-*", "pythonic");
 
         // Other models default to JSON
