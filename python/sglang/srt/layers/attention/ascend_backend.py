@@ -167,7 +167,7 @@ class AscendAttnBackend(AttentionBackend):
         v,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=True,
+        save_kv_cache: bool = True,
     ):
         if not self.use_mla:
             if save_kv_cache:
@@ -260,7 +260,7 @@ class AscendAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=True,
+        save_kv_cache :bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
@@ -390,7 +390,7 @@ class AscendAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache: bool = False,
+        save_kv_cache: bool = True,
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
