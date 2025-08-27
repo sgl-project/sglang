@@ -1,13 +1,6 @@
-pub mod config;
-pub mod connection;
-pub mod errors;
-pub mod executor;
-pub mod handler;
+// mod.rs - Minimal exports (Python-aligned)
 pub mod types;
+pub mod tool_server;
 
-#[cfg(test)]
-mod test;
-
-pub use config::MCPConfig;
-pub use errors::{MCPError, MCPResult};
-pub use handler::MCPToolHandler;
+pub use types::{MCPError, MCPResult, MCPConfig, ToolCall, ToolResult, ToolSession};
+pub use tool_server::MCPToolServer;
