@@ -1194,7 +1194,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             # To reduce a time-costing split operation
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-            )            
+            )
 
         return q, k, v, forward_batch
 
