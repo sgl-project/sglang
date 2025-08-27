@@ -12,8 +12,8 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
 use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, StringOrArray,
-    UserMessageContent,
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, MessageContent,
+    StringOrArray,
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
@@ -1873,11 +1873,12 @@ impl RouterTrait for PDRouter {
         // Extract text for cache-aware routing
         let request_text = if self.policies_need_request_text() {
             body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.clone()),
+                ChatMessage::User { content, .. } | ChatMessage::System { content, .. } => {
+                    match content {
+                        MessageContent::Text(text) => Some(text.clone()),
+                        MessageContent::Parts(_) => None,
+                    }
+                }
                 _ => None,
             })
         } else {

@@ -7,7 +7,7 @@ use serde_json::{from_str, to_string, to_value};
 use sglang_router_rs::core::{BasicWorker, WorkerType};
 use sglang_router_rs::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
-    SamplingParams, StringOrArray, UserMessageContent,
+    MessageContent, SamplingParams, StringOrArray,
 };
 
 /// Create a default GenerateRequest for benchmarks with minimal fields set
@@ -155,9 +155,9 @@ fn test_benchmark_request_creation() {
     let chat_req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Text("Test message".to_string()),
+            content: MessageContent::Text("Test message".to_string()),
             name: None,
+            extra: Default::default(),
         }],
         max_tokens: Some(150),
         max_completion_tokens: Some(150),
