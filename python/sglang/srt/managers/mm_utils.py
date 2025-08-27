@@ -20,7 +20,12 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import (
+    flatten_nested_list,
+    get_bool_env_var,
+    print_info_once,
+    print_warning_once,
+)
 from sglang.utils import logger
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
@@ -325,12 +330,12 @@ def get_embedding_chunk(
     extend_end_index = extend_prefix_len + extend_seq_len - 1
 
     for start, end in items_offset:
-        if extend_start_index >= start and extend_start_index <= end:
+        if start <= extend_start_index <= end:
             start_index += extend_start_index - start
         elif extend_start_index > end:
             start_index += end - start + 1
 
-        if extend_end_index >= start and extend_end_index <= end:
+        if start <= extend_end_index <= end:
             end_index += extend_end_index - start + 1
         elif extend_end_index > end:
             end_index += end - start + 1
@@ -364,43 +369,82 @@ def _get_precomputed_embedding(
 def _get_chunked_prefill_embedding(
     data_embedding_func: Callable[[List[MultimodalDataItem]], torch.Tensor],
     embedding_items: List[MultimodalDataItem],
-    items_size: List[int],
+    items_count: List[int],
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
 ) -> Optional[torch.Tensor]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
-    embedding_list = []
-    # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
-    max_iterations = min(len(items_size) - 1, len(prefix_length))
-    for i in range(max_iterations):
-        if items_size[i] == items_size[i + 1]:
-            continue
-        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
-        items_offset = items_offset_list[i]
-        assert items_offset is not None, items_offset
-        embedding_items_hash = get_embedding_hash(embedding_items_per_req)
-        # if all items has been prefixed, we do not need to calculate embedding
-        if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
-            continue
-        embedding_per_req = embedding_cache.get(embedding_items_hash)
-        if embedding_per_req is None:
-            embedding_per_req = data_embedding_func(embedding_items_per_req)
-            if not embedding_cache.put(embedding_items_hash, embedding_per_req):
-                print_warning_once(
-                    "Multimodal embedding cache is full. This typically occurs when a single "
-                    "embedding exceeds the cache size limit. Consider increasing the "
-                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
-                    "embedding size."
-                )
 
-        embedding_per_req_chunk, _, _ = get_embedding_chunk(
-            embedding=embedding_per_req,
-            extend_prefix_len=prefix_length[i],
-            extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
-            items_offset=items_offset,
-        )
-        embedding_list.append(embedding_per_req_chunk)
+    merge = get_bool_env_var("merge")
+    print_info_once(f"{merge=}")
+    embedding_list = []
+
+    if merge:
+        # Step 1: Identify cached and uncached embeddings for all requests
+        items_to_compute = embedding_items
+        embedding_items_hash = get_embedding_hash(items_to_compute)
+        merged_embeddings = data_embedding_func(items_to_compute)
+        embedding_cache.put(embedding_items_hash, merged_embeddings)
+
+        # flattened_items_offset_list = flatten_nested_list(items_offset_list)
+
+        # Step 4: Extract chunks for each request if merge process was successful
+        max_iterations = min(len(items_count) - 1, len(prefix_length))
+        start_idx, end_idx = None, None
+        accu_token_count = 0
+        for i in range(max_iterations):
+            items_offset_per_req = items_offset_list[i][0]
+            extend_prefix_len = prefix_length[i]
+            # extend_seq_len = extend_length[i]
+            # items_offset = flattened_items_offset_list
+            item_start_offset, item_end_offset = items_offset_per_req
+            if extend_prefix_len < item_end_offset:
+                if start_idx is None:
+                    start_idx = accu_token_count + max(
+                        extend_prefix_len - item_start_offset, 0
+                    )
+                end_idx = accu_token_count + (item_end_offset - extend_prefix_len)
+            accu_token_count += item_end_offset - item_start_offset + 1
+        if start_idx is None or end_idx is None or start_idx >= end_idx:
+            pass
+        else:
+            appeared_embedding_slice = merged_embeddings[start_idx : end_idx + 1]
+            embedding_list.append(appeared_embedding_slice)
+    else:
+        # NOTE: This is the original logic, now serving as a fallback.
+        # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
+        max_iterations = min(len(items_count) - 1, len(prefix_length))
+        for i in range(max_iterations):
+            if items_count[i] == items_count[i + 1]:
+                continue
+            embedding_items_per_req = embedding_items[
+                items_count[i] : items_count[i + 1]
+            ]
+            items_offset = items_offset_list[i]
+            assert items_offset is not None, items_offset
+            embedding_items_hash = get_embedding_hash(embedding_items_per_req)
+            # if all items has been prefixed, we do not need to calculate embedding
+            if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
+                continue
+            embedding_per_req = embedding_cache.get(embedding_items_hash)
+            if embedding_per_req is None:
+                embedding_per_req = data_embedding_func(embedding_items_per_req)
+                if not embedding_cache.put(embedding_items_hash, embedding_per_req):
+                    print_warning_once(
+                        "Multimodal embedding cache is full. This typically occurs when a single "
+                        "embedding exceeds the cache size limit. Consider increasing the "
+                        "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
+                        "embedding size."
+                    )
+
+            embedding_per_req_chunk, _, _ = get_embedding_chunk(
+                embedding=embedding_per_req,
+                extend_prefix_len=prefix_length[i],
+                extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
+                items_offset=items_offset,
+            )
+            embedding_list.append(embedding_per_req_chunk)
     if len(embedding_list) == 0:
         return None
     return torch.concat(embedding_list, dim=0)
@@ -559,9 +603,11 @@ def embed_mm_inputs(
                     if item.is_modality(modality=modality)
                 ]
                 items_size[i + 1] = len(mm_items)
-                items_offsets.append(
-                    flatten_nested_list([item.offsets for item in mm_items])
+                items_offsets_per_req_per_modality = flatten_nested_list(
+                    [item.offsets for item in mm_items]
                 )
+                assert len(items_offsets_per_req_per_modality) == 1
+                items_offsets.append(items_offsets_per_req_per_modality)
             items_size = torch.cumsum(items_size, dim=0).tolist()
 
             embedding, mask = get_embedding_and_mask(
