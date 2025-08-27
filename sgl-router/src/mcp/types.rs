@@ -112,17 +112,48 @@ pub struct ToolInfo {
 pub type ToolCall = serde_json::Value;   // Python uses dict
 pub type ToolResult = serde_json::Value; // Python uses dict
 
+// ===== Connection Types (matching Python's approach) =====
+#[derive(Debug, Clone)]
+pub enum ConnectionType {
+    Http(String),     // HTTP/SSE URL
+    Stdio(String),    // Command to run (e.g., "python server.py")
+}
+
 // ===== Tool Session (async context manager equivalent) =====
 pub struct ToolSession {
-    pub url: String,
+    pub connection: ConnectionType,
     pub client: reqwest::Client,
+    pub process: Option<tokio::process::Child>,
 }
 
 impl ToolSession {
-    pub async fn new(url: String) -> MCPResult<Self> {
+    pub async fn new(connection_str: String) -> MCPResult<Self> {
+        let connection = if connection_str.starts_with("http://") || connection_str.starts_with("https://") {
+            ConnectionType::Http(connection_str)
+        } else {
+            ConnectionType::Stdio(connection_str)
+        };
+        
         Ok(Self {
-            url,
+            connection,
             client: reqwest::Client::new(),
+            process: None,
+        })
+    }
+    
+    pub async fn new_http(url: String) -> MCPResult<Self> {
+        Ok(Self {
+            connection: ConnectionType::Http(url),
+            client: reqwest::Client::new(),
+            process: None,
+        })
+    }
+    
+    pub async fn new_stdio(command: String) -> MCPResult<Self> {
+        Ok(Self {
+            connection: ConnectionType::Stdio(command),
+            client: reqwest::Client::new(),
+            process: None,
         })
     }
     
@@ -139,23 +170,33 @@ impl ToolSession {
             })),
         };
         
-        // Send request via HTTP POST (simplified for now)
-        let response = self.client
-            .post(&self.url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| MCPError::ConnectionError(e.to_string()))?;
-        
-        let mcp_response: MCPResponse = response
-            .json()
-            .await
-            .map_err(|e| MCPError::ConnectionError(e.to_string()))?;
-        
-        if let Some(error) = mcp_response.error {
-            return Err(MCPError::ProtocolError(error.message));
+        match &self.connection {
+            ConnectionType::Http(url) => {
+                // HTTP/SSE communication
+                let response = self.client
+                    .post(url)
+                    .json(&request)
+                    .send()
+                    .await
+                    .map_err(|e| MCPError::ConnectionError(e.to_string()))?;
+                
+                let mcp_response: MCPResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| MCPError::ConnectionError(e.to_string()))?;
+                
+                if let Some(error) = mcp_response.error {
+                    return Err(MCPError::ProtocolError(error.message));
+                }
+                
+                mcp_response.result.ok_or_else(|| MCPError::ProtocolError("No result".to_string()))
+            }
+            
+            ConnectionType::Stdio(_command) => {
+                // For now, return placeholder for stdio implementation
+                // This would need process communication via stdin/stdout
+                Err(MCPError::ProtocolError("Stdio communication not yet implemented".to_string()))
+            }
         }
-        
-        mcp_response.result.ok_or_else(|| MCPError::ProtocolError("No result".to_string()))
     }
 }
