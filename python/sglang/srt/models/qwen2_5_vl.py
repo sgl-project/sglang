@@ -236,11 +236,13 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ln_q(x)
-        x = x.view(-1, self.hidden_size)
-
+        # x expected shape: [S, B, context_dim]
+        S, B, D = x.shape
+        x2d = x.reshape(-1, D)
+        x2d = self.ln_q(x2d)  # RMSNorm expects 2D
+        x2d = x2d.view(-1, self.hidden_size)  # group into spatial_merge_unit
         mlp_fc1, mlp_act, mlp_fc2 = self.mlp
-        x_parallel, _ = mlp_fc1(x)
+        x_parallel, _ = mlp_fc1(x2d)
         x_parallel = mlp_act(x_parallel)
         out, _ = mlp_fc2(x_parallel)
         return out
@@ -407,6 +409,12 @@ class Qwen2_5_VisionTransformer(nn.Module):
         )
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
 
+        # Move window_index to the same device as x before using it to index x
+        window_index = window_index.to(device=x.device)
+
+        # Ensure rotary_pos_emb is on the same device/dtype as x
+        rotary_pos_emb = rotary_pos_emb.to(device=x.device, dtype=x.dtype)
+
         seq_len, _ = x.size()
 
         x = x.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
@@ -419,12 +427,20 @@ class Qwen2_5_VisionTransformer(nn.Module):
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
+        # After building position_embeddings, make sure both cos and sin are on the same device/dtype as the attention input
+        position_embeddings = (
+            position_embeddings[0].to(x.device, x.dtype),
+            position_embeddings[1].to(x.device, x.dtype),
+        )
 
-        # compute cu_seqlens
+        # compute cu_seqlens - move cu_seqlens to GPU and make it int32
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], device=grid_thw.device),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
+                torch.tensor([0], device=x.device, dtype=torch.int32),
+                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                .cumsum(dim=0)
+                .to(torch.int32)
+                .to(x.device),
             ]
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
