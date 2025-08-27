@@ -1000,7 +1000,6 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
