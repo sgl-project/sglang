@@ -1,8 +1,10 @@
 import pytest
 import torch
 from flashinfer import fp4_quantize
-from sgl_kernel import flashinfer_cutedsl_moe_masked, scaled_fp4_grouped_quant
+from sgl_kernel import scaled_fp4_grouped_quant
 from torch.nn import functional as F
+
+from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
 
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
 

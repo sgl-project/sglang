@@ -2,8 +2,10 @@ from typing import Any, Dict, Optional
 
 import torch
 from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
-from sgl_kernel.gemm import (scaled_fp4_grouped_quant,
-    silu_and_mul_scaled_fp4_grouped_quant)
+from sgl_kernel.gemm import (
+    scaled_fp4_grouped_quant,
+    silu_and_mul_scaled_fp4_grouped_quant,
+)
 
 
 def get_cute_dtype(input: torch.Tensor) -> str:
@@ -15,6 +17,7 @@ def get_cute_dtype(input: torch.Tensor) -> str:
         return "float32"
     else:
         raise ValueError(f"Unsupported cute dtype {input.dtype}")
+
 
 def flashinfer_cutedsl_moe_masked(
     hidden_states: torch.Tensor,
