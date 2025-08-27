@@ -133,7 +133,11 @@ if _use_aiter:
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
     from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 
+    from aiter.ops.triton.fused_mxfp4_quant import fused_flatten_mxfp4_quant
+    from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
     def b_dynamic_mxfp4_quant(x):
         h,b,d= x.shape
         x, x_scales = dynamic_mxfp4_quant(x.reshape(-1, d))
@@ -1130,11 +1134,18 @@ class DeepseekV2AttentionMLA(nn.Module):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
-        if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
-            return hidden_states, None, forward_batch, None
+        if isinstance(hidden_states, tuple):
+            if hidden_states[0].shape[0] == 0:
+                assert (
+                    not self.o_proj.reduce_results
+                ), "short-circuiting allreduce will lead to hangs"
+                return hidden_states[0]
+        else:
+            if hidden_states.shape[0] == 0:
+                assert (
+                    not self.o_proj.reduce_results
+                ), "short-circuiting allreduce will lead to hangs"
+                return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
 
@@ -1252,7 +1263,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
-            if hidden_states.shape[0] <= 16 and self.use_min_latency_fused_a_gemm:
+            if (not isinstance(hidden_states, tuple)) and hidden_states.shape[0] <= 16 and self.use_min_latency_fused_a_gemm:
                 fused_qkv_a_proj_out = dsv3_fused_a_gemm(
                     hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
                 )
@@ -1272,8 +1283,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
             else:
-                q = self.q_a_layernorm(q)
-                k_nope = self.kv_a_layernorm(k_nope)
+                if _use_aiter and self.q_b_proj.weight.dtype == torch.uint8:
+                    q, k_nope = fused_rms_mxfp4_quant(q, self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon, k_nope, self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon)
+                else:
+                    q = self.q_a_layernorm(q)
+                    k_nope = self.kv_a_layernorm(k_nope)
 
             k_nope = k_nope.unsqueeze(1)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -1399,7 +1413,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.w_vc.to(torch.bfloat16) * self.w_scale,
                 )
 
-            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+            if self.o_proj.weight.dtype == torch.uint8:
+                attn_bmm_output = attn_bmm_output.transpose(0,1)
+                attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
+            else:
+                attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
@@ -1911,7 +1930,7 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch, True if self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8 else False
         )
 
         hidden_states = self.self_attn(
@@ -2420,13 +2439,30 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
-            if _use_aiter and self.quant_config.get_name() == "quark" and w.dtype == torch.bfloat16:
-                w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2,-1))
-                w_kc = w_kc.transpose(-2,-1)
-                w_s_kc = w_s_kc.transpose(-2,-1)
-                w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
-                self_attn.w_scale_k = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                self_attn.w_scale_v = w_s_vc.contiguous().transpose(1, 2)
+            if _use_aiter and self.quant_config.get_name() == "quark":
+                #dynamic quant for mxfp4
+                if w.dtype == torch.bfloat16:
+                    w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2,-1))
+                    w_kc = w_kc.transpose(-2,-1)
+                    w_s_kc = w_s_kc.transpose(-2,-1)
+                    w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
+                    self_attn.w_scale_k = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                    self_attn.w_scale_v = w_s_vc.contiguous().transpose(1, 2)
+                elif w.dtype == torch.uint8: # static quant for mxfp4
+                    from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import b_mxfp4_to_f32, e8m0_to_f32
+                    w = b_mxfp4_to_f32(w).to(torch.bfloat16)
+                    w_scales = self_attn.kv_b_proj.weight_scale.repeat_interleave(32, dim=-1)
+                    w_scales = e8m0_to_f32(w_scales).to(torch.bfloat16)
+                    w = w * w_scales
+                    w_kc, w_vc = w.unflatten(
+                    0, (-1, (self_attn.qk_nope_head_dim + self_attn.v_head_dim))
+                    ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                    w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2,-1))
+                    w_kc = w_kc.transpose(-2,-1)
+                    w_s_kc = w_s_kc.transpose(-2,-1)
+                    w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
+                    self_attn.w_scale_k = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                    self_attn.w_scale_v = w_s_vc.contiguous().transpose(1, 2)
 
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(

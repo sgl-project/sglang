@@ -43,12 +43,18 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_cuda, is_flashinfer_available
+from sglang.srt.utils import is_cuda, is_hip, is_flashinfer_available, get_bool_env_var
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip() 
+
+if _use_aiter:
+    from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
 
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+
+from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
 
 
 class ScatterMode(Enum):
@@ -202,6 +208,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
+        fused_mxfp4_quant: Optional[bool] = False
     ):
         if hidden_states.shape[0] == 0:
             residual = hidden_states
@@ -217,13 +224,26 @@ class LayerCommunicator:
                     )
                 )
             else:
+                context = self._context
+                input_mode = self.layer_scatter_modes.layer_input_mode
+                output_mode = self.layer_scatter_modes.attn_mode
+
+                same_group_size = context.is_same_group_size(input_mode, output_mode)
+
                 if residual is None:
                     residual = hidden_states
-                    hidden_states = self.input_layernorm(hidden_states)
+
+                    if _use_aiter and fused_mxfp4_quant:
+                        hidden_states = fused_rms_mxfp4_quant(hidden_states, self.input_layernorm.weight, self.input_layernorm.variance_epsilon, None, None, None, None)
+                    else:
+                        hidden_states = self.input_layernorm(hidden_states)
                 else:
-                    hidden_states, residual = self.input_layernorm(
-                        hidden_states, residual
-                    )
+                    if _use_aiter and fused_mxfp4_quant:
+                        hidden_states, residual = fused_rms_mxfp4_quant(hidden_states, self.input_layernorm.weight, self.input_layernorm.variance_epsilon, None, None, None, residual)
+                    else:
+                        hidden_states, residual = self.input_layernorm(
+                            hidden_states, residual
+                        )
 
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
