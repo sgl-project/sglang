@@ -189,7 +189,6 @@ class Qwen2_5_VisionBlock(nn.Module):
         attn = rearrange(attn, "b s h -> s b h")
 
         # norm2 with fused residual-add: also 2D
-        x2d = x.reshape(-1, H)
         attn2d = attn.reshape(-1, H)
         x_norm_2d, x_after_add_2d = self.norm2(x2d, residual=attn2d)
         x_norm = x_norm_2d.reshape(S, B, H)
@@ -438,8 +437,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                 torch.tensor([0], device=x.device, dtype=torch.int32),
                 (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
                 .cumsum(dim=0)
-                .to(torch.int32)
-                .to(x.device),
+                .to(device=x.device, dtype=torch.int32),
             ]
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
