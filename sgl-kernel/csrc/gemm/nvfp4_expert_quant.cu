@@ -347,7 +347,7 @@ cvt_fp16_to_fp4(
       }
     }
 
-    // Eerly exit when using masks.
+    // Early exit when using masks.
     if (use_mask && rowIdx_in_expert >= mask[expert_idx]) {
       continue;
     }
@@ -449,7 +449,7 @@ cvt_fp16_to_fp4_expert(
     // Find index within the experts
     int rowIdx_in_expert = rowIdx - input_offset_by_experts[expert_idx];
 
-    // Eerly exit when using masks.
+    // Early exit when using masks.
     if (use_mask && rowIdx_in_expert >= mask[expert_idx]) {
       break;
     }
