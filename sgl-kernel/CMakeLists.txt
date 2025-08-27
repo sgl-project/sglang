@@ -59,7 +59,7 @@ elseif("${CUDA_VERSION}" VERSION_EQUAL "12.9")
   set(DeepGEMM_TAG "blackwell")
 elseif("${CUDA_VERSION}" VERSION_EQUAL "13.0")
   set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
-  set(DeepGEMM_TAG "e38c2e31033dc6880d92eff4977c40f2eb6cff4a")
+  set(DeepGEMM_TAG "blackwell")
 else()
   set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
   set(DeepGEMM_TAG "391755ada0ffefa9a6a52b6f14dcaf22d1a463e0")
@@ -182,6 +182,8 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
+        "-gencode=arch=compute_103,code=sm_103"
+        "-gencode=arch=compute_103a,code=sm_103a"
         "-gencode=arch=compute_120,code=sm_120"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
