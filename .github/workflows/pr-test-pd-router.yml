@@ -118,8 +118,8 @@ jobs:
         python3 -m pip --no-cache-dir install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
         python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.5
-        python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.1
-        python3 -m pip --no-cache-dir install sgl-kernel==0.3.5
+        python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.2
+        python3 -m pip --no-cache-dir install sgl-kernel==0.3.7
 
     - name: Build and install sgl-router
       run: |
