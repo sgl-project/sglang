@@ -1,6 +1,9 @@
 // mod.rs - Minimal exports (Python-aligned)
-pub mod types;
 pub mod tool_server;
+pub mod types;
 
-pub use types::{MCPError, MCPResult, MCPConfig, ToolCall, ToolResult, ToolSession, ConnectionType};
-pub use tool_server::{MCPToolServer, parse_sse_event, ToolCache, ToolMetadata, ToolStats};
+pub use tool_server::{parse_sse_event, MCPToolServer, ToolCache, ToolMetadata, ToolStats};
+pub use types::{
+    ConnectionType, MCPConfig, MCPError, MCPResult, MultiToolSessionManager, SessionStats,
+    ToolCall, ToolResult, ToolSession,
+};
