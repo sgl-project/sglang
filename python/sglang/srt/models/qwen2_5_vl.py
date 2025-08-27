@@ -31,7 +31,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
-from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLVisionConfig,
