@@ -208,6 +208,15 @@ class MockModelRunner:
         self.kv_cache_dtype = config["kv_cache_dtype"]
         self.page_size = config["page_size"]
 
+        # Server args stub - needed by attention backends
+        self.server_args = type(
+            "ServerArgs",
+            (),
+            {
+                "enable_dp_attention": False,  # Default value for testing
+            },
+        )
+
         # Model-config stub with MLA attributes
         self.model_config = type(
             "ModelConfig",
@@ -833,7 +842,7 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 # Test workspace properties
                 self.assertEqual(metadata.workspace.device.type, "cuda")
-                self.assertEqual(metadata.workspace.dtype, torch.int8)
+                self.assertEqual(metadata.workspace.dtype, torch.uint8)
                 self.assertGreater(
                     metadata.workspace.numel(), 0, "Workspace should have non-zero size"
                 )
@@ -993,8 +1002,8 @@ class TestTRTLLMMLA(CustomTestCase):
         )
 
         # Verify CUDA graph buffers are allocated
-        self.assertIsNotNone(backend.cuda_graph_kv_indices)
-        self.assertIsNotNone(backend.cuda_graph_workspace)
+        self.assertIsNotNone(backend.decode_cuda_graph_kv_indices)
+        self.assertIsNotNone(backend.decode_cuda_graph_workspace)
 
         # Test capture metadata
         seq_lens = torch.full(
