@@ -338,6 +338,11 @@ class ServerArgs:
             print_deprecated_warning(
                 "NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
             )
+        if self.moe_runner_backend == "flashinfer_mxfp4":
+            self.moe_runner_backend = "flashinfer_trtllm"
+            print_deprecated_warning(
+                "NOTE: --moe-runner-backend=flashinfer_mxfp4 is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
+            )
 
         # Set missing default values
         if self.tokenizer_path is None:
