@@ -363,6 +363,7 @@ class GraniteForCausalLM(nn.Module):
         else:
             return self.pooler(hidden_states, forward_batch)
 
+<<<<<<< HEAD
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim
         if module_name in ["q_proj", "o_proj", "qkv_proj"]:
@@ -388,6 +389,8 @@ class GraniteForCausalLM(nn.Module):
         }
         return params_mapping.get(name, name)
 
+=======
+>>>>>>> origin/main
     def get_module_name_from_weight_name(self, name):
         for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
             if weight_name in name:

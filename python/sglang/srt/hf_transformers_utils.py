@@ -14,10 +14,18 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+<<<<<<< HEAD
 import os
 import warnings
 from pathlib import Path
 from typing import Dict, Optional, Type, Union
+=======
+import json
+import os
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Optional, Type, Union
+>>>>>>> origin/main
 
 import torch
 from huggingface_hub import snapshot_download
@@ -25,6 +33,10 @@ from transformers import (
     AutoConfig,
     AutoProcessor,
     AutoTokenizer,
+<<<<<<< HEAD
+=======
+    GenerationConfig,
+>>>>>>> origin/main
     PretrainedConfig,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -39,10 +51,18 @@ from sglang.srt.configs import (
     ExaoneConfig,
     KimiVLConfig,
     MultiModalityConfig,
+<<<<<<< HEAD
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, lru_cache_frozenset
+=======
+    Step3VLConfig,
+)
+from sglang.srt.configs.internvl import InternVLChatConfig
+from sglang.srt.connector import create_remote_connector
+from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
+>>>>>>> origin/main
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -52,6 +72,10 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     MultiModalityConfig.model_type: MultiModalityConfig,
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
+<<<<<<< HEAD
+=======
+    Step3VLConfig.model_type: Step3VLConfig,
+>>>>>>> origin/main
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -59,11 +83,25 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
+<<<<<<< HEAD
 def download_from_hf(model_path: str):
     if os.path.exists(model_path):
         return model_path
 
     return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
+=======
+def download_from_hf(
+    model_path: str,
+    allow_patterns: Optional[Union[str, list]] = None,
+):
+    if os.path.exists(model_path):
+        return model_path
+
+    if not allow_patterns:
+        allow_patterns = ["*.json", "*.bin", "*.model"]
+
+    return snapshot_download(model_path, allow_patterns=allow_patterns)
+>>>>>>> origin/main
 
 
 def get_hf_text_config(config: PretrainedConfig):
@@ -119,6 +157,28 @@ def get_config(
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
+<<<<<<< HEAD
+=======
+    if (
+        config.architectures is not None
+        and config.architectures[0] == "Phi4MMForCausalLM"
+    ):
+        # Phi4MMForCausalLM uses a hard-coded vision_config. See:
+        # https://github.com/vllm-project/vllm/blob/6071e989df1531b59ef35568f83f7351afb0b51e/vllm/model_executor/models/phi4mm.py#L71
+        # We set it here to support cases where num_attention_heads is not divisible by the TP size.
+        from transformers import SiglipVisionConfig
+
+        vision_config = {
+            "hidden_size": 1152,
+            "image_size": 448,
+            "intermediate_size": 4304,
+            "model_type": "siglip_vision_model",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 26,  # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
+            "patch_size": 14,
+        }
+        config.vision_config = SiglipVisionConfig(**vision_config)
+>>>>>>> origin/main
     text_config = get_hf_text_config(config=config)
 
     if isinstance(model, str) and text_config is not None:
@@ -153,6 +213,44 @@ def get_config(
     return config
 
 
+<<<<<<< HEAD
+=======
+@lru_cache_frozenset(maxsize=32)
+def get_generation_config(
+    model: str,
+    trust_remote_code: bool,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    try:
+        return GenerationConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except OSError as e:
+        return None
+
+
+# Qwen-1M related
+def get_sparse_attention_config(
+    model: str,
+    sparse_attention_config_filename: str = "sparse_attention_config.json",
+) -> Dict[str, Any]:
+    is_local = os.path.isdir(model)
+    if not is_local:
+        # Download the config files.
+        model = download_from_hf(model, allow_patterns=["*.json"])
+
+    config_file = os.path.join(model, sparse_attention_config_filename)
+    if not os.path.exists(config_file):
+        return {}
+
+    # Load the sparse attention config.
+    with open(config_file) as f:
+        config = json.load(f)
+    return config
+
+
+>>>>>>> origin/main
 # Models don't use the same configuration key for determining the maximum
 # context length.  Store them here so we can sanely check them.
 # NOTE: The ordering here is important. Some models have two of these and we
@@ -199,6 +297,14 @@ def get_tokenizer(
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+<<<<<<< HEAD
+=======
+    if tokenizer_name.endswith(".json"):
+        from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
+
+        return TiktokenTokenizer(tokenizer_name)
+
+>>>>>>> origin/main
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
@@ -298,6 +404,7 @@ def get_processor(
 
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
+<<<<<<< HEAD
 
     processor = AutoProcessor.from_pretrained(
         tokenizer_name,
@@ -307,6 +414,33 @@ def get_processor(
         **kwargs,
     )
 
+=======
+    try:
+        processor = AutoProcessor.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+
+    except ValueError as e:
+        error_message = str(e)
+        if "does not have a slow version" in error_message:
+            logger.info(
+                f"Processor {tokenizer_name} does not have a slow version. Automatically use fast version"
+            )
+            kwargs["use_fast"] = True
+            processor = AutoProcessor.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        else:
+            raise e
+>>>>>>> origin/main
     tokenizer = get_tokenizer_from_processor(processor)
 
     attach_additional_stop_token_ids(tokenizer)

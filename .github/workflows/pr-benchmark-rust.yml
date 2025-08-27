@@ -31,7 +31,11 @@ jobs:
 
       - name: Install dependencies
         run: |
+<<<<<<< HEAD
           bash scripts/ci_install_rust.sh
+=======
+          bash scripts/ci/ci_install_rust.sh
+>>>>>>> origin/main
 
       - name: Cache Rust dependencies
         uses: actions/cache@v4
@@ -78,7 +82,11 @@ jobs:
 
       - name: Install dependencies
         run: |
+<<<<<<< HEAD
           bash scripts/ci_install_rust.sh
+=======
+          bash scripts/ci/ci_install_rust.sh
+>>>>>>> origin/main
 
       - name: Cache Rust dependencies
         uses: actions/cache@v4

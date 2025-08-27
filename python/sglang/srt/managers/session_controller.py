@@ -54,7 +54,11 @@ class SessionReqNode:
             prefix += " -- " + self.childs[0].req.rid
             ret = self.childs[0]._str_helper(prefix)
             for child in self.childs[1:]:
+<<<<<<< HEAD
                 prefix = " " * len(origin_prefix) + " \- " + child.req.rid
+=======
+                prefix = " " * len(origin_prefix) + " \\- " + child.req.rid
+>>>>>>> origin/main
                 ret += child._str_helper(prefix)
             return ret
 

@@ -227,7 +227,11 @@ class DeepseekVL2ForCausalLM(nn.Module):
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
+<<<<<<< HEAD
             image_data_embedding_func=self.get_image_feature,
+=======
+            multimodal_model=self,
+>>>>>>> origin/main
             language_model=self.language_model,
         )
 
@@ -260,7 +264,11 @@ class DeepseekVL2ForCausalLM(nn.Module):
     def get_image_feature(self, items: List[MultimodalDataItem]):
 
         images_spatial_crop = torch.cat(
+<<<<<<< HEAD
             [item.image_spatial_crop for item in items], dim=0
+=======
+            [item.images_spatial_crop for item in items], dim=0
+>>>>>>> origin/main
         )
 
         assert images_spatial_crop.dim() == 3
@@ -268,9 +276,15 @@ class DeepseekVL2ForCausalLM(nn.Module):
         # TODO: can it be batched ?
         images_in_this_batch = []
         for item in items:
+<<<<<<< HEAD
             assert item.pixel_values.dim() == 4
             image_feature = self.vision.forward_features(
                 item.pixel_values.type(next(self.vision.parameters()).dtype).to(
+=======
+            assert item.feature.dim() == 4
+            image_feature = self.vision.forward_features(
+                item.feature.type(next(self.vision.parameters()).dtype).to(
+>>>>>>> origin/main
                     device=next(self.vision.parameters()).device
                 )
             )
@@ -278,8 +292,13 @@ class DeepseekVL2ForCausalLM(nn.Module):
             _, hw, n_dim = images_embeds.shape
             h = w = int(hw**0.5)
             tile_index = 0
+<<<<<<< HEAD
             for jdx in range(item.image_spatial_crop.shape[1]):
                 num_width_tiles, num_height_tiles = item.image_spatial_crop[0, jdx]
+=======
+            for jdx in range(item.images_spatial_crop.shape[1]):
+                num_width_tiles, num_height_tiles = item.images_spatial_crop[0, jdx]
+>>>>>>> origin/main
                 if num_width_tiles == 0 or num_height_tiles == 0:
                     break
                 num_tiles_in_image = num_width_tiles * num_height_tiles

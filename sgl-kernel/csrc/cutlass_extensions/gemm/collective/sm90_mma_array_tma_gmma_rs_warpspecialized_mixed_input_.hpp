@@ -36,7 +36,10 @@
 #include "cute/arch/copy_sm90.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
+<<<<<<< HEAD
 #include "cute/tensor_predicate.hpp"
+=======
+>>>>>>> origin/main
 #include "cutlass/cuda_host_adapter.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
@@ -1489,6 +1492,13 @@ struct CollectiveMmaArrayMixedInput<
   template <class... TMs>
   CUTLASS_DEVICE void
   tensormaps_cp_fence_release(TensorMapStorage& shared_tensormaps, cute::tuple<TMs...> const& input_tensormaps) {
+<<<<<<< HEAD
+=======
+    if (cute::elect_one_sync()) {
+      cute::tma_desc_commit_group();
+      cute::tma_desc_wait_group();
+    }
+>>>>>>> origin/main
     // Entire warp must do this (i.e. it's aligned)
     tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
     tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);

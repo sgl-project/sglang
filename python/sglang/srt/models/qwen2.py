@@ -27,6 +27,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
+<<<<<<< HEAD
+=======
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+>>>>>>> origin/main
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -43,7 +47,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+<<<<<<< HEAD
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+=======
+>>>>>>> origin/main
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -107,6 +114,10 @@ class Qwen2Attention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
+<<<<<<< HEAD
+=======
+        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
+>>>>>>> origin/main
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -158,6 +169,10 @@ class Qwen2Attention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+<<<<<<< HEAD
+=======
+            dual_chunk_attention_config=dual_chunk_attention_config,
+>>>>>>> origin/main
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -198,6 +213,12 @@ class Qwen2DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
+<<<<<<< HEAD
+=======
+        dual_chunk_attention_config = getattr(
+            config, "dual_chunk_attention_config", None
+        )
+>>>>>>> origin/main
         self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -208,6 +229,10 @@ class Qwen2DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+<<<<<<< HEAD
+=======
+            dual_chunk_attention_config=dual_chunk_attention_config,
+>>>>>>> origin/main
             prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Qwen2MLP(
@@ -267,7 +292,11 @@ class Qwen2Model(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
+<<<<<<< HEAD
                 enable_tp=not global_server_args_dict["enable_dp_attention"],
+=======
+                enable_tp=not is_dp_attention_enabled(),
+>>>>>>> origin/main
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -481,6 +510,50 @@ class Qwen2ForCausalLM(nn.Module):
         else:
             return hidden_states
 
+<<<<<<< HEAD
+=======
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ):
+        start, end = split_interval
+        # embed
+        if start == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds
+        # decoder layer
+        for i in range(start, end):
+            layer = self.model.layers[i]
+            forward_batch.hidden_states, forward_batch.residual = layer(
+                positions,
+                forward_batch.hidden_states,
+                forward_batch,
+                forward_batch.residual,
+            )
+
+        if end == self.model.config.num_hidden_layers:
+            # norm
+            hidden_states, _ = self.model.norm(
+                forward_batch.hidden_states, forward_batch.residual
+            )
+            forward_batch.hidden_states = hidden_states
+            # logits process
+            result = self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            result = None
+
+        return result
+
+>>>>>>> origin/main
     @property
     def start_layer(self):
         return self.model.start_layer
@@ -538,6 +611,11 @@ class Qwen2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+<<<<<<< HEAD
+=======
+                if name not in params_dict:
+                    continue
+>>>>>>> origin/main
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)

@@ -64,10 +64,19 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
+<<<<<<< HEAD
+=======
+    is_npu,
+>>>>>>> origin/main
     is_pin_memory_available,
     set_weight_attrs,
 )
 
+<<<<<<< HEAD
+=======
+_is_npu = is_npu()
+
+>>>>>>> origin/main
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
@@ -76,13 +85,28 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         yield module
         return
 
+<<<<<<< HEAD
     original_device_states: Dict[str, torch.device] = {}
+=======
+    original_infos: Dict[str, Dict] = {}
+>>>>>>> origin/main
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
+<<<<<<< HEAD
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
+=======
+            original_data = p.data
+            device_data = p.data.to(target_device)
+            original_infos[name] = dict(
+                device=p.device,
+                original_data=original_data,
+                device_data=device_data,
+            )
+            p.data = device_data
+>>>>>>> origin/main
         # Parameters already on target device are not touched
 
     try:
@@ -92,9 +116,27 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         # Restore parameters to their original devices, ignoring new parameters
         pin_memory = is_pin_memory_available()
         for name, p in module.named_parameters():
+<<<<<<< HEAD
             if name in original_device_states:
                 original_device: torch.device = original_device_states[name]
                 if original_device.type == "cpu":
+=======
+            if name in original_infos:
+                original_info = original_infos[name]
+                device_data = original_info["device_data"]
+                original_data = original_info["original_data"]
+                original_device: torch.device = original_info["device"]
+
+                if (
+                    (device_data.device == p.data.device)
+                    and (device_data.data_ptr() == p.data.data_ptr())
+                    and (device_data.shape == p.data.shape)
+                    and (device_data.dtype == p.data.dtype)
+                ):
+                    original_data.copy_(p.data.to(original_data.device))
+                    p.data = original_data
+                elif original_device.type == "cpu":
+>>>>>>> origin/main
                     # `torch.empty_like` does not support `pin_memory` argument
                     cpu_data = torch.empty_strided(
                         size=p.data.size(),
@@ -127,6 +169,7 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+<<<<<<< HEAD
         major, minor = get_device_capability()
 
         if major is not None and minor is not None:
@@ -139,6 +182,21 @@ def _get_quantization_config(
                     f"Minimum capability: {quant_config.get_min_capability()}. "
                     f"Current capability: {capability}."
                 )
+=======
+        if not _is_npu:
+            major, minor = get_device_capability()
+
+            if major is not None and minor is not None:
+                assert 0 <= minor < 10
+                capability = major * 10 + minor
+                if capability < quant_config.get_min_capability():
+                    raise ValueError(
+                        f"The quantization method {model_config.quantization} "
+                        "is not supported for the current GPU. "
+                        f"Minimum capability: {quant_config.get_min_capability()}. "
+                        f"Current capability: {capability}."
+                    )
+>>>>>>> origin/main
         supported_dtypes = quant_config.get_supported_act_dtypes()
         if model_config.dtype not in supported_dtypes:
             raise ValueError(
@@ -157,6 +215,28 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
+<<<<<<< HEAD
+=======
+    if _is_npu:
+        packed_modules_mapping.update(
+            {
+                "visual": {"qkv_proj": ["qkv"]},
+                "vision_model": {
+                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                    "proj": ["out_proj"],
+                },
+                "model": {
+                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                    "fused_qkv_a_proj_with_mqa": [
+                        "q_a_proj",
+                        "kv_a_proj_with_mqa",
+                    ],
+                },
+            }
+        )
+
+>>>>>>> origin/main
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping
     )
@@ -564,7 +644,17 @@ class DummyModelLoader(BaseModelLoader):
             # 2. Post-processing of weights, including assigning specific member variables.
             # For `dummy_init`, only the second stage is required.
             if hasattr(model, "post_load_weights"):
+<<<<<<< HEAD
                 model.post_load_weights()
+=======
+                if (
+                    model_config.hf_config.architectures[0]
+                    == "DeepseekV3ForCausalLMNextN"
+                ):
+                    model.post_load_weights(is_nextn=True)
+                else:
+                    model.post_load_weights()
+>>>>>>> origin/main
 
         return model.eval()
 

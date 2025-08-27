@@ -23,7 +23,18 @@ from sglang.srt.disaggregation.base.conn import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
+<<<<<<< HEAD
 from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
+=======
+from sglang.srt.utils import (
+    format_tcp_address,
+    get_free_port,
+    get_ip,
+    get_local_ip_by_remote,
+    is_valid_ipv6_address,
+    maybe_wrap_ipv6_address,
+)
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +76,26 @@ class CommonKVManager(BaseKVManager):
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
+<<<<<<< HEAD
             ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
         else:
             ip_address = get_ip()
 
         bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
+=======
+            if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
+                if self.dist_init_addr.endswith("]"):
+                    host = self.dist_init_addr
+                else:
+                    host, _ = self.dist_init_addr.rsplit(":", 1)
+            else:
+                host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
+        else:
+            host = get_ip()
+            host = maybe_wrap_ipv6_address(host)
+
+        bootstrap_server_url = f"{host}:{self.bootstrap_port}"
+>>>>>>> origin/main
         url = f"http://{bootstrap_server_url}/route"
         payload = {
             "role": "Prefill",
@@ -92,8 +118,15 @@ class CommonKVManager(BaseKVManager):
             logger.error(f"Prefill Failed to register to bootstrap server: {e}")
 
     @cache
+<<<<<<< HEAD
     def _connect(self, endpoint: str):
         socket = zmq.Context().socket(zmq.PUSH)
+=======
+    def _connect(self, endpoint: str, is_ipv6: bool = False):
+        socket = zmq.Context().socket(zmq.PUSH)
+        if is_ipv6:
+            socket.setsockopt(zmq.IPV6, 1)
+>>>>>>> origin/main
         socket.connect(endpoint)
         return socket
 
@@ -263,15 +296,37 @@ class CommonKVReceiver(BaseKVReceiver):
             return None
 
     @classmethod
+<<<<<<< HEAD
     def _connect(cls, endpoint: str):
         with cls._global_lock:
             if endpoint not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
+=======
+    def _connect(cls, endpoint: str, is_ipv6: bool = False):
+        with cls._global_lock:
+            if endpoint not in cls._socket_cache:
+                sock = cls._ctx.socket(zmq.PUSH)
+                if is_ipv6:
+                    sock.setsockopt(zmq.IPV6, 1)
+>>>>>>> origin/main
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
+<<<<<<< HEAD
+=======
+    @classmethod
+    def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
+        ip_address = bootstrap_info["rank_ip"]
+        port = bootstrap_info["rank_port"]
+        is_ipv6_address = is_valid_ipv6_address(ip_address)
+        sock, lock = cls._connect(
+            format_tcp_address(ip_address, port), is_ipv6=is_ipv6_address
+        )
+        return sock, lock
+
+>>>>>>> origin/main
     def _register_kv_args(self):
         pass
 

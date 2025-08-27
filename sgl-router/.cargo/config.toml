@@ -1,6 +1,11 @@
 [build]
+<<<<<<< HEAD
 rustflags = [
 ]
+=======
+rustflags = []
+incremental = true
+>>>>>>> origin/main
 
 [target.aarch64-apple-darwin]
 rustflags = [

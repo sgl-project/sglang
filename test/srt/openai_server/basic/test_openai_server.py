@@ -233,6 +233,10 @@ class TestOpenAIServer(CustomTestCase):
 
         is_firsts = {}
         is_finished = {}
+<<<<<<< HEAD
+=======
+        finish_reason_counts = {}
+>>>>>>> origin/main
         for response in generator:
             usage = response.usage
             if usage is not None:
@@ -245,6 +249,10 @@ class TestOpenAIServer(CustomTestCase):
             finish_reason = response.choices[0].finish_reason
             if finish_reason is not None:
                 is_finished[index] = True
+<<<<<<< HEAD
+=======
+                finish_reason_counts[index] = finish_reason_counts.get(index, 0) + 1
+>>>>>>> origin/main
 
             data = response.choices[0].delta
 
@@ -284,6 +292,18 @@ class TestOpenAIServer(CustomTestCase):
                 index, True
             ), f"index {index} is not found in the response"
 
+<<<<<<< HEAD
+=======
+        # Verify that each choice gets exactly one finish_reason chunk
+        for index in range(parallel_sample_num):
+            assert (
+                index in finish_reason_counts
+            ), f"No finish_reason found for index {index}"
+            assert (
+                finish_reason_counts[index] == 1
+            ), f"Expected 1 finish_reason chunk for index {index}, got {finish_reason_counts[index]}"
+
+>>>>>>> origin/main
     def test_completion(self):
         for echo in [False, True]:
             for logprobs in [None, 5]:
@@ -420,6 +440,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             client.models.retrieve("non-existent-model")
 
 
+<<<<<<< HEAD
 # -------------------------------------------------------------------------
 #    EBNF Test Class: TestOpenAIServerEBNF
 #    Launches the server with xgrammar, has only EBNF tests
@@ -505,6 +526,8 @@ class TestOpenAIServerEBNF(CustomTestCase):
         )
 
 
+=======
+>>>>>>> origin/main
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):

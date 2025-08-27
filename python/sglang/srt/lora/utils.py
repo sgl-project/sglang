@@ -1,7 +1,11 @@
 import re
 from dataclasses import dataclass
 from enum import Enum
+<<<<<<< HEAD
 from typing import List, Optional, Set, Tuple
+=======
+from typing import Iterable, Optional, Set, Tuple
+>>>>>>> origin/main
 
 import torch
 
@@ -47,6 +51,7 @@ def get_layer_id(name: str) -> int:
     return int(match.group(1))
 
 
+<<<<<<< HEAD
 def get_customized_names_from_hf_names(
     hf_module_names: Set[str], base_model: torch.nn.Module
 ) -> Set[str]:
@@ -75,6 +80,8 @@ def get_customized_names_from_hf_names(
         return {params_mapping.get(name, name) for name in hf_module_names}
 
 
+=======
+>>>>>>> origin/main
 def get_hidden_dim(
     module_name: str, config: AutoConfig, base_model: torch.nn.Module
 ) -> Tuple[int]:
@@ -92,6 +99,7 @@ def get_hidden_dim(
         Please implement the function in the model class if it is not.
         You can reference this function in llama.py.
         """
+<<<<<<< HEAD
         if module_name in ["q_proj", "o_proj", "qkv_proj"]:
             return config.hidden_size, config.hidden_size
         elif module_name in ["kv_proj"]:
@@ -100,12 +108,29 @@ def get_hidden_dim(
             )
         elif module_name == "gate_up_proj":
             return config.hidden_size, config.intermediate_size
+=======
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        if module_name == "qkv_proj":
+            return config.hidden_size, head_dim * (
+                config.num_attention_heads + config.num_key_value_heads * 2
+            )
+        elif module_name == "o_proj":
+            return (
+                head_dim * config.num_attention_heads,
+                config.hidden_size,
+            )
+        elif module_name == "gate_up_proj":
+            return config.hidden_size, config.intermediate_size * 2
+>>>>>>> origin/main
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
         else:
             raise NotImplementedError()
 
 
+<<<<<<< HEAD
 def get_normalized_lora_weight_names(name: str) -> Tuple[List[str], List[str]]:
     """
     Mapping a target module name to names of the normalized LoRA weights.
@@ -122,6 +147,27 @@ def get_normalized_lora_weight_names(name: str) -> Tuple[List[str], List[str]]:
     }
     stacked = params_mapping.get(name, ([name], [name]))
     return stacked
+=======
+def get_normalized_target_modules(
+    target_modules: Iterable[str],
+) -> set[str]:
+    """
+    Mapping a list of target module name to names of the normalized LoRA weights.
+    """
+    params_mapping = {
+        "q_proj": "qkv_proj",
+        "k_proj": "qkv_proj",
+        "v_proj": "qkv_proj",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+    }
+
+    result = set()
+    for name in target_modules:
+        normalized_name = params_mapping.get(name, name)
+        result.add(normalized_name)
+    return result
+>>>>>>> origin/main
 
 
 def get_stacked_multiply(module_name: str) -> int:
@@ -130,12 +176,16 @@ def get_stacked_multiply(module_name: str) -> int:
     """
     stacked_rank = {
         "qkv_proj": 3,
+<<<<<<< HEAD
         "kv_proj": 2,
+=======
+>>>>>>> origin/main
         "gate_up_proj": 2,
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
 
 
+<<<<<<< HEAD
 def get_weight_name(
     target_name: str, lora_weight_names: Tuple[Set[str]], lora_type: LoRAType
 ) -> Optional[str]:
@@ -159,4 +209,21 @@ VOCAB_PARALLELISM_EMBEDDING_NAMES = ["embeddings"]
 COLUMN_PARALLELISM_LINEAR_LORA_NAMES = ["gate_proj", "up_proj"]
 MERGED_COLUMN_PARALLELISM_LINEAR_LORA_NAMES = ["gate_up_proj"]
 QKV_PARALLELISM_LINEAR_LORA_NAMES = ["qkv_proj"]
+=======
+def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> str:
+    """
+    Get the target module name in target_modules that can match full_module_name.
+
+    If there is a target module name in target_modules that can match full_module_name, return this name
+    Else raise ValueError.
+    """
+    for target_module in target_modules:
+        if target_module in full_module_name:
+            return target_module
+    raise ValueError(
+        f"Cannot find target module name for {full_module_name} in {target_modules}"
+    )
+
+
+>>>>>>> origin/main
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]

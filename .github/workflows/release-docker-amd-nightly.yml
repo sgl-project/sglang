@@ -15,11 +15,19 @@ concurrency:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
+<<<<<<< HEAD
     runs-on: amd-docker
     environment: 'prod'
     strategy:
       matrix:
         rocm_version: ['6.3.0']
+=======
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    strategy:
+      matrix:
+        gpu_arch: ['gfx942', 'gfx950']
+>>>>>>> origin/main
         build_type: ['all', 'srt']
     steps:
       - name: Checkout repository
@@ -29,6 +37,7 @@ jobs:
         run: |
           echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
 
+<<<<<<< HEAD
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -40,6 +49,8 @@ jobs:
           large-packages: true
           swap-storage: false
 
+=======
+>>>>>>> origin/main
       - name: Login to Docker Hub
         uses: docker/login-action@v2
         with:
@@ -48,6 +59,22 @@ jobs:
 
       - name: Build and Push
         run: |
+<<<<<<< HEAD
+=======
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+
+          if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
+            rocm_tag="rocm630-mi30x"
+          elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
+            rocm_tag="rocm700-mi35x"
+          else
+            echo "Unsupported gfx arch"
+            exit 1
+          fi
+
+          tag=v${version}-${rocm_tag}
+
+>>>>>>> origin/main
           if [ "${{ matrix.build_type }}" = "all" ]; then
             tag_suffix=""
           elif [ "${{ matrix.build_type }}" = "srt" ]; then
@@ -57,6 +84,7 @@ jobs:
             exit 1
           fi
 
+<<<<<<< HEAD
           docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} -t rocm/sgl-dev:${{ env.DATE }}${tag_suffix} --no-cache
           docker push rocm/sgl-dev:${{ env.DATE }}${tag_suffix}
 
@@ -64,3 +92,7 @@ jobs:
         run: |
           sudo rm -rf /var/lib/docker
           sudo systemctl restart docker
+=======
+          docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix} --no-cache
+          docker push rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix}
+>>>>>>> origin/main

@@ -9,6 +9,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
+<<<<<<< HEAD
+=======
+from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
+>>>>>>> origin/main
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -18,8 +22,11 @@ if _is_cuda:
         apply_shuffle_mul_sum,
         cutlass_fp4_group_mm,
         fp8_blockwise_scaled_grouped_mm,
+<<<<<<< HEAD
         gelu_and_mul,
         gelu_tanh_and_mul,
+=======
+>>>>>>> origin/main
         prepare_moe_input,
         scaled_fp4_experts_quant,
         shuffle_rows,
@@ -125,6 +132,11 @@ def cutlass_fused_experts_fp8(
 
     if is_cuda:
         from sglang.srt.layers.quantization.fp8_kernel import (
+<<<<<<< HEAD
+=======
+            per_group_transpose,
+            per_token_group_quant_fp8_hopper_moe_mn_major,
+>>>>>>> origin/main
             sglang_per_token_group_quant_fp8,
         )
 
@@ -135,9 +147,13 @@ def cutlass_fused_experts_fp8(
     n = w2_q.size(1)
 
     topk = topk_ids.size(1)
+<<<<<<< HEAD
 
     a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
     device = a_q.device
+=======
+    device = a.device
+>>>>>>> origin/main
 
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
@@ -154,6 +170,10 @@ def cutlass_fused_experts_fp8(
         k,
     )
 
+<<<<<<< HEAD
+=======
+    a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
+>>>>>>> origin/main
     rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
     rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
@@ -211,7 +231,12 @@ def cutlass_fused_experts_fp8(
     )
 
     result = torch.empty((m, k), device=device, dtype=out_dtype)
+<<<<<<< HEAD
     return apply_shuffle_mul_sum(c2, result, c_map, topk_weights)
+=======
+    apply_shuffle_mul_sum(c2, result, c_map, topk_weights.to(out_dtype))
+    return result
+>>>>>>> origin/main
 
 
 FLOAT4_E2M1_MAX = 6.0
@@ -231,7 +256,10 @@ def cutlass_moe_fp4(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     params: CutlassMoEParams,
+<<<<<<< HEAD
     activation: str,
+=======
+>>>>>>> origin/main
     apply_router_weight_on_input: bool = False,
 ):
     """
@@ -276,10 +304,13 @@ def cutlass_moe_fp4(
     m, n, k: Unquantized weight shapes, dtype: int
     e: number of experts for the current rank, dtype: int
     assumes that topk < k < n to satisfy - up/down projection expectations.
+<<<<<<< HEAD
 
     activation: str
         The activation function to apply after the first GEMM.
         Supported values: "silu", "gelu", "gelu_tanh".
+=======
+>>>>>>> origin/main
     """
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_fp4.dtype == torch.uint8, "weight 1 must be uint8"
@@ -350,6 +381,7 @@ def cutlass_moe_fp4(
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
+<<<<<<< HEAD
     if activation == "gelu":
         gelu_and_mul(c1, intermediate)
     elif activation == "gelu_tanh":
@@ -361,6 +393,9 @@ def cutlass_moe_fp4(
             f"Unsupported activation function: {activation}. "
             "Supported values are 'silu', 'gelu', 'gelu_tanh'."
         )
+=======
+    silu_and_mul(c1, intermediate)
+>>>>>>> origin/main
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,

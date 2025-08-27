@@ -40,11 +40,22 @@ using namespace cute;
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 // Kernel Perf config
 template <typename T>
+<<<<<<< HEAD
 struct KernelTraits;
+=======
+struct KernelTraits {
+  using MmaTileShape = Shape<_256, _256, _256>;
+  using ClusterShape = Shape<int, int, _1>;
+  using EpilogueTile = Shape<_128, _64>;
+  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
+  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100;
+};
+>>>>>>> origin/main
 
 template <>
 struct KernelTraits<float> {
   using MmaTileShape = Shape<_128, _128, _256>;
+<<<<<<< HEAD
   using ClusterShape = Shape<_1, _1, _1>;
   using PerSmTileShape_MNK = Shape<_128, _128, _256>;
 };
@@ -61,6 +72,12 @@ struct KernelTraits<cutlass::bfloat16_t> {
   using MmaTileShape = Shape<_256, _256, _256>;
   using ClusterShape = Shape<_4, _4, _1>;
   using PerSmTileShape_MNK = Shape<_128, _256, _256>;
+=======
+  using ClusterShape = Shape<int, int, _1>;
+  using EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto;
+  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
+  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100;
+>>>>>>> origin/main
 };
 
 template <typename T>
@@ -90,6 +107,7 @@ struct Fp4GemmSm100 {
   // Kernel Perf config
   using MmaTileShape = typename KernelTraits<T>::MmaTileShape;
   using ClusterShape = typename KernelTraits<T>::ClusterShape;
+<<<<<<< HEAD
   using PerSmTileShape_MNK = typename KernelTraits<T>::PerSmTileShape_MNK;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -101,12 +119,32 @@ struct Fp4GemmSm100 {
       ElementAccumulator,
       ElementAccumulator,
       ElementC,
+=======
+  using EpilogueTile = typename KernelTraits<T>::EpilogueTile;
+  using EpilogueSchedule = typename KernelTraits<T>::EpilogueSchedule;
+  using MainloopSchedule = typename KernelTraits<T>::MainloopSchedule;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      cutlass::arch::OpClassTensorOp,
+      MmaTileShape,
+      ClusterShape,
+      EpilogueTile,
+      ElementAccumulator,
+      ElementAccumulator,
+      void,
+>>>>>>> origin/main
       LayoutCTag,
       AlignmentC,
       ElementD,
       LayoutDTag,
       AlignmentD,
+<<<<<<< HEAD
       cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+=======
+      EpilogueSchedule,
+      cutlass::epilogue::fusion::LinearCombination<ElementD, float, void, float>>::CollectiveOp;
+>>>>>>> origin/main
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag,
@@ -122,7 +160,11 @@ struct Fp4GemmSm100 {
       ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
+<<<<<<< HEAD
       cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+=======
+      MainloopSchedule>::CollectiveOp;
+>>>>>>> origin/main
 
   using GemmKernel =
       cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
@@ -191,6 +233,16 @@ typename T::Gemm::Arguments args_from_options(
        stride_D}};
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.alpha_ptr = static_cast<ElementCompute const*>(alpha.data_ptr());
+<<<<<<< HEAD
+=======
+  if constexpr (std::is_same_v<T, float>) {
+    arguments.hw_info.cluster_shape = dim3(1, 4, 1);
+    arguments.hw_info.cluster_shape_fallback = dim3(1, 1, 1);
+  } else {
+    arguments.hw_info.cluster_shape = dim3(4, 4, 1);
+    arguments.hw_info.cluster_shape_fallback = dim3(2, 1, 1);
+  }
+>>>>>>> origin/main
   return arguments;
 }
 
@@ -269,6 +321,7 @@ void cutlass_scaled_fp4_mm_sm100a(
   TORCH_CHECK(A.dim() == 2, "a must be a matrix");
   TORCH_CHECK(B.dim() == 2, "b must be a matrix");
   TORCH_CHECK(
+<<<<<<< HEAD
       A.sizes()[1] == B.sizes()[1],
       "a and b shapes cannot be multiplied (",
       A.sizes()[0],
@@ -283,6 +336,22 @@ void cutlass_scaled_fp4_mm_sm100a(
   auto const m = A.sizes()[0];
   auto const n = B.sizes()[0];
   auto const k = A.sizes()[1] * 2;
+=======
+      A.size(1) == B.size(1),
+      "a and b shapes cannot be multiplied (",
+      A.size(0),
+      "x",
+      A.size(1),
+      " and ",
+      B.size(0),
+      "x",
+      B.size(1),
+      ")");
+
+  auto const m = A.size(0);
+  auto const n = B.size(0);
+  auto const k = A.size(1) * 2;
+>>>>>>> origin/main
 
   constexpr int alignment = 32;
   TORCH_CHECK(
@@ -290,9 +359,15 @@ void cutlass_scaled_fp4_mm_sm100a(
       "Expected k to be divisible by ",
       alignment,
       ", but got a shape: (",
+<<<<<<< HEAD
       A.sizes()[0],
       "x",
       A.sizes()[1],
+=======
+      A.size(0),
+      "x",
+      A.size(1),
+>>>>>>> origin/main
       "), k: ",
       k,
       ".");
@@ -301,9 +376,15 @@ void cutlass_scaled_fp4_mm_sm100a(
       "Expected n to be divisible by ",
       alignment,
       ", but got b shape: (",
+<<<<<<< HEAD
       B.sizes()[0],
       "x",
       B.sizes()[1],
+=======
+      B.size(0),
+      "x",
+      B.size(1),
+>>>>>>> origin/main
       ").");
 
   auto round_up = [](int x, int y) { return (x + y - 1) / y * y; };
@@ -316,6 +397,7 @@ void cutlass_scaled_fp4_mm_sm100a(
   TORCH_CHECK(A_sf.dim() == 2, "scale_a must be a matrix");
   TORCH_CHECK(B_sf.dim() == 2, "scale_b must be a matrix");
   TORCH_CHECK(
+<<<<<<< HEAD
       A_sf.sizes()[1] == B_sf.sizes()[1],
       "scale_a and scale_b shapes cannot be multiplied (",
       A_sf.sizes()[0],
@@ -328,25 +410,54 @@ void cutlass_scaled_fp4_mm_sm100a(
       ")");
   TORCH_CHECK(
       A_sf.sizes()[0] == rounded_m && A_sf.sizes()[1] == rounded_k,
+=======
+      A_sf.size(1) == B_sf.size(1),
+      "scale_a and scale_b shapes cannot be multiplied (",
+      A_sf.size(0),
+      "x",
+      A_sf.size(1),
+      " and ",
+      B_sf.size(0),
+      "x",
+      B_sf.size(1),
+      ")");
+  TORCH_CHECK(
+      A_sf.size(0) == rounded_m && A_sf.size(1) == rounded_k,
+>>>>>>> origin/main
       "scale_a must be padded and swizzled to a shape (",
       rounded_m,
       "x",
       rounded_k,
       "), but got a shape (",
+<<<<<<< HEAD
       A_sf.sizes()[0],
       "x",
       A_sf.sizes()[1],
       ")");
   TORCH_CHECK(
       B_sf.sizes()[0] == rounded_n && B_sf.sizes()[1] == rounded_k,
+=======
+      A_sf.size(0),
+      "x",
+      A_sf.size(1),
+      ")");
+  TORCH_CHECK(
+      B_sf.size(0) == rounded_n && B_sf.size(1) == rounded_k,
+>>>>>>> origin/main
       "scale_b must be padded and swizzled to a shape (",
       rounded_n,
       "x",
       rounded_k,
       "), but got a shape (",
+<<<<<<< HEAD
       B_sf.sizes()[0],
       "x",
       B_sf.sizes()[1],
+=======
+      B_sf.size(0),
+      "x",
+      B_sf.size(1),
+>>>>>>> origin/main
       ")");
 
   auto out_dtype = D.dtype();

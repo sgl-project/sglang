@@ -28,12 +28,19 @@ LLaVA-Onevision : https://arxiv.org/pdf/2408.03326
 
 """
 import ast
+<<<<<<< HEAD
 import base64
+=======
+>>>>>>> origin/main
 import math
 import re
 from io import BytesIO
 
 import numpy as np
+<<<<<<< HEAD
+=======
+import pybase64
+>>>>>>> origin/main
 from PIL import Image
 
 from sglang.srt.utils import flatten_nested_list
@@ -252,7 +259,11 @@ def process_anyres_image(image, processor, grid_pinpoints):
 
 
 def load_image_from_base64(image):
+<<<<<<< HEAD
     return Image.open(BytesIO(base64.b64decode(image)))
+=======
+    return Image.open(BytesIO(pybase64.b64decode(image, validate=True)))
+>>>>>>> origin/main
 
 
 def expand2square(pil_img, background_color):

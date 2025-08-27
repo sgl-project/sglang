@@ -43,6 +43,10 @@ I'm going to the park
 """
 
 import argparse
+<<<<<<< HEAD
+=======
+import copy
+>>>>>>> origin/main
 import dataclasses
 import itertools
 import json
@@ -84,12 +88,20 @@ class BenchArgs:
     batch_size: Tuple[int] = (1,)
     input_len: Tuple[int] = (1024,)
     output_len: Tuple[int] = (16,)
+<<<<<<< HEAD
+=======
+    prompt_filename: str = ""
+>>>>>>> origin/main
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
     # This is only used for correctness test
     cut_len: int = 4
     log_decode_step: int = 0
     profile: bool = False
+<<<<<<< HEAD
+=======
+    profile_record_shapes: bool = False
+>>>>>>> origin/main
     profile_filename_prefix: str = "profile"
 
     @staticmethod
@@ -105,6 +117,12 @@ class BenchArgs:
             "--output-len", type=int, nargs="+", default=BenchArgs.output_len
         )
         parser.add_argument(
+<<<<<<< HEAD
+=======
+            "--prompt-filename", type=str, default=BenchArgs.prompt_filename
+        )
+        parser.add_argument(
+>>>>>>> origin/main
             "--result-filename", type=str, default=BenchArgs.result_filename
         )
         parser.add_argument("--correctness-test", action="store_true")
@@ -119,6 +137,14 @@ class BenchArgs:
             "--profile", action="store_true", help="Use Torch Profiler."
         )
         parser.add_argument(
+<<<<<<< HEAD
+=======
+            "--profile-record-shapes",
+            action="store_true",
+            help="Record tensor shapes in profiling results.",
+        )
+        parser.add_argument(
+>>>>>>> origin/main
             "--profile-filename-prefix",
             type=str,
             default=BenchArgs.profile_filename_prefix,
@@ -138,6 +164,10 @@ class BenchArgs:
 def load_model(server_args, port_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
+<<<<<<< HEAD
+=======
+    moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+>>>>>>> origin/main
 
     model_config = ModelConfig.from_server_args(server_args)
     model_runner = ModelRunner(
@@ -146,6 +176,11 @@ def load_model(server_args, port_args, tp_rank):
         gpu_id=tp_rank,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
+<<<<<<< HEAD
+=======
+        moe_ep_rank=moe_ep_rank,
+        moe_ep_size=server_args.ep_size,
+>>>>>>> origin/main
         pp_rank=0,
         pp_size=1,
         nccl_port=port_args.nccl_port,
@@ -162,12 +197,25 @@ def load_model(server_args, port_args, tp_rank):
     return model_runner, tokenizer
 
 
+<<<<<<< HEAD
 def prepare_inputs_for_correctness_test(bench_args, tokenizer):
     prompts = [
         "The capital of France is",
         "The capital of the United Kindom is",
         "Today is a sunny day and I like",
     ]
+=======
+def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
+    prompts = (
+        custom_prompts
+        if custom_prompts
+        else [
+            "The capital of France is",
+            "The capital of the United Kindom is",
+            "Today is a sunny day and I like",
+        ]
+    )
+>>>>>>> origin/main
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
         temperature=0,
@@ -208,8 +256,19 @@ def prepare_extend_inputs_for_correctness_test(
     return reqs
 
 
+<<<<<<< HEAD
 def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
+=======
+def prepare_synthetic_inputs_for_latency_test(
+    batch_size, input_len, custom_inputs=None
+):
+    input_ids = (
+        custom_inputs
+        if custom_inputs
+        else np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
+    )
+>>>>>>> origin/main
     sampling_params = SamplingParams(
         temperature=0,
         max_new_tokens=BenchArgs.output_len,
@@ -242,7 +301,10 @@ def extend(reqs, model_runner):
         model_config=model_runner.model_config,
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+<<<<<<< HEAD
         enable_custom_logit_processor=False,
+=======
+>>>>>>> origin/main
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
@@ -271,15 +333,50 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             batch,
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=1,
+<<<<<<< HEAD
             tp_cpu_group=model_runner.tp_group.cpu_group,
+=======
+            tp_group=model_runner.tp_group,
+>>>>>>> origin/main
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             speculative_num_draft_tokens=None,
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
+<<<<<<< HEAD
         )
 
 
+=======
+            disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
+        )
+
+
+def _read_prompts_from_file(prompt_file, rank_print):
+    """Read custom prompts from the file specified by `--prompt-filename`."""
+    if not prompt_file:
+        return []
+    if not os.path.exists(prompt_file):
+        rank_print(
+            f"Custom prompt file {prompt_file} not found. Using default inputs..."
+        )
+        return []
+    with open(prompt_file, "r") as pf:
+        return pf.readlines()
+
+
+def _save_profile_trace_results(profiler, filename):
+    parent_dir = os.path.dirname(os.path.abspath(filename))
+    os.makedirs(parent_dir, exist_ok=True)
+    profiler.export_chrome_trace(filename)
+    print(
+        profiler.key_averages(group_by_input_shape=True).table(
+            sort_by="self_cpu_time_total"
+        )
+    )
+
+
+>>>>>>> origin/main
 def correctness_test(
     server_args,
     port_args,
@@ -294,7 +391,14 @@ def correctness_test(
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs
+<<<<<<< HEAD
     input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
+=======
+    custom_prompts = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
+    input_ids, reqs = prepare_inputs_for_correctness_test(
+        bench_args, tokenizer, custom_prompts
+    )
+>>>>>>> origin/main
     rank_print(f"\n{input_ids=}\n")
 
     if bench_args.cut_len > 0:
@@ -340,6 +444,10 @@ def latency_test_run_once(
     device,
     log_decode_step,
     profile,
+<<<<<<< HEAD
+=======
+    profile_record_shapes,
+>>>>>>> origin/main
     profile_filename_prefix,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
@@ -370,6 +478,10 @@ def latency_test_run_once(
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             with_stack=True,
+<<<<<<< HEAD
+=======
+            record_shapes=profile_record_shapes,
+>>>>>>> origin/main
         )
         profiler.start()
 
@@ -387,10 +499,36 @@ def latency_test_run_once(
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
 
+<<<<<<< HEAD
+=======
+    if profile:
+        profiler.stop()
+        profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_prefill.trace.json.gz"
+        _save_profile_trace_results(profiler, profile_filename)
+        rank_print(
+            f"torch profiler chrome trace for prefill saved to {profile_filename}"
+        )
+
+>>>>>>> origin/main
     # Decode
     decode_latencies = []
     for i in range(output_len - 1):
         synchronize(device)
+<<<<<<< HEAD
+=======
+        if profile and i == output_len / 2:
+            profiler = None
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                with_stack=True,
+                record_shapes=profile_record_shapes,
+            )
+            profiler.start()
+
+>>>>>>> origin/main
         tic = time.perf_counter()
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
         synchronize(device)
@@ -403,6 +541,7 @@ def latency_test_run_once(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
 
+<<<<<<< HEAD
     if profile:
         profiler.stop()
         profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}.trace.json.gz"
@@ -410,6 +549,15 @@ def latency_test_run_once(
         os.makedirs(parent_dir, exist_ok=True)
         profiler.export_chrome_trace(profile_filename)
         rank_print(f"torch profiler chrome trace saved to {profile_filename}")
+=======
+        if profile and i == output_len / 2:
+            profiler.stop()
+            profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_decode.trace.json.gz"
+            _save_profile_trace_results(profiler, profile_filename)
+            rank_print(
+                f"torch profiler chrome trace for decoding 1 token saved to {profile_filename}"
+            )
+>>>>>>> origin/main
 
     # Record decode timing from 2nd output
     if output_len > 1:
@@ -465,17 +613,52 @@ def latency_test(
         server_args.device,
         log_decode_step=0,
         profile=False,
+<<<<<<< HEAD
+=======
+        profile_record_shapes=False,
+>>>>>>> origin/main
         profile_filename_prefix="",  # not used
     )
 
     rank_print("Benchmark ...")
 
+<<<<<<< HEAD
+=======
+    custom_inputs = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
+    custom_inputs = [tokenizer.encode(p.strip()) for p in custom_inputs]
+    custom_input_len = len(custom_inputs)
+
+>>>>>>> origin/main
     # Run the sweep
     result_list = []
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
+<<<<<<< HEAD
         reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+=======
+        bs_aligned_inputs = []
+        if custom_inputs:
+            if custom_input_len == bs:
+                bs_aligned_inputs = custom_inputs
+            elif custom_input_len > bs:
+                rank_print(
+                    f"Custom input size ({custom_input_len}) is larger than batch_size ({bs}). "
+                    f"Using the first {bs} prompts."
+                )
+                bs_aligned_inputs = copy.deepcopy(custom_inputs[:bs])
+            else:
+                rank_print(
+                    f"Custom input size ({custom_input_len}) is smaller than batch_size ({bs}). "
+                    f"Pad to the desired batch_size with the last prompt."
+                )
+                bs_aligned_inputs = copy.deepcopy(custom_inputs)
+                bs_aligned_inputs.extend(
+                    [bs_aligned_inputs[-1]] * (bs - custom_input_len)
+                )
+
+        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+>>>>>>> origin/main
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
@@ -487,6 +670,10 @@ def latency_test(
             server_args.device,
             bench_args.log_decode_step,
             bench_args.profile if tp_rank == 0 else None,
+<<<<<<< HEAD
+=======
+            bench_args.profile_record_shapes if tp_rank == 0 else None,
+>>>>>>> origin/main
             bench_args.profile_filename_prefix,
         )
         if ret is not None:

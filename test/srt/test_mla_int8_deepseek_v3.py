@@ -10,6 +10,10 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+<<<<<<< HEAD
+=======
+    is_in_ci,
+>>>>>>> origin/main
     popen_launch_server,
 )
 
@@ -112,6 +116,10 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
+<<<<<<< HEAD
+=======
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+>>>>>>> origin/main
 class TestMLADeepseekV3BlockInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):

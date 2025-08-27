@@ -3,18 +3,27 @@ Torch-native implementation for FusedMoE. This is used for torch.compile.
 It is based on https://github.com/pytorch-labs/gpt-fast/blob/32971d3129541c5bfb4f715abc33d1c5f408d204/mixtral-moe/model.py#L204
 """
 
+<<<<<<< HEAD
 from typing import Callable, Optional
 
+=======
+>>>>>>> origin/main
 import torch
 from torch.nn import functional as F
 
 from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
+<<<<<<< HEAD
 from sglang.srt.layers.moe.topk import select_experts
+=======
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+>>>>>>> origin/main
 
 
 def fused_moe_forward_native(
     layer: torch.nn.Module,
     x: torch.Tensor,
+<<<<<<< HEAD
     use_grouped_topk: bool,
     top_k: int,
     router_logits: torch.Tensor,
@@ -48,17 +57,36 @@ def fused_moe_forward_native(
         routed_scaling_factor=routed_scaling_factor,
         torch_native=True,
     )
+=======
+    topk_output: StandardTopKOutput,
+    moe_runner_config: MoeRunnerConfig,
+) -> torch.Tensor:
+
+    if moe_runner_config.apply_router_weight_on_input:
+        raise NotImplementedError()
+
+    topk_weights, topk_ids, _ = topk_output
+>>>>>>> origin/main
 
     w13_weights = layer.w13_weight[topk_ids]
     w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
     w2_weights = layer.w2_weight[topk_ids]
     x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
+<<<<<<< HEAD
     if activation == "silu":
         x1 = F.silu(x1)
     elif activation == "gelu":
         x1 = F.gelu(x1)
     else:
         raise ValueError(f"Unsupported activation: {activation=}")
+=======
+    if moe_runner_config.activation == "silu":
+        x1 = F.silu(x1)
+    elif moe_runner_config.activation == "gelu":
+        x1 = F.gelu(x1)
+    else:
+        raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
+>>>>>>> origin/main
     x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
     expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
     return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
@@ -67,6 +95,7 @@ def fused_moe_forward_native(
 def moe_forward_native(
     layer: torch.nn.Module,
     x: torch.Tensor,
+<<<<<<< HEAD
     use_grouped_topk: bool,
     top_k: int,
     router_logits: torch.Tensor,
@@ -100,6 +129,16 @@ def moe_forward_native(
         torch_native=True,
         routed_scaling_factor=routed_scaling_factor,
     )
+=======
+    topk_output: StandardTopKOutput,
+    moe_runner_config: MoeRunnerConfig,
+) -> torch.Tensor:
+
+    if moe_runner_config.apply_router_weight_on_input:
+        raise NotImplementedError()
+
+    topk_weights, topk_ids, _ = topk_output
+>>>>>>> origin/main
 
     # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589
     len_experts = layer.num_experts
@@ -112,12 +151,21 @@ def moe_forward_native(
     sorted_tokens = x[idxs // topk_ids.shape[1]]
     tokens_per_expert = tokens_per_expert.cpu().numpy()
 
+<<<<<<< HEAD
     if activation == "silu":
         act = SiluAndMul()
     elif activation == "gelu":
         act = GeluAndMul()
     else:
         raise ValueError(f"Unsupported activation: {activation=}")
+=======
+    if moe_runner_config.activation == "silu":
+        act = SiluAndMul()
+    elif moe_runner_config.activation == "gelu":
+        act = GeluAndMul()
+    else:
+        raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
+>>>>>>> origin/main
 
     outputs = []
     start_idx = 0

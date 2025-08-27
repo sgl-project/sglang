@@ -6,6 +6,10 @@ import triton
 
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import ceil_div, dispose_tensor, is_cuda
+<<<<<<< HEAD
+=======
+from sglang.utils import is_in_ci
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +150,10 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
 
 def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+<<<<<<< HEAD
+=======
+
+>>>>>>> origin/main
     seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
 
@@ -158,9 +166,72 @@ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     compute_src2dst_triton_kernel[grid](
         reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE
     )
+<<<<<<< HEAD
     return reorder_topk_ids, src2dst, seg_indptr
 
 
+=======
+
+    return reorder_topk_ids, src2dst, seg_indptr
+
+
+def run_cutlass_moe_ep_preproess(local_topk_ids: torch.Tensor, local_num_experts: int):
+    reorder_topk_ids, reorder_ids = torch.sort(local_topk_ids.view(-1), stable=True)
+
+    seg_indptr = torch.zeros(
+        local_num_experts + 1, device=local_topk_ids.device, dtype=torch.int64
+    )
+    src2dst = torch.empty(
+        local_topk_ids.numel(), device=local_topk_ids.device, dtype=torch.int32
+    )
+
+    BLOCK_SIZE = 512
+    grid = (triton.cdiv(local_topk_ids.numel(), BLOCK_SIZE),)
+    compute_src2dst_triton_kernel[grid](
+        reorder_ids, src2dst, local_topk_ids.numel(), BLOCK_SIZE
+    )
+
+    return reorder_topk_ids, src2dst, seg_indptr
+
+
+@triton.jit
+def pre_reorder_triton_kernel_for_cutlass_moe(
+    input_ptr,
+    gateup_input_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    a1_scales_ptr,
+    num_experts,
+    topk,
+    hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    OutDtype = gateup_input_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+
+    src_ptr = input_ptr + src_idx * hidden_size
+    for idx in range(topk):
+        expert_id = tl.load(topk_ids_ptr + idx)
+        if expert_id != num_experts:
+            if a1_scales_ptr is not None:
+                scale = 1.0 / tl.load(a1_scales_ptr)
+            else:
+                scale = 1.0
+
+            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                mask = offset < hidden_size
+                in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
+                out_data = (in_data * scale).to(OutDtype)
+                tl.store(dst_ptr + offset, out_data, mask=mask)
+
+
+>>>>>>> origin/main
 @triton.jit
 def pre_reorder_triton_kernel(
     input_ptr,
@@ -177,7 +248,12 @@ def pre_reorder_triton_kernel(
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
+<<<<<<< HEAD
     src_idx = tl.program_id(0)
+=======
+    src_idx_int32 = tl.program_id(0)
+    src_idx = src_idx_int32.to(tl.int64)
+>>>>>>> origin/main
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
@@ -196,7 +272,12 @@ def pre_reorder_triton_kernel(
             else:
                 scale = 1.0
 
+<<<<<<< HEAD
             dst_idx = tl.load(src2dst_ptr + idx)
+=======
+            dst_idx_int32 = tl.load(src2dst_ptr + idx)
+            dst_idx = dst_idx_int32.to(tl.int64)
+>>>>>>> origin/main
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
                 offset = start_offset + vec
@@ -521,6 +602,52 @@ def post_reorder_triton_kernel(
 
 
 @triton.jit
+<<<<<<< HEAD
+=======
+def post_reorder_triton_kernel_for_cutlass_moe(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    num_experts,
+    topk,
+    hidden_size,
+    dst_start,
+    BLOCK_SIZE: tl.constexpr,
+):
+    InDtype = down_output_ptr.dtype.element_ty
+
+    src_idx_int32 = tl.program_id(0)
+    src_idx = src_idx_int32.to(tl.int64)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    topk_weights_ptr = topk_weights_ptr + src_idx * topk
+
+    store_ptr = output_ptr + src_idx * hidden_size
+
+    vec = tl.arange(0, BLOCK_SIZE)
+
+    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+        offset = start_offset + vec
+        mask = offset < hidden_size
+
+        sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+        for idx in range(topk):
+            expert_id = tl.load(topk_ids_ptr + idx)
+            if expert_id != num_experts:
+                dst_idx_int32 = tl.load(src2dst_ptr + idx)
+                dst_idx = dst_idx_int32.to(tl.int64)
+                dst_idx = dst_idx - dst_start
+                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                load_ptr = down_output_ptr + dst_idx * hidden_size
+                in_data = tl.load(load_ptr + offset, mask=mask)
+                sum_vec += in_data * weigh_scale
+        tl.store(store_ptr + offset, sum_vec, mask=mask)
+
+
+@triton.jit
+>>>>>>> origin/main
 def compute_m_range(
     pid,
     batch_size,
@@ -1000,7 +1127,11 @@ def ep_gather(
     input_index: torch.Tensor,
     output_tensor: torch.Tensor,
 ):
+<<<<<<< HEAD
     BLOCK_D = 1024  # block size of quantization
+=======
+    BLOCK_D = 1024 if not is_in_ci() else 128  # block size of quantization
+>>>>>>> origin/main
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]

@@ -18,13 +18,21 @@
 /*
  * Adapted from https://github.com/IST-DASLab/marlin
  */
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/main
 #ifndef MARLIN_NAMESPACE_NAME
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
+<<<<<<< HEAD
 #include "gptq_marlin/marlin.cuh"
 #include "gptq_marlin/marlin_dtypes.cuh"
+=======
+#include "gemm/marlin/marlin.cuh"
+#include "gemm/marlin/marlin_dtypes.cuh"
+>>>>>>> origin/main
 #include "scalar_type.hpp"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                        \

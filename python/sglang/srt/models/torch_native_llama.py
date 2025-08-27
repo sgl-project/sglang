@@ -416,6 +416,7 @@ class TorchNativeLlamaForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+<<<<<<< HEAD
     def get_hidden_dim(self, module_name):
         if module_name in ["q_proj", "o_proj", "qkv_proj"]:
             return self.config.hidden_size, self.config.hidden_size
@@ -440,6 +441,8 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         }
         return params_mapping.get(name, name)
 
+=======
+>>>>>>> origin/main
     def get_module_name_from_weight_name(self, name):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id, num_shard)

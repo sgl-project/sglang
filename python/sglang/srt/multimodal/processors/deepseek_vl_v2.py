@@ -31,9 +31,17 @@ from sglang.srt.multimodal.processors.base_processor import (
 class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
     models = [DeepseekVL2ForCausalLM]
 
+<<<<<<< HEAD
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
         self.IMAGE_TOKEN = "<image>"
+=======
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<image>", image_token_id=self._processor.image_token_id
+        ).build(_processor)
+>>>>>>> origin/main
 
     async def process_mm_data_async(
         self,
@@ -47,6 +55,7 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         base_output = self.load_mm_data(
             input_text,
             image_data=image_data,
+<<<<<<< HEAD
             multimodal_tokens=MultimodalSpecialTokens(image_token=self.IMAGE_TOKEN),
             max_req_input_len=max_req_input_len,
         )
@@ -78,6 +87,19 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
 
         return {
             "mm_items": items,
+=======
+            multimodal_tokens=self.mm_tokens,
+        )
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            base_output,
+            self.mm_tokens,
+            max_req_input_len=max_req_input_len,
+            conversations=base_output.input_text,
+        )
+
+        return {
+            "mm_items": mm_items,
+>>>>>>> origin/main
             "input_ids": input_ids.tolist(),
             "im_token_id": self._processor.image_token_id,
         }

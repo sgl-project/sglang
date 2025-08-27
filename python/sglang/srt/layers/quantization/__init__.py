@@ -1,18 +1,29 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
+<<<<<<< HEAD
 import builtins
 import inspect
 import re
 from copy import deepcopy
 from typing import Callable, Dict, Optional, Type, Union
+=======
+from __future__ import annotations
+
+import builtins
+import inspect
+from typing import TYPE_CHECKING, Dict, Optional, Type
+>>>>>>> origin/main
 
 import torch
 
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
+<<<<<<< HEAD
     from vllm.model_executor.layers.quantization.awq_marlin import (
         AWQMarlinConfig,
         AWQMoEMethod,
     )
+=======
+>>>>>>> origin/main
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
         CompressedTensorsW8A8Fp8MoEMethod,
@@ -20,12 +31,16 @@ try:
     )
     from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
     from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
+<<<<<<< HEAD
     from vllm.model_executor.layers.quantization.fbgemm_fp8 import FBGEMMFp8Config
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
     from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         GPTQMarlinLinearMethod,
     )
+=======
+    from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+>>>>>>> origin/main
     from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
         GPTQMarlin24Config,
     )
@@ -34,14 +49,21 @@ try:
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
     VLLM_AVAILABLE = True
+<<<<<<< HEAD
 except ImportError:
     VLLM_AVAILABLE = False
+=======
+except ImportError as e:
+    VLLM_AVAILABLE = False
+    VLLM_IMPORT_ERROR = e
+>>>>>>> origin/main
 
     # Define empty classes as placeholders when vllm is not available
     class DummyConfig:
         def override_quantization_method(self, *args, **kwargs):
             return None
 
+<<<<<<< HEAD
     AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
         DeepSpeedFPConfig
     ) = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = GPTQMarlin24Config = (
@@ -51,25 +73,55 @@ except ImportError:
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.awq import AWQConfig
+=======
+    AQLMConfig = BitsAndBytesConfig = CompressedTensorsConfig = DeepSpeedFPConfig = (
+        ExpertsInt8Config
+    ) = GGUFConfig = GPTQMarlin24Config = MarlinConfig = QQQConfig = Int8TpuConfig = (
+        DummyConfig
+    )
+
+
+from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
+>>>>>>> origin/main
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+<<<<<<< HEAD
 from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,
     GPTQMarlinConfig,
     GPTQMarlinMoEMethod,
 )
+=======
+from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
+from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+>>>>>>> origin/main
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+<<<<<<< HEAD
 from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+=======
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+from sglang.srt.layers.quantization.petit import PetitNvFp4Config
+from sglang.srt.layers.quantization.qoq import QoQConfig
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+from sglang.srt.utils import is_cuda, is_hip, mxfp_supported
+
+_is_mxfp_supported = mxfp_supported()
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
+>>>>>>> origin/main
 
 # Base quantization methods that don't depend on vllm
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
@@ -79,6 +131,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "modelopt_fp4": ModelOptFp4Config,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
+<<<<<<< HEAD
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
@@ -100,6 +153,48 @@ VLLM_QUANTIZATION_METHODS = {
     "experts_int8": ExpertsInt8Config,
     "gptq_marlin": GPTQMarlinConfig,
     "gptq": GPTQConfig,
+=======
+    "awq": AWQConfig,
+    "awq_marlin": AWQMarlinConfig,
+    "gptq": GPTQConfig,
+    "gptq_marlin": GPTQMarlinConfig,
+    "moe_wna16": MoeWNA16Config,
+    "compressed-tensors": CompressedTensorsConfig,
+    "qoq": QoQConfig,
+    "w4afp8": W4AFp8Config,
+    "petit_nvfp4": PetitNvFp4Config,
+    "fbgemm_fp8": FBGEMMFp8Config,
+}
+
+
+if is_cuda():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "quark": Mxfp4Config,
+            "mxfp4": Mxfp4Config,
+        }
+    )
+elif _is_mxfp_supported and is_hip():
+    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "quark": QuarkConfig,
+            "mxfp4": Mxfp4Config,
+        }
+    )
+# VLLM-dependent quantization methods
+VLLM_QUANTIZATION_METHODS = {
+    "aqlm": AQLMConfig,
+    "deepspeedfp": DeepSpeedFPConfig,
+    "tpu_int8": Int8TpuConfig,
+    "marlin": MarlinConfig,
+    "gguf": GGUFConfig,
+    "gptq_marlin_24": GPTQMarlin24Config,
+    "bitsandbytes": BitsAndBytesConfig,
+    "qqq": QQQConfig,
+    "experts_int8": ExpertsInt8Config,
+>>>>>>> origin/main
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS, **VLLM_QUANTIZATION_METHODS}
@@ -114,12 +209,18 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
+<<<<<<< HEAD
             "Please install vllm by `pip install vllm==0.9.0.1`"
+=======
+            f"Please install vllm by `pip install vllm==0.9.0.1`\n"
+            f"Import error: {VLLM_IMPORT_ERROR}"
+>>>>>>> origin/main
         )
 
     return QUANTIZATION_METHODS[quantization]
 
 
+<<<<<<< HEAD
 # Match dynamic rules with module name (prefix) and override quantize
 # config if module (prefix) matches a rule
 def override_config(config: QuantizationConfig, prefix: str):
@@ -230,6 +331,8 @@ def gptq_get_quant_method(self, layer, prefix):
     return None
 
 
+=======
+>>>>>>> origin/main
 original_isinstance = builtins.isinstance
 
 
@@ -283,6 +386,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+<<<<<<< HEAD
         router_logits: torch.Tensor,
         top_k: int,
         renormalize: bool,
@@ -292,6 +396,10 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+=======
+        topk_output: TopKOutput,
+        *,
+>>>>>>> origin/main
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         inplace: bool = True,
@@ -305,6 +413,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
             "self": self,
             "layer": layer,
             "x": x,
+<<<<<<< HEAD
             "router_logits": router_logits,
             "top_k": top_k,
             "renormalize": renormalize,
@@ -319,6 +428,10 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
                     "Please increase the version of your vllm. Try `pip install vllm==0.9.0.1`"
                 )
             kwargs["e_score_correction_bias"] = correction_bias
+=======
+            "topk_output": topk_output,
+        }
+>>>>>>> origin/main
         return original_apply(**kwargs)
 
     setattr(class_obj, "apply", new_apply)
@@ -326,11 +439,15 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
 
 def monkey_patch_quant_configs():
     """Apply all monkey patches in one place."""
+<<<<<<< HEAD
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
     setattr(GPTQConfig, "get_quant_method", gptq_get_quant_method)
 
     monkey_patch_moe_apply(AWQMoEMethod)
     monkey_patch_moe_apply(GPTQMarlinMoEMethod)
+=======
+
+>>>>>>> origin/main
     monkey_patch_moe_apply(CompressedTensorsW8A8Fp8MoEMethod)
     monkey_patch_moe_apply(CompressedTensorsWNA16MoEMethod)
 

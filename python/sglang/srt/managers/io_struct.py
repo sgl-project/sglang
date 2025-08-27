@@ -13,18 +13,32 @@
 # ==============================================================================
 """
 The definition of objects transferred between different
+<<<<<<< HEAD
 processes (TokenizerManager, DetokenizerManager, Controller).
+=======
+processes (TokenizerManager, DetokenizerManager, Scheduler).
+>>>>>>> origin/main
 """
 
 import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+<<<<<<< HEAD
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+=======
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils import ImageData
+>>>>>>> origin/main
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -42,8 +56,26 @@ class SessionParams:
     drop_previous_output: Optional[bool] = None
 
 
+<<<<<<< HEAD
 AudioDataItem = Union[str, Dict]
 ImageDataItem = Union[Image, str, Dict]
+=======
+# Type definitions for multimodal input data
+# Individual data item types for each modality
+ImageDataInputItem = Union[Image, str, ImageData, Dict]
+AudioDataInputItem = Union[str, Dict]
+VideoDataInputItem = Union[str, Dict]
+# Union type for any multimodal data item
+MultimodalDataInputItem = Union[
+    ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
+]
+# Format types supporting single items, lists, or nested lists for batch processing
+MultimodalDataInputFormat = Union[
+    List[List[MultimodalDataInputItem]],
+    List[MultimodalDataInputItem],
+    MultimodalDataInputItem,
+]
+>>>>>>> origin/main
 
 
 @dataclass
@@ -60,11 +92,19 @@ class GenerateReqInput:
     # - List of images (one per request in a batch)
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
+<<<<<<< HEAD
     image_data: Optional[
         Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]
     ] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[Union[List[AudioDataItem], AudioDataItem]] = None
+=======
+    image_data: Optional[MultimodalDataInputFormat] = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    video_data: Optional[MultimodalDataInputFormat] = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: Optional[MultimodalDataInputFormat] = None
+>>>>>>> origin/main
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
@@ -84,6 +124,7 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+<<<<<<< HEAD
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -93,14 +134,32 @@ class GenerateReqInput:
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
 
+=======
+    # Whether to return hidden states
+    return_hidden_states: Union[List[bool], bool] = False
+
+    # The modalities of the image data [image, multi-images, video]
+    modalities: Optional[List[str]] = None
+    # Session info for continual prompting
+    session_params: Optional[Union[List[Dict], Dict]] = None
+
+    # The path to the LoRA adaptors
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
+
+>>>>>>> origin/main
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
+<<<<<<< HEAD
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
 
+=======
+>>>>>>> origin/main
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
@@ -109,8 +168,20 @@ class GenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+<<<<<<< HEAD
     def contains_mm_input(self) -> bool:
         return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
+=======
+    # For background responses (OpenAI responses API)
+    background: bool = False
+
+    def contains_mm_input(self) -> bool:
+        return (
+            has_valid_data(self.image_data)
+            or has_valid_data(self.video_data)
+            or has_valid_data(self.audio_data)
+        )
+>>>>>>> origin/main
 
     def normalize_batch_and_arguments(self):
         """
@@ -134,8 +205,11 @@ class GenerateReqInput:
         else:
             self._normalize_batch_inputs()
 
+<<<<<<< HEAD
         self._validate_session_params()
 
+=======
+>>>>>>> origin/main
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
         if (
@@ -200,6 +274,11 @@ class GenerateReqInput:
                 self.text = [self.text]
             if self.input_ids is not None:
                 self.input_ids = [self.input_ids]
+<<<<<<< HEAD
+=======
+            if self.input_embeds is not None:
+                self.input_embeds = [self.input_embeds]
+>>>>>>> origin/main
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -230,6 +309,10 @@ class GenerateReqInput:
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
+<<<<<<< HEAD
+=======
+        self._normalize_video_data(num)
+>>>>>>> origin/main
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
@@ -288,6 +371,12 @@ class GenerateReqInput:
                         self.modalities.append("image")
                     elif len(self.image_data[i]) > 1:
                         self.modalities.append("multi-images")
+<<<<<<< HEAD
+=======
+                    else:
+                        # Ensure len(self.modalities) == len(self.image_data)
+                        self.modalities.append(None)
+>>>>>>> origin/main
                 # Expand parallel_sample_num
                 self.image_data = self.image_data * self.parallel_sample_num
                 self.modalities = self.modalities * self.parallel_sample_num
@@ -298,6 +387,18 @@ class GenerateReqInput:
                 self.image_data = wrapped_images * self.parallel_sample_num
                 self.modalities = ["image"] * num
 
+<<<<<<< HEAD
+=======
+    def _normalize_video_data(self, num):
+        """Normalize video data for batch processing."""
+        if self.video_data is None:
+            self.video_data = [None] * num
+        elif not isinstance(self.video_data, list):
+            self.video_data = [self.video_data] * num
+        elif isinstance(self.video_data, list):
+            self.video_data = self.video_data * self.parallel_sample_num
+
+>>>>>>> origin/main
     def _normalize_audio_data(self, num):
         """Normalize audio data for batch processing."""
         if self.audio_data is None:
@@ -324,7 +425,13 @@ class GenerateReqInput:
             new_rids = [f"{self.rid}_{i}" for i in range(num)]
             self.rid = new_rids
         elif isinstance(self.rid, list):
+<<<<<<< HEAD
             if len(self.rid) != num:
+=======
+            # Note: the length of rid shall be the same as the batch_size,
+            # as the rid would be expanded for parallel sampling in tokenizer_manager
+            if len(self.rid) != self.batch_size:
+>>>>>>> origin/main
                 raise ValueError(
                     "The specified rids length mismatch with the batch_size for batch processing."
                 )
@@ -400,7 +507,15 @@ class GenerateReqInput:
         return GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
+<<<<<<< HEAD
             image_data=self.image_data[i],
+=======
+            input_embeds=(
+                self.input_embeds[i] if self.input_embeds is not None else None
+            ),
+            image_data=self.image_data[i],
+            video_data=self.video_data[i],
+>>>>>>> origin/main
             audio_data=self.audio_data[i],
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
@@ -413,6 +528,10 @@ class GenerateReqInput:
             log_metrics=self.log_metrics,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+<<<<<<< HEAD
+=======
+            lora_id=self.lora_id[i] if self.lora_id is not None else None,
+>>>>>>> origin/main
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
@@ -463,7 +582,11 @@ class TokenizedGenerateReqInput:
     stream: bool
 
     # LoRA related
+<<<<<<< HEAD
     lora_path: Optional[str] = None  # None means just use the base model
+=======
+    lora_id: Optional[str] = None  # None means just use the base model
+>>>>>>> origin/main
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
@@ -486,6 +609,27 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+<<<<<<< HEAD
+=======
+    # For dp balance
+    dp_balance_id: int = -1
+
+
+@dataclass
+class BatchTokenizedGenerateReqInput:
+    # The batch of tokenized requests
+    batch: List[TokenizedGenerateReqInput]
+
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, i):
+        return self.batch[i]
+
+    def __iter__(self):
+        return iter(self.batch)
+
+>>>>>>> origin/main
 
 @dataclass
 class EmbeddingReqInput:
@@ -497,17 +641,29 @@ class EmbeddingReqInput:
     # - List of images (one per request in a batch)
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
+<<<<<<< HEAD
     image_data: Optional[
         Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
     ] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[Union[List[str], str]] = None
+=======
+    image_data: Optional[MultimodalDataInputFormat] = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    video_data: Optional[MultimodalDataInputFormat] = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: Optional[MultimodalDataInputFormat] = None
+>>>>>>> origin/main
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The request id.
     rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
+<<<<<<< HEAD
     sampling_params: Union[List[Dict], Dict] = None
+=======
+    sampling_params: Optional[Union[List[Dict], Dict]] = None
+>>>>>>> origin/main
     # Dummy input embeds for compatibility
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -517,6 +673,12 @@ class EmbeddingReqInput:
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
 
+<<<<<<< HEAD
+=======
+    # For background responses (OpenAI responses API)
+    background: bool = False
+
+>>>>>>> origin/main
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
@@ -563,6 +725,11 @@ class EmbeddingReqInput:
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
+<<<<<<< HEAD
+=======
+            elif isinstance(self.sampling_params, dict):
+                self.sampling_params = [self.sampling_params] * self.batch_size
+>>>>>>> origin/main
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
@@ -571,14 +738,25 @@ class EmbeddingReqInput:
         return self.rid
 
     def contains_mm_input(self) -> bool:
+<<<<<<< HEAD
         return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
+=======
+        return (
+            has_valid_data(self.image_data)
+            or has_valid_data(self.video_data)
+            or has_valid_data(self.audio_data)
+        )
+>>>>>>> origin/main
 
     def __getitem__(self, i):
         if self.is_cross_encoder_request:
             return EmbeddingReqInput(
                 text=[self.text[i]] if self.text is not None else None,
+<<<<<<< HEAD
                 input_ids=None,
                 image_data=None,
+=======
+>>>>>>> origin/main
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
                 is_cross_encoder_request=True,
@@ -588,6 +766,11 @@ class EmbeddingReqInput:
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             image_data=self.image_data[i] if self.image_data is not None else None,
+<<<<<<< HEAD
+=======
+            audio_data=self.audio_data[i] if self.audio_data is not None else None,
+            video_data=self.video_data[i] if self.video_data is not None else None,
+>>>>>>> origin/main
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
         )
@@ -607,6 +790,28 @@ class TokenizedEmbeddingReqInput:
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+<<<<<<< HEAD
+=======
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+    # For dp balance
+    dp_balance_id: int = -1
+
+
+@dataclass
+class BatchTokenizedEmbeddingReqInput:
+    # The batch of tokenized embedding requests
+    batch: List[TokenizedEmbeddingReqInput]
+
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, i):
+        return self.batch[i]
+
+    def __iter__(self):
+        return iter(self.batch)
+>>>>>>> origin/main
 
 
 @dataclass
@@ -743,6 +948,11 @@ class UpdateWeightFromDiskReqInput:
     load_format: Optional[str] = None
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+<<<<<<< HEAD
+=======
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+>>>>>>> origin/main
 
 
 @dataclass
@@ -764,6 +974,11 @@ class UpdateWeightsFromDistributedReqInput:
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+<<<<<<< HEAD
+=======
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+>>>>>>> origin/main
 
 
 @dataclass
@@ -787,6 +1002,11 @@ class UpdateWeightsFromTensorReqInput:
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+<<<<<<< HEAD
+=======
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+>>>>>>> origin/main
 
 
 @dataclass
@@ -818,6 +1038,17 @@ class InitWeightsUpdateGroupReqOutput:
 
 
 @dataclass
+<<<<<<< HEAD
+=======
+class UpdateWeightVersionReqInput:
+    # The new weight version
+    new_version: str
+    # Whether to abort all running requests before updating
+    abort_all_requests: bool = True
+
+
+@dataclass
+>>>>>>> origin/main
 class GetWeightsByNameReqInput:
     name: str
     truncate_size: int = 100
@@ -868,6 +1099,11 @@ class AbortReq:
     rid: str = ""
     # Whether to abort all requests
     abort_all: bool = False
+<<<<<<< HEAD
+=======
+    # The finished reason data
+    finished_reason: Optional[Dict[str, Any]] = None
+>>>>>>> origin/main
 
 
 @dataclass
@@ -898,6 +1134,10 @@ class ProfileReqInput:
     # If set, it profile as many as this number of steps.
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
+<<<<<<< HEAD
+=======
+    start_step: Optional[int] = None
+>>>>>>> origin/main
     num_steps: Optional[int] = None
     activities: Optional[List[str]] = None
     profile_by_stage: bool = False
@@ -910,6 +1150,7 @@ class ProfileReqType(Enum):
     STOP_PROFILE = 2
 
 
+<<<<<<< HEAD
 class ExpertDistributionReq(Enum):
     START_RECORD = 1
     STOP_RECORD = 2
@@ -921,10 +1162,16 @@ class ExpertDistributionReqOutput:
     pass
 
 
+=======
+>>>>>>> origin/main
 @dataclass
 class ProfileReq:
     type: ProfileReqType
     output_dir: Optional[str] = None
+<<<<<<< HEAD
+=======
+    start_step: Optional[int] = None
+>>>>>>> origin/main
     num_steps: Optional[int] = None
     activities: Optional[List[str]] = None
     profile_by_stage: bool = False
@@ -940,6 +1187,14 @@ class ProfileReqOutput:
 
 
 @dataclass
+<<<<<<< HEAD
+=======
+class FreezeGCReq:
+    pass
+
+
+@dataclass
+>>>>>>> origin/main
 class ConfigureLoggingReq:
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
@@ -969,6 +1224,20 @@ class HealthCheckOutput:
     pass
 
 
+<<<<<<< HEAD
+=======
+class ExpertDistributionReq(Enum):
+    START_RECORD = 1
+    STOP_RECORD = 2
+    DUMP_RECORD = 3
+
+
+@dataclass
+class ExpertDistributionReqOutput:
+    pass
+
+
+>>>>>>> origin/main
 @dataclass
 class Function:
     description: Optional[str] = None
@@ -1023,19 +1292,62 @@ class LoadLoRAAdapterReqInput:
     lora_name: str
     # The path of loading.
     lora_path: str
+<<<<<<< HEAD
+=======
+    # Whether to pin the LoRA adapter in memory.
+    pinned: bool = False
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path=self.lora_path,
+            pinned=self.pinned,
+        )
+>>>>>>> origin/main
 
 
 @dataclass
 class UnloadLoRAAdapterReqInput:
     # The name of lora module to unload.
     lora_name: str
+<<<<<<< HEAD
+=======
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+        )
+>>>>>>> origin/main
 
 
 @dataclass
 class LoRAUpdateResult:
     success: bool
     error_message: Optional[str] = None
+<<<<<<< HEAD
     loaded_adapters: Dict[str, str] = field(default_factory=dict)
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
+=======
+    loaded_adapters: Optional[Dict[str, LoRARef]] = None
+
+
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
+
+
+class BlockReqType(Enum):
+    BLOCK = 1
+    UNBLOCK = 2
+
+
+@dataclass
+class BlockReqInput:
+    type: BlockReqType
+>>>>>>> origin/main

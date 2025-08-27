@@ -164,9 +164,12 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
     num_tokens_post_pad_cuda = torch.empty(
         (1), dtype=torch.int32, device=topk_ids.device
     )
+<<<<<<< HEAD
     token_cnts_buffer = torch.zeros(
         (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
     )
+=======
+>>>>>>> origin/main
     cumsum_buffer = torch.zeros(
         num_experts + 1, dtype=torch.int32, device=topk_ids.device
     )
@@ -189,7 +192,10 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         sorted_ids_cuda,
         expert_ids_cuda,
         num_tokens_post_pad_cuda,
+<<<<<<< HEAD
         token_cnts_buffer,
+=======
+>>>>>>> origin/main
         cumsum_buffer,
     )
     moe_align_block_size_triton(
@@ -273,11 +279,14 @@ def sgl_moe_align_block_size_with_empty(
     if not pad_sorted_token_ids:
         sorted_ids.fill_(topk_ids.numel())
 
+<<<<<<< HEAD
     token_cnts_buffer = torch.empty(
         (num_experts + 1) * num_experts,
         dtype=torch.int32,
         device=topk_ids.device,
     )
+=======
+>>>>>>> origin/main
     cumsum_buffer = torch.empty(
         num_experts + 1, dtype=torch.int32, device=topk_ids.device
     )
@@ -289,7 +298,10 @@ def sgl_moe_align_block_size_with_empty(
         sorted_ids.clone(),
         expert_ids.clone(),
         num_tokens_post_pad.clone(),
+<<<<<<< HEAD
         token_cnts_buffer,
+=======
+>>>>>>> origin/main
         cumsum_buffer,
         pad_sorted_token_ids,
     )

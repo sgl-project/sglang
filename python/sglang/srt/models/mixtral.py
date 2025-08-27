@@ -24,6 +24,10 @@ from torch import nn
 from transformers import MixtralConfig
 
 from sglang.srt.distributed import (
+<<<<<<< HEAD
+=======
+    get_moe_expert_parallel_world_size,
+>>>>>>> origin/main
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -37,6 +41,10 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+<<<<<<< HEAD
+=======
+from sglang.srt.layers.moe.topk import TopK
+>>>>>>> origin/main
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -45,7 +53,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+<<<<<<< HEAD
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+=======
+>>>>>>> origin/main
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
@@ -68,6 +79,10 @@ class MixtralMoE(nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+<<<<<<< HEAD
+=======
+        layer_id: int,
+>>>>>>> origin/main
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
@@ -86,6 +101,7 @@ class MixtralMoE(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
+<<<<<<< HEAD
         MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
         self.experts = MoEImpl(
             num_experts=num_experts,
@@ -96,6 +112,23 @@ class MixtralMoE(nn.Module):
             renormalize=True,
             quant_config=quant_config,
             tp_size=tp_size,
+=======
+
+        self.topk = TopK(
+            top_k=top_k,
+            renormalize=True,
+        )
+
+        MoEImpl = EPMoE if get_moe_expert_parallel_world_size() > 1 else FusedMoE
+        self.experts = MoEImpl(
+            num_experts=num_experts,
+            top_k=top_k,
+            layer_id=layer_id,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+>>>>>>> origin/main
             prefix=add_prefix("experts", prefix),
         )
 
@@ -105,7 +138,12 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+<<<<<<< HEAD
         final_hidden_states = self.experts(hidden_states, router_logits)
+=======
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
+>>>>>>> origin/main
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(orig_shape)
@@ -219,6 +257,10 @@ class MixtralDecoderLayer(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
+<<<<<<< HEAD
+=======
+            layer_id=layer_id,
+>>>>>>> origin/main
             quant_config=quant_config,
             prefix=add_prefix("block_sparse_moe", prefix),
         )
@@ -388,8 +430,12 @@ class MixtralForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+<<<<<<< HEAD
         MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
         expert_params_mapping = MoEImpl.make_expert_params_mapping(
+=======
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+>>>>>>> origin/main
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",

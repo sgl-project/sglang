@@ -2,11 +2,19 @@ import heapq
 import logging
 import threading
 import time
+<<<<<<< HEAD
+=======
+from queue import Queue
+>>>>>>> origin/main
 from typing import List, Optional
 
 import torch
 
+<<<<<<< HEAD
 from sglang.srt.managers.cache_controller import HiCacheController
+=======
+from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+>>>>>>> origin/main
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import (
@@ -34,6 +42,7 @@ class HiRadixCache(RadixCache):
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
+<<<<<<< HEAD
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -43,29 +52,94 @@ class HiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache, hicache_ratio, hicache_size, page_size
+=======
+        hicache_io_backend: str,
+        hicache_mem_layout: str,
+        hicache_storage_backend: Optional[str] = None,
+        hicache_storage_prefetch_policy: Optional[str] = "best_effort",
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[str] = None,
+    ):
+
+        if hicache_io_backend == "direct":
+            if hicache_mem_layout == "page_first":
+                hicache_mem_layout = "layer_first"
+                logger.warning(
+                    "Page first layout is not supported with direct IO backend, switching to layer first layout"
+                )
+
+        self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(self.kv_cache, MHATokenToKVPool):
+            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+                self.kv_cache,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+                hicache_mem_layout,
+            )
+        elif isinstance(self.kv_cache, MLATokenToKVPool):
+            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
+                self.kv_cache,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+                hicache_mem_layout,
+>>>>>>> origin/main
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
         self.tp_group = tp_cache_group
+<<<<<<< HEAD
+=======
+        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.enable_storage = hicache_storage_backend is not None
+        # todo: customizable storage prefetch threshold and timeout
+        self.prefetch_threshold = 256
+        self.prefetch_timeout = 3  # seconds
+        self.prefetch_stop_policy = hicache_storage_prefetch_policy
+>>>>>>> origin/main
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator,
             self.token_to_kv_pool_host,
             page_size,
+<<<<<<< HEAD
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
+=======
+            self.tp_group,
+            load_cache_event=self.load_cache_event,
+            write_policy=hicache_write_policy,
+            io_backend=hicache_io_backend,
+            storage_backend=hicache_storage_backend,
+            prefetch_threshold=self.prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+>>>>>>> origin/main
         )
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
+<<<<<<< HEAD
+=======
+        # record the ongoing prefetch requests
+        self.ongoing_prefetch = {}
+        self.ongoing_backup = {}
+>>>>>>> origin/main
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 3
         )
+<<<<<<< HEAD
+=======
+        self.write_through_threshold_storage = (
+            1 if hicache_write_policy == "write_through" else 3
+        )
+>>>>>>> origin/main
         self.load_back_threshold = 10
         super().__init__(
             req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
@@ -97,6 +171,10 @@ class HiRadixCache(RadixCache):
             )
         if host_indices is not None:
             node.host_value = host_indices
+<<<<<<< HEAD
+=======
+            assert len(node.host_value) > 0
+>>>>>>> origin/main
             self.ongoing_write_through[node.id] = node
             if not write_back:
                 # no need to lock nodes if write back
@@ -106,6 +184,7 @@ class HiRadixCache(RadixCache):
 
         return len(host_indices)
 
+<<<<<<< HEAD
     def inc_hit_count(self, node: TreeNode):
         if node.backuped or self.cache_controller.write_policy == "write_back":
             return
@@ -113,6 +192,32 @@ class HiRadixCache(RadixCache):
         if node.hit_count >= self.write_through_threshold:
             self.write_backup(node)
             node.hit_count = 0
+=======
+    def write_backup_storage(self, node: TreeNode):
+        operation_id = self.cache_controller.write_storage(
+            node.host_value, node.key, node.hash_value
+        )
+        self.ongoing_backup[operation_id] = node
+        node.protect_host()
+
+    def inc_hit_count(self, node: TreeNode):
+        if self.cache_controller.write_policy == "write_back":
+            return
+        node.hit_count += 1
+
+        if not node.backuped:
+            if node.hit_count >= self.write_through_threshold:
+                # write to host if the node is not backuped
+                self.write_backup(node)
+        else:
+            if (
+                self.enable_storage
+                and (not node.backuped_storage)
+                and node.hit_count >= self.write_through_threshold_storage
+            ):
+                # if the node is backuped on host memory but not on storage
+                self.write_backup_storage(node)
+>>>>>>> origin/main
 
     def writing_check(self, write_back=False):
         if write_back:
@@ -124,7 +229,11 @@ class HiRadixCache(RadixCache):
         queue_size = torch.tensor(
             self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
         )
+<<<<<<< HEAD
         if torch.distributed.get_world_size(group=self.tp_group) > 1:
+=======
+        if self.tp_world_size > 1:
+>>>>>>> origin/main
             # synchrnoize TP workers to make the same update to radix cache
             torch.distributed.all_reduce(
                 queue_size,
@@ -219,6 +328,13 @@ class HiRadixCache(RadixCache):
             if not x.evicted:
                 continue
 
+<<<<<<< HEAD
+=======
+            # node is protected from eviction as it has ongoing prefetch or backup to storage
+            if x.host_ref_counter > 0:
+                continue
+
+>>>>>>> origin/main
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
             for k, v in x.parent.children.items():
@@ -312,6 +428,148 @@ class HiRadixCache(RadixCache):
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
+<<<<<<< HEAD
+=======
+        if self.enable_storage:
+            self.check_revoked_prefetch()
+            self.check_backup_progress()
+
+    def check_revoked_prefetch(self):
+        queue_size = torch.tensor(
+            self.cache_controller.prefetch_revoke_queue.qsize(), dtype=torch.int
+        )
+        if self.tp_world_size > 1:
+            # synchrnoize TP workers to make the same update to hiradix cache
+            torch.distributed.all_reduce(
+                queue_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        for _ in range(queue_size.item()):
+            req_id = self.cache_controller.prefetch_revoke_queue.get()
+            if req_id in self.ongoing_prefetch:
+                last_host_node, token_ids, _, _ = self.ongoing_prefetch[req_id]
+                last_host_node.release_host()
+                del self.ongoing_prefetch[req_id]
+                self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+            else:
+                # the revoked operation already got terminated
+                pass
+
+    def check_backup_progress(self):
+        queue_size = torch.tensor(
+            self.cache_controller.ack_backup_queue.qsize(), dtype=torch.int
+        )
+        if self.tp_world_size > 1:
+            # synchrnoize TP workers to make the same update to hiradix cache
+            torch.distributed.all_reduce(
+                queue_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        for _ in range(queue_size.item()):
+            ack_id, completed_tokens = self.cache_controller.ack_backup_queue.get()
+            host_node = self.ongoing_backup[ack_id]
+
+            if completed_tokens > 0:
+                if completed_tokens < len(host_node.key):
+                    # backup is only partially successful, split the node
+                    new_node = self._split_node(
+                        host_node.key, host_node, completed_tokens
+                    )
+                    new_node.backuped_storage = True
+                else:
+                    host_node.backuped_storage = True
+            host_node.release_host()
+            del self.ongoing_backup[ack_id]
+
+    def can_terminate_prefetch(self, operation: PrefetchOperation):
+        can_terminate = True
+
+        if self.prefetch_stop_policy == "best_effort":
+            return can_terminate
+
+        completed = (
+            operation.completed_tokens == len(operation.hash_value) * self.page_size
+        )
+
+        if self.prefetch_stop_policy == "wait_complete":
+            can_terminate = completed
+        elif self.prefetch_stop_policy == "timeout":
+            can_terminate = completed or (
+                time.monotonic() - operation.start_time > self.prefetch_timeout
+            )
+        else:
+            # unknown prefetch stop policy, just return True
+            return True
+
+        if self.tp_world_size > 1:
+            can_terminate = torch.tensor(can_terminate, dtype=torch.int)
+            torch.distributed.all_reduce(
+                can_terminate,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            can_terminate = bool(can_terminate.item())
+
+        return can_terminate
+
+    def check_prefetch_progress(self, req_id: str) -> bool:
+        if req_id not in self.ongoing_prefetch:
+            # there is no ongoing prefetch for this request or it has been revoked
+            return True
+
+        # todo: more policies for prefetch progress such as timeout
+        # the current policy is to prefetch with best effort and terminate when queuing is over
+        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
+            req_id
+        ]
+
+        if operation.host_indices is None:
+            # prefetch has not been issued due to insufficient host memory
+            return True
+
+        if not self.can_terminate_prefetch(operation):
+            return False
+
+        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+            operation
+        )
+        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+
+        min_completed_tokens = completed_tokens
+        if self.tp_world_size > 1 and self.prefetch_stop_policy != "wait_complete":
+            # synchrnoize TP workers to make the same update to hiradix cache
+            completed_tokens_tensor = torch.tensor(
+                min_completed_tokens, dtype=torch.int
+            )
+            torch.distributed.all_reduce(
+                completed_tokens_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            min_completed_tokens = completed_tokens_tensor.item()
+        fetched_token_ids = token_ids[:min_completed_tokens]
+        written_indices = host_indices[:min_completed_tokens]
+        matched_length = self._insert_helper_host(
+            last_host_node,
+            fetched_token_ids,
+            written_indices,
+            hash_value[: min_completed_tokens // self.page_size],
+        )
+        if len(written_indices):
+            self.cache_controller.mem_pool_host.update_prefetch(written_indices)
+
+        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        self.cache_controller.mem_pool_host.free(
+            host_indices[min_completed_tokens:completed_tokens]
+        )
+        last_host_node.release_host()
+        del self.ongoing_prefetch[req_id]
+        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+        return True
+>>>>>>> origin/main
 
     def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -338,6 +596,11 @@ class HiRadixCache(RadixCache):
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
+<<<<<<< HEAD
+=======
+        while not last_host_node.backuped:
+            last_host_node = last_host_node.parent
+>>>>>>> origin/main
 
         return MatchResult(
             device_indices=value,
@@ -346,6 +609,74 @@ class HiRadixCache(RadixCache):
             host_hit_length=host_hit_length,
         )
 
+<<<<<<< HEAD
+=======
+    def prefetch_from_storage(
+        self,
+        req_id: str,
+        last_host_node: TreeNode,
+        new_input_tokens: List[int],
+        last_hash: Optional[str] = None,
+    ):
+        # align the number of fetching tokens to the page size
+        prefetch_length = len(new_input_tokens) - (
+            len(new_input_tokens) % self.page_size
+        )
+        new_input_tokens = new_input_tokens[:prefetch_length]
+        if not self.enable_storage or prefetch_length < self.prefetch_threshold:
+            return
+
+        last_host_node.protect_host()
+        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            self.evict_host(prefetch_length)
+            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        operation = self.cache_controller.prefetch(
+            req_id, host_indices, new_input_tokens, last_hash
+        )
+        self.ongoing_prefetch[req_id] = (
+            last_host_node,
+            new_input_tokens,
+            host_indices,
+            operation,
+        )
+        self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+
+    def _insert_helper_host(self, node: TreeNode, key: List, host_value, hash_value):
+        node.last_access_time = time.monotonic()
+        if len(key) == 0:
+            return 0
+
+        child_key = self.get_child_key_fn(key)
+
+        matched_length = 0
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = time.monotonic()
+            prefix_len = self.key_match_fn(node.key, key)
+            key = key[prefix_len:]
+            host_value = host_value[prefix_len:]
+            hash_value = hash_value[prefix_len // self.page_size :]
+            matched_length += prefix_len
+
+            if prefix_len < len(node.key):
+                new_node = self._split_node(node.key, node, prefix_len)
+                node = new_node
+
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
+        if len(key):
+            new_node = TreeNode()
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = None
+            new_node.host_value = host_value
+            new_node.hash_value = hash_value
+            node.children[child_key] = new_node
+        return matched_length
+
+>>>>>>> origin/main
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
@@ -357,13 +688,19 @@ class HiRadixCache(RadixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+<<<<<<< HEAD
                 self.inc_hit_count(new_node)
+=======
+>>>>>>> origin/main
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
                 break
             else:
+<<<<<<< HEAD
                 self.inc_hit_count(child)
+=======
+>>>>>>> origin/main
                 if not child.evicted:
                     value.append(child.value)
                 node = child
@@ -393,6 +730,13 @@ class HiRadixCache(RadixCache):
         if child.backuped:
             new_node.host_value = child.host_value[:split_len]
             child.host_value = child.host_value[split_len:]
+<<<<<<< HEAD
+=======
+
+        if child.hash_value:
+            new_node.hash_value = child.hash_value[: split_len // self.page_size]
+            child.hash_value = child.hash_value[split_len // self.page_size :]
+>>>>>>> origin/main
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
@@ -447,6 +791,24 @@ class HiRadixCache(RadixCache):
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
 
+<<<<<<< HEAD
+=======
+            if self.enable_storage:
+                last_hash = node.get_last_hash_value()
+                assert (node == self.root_node) or (
+                    last_hash is not None
+                ), "Parent node must have a hash value with storage enabled"
+                new_node.hash_value = []
+                for idx in range(0, len(key), self.page_size):
+                    new_node.hash_value.append(
+                        self.cache_controller.get_hash_str(
+                            key[idx : idx + self.page_size],
+                            prior_hash=last_hash,
+                        )
+                    )
+                    last_hash = new_node.hash_value[-1]
+
+>>>>>>> origin/main
             if self.cache_controller.write_policy != "write_back":
                 self.inc_hit_count(new_node)
         return total_prefix_length

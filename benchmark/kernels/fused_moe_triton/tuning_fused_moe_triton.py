@@ -2,6 +2,10 @@
 import argparse
 import json
 import time
+<<<<<<< HEAD
+=======
+from contextlib import nullcontext
+>>>>>>> origin/main
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, TypedDict
 
@@ -11,6 +15,10 @@ import triton
 from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
 
+<<<<<<< HEAD
+=======
+from sglang.srt.layers.moe.fused_moe_triton import override_config
+>>>>>>> origin/main
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe,
     get_config_dtype_str,
@@ -18,6 +26,11 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_default_config,
     get_moe_configs,
 )
+<<<<<<< HEAD
+=======
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+>>>>>>> origin/main
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -115,6 +128,7 @@ def benchmark_config(
         w1 = w1.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
         w2 = w2.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
 
+<<<<<<< HEAD
     input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
 
     def prepare(i: int):
@@ -122,16 +136,41 @@ def benchmark_config(
 
     def run():
         from sglang.srt.layers.moe.fused_moe_triton import override_config
+=======
+    input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
+    topk_config = TopKConfig(
+        top_k=topk,
+        renormalize=True,
+    )
+    topk_output = select_experts(x, input_gating, topk_config)
+
+    def prepare(i: int):
+        input_gating = gating_output[i]
+        new_topk_output = select_experts(x, input_gating, topk_config)
+        topk_output.topk_weights.copy_(new_topk_output.topk_weights)
+        topk_output.topk_ids.copy_(new_topk_output.topk_ids)
+        topk_output.router_logits.copy_(new_topk_output.router_logits)
+
+    def run():
+        moe_runner_config = MoeRunnerConfig(
+            inplace=True,
+        )
+>>>>>>> origin/main
 
         with override_config(config):
             fused_moe(
                 x,
                 w1,
                 w2,
+<<<<<<< HEAD
                 input_gating,
                 topk,
                 renormalize=True,
                 inplace=True,
+=======
+                topk_output,
+                moe_runner_config=moe_runner_config,
+>>>>>>> origin/main
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_int8_w8a8=use_int8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
@@ -233,6 +272,12 @@ class BenchmarkWorker:
         torch.set_default_device("cuda")
         torch.cuda.manual_seed_all(0)
         self.seed = seed
+<<<<<<< HEAD
+=======
+        # Get the device ID to allocate tensors and kernels
+        # on the respective GPU.
+        self.device_id = int(ray.get_gpu_ids()[0])
+>>>>>>> origin/main
 
     def benchmark(
         self,
@@ -271,6 +316,7 @@ class BenchmarkWorker:
             )
         else:
             config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
+<<<<<<< HEAD
         kernel_time = benchmark_config(
             config,
             num_tokens,
@@ -284,6 +330,22 @@ class BenchmarkWorker:
             use_int8_w8a16,
             block_shape,
         )
+=======
+        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            kernel_time = benchmark_config(
+                config,
+                num_tokens,
+                num_experts,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a8,
+                use_int8_w8a16,
+                block_shape,
+            )
+>>>>>>> origin/main
         return config, kernel_time
 
     def tune(
@@ -302,6 +364,7 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
+<<<<<<< HEAD
         for config in tqdm(search_space):
             try:
                 kernel_time = benchmark_config(
@@ -325,6 +388,32 @@ class BenchmarkWorker:
             if kernel_time < best_time:
                 best_time = kernel_time
                 best_config = config
+=======
+        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+            for config in tqdm(search_space):
+                try:
+                    kernel_time = benchmark_config(
+                        config,
+                        num_tokens,
+                        num_experts,
+                        shard_intermediate_size,
+                        hidden_size,
+                        topk,
+                        dtype,
+                        use_fp8_w8a8,
+                        use_int8_w8a8,
+                        use_int8_w8a16,
+                        block_shape,
+                        num_iters=10,
+                    )
+                except triton.runtime.autotuner.OutOfResources:
+                    # Some configurations may be invalid and fail to compile.
+                    continue
+
+                if kernel_time < best_time:
+                    best_time = kernel_time
+                    best_config = config
+>>>>>>> origin/main
         now = datetime.now()
         print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
         assert best_config is not None
@@ -423,6 +512,14 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+<<<<<<< HEAD
+=======
+    elif config.architectures[0] in ["Glm4MoeForCausalLM"]:
+        E = config.n_routed_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+>>>>>>> origin/main
     else:
         # Default: Mixtral
         E = config.num_local_experts

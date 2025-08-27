@@ -1960,7 +1960,11 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         self.logits_processor = LogitsProcessor(config)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+<<<<<<< HEAD
         pixel_values = torch.concat([item.pixel_values for item in items], dim=0)
+=======
+        pixel_values = torch.concat([item.feature for item in items], dim=0)
+>>>>>>> origin/main
         bs, n = pixel_values.shape[0:2]
         pixel_values = pixel_values.to(
             device=self.vision_model.device, dtype=self.vision_model.dtype
@@ -1989,7 +1993,11 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
+<<<<<<< HEAD
             image_data_embedding_func=self.get_image_feature,
+=======
+            multimodal_model=self,
+>>>>>>> origin/main
             language_model=self.language_model,
             positions=positions,
         )

@@ -1,19 +1,32 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/v0.8.2/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+<<<<<<< HEAD
+=======
+from __future__ import annotations
+>>>>>>> origin/main
 
 import enum
 import logging
 from enum import Enum
+<<<<<<< HEAD
 from typing import Callable, List, Optional
+=======
+from typing import TYPE_CHECKING, List, Optional
+>>>>>>> origin/main
 
 import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
+<<<<<<< HEAD
+=======
+from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+>>>>>>> origin/main
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
+<<<<<<< HEAD
     cpu_has_amx_support,
     per_tensor_dequantize,
     replace_parameter,
@@ -28,6 +41,35 @@ _is_cpu = is_cpu()
 if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
+=======
+    per_tensor_dequantize,
+    replace_parameter,
+)
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.ops.shuffle import shuffle_weight
+
+    from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
+>>>>>>> origin/main
 
 try:
     import vllm
@@ -51,7 +93,11 @@ __all__ = [
 ]
 
 
+<<<<<<< HEAD
 class CompressedTensorsMoEMethod:
+=======
+class CompressedTensorsMoEMethod(FusedMoEMethodBase):
+>>>>>>> origin/main
     def __new__(cls, *args, **kwargs):
         if cls is CompressedTensorsMoEMethod:
             return super().__new__(cls)
@@ -59,7 +105,11 @@ class CompressedTensorsMoEMethod:
 
     @staticmethod
     def get_moe_method(
+<<<<<<< HEAD
         quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
+=======
+        quant_config: CompressedTensorsConfig,
+>>>>>>> origin/main
     ) -> "CompressedTensorsMoEMethod":
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -82,9 +132,13 @@ class CompressedTensorsMoEMethod:
 
 class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
+<<<<<<< HEAD
     def __init__(
         self, quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
     ):
+=======
+    def __init__(self, quant_config: CompressedTensorsConfig):
+>>>>>>> origin/main
         self.quant_config = quant_config
         self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
@@ -191,7 +245,11 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+<<<<<<< HEAD
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+=======
+    def process_weights_after_loading(self, layer: FusedMoE) -> None:
+>>>>>>> origin/main
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
         if self.static_input_scales:
@@ -248,7 +306,11 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             assert layer.w13_weight_scale is not None
             shard_size = layer.intermediate_size_per_partition
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
+<<<<<<< HEAD
             for expert_id in range(layer.local_num_experts):
+=======
+            for expert_id in range(layer.num_local_experts):
+>>>>>>> origin/main
                 start = 0
                 for shard_id in range(2):
                     dq_weight = per_tensor_dequantize(
@@ -266,10 +328,28 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 max_w13_scales, requires_grad=False
             )
 
+<<<<<<< HEAD
+=======
+        if _use_aiter:
+            with torch.no_grad():
+                # Pre-shuffle weights
+                layer.w13_weight = torch.nn.Parameter(
+                    shuffle_weight(layer.w13_weight.data, (16, 16)),
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
+                layer.w2_weight = torch.nn.Parameter(
+                    shuffle_weight(layer.w2_weight.data, (16, 16)),
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
+
+>>>>>>> origin/main
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+<<<<<<< HEAD
         router_logits: torch.Tensor,
         top_k: int,
         renormalize: bool,
@@ -323,13 +403,61 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             apply_router_weight_on_input=apply_router_weight_on_input,
             routed_scaling_factor=routed_scaling_factor,
         )
+=======
+        topk_output: TopKOutput,
+        moe_runner_config: MoeRunnerConfig,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.fused_moe_triton import fused_experts
+
+        if (
+            _use_aiter
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and moe_runner_config.apply_router_weight_on_input
+        ):
+            topk_weights, topk_ids, _ = topk_output
+            return rocm_fused_experts_tkw1(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=moe_runner_config.activation,
+                apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+                use_fp8_w8a8=True,
+                per_channel_quant=self.weight_quant.strategy
+                == QuantizationStrategy.CHANNEL,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
+        else:
+            return fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_output=topk_output,
+                moe_runner_config=moe_runner_config,
+                use_fp8_w8a8=True,
+                per_channel_quant=self.weight_quant.strategy
+                == QuantizationStrategy.CHANNEL,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
+>>>>>>> origin/main
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
+<<<<<<< HEAD
     def __init__(
         self, quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
     ):
+=======
+    def __init__(self, quant_config: CompressedTensorsConfig):
+>>>>>>> origin/main
         self.quant_config = quant_config
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -589,6 +717,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
 
+<<<<<<< HEAD
+=======
+        from vllm import _custom_ops as vllm_ops
+
+>>>>>>> origin/main
         marlin_w13_qweight = vllm_ops.gptq_marlin_moe_repack(
             layer.w13_weight_packed,
             layer.w13_g_idx_sort_indices,
@@ -628,6 +761,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+<<<<<<< HEAD
         router_logits: torch.Tensor,
         top_k: int,
         renormalize: bool,
@@ -665,6 +799,17 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
+=======
+        topk_output: TopKOutput,
+        moe_runner_config: MoeRunnerConfig,
+    ) -> torch.Tensor:
+
+        assert (
+            moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        topk_weights, topk_ids, router_logits = topk_output
+>>>>>>> origin/main
 
         return torch.ops.vllm.fused_marlin_moe(
             x,

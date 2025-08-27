@@ -157,7 +157,11 @@ def test_moe_align_block_size_compare_implementations(
         :, :topk
     ]
 
+<<<<<<< HEAD
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+=======
+    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+>>>>>>> origin/main
 
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
@@ -171,6 +175,7 @@ def test_moe_align_block_size_compare_implementations(
     num_tokens_post_pad_cuda = torch.empty(
         (1), dtype=torch.int32, device=topk_ids.device
     )
+<<<<<<< HEAD
     token_cnts_buffer = torch.empty(
         (num_experts + 1) * num_experts,
         dtype=torch.int32,
@@ -178,6 +183,10 @@ def test_moe_align_block_size_compare_implementations(
     )
     cumsum_buffer = torch.empty(
         num_experts + 1, dtype=torch.int32, device=topk_ids.device
+=======
+    cumsum_buffer = torch.empty(
+        num_experts + 2, dtype=torch.int32, device=topk_ids.device
+>>>>>>> origin/main
     )
 
     sorted_ids_triton = torch.empty_like(sorted_ids_cuda)
@@ -187,19 +196,30 @@ def test_moe_align_block_size_compare_implementations(
 
     moe_align_block_size(
         topk_ids,
+<<<<<<< HEAD
         num_experts,
+=======
+        num_experts + 1,
+>>>>>>> origin/main
         block_size,
         sorted_ids_cuda,
         expert_ids_cuda,
         num_tokens_post_pad_cuda,
+<<<<<<< HEAD
         token_cnts_buffer,
+=======
+>>>>>>> origin/main
         cumsum_buffer,
         pad_sorted_token_ids,
     )
 
     moe_align_block_size_triton(
         topk_ids,
+<<<<<<< HEAD
         num_experts,
+=======
+        num_experts + 1,
+>>>>>>> origin/main
         block_size,
         sorted_ids_triton,
         expert_ids_triton,
@@ -229,7 +249,11 @@ def test_moe_align_block_size_compare_implementations(
     matching_indices = torch.where(expert_ids_cuda == expert_idx)[0]
     block_sorted_start = matching_indices[0].item() * block_size
     block_sorted_end = min(
+<<<<<<< HEAD
         (matching_indices[-1].item() + 1) * block_size, max_num_tokens_padded
+=======
+        (matching_indices[-1].item() + 1) * block_size, num_tokens_post_pad_cuda.item()
+>>>>>>> origin/main
     )
 
     selected_sorted_ids_cuda = sorted_ids_cuda[

@@ -38,8 +38,17 @@ repos:
     hooks:
       - id: codespell
         additional_dependencies: ['tomli']
+<<<<<<< HEAD
         args: ['--toml', 'python/pyproject.toml']
         exclude: test/srt/test_reasoning_parser.py # Exclude the test file that is expected to fail
+=======
+        args: ['--toml', 'python/pyproject.toml', '-L', 'cann,thi,makro,wil,rouge']
+        exclude: |
+          (?x)^(
+            test/srt/test_reasoning_parser\.py|
+            docs/advanced_features/vlm_query\.ipynb
+          )$
+>>>>>>> origin/main
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8
     hooks:

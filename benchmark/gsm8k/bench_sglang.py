@@ -7,9 +7,16 @@ import time
 
 import numpy as np
 
+<<<<<<< HEAD
 from sglang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
+=======
+from sglang.lang.api import set_default_backend
+from sglang.test.test_utils import (
+    add_common_sglang_args_and_parse,
+    dump_bench_raw_result,
+>>>>>>> origin/main
     select_sglang_backend,
 )
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
@@ -115,6 +122,15 @@ def main(args):
 
     # Dump results
     dump_state_text(f"tmp_output_{args.backend}.txt", states)
+<<<<<<< HEAD
+=======
+    dump_bench_raw_result(
+        path=args.raw_result_file,
+        states=states,
+        preds=preds,
+        labels=labels,
+    )
+>>>>>>> origin/main
 
     with open(args.result_file, "a") as fout:
         value = {

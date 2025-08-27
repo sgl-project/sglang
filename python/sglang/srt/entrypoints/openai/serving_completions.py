@@ -1,6 +1,10 @@
 import logging
 import time
+<<<<<<< HEAD
 from typing import Any, AsyncGenerator, Dict, List, Union
+=======
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+>>>>>>> origin/main
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -23,6 +27,10 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+<<<<<<< HEAD
+=======
+from sglang.utils import convert_json_schema_to_str
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +49,17 @@ class OpenAIServingCompletion(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "cmpl-"
 
+<<<<<<< HEAD
+=======
+    def _validate_request(self, request: CompletionRequest) -> Optional[str]:
+        """Validate that the input is valid."""
+        prompt = request.prompt
+        if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
+            return "Prompt cannot be empty"
+
+        return None
+
+>>>>>>> origin/main
     def _convert_to_internal_request(
         self,
         request: CompletionRequest,
@@ -117,6 +136,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "logit_bias": request.logit_bias,
         }
 
+<<<<<<< HEAD
+=======
+        # Handle response_format constraints
+        if request.response_format and request.response_format.type == "json_schema":
+            sampling_params["json_schema"] = convert_json_schema_to_str(
+                request.response_format.json_schema.schema_
+            )
+        elif request.response_format and request.response_format.type == "json_object":
+            sampling_params["json_schema"] = '{"type": "object"}'
+        elif (
+            request.response_format and request.response_format.type == "structural_tag"
+        ):
+            sampling_params["structural_tag"] = convert_json_schema_to_str(
+                request.response_format.model_dump(by_alias=True)
+            )
+
+>>>>>>> origin/main
         return sampling_params
 
     async def _handle_streaming_request(
@@ -373,6 +409,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
             created=created,
             choices=choices,
             usage=usage,
+<<<<<<< HEAD
+=======
+            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+>>>>>>> origin/main
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

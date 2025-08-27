@@ -59,6 +59,10 @@ __device__ void moe_fused_gate_impl(
     int64_t topk,
     int64_t num_fused_shared_experts,
     double routed_scaling_factor,
+<<<<<<< HEAD
+=======
+    bool apply_routed_scaling_factor_on_output,
+>>>>>>> origin/main
     Params params) {
   int tidx = threadIdx.x;
   int64_t thread_row =
@@ -248,6 +252,12 @@ __device__ void moe_fused_gate_impl(
     for (int ii = 0; ii < topk; ++ii) {
       int64_t const idx = topk * thread_row + ii;
       output_ptr[idx] = output_ptr[idx] / output_sum;
+<<<<<<< HEAD
+=======
+      if (apply_routed_scaling_factor_on_output) {
+        output_ptr[idx] *= routed_scaling_factor;
+      }
+>>>>>>> origin/main
     }
   }
 }
@@ -282,7 +292,12 @@ __global__ void moe_fused_gate_kernel(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
+<<<<<<< HEAD
     double routed_scaling_factor) {
+=======
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output) {
+>>>>>>> origin/main
   KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> params;
   moe_fused_gate_impl<T>(
       input,
@@ -294,6 +309,10 @@ __global__ void moe_fused_gate_kernel(
       topk,
       num_fused_shared_experts,
       routed_scaling_factor,
+<<<<<<< HEAD
+=======
+      apply_routed_scaling_factor_on_output,
+>>>>>>> origin/main
       params);
 }
 
@@ -314,7 +333,12 @@ __global__ void moe_fused_gate_kernel(
             topk_group,                                                                                  \
             topk,                                                                                        \
             num_fused_shared_experts,                                                                    \
+<<<<<<< HEAD
             routed_scaling_factor);                                                                      \
+=======
+            routed_scaling_factor,                                                                       \
+            apply_routed_scaling_factor_on_output);                                                      \
+>>>>>>> origin/main
     dispatched = true;                                                                                   \
   } while (0)
 
@@ -342,7 +366,12 @@ __global__ void moe_fused_gate_kernel_dynamic(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
+<<<<<<< HEAD
     double routed_scaling_factor) {
+=======
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output) {
+>>>>>>> origin/main
   KernelParamsDynamic params;
   params.NUM_EXPERTS = num_experts;             // e.g, for deepseek v3, this is 256
   params.VPT = num_experts / num_expert_group;  // e.g., for deepseek v3, this is 256 / 8 = 32
@@ -361,6 +390,10 @@ __global__ void moe_fused_gate_kernel_dynamic(
       topk,
       num_fused_shared_experts,
       routed_scaling_factor,
+<<<<<<< HEAD
+=======
+      apply_routed_scaling_factor_on_output,
+>>>>>>> origin/main
       params);
 }
 
@@ -374,7 +407,12 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
+<<<<<<< HEAD
     double routed_scaling_factor) {
+=======
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output) {
+>>>>>>> origin/main
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
@@ -473,7 +511,12 @@ std::vector<at::Tensor> moe_fused_gate(
           topk_group,
           topk,
           num_fused_shared_experts,
+<<<<<<< HEAD
           routed_scaling_factor);
+=======
+          routed_scaling_factor,
+          apply_routed_scaling_factor_on_output);
+>>>>>>> origin/main
     } else if (input.scalar_type() == at::kHalf) {
       moe_fused_gate_kernel_dynamic<float16_t><<<num_blocks, block_dim, 0, stream>>>(
           input.data_ptr(),
@@ -486,7 +529,12 @@ std::vector<at::Tensor> moe_fused_gate(
           topk_group,
           topk,
           num_fused_shared_experts,
+<<<<<<< HEAD
           routed_scaling_factor);
+=======
+          routed_scaling_factor,
+          apply_routed_scaling_factor_on_output);
+>>>>>>> origin/main
     } else if (input.scalar_type() == at::kFloat) {
       moe_fused_gate_kernel_dynamic<float32_t><<<num_blocks, block_dim, 0, stream>>>(
           input.data_ptr(),
@@ -499,7 +547,12 @@ std::vector<at::Tensor> moe_fused_gate(
           topk_group,
           topk,
           num_fused_shared_experts,
+<<<<<<< HEAD
           routed_scaling_factor);
+=======
+          routed_scaling_factor,
+          apply_routed_scaling_factor_on_output);
+>>>>>>> origin/main
     } else {
       TORCH_CHECK(false, "Unsupported data type for moe_fused_gate");
     }

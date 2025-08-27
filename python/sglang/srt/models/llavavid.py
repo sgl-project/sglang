@@ -135,14 +135,22 @@ class LlavaVidForCausalLM(nn.Module):
             if need_vision.any():
                 pixel_values = flatten_nested_list(
                     [
+<<<<<<< HEAD
                         [item.pixel_values for item in image_inputs[i].mm_items]
+=======
+                        [item.feature for item in image_inputs[i].mm_items]
+>>>>>>> origin/main
                         for i in range(bs)
                         if need_vision[i]
                     ]
                 )
                 image_offsets = [
                     flatten_nested_list(
+<<<<<<< HEAD
                         [item.image_offsets for item in image_inputs[i].mm_items]
+=======
+                        [item.offsets for item in image_inputs[i].mm_items]
+>>>>>>> origin/main
                     )
                     for i in range(bs)
                     if need_vision[i]

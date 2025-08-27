@@ -30,10 +30,16 @@
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
+<<<<<<< HEAD
+=======
+#include "cutlass_extensions/gemm/cutlass_gemm_caller.cuh"
+#include "cutlass_extensions/gemm/fp8_blockwise_gemm_sm90_dispatch.cuh"
+>>>>>>> origin/main
 #include "utils.h"
 
 using namespace cute;
 
+<<<<<<< HEAD
 template <typename SchedulerType, typename OutType, typename TileShape, typename ClusterShape>
 void launch_sm90_fp8_blockwise_scaled_mm(
     torch::Tensor& out,
@@ -162,6 +168,8 @@ void launch_sm90_fp8_blockwise_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status))
 }
 
+=======
+>>>>>>> origin/main
 template <
     typename OutType,
     typename MmaTileShape,
@@ -298,6 +306,7 @@ void launch_sm100_fp8_blockwise_scaled_mm(
 }
 
 template <typename OutType>
+<<<<<<< HEAD
 void sm90_fp8_blockwise_dispatch_shape(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -319,6 +328,8 @@ void sm90_fp8_blockwise_dispatch_shape(
 }
 
 template <typename OutType>
+=======
+>>>>>>> origin/main
 void sm100_fp8_blockwise_dispatch_shape(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -353,7 +364,11 @@ torch::Tensor fp8_blockwise_scaled_mm(
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
   TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a 2D tensor");
   TORCH_CHECK(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
+<<<<<<< HEAD
   TORCH_CHECK(mat_b.stride(0) == 1, "mat_a must be a column major tensor");
+=======
+  TORCH_CHECK(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
+>>>>>>> origin/main
   TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
 
   TORCH_CHECK(
@@ -394,10 +409,17 @@ torch::Tensor fp8_blockwise_scaled_mm(
   if (sm_version == 90) {
     torch::Tensor scales_b_contiguous = scales_b.contiguous();
     if (out_dtype == torch::kBFloat16) {
+<<<<<<< HEAD
       sm90_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
           out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b_contiguous);
     } else {
       sm90_fp8_blockwise_dispatch_shape<cutlass::half_t>(
+=======
+      cutlass_gemm_blockwise_sm90_fp8_dispatch<cutlass::bfloat16_t>(
+          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b_contiguous);
+    } else {
+      cutlass_gemm_blockwise_sm90_fp8_dispatch<cutlass::half_t>(
+>>>>>>> origin/main
           out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b_contiguous);
     }
     return out_padded.slice(0, 0, original_rows);

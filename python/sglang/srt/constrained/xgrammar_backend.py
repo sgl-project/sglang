@@ -32,10 +32,22 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+<<<<<<< HEAD
 from sglang.srt.constrained.triton_ops.bitmask_ops import (
     apply_token_bitmask_inplace_triton,
 )
 
+=======
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+if _is_hip:
+    from sgl_kernel import apply_token_bitmask_inplace_cuda
+else:
+    from sglang.srt.constrained.triton_ops.bitmask_ops import (
+        apply_token_bitmask_inplace_triton,
+    )
+>>>>>>> origin/main
 logger = logging.getLogger(__name__)
 
 
@@ -94,7 +106,14 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type == "cuda":
+<<<<<<< HEAD
             apply_token_bitmask_inplace_triton(logits, vocab_mask)
+=======
+            if _is_hip:
+                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
+            else:
+                apply_token_bitmask_inplace_triton(logits, vocab_mask)
+>>>>>>> origin/main
         elif logits.device.type == "cpu" and self.apply_vocab_mask_cpu:
             self.apply_vocab_mask_cpu(logits, vocab_mask)
         else:
@@ -150,12 +169,27 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self,
         tokenizer,
         vocab_size: int,
+<<<<<<< HEAD
     ):
         super().__init__()
 
         if True:
             tokenizer_info = TokenizerInfo.from_huggingface(
                 tokenizer, vocab_size=vocab_size
+=======
+        model_eos_token_ids: Optional[List[int]] = None,
+    ):
+        super().__init__()
+
+        if hasattr(tokenizer, "init_xgrammar"):
+            # For special tokenizer
+            tokenizer_info, override_stop_tokens = tokenizer.init_xgrammar()
+        else:
+            # Create TokenizerInfo with model's EOS tokens as the authoritative stop tokens
+            # This ensures consistency between what the model considers EOS and what XGrammar uses
+            tokenizer_info = TokenizerInfo.from_huggingface(
+                tokenizer, vocab_size=vocab_size, stop_token_ids=model_eos_token_ids
+>>>>>>> origin/main
             )
             override_stop_tokens = None
 

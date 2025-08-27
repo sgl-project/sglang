@@ -1,12 +1,18 @@
 """Common utilities"""
 
+<<<<<<< HEAD
 import base64
+=======
+>>>>>>> origin/main
 import importlib
 import json
 import logging
 import os
 import random
+<<<<<<< HEAD
 import signal
+=======
+>>>>>>> origin/main
 import socket
 import subprocess
 import sys
@@ -15,11 +21,19 @@ import traceback
 import urllib.request
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+<<<<<<< HEAD
+=======
+from functools import wraps
+>>>>>>> origin/main
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
+<<<<<<< HEAD
+=======
+import pybase64
+>>>>>>> origin/main
 import requests
 from IPython.display import HTML, display
 from pydantic import BaseModel
@@ -28,6 +42,27 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 
+<<<<<<< HEAD
+=======
+def execute_once(func):
+    has_run = None
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        nonlocal has_run
+        if not has_run:
+            func(*args, **kwargs)
+            has_run = True
+
+    return wrapper
+
+
+@execute_once
+def info_once(message: str):
+    logger.info(message)
+
+
+>>>>>>> origin/main
 def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
     """Convert a JSON schema to a string.
     Parameters
@@ -148,15 +183,25 @@ def encode_image_base64(image_path: Union[str, bytes]):
     if isinstance(image_path, str):
         with open(image_path, "rb") as image_file:
             data = image_file.read()
+<<<<<<< HEAD
             return base64.b64encode(data).decode("utf-8")
     elif isinstance(image_path, bytes):
         return base64.b64encode(image_path).decode("utf-8")
+=======
+            return pybase64.b64encode(data).decode("utf-8")
+    elif isinstance(image_path, bytes):
+        return pybase64.b64encode(image_path).decode("utf-8")
+>>>>>>> origin/main
     else:
         # image_path is PIL.WebPImagePlugin.WebPImageFile
         image = image_path
         buffered = BytesIO()
         image.save(buffered, format="PNG")
+<<<<<<< HEAD
         return base64.b64encode(buffered.getvalue()).decode("utf-8")
+=======
+        return pybase64.b64encode(buffered.getvalue()).decode("utf-8")
+>>>>>>> origin/main
 
 
 def encode_frame(frame):
@@ -223,7 +268,11 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     video_bytes = b"".join(encoded_frames)
 
     # Encode the concatenated bytes to base64
+<<<<<<< HEAD
     video_base64 = "video:" + base64.b64encode(video_bytes).decode("utf-8")
+=======
+    video_base64 = "video:" + pybase64.b64encode(video_bytes).decode("utf-8")
+>>>>>>> origin/main
 
     return video_base64
 
@@ -272,6 +321,7 @@ def find_printable_text(text: str):
         return text[: text.rfind(" ") + 1]
 
 
+<<<<<<< HEAD
 def graceful_registry(sub_module_name: str):
     def graceful_shutdown(signum, frame):
         logger.info(
@@ -283,6 +333,8 @@ def graceful_registry(sub_module_name: str):
     signal.signal(signal.SIGTERM, graceful_shutdown)
 
 
+=======
+>>>>>>> origin/main
 class LazyImport:
     """Lazy import to make `import sglang` run faster."""
 
@@ -450,7 +502,11 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+<<<<<<< HEAD
                     We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
+=======
+                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
+>>>>>>> origin/main
                     """
                 )
                 break

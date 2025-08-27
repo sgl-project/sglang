@@ -8,7 +8,10 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
+<<<<<<< HEAD
     StructureInfo,
+=======
+>>>>>>> origin/main
     ToolCallItem,
     _GetInfoFunc,
 )
@@ -19,10 +22,24 @@ logger = logging.getLogger(__name__)
 
 class PythonicDetector(BaseFormatDetector):
     """
+<<<<<<< HEAD
     Detector for Llama-3.2 and Llama-4 models with pythonic tool call format.
     Assumes function call format:
       [tool1(arg1=val1, arg2=val2), tool2(arg1=val3)]
     Arguments are Python literals (not JSON).
+=======
+    Detector for Llama-4 models with Pythonic tool call format.
+
+    The Pythonic format uses Python function call syntax within square brackets,
+    with arguments as Python literals rather than JSON.
+
+    Format Structure:
+    ```
+    [tool1(arg1=val1, arg2=val2), tool2(arg1=val3)]
+    ```
+
+    Reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct?chat_template=default
+>>>>>>> origin/main
     """
 
     def __init__(self):
@@ -75,11 +92,15 @@ class PythonicDetector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
             calls = []
+<<<<<<< HEAD
             tool_indices = {
                 tool.function.name: i
                 for i, tool in enumerate(tools)
                 if tool.function.name
             }
+=======
+            tool_indices = self._get_tool_indices(tools)
+>>>>>>> origin/main
             for call_index, call in enumerate(parsed.elts):
                 if not isinstance(call.func, ast.Name):
                     continue
@@ -213,11 +234,19 @@ class PythonicDetector(BaseFormatDetector):
         else:
             raise ValueError("Tool call arguments must be literals")
 
+<<<<<<< HEAD
     def structure_info(self) -> _GetInfoFunc:
         def info(name: str):
             return StructureInfo(begin=f"[{name}(", end=")]", trigger=f"[{name}(")
 
         return info
+=======
+    def supports_structural_tag(self) -> bool:
+        return False
+
+    def structure_info(self) -> _GetInfoFunc:
+        raise NotImplementedError
+>>>>>>> origin/main
 
     def build_ebnf(self, tools: List[Tool]) -> Optional[str]:
         return EBNFComposer.build_ebnf(

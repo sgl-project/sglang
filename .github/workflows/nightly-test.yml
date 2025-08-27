@@ -24,7 +24,11 @@ jobs:
 
       - name: Install dependencies
         run: |
+<<<<<<< HEAD
           bash scripts/ci_install_dependency.sh
+=======
+          bash scripts/ci/ci_install_dependency.sh
+>>>>>>> origin/main
 
       - name: Run test
         timeout-minutes: 120

@@ -3,26 +3,52 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+<<<<<<< HEAD
 from functools import lru_cache
 from typing import Any, Optional, Tuple, Union
+=======
+from functools import lru_cache, partial
+from typing import Any, Callable, Optional, Tuple, Union
+>>>>>>> origin/main
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+<<<<<<< HEAD
 from sglang.srt.utils import is_cuda, print_info_once
+=======
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.utils import (
+    get_device_capability,
+    is_blackwell,
+    is_cuda,
+    print_info_once,
+)
+>>>>>>> origin/main
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
+<<<<<<< HEAD
 from sglang.srt.distributed import parallel_state
+=======
+from sglang.srt.distributed import (
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_gather,
+)
+>>>>>>> origin/main
 from sglang.srt.distributed import utils as dist_utils
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
+<<<<<<< HEAD
+=======
+from sglang.srt.layers.layernorm import RMSNorm
+>>>>>>> origin/main
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -239,6 +265,11 @@ class VisionTritonAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor],
+<<<<<<< HEAD
+=======
+        bsz: int,
+        seq_len: int,
+>>>>>>> origin/main
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -247,6 +278,11 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+<<<<<<< HEAD
+=======
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+>>>>>>> origin/main
 
         # [b * s, head, head_size]
         output = torch.empty_like(q)
@@ -303,6 +339,10 @@ class VisionFlash3Attention(nn.Module):
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
+<<<<<<< HEAD
+=======
+
+>>>>>>> origin/main
         output = flash_attn_varlen_func(
             q,
             k,
@@ -349,25 +389,50 @@ class VisionAttention(nn.Module):
         flatten_batch: bool = False,
         prefix: str = "",
         proj_bias: bool = True,
+<<<<<<< HEAD
         **kwargs,
     ):
         super().__init__()
         world_size = parallel_state.get_tensor_model_parallel_world_size()
+=======
+        num_dummy_heads: int = 0,
+        qkv_bias: bool = True,
+        qk_normalization: bool = False,
+        layer_norm_eps: float = 1e-06,
+        customized_position_embedding_applier: Callable[
+            [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+        self.tp_size = attn_tp_size
+        self.tp_rank = attn_tp_rank
+>>>>>>> origin/main
         self.dropout = dropout
         self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
         self.num_attention_heads_per_partition = dist_utils.divide(
+<<<<<<< HEAD
             num_heads, world_size
         )
         self.num_attention_kv_heads_per_partition = dist_utils.divide(
             num_heads, world_size
+=======
+            num_dummy_heads + num_heads, self.tp_size
+        )
+        self.num_attention_kv_heads_per_partition = dist_utils.divide(
+            num_dummy_heads + num_heads, self.tp_size
+>>>>>>> origin/main
         )
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
 
+<<<<<<< HEAD
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
                 qkv_backend = "sdpa"
@@ -377,6 +442,34 @@ class VisionAttention(nn.Module):
 
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
+=======
+        self.qk_normalization = qk_normalization
+
+        # Additional dummy heads are used to enable TP for common GPU counts.
+        self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
+
+        if self.qk_normalization:
+            self.q_norm = RMSNorm(
+                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+            )
+            self.k_norm = RMSNorm(
+                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+            )
+
+        # Select attention backend via a unified method
+        _passed_backend = qkv_backend
+        qkv_backend = self._determine_attention_backend(_passed_backend)
+        if (
+            global_server_args_dict["mm_attention_backend"] is None
+            and _passed_backend is None
+        ):
+            print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
+        print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
+
+        self.customized_position_embedding_applier = (
+            customized_position_embedding_applier
+        )
+>>>>>>> origin/main
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
             head_dim=self.head_size,
             num_heads=self.num_attention_heads_per_partition,
@@ -391,14 +484,24 @@ class VisionAttention(nn.Module):
             self.qkv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
                 head_size=self.head_size,
+<<<<<<< HEAD
                 total_num_heads=num_heads,
                 total_num_kv_heads=num_heads,
                 quant_config=quant_config,
+=======
+                total_num_heads=num_dummy_heads + num_heads,
+                total_num_kv_heads=num_dummy_heads + num_heads,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+>>>>>>> origin/main
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
             self.qkv_proj = ColumnParallelLinear(
                 input_size=embed_dim,
+<<<<<<< HEAD
                 output_size=3 * projection_size,
                 quant_config=quant_config,
                 prefix=add_prefix("qkv_proj", prefix),
@@ -411,6 +514,70 @@ class VisionAttention(nn.Module):
             prefix=add_prefix("proj", prefix),
         )
 
+=======
+                output_size=3 * self.dummy_dim,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
+        self.proj = RowParallelLinear(
+            input_size=self.dummy_dim,
+            output_size=embed_dim,
+            bias=proj_bias,
+            quant_config=quant_config,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            prefix=add_prefix("proj", prefix),
+        )
+
+    def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
+        """Decide the multimodal attention backend string.
+
+        Priority: server args override > constructor arg > platform default.
+
+        Platform defaults:
+        - CUDA: "triton_attn"
+        - Non-CUDA: "sdpa"
+        """
+        override_backend = global_server_args_dict["mm_attention_backend"]
+        if override_backend is not None:
+            backend = override_backend
+        elif passed_backend is not None:
+            backend = passed_backend
+        elif is_cuda():
+            major, minor = get_device_capability()
+            if major == 9:
+                backend = "fa3"
+            else:
+                backend = "triton_attn"
+        else:
+            backend = "sdpa"
+        if backend == "fa3" and is_blackwell():
+            raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
+
+        return backend
+
+    def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
+        """apply qk norm for internvl vit attn"""
+        q = q.flatten(1, 2)
+        k = k.flatten(1, 2)
+
+        if self.tp_size > 1:
+            q = tensor_model_parallel_all_gather(q.contiguous())
+            k = tensor_model_parallel_all_gather(k.contiguous())
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        if self.tp_size > 1:
+            splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
+            q = splitter(q)[self.tp_rank]
+            k = splitter(k)[self.tp_rank]
+        q = q.unflatten(-1, (-1, self.head_size))
+        k = k.unflatten(-1, (-1, self.head_size))
+        return q, k
+
+>>>>>>> origin/main
     def forward(
         self,
         x: torch.Tensor,
@@ -429,13 +596,21 @@ class VisionAttention(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
+<<<<<<< HEAD
         bsz, s, _ = x.shape
+=======
+        x_shape = x.shape
+        bsz, s, _ = x_shape
+>>>>>>> origin/main
         head = self.num_attention_heads_per_partition
         kv_head = self.num_attention_kv_heads_per_partition
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/main
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             # [b, s, embed_dim] --> [b * s, head, head_size]
@@ -464,6 +639,7 @@ class VisionAttention(nn.Module):
             ]
 
         if position_embeddings is not None:
+<<<<<<< HEAD
             cos, sin = position_embeddings
             original_shape = q.shape
             # [total_tokens, head, head_size]
@@ -474,6 +650,27 @@ class VisionAttention(nn.Module):
 
             q = q.view(original_shape)
             k = k.view(original_shape)
+=======
+            original_shape = q.shape
+
+            if self.customized_position_embedding_applier is not None:
+                q, k = self.customized_position_embedding_applier(
+                    q, k, position_embeddings, x_shape
+                )
+                q = q.view(original_shape)
+                k = k.view(original_shape)
+            else:
+                cos, sin = position_embeddings
+
+                # [total_tokens, head, head_size]
+                q = q.view(-1, head, self.head_size)
+                k = k.view(-1, head, self.head_size)
+
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+                q = q.view(original_shape)
+                k = k.view(original_shape)
+>>>>>>> origin/main
 
         if q.dim() == 4:
             # [b, s, head, head_size] --> [b * s, head, head_size]
@@ -489,6 +686,13 @@ class VisionAttention(nn.Module):
         assert k.dim() == 3, k.dim()
         assert v.dim() == 3, v.dim()
 
+<<<<<<< HEAD
+=======
+        # internvl
+        if self.qk_normalization:
+            q, k = self._apply_qk_norm(q, k)
+
+>>>>>>> origin/main
         output = self.qkv_backend.forward(
             q=q,
             k=k,

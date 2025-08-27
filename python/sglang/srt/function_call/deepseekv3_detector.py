@@ -19,9 +19,34 @@ logger = logging.getLogger(__name__)
 
 class DeepSeekV3Detector(BaseFormatDetector):
     """
+<<<<<<< HEAD
     Detector for DeepSeek models.
     Assumes function call format:
       '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Paris"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜>
+=======
+    Detector for DeepSeek V3 model function call format.
+
+    The DeepSeek V3 format uses special Unicode tokens to delimit function calls
+    with JSON code blocks for arguments.
+
+    Format Structure:
+    ```
+    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>{function_name}\n```json\n{json_arguments}\n```<｜tool▁calls▁end｜><｜end▁of▁sentence｜>
+    ```
+    Examples:
+    ```
+    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Paris"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜>
+    ```
+
+    Key Components:
+    - Tool Calls Section: Wrapped between `<｜tool▁calls▁begin｜>` and `<｜tool▁calls▁end｜>`
+    - Individual Tool Call: Wrapped between `<｜tool▁call▁begin｜>` and `<｜tool▁call▁end｜>`
+    - Function Declaration: `function<｜tool▁sep｜>{function_name}`
+    - Arguments: JSON code block between ````json` and ````
+    - Supports multiple tool calls
+
+    Reference: https://huggingface.co/deepseek-ai/DeepSeek-V3-0324?chat_template=default
+>>>>>>> origin/main
     """
 
     def __init__(self):
@@ -89,16 +114,24 @@ class DeepSeekV3Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=new_text)
 
         if not hasattr(self, "_tool_indices"):
+<<<<<<< HEAD
             self._tool_indices = {
                 tool.function.name: i
                 for i, tool in enumerate(tools)
                 if tool.function and tool.function.name
             }
+=======
+            self._tool_indices = self._get_tool_indices(tools)
+>>>>>>> origin/main
 
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
+<<<<<<< HEAD
                 pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)",
+=======
+                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
+>>>>>>> origin/main
                 string=current_text,
                 flags=re.DOTALL,
             )
@@ -127,7 +160,11 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         )
                     )
                     self.current_tool_name_sent = True
+<<<<<<< HEAD
                     # Store the tool call info for adapter.py
+=======
+                    # Store the tool call info for serving layer completions endpoint
+>>>>>>> origin/main
                     self.prev_tool_call_arr[self.current_tool_id] = {
                         "name": func_name,
                         "arguments": {},
@@ -153,7 +190,11 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         ] += argument_diff
 
                     if _is_complete_json(func_args_raw):
+<<<<<<< HEAD
                         # Update the stored arguments for adapter.py
+=======
+                        # Update the stored arguments
+>>>>>>> origin/main
                         try:
                             parsed_args = json.loads(func_args_raw)
                             self.prev_tool_call_arr[self.current_tool_id][
@@ -200,6 +241,10 @@ class DeepSeekV3Detector(BaseFormatDetector):
             sequence_start_token=self.bot_token,
             sequence_end_token=self.eot_token,
             tool_call_separator="",
+<<<<<<< HEAD
             call_rule_fmt='"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n" {arguments_rule} "\\n```<｜tool▁call▁end｜>"',
+=======
+            call_rule_fmt='"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n"{arguments_rule}"\\n```<｜tool▁call▁end｜>"',
+>>>>>>> origin/main
             function_format="json",
         )

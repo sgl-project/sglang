@@ -149,6 +149,7 @@ class TestDeepseekV3MTP(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
+<<<<<<< HEAD
 # compatible with old APIs
 class TestDeepseekV3MTPWithDraft(CustomTestCase):
     @classmethod
@@ -210,5 +211,7 @@ class TestDeepseekV3MTPWithDraft(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
+=======
+>>>>>>> origin/main
 if __name__ == "__main__":
     unittest.main()

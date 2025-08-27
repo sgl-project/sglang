@@ -32,7 +32,13 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+<<<<<<< HEAD
 from sglang.srt.layers.moe.fused_moe_triton import fused_moe
+=======
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import TopK
+>>>>>>> origin/main
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -104,6 +110,14 @@ class DbrxExperts(nn.Module):
         self.params_dtype = params_dtype
 
         self.router = DbrxRouter(config, self.params_dtype)
+<<<<<<< HEAD
+=======
+        self.topk = TopK(
+            self.top_k,
+            renormalize=True,
+        )
+        self.moe_runner_config = MoeRunnerConfig(inplace=True)
+>>>>>>> origin/main
         self.ws = nn.Parameter(
             torch.empty(
                 self.num_total_experts,
@@ -169,14 +183,23 @@ class DbrxExperts(nn.Module):
         hidden_states = hidden_states.view(-1, self.d_model)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
+<<<<<<< HEAD
+=======
+        topk_output = self.topk(hidden_states, router_logits)
+>>>>>>> origin/main
         final_hidden_states = fused_moe(
             hidden_states,
             self.ws,
             self.w2s,
+<<<<<<< HEAD
             router_logits,
             self.top_k,
             renormalize=True,
             inplace=True,
+=======
+            topk_output,
+            self.moe_runner_config,
+>>>>>>> origin/main
         )
 
         if self.tp_size > 1:
@@ -293,7 +316,11 @@ class DbrxFusedNormAttention(nn.Module):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+<<<<<<< HEAD
     ) -> torch.Tensor:
+=======
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+>>>>>>> origin/main
         residual = hidden_states
         hidden_states = self.norm_1(hidden_states)
         x = self.attn(

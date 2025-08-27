@@ -8,6 +8,18 @@ from transformers import AutoConfig
 
 from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+<<<<<<< HEAD
+=======
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+
+# Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
+def calc_diff(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
+>>>>>>> origin/main
 
 
 def get_model_config(tp_size: int):
@@ -69,6 +81,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
 
     # --- Input Data ---
     # Use bf16/fp16 for input activation based on model config
+<<<<<<< HEAD
     x = torch.randn((batch_size, H), device="cuda", dtype=dtype) * 0.0001
     # --- Weights (Generate in higher precision, then convert to FP8) ---
     # Generate weights suitable for FP8 conversion (e.g., scaled appropriately)
@@ -79,6 +92,13 @@ def run_test(tp_size, batch_size, model_config, check=False):
         torch.randn((E, H, I // 2), device="cuda", dtype=torch.float32) * 0.00001
         + 0.00001
     )
+=======
+    x = torch.randn((batch_size, H), device="cuda", dtype=dtype)
+    # --- Weights (Generate in higher precision, then convert to FP8) ---
+    # Generate weights suitable for FP8 conversion (e.g., scaled appropriately)
+    w1_hp = torch.randn((E, I, H), device="cuda", dtype=torch.float32)
+    w2_hp = torch.randn((E, H, I // 2), device="cuda", dtype=torch.float32)
+>>>>>>> origin/main
 
     w1 = to_fp8(w1_hp)
     w2 = to_fp8(w2_hp)
@@ -149,14 +169,23 @@ def run_test(tp_size, batch_size, model_config, check=False):
     )
 
     # Note: Triton expects non-transposed weights
+<<<<<<< HEAD
+=======
+    moe_config = MoeRunnerConfig(inplace=False)
+>>>>>>> origin/main
     triton_lambda = lambda: fused_experts(
         x,
         w1,
         w2,
+<<<<<<< HEAD
         topk_weights,
         topk_ids,
         inplace=False,  # Use False for benchmarking to avoid side effects if run multiple times
         activation="silu",  # Assuming SiLU activation common in MoEs
+=======
+        (topk_weights, topk_ids, "dummy"),
+        moe_config,
+>>>>>>> origin/main
         use_fp8_w8a8=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -221,16 +250,22 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 x,
                 w1,  # Original shape
                 w2,  # Original shape
+<<<<<<< HEAD
                 topk_weights,
                 topk_ids,
                 inplace=False,  # Important: Use False to get output tensor
                 activation="silu",
+=======
+                (topk_weights, topk_ids, "dummy"),
+                moe_config,
+>>>>>>> origin/main
                 use_fp8_w8a8=True,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
             )
 
+<<<<<<< HEAD
         # Ensure outputs are same dtype for comparison
         y_cutlass = y_cutlass.to(dtype)
         y_triton = y_triton.to(dtype)
@@ -249,6 +284,14 @@ def run_test(tp_size, batch_size, model_config, check=False):
         # Tolerance might need adjustment based on FP8 specifics and kernel differences
         # FP8 comparisons often require higher tolerance than FP16/BF16
         assert max_rel_err < 5e-1, f"Relative error too high! {max_rel_err}"
+=======
+        diff = calc_diff(y_cutlass, y_triton)
+        print(f"Diff: {diff:.6f}")
+
+        # Tolerance might need adjustment based on FP8 specifics and kernel differences
+        # FP8 comparisons often require higher tolerance than FP16/BF16
+        assert diff < 1e-4, f"Diff too high! {diff}"
+>>>>>>> origin/main
         print("Correctness check passed.")
 
 
@@ -266,7 +309,25 @@ if __name__ == "__main__":
         "--batch-sizes",
         type=int,
         nargs="+",
+<<<<<<< HEAD
         default=[1, 4, 8, 16, 32, 64, 128, 256, 512],  # Adjusted default
+=======
+        default=[
+            1,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+        ],  # Adjusted default
+>>>>>>> origin/main
         help="List of batch sizes to test",
     )
     parser.add_argument("--check", action="store_true", help="Enable check mode")

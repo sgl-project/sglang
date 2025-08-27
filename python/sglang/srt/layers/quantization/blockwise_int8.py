@@ -1,12 +1,20 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
+<<<<<<< HEAD
 import logging
 from typing import Any, Callable, Dict, List, Optional
+=======
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+>>>>>>> origin/main
 
 import torch
 from torch.nn import Module
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+<<<<<<< HEAD
 from sglang.srt.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -14,13 +22,30 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
+=======
+from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
+from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
+>>>>>>> origin/main
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
+<<<<<<< HEAD
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
+=======
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.utils import set_weight_attrs
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.topk import TopKOutput
+
+>>>>>>> origin/main
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
@@ -78,7 +103,11 @@ class BlockInt8Config(QuantizationConfig):
         return []
 
     @classmethod
+<<<<<<< HEAD
     def from_config(cls, config: Dict[str, Any]) -> "BlockInt8Config":
+=======
+    def from_config(cls, config: Dict[str, Any]) -> BlockInt8Config:
+>>>>>>> origin/main
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_int8_serialized = "int8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
@@ -93,7 +122,12 @@ class BlockInt8Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
+<<<<<<< HEAD
     ) -> Optional["QuantizeMethodBase"]:
+=======
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
+>>>>>>> origin/main
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
@@ -230,7 +264,11 @@ class BlockInt8LinearMethod(LinearMethodBase):
         )
 
 
+<<<<<<< HEAD
 class BlockInt8MoEMethod:
+=======
+class BlockInt8MoEMethod(FusedMoEMethodBase):
+>>>>>>> origin/main
     """MoE method for INT8.
     Supports loading INT8 checkpoints with static weight scale and
     dynamic activation scale.
@@ -242,6 +280,7 @@ class BlockInt8MoEMethod:
         quant_config: The quantization config.
     """
 
+<<<<<<< HEAD
     def __new__(cls, *args, **kwargs):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
 
@@ -261,6 +300,9 @@ class BlockInt8MoEMethod:
         return super().__new__(cls)
 
     def __init__(self, quant_config):
+=======
+    def __init__(self, quant_config: BlockInt8Config):
+>>>>>>> origin/main
         self.quant_config = quant_config
         assert self.quant_config.weight_block_size is not None
         assert self.quant_config.is_checkpoint_int8_serialized
@@ -361,6 +403,7 @@ class BlockInt8MoEMethod:
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+<<<<<<< HEAD
         router_logits: torch.Tensor,
         top_k: int,
         renormalize: bool,
@@ -393,23 +436,37 @@ class BlockInt8MoEMethod:
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
+=======
+        topk_output: TopKOutput,
+        moe_runner_config: MoeRunnerConfig,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+>>>>>>> origin/main
 
         # Expert fusion with INT8 quantization
         return fused_experts(
             x,
             layer.w13_weight,
             layer.w2_weight,
+<<<<<<< HEAD
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             inplace=inplace,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
+=======
+            topk_output=topk_output,
+            moe_runner_config=moe_runner_config,
+>>>>>>> origin/main
             use_int8_w8a8=True,
             w1_scale=(layer.w13_weight_scale_inv),
             w2_scale=(layer.w2_weight_scale_inv),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
+<<<<<<< HEAD
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
+=======
+>>>>>>> origin/main
         )

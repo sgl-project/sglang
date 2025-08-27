@@ -11,12 +11,20 @@ jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
+<<<<<<< HEAD
     environment: 'prod'
+=======
+    environment: "prod"
+>>>>>>> origin/main
     steps:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
+<<<<<<< HEAD
           python-version: '3.9'
+=======
+          python-version: "3.10"
+>>>>>>> origin/main
 
       - name: Checkout repository
         uses: actions/checkout@v4

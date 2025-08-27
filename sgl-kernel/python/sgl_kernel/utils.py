@@ -43,8 +43,16 @@ def _to_tensor_scalar_tuple(x):
 
 
 @functools.lru_cache(maxsize=1)
+<<<<<<< HEAD
 def is_hopper_arch() -> bool:
     # Hopper arch's compute capability == 9.0
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
     return major == 9
+=======
+def is_arch_support_pdl() -> bool:
+    # Hopper arch's compute capability == 9.0
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    return major >= 9
+>>>>>>> origin/main

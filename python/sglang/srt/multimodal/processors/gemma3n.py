@@ -12,7 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 
+<<<<<<< HEAD
 import re
+=======
+>>>>>>> origin/main
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.multimodal_processor import (
@@ -27,6 +30,7 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
 
     models = [Gemma3nForConditionalGeneration]
 
+<<<<<<< HEAD
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
 
@@ -47,6 +51,22 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         self.AUDIO_TOKEN_ID = hf_config.audio_token_id
         self.AUDIO_START_TOKEN_ID = hf_config.boa_token_id
         self.AUDIO_END_TOKEN_ID = hf_config.eoa_token_id
+=======
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+
+        self.IM_START_TOKEN_ID = hf_config.boi_token_id
+        self.IM_END_TOKEN_ID = hf_config.eoi_token_id
+
+        self.AUDIO_START_TOKEN_ID = hf_config.boa_token_id
+        self.AUDIO_END_TOKEN_ID = hf_config.eoa_token_id
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<image_soft_token>",
+            image_token_id=hf_config.image_token_id,
+            audio_token="<audio_soft_token>",
+            audio_token_id=hf_config.audio_token_id,
+        ).build(_processor)
+>>>>>>> origin/main
 
     async def process_mm_data_async(
         self,
@@ -54,7 +74,10 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         audio_data: Optional[List[Union[str, bytes, Dict]]] = None,
         input_text: str = "",
         request_obj=None,
+<<<<<<< HEAD
         max_req_input_len: int = 0,
+=======
+>>>>>>> origin/main
         *args,
         **kwargs,
     ):
@@ -63,6 +86,7 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             prompt=input_text,
             image_data=image_data,
             audio_data=audio_data,
+<<<<<<< HEAD
             max_req_input_len=max_req_input_len,
             multimodal_tokens=MultimodalSpecialTokens(
                 image_token=self.IMAGE_TOKEN,
@@ -73,10 +97,24 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         )
 
         mm_items, input_ids = self.process_and_combine_mm_data(base_output)
+=======
+            multimodal_tokens=self.mm_tokens,
+        )
+
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
+        )
+>>>>>>> origin/main
 
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
+<<<<<<< HEAD
             "im_token_id": self.IM_TOKEN_ID,
             "audio_token_id": self.AUDIO_TOKEN_ID,
+=======
+            # TODO(mick): could we return MultimodalSpecialTokens directly?
+            "im_token_id": self.mm_tokens.image_token_id,
+            "audio_token_id": self.mm_tokens.audio_token_id,
+>>>>>>> origin/main
         }

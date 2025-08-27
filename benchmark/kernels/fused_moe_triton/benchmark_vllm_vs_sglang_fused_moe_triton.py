@@ -42,7 +42,15 @@ def get_model_config(model_name: str, tp_size: int):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
+<<<<<<< HEAD
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
+=======
+    elif config.architectures[0] in [
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "Glm4MoeForCausalLM",
+    ]:
+>>>>>>> origin/main
         E = (
             config.n_routed_experts + 1
             if config.architectures[0] in ["DeepseekV3ForCausalLM"]

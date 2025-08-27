@@ -55,8 +55,19 @@ class TreeNode:
         self.hit_count = 0
         # indicating the node is loading KV cache from host
         self.loading = False
+<<<<<<< HEAD
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
+=======
+        # indicating the node is locked to protect from eviction
+        # incremented when the node is referenced by a storage operation
+        self.host_ref_counter = 0
+        # store the host indices of KV cache
+        self.host_value: Optional[torch.Tensor] = None
+        # store hash values of each pages
+        self.hash_value: Optional[List[str]] = None
+        self.backuped_storage = False
+>>>>>>> origin/main
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -69,6 +80,26 @@ class TreeNode:
     def backuped(self):
         return self.host_value is not None
 
+<<<<<<< HEAD
+=======
+    def protect_host(self):
+        """Protect the host value from eviction."""
+        self.host_ref_counter += 1
+
+    def release_host(self):
+        """Release the host value, allowing it to be evicted."""
+        if self.host_ref_counter > 0:
+            self.host_ref_counter -= 1
+        else:
+            raise RuntimeError("Host reference counter is already zero.")
+
+    def get_last_hash_value(self) -> Optional[str]:
+        """Returns the hash value of the last page in this node."""
+        if self.hash_value is None or len(self.hash_value) == 0:
+            return None
+        return self.hash_value[-1]
+
+>>>>>>> origin/main
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
 
@@ -129,6 +160,10 @@ class RadixCache(BasePrefixCache):
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
+<<<<<<< HEAD
+=======
+        self.root_node.host_value = []
+>>>>>>> origin/main
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
@@ -196,11 +231,21 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+<<<<<<< HEAD
             page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.clone()
+=======
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        else:
+            page_aligned_len = len(kv_indices)
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+>>>>>>> origin/main
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
@@ -226,10 +271,19 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+<<<<<<< HEAD
             page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.clone()
+=======
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
+        else:
+            page_aligned_len = len(kv_indices)
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+>>>>>>> origin/main
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
@@ -468,7 +522,11 @@ class RadixCache(BasePrefixCache):
         # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
             # First chunk links to the last page of the parent node (if any).
+<<<<<<< HEAD
             if node.parent is None:
+=======
+            if node.parent is None or node != self.root_node:
+>>>>>>> origin/main
                 parent_block_hash = None
             else:
                 last_page_start = (

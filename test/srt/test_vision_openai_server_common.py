@@ -1,9 +1,14 @@
 import base64
+<<<<<<< HEAD
 import copy
 import io
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+=======
+import io
+import os
+>>>>>>> origin/main
 
 import numpy as np
 import openai
@@ -11,12 +16,16 @@ import requests
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
+<<<<<<< HEAD
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
+=======
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
+>>>>>>> origin/main
 
 # image
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
@@ -30,6 +39,7 @@ AUDIO_TRUMP_SPEECH_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test
 AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/bird_song.mp3"
 
 
+<<<<<<< HEAD
 class TestOpenAIVisionServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -42,15 +52,131 @@ class TestOpenAIVisionServer(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
         )
+=======
+class TestOpenAIOmniServerBase(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = ""
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = None
+>>>>>>> origin/main
         cls.base_url += "/v1"
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+<<<<<<< HEAD
     def get_request_kwargs(self):
         return {}
 
+=======
+    def get_vision_request_kwargs(self):
+        return self.get_request_kwargs()
+
+    def get_request_kwargs(self):
+        return {}
+
+    def get_or_download_file(self, url: str) -> str:
+        cache_dir = os.path.expanduser("~/.cache")
+        if url is None:
+            raise ValueError()
+        file_name = url.split("/")[-1]
+        file_path = os.path.join(cache_dir, file_name)
+        os.makedirs(cache_dir, exist_ok=True)
+
+        if not os.path.exists(file_path):
+            response = requests.get(url)
+            response.raise_for_status()
+
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+        return file_path
+
+
+class AudioOpenAITestMixin(TestOpenAIOmniServerBase):
+    def prepare_audio_messages(self, prompt, audio_file_name):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": f"{audio_file_name}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }
+        ]
+
+        return messages
+
+    def get_audio_request_kwargs(self):
+        return self.get_request_kwargs()
+
+    def get_audio_response(self, url: str, prompt, category):
+        audio_file_path = self.get_or_download_file(url)
+        client = openai.Client(api_key="sk-123456", base_url=self.base_url)
+
+        messages = self.prepare_audio_messages(prompt, audio_file_path)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=128,
+            stream=False,
+            **(self.get_audio_request_kwargs()),
+        )
+
+        audio_response = response.choices[0].message.content
+
+        print("-" * 30)
+        print(f"audio {category} response:\n{audio_response}")
+        print("-" * 30)
+
+        audio_response = audio_response.lower()
+
+        self.assertIsNotNone(audio_response)
+        self.assertGreater(len(audio_response), 0)
+
+        return audio_response.lower()
+
+    def test_audio_speech_completion(self):
+        # a fragment of Trump's speech
+        audio_response = self.get_audio_response(
+            AUDIO_TRUMP_SPEECH_URL,
+            "Listen to this audio and write down the audio transcription in English.",
+            category="speech",
+        )
+        check_list = [
+            "thank you",
+            "it's a privilege to be here",
+            "leader",
+            "science",
+            "art",
+        ]
+        for check_word in check_list:
+            assert (
+                check_word in audio_response
+            ), f"audio_response: ｜{audio_response}｜ should contain ｜{check_word}｜"
+
+    def test_audio_ambient_completion(self):
+        # bird song
+        audio_response = self.get_audio_response(
+            AUDIO_BIRD_SONG_URL,
+            "Please listen to the audio snippet carefully and transcribe the content in English.",
+            "ambient",
+        )
+        assert "bird" in audio_response
+
+
+class ImageOpenAITestMixin(TestOpenAIOmniServerBase):
+>>>>>>> origin/main
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -66,13 +192,21 @@ class TestOpenAIVisionServer(CustomTestCase):
                         },
                         {
                             "type": "text",
+<<<<<<< HEAD
                             "text": "Describe this image in a very short sentence.",
+=======
+                            "text": "Describe this image in a sentence.",
+>>>>>>> origin/main
                         },
                     ],
                 },
             ],
             temperature=0,
+<<<<<<< HEAD
             **(self.get_request_kwargs()),
+=======
+            **(self.get_vision_request_kwargs()),
+>>>>>>> origin/main
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -91,8 +225,18 @@ class TestOpenAIVisionServer(CustomTestCase):
         ), f"text: {text}, should contain cab, taxi, SUV, vehicle or car"
         # MiniCPMO fails to recognize `iron`, but `hanging`
         assert (
+<<<<<<< HEAD
             "iron" in text or "hang" in text or "cloth" in text or "holding" in text
         ), f"text: {text}, should contain iron, hang, cloth or holding"
+=======
+            "iron" in text
+            or "hang" in text
+            or "cloth" in text
+            or "coat" in text
+            or "holding" in text
+            or "outfit" in text
+        ), f"text: {text}, should contain iron, hang, cloth, coat or holding or outfit"
+>>>>>>> origin/main
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -114,7 +258,11 @@ class TestOpenAIVisionServer(CustomTestCase):
                         },
                         {
                             "type": "text",
+<<<<<<< HEAD
                             "text": "Describe this image in a very short sentence.",
+=======
+                            "text": "Describe this image in a sentence.",
+>>>>>>> origin/main
                         },
                     ],
                 },
@@ -135,7 +283,11 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
+<<<<<<< HEAD
             **(self.get_request_kwargs()),
+=======
+            **(self.get_vision_request_kwargs()),
+>>>>>>> origin/main
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -178,7 +330,11 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
+<<<<<<< HEAD
             **(self.get_request_kwargs()),
+=======
+            **(self.get_vision_request_kwargs()),
+>>>>>>> origin/main
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -188,18 +344,92 @@ class TestOpenAIVisionServer(CustomTestCase):
         print(f"Multi images response:\n{text}")
         print("-" * 30)
         assert (
+<<<<<<< HEAD
             "man" in text or "cab" in text or "SUV" in text or "taxi" in text
         ), f"text: {text}, should contain man, cab, SUV or taxi"
         assert (
             "logo" in text or '"S"' in text or "SG" in text
         ), f"text: {text}, should contain logo, S or SG"
+=======
+            "man" in text
+            or "cab" in text
+            or "SUV" in text
+            or "taxi" in text
+            or "car" in text
+        ), f"text: {text}, should contain man, cab, SUV, taxi or car"
+        assert (
+            "logo" in text or '"S"' in text or "SG" in text or "graphic" in text
+        ), f"text: {text}, should contain logo, S or SG or graphic"
+>>>>>>> origin/main
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
+<<<<<<< HEAD
     def prepare_video_messages(self, video_path):
+=======
+    def _test_mixed_image_audio_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                        },
+                        {
+                            "type": "audio_url",
+                            "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Please describe the image in one sentence, and then write down the audio transcription in English.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+            **(self.get_vision_request_kwargs()),
+        )
+
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+        print("-" * 30)
+        print(f"Mixed image & audio response:\n{text}")
+        print("-" * 30)
+        assert (
+            "man" in text
+            or "cab" in text
+            or "SUV" in text
+            or "taxi" in text
+            or "car" in text
+        ), f"text: {text}, should contain man, cab, SUV, taxi or car"
+        check_list = [
+            "thank you",
+            "it's a privilege to be here",
+            "leader",
+            "science",
+            "art",
+        ]
+        for check_word in check_list:
+            assert (
+                check_word in text
+            ), f"text: ｜{text}｜ should contain ｜{check_word}｜"
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
+
+    def prepare_video_images_messages(self, video_path):
+>>>>>>> origin/main
         # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
         # the size of the video embeds differs from the `modality` argument when preprocessed
 
@@ -209,7 +439,11 @@ class TestOpenAIVisionServer(CustomTestCase):
         # from transformers import AutoTokenizer
         from decord import VideoReader, cpu
 
+<<<<<<< HEAD
         max_frames_num = 20
+=======
+        max_frames_num = 10
+>>>>>>> origin/main
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
@@ -230,7 +464,11 @@ class TestOpenAIVisionServer(CustomTestCase):
         frame_format = {
             "type": "image_url",
             "image_url": {"url": "data:image/jpeg;base64,{}"},
+<<<<<<< HEAD
             "modalities": "video",
+=======
+            "modalities": "image",
+>>>>>>> origin/main
         }
 
         for base64_frame in base64_frames:
@@ -244,15 +482,87 @@ class TestOpenAIVisionServer(CustomTestCase):
 
         return messages
 
+<<<<<<< HEAD
     def prepare_video_messages_video_direct(self, video_path):
+=======
+    def test_video_images_chat_completion(self):
+        url = VIDEO_JOBS_URL
+        file_path = self.get_or_download_file(url)
+
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        messages = self.prepare_video_images_messages(file_path)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=1024,
+            stream=False,
+        )
+
+        video_response = response.choices[0].message.content
+
+        print("-" * 30)
+        print(f"Video images response:\n{video_response}")
+        print("-" * 30)
+
+        # Add assertions to validate the video response
+        assert (
+            "iPod" in video_response
+            or "device" in video_response
+            or "microphone" in video_response
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'iPod' or 'device' or 'microphone'
+        """
+        assert (
+            "man" in video_response
+            or "person" in video_response
+            or "individual" in video_response
+            or "speaker" in video_response
+            or "presenter" in video_response
+            or "Steve" in video_response
+            or "hand" in video_response
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'man' or 'person' or 'individual' or 'speaker' or 'presenter' or 'Steve' or 'hand'
+        """
+        assert (
+            "present" in video_response
+            or "examine" in video_response
+            or "display" in video_response
+            or "hold" in video_response
+        ), f"""
+        ====================== video_response =====================
+        {video_response}
+        ===========================================================
+        should contain 'present' or 'examine' or 'display' or 'hold'
+        """
+        self.assertIsNotNone(video_response)
+        self.assertGreater(len(video_response), 0)
+
+
+class VideoOpenAITestMixin(TestOpenAIOmniServerBase):
+    def prepare_video_messages(self, video_path):
+>>>>>>> origin/main
         messages = [
             {
                 "role": "user",
                 "content": [
                     {
+<<<<<<< HEAD
                         "type": "image_url",
                         "image_url": {"url": f"video:{video_path}"},
                         "modalities": "video",
+=======
+                        "type": "video_url",
+                        "video_url": {"url": f"{video_path}"},
+>>>>>>> origin/main
                     },
                     {"type": "text", "text": "Please describe the video in detail."},
                 ],
@@ -260,6 +570,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         ]
         return messages
 
+<<<<<<< HEAD
     def get_or_download_file(self, url: str) -> str:
         cache_dir = os.path.expanduser("~/.cache")
         if url is None:
@@ -276,13 +587,18 @@ class TestOpenAIVisionServer(CustomTestCase):
                 f.write(response.content)
         return file_path
 
+=======
+>>>>>>> origin/main
     def test_video_chat_completion(self):
         url = VIDEO_JOBS_URL
         file_path = self.get_or_download_file(url)
 
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
+<<<<<<< HEAD
         # messages = self.prepare_video_messages_video_direct(file_path)
+=======
+>>>>>>> origin/main
         messages = self.prepare_video_messages(file_path)
 
         response = client.chat.completions.create(
@@ -291,7 +607,11 @@ class TestOpenAIVisionServer(CustomTestCase):
             temperature=0,
             max_tokens=1024,
             stream=False,
+<<<<<<< HEAD
             **(self.get_request_kwargs()),
+=======
+            **(self.get_vision_request_kwargs()),
+>>>>>>> origin/main
         )
 
         video_response = response.choices[0].message.content
@@ -302,14 +622,26 @@ class TestOpenAIVisionServer(CustomTestCase):
 
         # Add assertions to validate the video response
         assert (
+<<<<<<< HEAD
             "iPod" in video_response or "device" in video_response
+=======
+            "iPod" in video_response
+            or "device" in video_response
+            or "microphone" in video_response
+>>>>>>> origin/main
         ), f"video_response: {video_response}, should contain 'iPod' or 'device'"
         assert (
             "man" in video_response
             or "person" in video_response
             or "individual" in video_response
             or "speaker" in video_response
+<<<<<<< HEAD
         ), f"video_response: {video_response}, should either have 'man' in video_response, or 'person' in video_response, or 'individual' in video_response or 'speaker' in video_response"
+=======
+            or "presenter" in video_response
+            or "hand" in video_response
+        ), f"video_response: {video_response}, should either have 'man' in video_response, or 'person' in video_response, or 'individual' in video_response or 'speaker' in video_response or 'presenter' or 'hand' in video_response"
+>>>>>>> origin/main
         assert (
             "present" in video_response
             or "examine" in video_response
@@ -321,6 +653,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         ), f"video_response: {video_response}, should contain 'black' or 'dark'"
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
+<<<<<<< HEAD
 
     def test_regex(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -482,3 +815,5 @@ class TestOpenAIVisionServer(CustomTestCase):
 
     def test_audio_chat_completion(self):
         pass
+=======
+>>>>>>> origin/main

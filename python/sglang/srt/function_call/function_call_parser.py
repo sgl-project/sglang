@@ -10,10 +10,23 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+<<<<<<< HEAD
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+=======
+from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
+from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.kimik2_detector import KimiK2Detector
+from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.pythonic_detector import PythonicDetector
+from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.srt.function_call.step3_detector import Step3Detector
+>>>>>>> origin/main
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +45,17 @@ class FunctionCallParser:
         "qwen25": Qwen25Detector,
         "mistral": MistralDetector,
         "deepseekv3": DeepSeekV3Detector,
+<<<<<<< HEAD
         "pythonic": PythonicDetector,
+=======
+        "deepseekv31": DeepSeekV31Detector,
+        "pythonic": PythonicDetector,
+        "kimi_k2": KimiK2Detector,
+        "qwen3_coder": Qwen3CoderDetector,
+        "glm45": Glm4MoeDetector,
+        "step3": Step3Detector,
+        "gpt-oss": GptOssDetector,
+>>>>>>> origin/main
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
@@ -151,9 +174,15 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
+<<<<<<< HEAD
         # It cannot parse or validate Python syntax like function calls.
         if (
             not isinstance(self.detector, PythonicDetector)
+=======
+        # It cannot parse or validate function call Pythonic or XML-ish syntax.
+        if (
+            self.detector.supports_structural_tag()
+>>>>>>> origin/main
             and tool_choice == "auto"
             and any(tool.function.strict for tool in self.tools)
         ):
