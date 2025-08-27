@@ -5,6 +5,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla, transfer_kv_direct
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
@@ -246,6 +248,9 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished()
             if req.finished():
+                if self.server_args.enable_hierarchical_cache:
+                    self.offload_kv_cache_to_cpu(req)
+
                 self.tree_cache.cache_finished_req(req)
                 req.time_stats.completion_time = time.time()
 
@@ -721,4 +726,33 @@ class SchedulerOutputProcessorMixin:
             BatchEmbeddingOut(
                 rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
             )
+        )
+
+    def offload_kv_cache_to_cpu(self, req: Req):
+        """Offload KV cache for a finished request to CPU"""
+        if req.req_pool_idx == -1:
+            logger.debug(f"Request {req.rid} has invalid req_pool_idx")
+            return
+
+        token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        actual_length = len(req.origin_input_ids) + len(req.output_ids)
+
+        if token_indices.dim() == 0 or token_indices.numel() == 0:
+            logger.debug(
+                f"Request {req.rid} has invalid token_indices: {token_indices}"
+            )
+            return
+
+        token_indices = token_indices[:actual_length]
+        cpu_indices = self.offload_worker_manager.mem_pool_host.alloc(actual_length)
+
+        if cpu_indices.dim() == 0 or cpu_indices.numel() == 0:
+            logger.debug(f"Request {req.rid} has invalid cpu_indices: {cpu_indices}")
+            return
+
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        logger.info(f"Transferring KV cache for req {req.rid}: {actual_length} tokens")
+
+        self.offload_worker_manager.mem_pool_host.backup_from_device_all_layer(
+            kv_cache, cpu_indices, token_indices.long(), "direct"
         )
