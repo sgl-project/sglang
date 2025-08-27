@@ -182,10 +182,9 @@ class Qwen2_5_VisionBlock(nn.Module):
             position_embeddings=position_embeddings,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
-        x = x + attn
-        norm2 = self.norm2(x)
-        mlp = self.mlp(norm2)
-        x = x + mlp
+        x_norm, x_after_add = self.norm2(x, residual=attn)
+        mlp_out = self.mlp(x_norm)
+        x = x_after_add + mlp_out
         return x
 
 
