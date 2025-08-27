@@ -1,6 +1,13 @@
 from torch import nn
 
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()

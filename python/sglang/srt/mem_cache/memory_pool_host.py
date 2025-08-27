@@ -8,7 +8,7 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import is_npu,is_xpu
+from sglang.srt.utils import is_npu, is_xpu
 
 _is_npu = is_npu()
 _is_xpu = is_xpu()
