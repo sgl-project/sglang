@@ -1972,7 +1972,7 @@ class ServerArgs:
             "--disaggregation-decode-tp",
             type=int,
             default=ServerArgs.disaggregation_decode_tp,
-            help="Decode tp size. If not set, it matches the tp size of the current engine. This is only set on the prefill server.",
+            help="Decode tp size.  If not set, it matches the tp size of the current engine. This is only set on the prefill server.",
         )
         parser.add_argument(
             "--disaggregation-decode-dp",
