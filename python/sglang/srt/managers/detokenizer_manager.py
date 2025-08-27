@@ -139,7 +139,10 @@ class DetokenizerManager(MultiTokenizerMixin):
             # Send data using the corresponding socket
             for i, worker_id in enumerate(worker_ids):
                 if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                    self.register_tokenizer_ipc(recv_obj, worker_id)
+                    if self.register_tokenizer_ipc(recv_obj, worker_id):
+                        logger.info(
+                            f"DetokenizerManager Created ZMQ socket for worker {worker_id}"
+                        )
                     continue
                 else:
                     if worker_id not in self.tokenizer_mapping:

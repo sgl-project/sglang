@@ -65,24 +65,21 @@ class MultiTokenizerMixin:
             socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
             self.tokenizer_mapping[worker_id_int] = socket
             self.tokenizer_mapping[worker_id_int].send_pyobj(recv_obj)
-            logger.info(
-                f"Detokenizer Manager Created ZMQ socket for worker {worker_id} with ipc_name {ipc_name}"
-            )
+            return True
         else:
-            logger.info(
-                f"ZMQ socket for worker {worker_id} already exists, skipping creation"
-            )
+            return False
 
     def register_tokenizer_ipc(self, recv_obj, worker_id):
         if worker_id not in self.tokenizer_mapping:
             # register the worker if not already done
             if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                self.init_tokenizer_mapping(recv_obj, worker_id)
+                return self.init_tokenizer_mapping(recv_obj, worker_id)    
             else:
                 logger.error(
                     f"Worker {worker_id} not registered and not found in tokenizer mapping . "
                     "Please ensure the worker is registered correctly."
                 )
+        return False
 
     def _handle_output_by_index(self, output, i):
         if isinstance(output, BatchTokenIDOut):
@@ -344,7 +341,7 @@ class MultiTokenizerMixin:
         return new_output
 
 
-class MultiTokenizerRouter(MultiTokenizerMixin):
+class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
     """A router to receive requests from MultiTokenizerManager"""
 
     def __init__(
@@ -352,6 +349,7 @@ class MultiTokenizerRouter(MultiTokenizerMixin):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        self.server_args = server_args
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
@@ -372,6 +370,7 @@ class MultiTokenizerRouter(MultiTokenizerMixin):
         self._handle_task = asyncio.run_coroutine_threadsafe(
             print_exception_wrapper(self.handle_loop), self._loop
         )
+        self.init_disaggregation()
 
     def _run_loop(self):
         self._loop.run_forever()
@@ -403,7 +402,10 @@ class MultiTokenizerRouter(MultiTokenizerMixin):
         # Distribute result to each worker
         for i, worker_id in enumerate(worker_ids):
             if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                self.register_tokenizer_ipc(recv_obj, worker_id)
+                if self.register_tokenizer_ipc(recv_obj, worker_id):
+                    logger.info(
+                        f"MultiTokenizerRouter Created ZMQ socket for worker {worker_id}"
+                    )
                 continue
             else:
                 if worker_id not in self.tokenizer_mapping:
