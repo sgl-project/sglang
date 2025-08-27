@@ -102,6 +102,7 @@ def flashinfer_cutedsl_moe_masked(
     aq, aq_sf = scaled_fp4_grouped_quant(
         hidden_states,
         input_global_scale,
+        masked_m,
     )
     gateup_output = torch.empty(
         (num_experts, m, n * 2), dtype=hidden_states.dtype, device=aq.device
