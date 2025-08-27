@@ -833,7 +833,10 @@ impl PDRouter {
                 }
             };
 
-            let sse_data = format!("data: {{'error': {}}}", serde_json::to_string(&error_payload).unwrap_or_default());
+            let sse_data = format!(
+                "data: {{'error': {}}}",
+                serde_json::to_string(&error_payload).unwrap_or_default()
+            );
             let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
 
             let decode_url = decode.url().to_string();
@@ -850,13 +853,8 @@ impl PDRouter {
         } else {
             // Handle non-streaming error response
             match res.bytes().await {
-                Ok(error_body) => {
-                    (status, error_body).into_response()
-                }
-                Err(e) => {
-                    (status, format!("Decode server error: {}", e))
-                        .into_response()
-                }
+                Ok(error_body) => (status, error_body).into_response(),
+                Err(e) => (status, format!("Decode server error: {}", e)).into_response(),
             }
         }
     }
@@ -934,7 +932,9 @@ impl PDRouter {
                             status
                         );
 
-                        return self.handle_decode_error_response(res, &context, prefill, decode).await;
+                        return self
+                            .handle_decode_error_response(res, &context, prefill, decode)
+                            .await;
                     }
 
                     // Process prefill response for logprobs
@@ -1078,7 +1078,8 @@ impl PDRouter {
                             status
                         );
 
-                        self.handle_decode_error_response(res, &context, prefill, decode).await
+                        self.handle_decode_error_response(res, &context, prefill, decode)
+                            .await
                     } else if context.is_stream {
                         // Streaming response without logprobs - direct passthrough
                         let decode_url = decode.url().to_string();
