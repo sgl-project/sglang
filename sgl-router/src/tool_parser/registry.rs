@@ -1,5 +1,5 @@
 use crate::tool_parser::parsers::{
-    DeepSeekParser, JsonParser, LlamaParser, MistralParser, PythonicParser, QwenParser,
+    DeepSeekParser, JsonParser, LlamaParser, MistralParser, PythonicParser, QwenParser, Step3Parser,
 };
 use crate::tool_parser::traits::ToolParser;
 use std::collections::HashMap;
@@ -113,6 +113,8 @@ impl ParserRegistry {
 
         // DeepSeek V3 parser - Unicode tokens with JSON blocks
         self.register_parser("deepseek", Arc::new(DeepSeekParser::new()));
+        // Step3 parser - StepTML XML format
+        self.register_parser("step3", Arc::new(Step3Parser::new()));
     }
 
     /// Register default model mappings
