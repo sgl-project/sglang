@@ -330,7 +330,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # intermediate_size_per_partition_after_pad the same as the
             # per_rank_intermediate_size during weight loading
             intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size, mxfp4_block
+                intermediate_size, self.scaling_vector_size
             )
 
         self.intermediate_size = intermediate_size_per_partition_after_pad
