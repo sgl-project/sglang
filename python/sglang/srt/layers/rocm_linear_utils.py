@@ -1,11 +1,15 @@
 import torch
-
-from sglang.srt.utils import BumpAllocator
-
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 
-def aiter_dsv3_router_gemm(hidden_states: torch.Tensor, weight: torch.Tensor, gemm_output_zero_allocator: BumpAllocator = None):
+from sglang.srt.utils import BumpAllocator
+
+
+def aiter_dsv3_router_gemm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    gemm_output_zero_allocator: BumpAllocator = None,
+):
     M = hidden_states.shape[0]
     N = weight.shape[0]
     y = None
@@ -26,7 +30,9 @@ def aiter_dsv3_router_gemm(hidden_states: torch.Tensor, weight: torch.Tensor, ge
     return logits
 
 
-def get_dsv3_gemm_output_zero_allocator_size(n_routed_experts: int, num_moe_layers: int, allocate_size: int, embedding_dim: int):
+def get_dsv3_gemm_output_zero_allocator_size(
+    n_routed_experts: int, num_moe_layers: int, allocate_size: int, embedding_dim: int
+):
     if embedding_dim != 7168 or n_routed_experts != 256:
         return 0
 

@@ -130,9 +130,13 @@ _device_sm = get_device_sm()
 
 if _use_aiter:
     from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
-    from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm, get_dsv3_gemm_output_zero_allocator_size
-    from sglang.srt.layers.quantization.rocm_mxfp4_utils import *
+
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
+    from sglang.srt.layers.quantization.rocm_mxfp4_utils import *
+    from sglang.srt.layers.rocm_linear_utils import (
+        aiter_dsv3_router_gemm,
+        get_dsv3_gemm_output_zero_allocator_size,
+    )
 
 if _is_cuda:
     from sgl_kernel import (
@@ -234,7 +238,9 @@ class DeepseekV2MLP(nn.Module):
             return x
 
         if gemm_output_zero_allocator != None and x.shape[0] <= 256:
-            y = gemm_output_zero_allocator.allocate(x.shape[0]*self.gate_up_proj.output_size_per_partition).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+            y = gemm_output_zero_allocator.allocate(
+                x.shape[0] * self.gate_up_proj.output_size_per_partition
+            ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
@@ -286,7 +292,9 @@ class MoEGate(nn.Module):
             # router gemm output float32
             logits = dsv3_router_gemm(hidden_states, self.weight)
         elif _use_aiter and hidden_states.shape[0] <= 256:
-            logits = aiter_dsv3_router_gemm(hidden_states, self.weight, gemm_output_zero_allocator)
+            logits = aiter_dsv3_router_gemm(
+                hidden_states, self.weight, gemm_output_zero_allocator
+            )
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
@@ -1242,7 +1250,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
-            if (not isinstance(hidden_states, tuple)) and hidden_states.shape[0] <= 16 and self.use_min_latency_fused_a_gemm:
+            if (
+                (not isinstance(hidden_states, tuple))
+                and hidden_states.shape[0] <= 16
+                and self.use_min_latency_fused_a_gemm
+            ):
                 fused_qkv_a_proj_out = dsv3_fused_a_gemm(
                     hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
                 )
@@ -1263,7 +1275,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             else:
                 if _use_aiter and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, k_nope = fused_rms_mxfp4_quant(q, self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon, k_nope, self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon)
+                    q, k_nope = fused_rms_mxfp4_quant(
+                        q,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.variance_epsilon,
+                        k_nope,
+                        self.kv_a_layernorm.weight,
+                        self.kv_a_layernorm.variance_epsilon,
+                    )
                 else:
                     q = self.q_a_layernorm(q)
                     k_nope = self.kv_a_layernorm(k_nope)
@@ -1300,8 +1319,20 @@ class DeepseekV2AttentionMLA(nn.Module):
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter and self.w_kc.dtype == torch.uint8:
                 x = q_nope.transpose(0, 1)
-                q_nope_out = torch.empty(x.shape[0], x.shape[1], self.w_kc.shape[2], device=x.device, dtype=torch.bfloat16)
-                batched_gemm_afp4wfp4_pre_quant(x, self.w_kc.transpose(-2, -1), self.w_scale_k.transpose(-2,-1), torch.bfloat16, q_nope_out)
+                q_nope_out = torch.empty(
+                    x.shape[0],
+                    x.shape[1],
+                    self.w_kc.shape[2],
+                    device=x.device,
+                    dtype=torch.bfloat16,
+                )
+                batched_gemm_afp4wfp4_pre_quant(
+                    x,
+                    self.w_kc.transpose(-2, -1),
+                    self.w_scale_k.transpose(-2, -1),
+                    torch.bfloat16,
+                    q_nope_out,
+                )
             else:
                 q_nope_out = torch.bmm(
                     q_nope.to(torch.bfloat16).transpose(0, 1),
@@ -1354,7 +1385,16 @@ class DeepseekV2AttentionMLA(nn.Module):
             if _use_aiter:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
-                q, k = fused_qk_rope_cat(q_nope_out, q_pe, k_nope, k_pe, positions, cos, sin, self.rotary_emb.is_neox_style)
+                q, k = fused_qk_rope_cat(
+                    q_nope_out,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    positions,
+                    cos,
+                    sin,
+                    self.rotary_emb.is_neox_style,
+                )
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
@@ -1385,8 +1425,20 @@ class DeepseekV2AttentionMLA(nn.Module):
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
-                attn_bmm_output = torch.empty(x.shape[0], x.shape[1], self.w_vc.shape[2], device=x.device, dtype=torch.bfloat16)
-                batched_gemm_afp4wfp4_pre_quant(x, self.w_vc.transpose(-2, -1), self.w_scale_v.transpose(-2,-1), torch.bfloat16, attn_bmm_output)
+                attn_bmm_output = torch.empty(
+                    x.shape[0],
+                    x.shape[1],
+                    self.w_vc.shape[2],
+                    device=x.device,
+                    dtype=torch.bfloat16,
+                )
+                batched_gemm_afp4wfp4_pre_quant(
+                    x,
+                    self.w_vc.transpose(-2, -1),
+                    self.w_scale_v.transpose(-2, -1),
+                    torch.bfloat16,
+                    attn_bmm_output,
+                )
             else:
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),
@@ -1394,7 +1446,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
 
             if self.o_proj.weight.dtype == torch.uint8:
-                attn_bmm_output = attn_bmm_output.transpose(0,1)
+                attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
@@ -1910,7 +1962,14 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch, True if self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8 else False
+            hidden_states,
+            residual,
+            forward_batch,
+            (
+                True
+                if self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8
+                else False
+            ),
         )
 
         hidden_states = self.self_attn(
@@ -2080,16 +2139,35 @@ class DeepseekV2Model(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
 
         self.gemm_output_zero_allocator_size = 0
-        if _use_aiter and config.n_routed_experts == 256 and self.embed_tokens.embedding_dim == 7168:
-            num_moe_layers = sum([1 for i in range(len(self.layers)) if isinstance(self.layers[i].mlp, DeepseekV2MoE)])
+        if (
+            _use_aiter
+            and config.n_routed_experts == 256
+            and self.embed_tokens.embedding_dim == 7168
+        ):
+            num_moe_layers = sum(
+                [
+                    1
+                    for i in range(len(self.layers))
+                    if isinstance(self.layers[i].mlp, DeepseekV2MoE)
+                ]
+            )
 
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
-                    allocate_size = self.layers[i].mlp.shared_experts.gate_up_proj.output_size_per_partition
+                    allocate_size = self.layers[
+                        i
+                    ].mlp.shared_experts.gate_up_proj.output_size_per_partition
                     break
 
-            self.gemm_output_zero_allocator_size = get_dsv3_gemm_output_zero_allocator_size(config.n_routed_experts, num_moe_layers, allocate_size, self.embed_tokens.embedding_dim)
+            self.gemm_output_zero_allocator_size = (
+                get_dsv3_gemm_output_zero_allocator_size(
+                    config.n_routed_experts,
+                    num_moe_layers,
+                    allocate_size,
+                    self.embed_tokens.embedding_dim,
+                )
+            )
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -2110,7 +2188,15 @@ class DeepseekV2Model(nn.Module):
             device=device,
         )
 
-        gemm_output_zero_allocator = BumpAllocator(buffer_size = self.gemm_output_zero_allocator_size, dtype=torch.float32, device=device) if self.gemm_output_zero_allocator_size > 0 else None
+        gemm_output_zero_allocator = (
+            BumpAllocator(
+                buffer_size=self.gemm_output_zero_allocator_size,
+                dtype=torch.float32,
+                device=device,
+            )
+            if self.gemm_output_zero_allocator_size > 0
+            else None
+        )
 
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -2138,7 +2224,12 @@ class DeepseekV2Model(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator, gemm_output_zero_allocator
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
+                    gemm_output_zero_allocator,
                 )
 
         if normal_end_layer != self.end_layer:
@@ -2411,7 +2502,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
             if _use_aiter and self.quant_config.get_name() == "quark":
-                w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = quark_post_load_weights(self_attn, w, "mxfp4")
+                w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
+                    quark_post_load_weights(self_attn, w, "mxfp4")
+                )
 
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(

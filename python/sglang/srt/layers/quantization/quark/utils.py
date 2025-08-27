@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import re
-import torch
-from torch import nn
-
 from collections.abc import Iterable, Mapping
 from types import MappingProxyType
 from typing import Any, Optional
 
+import torch
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from torch import nn
+
 
 def deep_compare(dict1: Any, dict2: Any) -> bool:
     if type(dict1) is not type(dict2):
@@ -110,11 +110,13 @@ def _is_equal_or_regex_match(
         return True
     return False
 
+
 # utility for tensor dims > 2 cases
 def b_dynamic_mxfp4_quant(x):
-    h,b,d= x.shape
+    h, b, d = x.shape
     x, x_scales = dynamic_mxfp4_quant(x.reshape(-1, d))
-    return x.view(h,b,d//2), x_scales.view(h,b,d//32)
+    return x.view(h, b, d // 2), x_scales.view(h, b, d // 32)
+
 
 def mxfp4_to_f32(x, is_threed):
     # 2 because we pack fp4 in uint8.
@@ -147,31 +149,33 @@ def mxfp4_to_f32(x, is_threed):
     mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device="cuda")
     return mxfp4_in_f32[x.long()]
 
+
 def e8m0_to_f32(x):
     x_f32 = 2 ** ((x.to(torch.float32)) - 127)
     x_f32[x_f32 == 128] = float("nan")
     return x_f32
 
+
 def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format: str):
     if "mxfp4" in quant_format:
         if w.dtype == torch.bfloat16:
-            w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2,-1))
-            w_kc = w_kc.transpose(-2,-1)
-            w_s_kc = w_s_kc.transpose(-2,-1)
+            w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2, -1))
+            w_kc = w_kc.transpose(-2, -1)
+            w_s_kc = w_s_kc.transpose(-2, -1)
             w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
             w_s_kc = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
             w_s_vc = w_s_vc.contiguous().transpose(1, 2)
-        elif w.dtype == torch.uint8: # static quant for mxfp4
+        elif w.dtype == torch.uint8:  # static quant for mxfp4
             w = mxfp4_to_f32(w, True).to(torch.bfloat16)
             w_scales = self_attn.kv_b_proj.weight_scale.repeat_interleave(32, dim=-1)
             w_scales = e8m0_to_f32(w_scales).to(torch.bfloat16)
             w = w * w_scales
             w_kc, w_vc = w.unflatten(
-            0, (-1, (self_attn.qk_nope_head_dim + self_attn.v_head_dim))
+                0, (-1, (self_attn.qk_nope_head_dim + self_attn.v_head_dim))
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2,-1))
-            w_kc = w_kc.transpose(-2,-1)
-            w_s_kc = w_s_kc.transpose(-2,-1)
+            w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2, -1))
+            w_kc = w_kc.transpose(-2, -1)
+            w_s_kc = w_s_kc.transpose(-2, -1)
             w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
             w_s_kc = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
             w_s_vc = w_s_vc.contiguous().transpose(1, 2)

@@ -81,6 +81,7 @@ class SiluAndMul(CustomOp):
         out = torch_npu.npu_swiglu(x)
         return out
 
+
 class GeluAndMul(CustomOp):
     def __init__(self, approximate="tanh"):
         super().__init__()

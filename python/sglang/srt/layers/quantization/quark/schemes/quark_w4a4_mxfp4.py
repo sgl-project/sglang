@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from aiter.ops.gemm_op_a4w4 import gemm_a4w4
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
-from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
+from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility import dtypes
 from aiter.utility.fp4_utils import e8m0_shuffle
 
@@ -20,6 +20,7 @@ from sglang.srt.utils import get_bool_env_var
 __all__ = ["QuarkW4A4MXFP4"]
 
 OCP_MX_BLOCK_SIZE = 32
+
 
 class QuarkW4A4MXFP4(QuarkScheme):
 
@@ -86,11 +87,14 @@ class QuarkW4A4MXFP4(QuarkScheme):
     ) -> torch.Tensor:
         # This path doesnt have support for bias currently
         assert bias is None, "bias is not supported"
-        three_d=False
+        three_d = False
         x_s = None
         y = None
         if isinstance(x, tuple):
-            assert len(x) in [2, 3], "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+            assert len(x) in [
+                2,
+                3,
+            ], "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
             if len(x) == 2:
                 x, x_s = x
             elif len(x) == 3:
@@ -98,10 +102,10 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
         use_prequant_kernel = (
             x_s is None and y is not None and layer.weight.shape[0] == y.shape[1]
-        )    
+        )
 
         if x.dim() == 3:
-            three_d=True
+            three_d = True
             x = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
 
@@ -111,7 +115,12 @@ class QuarkW4A4MXFP4(QuarkScheme):
             x_q, x_s = dynamic_mxfp4_quant(x)
 
         if y is None:
-            y = torch.empty(x_q.shape[0], layer.weight.shape[0], device=x_q.device, dtype=self.out_dtype)
+            y = torch.empty(
+                x_q.shape[0],
+                layer.weight.shape[0],
+                device=x_q.device,
+                dtype=self.out_dtype,
+            )
 
         if use_prequant_kernel:
             gemm_afp4wfp4_pre_quant(x_q, layer.weight, layer.weight_scale, y.dtype, y)
@@ -121,5 +130,5 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
         if three_d:
             return y.view(*output_shape)
-        
-        return y 
+
+        return y
