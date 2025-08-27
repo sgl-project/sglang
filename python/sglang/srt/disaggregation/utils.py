@@ -354,14 +354,9 @@ def register_disaggregation_server(
 
 
 def is_mla_backend(target_kv_pool) -> bool:
-    from sglang.srt.mem_cache.memory_pool import (
-        AscendMLAPagedTokenToKVPool,
-        MLATokenToKVPool,
-    )
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
-    return isinstance(target_kv_pool, MLATokenToKVPool) or isinstance(
-        target_kv_pool, AscendMLAPagedTokenToKVPool
-    )
+    return isinstance(target_kv_pool, MLATokenToKVPool)
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
