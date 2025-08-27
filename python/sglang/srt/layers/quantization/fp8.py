@@ -64,7 +64,6 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
-from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -72,6 +71,8 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_sm90_supported,
+    is_sm100_supported,
     log_info_on_rank0,
     next_power_of_2,
     print_warning_once,
