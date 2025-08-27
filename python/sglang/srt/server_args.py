@@ -192,7 +192,7 @@ class ServerArgs:
     ] = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
-    deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    deepep_mode: Optional[Literal["auto", "normal", "low_latency", "low_latency_overlap"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -254,6 +254,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
+    enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
@@ -598,6 +599,15 @@ class ServerArgs:
                 self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
+
+        if self.enable_single_batch_overlap:
+            assert (
+                self.moe_a2a_backend == "deepep"
+            ), "Single batch overlap for decode is compatible with deepep moe."
+
+            assert (
+                self.deepep_mode in ["auto", "low_latency_overlap"]
+            ), "Single batch overlap for decode is only compatible with deepep_mode = `auto` or `low_latency_overlap`."
 
         # Pipeline parallelism
         if self.pp_size > 1:
@@ -1515,9 +1525,9 @@ class ServerArgs:
         parser.add_argument(
             "--deepep-mode",
             type=str,
-            choices=["normal", "low_latency", "auto"],
+            choices=["normal", "low_latency", "low_latency_overlap", "auto"],
             default="auto",
-            help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+            help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency`, `low_latency_overlap` or `auto`. Default is `auto`, which means `low_latency` or `low_latency_overlap` for decode batch and `normal` for prefill batch.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",
@@ -1816,6 +1826,11 @@ class ServerArgs:
             "--enable-two-batch-overlap",
             action="store_true",
             help="Enabling two micro batches to overlap.",
+        )
+        parser.add_argument(
+            "--enable-single-batch-overlap",
+            action="store_true",
+            help="Decode enables single batch overlap.",
         )
         parser.add_argument(
             "--tbo-token-distribution-threshold",

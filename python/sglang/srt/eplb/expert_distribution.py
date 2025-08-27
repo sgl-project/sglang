@@ -297,7 +297,7 @@ class _SinglePassGatherer(ABC):
         if server_args.moe_a2a_backend != "none":
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-            elif server_args.deepep_mode == "low_latency":
+            elif server_args.deepep_mode == "low_latency" or server_args.deepep_mode == "low_latency_overlap":
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata, rank
                 )

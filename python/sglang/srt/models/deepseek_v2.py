@@ -458,7 +458,11 @@ class DeepseekV2MoE(nn.Module):
                     use_reduce_scatter,
                 )
         else:
-            return self.forward_deepep(hidden_states, forward_batch)
+            use_sbo = global_server_args_dict["enable_single_batch_overlap"]
+            if not forward_batch.is_extend_in_batch and use_sbo:
+                return self.forward_deepep_sbo(hidden_states, forward_batch)
+            else:
+                return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
         self,
@@ -628,6 +632,55 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
+
+    def forward_deepep_sbo(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        shared_output = None
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
+            topk_weights, topk_idx, _ = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+        else:
+            topk_weights, topk_idx, _ = self.topk.empty_topk_output(
+                hidden_states.device
+            )
+        
+        down_start_event = torch.cuda.Event()
+        forward_params = dict(
+            num_experts=self.num_experts,
+            tp_size=self.tp_size,
+            down_start_event=down_start_event,
+            alt_stream=self.alt_stream,
+            shared_experts=self.shared_experts if self.num_fused_shared_experts == 0 else None,
+        )
+
+        final_hidden_states, shared_output = self.experts(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+            enable_sbo=True,
+            params=forward_params,
+        )
+
+        if shared_output is not None:
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            final_hidden_states *= self.routed_scaling_factor
+
+        return final_hidden_states    
+
 
     def _forward_shared_experts(self, hidden_states):
         if self.num_fused_shared_experts == 0:

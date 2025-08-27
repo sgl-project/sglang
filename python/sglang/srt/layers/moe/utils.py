@@ -71,6 +71,7 @@ class DeepEPMode(Enum):
 
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"
+    LOW_LATENCY_OVERLAP = "low_latency_overlap"
     AUTO = "auto"
 
     def enable_normal(self) -> bool:
@@ -79,14 +80,20 @@ class DeepEPMode(Enum):
     def enable_low_latency(self) -> bool:
         return self in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]
 
-    def resolve(self, is_extend_in_batch: bool) -> DeepEPMode:
+    def enable_low_latency_overlap(self) -> bool:
+        return self in [DeepEPMode.LOW_LATENCY_OVERLAP, DeepEPMode.AUTO]
+
+    def resolve(self, is_extend_in_batch: bool, use_sbo: bool = False) -> DeepEPMode:
         if self != DeepEPMode.AUTO:
             return self
 
         if is_extend_in_batch:
             return DeepEPMode.NORMAL
         else:
-            return DeepEPMode.LOW_LATENCY
+            if use_sbo:
+                return DeepEPMode.LOW_LATENCY_OVERLAP
+            else:
+                return DeepEPMode.LOW_LATENCY
 
     def is_normal(self) -> bool:
         return self == DeepEPMode.NORMAL

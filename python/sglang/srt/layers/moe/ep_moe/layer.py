@@ -426,18 +426,63 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        enable_sbo: bool = False,
+        params: dict = None,
     ):
-        dispatch_output = self.dispatch(
-            hidden_states, topk_idx, topk_weights, forward_batch
-        )
-        hidden_states = self.moe_impl(dispatch_output)
-        hidden_states = self.combine(
-            hidden_states,
-            dispatch_output.topk_idx,
-            dispatch_output.topk_weights,
-            forward_batch,
-        )
-        return hidden_states
+        if not enable_sbo:
+            dispatch_output = self.dispatch(
+                hidden_states, topk_idx, topk_weights, forward_batch
+            )
+            hidden_states = self.moe_impl(dispatch_output)
+            hidden_states = self.combine(
+                hidden_states,
+                dispatch_output.topk_idx,
+                dispatch_output.topk_weights,
+                forward_batch,
+            )
+            return hidden_states
+        else:
+            event = params["down_start_event"]
+            alt_stream = params["alt_stream"]
+            shared_experts = params["shared_experts"]
+            dispatch_output, shared_output = self.dispatch(
+                hidden_states, topk_idx, topk_weights, forward_batch, shared_experts=shared_experts, enable_shared_experts_overlap=True
+            )
+
+            num_experts = params["num_experts"]
+            tp_size = params["tp_size"]
+            MIN_BLOCK_M = 64
+            max_signal_size = (num_experts // tp_size) * \
+                ((dispatch_output[0][0].shape[1] + MIN_BLOCK_M - 1) // MIN_BLOCK_M)
+            signal = torch.zeros(max_signal_size, dtype=torch.int32, device=dispatch_output[0][0].device)
+
+            hidden_states, block_m, threshold = self.forward_deepgemm_signal(dispatch_output, signal, event)
+            if alt_stream is not None:
+                current_stream = torch.cuda.current_stream()
+                alt_stream.wait_event(event)
+                with torch.cuda.stream(alt_stream):
+                    hidden_states = self.combine(
+                        hidden_states,
+                        dispatch_output.topk_idx,
+                        dispatch_output.topk_weights,
+                        forward_batch,
+                        signal=signal,
+                        block_m=block_m,
+                        threshold=threshold,
+                        valid_sm=3,
+                    )
+                current_stream.wait_stream(alt_stream)
+            else:
+                hidden_states = self.combine(
+                    hidden_states,
+                    dispatch_output.topk_idx,
+                    dispatch_output.topk_weights,
+                    forward_batch,
+                    signal=signal,
+                    block_m=block_m,
+                    threshold=threshold,
+                )
+            return hidden_states, shared_output
 
     def dispatch(
         self,
@@ -445,12 +490,16 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        shared_experts: Optional[torch.Tensor] = None,
+        enable_shared_experts_overlap: bool = False,
     ):
         return self.deepep_dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
+            shared_experts=shared_experts,
+            enable_shared_experts_overlap=enable_shared_experts_overlap,
         )
 
     def moe_impl(self, dispatch_output: DispatchOutput):
@@ -480,12 +529,20 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        signal: torch.Tensor = None,
+        block_m: int = None,
+        threshold: int = None,
+        valid_sm: int = 3,
     ):
         return self.deepep_dispatcher.combine(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
+            signal=signal,
+            block_m=block_m,
+            threshold=threshold,
+            valid_sm=valid_sm,
         )
 
     def forward_aiter(
@@ -726,6 +783,92 @@ class DeepEPMoE(EPMoE):
         )
 
         return down_output
+
+    def forward_deepgemm_signal(
+        self,
+        dispatch_output: DeepEPLLOutput,
+        signal: torch.Tensor,
+        down_start_event: torch.cuda.Event,
+    ):
+        hidden_states_fp8, _, _, masked_m, expected_m = dispatch_output
+        assert self.quant_method is not None
+        assert self.moe_runner_config.activation == "silu"
+
+        # GroupGemm-0
+        num_groups, m, k = hidden_states_fp8[0].size()
+        n = self.w13_weight.size(1)
+        expected_m = min(expected_m, m)
+        gateup_output = torch.empty(
+            (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            hidden_states_fp8,
+            self.w13_weight_fp8,
+            gateup_output,
+            masked_m,
+            expected_m,
+            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
+        )
+        dispose_tensor(hidden_states_fp8[0])
+
+        # Act
+        down_input = torch.empty(
+            (
+                gateup_output.shape[0],
+                gateup_output.shape[1],
+                gateup_output.shape[2] // 2,
+            ),
+            device=gateup_output.device,
+            dtype=self.fp8_dtype,
+        )
+        scale_block_size = 128
+        down_input_scale = torch.empty(
+            (
+                gateup_output.shape[0],
+                gateup_output.shape[1],
+                gateup_output.shape[2] // 2 // scale_block_size,
+            ),
+            device=gateup_output.device,
+            dtype=torch.float32,
+        )
+        silu_and_mul_masked_post_quant_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            scale_block_size,
+            masked_m,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+        del gateup_output
+
+        # GroupGemm-1
+        n = self.w2_weight.size(1)
+        down_input_fp8 = (
+            down_input,
+            (
+                down_input_scale
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
+                    down_input_scale
+                )
+            ),
+        )
+        down_output = torch.empty(
+            (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
+        )
+        block_m, threshold = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_signal(
+            down_input_fp8,
+            self.w2_weight_fp8,
+            down_output,
+            masked_m,
+            signal,
+            expected_m,
+            down_start_event,
+            3,
+            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
+        )
+
+        return down_output, block_m, threshold
 
     def forward_npu(
         self,

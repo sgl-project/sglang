@@ -9,6 +9,7 @@ from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     DEEPGEMM_BLACKWELL,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
+    DEEPGEMM_MIN_BLOCK_M,
 )
 from sglang.srt.server_args import ServerArgs
 
@@ -20,10 +21,13 @@ if ENABLE_JIT_DEEPGEMM:
     if DEEPGEMM_BLACKWELL:
         from deep_gemm import fp8_gemm_nt as _gemm_nt_f8f8bf16_raw
         from deep_gemm import (
-            fp8_m_grouped_gemm_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
+            m_grouped_fp8_gemm_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
         )
         from deep_gemm import (
             m_grouped_fp8_gemm_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
+        )
+        from deep_gemm import (
+            m_grouped_gemm_fp8_fp8_bf16_nt_signal as _grouped_gemm_nt_f8f8bf16_signal_raw,
         )
     else:
         from deep_gemm import gemm_fp8_fp8_bf16_nt as _gemm_nt_f8f8bf16_raw
@@ -33,6 +37,9 @@ if ENABLE_JIT_DEEPGEMM:
         )
         from deep_gemm import (
             m_grouped_gemm_fp8_fp8_bf16_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
+        )
+        from deep_gemm import (
+            m_grouped_gemm_fp8_fp8_bf16_nt_signal as _grouped_gemm_nt_f8f8bf16_signal_raw,
         )
 
 
@@ -59,6 +66,38 @@ def grouped_gemm_nt_f8f8bf16_masked(
             expected_m,
             **({"recipe": recipe} if DEEPGEMM_BLACKWELL else {})
         )
+
+def grouped_gemm_nt_f8f8bf16_signal(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    signal: torch.Tensor,
+    expected_m: int,
+    gemm_start_event: torch.cuda.Event = None,
+    invalid_sm: int = 3,
+    recipe=None,
+):
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_SIGNAL
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        if gemm_start_event is not None:
+            gemm_start_event.record()
+        block_m, threshold = _grouped_gemm_nt_f8f8bf16_signal_raw(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            signal,
+            expected_m,
+            invalid_sm,
+            **({"recipe": recipe} if DEEPGEMM_BLACKWELL else {})
+        )
+    return block_m, threshold
 
 
 def grouped_gemm_nt_f8f8bf16_contig(

@@ -13,6 +13,7 @@ from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -145,7 +146,7 @@ class DeepEPBuffer:
                     config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
                     num_rdma_bytes,
                 )
-        if deepep_mode.enable_low_latency():
+        if deepep_mode.enable_low_latency() or deepep_mode.enable_low_latency_overlap():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
             num_rdma_bytes = max(
@@ -160,7 +161,7 @@ class DeepEPBuffer:
 
         if deepep_mode == DeepEPMode.NORMAL:
             num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
-        elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
+        elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.LOW_LATENCY_OVERLAP, DeepEPMode.AUTO]:
             num_qps_per_rank = num_experts // group.size()
         else:
             raise NotImplementedError
@@ -171,6 +172,7 @@ class DeepEPBuffer:
             ).multi_processor_count
             if (
                 (deepep_mode != DeepEPMode.LOW_LATENCY)
+                and (deepep_mode != DeepEPMode.LOW_LATENCY_OVERLAP)
                 and not is_tbo_enabled()
                 and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
             ):
@@ -184,7 +186,7 @@ class DeepEPBuffer:
             group,
             num_nvl_bytes,
             num_rdma_bytes,
-            low_latency_mode=deepep_mode.enable_low_latency(),
+            low_latency_mode=deepep_mode.enable_low_latency() or deepep_mode.enable_low_latency_overlap(),
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
@@ -274,6 +276,7 @@ class _DeepEPDispatcherImplBase:
         )
 
         self.handle = None
+        self.masked_m = None
 
     def dispatch_a(
         self,
@@ -613,6 +616,158 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
 
+class _DeepEPDispatcherImplLowLatencyOverlap(_DeepEPDispatcherImplBase):
+    def __init__(self, return_recv_hook: bool, **kwargs):
+        super().__init__(**kwargs)
+
+        """
+        num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
+        https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
+        """
+        self.return_recv_hook = return_recv_hook
+
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        buffer = self._get_buffer()
+        topk_idx = topk_idx.to(torch.int64)
+        expected_m = (
+            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+            + self.num_experts
+        ) // self.num_experts
+        hidden_states, self.masked_m, event, hook = self._dispatch_core(
+            hidden_states,
+            topk_idx,
+            use_fp8=True,
+        )
+        return (
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            self.masked_m,
+            expected_m,
+            event,
+            hook,
+        )
+
+    def dispatch_b(
+        self,
+        hidden_states,
+        topk_idx,
+        topk_weights,
+        masked_m,
+        expected_m,
+        event,
+        hook,
+    ):
+        hook() if self.return_recv_hook else event.current_stream_wait()
+
+        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+            masked_m
+        )
+
+        deepep_output = DeepEPLLOutput(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            masked_m,
+            expected_m,
+        )
+
+        return deepep_output
+
+    def _dispatch_core(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        use_fp8: bool = False,
+    ):
+        buffer = self._get_buffer()
+        packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
+            buffer.low_latency_dispatch(
+                hidden_states,
+                topk_idx,
+                self.num_max_dispatch_tokens_per_rank,
+                self.num_experts,
+                use_fp8=use_fp8,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+            )
+        )
+        return packed_recv_hidden, packed_recv_count, event, hook
+
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        signal: torch.Tensor,
+        block_m: int,
+        threshold: int,
+        valid_sm: int,
+    ):
+        hidden_states, event, hook = self._combine_core(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            signal,
+            block_m,
+            threshold,
+            valid_sm,
+        )
+        return hidden_states, event, hook
+
+    def combine_b(self, hidden_states, event, hook):
+        hook() if self.return_recv_hook else event.current_stream_wait()
+        return hidden_states
+
+    def _combine_core(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        signal: torch.Tensor,
+        block_m: int,
+        threshold: int,
+        valid_sm: int,
+    ):
+        buffer = self._get_buffer()
+        combined_hidden_states, event, hook = buffer.ll_overlap_combine(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            self.handle,
+            True,
+            self.masked_m,
+            signal,
+            block_m,
+            threshold,
+            num_sms=valid_sm,
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+        )
+        self.masked_m = None
+        self.handle = None
+        return combined_hidden_states, event, hook
+
+    def _get_buffer(self):
+        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+        return DeepEPBuffer.get_deepep_buffer(
+            self.group,
+            self.hidden_size,
+            self.params_bytes,
+            self.deepep_mode,
+            self.num_max_dispatch_tokens_per_rank,
+            self.num_experts,
+        )
+
 @dataclass
 class _Stage(Enum):
     INITIAL = auto()
@@ -648,8 +803,14 @@ class DeepEPDispatcher(BaseDispatcher):
             deepep_mode=deepep_mode,
         )
 
+        use_sbo = global_server_args_dict["enable_single_batch_overlap"]
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
+                return_recv_hook=return_recv_hook,
+                **common_kwargs,
+            )
+        if self.deepep_mode.enable_low_latency_overlap() and use_sbo == True:
+            self._low_latency_overlap_dispatcher = _DeepEPDispatcherImplLowLatencyOverlap(
                 return_recv_hook=return_recv_hook,
                 **common_kwargs,
             )
@@ -662,9 +823,22 @@ class DeepEPDispatcher(BaseDispatcher):
         self._stage = _Stage.INITIAL
 
     def dispatch(self, *args, **kwargs) -> DispatchOutput:
+        enable_shared_experts_overlap = kwargs.pop("enable_shared_experts_overlap", False)
+        shared_experts = kwargs.pop("shared_experts", None)
+        hidden_states = kwargs.get("hidden_states")
+        shared_output = None
+
         self.dispatch_a(*args, **kwargs)
+
+        if enable_shared_experts_overlap and shared_experts:
+            shared_output = shared_experts(hidden_states)
+
         ret = self.dispatch_b()
-        return ret
+
+        if enable_shared_experts_overlap:
+            return ret, shared_output
+        else:
+            return ret
 
     def dispatch_a(
         self,
@@ -698,13 +872,31 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        signal: torch.Tensor = None,
+        block_m: int = None,
+        threshold: int = None,
+        valid_sm: int = 3,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl(forward_batch).combine_a(
-            hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-        )
+
+        dispatcher = self._get_impl(forward_batch)
+        if isinstance(dispatcher, _DeepEPDispatcherImplLowLatencyOverlap):
+            inner_state = dispatcher.combine_a(
+                hidden_states=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                signal=signal,
+                block_m=block_m,
+                threshold=threshold,
+                valid_sm=valid_sm,
+            )
+        else:
+            inner_state = dispatcher.combine_a(
+                hidden_states=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+            )
+
         self._combine_intermediate_state = forward_batch, inner_state
 
     def combine_b(self):
@@ -714,13 +906,17 @@ class DeepEPDispatcher(BaseDispatcher):
         return self._get_impl(forward_batch).combine_b(*inner_state)
 
     def _get_impl(self, forward_batch: ForwardBatch) -> _DeepEPDispatcherImplBase:
+        use_sbo = global_server_args_dict["enable_single_batch_overlap"]
         resolved_deepep_mode = self.deepep_mode.resolve(
-            forward_batch.is_extend_in_batch
+            forward_batch.is_extend_in_batch,
+            use_sbo,
         )
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             return self._normal_dispatcher
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
             return self._low_latency_dispatcher
+        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY_OVERLAP:
+            return self._low_latency_overlap_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 

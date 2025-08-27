@@ -20,7 +20,7 @@ if ENABLE_JIT_DEEPGEMM and not DEEPGEMM_BLACKWELL:
     from deep_gemm import get_num_sms
     from deep_gemm.jit import build
     from deep_gemm.jit_kernels.gemm import get_best_configs
-    from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
+    from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, FP8SignalGemmRuntime, GemmType
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
@@ -81,6 +81,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
+    GROUPED_GEMM_NT_F8F8BF16_SIGNAL = auto()
     GEMM_NT_F8F8BF16 = auto()
 
 
@@ -198,6 +199,40 @@ def _compile_grouped_gemm_nt_f8f8bf16_contig_one(
     _ = build("m_grouped_gemm_fp8_fp8_bf16_nt", code, FP8GemmRuntime, kwargs)
 
 
+def _compile_grouped_gemm_nt_f8f8bf16_signal_one(
+    n: int,
+    k: int,
+    num_groups: int,
+    config: Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]],
+) -> None:
+    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = config
+    block_k = 128
+    num_tma_threads = 128
+    num_math_threads_per_group = 128
+
+    kwargs = {
+        "GEMM_TYPE": GemmType.GroupedMasked,  # Signal GEMM uses GroupedMaksed type
+        "NUM_TMA_THREADS": num_tma_threads,
+        "NUM_MATH_THREADS_PER_GROUP": num_math_threads_per_group,
+        "N": n,
+        "K": k,
+        "NUM_GROUPS": num_groups,
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "SWIZZLE_D_MODE": smem_config[1],
+        "BLOCK_N_PADDING": smem_config[2],
+        "NUM_STAGES": num_stages,
+        "NUM_TMA_MULTICAST": tma_multicast_config[0],
+        "IS_TMA_MULTICAST_ON_A": tma_multicast_config[1],
+        "NUM_SMS": num_sms,
+        "SMEM_SIZE": smem_config[0],
+    }
+
+    code = FP8SignalGemmRuntime.generate(kwargs)
+    _ = build("m_grouped_gemm_fp8_fp8_bf16_nt_signal", code, FP8SignalGemmRuntime, kwargs)
+
+
 def _compile_gemm_nt_f8f8bf16_one(
     n: int,
     k: int,
@@ -245,6 +280,13 @@ _KERNEL_HELPER_DICT: Dict[DeepGemmKernelType, DeepGemmKernelHelper] = {
         compile_func=_compile_grouped_gemm_nt_f8f8bf16_contig_one,
         configure_func=lambda m, n, k, _, num_sms: get_best_configs(
             m, n, k, 1, num_sms, is_grouped_contiguous=True
+        ),
+    ),
+    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_SIGNAL: DeepGemmKernelHelper(
+        name="m_grouped_gemm_fp8_fp8_bf16_nt_signal",
+        compile_func=_compile_grouped_gemm_nt_f8f8bf16_signal_one,
+        configure_func=lambda m, n, k, num_groups, num_sms: get_best_configs(
+            m, n, k, num_groups, num_sms, is_grouped_masked=True
         ),
     ),
     DeepGemmKernelType.GEMM_NT_F8F8BF16: DeepGemmKernelHelper(
