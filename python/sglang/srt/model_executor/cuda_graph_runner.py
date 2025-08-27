@@ -776,6 +776,16 @@ class CudaGraphRunner:
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = self.custom_mask
+        if forward_batch.forward_mode.is_target_verify() and bs - raw_bs > 0:
+            # pad the spec_info custom mask
+            spec_info = forward_batch.spec_info
+            pad_len = (bs - raw_bs) * spec_info.draft_token_num * (spec_info.draft_token_num + 1)
+            pad_mask = torch.full(
+                (pad_len,),
+                True,
+                device=spec_info.custom_mask.device,
+            )
+            spec_info.custom_mask = torch.cat([spec_info.custom_mask, pad_mask], dim=0)
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
