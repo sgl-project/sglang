@@ -1413,6 +1413,7 @@ class ModelRunner:
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
                         )
                 else:
                     assert not self.is_hybrid
