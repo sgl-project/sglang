@@ -300,6 +300,17 @@ impl MCPToolServer {
     pub fn has_server(&self, server_url: &str) -> bool {
         self.urls.values().any(|url| url == server_url)
     }
+    
+    /// Execute a tool directly (convenience method for simple usage)
+    pub async fn call_tool(&self, tool_name: &str, arguments: serde_json::Value) -> MCPResult<serde_json::Value> {
+        let session = self.get_tool_session(tool_name).await?;
+        session.call_tool(tool_name, arguments).await
+    }
+    
+    /// Create a tool session from server URL (convenience method)
+    pub async fn create_session_from_url(&self, server_url: &str) -> MCPResult<ToolSession> {
+        ToolSession::new(server_url.to_string()).await
+    }
 }
 
 /// Tool statistics for monitoring

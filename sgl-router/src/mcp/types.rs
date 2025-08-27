@@ -199,4 +199,20 @@ impl ToolSession {
             }
         }
     }
+    
+    /// Check if session is ready for tool calls
+    pub fn is_ready(&self) -> bool {
+        match &self.connection {
+            ConnectionType::Http(_) => true,  // HTTP sessions are always ready
+            ConnectionType::Stdio(_) => false, // Stdio not implemented yet
+        }
+    }
+    
+    /// Get connection info for debugging
+    pub fn connection_info(&self) -> String {
+        match &self.connection {
+            ConnectionType::Http(url) => format!("HTTP: {}", url),
+            ConnectionType::Stdio(cmd) => format!("Stdio: {}", cmd),
+        }
+    }
 }

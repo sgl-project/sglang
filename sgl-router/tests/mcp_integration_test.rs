@@ -193,3 +193,76 @@ async fn test_conflict_handling_behavior() {
     assert_eq!(server.list_tools().len(), 0);
     assert_eq!(server.list_servers().len(), 0);
 }
+
+// Phase 5: Session Management Tests
+#[tokio::test]
+async fn test_tool_session_lifecycle() {
+    // Test HTTP session creation
+    let http_session = ToolSession::new_http("http://localhost:8000/sse".to_string()).await;
+    assert!(http_session.is_ok());
+    
+    let session = http_session.unwrap();
+    assert!(session.is_ready());
+    assert!(session.connection_info().contains("HTTP"));
+    assert!(session.connection_info().contains("localhost:8000"));
+}
+
+#[tokio::test]
+async fn test_tool_session_stdio() {
+    // Test Stdio session creation
+    let stdio_session = ToolSession::new_stdio("python server.py".to_string()).await;
+    assert!(stdio_session.is_ok());
+    
+    let session = stdio_session.unwrap();
+    assert!(!session.is_ready()); // Stdio not implemented yet
+    assert!(session.connection_info().contains("Stdio"));
+    assert!(session.connection_info().contains("python server.py"));
+}
+
+#[tokio::test]
+async fn test_tool_session_auto_detection() {
+    // Test auto-detection of connection type
+    let http_session = ToolSession::new("http://localhost:8000/sse".to_string()).await.unwrap();
+    assert!(http_session.is_ready());
+    
+    let stdio_session = ToolSession::new("python server.py".to_string()).await.unwrap();
+    assert!(!stdio_session.is_ready());
+}
+
+#[tokio::test]
+async fn test_convenience_methods() {
+    let server = MCPToolServer::new();
+    
+    // Test convenience method for session creation from URL
+    let session_result = server.create_session_from_url("http://localhost:8000/sse").await;
+    assert!(session_result.is_ok());
+    
+    let session = session_result.unwrap();
+    assert!(session.is_ready());
+}
+
+#[tokio::test]
+async fn test_direct_tool_calling() {
+    let server = MCPToolServer::new();
+    
+    // Test direct tool calling (will fail since no server, but tests the API)
+    let result = server.call_tool("nonexistent_tool", serde_json::json!({})).await;
+    assert!(result.is_err());
+    
+    // Should get ToolNotFound error
+    let error_msg = result.unwrap_err().to_string();
+    assert!(error_msg.contains("not found") || error_msg.contains("nonexistent_tool"));
+}
+
+#[tokio::test]
+async fn test_session_tool_calling() {
+    let session = ToolSession::new_http("http://localhost:8000/sse".to_string()).await.unwrap();
+    
+    // Test tool calling through session (will fail since no server, but tests the API)
+    let result = session.call_tool("test_tool", serde_json::json!({"param": "value"})).await;
+    assert!(result.is_err());
+    
+    // Should get connection error since no server is running
+    let error_msg = result.unwrap_err().to_string();
+    assert!(error_msg.contains("Connection") || error_msg.contains("error"));
+}
