@@ -175,15 +175,28 @@ class Qwen2_5_VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.norm1(x)
-        hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
+        S, B, H = x.shape
+        # norm1: flatten to 2D -> [S*B, H], then reshape back
+        x2d = x.reshape(-1, H)
+        hidden_states = self.norm1(x2d).reshape(S, B, H)
+
+        # Attention expects [B, S, H]
+        hidden_states = rearrange(hidden_states, "s b h -> b s h")
         attn = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
-        attn = rearrange(attn, "b s ... -> s b ...")
-        x_norm, x_after_add = self.norm2(x, residual=attn)
+        attn = rearrange(attn, "b s h -> s b h")
+
+        # norm2 with fused residual-add: also 2D
+        x2d = x.reshape(-1, H)
+        attn2d = attn.reshape(-1, H)
+        x_norm_2d, x_after_add_2d = self.norm2(x2d, residual=attn2d)
+        x_norm = x_norm_2d.reshape(S, B, H)
+        x_after_add = x_after_add_2d.reshape(S, B, H)
+
+        # MLP and final residual
         mlp_out = self.mlp(x_norm)
         x = x_after_add + mlp_out
         return x
