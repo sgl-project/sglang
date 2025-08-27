@@ -3,17 +3,17 @@ use crate::mcp::types::*;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-/// Main MCP Tool Server (enhanced with caching and indexing)
+/// Main MCP Tool Server
 pub struct MCPToolServer {
     /// Tool descriptions by server (matching Python's harmony_tool_descriptions)
     tool_descriptions: HashMap<String, Value>,
     /// Server URLs (matching Python's urls dict)
     urls: HashMap<String, String>,
-    /// Tool cache with metadata (enhancement)
+    /// Tool cache with metadata
     tool_cache: ToolCache,
 }
 
-/// Tool caching system for improved performance
+/// Tool caching system
 #[derive(Debug, Clone)]
 pub struct ToolCache {
     /// Index of tools by category/tag
@@ -133,7 +133,7 @@ impl Default for MCPToolServer {
 }
 
 impl MCPToolServer {
-    /// Create new MCPToolServer (enhanced with caching)
+    /// Create new MCPToolServer
     pub fn new() -> Self {
         Self {
             tool_descriptions: HashMap::new(),
@@ -142,13 +142,13 @@ impl MCPToolServer {
         }
     }
 
-    /// Add tool server (enhanced with better server detection and error recovery)
+    /// Add tool server
     pub async fn add_tool_server(&mut self, server_url: String) -> MCPResult<()> {
         let tool_urls: Vec<&str> = server_url.split(",").collect();
         let mut successful_connections = 0;
         let mut errors = Vec::new();
 
-        // Clear existing (like Python does)
+        // Clear existing
         self.tool_descriptions = HashMap::new();
         self.urls = HashMap::new();
         self.tool_cache.clear();
@@ -165,20 +165,20 @@ impl MCPToolServer {
                 format!("http://{}", url_str)
             };
 
-            // Enhanced server connection with retry and error recovery
+            // Server connection with retry and error recovery
             match self.connect_to_server(&formatted_url).await {
                 Ok((_init_response, tools_response)) => {
-                    // Process tools with enhanced validation
+                    // Process tools with validation
                     let processed_tools = post_process_tools_description(tools_response);
 
-                    // Enhanced tool storage with conflict detection
+                    // Tool storage with conflict detection
                     if let Ok(tools_obj) =
                         serde_json::from_value::<ListToolsResponse>(processed_tools.clone())
                     {
                         for tool in &tools_obj.tools {
                             let tool_name = &tool.name;
 
-                            // Check for duplicate tools (like Python's warning)
+                            // Check for duplicate tools
                             if self.tool_descriptions.contains_key(tool_name) {
                                 tracing::warn!(
                                     "Tool {} already exists. Ignoring duplicate tool from server {}",
@@ -188,7 +188,7 @@ impl MCPToolServer {
                                 continue;
                             }
 
-                            // Store individual tool descriptions (matching Python's approach)
+                            // Store individual tool descriptions
                             let tool_json = json!(tool);
                             self.tool_descriptions
                                 .insert(tool_name.clone(), tool_json.clone());
@@ -209,7 +209,7 @@ impl MCPToolServer {
             }
         }
 
-        // Enhanced error handling - succeed if at least one server connects
+        // Error handling - succeed if at least one server connects
         if successful_connections == 0 {
             let combined_error = errors.join("; ");
             return Err(MCPError::ConnectionError(format!(
@@ -231,7 +231,7 @@ impl MCPToolServer {
         Ok(())
     }
 
-    /// Enhanced server connection with retries (internal helper)
+    /// Server connection with retries (internal helper)
     async fn connect_to_server(
         &self,
         url: &str,
@@ -266,7 +266,7 @@ impl MCPToolServer {
         Err(last_error.unwrap())
     }
 
-    /// Add stdio-based MCP server (for local development)
+    /// Add stdio-based MCP server
     pub async fn add_stdio_server(&mut self, _command: String) -> MCPResult<()> {
         // This would start a local process and communicate via stdin/stdout
         // For now, placeholder implementation
@@ -292,11 +292,11 @@ impl MCPToolServer {
             .get(tool_name)
             .ok_or_else(|| MCPError::ToolNotFound(tool_name.to_string()))?;
 
-        // Create session (like Python's async context manager)
+        // Create session
         ToolSession::new(url.clone()).await
     }
 
-    /// Create multi-tool session manager (like Python's tool_session_ctxs pattern)
+    /// Create multi-tool session manager
     pub async fn create_multi_tool_session(
         &self,
         tool_names: Vec<String>,
@@ -331,27 +331,27 @@ impl MCPToolServer {
         Ok(session_manager)
     }
 
-    /// Get tools by category (enhanced caching feature)
+    /// Get tools by category
     pub fn get_tools_by_category(&self, category: &str) -> Vec<String> {
         self.tool_cache.get_tools_by_category(category)
     }
 
-    /// Get tools by parameter (enhanced caching feature)
+    /// Get tools by parameter
     pub fn get_tools_by_parameter(&self, parameter: &str) -> Vec<String> {
         self.tool_cache.get_tools_by_parameter(parameter)
     }
 
-    /// Get tool metadata (enhanced caching feature)
+    /// Get tool metadata
     pub fn get_tool_metadata(&self, tool_name: &str) -> Option<&ToolMetadata> {
         self.tool_cache.metadata_cache.get(tool_name)
     }
 
-    /// List all available tools (enhanced version)
+    /// List all available tools
     pub fn list_tools(&self) -> Vec<String> {
         self.tool_descriptions.keys().cloned().collect()
     }
 
-    /// Get tool statistics (enhanced feature)
+    /// Get tool statistics
     pub fn get_tool_stats(&self) -> ToolStats {
         ToolStats {
             total_tools: self.tool_descriptions.len(),
@@ -366,7 +366,7 @@ impl MCPToolServer {
         }
     }
 
-    /// List all connected servers (Phase 4 enhancement)
+    /// List all connected servers
     pub fn list_servers(&self) -> Vec<String> {
         self.urls
             .values()
@@ -407,11 +407,11 @@ pub struct ToolStats {
     pub last_updated: Option<std::time::Instant>,
 }
 
-/// MCP-compliant server connection following official JSON-RPC over SSE specification
+/// MCP-compliant server connection using JSON-RPC over SSE
 async fn list_server_and_tools(
     server_url: &str,
 ) -> MCPResult<(InitializeResponse, ListToolsResponse)> {
-    // Follow official MCP specification:
+    // MCP specification:
     // 1. Connect to MCP endpoint with GET (SSE) or POST (JSON-RPC)
     // 2. Send initialize request
     // 3. Send tools/list request
@@ -457,7 +457,7 @@ async fn send_mcp_request(
     url: &str,
     request: MCPRequest,
 ) -> MCPResult<Value> {
-    // MCP specification: use HTTP POST for JSON-RPC requests
+    // Use HTTP POST for JSON-RPC requests
     let response = client
         .post(url)
         .header("Content-Type", "application/json")
@@ -526,16 +526,16 @@ pub fn parse_sse_event(event: &str) -> MCPResult<Option<Value>> {
     Ok(mcp_response.result)
 }
 
-/// Enhanced schema adaptation matching Python's trim_schema() with additional features
+/// Schema adaptation matching Python's trim_schema()
 fn trim_schema(mut schema: Value) -> Value {
     if let Some(obj) = schema.as_object_mut() {
-        // Remove title and null defaults (exactly like Python)
+        // Remove title and null defaults
         obj.remove("title");
         if obj.get("default") == Some(&Value::Null) {
             obj.remove("default");
         }
 
-        // Convert anyOf to type arrays (enhanced version)
+        // Convert anyOf to type arrays
         if let Some(any_of) = obj.remove("anyOf") {
             if let Some(array) = any_of.as_array() {
                 let types: Vec<String> = array
@@ -561,7 +561,7 @@ fn trim_schema(mut schema: Value) -> Value {
             }
         }
 
-        // Handle oneOf similar to anyOf (additional enhancement)
+        // Handle oneOf similar to anyOf
         if let Some(one_of) = obj.remove("oneOf") {
             if let Some(array) = one_of.as_array() {
                 let types: Vec<String> = array
@@ -580,7 +580,7 @@ fn trim_schema(mut schema: Value) -> Value {
             }
         }
 
-        // Recursive processing for properties (exactly like Python)
+        // Recursive processing for properties
         if let Some(properties) = obj.get_mut("properties") {
             if let Some(props_obj) = properties.as_object_mut() {
                 for (_, value) in props_obj.iter_mut() {
@@ -594,7 +594,7 @@ fn trim_schema(mut schema: Value) -> Value {
             *items = trim_schema(items.clone());
         }
 
-        // Handle nested schemas in additionalProperties (for objects)
+        // Handle nested schemas in additionalProperties
         if let Some(additional_props) = obj.get_mut("additionalProperties") {
             if additional_props.is_object() {
                 *additional_props = trim_schema(additional_props.clone());
@@ -623,14 +623,14 @@ fn trim_schema(mut schema: Value) -> Value {
     schema
 }
 
-/// Enhanced tool processing with advanced filtering (matching Python plus improvements)
+/// Tool processing with filtering
 fn post_process_tools_description(mut tools_response: ListToolsResponse) -> Value {
-    // Adapt schemas for Harmony (exactly like Python)
+    // Adapt schemas for Harmony
     for tool in &mut tools_response.tools {
         tool.input_schema = trim_schema(tool.input_schema.clone());
     }
 
-    // Enhanced tool filtering based on annotations
+    // Tool filtering based on annotations
     let initial_count = tools_response.tools.len();
 
     tools_response.tools.retain(|tool| {
@@ -650,7 +650,7 @@ fn post_process_tools_description(mut tools_response: ListToolsResponse) -> Valu
             return false;
         }
 
-        // Additional filtering: Check if tool is explicitly disabled
+        // Check if tool is explicitly disabled
         let disabled = tool
             .annotations
             .as_ref()

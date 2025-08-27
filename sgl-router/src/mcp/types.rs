@@ -1,9 +1,9 @@
-// types.rs - All MCP data structures in one place (Python-aligned)
+// types.rs - All MCP data structures
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
-// ===== Errors (simplified from errors.rs) =====
+// ===== Errors =====
 #[derive(Error, Debug)]
 pub enum MCPError {
     #[error("Connection failed: {0}")]
@@ -37,7 +37,7 @@ impl From<reqwest::Error> for MCPError {
     }
 }
 
-// ===== Config (simplified from config.rs) =====
+// ===== Config =====
 #[derive(Clone, Debug)]
 pub struct MCPConfig {
     pub connection_timeout_ms: u64,
@@ -53,7 +53,7 @@ impl MCPConfig {
     }
 }
 
-// ===== MCP Protocol Types (matching Python's approach) =====
+// ===== MCP Protocol Types =====
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MCPRequest {
     pub jsonrpc: String,
@@ -108,18 +108,18 @@ pub struct ToolInfo {
     pub annotations: Option<serde_json::Value>,
 }
 
-// ===== Simplified Types (matching Python's usage) =====
+// ===== Types =====
 pub type ToolCall = serde_json::Value; // Python uses dict
 pub type ToolResult = serde_json::Value; // Python uses dict
 
-// ===== Connection Types (matching Python's approach) =====
+// ===== Connection Types =====
 #[derive(Debug, Clone)]
 pub enum ConnectionType {
     Http(String),  // HTTP/SSE URL
     Stdio(String), // Command to run (e.g., "python server.py")
 }
 
-// ===== Tool Session (async context manager equivalent) =====
+// ===== Tool Session =====
 pub struct ToolSession {
     pub connection: ConnectionType,
     pub client: reqwest::Client,
@@ -143,7 +143,7 @@ impl ToolSession {
             session_initialized: false,
         };
 
-        // Initialize the session (like Python's await session.initialize())
+        // Initialize the session
         session.initialize().await?;
         Ok(session)
     }
@@ -169,7 +169,7 @@ impl ToolSession {
         })
     }
 
-    /// Initialize the session (like Python's await session.initialize())
+    /// Initialize the session
     pub async fn initialize(&mut self) -> MCPResult<()> {
         if self.session_initialized {
             return Ok(());
@@ -219,7 +219,7 @@ impl ToolSession {
         }
     }
 
-    /// Call a tool (following MCP tools/call specification)
+    /// Call a tool using MCP tools/call
     pub async fn call_tool(
         &self,
         name: &str,
@@ -286,11 +286,11 @@ impl ToolSession {
     pub fn is_ready(&self) -> bool {
         match &self.connection {
             ConnectionType::Http(_) => self.session_initialized,
-            ConnectionType::Stdio(_) => false, // Stdio not implemented yet
+            ConnectionType::Stdio(_) => false, // Stdio not supported
         }
     }
 
-    /// Get connection info for debugging
+    /// Get connection info
     pub fn connection_info(&self) -> String {
         match &self.connection {
             ConnectionType::Http(url) => format!("HTTP: {}", url),
@@ -299,7 +299,7 @@ impl ToolSession {
     }
 }
 
-// ===== Multi-Tool Session Manager (matching Python's tool_session_ctxs pattern) =====
+// ===== Multi-Tool Session Manager =====
 pub struct MultiToolSessionManager {
     sessions: HashMap<String, ToolSession>,
     server_urls: HashMap<String, String>, // tool_name -> server_url mapping
@@ -338,7 +338,7 @@ impl MultiToolSessionManager {
         Ok(())
     }
 
-    /// Get session for a specific tool (matches Python's tool_sessions[tool_name])
+    /// Get session for a specific tool
     pub fn get_session(&self, tool_name: &str) -> Option<&ToolSession> {
         self.sessions.get(tool_name)
     }
@@ -357,7 +357,7 @@ impl MultiToolSessionManager {
         session.call_tool(tool_name, arguments).await
     }
 
-    /// Execute multiple tools concurrently (enhanced feature)
+    /// Execute multiple tools concurrently
     pub async fn call_tools_concurrent(
         &self,
         tool_calls: Vec<(String, serde_json::Value)>,

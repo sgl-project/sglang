@@ -1,4 +1,4 @@
-// mod.rs - Minimal exports (Python-aligned)
+// mod.rs - MCP module exports
 pub mod tool_server;
 pub mod types;
 
