@@ -172,6 +172,20 @@ def is_blackwell():
     return torch.cuda.get_device_capability()[0] == 10
 
 
+@lru_cache(maxsize=1)
+def is_sm100_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 10) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
+@lru_cache(maxsize=1)
+def is_sm90_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 9) and (
+        torch.version.cuda >= "12.3"
+    )
+
+
 _warned_bool_env_var_keys = set()
 
 
@@ -1947,6 +1961,15 @@ def get_ip() -> str:
         # https://developers.google.com/speed/public-dns/docs/using#addresses
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try  using hostname
+    hostname = socket.gethostname()
+    try:
+        ip_addr = socket.gethostbyname(hostname)
+        warnings.warn("using local ip address: {}".format(ip_addr))
+        return ip_addr
     except Exception:
         pass
 
