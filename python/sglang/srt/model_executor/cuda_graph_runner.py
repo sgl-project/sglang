@@ -779,7 +779,11 @@ class CudaGraphRunner:
         if forward_batch.forward_mode.is_target_verify() and bs - raw_bs > 0:
             # pad the spec_info custom mask
             spec_info = forward_batch.spec_info
-            pad_len = (bs - raw_bs) * spec_info.draft_token_num * (spec_info.draft_token_num + 1)
+            pad_len = (
+                (bs - raw_bs)
+                * spec_info.draft_token_num
+                * (spec_info.draft_token_num + 1)
+            )
             pad_mask = torch.full(
                 (pad_len,),
                 True,
