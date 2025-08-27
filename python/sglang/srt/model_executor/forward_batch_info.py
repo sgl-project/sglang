@@ -92,6 +92,9 @@ class ForwardMode(IntEnum):
     def is_prefill(self):
         return self.is_extend()
 
+    def is_prefill_or_idle(self):
+        return self.is_extend() or self.is_idle()
+
     def is_extend(self):
         return (
             self == ForwardMode.EXTEND

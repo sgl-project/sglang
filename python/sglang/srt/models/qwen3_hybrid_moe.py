@@ -417,7 +417,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         cache_params: Optional[MambaCacheParams] = None,
-        sequence_idx: Optional[torch.Tensor] = None,
     ):
         has_initial_states = None
         if forward_batch.extend_prefix_lens is not None:
@@ -427,11 +426,10 @@ class Qwen3GatedDeltaNet(nn.Module):
         seq_len, _ = hidden_states.shape
         conv_state, recurrent_state = None, None
 
-        # 检查 cache_params 是否为 None
         if cache_params is None:
             raise ValueError("cache_params cannot be None")
 
-        has_prefill = forward_batch.forward_mode.is_prefill()
+        has_prefill = forward_batch.forward_mode.is_prefill_or_idle()
 
         projected_states, _ = self.in_proj(hidden_states)
 
@@ -965,20 +963,6 @@ class Qwen3HybridMoeModel(nn.Module):
         # pass a sequence index tensor, that is required for
         # proper continuous batching computation including
         # chunked prefill
-
-        seq_idx = None
-        if forward_batch.forward_mode.is_prefill() > 0:
-            seq_idx = torch.zeros_like(input_ids, dtype=torch.int32)
-            if forward_batch.extend_start_loc is not None:
-                for i, (srt, end) in enumerate(
-                    zip(
-                        forward_batch.extend_start_loc.tolist(),
-                        forward_batch.extend_start_loc[1:].tolist(),
-                    )
-                ):
-                    seq_idx[srt:end] = i
-            seq_idx.unsqueeze_(0)
-
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
@@ -1001,7 +985,6 @@ class Qwen3HybridMoeModel(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
                 mamba_cache_params=layer_mamba_cache_params,
-                sequence_idx=seq_idx,
                 forward_batch=forward_batch,
             )
 
