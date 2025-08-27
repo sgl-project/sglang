@@ -54,9 +54,6 @@ if _use_aiter:
 
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
-from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
-
-
 class ScatterMode(Enum):
     """
     Suppose we have TP=4, DP=2, enable-dp-attention, and the system handles seq a,b,c,d
@@ -224,12 +221,6 @@ class LayerCommunicator:
                     )
                 )
             else:
-                context = self._context
-                input_mode = self.layer_scatter_modes.layer_input_mode
-                output_mode = self.layer_scatter_modes.attn_mode
-
-                same_group_size = context.is_same_group_size(input_mode, output_mode)
-
                 if residual is None:
                     residual = hidden_states
 

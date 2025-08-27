@@ -130,19 +130,9 @@ _device_sm = get_device_sm()
 
 if _use_aiter:
     from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
-    from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import batched_gemm_afp4wfp4_pre_quant
-    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-    from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
-
-    from aiter.ops.triton.fused_mxfp4_quant import fused_flatten_mxfp4_quant
-    from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
-
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-
-    def b_dynamic_mxfp4_quant(x):
-        h,b,d= x.shape
-        x, x_scales = dynamic_mxfp4_quant(x.reshape(-1, d))
-        return x.view(h,b,d//2), x_scales.view(h,b,d//32)
+    from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
+    from sglang.srt.layers.quantization.rocm_mxfp4_utils import *
+    from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
 
 if _is_cuda:
     from sgl_kernel import (
@@ -298,24 +288,7 @@ class MoEGate(nn.Module):
             # router gemm output float32
             logits = dsv3_router_gemm(hidden_states, self.weight)
         elif _use_aiter and hidden_states.shape[0] <= 256:
-            M = hidden_states.shape[0]
-            N = self.weight.shape[0]
-            y = None
-
-            if M <= 256:
-                # TODO (cagri): convert to bfloat16 as part of another kernel to save time
-                # for now it is also coupled with zero allocator.
-                dtype = torch.float32
-
-                if gemm_output_zero_allocator != None:
-                    y = gemm_output_zero_allocator.allocate(M * N).view(dtype).view(M, N)
-                else:
-                    y = torch.zeros((M, N), dtype=dtype, device=hidden_states.device)
-            
-            if y is not None:
-                logits = gemm_a16w16_atomic(hidden_states, self.weight, y=y).to(hidden_states.dtype)
-            else:
-                logits = gemm_a16w16(hidden_states, self.weight)
+            logits = aiter_dsv3_router_gemm(hidden_states, self.weight, gemm_output_zero_allocator)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
@@ -2122,7 +2095,7 @@ class DeepseekV2Model(nn.Module):
                     allocate_size = self.layers[i].mlp.shared_experts.gate_up_proj.output_size_per_partition
                     break
 
-                per_layer_size += 256 * allocate_size
+            per_layer_size += 256 * allocate_size
 
             assert self.n_routed_experts == 256, f"SGLANG_DSR1_AITER_TRITON_MOEGATE_AITER_GEMM>0 option only support config.n_routed_experts == 256, but got {self.n_routed_experts}, please set SGLANG_DSR1_AITER_TRITON_MOEGATE_AITER_GEMM=0"
             per_layer_size += 256 * self.n_routed_experts
@@ -2449,29 +2422,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
             if _use_aiter and self.quant_config.get_name() == "quark":
-                #dynamic quant for mxfp4
-                if w.dtype == torch.bfloat16:
-                    w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2,-1))
-                    w_kc = w_kc.transpose(-2,-1)
-                    w_s_kc = w_s_kc.transpose(-2,-1)
-                    w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
-                    self_attn.w_scale_k = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                    self_attn.w_scale_v = w_s_vc.contiguous().transpose(1, 2)
-                elif w.dtype == torch.uint8: # static quant for mxfp4
-                    from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import b_mxfp4_to_f32, e8m0_to_f32
-                    w = b_mxfp4_to_f32(w).to(torch.bfloat16)
-                    w_scales = self_attn.kv_b_proj.weight_scale.repeat_interleave(32, dim=-1)
-                    w_scales = e8m0_to_f32(w_scales).to(torch.bfloat16)
-                    w = w * w_scales
-                    w_kc, w_vc = w.unflatten(
-                    0, (-1, (self_attn.qk_nope_head_dim + self_attn.v_head_dim))
-                    ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-                    w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2,-1))
-                    w_kc = w_kc.transpose(-2,-1)
-                    w_s_kc = w_s_kc.transpose(-2,-1)
-                    w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
-                    self_attn.w_scale_k = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                    self_attn.w_scale_v = w_s_vc.contiguous().transpose(1, 2)
+                w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v =quark_post_load_weights(self_attn, w, "mxfp4")
 
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(
