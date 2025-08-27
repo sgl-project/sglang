@@ -433,9 +433,6 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
             )
         current_role = "prefill"
         bootstrap_port = load_balancer.remove_prefill_server(server_url)
-        logger.info(
-            f"Stop sending req to {server_url}. Waiting for prefill to finish all reqs."
-        )
     elif server_url in load_balancer.decode_servers:
         if len(load_balancer.decode_servers) <= 1:
             raise HTTPException(
@@ -444,38 +441,18 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
             )
         current_role = "decode"
         load_balancer.remove_decode_server(server_url)
-        logger.info(
-            f"Stop sending req to {server_url}. Waiting for decode to finish all reqs."
-        )
     else:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid URL:{server_url}. The server may be not registered.",
         )
-    # check_idle for server to finish all requests and flush cache in tokenizer manager
-    obj.check_idle = True
-    async with aiohttp.ClientSession() as session:
-        response = await session.post(
-            f"{server_url}/convert_pd_role", json=dataclasses.asdict(obj)
-        )
 
     # Convert P/D role
-    obj.check_idle = False
     async with aiohttp.ClientSession() as session:
         response = await session.post(
             f"{server_url}/convert_pd_role", json=dataclasses.asdict(obj)
         )
         content = await response.json()
-
-    # wait scheduler event loop ready
-    async with aiohttp.ClientSession() as session:
-        try:
-            response = await session.get(f"{server_url}/get_server_info", timeout=10)
-        except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Can not receive server info from {server_url} in 10s, maybe role conversion failed.",
-            )
 
     # clean connection pool in decode server
     if current_role == "prefill":
@@ -506,8 +483,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
             load_balancer.add_prefill_server(
                 PrefillConfig(url=server_url, bootstrap_port=content["bootstrap_port"])
             )
-            logger.info(f"Converted decode server to prefill: {server_url}")
-            logger.info(f"prefill server bootstrap port: {content['bootstrap_port']}")
+            logger.info(f"Converted decode server to prefill: {server_url}; bootstrap port: {content['bootstrap_port']}")
         return Response(status_code=200)
     else:
         raise HTTPException(

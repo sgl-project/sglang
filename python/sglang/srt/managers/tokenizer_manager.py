@@ -1351,9 +1351,7 @@ class TokenizerManager:
                         os.environ.pop(k, None)
 
         bootstrap_port = None
-        if obj.clean_connection_pool:
-            pass
-        elif obj.check_idle:
+        if obj.clean_connection_pool is None:
             check_count = 60
             while len(self.rid_to_state) > 0:
                 await asyncio.sleep(1)
@@ -1362,38 +1360,39 @@ class TokenizerManager:
                 if check_count <= 0:
                     return False, "Maybe caused by: 1. Server stuck, 2. 60s is not enough", None
             await self.flush_cache()
-            return True, "All requests are finished and cache flushed, can convert p/d role", None
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # start a bootstarp server first
-            kv_bootstrap_server_class = get_kv_class(
-                self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
-            )
-            # find a free port
-            bootstrap_port = 8998
-            while True:
-                if is_port_available(bootstrap_port):
-                    break
-                else:
-                    bootstrap_port += 1
-            self.bootstrap_server = kv_bootstrap_server_class(
-                bootstrap_port,
-            )
-            self.server_args.disaggregation_bootstrap_port = bootstrap_port
-            obj.bootstrap_port = bootstrap_port
-            set_env_vars(obj.disaggregation_prefill_envs)
-        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # stop the bootstrap server
-            self.bootstrap_server.close()
-            del self.bootstrap_server
-            set_env_vars(obj.disaggregation_decode_envs)
-        else:
-            return False, "Not support converting disaggregation of 'null'", None
+            logger.info("All requests are finished and cache flushed, can convert p/d role")
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                # start a bootstarp server first
+                kv_bootstrap_server_class = get_kv_class(
+                    self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
+                )
+                # find a free port
+                bootstrap_port = 8998
+                while True:
+                    if is_port_available(bootstrap_port):
+                        break
+                    else:
+                        bootstrap_port += 1
+                self.bootstrap_server = kv_bootstrap_server_class(
+                    bootstrap_port,
+                )
+                self.server_args.disaggregation_bootstrap_port = bootstrap_port
+                obj.bootstrap_port = bootstrap_port
+                set_env_vars(obj.disaggregation_prefill_envs)
+            else:
+                # stop the bootstrap server
+                self.bootstrap_server.close()
+                del self.bootstrap_server
+                set_env_vars(obj.disaggregation_decode_envs)
 
         responses: List[ConvertDisaggregationRoleReqOutput] = (
             await self.convert_pd_role_communicator(obj)
         )
 
-        if obj.clean_connection_pool or obj.check_idle:
+        # wait scheduler event loop ready
+        await self.flush_cache()
+        if obj.clean_connection_pool:
             pass
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disaggregation_mode = DisaggregationMode.DECODE

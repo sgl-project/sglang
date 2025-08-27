@@ -882,7 +882,6 @@ DISAGGREGATION_DECODE_ENVS = [
 class ConvertDisaggregationRoleReqInput:
     # the server url to convert
     server_url: str
-    check_idle: bool = True
     clean_connection_pool: Optional[str] = None
     # convert decode to prefill
     bootstrap_port: Optional[int] = None
