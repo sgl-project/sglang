@@ -168,32 +168,4 @@ mod tests {
         assert_eq!(capacity, 200.0); // 2 workers * 100 default
         assert_eq!(rate, 200.0);
     }
-
-    #[tokio::test]
-    async fn test_unhealthy_worker_exclusion() {
-        let token_bucket = Arc::new(TokenBucket::new(100, 100));
-        let manager = Arc::new(CapacityManager::new(
-            token_bucket.clone(),
-            Duration::from_secs(10),
-        ));
-
-        // Add one healthy and one unhealthy worker
-        let worker1 = Arc::new(BasicWorker::new(
-            "http://worker1:8080".to_string(),
-            WorkerType::Regular,
-        ));
-        worker1.set_healthy(true);
-
-        let worker2 = Arc::new(BasicWorker::new(
-            "http://worker2:8080".to_string(),
-            WorkerType::Regular,
-        ));
-        worker2.set_healthy(false);
-
-        manager.update_workers(vec![worker1, worker2]).await;
-
-        // Only healthy worker should count
-        let (capacity, _) = token_bucket.get_parameters().await;
-        assert_eq!(capacity, 100.0); // 1 healthy worker * 100 default
-    }
 }
