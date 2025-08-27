@@ -9,15 +9,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    # STDERR_FILENAME,
-    # STDOUT_FILENAME,
+    STDERR_FILENAME,
+    STDOUT_FILENAME,
     CustomTestCase,
     popen_launch_server,
     send_concurrent_generate_requests_with_custom_params,
 )
-
-STDERR_FILENAME = "/sgl-workspace/sglang/test/stderr.log"
-STDOUT_FILENAME = "/sgl-workspace/sglang/test/stdout.log"
 
 class TestPriorityScheduling(CustomTestCase):
     @classmethod
