@@ -4,17 +4,13 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
+      - "python/sglang/srt/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-blackwell.yml"
   pull_request:
     branches: [ main ]
     paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
+      - "python/sglang/srt/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-blackwell.yml"
   workflow_dispatch:
@@ -38,9 +34,7 @@ jobs:
         with:
           filters: |
             src:
-              - "python/**"
-              - "scripts/**"
-              - "test/**"
+              - "python/sglang/srt/**"
               - "sgl-kernel/**"
               - ".github/workflows/pr-test-blackwell.yml"
 
