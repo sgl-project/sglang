@@ -449,8 +449,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         "q_proj": ("qkv_proj", 0),
         "k_proj": ("qkv_proj", 1),
         "v_proj": ("qkv_proj", 2),
-        "gate_up_proj": ("gate_up_proj", 0),
-        "down_proj": ("gate_up_proj", 1),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1)
     }
 
     def __init__(
