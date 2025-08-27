@@ -260,7 +260,7 @@ class AscendAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache :bool = True,
+        save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
