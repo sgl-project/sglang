@@ -141,9 +141,7 @@ class Sampler(nn.Module):
                 (
                     logits_output.next_token_token_ids_logprobs_val,
                     logits_output.next_token_token_ids_logprobs_idx,
-                ) = get_token_ids_logprobs(
-                    logprobs, token_ids_logprobs
-                )
+                ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
 
             logits_output.next_token_logprobs = logprobs[
                 torch.arange(len(batch_next_token_ids), device=sampling_info.device),
