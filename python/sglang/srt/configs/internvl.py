@@ -6,13 +6,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import sentencepiece as spm
 from transformers import (
     TOKENIZER_MAPPING,
+    GptOssConfig,
     LlamaConfig,
     PretrainedConfig,
     PreTrainedTokenizer,
     Qwen2Config,
     Qwen3Config,
     Qwen3MoeConfig,
-    GptOssConfig,
 )
 
 from sglang.utils import logger
