@@ -336,7 +336,7 @@ class BenchmarkWorker:
                         block_shape,
                         num_iters=10,
                     )
-                except triton.runtime.autotuner.OutOfResources:
+                except (triton.runtime.autotuner.OutOfResources, RuntimeError):
                     # Some configurations may be invalid and fail to compile.
                     continue
 
