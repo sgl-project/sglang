@@ -459,7 +459,7 @@ def _requant_weight_ue8m0(
         import deep_gemm.utils.layout
 
         sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
-        sf = deep_gemm.utils.layout.get_col_major_tma_aligned_packed_tensor(sf)
+        sf = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
         return sf
 
     out_s = _transform_scale(out_s, mn=out_w.shape[-2])
