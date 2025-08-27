@@ -773,7 +773,7 @@ void scaled_fp4_experts_quant_sm100a(
         input_offset_by_experts.data_ptr(),
         output_scale_offset_by_experts.data_ptr(),
         nullptr,  // mask
-        false,  // use_silu_and_mul
+        false,    // use_silu_and_mul
         m_topk,
         k,
         n_experts,
@@ -787,7 +787,7 @@ void scaled_fp4_experts_quant_sm100a(
         input_offset_by_experts.data_ptr(),
         output_scale_offset_by_experts.data_ptr(),
         nullptr,  // mask
-        false,  // use_silu_and_mul
+        false,    // use_silu_and_mul
         m_topk,
         k,
         n_experts,
