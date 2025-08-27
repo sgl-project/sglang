@@ -24,4 +24,6 @@ pub use traits::{PartialJsonParser, ToolParser};
 pub use types::{FunctionCall, PartialToolCall, StreamResult, TokenConfig, ToolCall};
 
 // Re-export parsers for convenience
-pub use parsers::{JsonParser, LlamaParser, MistralParser, PythonicParser, QwenParser};
+pub use parsers::{
+    DeepSeekParser, JsonParser, LlamaParser, MistralParser, PythonicParser, QwenParser,
+};
