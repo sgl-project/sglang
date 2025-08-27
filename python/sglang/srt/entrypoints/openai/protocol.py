@@ -35,6 +35,8 @@ from pydantic import (
 )
 from typing_extensions import Literal
 
+DEFAULT_MODEL_NAME = "default"
+
 
 class ModelCard(BaseModel):
     """Model cards."""
@@ -183,7 +185,7 @@ class BatchResponse(BaseModel):
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
     echo: bool = False
@@ -410,7 +412,7 @@ class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
@@ -572,7 +574,7 @@ class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
     input: EmbeddingInput
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     encoding_format: str = "float"
     dimensions: Optional[int] = None
     user: Optional[str] = None
@@ -606,7 +608,7 @@ class ScoringRequest(BaseModel):
     )
     apply_softmax: bool = False
     item_first: bool = False
-    model: str
+    model: str = DEFAULT_MODEL_NAME
 
 
 class ScoringResponse(BaseModel):

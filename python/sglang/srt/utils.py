@@ -1964,6 +1964,15 @@ def get_ip() -> str:
     except Exception:
         pass
 
+    # try  using hostname
+    hostname = socket.gethostname()
+    try:
+        ip_addr = socket.gethostbyname(hostname)
+        warnings.warn("using local ip address: {}".format(ip_addr))
+        return ip_addr
+    except Exception:
+        pass
+
     warnings.warn(
         "Failed to get the IP address, using 0.0.0.0 by default."
         "The value can be set by the environment variable"
