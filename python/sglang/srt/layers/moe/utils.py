@@ -195,6 +195,6 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
-        and MOE_QUANTIZATION == "modelopt_fp4"
+        and (MOE_QUANTIZATION == "modelopt_fp4" or MOE_QUANTIZATION == "mxfp4")
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
     )

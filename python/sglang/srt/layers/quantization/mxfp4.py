@@ -22,7 +22,12 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import get_dp_global_num_tokens, get_local_dp_buffer
+from sglang.srt.layers.moe.utils import (
+    get_moe_runner_backend,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -723,11 +728,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         value=0.0,
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
-                x_quant, x_scale = mxfp8_quantize(
-                    x,
-                    self.enable_flashinfer_cutlass_moe,
-                    alignment=self.weight_alignment,
+                swizzle = (
+                    self.enable_flashinfer_cutlass_moe
+                    and not should_use_flashinfer_cutlass_moe_fp4_allgather()
                 )
+                if x.shape[0] == 0:
+                    x_quant = torch.zeros(
+                        0, self.hidden_size, dtype=torch.uint8, device=x.device
+                    )
+                    x_scale = torch.zeros(
+                        0,
+                        self.hidden_size // self.scaling_vector_size,
+                        dtype=torch.uint8,
+                        device=x.device,
+                    )
+                else:
+                    x_quant, x_scale = mxfp8_quantize(
+                        x,
+                        swizzle,
+                        alignment=self.weight_alignment,
+                    )
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
             else:
                 raise NotImplementedError
@@ -737,6 +757,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.enable_flashinfer_cutlass_moe:
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
             output_dtype = x.dtype
+
+            if should_use_flashinfer_cutlass_moe_fp4_allgather():
+                # Quantize before comm, swizzle after.
+                x_quant = x_quant.view(torch.uint8)
+                x_scale = x_scale.view(torch.uint8).reshape(
+                    x.shape[0], self.hidden_size // self.scaling_vector_size
+                )
+                topk_weights, topk_ids, x_quant, x_scale = get_tp_group().all_gatherv(
+                    [topk_weights, topk_ids, x_quant, x_scale],
+                    sizes=get_dp_global_num_tokens(),
+                )
+                x_quant = x_quant.view(torch.float8_e4m3fn)
+                x_scale = block_scale_interleave(x_scale)
 
             output = flashinfer_cutlass_fused_moe(
                 input=x_quant,
@@ -764,7 +797,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 use_mxfp8_act_scaling=True,
             )[0]
-            return output
+            if should_use_flashinfer_cutlass_moe_fp4_allgather():
+                global_output = output[:, : self.initial_hidden_size].contiguous()
+                local_output = get_local_dp_buffer()
+                get_tp_group().reduce_scatterv(
+                    global_output, output=local_output, sizes=get_dp_global_num_tokens()
+                )
+            return local_output
 
         if self.use_flashinfer:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
