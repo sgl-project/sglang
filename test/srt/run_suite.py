@@ -172,6 +172,7 @@ suite_amd = {
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
+        TestFile("models/test_vlm_models.py", 437),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("openai_server/basic/test_protocol.py", 10),
         TestFile("openai_server/basic/test_serving_chat.py", 10),
@@ -227,6 +228,28 @@ suite_amd = {
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_triton_attention_backend.py", 150),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
+        TestFile("test_vlm_input_format.py", 300),
+        TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_rope_rocm.py", 3),
+        TestFile("test_awq_dequant.py", 2),
+    ],
+    "per-commit-1-ascend-npu": [
+        TestFile("test_ascend_tp1_bf16.py", 400),
+    ],
+    "per-commit-2-ascend-npu": [
+        TestFile("test_ascend_tp2_bf16.py", 400),
+    ],
+    "per-commit-4-ascend-npu": [
+        TestFile("test_ascend_mla_w8a8int8.py", 400),
+    ],
+    "per-commit-2-gpu": [
+        TestFile("models/lora/test_lora_tp.py", 116),
+        TestFile("test_data_parallelism.py", 73),
+        TestFile("test_dp_attention.py", 277),
+        TestFile("test_mla_tp.py", 170),
+        TestFile("test_patch_torch.py", 19),
+        TestFile("test_update_weights_from_distributed.py", 103),
+        TestFile("test_release_memory_occupation.py", 127),
         TestFile("test_wave_attention_kernels.py", 2),
         TestFile("test_wave_attention_backend.py", 150),
     ],
