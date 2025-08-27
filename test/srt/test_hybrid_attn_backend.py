@@ -126,7 +126,7 @@ class TestHybridAttnBackendSpeculativeDecoding(TestHybridAttnBackendBase):
             "--speculative-num-steps",
             "3",
             "--speculative-eagle-topk",
-            "1",
+            "2",
             "--speculative-num-draft-tokens",
             "4",
         ]
