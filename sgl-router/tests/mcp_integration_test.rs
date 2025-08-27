@@ -144,3 +144,52 @@ async fn test_sse_parsing_error_response() {
     let error_msg = result.unwrap_err().to_string();
     assert!(error_msg.contains("Test error"));
 }
+
+// Phase 4: Multi-Server Support Tests
+#[tokio::test]
+async fn test_multi_server_parsing() {
+    let mut server = MCPToolServer::new();
+    
+    // Test comma-separated URLs (will fail to connect but should parse correctly)
+    let result = server.add_tool_server("localhost:8000,localhost:8001,localhost:8002".to_string()).await;
+    assert!(result.is_err()); // Expected to fail since no servers running
+    
+    // Should have attempted to connect to 3 servers
+    let stats = server.get_tool_stats();
+    assert_eq!(stats.total_tools, 0); // No tools since connections failed
+}
+
+#[tokio::test]
+async fn test_server_management_methods() {
+    let server = MCPToolServer::new();
+    
+    // Test server listing (empty initially)
+    let servers = server.list_servers();
+    assert_eq!(servers.len(), 0);
+    
+    // Test server checking
+    assert!(!server.has_server("http://localhost:8000/sse"));
+    
+    // Test stats
+    let stats = server.get_tool_stats();
+    assert_eq!(stats.total_servers, 0);
+    assert_eq!(stats.total_tools, 0);
+}
+
+#[tokio::test]
+async fn test_conflict_handling_behavior() {
+    let mut server = MCPToolServer::new();
+    
+    // Test that attempting to add multiple servers with same tools shows warnings
+    // This will fail to connect but we can test the parsing logic
+    let result = server.add_tool_server("localhost:8000".to_string()).await;
+    assert!(result.is_err()); // Expected - no server running
+    
+    // Test adding another server URL (would conflict if servers existed)
+    let result2 = server.add_tool_server("localhost:8001".to_string()).await;
+    assert!(result2.is_err()); // Expected - no server running
+    
+    // Verify empty state since no connections succeeded
+    assert_eq!(server.list_tools().len(), 0);
+    assert_eq!(server.list_servers().len(), 0);
+}

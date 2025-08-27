@@ -290,6 +290,16 @@ impl MCPToolServer {
             last_updated: self.tool_cache.last_updated,
         }
     }
+    
+    /// List all connected servers (Phase 4 enhancement)
+    pub fn list_servers(&self) -> Vec<String> {
+        self.urls.values().cloned().collect::<std::collections::HashSet<_>>().into_iter().collect()
+    }
+    
+    /// Check if a specific server is connected
+    pub fn has_server(&self, server_url: &str) -> bool {
+        self.urls.values().any(|url| url == server_url)
+    }
 }
 
 /// Tool statistics for monitoring
