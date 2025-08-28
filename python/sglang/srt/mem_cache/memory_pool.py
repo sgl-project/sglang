@@ -33,6 +33,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel import set_kv_buffer_kernel
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -206,8 +207,6 @@ class MHATokenToKVPool(KVCache):
         self._create_buffers()
 
         self.layer_transfer_counter = None
-        self.device_module = torch.get_device_module(self.device)
-        self.alt_stream = self.device_module.Stream() if _is_cuda else None
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
@@ -397,14 +396,14 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if get_is_capture_mode() and self.alt_stream is not None:
-            # Overlap the copy of K and V cache for small batch size
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-            current_stream.wait_stream(self.alt_stream)
+        if _is_cuda:
+            set_kv_buffer_kernel(
+                k_cache=self.k_buffer[layer_id - self.start_layer],
+                v_cache=self.v_buffer[layer_id - self.start_layer],
+                k=cache_k,
+                v=cache_v,
+                loc=loc,
+            )
         else:
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
