@@ -55,7 +55,7 @@ if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB", default=False)
+RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 @contextmanager
