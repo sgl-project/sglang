@@ -212,7 +212,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.0", prefix),
                 ),
-                get_act_fn("gelu", approximate="None"),
+                get_act_fn("gelu"),
                 RowParallelLinear(
                     self.hidden_size,
                     dim,
