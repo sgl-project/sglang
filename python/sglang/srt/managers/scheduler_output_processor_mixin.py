@@ -202,11 +202,9 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        # TODO: isn't free_cache_loc_cpu unused?
-        logits_output, next_token_ids, free_cache_loc_cpu, can_run_cuda_graph = (
+        logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
-            result.free_cache_loc_cpu,
             result.can_run_cuda_graph,
         )
         self.num_generated_tokens += len(batch.reqs)

@@ -183,9 +183,6 @@ class GenerationBatchResult:
     bid: int
     can_run_cuda_graph: bool
 
-    # A CPU tensor storing locations of cache slots that should be freed. Only used in overlap + EAGLE mode.
-    free_cache_loc_cpu: Optional[torch.Tensor]
-
 
 @dataclass
 class EmbeddingBatchResult:
@@ -1876,11 +1873,6 @@ class Scheduler(
                 pp_hidden_states_proxy_tensors=(
                     pp_hidden_states_proxy_tensors
                     if not self.pp_group.is_last_rank
-                    else None
-                ),
-                free_cache_loc_cpu=(
-                    free_cache_loc_cpu
-                    if self.enable_overlap and self.spec_algorithm.is_eagle()
                     else None
                 ),
                 next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
