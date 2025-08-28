@@ -9,7 +9,7 @@ from sglang.srt.function_call.core_types import (
     StructureInfo,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
+from sglang.srt.function_call.json_schema_composer import JSONSchemaComposer
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +37,18 @@ class Llama32Detector(BaseFormatDetector):
         """Check if the text contains a Llama 3.2 format tool call."""
         # depending on the prompt format the Llama model may or may not
         # prefix the output with the <|python_tag|> token
-        return "<|python_tag|>" in text or text.startswith("{")
+        # Also check for JSON array format when using JSON schema constraints
+        has_call = "<|python_tag|>" in text or text.startswith("{") or text.startswith("[")
+        if has_call:
+            logger.debug(f"Llama32Detector: Detected tool call in text starting with: {text[:50]}...")
+        return has_call
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse function calls from text, handling multiple JSON objects."""
-        if "<|python_tag|>" not in text and not text.startswith("{"):
+        logger.debug(f"Llama32Detector: Parsing text: {text[:100]}...")
+        
+        if "<|python_tag|>" not in text and not text.startswith("{") and not text.startswith("["):
+            logger.debug("Llama32Detector: No tool call markers found, returning normal text")
             return StreamingParseResult(normal_text=text, calls=[])
 
         if "<|python_tag|>" in text:
@@ -54,25 +61,52 @@ class Llama32Detector(BaseFormatDetector):
         safe_idx = idx  # the index of the last valid JSON object
         all_actions = []
         action_text_len = len(action_text)
-        while idx < action_text_len:
+        
+        # Handle case where action_text is a complete JSON array or object
+        if action_text.strip().startswith("[") or action_text.strip().startswith("{"):
             try:
-                obj, end = decoder.raw_decode(action_text[idx:])
-                all_actions.append(obj)
-                idx += end + len(self.tool_call_separator)
-                safe_idx = idx
-            except json.JSONDecodeError as e:
-                # Find where next `{"name"` appears and try again
-                logger.warning(
-                    f"Failed to parse JSON part: {action_text[idx:]}, JSON parse error: {str(e)}"
-                )
-                next_obj_start = action_text.find('{"name":', idx + 1)
-                if next_obj_start == -1:
-                    break
-                idx = next_obj_start
-                continue
+                parsed_content = json.loads(action_text)
+                if isinstance(parsed_content, list):
+                    all_actions = parsed_content
+                    safe_idx = len(action_text)
+                else:
+                    all_actions = [parsed_content]
+                    safe_idx = len(action_text)
+            except json.JSONDecodeError:
+                # Fall back to incremental parsing
+                pass
+        
+        # If we didn't get actions from array parsing, try incremental parsing
+        if not all_actions:
+            while idx < action_text_len:
+                try:
+                    obj, end = decoder.raw_decode(action_text[idx:])
+                    all_actions.append(obj)
+                    idx += end + len(self.tool_call_separator)
+                    safe_idx = idx
+                except json.JSONDecodeError as e:
+                    # Find where next `{"name"` appears and try again
+                    logger.warning(
+                        f"Failed to parse JSON part: {action_text[idx:]}, JSON parse error: {str(e)}"
+                    )
+                    next_obj_start = action_text.find('{"name":', idx + 1)
+                    if next_obj_start == -1:
+                        break
+                    idx = next_obj_start
+                    continue
 
         # Only process if we found valid JSON objects
+        logger.debug(f"Llama32Detector: Found {len(all_actions)} actions: {all_actions}")
         calls = self.parse_base_json(all_actions, tools) if all_actions else []
+        logger.debug(f"Llama32Detector: Parsed {len(calls)} tool calls: {calls}")
+        
+        # Update tool indices to point to the correct tools
+        tool_indices = self._get_tool_indices(tools)
+        for call in calls:
+            if call.name in tool_indices:
+                call.tool_index = tool_indices[call.name]
+                logger.debug(f"Llama32Detector: Updated tool_index for {call.name} to {call.tool_index}")
+        
         # Use safe_idx to avoid idx containing the last part of an invalid JSON object
         trailing_text = (
             action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
@@ -88,7 +122,16 @@ class Llama32Detector(BaseFormatDetector):
             trigger="<|python_tag|>",
         )
 
+    def build_json_schema(self, tools: List[Tool]):
+        return JSONSchemaComposer.build_json_schema(
+            tools,
+            tool_choice="required",
+            function_format="json",
+            tool_call_separator=self.tool_call_separator,
+        )
+    
     def build_ebnf(self, tools: List[Tool]):
+        # Keep for backward compatibility
         return EBNFComposer.build_ebnf(
             tools,
             function_format="json",

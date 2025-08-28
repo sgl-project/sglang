@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
@@ -170,6 +171,11 @@ class FunctionCallParser:
             strict_tag = self.get_structure_tag()
             return ("structural_tag", strict_tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+            # Try JSON schema first, fall back to EBNF for backward compatibility
+            json_schema = self.get_json_schema(tool_choice)
+            if json_schema is not None:
+                return ("json_schema", json.dumps(json_schema))
+            
             ebnf = self.get_ebnf(tool_choice)
             return ("ebnf", ebnf) if ebnf is not None else None
 
@@ -210,3 +216,42 @@ class FunctionCallParser:
             filtered_tools = self.tools
 
         return self.detector.build_ebnf(filtered_tools)
+
+    def get_json_schema(
+        self, tool_choice: Union[ToolChoice, Literal["required"]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get the JSON schema for the specified tool choice.
+
+        Args:
+            tool_choice: The tool choice specification
+
+        Returns:
+            JSON schema dict, or None if no valid tools found
+
+        Note:
+            This is the new preferred method for constrained generation.
+            Falls back to EBNF if JSON schema generation fails.
+        """
+        filtered_tools = []
+        if isinstance(tool_choice, ToolChoice):
+            fn_name = tool_choice.function.name
+            filtered_tools = [t for t in self.tools if t.function.name == fn_name]
+
+            # Check if the requested function exists in available tools
+            if not filtered_tools:
+                available_functions = [t.function.name for t in self.tools]
+                logger.warning(
+                    f"Function '{fn_name}' not found in available tools. "
+                    f"Available functions: {available_functions}. "
+                    f"Skipping tool choice."
+                )
+                return None
+        else:
+            filtered_tools = self.tools
+
+        try:
+            return self.detector.build_json_schema(filtered_tools)
+        except Exception as e:
+            logger.warning(f"Failed to generate JSON schema: {e}. Falling back to EBNF.")
+            return None

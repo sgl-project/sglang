@@ -339,6 +339,22 @@ class BaseFormatDetector(ABC):
         """
         raise NotImplementedError()
 
+    def build_json_schema(self, tools: List[Tool]):
+        """
+        Build a JSON schema for constrained generation of function calls.
+
+        This method generates a JSON schema that constrains the model's output
+        to valid function calls in this format. The schema should include all
+        available tools and their parameter schemas.
+
+        Args:
+            tools: List of available tools/functions that can be called
+
+        Returns:
+            A JSON schema dict for this function call format
+        """
+        raise NotImplementedError()
+
     @abstractmethod
     def build_ebnf(self, tools: List[Tool]) -> str:
         """
