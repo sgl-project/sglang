@@ -1,7 +1,5 @@
 # How to reproduce the result of GPT-OSS with SGLang
 
-## Prerequisite
-
 ### Install the latest SGLang
 
 ```bash
