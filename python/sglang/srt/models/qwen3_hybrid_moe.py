@@ -5,10 +5,6 @@ from typing import Any, Dict, Iterable, Optional, Set, Tuple
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from fla.ops.gated_delta_rule import (
-    chunk_gated_delta_rule,
-    fused_recurrent_gated_delta_rule_update,
-)
 from torch import nn
 
 from sglang.srt.configs.qwen3_hybrid_moe import Qwen3HybridMoeConfig
@@ -19,6 +15,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.srt.layers.attention.fla.fused_recurrent import (
+    fused_recurrent_gated_delta_rule_update,
+)
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.attention.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
