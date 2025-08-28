@@ -50,8 +50,8 @@ if _is_cuda:
     )
     try:
         from sgl_kernel import sgl_silu_and_mul_per_tensor_quant_fp8
-    except:
-        print(f"Failed to import sgl_silu_and_mul_per_tensor_quant_fp8")
+    except ImportError:
+        logging.warning(f"Failed to import sgl_silu_and_mul_per_tensor_quant_fp8")
 
 if _is_hip:
     if _use_aiter:
