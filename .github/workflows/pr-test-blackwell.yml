@@ -146,8 +146,8 @@ jobs:
 
       - name: Install PyTorch and pytest
         run: |
-          pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129
-          pip install pytest
+          pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129 --break-system-packages
+          pip install pytest --break-system-packages
 
       - name: Build sgl-kernel wheel
         run: |
@@ -159,7 +159,7 @@ jobs:
       - name: Install sgl-kernel wheel
         run: |
           pip uninstall sgl-kernel -y || true
-          pip install sgl-kernel/dist/*whl --force-reinstall --no-deps
+          pip install sgl-kernel/dist/*whl --force-reinstall --no-deps --break-system-packages
           pip list | grep sgl-kernel
 
       - name: Run test suite
@@ -255,7 +255,7 @@ jobs:
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
-          pip install -e .
+          pip install -e . --break-system-packages
 
       - name: Evaluate accuracy
         timeout-minutes: 30
@@ -278,7 +278,7 @@ jobs:
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
-          pip install -e .
+          pip install -e . --break-system-packages
 
       - name: Evaluate accuracy (TP=2)
         timeout-minutes: 30
