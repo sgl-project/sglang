@@ -185,6 +185,7 @@ _ACTIVATION_REGISTRY = {
     "gelu_pytorch_tanh": nn.GELU(approximate="tanh"),
     "gelu_new": NewGELU(),
     "relu2": ReLU2(),
+    "silu": nn.SiLU(),
 }
 
 
