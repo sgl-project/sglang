@@ -193,14 +193,17 @@ class EAGLEWorker(TpModelWorker):
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
 
-    def _create_decode_backend(self):
-        self.server_args.decode_attention_backend = (
-            self.server_args.attention_backend
-            if self.server_args.decode_attention_backend is None
-            else self.server_args.decode_attention_backend
-        )
-        backend_type = self.server_args.decode_attention_backend
+    def _create_backend(
+        self, backend_name: str, backend_map: dict, error_template: str
+    ):
+        backend_type = getattr(self.server_args, backend_name)
+        if backend_type is None:
+            backend_type = self.server_args.attention_backend
 
+        if backend_type not in backend_map:
+            raise ValueError(error_template.format(backend_type=backend_type))
+
+    def _create_decode_backend(self):
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,
             "triton": self._create_triton_decode_backend,
@@ -211,21 +214,13 @@ class EAGLEWorker(TpModelWorker):
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
         }
 
-        if backend_type not in backend_map:
-            raise ValueError(
-                f"EAGLE is not supported in decode attention backend {backend_type}"
-            )
-
-        return backend_map[backend_type]()
+        return self._create_backend(
+            "decode_attention_backend",
+            backend_map,
+            "EAGLE is not supported in decode attention backend {backend_type}",
+        )
 
     def _create_draft_extend_backend(self):
-        self.server_args.prefill_attention_backend = (
-            self.server_args.attention_backend
-            if self.server_args.prefill_attention_backend is None
-            else self.server_args.prefill_attention_backend
-        )
-        backend_type = self.server_args.prefill_attention_backend
-
         backend_map = {
             "flashinfer": self._create_flashinfer_prefill_backend,
             "triton": self._create_triton_prefill_backend,
@@ -235,12 +230,11 @@ class EAGLEWorker(TpModelWorker):
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
         }
 
-        if backend_type not in backend_map:
-            raise ValueError(
-                f"EAGLE is not supported in prefill attention backend {backend_type}"
-            )
-
-        return backend_map[backend_type]()
+        return self._create_backend(
+            "prefill_attention_backend",
+            backend_map,
+            "EAGLE is not supported in prefill attention backend {backend_type}",
+        )
 
     def _create_flashinfer_decode_backend(self):
         if not global_server_args_dict["use_mla_backend"]:
