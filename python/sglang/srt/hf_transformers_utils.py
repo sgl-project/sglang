@@ -368,13 +368,22 @@ def get_processor(
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
     try:
-        processor = AutoProcessor.from_pretrained(
-            tokenizer_name,
-            *args,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        if "InternVL3_5" in tokenizer_name:
+            processor = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        else:
+            processor = AutoProcessor.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
     except ValueError as e:
         error_message = str(e)
