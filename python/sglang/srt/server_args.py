@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     is_cuda,
@@ -620,11 +621,18 @@ class ServerArgs:
         if self.speculative_algorithm in ("EAGLE", "EAGLE3"):
             if self.max_running_requests is None:
                 self.max_running_requests = 48
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using "
-                "eagle speculative decoding."
-            )
+            if not self.disable_overlap_schedule and get_bool_env_var(
+                "SGLANG_ENABLE_EXPERIMENTAL_EAGLE_OVERLAP_SCHEDULE"
+            ):
+                logger.warning(
+                    "Using experimental overlap scheduler + eagle speculative decoding."
+                )
+            else:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled because of using "
+                    "eagle speculative decoding."
+                )
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(

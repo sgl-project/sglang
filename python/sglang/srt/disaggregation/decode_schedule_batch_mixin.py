@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
@@ -146,14 +147,31 @@ class ScheduleBatchDisaggregationDecodeMixin:
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
 
             # local import to avoid circular import
-            from sglang.srt.speculative.eagle_utils import EagleDraftInput
+            if (
+                os.environ.get("SGLANG_ENABLE_EXPERIMENTAL_EAGLE_OVERLAP_SCHEDULE", "0")
+                == "1"
+            ):
+                from sglang.srt.speculative.eagle_utils_for_overlap_scheduler import (
+                    EagleDraftInput,
+                )
 
-            spec_info = EagleDraftInput(
-                topk_p=topk_p,
-                topk_index=topk_index,
-                hidden_states=hidden_states,
-                verified_id=self.output_ids,
-            )
+                spec_info = EagleDraftInput(
+                    topk_p=topk_p,
+                    topk_index=topk_index,
+                    hidden_states=hidden_states,
+                    verified_id=self.output_ids,
+                    spec_steps=server_args.speculative_num_steps,
+                )
+            else:
+                from sglang.srt.speculative.eagle_utils import EagleDraftInput
+
+                spec_info = EagleDraftInput(
+                    topk_p=topk_p,
+                    topk_index=topk_index,
+                    hidden_states=hidden_states,
+                    verified_id=self.output_ids,
+                )
+
             spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             self.spec_info = spec_info
