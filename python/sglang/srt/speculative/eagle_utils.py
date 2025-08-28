@@ -234,7 +234,7 @@ class EagleVerifyOutput:
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
     # KV indices to free. Only set in overlap scheduling.
-    free_cache_loc_cpu: Optional[torch.Tensor]
+    free_cache_loc_cpu: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -760,7 +760,6 @@ class EagleVerifyInput:
                 verified_id=verified_id,
                 accept_length_per_req_cpu=accept_length_cpu,
                 accepted_indices=accept_index,
-                free_cache_loc_cpu=None,
             )
 
     def overlap_verify(
