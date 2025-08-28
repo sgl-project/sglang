@@ -172,6 +172,20 @@ def is_blackwell():
     return torch.cuda.get_device_capability()[0] == 10
 
 
+@lru_cache(maxsize=1)
+def is_sm100_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 10) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
+@lru_cache(maxsize=1)
+def is_sm90_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 9) and (
+        torch.version.cuda >= "12.3"
+    )
+
+
 _warned_bool_env_var_keys = set()
 
 
@@ -1665,8 +1679,28 @@ def direct_register_custom_op(
     IMPORTANT: the lifetime of the operator is tied to the lifetime of the
     library object. If you want to bind the operator to a different library,
     make sure the library object is alive when the operator is used.
+
+    Note: This function will silently skip registration if the operator
+    with the same name is already registered to avoid RuntimeError in
+    multi-engine scenarios (e.g., VERL framework).
     """
     import torch.library
+
+    my_lib = target_lib or sglang_lib
+
+    # Check if operator is already registered to avoid duplicate registration
+    # This is important for scenarios where multiple SGLang engines run in the same process
+    try:
+        # Try to access the operator to see if it's already registered
+        lib_name = my_lib.m.name if hasattr(my_lib.m, "name") else "sglang"
+        if hasattr(torch.ops, lib_name) and hasattr(
+            getattr(torch.ops, lib_name), op_name
+        ):
+            # Operator already exists, skip registration
+            return
+    except (AttributeError, RuntimeError):
+        # Operator doesn't exist, proceed with registration
+        pass
 
     if hasattr(torch.library, "infer_schema"):
         schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
@@ -1676,11 +1710,22 @@ def direct_register_custom_op(
 
         schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
 
-    my_lib = target_lib or sglang_lib
-    my_lib.define(op_name + schema_str)
-    my_lib.impl(op_name, op_func, "CUDA")
-    if fake_impl is not None:
-        my_lib._register_fake(op_name, fake_impl)
+    try:
+        my_lib.define(op_name + schema_str)
+        my_lib.impl(op_name, op_func, "CUDA")
+        if fake_impl is not None:
+            my_lib._register_fake(op_name, fake_impl)
+    except RuntimeError as error:
+        if "Tried to register an operator" in str(e) and "multiple times" in str(e):
+            # Silently ignore duplicate registration errors
+            # This can happen in multi-engine scenarios
+            pass
+        else:
+            # Re-raise other RuntimeErrors
+            raise error
+    except AttributeError as error:
+        # Always re-raise AttributeError as it indicates missing dependencies
+        raise error
 
 
 def set_gpu_proc_affinity(
@@ -1919,6 +1964,15 @@ def get_ip() -> str:
     except Exception:
         pass
 
+    # try  using hostname
+    hostname = socket.gethostname()
+    try:
+        ip_addr = socket.gethostbyname(hostname)
+        warnings.warn("using local ip address: {}".format(ip_addr))
+        return ip_addr
+    except Exception:
+        pass
+
     warnings.warn(
         "Failed to get the IP address, using 0.0.0.0 by default."
         "The value can be set by the environment variable"
@@ -2000,13 +2054,6 @@ def configure_ipv6(dist_init_addr):
     except ValueError:
         raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
     return port, host
-
-
-def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() == 0:
-        logger.info(msg)
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):
