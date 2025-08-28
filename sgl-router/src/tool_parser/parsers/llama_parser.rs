@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
+use super::json_parser::JsonParser;
 use crate::tool_parser::{
     errors::ToolParserResult,
-    json_parser::JsonParser,
     state::ParseState,
     traits::ToolParser,
     types::{StreamResult, TokenConfig, ToolCall},

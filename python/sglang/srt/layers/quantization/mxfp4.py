@@ -66,10 +66,15 @@ _is_hip = is_hip()
 
 if _is_hip:
     # import aiter
-    from aiter import ActivationType, QuantType, dtypes
-    from aiter.fused_moe import fused_moe
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-    from aiter.utility.fp4_utils import e8m0_shuffle
+    try:
+        from aiter import ActivationType, QuantType, dtypes
+        from aiter.fused_moe import fused_moe
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+        from aiter.utility.fp4_utils import e8m0_shuffle
+    except ImportError as err:
+        ActivationType = QuantType = dtypes = fused_moe = dynamic_mxfp4_quant = (
+            e8m0_shuffle
+        ) = err
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
