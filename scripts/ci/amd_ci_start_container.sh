@@ -119,7 +119,7 @@ find_latest_image() {
 HOSTNAME_VALUE=$(hostname)
 RUNNER_NAME="unknown"
 
-if [[ "${HOSTNAME_VALUE}" =~ ^(linux-mi[0-9]+-gpu-[0-9]+) ]]; then
+if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   RUNNER_NAME="${BASH_REMATCH[1]}"
   echo "Extracted runner from hostname: ${RUNNER_NAME}"
 else
