@@ -39,6 +39,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = int(
+    os.getenv("SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL", 0)
+)
+
 # --------------------------------------- Entrypoint -----------------------------------------
 
 _OutputMode = Literal["file", "object"]
@@ -661,6 +665,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self.window_sizes = [10, 100, 1000]
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._rank = torch.distributed.get_rank()
+            self._expert_dispatch_collector = ExpertDispatchCollector(
+                self._expert_location_metadata.ep_size
+            )
+            self.collection_counter = 0
 
     def append(
         self,
@@ -692,6 +700,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
 
         if self._rank == 0:
+            self._collect_metrics_if_needed(gpu_physical_count)
+
             utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
             utilization_rate = torch.mean(utilization_rate_tensor).item()
             self._history.append(utilization_rate)
@@ -706,6 +716,30 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 f"gpu_physical_count_sum={gpu_physical_count_sum}"
                 # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
             )
+
+    def _collect_metrics_if_needed(self, gpu_physical_count: torch.Tensor):
+        # sglang:eplb_gpu_physical_count metric is disabled if SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
+        if (
+            SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL > 0
+            and self.collection_counter % SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL == 0
+        ):
+            for layer_idx in range(self._expert_location_metadata.num_layers):
+                count_of_layer = (
+                    self._expert_dispatch_collector.eplb_gpu_physical_count.labels(
+                        layer=str(layer_idx)
+                    )
+                )
+                # Exclude the +Inf bucket.
+                assert (
+                    self._expert_location_metadata.ep_size
+                    == len(count_of_layer._buckets) - 1
+                ), f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+                for gpu_rank in range(self._expert_location_metadata.ep_size):
+                    count = gpu_physical_count[layer_idx, gpu_rank]
+                    if count > 0:
+                        count_of_layer._sum.inc(count * gpu_rank)
+                        count_of_layer._buckets[gpu_rank].inc(count)
+        self.collection_counter += 1
 
 
 class _DequeCollection:
