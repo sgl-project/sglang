@@ -19,6 +19,6 @@ pub use circuit_breaker::{
 pub use error::{WorkerError, WorkerResult};
 pub use retry::{is_retryable_status, BackoffCalculator, RetryError, RetryExecutor};
 pub use worker::{
-    start_health_checker, BasicWorker, DPAwareWorker, HealthChecker, HealthConfig, Worker,
-    WorkerCollection, WorkerFactory, WorkerLoadGuard, WorkerType,
+    start_health_checker, BasicWorker, ConnectionMode, DPAwareWorker, HealthChecker, HealthConfig,
+    Worker, WorkerCollection, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
