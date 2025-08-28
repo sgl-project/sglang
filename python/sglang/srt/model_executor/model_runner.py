@@ -1440,14 +1440,12 @@ class ModelRunner:
             else self.server_args.attention_backend
         )
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
-            assert (
-                self.server_args.speculative_algorithm is None
-            ), "Currently HybridAttentionBackend does not support speculative decoding."
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
             )
 
             attn_backend = HybridAttnBackend(
+                self,
                 decode_backend=self._get_attention_backend_from_str(
                     self.decode_attention_backend_str
                 ),
