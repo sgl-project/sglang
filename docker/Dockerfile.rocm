@@ -1,13 +1,27 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx942 -t v0.4.9.post1-rocm630-mi30x -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.4.9.post1 --build-arg GPU_ARCH=gfx950 -t v0.4.9.post1-rocm700-mi35x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.1.post3 --build-arg GPU_ARCH=gfx942-rocm630 -t v0.5.1.post3-rocm630-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.1.post3 --build-arg GPU_ARCH=gfx942 -t v0.5.1.post3-rocm700-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.1.post3 --build-arg GPU_ARCH=gfx950 -t v0.5.1.post3-rocm700-mi35x -f Dockerfile.rocm .
+
 
 # Default base images
-ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250821"
+ARG BASE_IMAGE_942_ROCM630="rocm/sgl-dev:vllm20250114"
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250821"
+ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250821"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
+
+# ===============================
+# Base image 942 with rocm630 and args
+FROM $BASE_IMAGE_942 AS gfx942-rocm630
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT="v0.1.4"
+ENV NO_DEPS_FLAG=""
 
 # ===============================
 # Base image 942 and args
@@ -37,7 +51,7 @@ FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
-ENV GPU_ARCH_LIST=${GPU_ARCH:-${PYTORCH_ROCM_ARCH}}
+ENV GPU_ARCH_LIST=${GPU_ARCH%-*:-${PYTORCH_ROCM_ARCH}}
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
