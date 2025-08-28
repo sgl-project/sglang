@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -14,14 +13,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-
-if os.environ.get("SGLANG_ENABLE_EXPERIMENTAL_EAGLE_OVERLAP_SCHEDULE", "0") == "1":
-    from sglang.srt.speculative.eagle_utils_for_overlap_scheduler import (
-        EagleDraftInput,
-        EagleVerifyInput,
-    )
-else:
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -340,6 +332,9 @@ class FlashAttentionBackend(AttentionBackend):
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
             )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.enable_overlap_schedule = (
+            not model_runner.server_args.disable_overlap_schedule
+        )
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -1902,9 +1897,9 @@ class FlashAttentionBackend(AttentionBackend):
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
             accept_length = spec_info.accept_length[:bs]
-            if getattr(spec_info, "spec_steps", None) is not None:
+            if self.enable_overlap_schedule:
                 # EAGLE + Overlap scheduling code path
-                metadata.max_seq_len_q = spec_info.spec_steps + 1
+                metadata.max_seq_len_q = self.speculative_num_steps + 1
             elif spec_info.accept_length_cpu:
                 metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
             else:

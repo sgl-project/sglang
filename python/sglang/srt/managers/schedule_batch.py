@@ -906,7 +906,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
-    # Used for EAGLE + Overlap scheduling only. Stores the temporary draft output token locations.
+    # Used for EAGLE + Overlap scheduling. Stores the temporary draft output KV cache locations.
     draft_out_cache_loc: Optional[torch.Tensor] = None
 
     # Whether to return hidden states
@@ -1695,7 +1695,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
-            self.spec_info.filter_batch(keep_indices_device)
+            self.spec_info.filter_batch(
+                keep_indices_device, has_been_filtered=not self.enable_overlap
+            )
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1948,7 +1950,7 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = 0
-    # Used for EAGLE + Overlap scheduling only. Stores the temporary draft output token locations.
+    # Used for EAGLE + Overlap scheduling. Stores the temporary draft output KV cache locations.
     draft_out_cache_loc: Optional[torch.Tensor] = None
 
     # Overlap event

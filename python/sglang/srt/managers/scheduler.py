@@ -1814,7 +1814,6 @@ class Scheduler(
 
                 model_worker_batch = batch.get_model_worker_batch()
                 if self.enable_overlap:
-                    # TODO (timmy): Do not alias seq_lens between forward and scheduler threads.
                     # Optimistically estimate the seq_lens_cpu for the next draft forward
                     model_worker_batch.seq_lens_cpu.add_(
                         self.server_args.speculative_num_steps + 1

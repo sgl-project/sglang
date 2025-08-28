@@ -26,7 +26,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_utils_for_overlap_scheduler import EagleDraftInput
+from sglang.srt.speculative.eagle_utils import EagleDraftInput
 from sglang.srt.speculative.eagle_worker_for_overlap_scheduler import EAGLEWorker
 from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback

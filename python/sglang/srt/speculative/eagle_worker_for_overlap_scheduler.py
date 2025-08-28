@@ -37,7 +37,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_utils_for_overlap_scheduler import (
+from sglang.srt.speculative.eagle_utils import (
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
@@ -259,6 +259,7 @@ class EAGLEWorker(TpModelWorker):
             self.draft_extend_attn_backend = FlashAttentionBackend(
                 self.draft_model_runner,
                 skip_prefill=False,
+                speculative_num_steps=self.speculative_num_steps,
             )
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import (
@@ -634,7 +635,7 @@ class EAGLEWorker(TpModelWorker):
         return score_list, token_list, parents_list
 
     def verify(self, batch: ModelWorkerBatch, spec_info: EagleVerifyInput):
-        spec_info.prepare_for_verify(
+        spec_info.overlap_prepare_for_verify(
             batch,
             self.page_size,
             self.req_to_token_pool,
@@ -657,7 +658,7 @@ class EAGLEWorker(TpModelWorker):
 
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
-        res: EagleVerifyOutput = spec_info.verify(
+        res: EagleVerifyOutput = spec_info.overlap_verify(
             batch,
             logits_output,
             self.req_to_token_pool,
@@ -700,7 +701,6 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
-            spec_steps=self.speculative_num_steps,
             num_tokens_per_batch=1,
             num_tokens_for_logprob_per_batch=1,
         )
