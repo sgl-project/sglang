@@ -317,7 +317,9 @@ class CudaGraphRunner:
                 (self.max_num_token,), dtype=self._cache_loc_dtype()
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_token), dtype=torch.int64
+            )
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
