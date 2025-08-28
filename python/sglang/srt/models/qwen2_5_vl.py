@@ -117,6 +117,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         attn_implementation: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        num_dummy_heads: int = 0,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -157,6 +158,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             flatten_batch=flatten_batch,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            num_dummy_heads=num_dummy_heads,
         )
         self.mlp = Qwen2_5_VLMLP(
             dim,
@@ -527,6 +529,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

@@ -263,6 +263,11 @@ def get_tokenizer(
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+    if tokenizer_name.endswith(".json"):
+        from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
+
+        return TiktokenTokenizer(tokenizer_name)
+
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
@@ -363,13 +368,22 @@ def get_processor(
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
     try:
-        processor = AutoProcessor.from_pretrained(
-            tokenizer_name,
-            *args,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        if "InternVL3_5" in tokenizer_name:
+            processor = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        else:
+            processor = AutoProcessor.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
     except ValueError as e:
         error_message = str(e)
