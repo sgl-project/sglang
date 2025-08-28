@@ -92,6 +92,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateResult,
+    MultiTokenizerWarpper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -116,7 +117,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    MultiTokenizerWarpper,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -458,7 +458,7 @@ class TokenizerManager:
                 (HealthCheckOutput, lambda x: None),
             ]
         )
-    
+
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
@@ -2148,7 +2148,7 @@ class _Communicator(Generic[T]):
 
         if obj:
             if _Communicator.enable_multi_tokenizer:
-                obj = MultiTokenizerWarpper(worker_id=os.getpid(),obj=obj)
+                obj = MultiTokenizerWarpper(worker_id=os.getpid(), obj=obj)
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()

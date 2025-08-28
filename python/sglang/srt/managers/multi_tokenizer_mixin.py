@@ -73,7 +73,7 @@ class MultiTokenizerMixin:
         if worker_id not in self.tokenizer_mapping:
             # register the worker if not already done
             if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                return self.init_tokenizer_mapping(recv_obj, worker_id)    
+                return self.init_tokenizer_mapping(recv_obj, worker_id)
             else:
                 logger.error(
                     f"Worker {worker_id} not registered and not found in tokenizer mapping . "

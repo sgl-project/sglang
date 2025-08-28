@@ -83,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MultiTokenizerRegisterReq,
+    MultiTokenizerWarpper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -101,7 +102,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
-    MultiTokenizerWarpper,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -1100,7 +1100,7 @@ class Scheduler(
                     )
                     self.send_to_tokenizer.send_pyobj(abort_req)
                     continue
-            
+
             # If it is a MultiTokenizerWarpper, unwrap it and handle the inner request.
             if isinstance(recv_req, MultiTokenizerWarpper):
                 worker_id = recv_req.worker_id
