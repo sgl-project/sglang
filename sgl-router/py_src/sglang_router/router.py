@@ -74,6 +74,8 @@ class Router:
         health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
         health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
         health_check_endpoint: Health check endpoint path. Default: '/health'
+        enable_dynamic_capacity: Enable dynamic capacity adjustment based on worker capabilities. Default: None
+        capacity_update_interval_secs: Interval for updating capacity based on worker changes (in seconds). Default: None
     """
 
     def __init__(
@@ -131,6 +133,8 @@ class Router:
         health_check_timeout_secs: int = 5,
         health_check_interval_secs: int = 60,
         health_check_endpoint: str = "/health",
+        enable_dynamic_capacity: Optional[bool] = None,
+        capacity_update_interval_secs: Optional[int] = None,
     ):
         if selector is None:
             selector = {}
@@ -195,6 +199,8 @@ class Router:
             health_check_timeout_secs=health_check_timeout_secs,
             health_check_interval_secs=health_check_interval_secs,
             health_check_endpoint=health_check_endpoint,
+            enable_dynamic_capacity=enable_dynamic_capacity,
+            capacity_update_interval_secs=capacity_update_interval_secs,
         )
 
     def start(self) -> None:

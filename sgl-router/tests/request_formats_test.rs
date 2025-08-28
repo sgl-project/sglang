@@ -18,6 +18,8 @@ struct TestContext {
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         let mut config = RouterConfig {
+            enable_dynamic_capacity: None,
+            capacity_update_interval_secs: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },

@@ -1129,6 +1129,17 @@ impl WorkerManagement for Router {
     fn get_worker_urls(&self) -> Vec<String> {
         Router::get_worker_urls(self)
     }
+
+    fn get_all_workers(&self) -> Vec<Arc<dyn crate::core::Worker>> {
+        let workers = self.workers.read().unwrap();
+        workers
+            .iter()
+            .map(|w| {
+                let worker: Arc<dyn crate::core::Worker> = Arc::from(w.clone_worker());
+                worker
+            })
+            .collect()
+    }
 }
 
 #[async_trait]

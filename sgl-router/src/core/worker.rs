@@ -49,6 +49,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the current load (number of active requests)
     fn load(&self) -> usize;
 
+    /// Get the maximum capacity of this worker (max concurrent requests it can handle)
+    /// Returns None if capacity is unknown
+    fn capacity(&self) -> Option<usize> {
+        None
+    }
+
     /// Increment the load counter
     fn increment_load(&self);
 

@@ -89,6 +89,9 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<usize>,
+    // Dynamic capacity configuration
+    enable_dynamic_capacity: Option<bool>,
+    capacity_update_interval_secs: Option<u64>,
 }
 
 impl Router {
@@ -207,6 +210,8 @@ impl Router {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
+            enable_dynamic_capacity: self.enable_dynamic_capacity,
+            capacity_update_interval_secs: self.capacity_update_interval_secs,
         })
     }
 }
@@ -273,6 +278,8 @@ impl Router {
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
+        enable_dynamic_capacity = None,
+        capacity_update_interval_secs = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -330,6 +337,8 @@ impl Router {
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<usize>,
+        enable_dynamic_capacity: Option<bool>,
+        capacity_update_interval_secs: Option<u64>,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -386,6 +395,8 @@ impl Router {
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,
+            enable_dynamic_capacity,
+            capacity_update_interval_secs,
         })
     }
 
