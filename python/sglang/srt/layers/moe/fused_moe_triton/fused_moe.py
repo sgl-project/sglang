@@ -670,7 +670,10 @@ def invoke_fused_moe_kernel(
             padded_size = padding_size
             # activations apply per-token quantization when weights apply per-channel quantization by default
             A, A_scale = scaled_fp8_quant(
-                A, A_scale, use_per_token_if_dynamic=per_channel_quant, use_fused_silu_and_quant=use_fused_silu_and_quant
+                A,
+                A_scale,
+                use_per_token_if_dynamic=per_channel_quant,
+                use_fused_silu_and_quant=use_fused_silu_and_quant,
             )
         else:
             # activation block-wise fp8 quantization
@@ -1551,7 +1554,9 @@ def fused_experts_impl(
                 if not use_fused_silu_and_quant:
                     silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
                 else:
-                    intermediate_cache2 = intermediate_cache1.view(-1, N) # silu not applied
+                    intermediate_cache2 = intermediate_cache1.view(
+                        -1, N
+                    )  # silu not applied
             else:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)

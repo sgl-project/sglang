@@ -138,7 +138,7 @@ class FusedMoE(torch.nn.Module):
         gemm1_clamp_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
         with_bias=False,
-        use_fused_silu_and_quant: bool = False
+        use_fused_silu_and_quant: bool = False,
     ):
         super().__init__()
 

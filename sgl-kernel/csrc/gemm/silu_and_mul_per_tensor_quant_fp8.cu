@@ -12,8 +12,12 @@ __device__ __forceinline__ float silu(const float& val) {
 }
 
 template <typename T>
-__global__ void
-silu_and_mul_per_tensor_absmax_kernel(T* __restrict__ input, const T* __restrict__ input_2, float* __restrict__ output_s, const int64_t num_elements, const int hidden_dim) {
+__global__ void silu_and_mul_per_tensor_absmax_kernel(
+    T* __restrict__ input,
+    const T* __restrict__ input_2,
+    float* __restrict__ output_s,
+    const int64_t num_elements,
+    const int hidden_dim) {
   float max_value = 0.0f;
   unsigned int tid = threadIdx.x;
   unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -102,7 +106,8 @@ __global__ void per_tensor_quant_fp8_kernel(
   }
 }
 
-void sgl_silu_and_mul_per_tensor_quant_fp8(torch::Tensor input_gate, torch::Tensor input_up, torch::Tensor output_q, torch::Tensor output_s, bool is_static) {
+void sgl_silu_and_mul_per_tensor_quant_fp8(
+    torch::Tensor input_gate, torch::Tensor input_up, torch::Tensor output_q, torch::Tensor output_s, bool is_static) {
   CHECK_INPUT(input_gate);
   CHECK_INPUT(input_up);
   CHECK_INPUT(output_q);
@@ -120,15 +125,19 @@ void sgl_silu_and_mul_per_tensor_quant_fp8(torch::Tensor input_gate, torch::Tens
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
-
     silu_and_mul_per_tensor_absmax_kernel<scalar_t><<<grid, block, 0, stream>>>(
-        static_cast<scalar_t*>(input_gate.data_ptr()), static_cast<scalar_t*>(input_up.data_ptr()), static_cast<float*>(output_s.data_ptr()), num_elements, hidden_dim);
+        static_cast<scalar_t*>(input_gate.data_ptr()),
+        static_cast<scalar_t*>(input_up.data_ptr()),
+        static_cast<float*>(output_s.data_ptr()),
+        num_elements,
+        hidden_dim);
 
     silu_and_mul_per_tensor_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(
         static_cast<scalar_t*>(input_gate.data_ptr()),
         static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
         static_cast<float*>(output_s.data_ptr()),
-        num_elements, hidden_dim);
+        num_elements,
+        hidden_dim);
     return true;
   });
 }

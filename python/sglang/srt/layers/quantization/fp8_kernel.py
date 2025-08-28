@@ -48,6 +48,7 @@ if _is_cuda:
         sgl_per_token_group_quant_fp8,
         sgl_per_token_quant_fp8,
     )
+
     try:
         from sgl_kernel import sgl_silu_and_mul_per_tensor_quant_fp8
     except ImportError:
@@ -1415,7 +1416,9 @@ else:
         if use_fused_silu_and_quant:
             ## double hidden dimension, silu is not applied yet.
             shape = (input.shape[0], input.shape[1] // 2)
-            assert scale is None and not use_per_token_if_dynamic, "fused silu and quant only support dynamic per_tensor quant"
+            assert (
+                scale is None and not use_per_token_if_dynamic
+            ), "fused silu and quant only support dynamic per_tensor quant"
         else:
             shape = input.shape
         if num_token_padding:

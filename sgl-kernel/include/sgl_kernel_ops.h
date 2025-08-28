@@ -226,7 +226,8 @@ void sgl_per_token_group_quant_int8(
     double int8_max);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
-void sgl_silu_and_mul_per_tensor_quant_fp8(at::Tensor input_gate, at::Tensor input_up, at::Tensor output_q, at::Tensor output_s, bool is_static);
+void sgl_silu_and_mul_per_tensor_quant_fp8(
+    at::Tensor input_gate, at::Tensor input_up, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,
