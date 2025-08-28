@@ -68,7 +68,7 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
 
     def is_cutlass_w4afp8(self):
-        return self == MOE_RUNNER_BACKEND.CUTLASS_W4AFP8
+        return self == MoeRunnerBackend.CUTLASS_W4AFP8
 
 
 class DeepEPMode(Enum):
