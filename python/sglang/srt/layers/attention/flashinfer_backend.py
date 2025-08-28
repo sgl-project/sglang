@@ -26,11 +26,14 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import is_flashinfer_available, next_power_of_2
+from sglang.srt.utils import (
+    is_flashinfer_available,
+    is_sm100_supported,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1263,11 +1266,12 @@ def should_use_tensor_core(
     # Calculate GQA group size
     gqa_group_size = num_attention_heads // num_kv_heads
 
-    # Determine based on dtype and GQA group size
+    # For Flashinfer, a GQA group size of at least 4 is needed to efficiently
+    # use Tensor Cores, as it fuses the head group with the token dimension in MMA.
     if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         return True
     elif kv_cache_dtype in (torch.float16, torch.half, torch.bfloat16):
-        return gqa_group_size > 4
+        return gqa_group_size >= 4
     else:
         return False
 

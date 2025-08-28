@@ -137,8 +137,15 @@ class EAGLEWorker(TpModelWorker):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
         if self.speculative_algorithm.is_eagle3():
-            # EAGLE3 models don't share lm_head
-            self.draft_model_runner.model.set_embed(embed)
+            # most cases EAGLE3 models don't share lm_head
+            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+            if (
+                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                and self.draft_model_runner.model.load_lm_head_from_target
+            ):
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
+            else:
+                self.draft_model_runner.model.set_embed(embed)
 
             # grab hot token ids
             if self.draft_model_runner.model.hot_token_id is not None:
@@ -266,6 +273,43 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
             )
+        elif self.server_args.attention_backend == "trtllm_mha":
+            from sglang.srt.layers.attention.trtllm_mha_backend import (
+                TRTLLMHAAttnBackend,
+                TRTLLMHAAttnMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = TRTLLMHAAttnMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = TRTLLMHAAttnBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
+            self.has_prefill_wrapper_verify = True
+        elif self.server_args.attention_backend == "trtllm_mla":
+            if not global_server_args_dict["use_mla_backend"]:
+                raise ValueError(
+                    "trtllm_mla backend requires MLA model (use_mla_backend=True)."
+                )
+
+            from sglang.srt.layers.attention.trtllm_mla_backend import (
+                TRTLLMMLABackend,
+                TRTLLMMLAMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = TRTLLMMLAMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = TRTLLMMLABackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
+            self.has_prefill_wrapper_verify = True
         else:
             raise ValueError(
                 f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
@@ -980,7 +1024,9 @@ def get_last_loc_large_page_size_top_k_1(
     return prefix_lens, seq_lens, last_loc
 
 
-@torch.compile(dynamic=True)
+# Disable torch.compile for this function because it will be
+# even slower.
+# @torch.compile(dynamic=True)
 def get_last_loc_large_page_size_large_top_k(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,

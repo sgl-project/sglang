@@ -12,13 +12,9 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
-use crate::protocols::{
-    common::StringOrArray,
-    generate::GenerateRequest,
-    openai::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
-        completions::CompletionRequest,
-    },
+use crate::protocols::spec::{
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, StringOrArray,
+    UserMessageContent,
 };
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
@@ -32,7 +28,7 @@ use axum::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -790,9 +786,10 @@ impl PDRouter {
                             .await;
 
                         // Record outcomes for circuit breakers
-                        let is_success = response.status().is_success();
-                        prefill.record_outcome(is_success);
-                        decode.record_outcome(is_success);
+                        let _status = response.status();
+                        let not_error = _status.is_success() || _status.is_client_error();
+                        prefill.record_outcome(not_error);
+                        decode.record_outcome(not_error);
 
                         response
                     }
@@ -811,6 +808,57 @@ impl PDRouter {
         .await
     }
 
+    async fn handle_decode_error_response(
+        &self,
+        res: reqwest::Response,
+        context: &PDRequestContext,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+    ) -> Response {
+        let status = res.status();
+
+        if context.is_stream {
+            // Handle streaming error response
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let error_payload = match res.bytes().await {
+                Ok(error_body) => {
+                    if let Ok(error_json) = serde_json::from_slice::<Value>(&error_body) {
+                        json!({ "message": error_json, "status": status.as_u16() })
+                    } else {
+                        json!({ "message": String::from_utf8_lossy(&error_body).to_string(), "status": status.as_u16() })
+                    }
+                }
+                Err(e) => {
+                    json!({ "message": format!("Decode server error: {}", e), "status": status.as_u16() })
+                }
+            };
+
+            let sse_data = format!(
+                "data: {{'error': {}}}",
+                serde_json::to_string(&error_payload).unwrap_or_default()
+            );
+            let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
+
+            let decode_url = decode.url().to_string();
+            self.create_streaming_response(
+                error_stream,
+                status,
+                None,
+                context.return_logprob,
+                Some(decode_url),
+                Some(response_headers),
+                prefill,
+                decode,
+            )
+        } else {
+            // Handle non-streaming error response
+            match res.bytes().await {
+                Ok(error_body) => (status, error_body).into_response(),
+                Err(e) => (status, format!("Decode server error: {}", e)).into_response(),
+            }
+        }
+    }
+
     // Internal method that performs the actual dual dispatch (without retry logic)
     async fn execute_dual_dispatch_internal(
         &self,
@@ -821,8 +869,13 @@ impl PDRouter {
         decode: &dyn Worker,
         start_time: Instant,
     ) -> Response {
-        // Update load tracking for both workers
-        let _guard = WorkerLoadGuard::new_multi(vec![prefill, decode]);
+        // For non-streaming: use guard for automatic load management
+        // For streaming: load will be managed in create_streaming_response
+        let _guard = if !context.is_stream {
+            Some(WorkerLoadGuard::new_multi(vec![prefill, decode]))
+        } else {
+            None
+        };
 
         // Build decode request with shared client
         let decode_request = self.build_post_with_headers(
@@ -879,16 +932,9 @@ impl PDRouter {
                             status
                         );
 
-                        // Return the error response from decode server
-                        match res.bytes().await {
-                            Ok(error_body) => {
-                                return (status, error_body).into_response();
-                            }
-                            Err(e) => {
-                                return (status, format!("Decode server error: {}", e))
-                                    .into_response();
-                            }
-                        }
+                        return self
+                            .handle_decode_error_response(res, &context, prefill, decode)
+                            .await;
                     }
 
                     // Process prefill response for logprobs
@@ -916,13 +962,15 @@ impl PDRouter {
                         let response_headers =
                             header_utils::preserve_response_headers(res.headers());
 
-                        Self::create_streaming_response(
+                        self.create_streaming_response(
                             res.bytes_stream(),
                             status,
                             prefill_logprobs,
                             context.return_logprob,
                             None,
                             Some(response_headers),
+                            prefill,
+                            decode,
                         )
                     } else {
                         // Non-streaming response with logprobs
@@ -1030,26 +1078,23 @@ impl PDRouter {
                             status
                         );
 
-                        // Return the error response from decode server
-                        match res.bytes().await {
-                            Ok(error_body) => (status, error_body).into_response(),
-                            Err(e) => {
-                                (status, format!("Decode server error: {}", e)).into_response()
-                            }
-                        }
+                        self.handle_decode_error_response(res, &context, prefill, decode)
+                            .await
                     } else if context.is_stream {
                         // Streaming response without logprobs - direct passthrough
                         let decode_url = decode.url().to_string();
                         let response_headers =
                             header_utils::preserve_response_headers(res.headers());
 
-                        Self::create_streaming_response(
+                        self.create_streaming_response(
                             res.bytes_stream(),
                             status,
                             None,
                             false,
                             Some(decode_url),
                             Some(response_headers),
+                            prefill,
+                            decode,
                         )
                     } else {
                         // Non-streaming response without logprobs - direct passthrough like fast version
@@ -1210,21 +1255,46 @@ impl PDRouter {
     }
 
     // Helper to create a streaming response
+    #[allow(clippy::too_many_arguments)]
     fn create_streaming_response(
+        &self,
         stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
         status: StatusCode,
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
     ) -> Response {
+        // For streaming, increment load now - will be decremented when streaming completes
+        prefill.increment_load();
+        decode.increment_load();
+
+        // Store URLs to find workers later for decrementing
+        let prefill_url = prefill.url().to_string();
+        let decode_url_str = decode.url().to_string();
+
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // Clone the worker collections for the spawned task
+        let prefill_workers = self.prefill_workers.clone();
+        let decode_workers = self.decode_workers.clone();
+
         tokio::spawn(async move {
+            // Use a flag to track whether stream completed successfully
+            let mut stream_completed = false;
+
             futures_util::pin_mut!(stream);
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        // Check for stream end marker to decrement load early
+                        let is_done = chunk
+                            .as_ref()
+                            .windows(12)
+                            .any(|window| window == b"data: [DONE]");
+
                         let result = if return_logprob && prefill_logprobs.is_some() {
                             // Try to merge logprobs
                             Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -1236,6 +1306,12 @@ impl PDRouter {
                         if tx.send(Ok(result)).is_err() {
                             break;
                         }
+
+                        // If we see the done marker, decrement load immediately
+                        if is_done {
+                            stream_completed = true;
+                            break;
+                        }
                     }
                     Err(e) => {
                         if let Some(ref url) = decode_url {
@@ -1243,6 +1319,35 @@ impl PDRouter {
                             RouterMetrics::record_pd_stream_error(url);
                         }
                         let _ = tx.send(Err(format!("Stream error: {}", e)));
+                        break;
+                    }
+                }
+            }
+
+            // Always decrement load after streaming (either completes or errors)
+            // Find and decrement prefill worker
+            if let Ok(prefill_workers_guard) = prefill_workers.read() {
+                for worker in prefill_workers_guard.iter() {
+                    if worker.url() == prefill_url.as_str() {
+                        worker.decrement_load();
+                        debug!(
+                            "Decremented load for prefill worker: {} (stream_completed: {})",
+                            prefill_url, stream_completed
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // Find and decrement decode worker
+            if let Ok(decode_workers_guard) = decode_workers.read() {
+                for worker in decode_workers_guard.iter() {
+                    if worker.url() == decode_url_str.as_str() {
+                        worker.decrement_load();
+                        debug!(
+                            "Decremented load for decode worker: {} (stream_completed: {})",
+                            decode_url_str, stream_completed
+                        );
                         break;
                     }
                 }
@@ -2277,6 +2382,82 @@ mod tests {
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_load_tracking() {
+        use futures_util::StreamExt;
+        use tokio::time::{sleep, Duration};
+
+        let router = create_test_pd_router();
+
+        // Add workers
+        let prefill_worker = create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let decode_worker =
+            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+
+        router.prefill_workers.write().unwrap().push(prefill_worker);
+        router.decode_workers.write().unwrap().push(decode_worker);
+
+        // Get references to the workers - clone to avoid holding lock across await
+        let (prefill_ref, decode_ref) = {
+            let workers = router.prefill_workers.read().unwrap();
+            let prefill = workers[0].clone_worker();
+            drop(workers);
+            let workers = router.decode_workers.read().unwrap();
+            let decode = workers[0].clone_worker();
+            (prefill, decode)
+        };
+
+        // Initially load should be 0
+        assert_eq!(prefill_ref.load(), 0);
+        assert_eq!(decode_ref.load(), 0);
+
+        // Create a mock streaming response
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+
+        // Call create_streaming_response which should increment load
+        let _response = router.create_streaming_response(
+            stream.map(Ok),
+            StatusCode::OK,
+            None,
+            false,
+            None,
+            None,
+            prefill_ref.as_ref(),
+            decode_ref.as_ref(),
+        );
+
+        // Load should be incremented immediately
+        assert_eq!(prefill_ref.load(), 1);
+        assert_eq!(decode_ref.load(), 1);
+
+        // Send some data through the stream
+        tx.send(bytes::Bytes::from("test data")).unwrap();
+
+        // Give time for the spawned task to process
+        sleep(Duration::from_millis(10)).await;
+
+        // Load should still be 1 (streaming in progress)
+        assert_eq!(prefill_ref.load(), 1);
+        assert_eq!(decode_ref.load(), 1);
+
+        // Close the stream
+        drop(tx);
+
+        // Give time for cleanup
+        sleep(Duration::from_millis(100)).await;
+
+        // Load should be decremented after streaming completes
+        assert_eq!(prefill_ref.load(), 0);
+        assert_eq!(decode_ref.load(), 0);
     }
 
     // ============= Concurrent Operations Tests =============

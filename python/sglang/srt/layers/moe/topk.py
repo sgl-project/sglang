@@ -198,6 +198,7 @@ class TopK(CustomOp):
         correction_bias: Optional[torch.Tensor] = None,
         routed_scaling_factor: Optional[float] = None,
         apply_routed_scaling_factor_on_output: Optional[bool] = False,
+        force_topk: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -220,6 +221,7 @@ class TopK(CustomOp):
         )
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        self.force_topk = force_topk
 
     def forward_native(
         self,
@@ -254,7 +256,7 @@ class TopK(CustomOp):
                 sm_first=not self.topk_config.renormalize,
             )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
-        elif (
+        elif not self.force_topk and (
             should_use_flashinfer_trtllm_moe()
             or get_moe_runner_backend().is_flashinfer_mxfp4()
         ):
@@ -302,7 +304,7 @@ class TopK(CustomOp):
         global_num_experts = router_logits.shape[-1]
 
         # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
-        if global_num_experts == 256 and self.topk_config.renormalize is False:
+        if global_num_experts == 256 and self.topk_config.renormalize is True:
 
             routed_scaling_factor = self.topk_config.routed_scaling_factor or 1
             router_logits = router_logits.to(torch.float32)

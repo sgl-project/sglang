@@ -238,6 +238,8 @@ class PrefillBootstrapQueue:
                 self.scheduler.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 continue
 
             # KV.WaitingForInput - init here
@@ -522,6 +524,8 @@ class SchedulerDisaggregationPrefillMixin:
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 done_reqs.append(req)
+                if self.enable_metrics:
+                    self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 assert False, f"Unexpected polling state {poll=}"
 
