@@ -242,13 +242,92 @@ impl Default for JsonParser {
 #[async_trait]
 impl ToolParser for JsonParser {
     async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+        // Check if we have multiple start tokens (e.g., multiple <|python_tag|> markers)
+        if !self.token_config.start_tokens.is_empty() {
+            let start_token = &self.token_config.start_tokens[0];
+            if !start_token.is_empty() && text.matches(start_token).count() > 1 {
+                // We have multiple occurrences of the start token
+                let mut all_tools = Vec::new();
+                let mut remaining = text;
+
+                while let Some(start_pos) = remaining.find(start_token.as_str()) {
+                    // Extract content after this start token
+                    let after_token = &remaining[start_pos + start_token.len()..];
+
+                    // Find where this JSON ends (look for the next start token or end of string)
+                    let end_pos = if let Some(next_start) = after_token.find(start_token.as_str()) {
+                        next_start
+                    } else {
+                        after_token.len()
+                    };
+
+                    let json_content = &after_token[..end_pos];
+
+                    // Try to extract and parse JSON from this segment
+                    if let Some(extracted) = self.extract_json_from_text(json_content) {
+                        if let Ok(value) = serde_json::from_str::<Value>(&extracted) {
+                            if let Ok(tools) = self.parse_json_value(&value) {
+                                all_tools.extend(tools);
+                            }
+                        }
+                    }
+
+                    // Move to the next segment
+                    remaining = &remaining[start_pos + start_token.len() + end_pos..];
+                    if remaining.is_empty() {
+                        break;
+                    }
+                }
+
+                if !all_tools.is_empty() {
+                    return Ok(all_tools);
+                }
+            }
+        }
+
         // Extract JSON content from wrapper tokens if present
         let json_content = self.extract_json_content(text);
 
-        // Try to parse as JSON
+        // Try to parse as JSON first
         match serde_json::from_str::<Value>(json_content) {
             Ok(value) => self.parse_json_value(&value),
             Err(_) => {
+                // If parse failed, check if we have multiple JSON objects separated by the configured separator
+                // This handles cases like: {"name": "func1", ...};{"name": "func2", ...}
+                if !self.token_config.separator.is_empty()
+                    && json_content.contains(&self.token_config.separator)
+                {
+                    let mut all_tools = Vec::new();
+
+                    // Split by separator and try to parse each part
+                    let parts: Vec<&str> =
+                        json_content.split(&self.token_config.separator).collect();
+                    for part in parts {
+                        let trimmed = part.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+
+                        // Try to parse this part as JSON
+                        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                            if let Ok(tools) = self.parse_json_value(&value) {
+                                all_tools.extend(tools);
+                            }
+                        } else if let Some(extracted) = self.extract_json_from_text(trimmed) {
+                            // Try extracting JSON from this part
+                            if let Ok(value) = serde_json::from_str::<Value>(&extracted) {
+                                if let Ok(tools) = self.parse_json_value(&value) {
+                                    all_tools.extend(tools);
+                                }
+                            }
+                        }
+                    }
+
+                    if !all_tools.is_empty() {
+                        return Ok(all_tools);
+                    }
+                }
+
                 // If no wrapper tokens configured and parse failed,
                 // try to extract JSON from mixed text
                 if self.token_config.start_tokens.is_empty() {
@@ -350,9 +429,11 @@ impl ToolParser for JsonParser {
                     Value::Array(ref arr) => {
                         // Check if array contains tool-like objects
                         arr.iter().any(|v| {
-                            v.as_object().is_some_and(|o| {
-                                o.contains_key("name") || o.contains_key("function")
-                            })
+                            if let Some(obj) = v.as_object() {
+                                obj.contains_key("name") || obj.contains_key("function")
+                            } else {
+                                false
+                            }
                         })
                     }
                     _ => false,
