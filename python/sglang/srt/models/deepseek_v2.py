@@ -87,8 +87,8 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id, is_sm100_supported
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -114,6 +114,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_non_idle_and_non_empty,
+    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
