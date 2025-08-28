@@ -5,8 +5,8 @@ mod test_pd_routing {
         CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
     };
     use sglang_router_rs::core::{WorkerFactory, WorkerType};
-    use sglang_router_rs::routers::pd_types::get_hostname;
-    use sglang_router_rs::routers::pd_types::PDSelectionPolicy;
+    use sglang_router_rs::routers::http::pd_types::get_hostname;
+    use sglang_router_rs::routers::http::pd_types::PDSelectionPolicy;
     use sglang_router_rs::routers::RouterFactory;
 
     // Test-only struct to help validate PD request parsing
