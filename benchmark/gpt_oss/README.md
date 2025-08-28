@@ -81,3 +81,81 @@ OPENAI_API_KEY=dummy python -m gpt_oss.evals \
     --eval $DATASET \
     --n-threads 1000
 ```
+
+### Reproduce the benchmark result of acceptance length
+
+```bash
+config_list=(
+    "1,0,0,0"
+    "1,3,1,4"
+    "1,5,4,8"
+)
+python3 bench_model_speedup.py \
+    --model-path openai/gpt-oss-120b \
+    --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 \
+    --port 20001 \
+    --trust-remote-code \
+    --mem-fraction-static 0.8 \
+    --tp-size 4 \
+    --attention-backend fa3 \
+    --config-list "${config_list[@]}" \
+    --benchmark-list mtbench:80 gsm8k:200 humaneval:200 math500:200 \
+    --output lmsys_gpt-oss-120b_Eagle3_result.jsonl
+
+python3 bench_model_speedup.py \
+    --model-path openai/gpt-oss-120b \
+    --speculative-draft-model-path nvidia/gpt-oss-120b-Eagle3 \
+    --port 20001 \
+    --trust-remote-code \
+    --mem-fraction-static 0.8 \
+    --tp-size 4 \
+    --attention-backend fa3 \
+    --config-list "${config_list[@]}" \
+    --benchmark-list mtbench:80 gsm8k:200 humaneval:200 math500:200 \
+    --output nv_gpt-oss-120b_Eagle3_result.jsonl
+```
+
+### Reproduce the result of speculative decoding speedup
+
+Launch Command
+
+```bash
+# On Hopper:
+# - Tree decoding (topk > 1) and chain decoding (topk = 1) are supported on both FA3 and Triton backends.
+python3 -m sglang.launch_server --model openai/gpt-oss-120b --speculative-algorithm EAGLE3 --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --tp 4
+python3 -m sglang.launch_server --model openai/gpt-oss-120b --speculative-algorithm EAGLE3 --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 5 --speculative-eagle-topk 4 --speculative-num-draft-tokens 8 --tp 4
+
+# On Blackwell:
+# - Chain decoding (topk = 1) is supported on TRTLLM-MHA backend. Tree decoding (topk > 1) is in progress, stay tuned!
+# - Both tree decoding (topk > 1) and chain decoding (topk = 1) are supported on the Triton backend.
+python3 -m sglang.launch_server --model openai/gpt-oss-120b --speculative-algo EAGLE3 --speculative-draft lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --tp 4
+python3 -m sglang.launch_server --model openai/gpt-oss-120b --speculative-algo EAGLE3 --speculative-draft lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 5 --speculative-eagle-topk 4 --speculative-num-draft-tokens 8 --attention-backend triton --tp 4
+```
+
+Benchmark Command
+
+```bash
+git clone https://github.com/sgl-project/SpecForge.git
+cd SpecForge/benchmarks
+config_list=(
+    "1,0,0,0"
+    "1,3,1,4"
+    "1,5,4,8"
+)
+python3 bench_model_speedup.py \
+    --model-path openai/gpt-oss-120b \
+    --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 \
+    --port 20001 \
+    --trust-remote-code \
+    --mem-fraction-static 0.8 \
+    --tp-size 4 \
+    --attention-backend fa3 \
+    --config-list "${config_list[@]}" \
+    --benchmark-list gsm8k:200 humaneval:200 math500:200 \
+    --output lmsys_gpt-oss-120b_Eagle3_result.jsonl
+```
+
+We can gain the best speedup with the following settings:
+
+- **1.39x** speedup with the `--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` setting.
+- **1.52x** speedup with the `--speculative-num-steps 5 --speculative-eagle-topk 4 --speculative-num-draft-tokens 8` setting.
