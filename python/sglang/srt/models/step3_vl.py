@@ -38,6 +38,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -150,7 +151,7 @@ class Step3TextMoEMLP(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if global_server_args_dict["moe_a2a_backend"].is_deepep():
+        if get_moe_a2a_backend().is_deepep():
             raise NotImplementedError("DeepEP MoE is not supported yet in Step3 model.")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

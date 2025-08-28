@@ -36,12 +36,15 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
 
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
 
 
 class ReqToTokenPool:
@@ -624,8 +627,6 @@ class AscendTokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        import torch_npu
-
         torch_npu._npu_reshape_and_cache(
             key=cache_k,
             value=cache_v,
@@ -849,7 +850,7 @@ class MLATokenToKVPool(KVCache):
             cache_k_rope = cache_k_rope.view(self.store_dtype)
 
         set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+            self.kv_buffer[layer_id - self.start_layer], loc, cache_k_nope, cache_k_rope
         )
 
     def get_cpu_copy(self, indices):
@@ -912,12 +913,22 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.kv_buffer = torch.zeros(
+            self.k_buffer = torch.zeros(
                 (
                     layer_num,
                     self.size // self.page_size + 1,
                     self.page_size,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    self.kv_lora_rank,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self.v_buffer = torch.zeros(
+                (
+                    layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.qk_rope_head_dim,
                 ),
                 dtype=self.store_dtype,
                 device=self.device,
@@ -931,12 +942,52 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
         )
         self.mem_usage = kv_size / GB
 
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "k_buffer")
+        assert hasattr(self, "v_buffer")
+        kv_size_bytes = 0
+        for k_cache in self.k_buffer:
+            kv_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
+        for v_cache in self.v_buffer:
+            kv_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
+        return kv_size_bytes
+
+    def get_kv_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return (
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+        )
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if self.store_dtype != self.dtype:
+            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_value_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        if self.store_dtype != self.dtype:
+            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.v_buffer[layer_id - self.start_layer]
+
     # for disagg
     def get_contiguous_buf_infos(self):
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
-        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
-        kv_item_lens = [self.kv_buffer[i][0].nbytes for i in range(self.layer_num)]
+        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
+            self.v_buffer[i].data_ptr() for i in range(self.layer_num)
+        ]
+        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)] + [
+            self.v_buffer[i].nbytes for i in range(self.layer_num)
+        ]
+        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)] + [
+            self.v_buffer[i][0].nbytes for i in range(self.layer_num)
+        ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
@@ -951,16 +1002,24 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
             cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(store_dtype)
+            cache_k = cache_k.view(self.store_dtype)
 
-        import torch_npu
+        if cache_v is None:
+            cache_k, cache_v = cache_k.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
 
-        torch_npu._npu_reshape_and_cache_siso(
-            key=cache_k.view(-1, 1, self.kv_lora_rank + self.qk_rope_head_dim),
-            key_cache=self.kv_buffer[layer_id - self.start_layer].view(
-                -1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim
+        torch_npu.npu_scatter_nd_update_(
+            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
+            loc.view(-1, 1),
+            cache_k.view(-1, 1, self.kv_lora_rank),
+        )
+        torch_npu.npu_scatter_nd_update_(
+            self.v_buffer[layer_id - self.start_layer].view(
+                -1, 1, self.qk_rope_head_dim
             ),
-            slot_indices=loc,
+            loc.view(-1, 1),
+            cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
 
 
@@ -1070,7 +1129,7 @@ def copy_all_layer_kv_cache(
     num_loop = tl.cdiv(stride, BLOCK_SIZE)
     for i in range(num_loop):
         copy_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = (num_locs_offset < num_locs)[:, None] and (copy_offset < stride)[None, :]
+        mask = (num_locs_offset < num_locs)[:, None] & (copy_offset < stride)[None, :]
         value = tl.load(
             data_ptr + src_locs[:, None] * stride + copy_offset[None, :], mask=mask
         )

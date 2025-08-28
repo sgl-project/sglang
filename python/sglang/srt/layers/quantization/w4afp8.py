@@ -18,7 +18,9 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.ep_moe.layer import EPMoE, TopKOutput
+    from sglang.srt.layers.moe import MoeRunnerConfig
+    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -280,11 +282,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: EPMoE,
         x: torch.Tensor,
-        topk_output: TopKOutput,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-        **kwargs,
+        topk_output: StandardTopKOutput,
+        moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
 
         # TODO(ch-wan): move it out of this class
@@ -324,6 +323,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
         )
-        if routed_scaling_factor is not None:
-            output *= routed_scaling_factor
+        if moe_runner_config.routed_scaling_factor is not None:
+            output *= moe_runner_config.routed_scaling_factor
         return output

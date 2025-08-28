@@ -64,14 +64,17 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
+from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -145,6 +148,7 @@ from sglang.srt.utils import (
     configure_gc_logger,
     configure_logger,
     disable_request_logging,
+    freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
     get_zmq_socket,
@@ -245,6 +249,9 @@ class Scheduler(
             )
         )
 
+        # Init model config
+        self.model_config = ModelConfig.from_server_args(server_args)
+
         # Init inter-process communication
         context = zmq.Context(2)
         self.idle_sleeper = None
@@ -291,6 +298,9 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+
+        # Init moe config
+        self.init_moe_config()
 
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
@@ -502,6 +512,8 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
+                (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
@@ -518,6 +530,7 @@ class Scheduler(
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
+                (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
@@ -538,8 +551,6 @@ class Scheduler(
 
     def init_tokenizer(self):
         server_args = self.server_args
-
-        self.model_config = ModelConfig.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
 
         if server_args.skip_tokenizer_init:
@@ -616,6 +627,8 @@ class Scheduler(
                     hicache_mem_layout=server_args.hicache_mem_layout,
                     hicache_storage_backend=server_args.hicache_storage_backend,
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
+                    model_name=server_args.served_model_name,
+                    storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -760,6 +773,10 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+
+    def init_moe_config(self):
+        if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
+            initialize_moe_config(self.server_args)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1007,14 +1024,26 @@ class Scheduler(
                     req
                     for req in recv_reqs
                     if isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            TokenizedEmbeddingReqInput,
+                            BatchTokenizedGenerateReqInput,
+                            BatchTokenizedEmbeddingReqInput,
+                        ),
                     )
                 ]
                 control_reqs = [
                     req
                     for req in recv_reqs
                     if not isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            TokenizedEmbeddingReqInput,
+                            BatchTokenizedGenerateReqInput,
+                            BatchTokenizedEmbeddingReqInput,
+                        ),
                     )
                 ]
             else:
@@ -1133,7 +1162,7 @@ class Scheduler(
                         f"boostrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    prepare_abort(req, error_msg)
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.stream_output([req], req.return_logprob)
                     return
 
@@ -1242,6 +1271,17 @@ class Scheduler(
         else:
             self._add_request_to_queue(req)
 
+    def handle_batch_generate_request(
+        self,
+        recv_req: BatchTokenizedGenerateReqInput,
+    ):
+        """Handle optimized batch generate request."""
+        logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
+
+        # Process each request in the batch
+        for tokenized_req in recv_req:
+            self.handle_generate_request(tokenized_req)
+
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1258,10 +1298,11 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
-            last_hash = req.last_host_node.get_last_hash_value()
-            matched_len = len(req.prefix_indices) + req.host_hit_length
-            # todo, free-form fetching, calculating hash keys on the fly
-            if (matched_len > 0 and last_hash is not None) or matched_len == 0:
+            if req.last_node.backuped:
+                # only to initiate the prefetch if the last node is backuped
+                # otherwise, the allocated GPU memory must be locked for integrity
+                last_hash = req.last_host_node.get_last_hash_value()
+                matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
                 self.tree_cache.prefetch_from_storage(
                     req.rid, req.last_host_node, new_input_tokens, last_hash
@@ -1323,6 +1364,19 @@ class Scheduler(
         # Copy more attributes
         req.logprob_start_len = len(req.origin_input_ids) - 1
         self._add_request_to_queue(req)
+
+    def handle_batch_embedding_request(
+        self,
+        recv_req: BatchTokenizedEmbeddingReqInput,
+    ):
+        """Handle optimized batch embedding request."""
+        logger.debug(
+            f"Processing batch embedding request with {len(recv_req)} requests"
+        )
+
+        # Process each request in the batch
+        for tokenized_req in recv_req:
+            self.handle_embedding_request(tokenized_req)
 
     def self_check_during_idle(self):
         self.check_memory()
@@ -1823,11 +1877,6 @@ class Scheduler(
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-            enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
-            enable_deepep_moe=MoeA2ABackend(
-                self.server_args.moe_a2a_backend
-            ).is_deepep(),
-            deepep_mode=DeepEPMode(self.server_args.deepep_mode),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )
@@ -1922,9 +1971,6 @@ class Scheduler(
         disable_cuda_graph: bool,
         spec_algorithm,
         speculative_num_draft_tokens,
-        enable_two_batch_overlap: bool,
-        enable_deepep_moe: bool,
-        deepep_mode: DeepEPMode,
         require_mlp_tp_gather: bool,
         disable_overlap_schedule: bool,
     ):
@@ -1972,9 +2018,6 @@ class Scheduler(
                 is_extend_in_batch,
                 *tbo_preparer.prepare_all_gather(
                     local_batch,
-                    deepep_mode,
-                    enable_deepep_moe,
-                    enable_two_batch_overlap,
                 ),
             ],
             dtype=torch.int64,
@@ -2472,6 +2515,12 @@ class Scheduler(
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
 
+    def handle_freeze_gc(self, recv_req: FreezeGCReq):
+        """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
+        freeze_gc("Scheduler")
+        self.send_to_detokenizer.send_pyobj(recv_req)
+        return None
+
 
 class IdleSleeper:
     """
@@ -2507,7 +2556,15 @@ def is_health_check_generate_req(recv_req):
 
 
 def is_work_request(recv_req):
-    return isinstance(recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+    return isinstance(
+        recv_req,
+        (
+            TokenizedGenerateReqInput,
+            TokenizedEmbeddingReqInput,
+            BatchTokenizedGenerateReqInput,
+            BatchTokenizedEmbeddingReqInput,
+        ),
+    )
 
 
 def run_scheduler_process(
@@ -2582,7 +2639,10 @@ def run_scheduler_process(
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_prefill()
             else:
-                scheduler.event_loop_normal_disagg_prefill()
+                if server_args.pp_size > 1:
+                    scheduler.event_loop_pp_disagg_prefill()
+                else:
+                    scheduler.event_loop_normal_disagg_prefill()
 
         elif disaggregation_mode == DisaggregationMode.DECODE:
             if scheduler.enable_overlap:

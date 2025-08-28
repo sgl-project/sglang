@@ -191,7 +191,11 @@ class LogitsMetadata:
         else:
             self.global_dp_buffer_len = self.global_dp_buffer_len
 
-        set_dp_buffer_len(self.global_dp_buffer_len, self.dp_local_num_tokens)
+        set_dp_buffer_len(
+            self.global_dp_buffer_len,
+            self.dp_local_num_tokens,
+            self.global_num_tokens_for_logprob_cpu,
+        )
 
 
 class LogitsProcessor(nn.Module):
