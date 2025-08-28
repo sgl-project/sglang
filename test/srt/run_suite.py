@@ -135,12 +135,12 @@ suites = {
         TestFile("test_full_deepseek_v3.py", 333),
     ],
     "per-commit-8-gpu-b200": [
-        TestFile("../../python/sglang/test/attention/test_trtllm_mla_backend.py", 150),
-        TestFile("../../python/sglang/test/test_block_fp8_deep_gemm_blackwell.py", 180),
-        TestFile("../../python/sglang/test/test_fp4_moe.py", 120),
         TestFile("../../sgl-kernel/tests/test_fp4_gemm.py", 60),
         TestFile("../../sgl-kernel/tests/test_fp4_quantize.py", 60),
+        TestFile("../../python/sglang/test/test_fp4_moe.py", 120),
         TestFile("../../sgl-kernel/tests/test_moe_fused_gate.py", 90),
+        TestFile("../../python/sglang/test/test_block_fp8_deep_gemm_blackwell.py", 180),
+        TestFile("../../python/sglang/test/attention/test_trtllm_mla_backend.py", 150),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),

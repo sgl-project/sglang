@@ -144,33 +144,11 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Install PyTorch and pytest
-        run: |
-          pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129 --break-system-packages
-          pip install pytest --break-system-packages
-
-      - name: Build sgl-kernel wheel
-        run: |
-          cd sgl-kernel
-          chmod +x ./build.sh
-          # Build for Python 3.10 and CUDA 12.9 (Blackwell)
-          ./build.sh "3.10" "12.9"
-
-      - name: Install sgl-kernel wheel
-        run: |
-          pip uninstall sgl-kernel -y || true
-          pip install sgl-kernel/dist/*whl --force-reinstall --no-deps --break-system-packages
-          pip list | grep sgl-kernel
-
       - name: Run test suite
         timeout-minutes: 30
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
-
-      - name: Cleanup
-        run: |
-          pip uninstall sgl-kernel -y
 
   performance-test-1-gpu-blackwell:
     needs: [check-changes]
