@@ -71,6 +71,8 @@ cd gpt-oss
 pip install -e .
 ```
 
+Evaluation Command
+
 ```bash
 DATASET=gpqa
 BASE_URL=YOUR_BASE_URL
