@@ -511,6 +511,18 @@ async def stop_profile_async():
     )
 
 
+@app.api_route("/freeze_gc", methods=["GET", "POST"])
+async def freeze_gc_async():
+    """
+    See engine.freeze_gc for more details.
+    """
+    await _global_state.tokenizer_manager.freeze_gc()
+    return Response(
+        content="Garbage collection frozen.\n",
+        status_code=200,
+    )
+
+
 @app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
 async def start_expert_distribution_record_async():
     """Start recording the expert distribution. Clear the previous record if any."""

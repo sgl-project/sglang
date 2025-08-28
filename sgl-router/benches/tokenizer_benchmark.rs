@@ -100,7 +100,8 @@ fn bench_encode_throughput(c: &mut Criterion) {
         let tokenizer_clone = tokenizer.clone();
 
         // Get token count once
-        let token_count = tokenizer.encode(prompt).unwrap().token_ids().len();
+        let encoding = tokenizer.encode(prompt).unwrap();
+        let token_count = encoding.token_ids().len();
 
         // Track if metrics have been printed for this test case
         let printed = Arc::new(AtomicBool::new(false));
@@ -157,7 +158,8 @@ fn bench_batch_encode(c: &mut Criterion) {
     let batch_sizes = vec![1, 8, 16, 32, 64, 128];
     let prompt = MEDIUM_PROMPT;
     let prompt_len = prompt.len();
-    let token_count = tokenizer.encode(prompt).unwrap().token_ids().len();
+    let encoding = tokenizer.encode(prompt).unwrap();
+    let token_count = encoding.token_ids().len();
 
     let mut group = c.benchmark_group("batch_encode");
 
@@ -303,7 +305,8 @@ fn bench_decode_performance(c: &mut Criterion) {
     );
 
     let test_text = "The quick brown fox jumps over the lazy dog. ".repeat(10);
-    let tokens = tokenizer.encode(&test_text).unwrap().token_ids();
+    let encoding = tokenizer.encode(&test_text).unwrap();
+    let tokens = encoding.token_ids();
     let num_tokens = tokens.len();
 
     let mut group = c.benchmark_group("decode_performance");
@@ -313,12 +316,11 @@ fn bench_decode_performance(c: &mut Criterion) {
     group.bench_function("direct_decode", |b| {
         let printed = printed_direct.clone();
         let tokenizer = tokenizer.clone();
-        let tokens = tokens.clone();
 
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                black_box(tokenizer.decode(&tokens, false).unwrap());
+                black_box(tokenizer.decode(tokens, false).unwrap());
             }
             let duration = start.elapsed();
 
@@ -344,14 +346,13 @@ fn bench_decode_performance(c: &mut Criterion) {
     group.bench_function("decode_stream", |b| {
         let printed = printed_stream.clone();
         let tokenizer = tokenizer.clone();
-        let tokens = tokens.clone();
 
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
                 let mut decoder = DecodeStream::new(tokenizer.clone(), &[], false);
                 let mut output = String::new();
-                for token in &tokens {
+                for token in tokens {
                     if let Some(text) = decoder.step(*token).unwrap() {
                         output.push_str(&text);
                     }
@@ -382,14 +383,13 @@ fn bench_decode_performance(c: &mut Criterion) {
     group.bench_function("sequence_decode", |b| {
         let printed = printed_seq.clone();
         let tokenizer = tokenizer.clone();
-        let tokens = tokens.clone();
 
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
                 let mut sequence = Sequence::new(tokenizer.clone());
                 let mut output = String::new();
-                for token in &tokens {
+                for token in tokens {
                     let text = sequence.append_token(*token).unwrap();
                     output.push_str(&text);
                 }
@@ -424,7 +424,8 @@ fn bench_streaming_decode_100k(c: &mut Criterion) {
     );
 
     let sample_text = "The quick brown fox jumps over the lazy dog. ".repeat(1000);
-    let all_tokens = tokenizer.encode(&sample_text).unwrap().token_ids();
+    let encoding = tokenizer.encode(&sample_text).unwrap();
+    let all_tokens = encoding.token_ids();
 
     let mut group = c.benchmark_group("streaming_100k");
     group.measurement_time(Duration::from_secs(1));
@@ -434,7 +435,6 @@ fn bench_streaming_decode_100k(c: &mut Criterion) {
     group.bench_function("decode_stream_100k", |b| {
         let printed = printed_stream.clone();
         let tokenizer = tokenizer.clone();
-        let tokens = all_tokens.clone();
 
         b.iter_custom(|_iters| {
             let start = Instant::now();
@@ -442,7 +442,7 @@ fn bench_streaming_decode_100k(c: &mut Criterion) {
             let mut output = String::new();
             let mut tokens_processed = 0u64;
 
-            for token in tokens.iter().cycle() {
+            for token in all_tokens.iter().cycle() {
                 if start.elapsed() >= Duration::from_millis(500) {
                     break;
                 }
@@ -486,7 +486,6 @@ fn bench_streaming_decode_100k(c: &mut Criterion) {
     group.bench_function("sequence_100k", |b| {
         let printed = printed_seq.clone();
         let tokenizer = tokenizer.clone();
-        let tokens = all_tokens.clone();
 
         b.iter_custom(|_iters| {
             let start = Instant::now();
@@ -494,7 +493,7 @@ fn bench_streaming_decode_100k(c: &mut Criterion) {
             let mut output = String::new();
             let mut tokens_processed = 0u64;
 
-            for token in tokens.iter().cycle() {
+            for token in all_tokens.iter().cycle() {
                 if start.elapsed() >= Duration::from_millis(500) {
                     break;
                 }
@@ -693,7 +692,8 @@ fn bench_concurrent_streaming(c: &mut Criterion) {
     let tokens_per_sequence = 10_000;
 
     let sample_text = "The quick brown fox jumps over the lazy dog. ".repeat(100);
-    let token_batch = tokenizer.encode(&sample_text).unwrap().token_ids();
+    let encoding = tokenizer.encode(&sample_text).unwrap();
+    let token_batch: Vec<u32> = encoding.token_ids().to_vec();
 
     let mut group = c.benchmark_group("concurrent_streaming");
     group.measurement_time(Duration::from_secs(2));
@@ -775,7 +775,8 @@ fn bench_stop_sequences(c: &mut Criterion) {
         .with_stop_token(2);
 
     let sample_text = "Hello world! This is a test. ### Stop here. Continue after.".repeat(100);
-    let tokens = tokenizer.encode(&sample_text).unwrap().token_ids();
+    let encoding = tokenizer.encode(&sample_text).unwrap();
+    let tokens = encoding.token_ids();
 
     let mut group = c.benchmark_group("stop_sequences");
 
@@ -784,7 +785,6 @@ fn bench_stop_sequences(c: &mut Criterion) {
     group.bench_function("no_stops", |b| {
         let printed_clone = printed_no_stop.clone();
         let tokenizer = tokenizer.clone();
-        let tokens = tokens.clone();
 
         b.iter_custom(|iters| {
             let start = Instant::now();
@@ -796,7 +796,7 @@ fn bench_stop_sequences(c: &mut Criterion) {
                     StopSequenceConfig::default(),
                     false,
                 );
-                for token in &tokens {
+                for token in tokens {
                     let _ = decoder.process_token(*token).unwrap();
                     total_tokens += 1;
                 }
@@ -826,7 +826,6 @@ fn bench_stop_sequences(c: &mut Criterion) {
     group.bench_function("with_stops", |b| {
         let printed_clone = printed_with_stops.clone();
         let tokenizer = tokenizer.clone();
-        let tokens = tokens.clone();
         let config = config.clone();
 
         b.iter_custom(|iters| {
@@ -839,7 +838,7 @@ fn bench_stop_sequences(c: &mut Criterion) {
                     StopSequenceDecoder::new(tokenizer.clone(), config.clone(), false);
                 let mut sequence_tokens = 0u64;
 
-                for token in &tokens {
+                for token in tokens {
                     let result = decoder.process_token(*token).unwrap();
                     sequence_tokens += 1;
 
@@ -986,7 +985,8 @@ fn bench_multithreaded_decode(c: &mut Criterion) {
 
     // Generate tokens for decoding
     let test_text = "The quick brown fox jumps over the lazy dog. ".repeat(100);
-    let test_tokens = tokenizer.encode(&test_text).unwrap().token_ids();
+    let encoding = tokenizer.encode(&test_text).unwrap();
+    let test_tokens: Vec<u32> = encoding.token_ids().to_vec();
 
     let mut group = c.benchmark_group("multithreaded_decode");
     group.measurement_time(Duration::from_secs(2));
@@ -1130,7 +1130,7 @@ fn bench_memory_efficiency(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                let _ = black_box(encoding.token_ids_ref());
+                let _ = black_box(encoding.token_ids());
             }
             let duration = start.elapsed();
 
