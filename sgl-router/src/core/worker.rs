@@ -153,10 +153,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get the data parallelism size of a worker by querying its server info endpoint
     /// This is a utility method that can be overridden by specific worker implementations
-    fn get_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String>
-    where
-        Self: Sized,
-    {
+    fn get_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> where Self: Sized {
         let sync_client = reqwest::blocking::Client::new();
         let mut req_builder = sync_client.get(format!("{}/get_server_info", worker_url));
         if let Some(key) = api_key {
