@@ -29,14 +29,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     direct_register_custom_op,
-    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_sm100_supported,
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
@@ -67,10 +66,15 @@ _is_hip = is_hip()
 
 if _is_hip:
     # import aiter
-    from aiter import ActivationType, QuantType, dtypes
-    from aiter.fused_moe import fused_moe
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-    from aiter.utility.fp4_utils import e8m0_shuffle
+    try:
+        from aiter import ActivationType, QuantType, dtypes
+        from aiter.fused_moe import fused_moe
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+        from aiter.utility.fp4_utils import e8m0_shuffle
+    except ImportError as err:
+        ActivationType = QuantType = dtypes = fused_moe = dynamic_mxfp4_quant = (
+            e8m0_shuffle
+        ) = err
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -146,27 +150,21 @@ def _quant_dequant_mxfp4_fake(
     return torch.empty_like(x)
 
 
-try:
-    direct_register_custom_op(
-        op_name="dequant_mxfp4",
-        op_func=_dequant_mxfp4,
-        mutates_args=[],
-        fake_impl=_dequant_mxfp4_fake,
-    )
-    dequant_mxfp4 = torch.ops.sglang.dequant_mxfp4
-except AttributeError as error:
-    raise error
+direct_register_custom_op(
+    op_name="dequant_mxfp4",
+    op_func=_dequant_mxfp4,
+    mutates_args=[],
+    fake_impl=_dequant_mxfp4_fake,
+)
+dequant_mxfp4 = torch.ops.sglang.dequant_mxfp4
 
-try:
-    direct_register_custom_op(
-        op_name="quant_dequant_mxfp4",
-        op_func=_quant_dequant_mxfp4,
-        mutates_args=[],
-        fake_impl=_quant_dequant_mxfp4_fake,
-    )
-    quant_dequant_mxfp4 = torch.ops.sglang.quant_dequant_mxfp4
-except AttributeError as error:
-    raise error
+direct_register_custom_op(
+    op_name="quant_dequant_mxfp4",
+    op_func=_quant_dequant_mxfp4,
+    mutates_args=[],
+    fake_impl=_quant_dequant_mxfp4_fake,
+)
+quant_dequant_mxfp4 = torch.ops.sglang.quant_dequant_mxfp4
 
 
 class Mxfp4Config(QuantizationConfig):
