@@ -561,7 +561,10 @@ class Req:
             # shape: (bs, k)
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
-            self.output_token_ids_logprobs_val = []
+            # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
+            self.output_token_ids_logprobs_val: List[
+                Union[List[float], torch.Tensor]
+            ] = []
             self.output_token_ids_logprobs_idx = []
         else:
             self.output_token_logprobs_val = self.output_token_logprobs_idx = (
@@ -1208,11 +1211,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # Compute the relative logprob_start_len in an extend batch
             if req.logprob_start_len >= pre_len:
-                req.extend_logprob_start_len = min(
-                    req.logprob_start_len - pre_len,
-                    req.extend_input_len,
-                    req.seqlen - 1,
-                )
+                # For prefill-only requests that doesn't require input logprobs,
+                # skip input logprob computation entirely by setting extend_logprob_start_len to extend_input_len.
+                if (
+                    self.is_prefill_only
+                    and req.logprob_start_len == len(req.origin_input_ids) - 1
+                ):
+                    req.extend_logprob_start_len = req.extend_input_len
+                else:
+                    req.extend_logprob_start_len = min(
+                        req.logprob_start_len - pre_len,
+                        req.extend_input_len,
+                        req.seqlen - 1,
+                    )
             else:
                 req.extend_logprob_start_len = 0
 
@@ -1760,6 +1771,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            is_prefill_only=self.is_prefill_only,
         )
 
     def copy(self):
@@ -1901,6 +1913,9 @@ class ModelWorkerBatch:
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
+
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
 
 
 @triton.jit

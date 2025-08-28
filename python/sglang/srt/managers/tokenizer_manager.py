@@ -1621,11 +1621,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # the next position after the last token in the prompt
             output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
 
-            # Throw an error here if output_logprobs is None
-            if output_logprobs is None:
+            # Check if output_logprobs is properly populated
+            if (
+                output_logprobs is None
+                or not output_logprobs
+                or len(output_logprobs) == 0
+            ):
                 raise RuntimeError(
-                    f"output_logprobs is None for request {result['meta_info'].get('id', '<unknown>')}. "
-                    "This usually indicates a problem with the scoring request or the backend output."
+                    f"output_logprobs is empty for request {result['meta_info'].get('id', '<unknown>')}. "
+                    "This indicates token_ids_logprobs were not computed properly for the scoring request."
                 )
 
             for logprob, token_id, _ in output_logprobs[0]:

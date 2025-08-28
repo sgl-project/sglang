@@ -1,5 +1,5 @@
 import logging
-from typing import List
+from typing import List, Tuple
 
 import torch
 import torch.distributed as dist
@@ -164,6 +164,65 @@ class Sampler(nn.Module):
 
         return batch_next_token_ids
 
+    def compute_logprobs_only(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        return_logprob: bool,
+        top_logprobs_nums: List[int],
+        token_ids_logprobs: List[List[int]],
+    ) -> None:
+        """
+        Compute logprobs for requested token IDs without performing sampling.
+
+        Optimized for prefill-only scoring requests that need token probabilities
+        but don't require next token generation.
+        """
+        if logits_output.next_token_logits is None:
+            logger.warning("No logits available for logprob computation")
+            return
+
+        # Check if any requests actually need token ID logprobs
+        needs_computation = any(
+            token_ids is not None and len(token_ids) > 0
+            for token_ids in token_ids_logprobs
+        )
+        if not needs_computation:
+            return
+
+        logits = logits_output.next_token_logits
+
+        # Apply custom logit processors if configured
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(logits, sampling_info)
+
+        # Detect and handle NaN values in logits
+        if self.use_nan_detection and torch.any(torch.isnan(logits)):
+            logger.warning(
+                "Detected errors during logprob computation! NaN in the logits."
+            )
+            logits = torch.where(
+                torch.isnan(logits), torch.full_like(logits, -1e5), logits
+            )
+            if crash_on_warnings():
+                raise ValueError(
+                    "Detected errors during logprob computation! NaN in the logits."
+                )
+
+        # Compute logprobs for token_ids_logprobs if requested
+        if any(x is not None for x in token_ids_logprobs):
+            # Convert logits to logprobs
+            logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        # Extract requested token logprobs using optimized batch processing
+        # Use delayed CPU copy to improve GPU-CPU overlap
+        (
+            logits_output.next_token_token_ids_logprobs_val,
+            logits_output.next_token_token_ids_logprobs_idx,
+        ) = get_token_ids_logprobs_batch_optimized(
+            logprobs, token_ids_logprobs, delay_cpu_copy=True
+        )
+
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
@@ -233,10 +292,76 @@ def get_top_logprobs(
     )
 
 
-def get_token_ids_logprobs(
+def get_token_ids_logprobs_batch_optimized(
     logprobs: torch.Tensor,
     token_ids_logprobs: List[List[int]],
-):
+    delay_cpu_copy: bool = False,
+) -> Tuple[List, List]:
+    """
+    Vectorized batch processing for token ID logprobs extraction.
+
+    Uses a single GPU kernel call for the entire batch instead of multiple
+    separate calls, significantly improving performance for large batches.
+
+    Args:
+        logprobs: Log probabilities tensor [batch_size, vocab_size]
+        token_ids_logprobs: List of token IDs to extract logprobs for
+        delay_cpu_copy: If True, keep results on GPU for later CPU transfer
+    """
+    batch_size = len(token_ids_logprobs)
+    output_token_ids_logprobs_val = [None] * batch_size
+    output_token_ids_logprobs_idx = [None] * batch_size
+
+    # Collect all valid requests for vectorized batch processing
+    batch_row_indices = []
+    batch_col_indices = []
+    request_info = []  # (original_index, start_pos, num_tokens)
+
+    current_pos = 0
+    for i, token_ids in enumerate(token_ids_logprobs):
+        if token_ids is not None:
+            num_tokens = len(token_ids)
+            # Add row indices (batch dimension) - repeat for each token
+            batch_row_indices.extend([i] * num_tokens)
+            # Add column indices (token dimension)
+            batch_col_indices.extend(token_ids)
+            # Record info for splitting results back
+            request_info.append((i, current_pos, num_tokens))
+            current_pos += num_tokens
+
+    if batch_row_indices:
+        # Single vectorized indexing operation
+        batch_row_tensor = torch.tensor(
+            batch_row_indices, device=logprobs.device, dtype=torch.long
+        )
+        batch_col_tensor = torch.tensor(
+            batch_col_indices, device=logprobs.device, dtype=torch.long
+        )
+
+        # Extract all required logprobs in one kernel call
+        batch_logprobs = logprobs[batch_row_tensor, batch_col_tensor]
+
+        # Split results back into per-request format
+        for original_idx, start_pos, num_tokens in request_info:
+            end_pos = start_pos + num_tokens
+            request_logprobs = batch_logprobs[start_pos:end_pos]
+
+            # Handle delayed vs immediate CPU copy
+            if delay_cpu_copy:
+                # Keep GPU tensor for later conversion during output processing
+                output_token_ids_logprobs_val[original_idx] = request_logprobs
+            else:
+                # Immediate CPU copy
+                output_token_ids_logprobs_val[original_idx] = request_logprobs.tolist()
+
+            output_token_ids_logprobs_idx[original_idx] = token_ids_logprobs[
+                original_idx
+            ]
+
+    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
+
+
+def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]]):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
     for i, token_ids in enumerate(token_ids_logprobs):
