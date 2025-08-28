@@ -130,7 +130,7 @@ echo "The runner is: ${RUNNER_NAME}"
 GPU_ARCH="mi30x"
 
 # Check for mi350/mi355 runners
-if [[ "${RUNNER_NAME}" =~ ^linux-mi350-gpu-[0-9]+$ ]] || [[ "${RUNNER_NAME}" =~ ^linux-mi355-gpu-[0-9]+$ ]]; then
+if [[ "${RUNNER_NAME}" =~ ^linux-mi35x-gpu-[0-9]+$ ]]; then
   echo "Runner is ${RUNNER_NAME}, will find mi35x image."
   GPU_ARCH="mi35x"
 # Check for mi300/mi325 runners
