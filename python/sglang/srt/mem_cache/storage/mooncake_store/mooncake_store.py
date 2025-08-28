@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -84,15 +84,7 @@ class MooncakeStoreConfig:
 
 
 class MooncakeStore(HiCacheStorage):
-    def __init__(self, is_mla_backend: bool = False):
-        """
-        Initialize MooncakeStore.
-
-        Args:
-            is_mla_backend: If the backend is MLA
-        """
-        self.is_mla_backend = is_mla_backend
-
+    def __init__(self, storage_config: HiCacheStorageConfig = None):
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as e:
@@ -123,14 +115,19 @@ class MooncakeStore(HiCacheStorage):
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
+            if storage_config is not None:
+                self.is_mla_backend = storage_config.is_mla_model
+                self.local_rank = storage_config.tp_rank
+            else:
+                self.is_mla_backend = False
+                self.local_rank = 0
+
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
             raise
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
-
-        self.local_rank = get_tensor_model_parallel_rank()
 
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
