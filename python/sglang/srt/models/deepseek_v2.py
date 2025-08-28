@@ -1669,7 +1669,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             # Fetch latent cache from memory pool with precomputed chunked kv indices
             latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
                 self.attn_mha.layer_id
-            )
+            ).to(q.dtype)
             latent_cache = latent_cache_buf[
                 forward_batch.prefix_chunk_kv_indices[i]
             ].contiguous()
