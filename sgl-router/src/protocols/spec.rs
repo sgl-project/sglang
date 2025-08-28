@@ -1500,10 +1500,12 @@ pub struct StreamOptions {
 
 /// Tool choice value for simple string options
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ToolChoiceValue {
+    #[serde(rename = "auto")]
     Auto,
+    #[serde(rename = "required")]
     Required,
+    #[serde(rename = "none")]
     None,
 }
 
