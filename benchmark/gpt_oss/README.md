@@ -13,14 +13,6 @@ pip install --upgrade pip
 pip install -e "python[all]"
 ```
 
-### Install gpt-oss
-
-```bash
-git clone https://github.com/openai/gpt-oss.git
-cd gpt-oss
-pip install -e .
-```
-
 ### Reproduce the benchmark throughput result (Batch Size 1)
 
 Launch Command
@@ -69,4 +61,25 @@ Benchmark Command
 
 ```bash
 python3 -m sglang.bench_one_batch_server --model openai/gpt-oss-120b --base-url http://localhost:30000 --batch-size 32 --input-len 1024 8192 --output-len 512 --show-report
+```
+
+### Reproduce the evaluation result
+
+Install gpt-oss
+
+```bash
+git clone https://github.com/openai/gpt-oss.git
+cd gpt-oss
+pip install -e .
+```
+
+```bash
+DATASET=gpqa
+BASE_URL=YOUR_BASE_URL
+OPENAI_API_KEY=dummy python -m gpt_oss.evals \
+    --base-url ${BASE_URL}/v1 \
+    --model dummy \
+    --reasoning-effort low,medium,high \
+    --eval $DATASET \
+    --n-threads 1000
 ```
