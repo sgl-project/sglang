@@ -89,6 +89,7 @@ class TemplateManager:
         if template is None:
             return False
 
+        # TODO: remove this hard code the reasoning pattern
         force_reasoning_pattern = r"<\|im_start\|>assistant\\n<think>\\n"
         has_reasoning = re.search(force_reasoning_pattern, template) is not None
 
@@ -128,11 +129,12 @@ class TemplateManager:
                     logger.info(
                         f"Using default HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
                     )
-                    return
-
-            # Default to string content format if no template was found
-            self._jinja_template_content_format = "string"
-            logger.info("No chat template found, defaulting to 'string' content format")
+                else:
+                    # Default to string content format if no template was found
+                    self._jinja_template_content_format = "string"
+                    logger.info(
+                        "No chat template found, defaulting to 'string' content format"
+                    )
 
         # Detect reasoning pattern from chat template
         if tokenizer_manager.tokenizer:
