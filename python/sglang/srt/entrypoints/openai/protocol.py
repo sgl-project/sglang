@@ -35,6 +35,8 @@ from pydantic import (
 )
 from typing_extensions import Literal
 
+DEFAULT_MODEL_NAME = "default"
+
 
 class ModelCard(BaseModel):
     """Model cards."""
@@ -108,6 +110,23 @@ class JsonSchemaResponseFormat(BaseModel):
     strict: Optional[bool] = False
 
 
+class ResponseFormat(BaseModel):
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: Optional[JsonSchemaResponseFormat] = None
+
+
+class StructuresResponseFormat(BaseModel):
+    begin: str
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    end: str
+
+
+class StructuralTagResponseFormat(BaseModel):
+    type: Literal["structural_tag"]
+    structures: List[StructuresResponseFormat]
+    triggers: List[str]
+
+
 class FileRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/files/create
     file: bytes  # The File object (not file name) to be uploaded
@@ -166,7 +185,7 @@ class BatchResponse(BaseModel):
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
     echo: bool = False
@@ -200,6 +219,7 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -359,23 +379,6 @@ ChatCompletionMessageParam = Union[
 ]
 
 
-class ResponseFormat(BaseModel):
-    type: Literal["text", "json_object", "json_schema"]
-    json_schema: Optional[JsonSchemaResponseFormat] = None
-
-
-class StructuresResponseFormat(BaseModel):
-    begin: str
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    end: str
-
-
-class StructuralTagResponseFormat(BaseModel):
-    type: Literal["structural_tag"]
-    structures: List[StructuresResponseFormat]
-    triggers: List[str]
-
-
 class Function(BaseModel):
     """Function descriptions."""
 
@@ -409,7 +412,7 @@ class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
@@ -571,7 +574,7 @@ class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
     input: EmbeddingInput
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     encoding_format: str = "float"
     dimensions: Optional[int] = None
     user: Optional[str] = None
@@ -605,7 +608,7 @@ class ScoringRequest(BaseModel):
     )
     apply_softmax: bool = False
     item_first: bool = False
-    model: str
+    model: str = DEFAULT_MODEL_NAME
 
 
 class ScoringResponse(BaseModel):

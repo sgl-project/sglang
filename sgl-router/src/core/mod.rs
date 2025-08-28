@@ -9,6 +9,7 @@
 pub mod circuit_breaker;
 pub mod error;
 pub mod retry;
+pub mod token_bucket;
 pub mod worker;
 
 // Re-export commonly used types at the module level

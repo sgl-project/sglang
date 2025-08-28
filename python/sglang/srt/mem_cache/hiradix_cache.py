@@ -39,6 +39,8 @@ class HiRadixCache(RadixCache):
         hicache_mem_layout: str,
         hicache_storage_backend: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[str] = None,
     ):
 
         if hicache_io_backend == "direct":
@@ -87,6 +89,8 @@ class HiRadixCache(RadixCache):
             io_backend=hicache_io_backend,
             storage_backend=hicache_storage_backend,
             prefetch_threshold=self.prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
         )
 
         # record the nodes with ongoing write through
@@ -430,9 +434,12 @@ class HiRadixCache(RadixCache):
         if self.prefetch_stop_policy == "best_effort":
             return can_terminate
 
-        completed = (
-            operation.completed_tokens == len(operation.hash_value) * self.page_size
-        )
+        if len(operation.hash_value) == 0:
+            completed = False
+        else:
+            completed = (
+                operation.completed_tokens == len(operation.hash_value) * self.page_size
+            )
 
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
@@ -536,6 +543,8 @@ class HiRadixCache(RadixCache):
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
+        while not last_host_node.backuped:
+            last_host_node = last_host_node.parent
 
         return MatchResult(
             device_indices=value,

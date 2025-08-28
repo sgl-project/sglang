@@ -1,5 +1,5 @@
 use super::*;
-use crate::tool_parser::json_parser::JsonParser;
+use crate::tool_parser::parsers::JsonParser;
 use crate::tool_parser::partial_json::{
     compute_diff, find_common_prefix, is_complete_json, PartialJson,
 };
@@ -387,11 +387,10 @@ fn test_json_parser_format_detection() {
 
 #[tokio::test]
 async fn test_json_parser_streaming() {
-    // Phase 2 simplified streaming test
     let parser = JsonParser::new();
     let mut state = ParseState::new();
 
-    // Test with complete JSON (simplified for Phase 2)
+    // Test with complete JSON
     let full_json = r#"{"name": "get_weather", "arguments": {"location": "San Francisco"}}"#;
 
     let result = parser
@@ -739,7 +738,7 @@ mod edge_cases {
             _ => panic!("Expected ToolComplete for complete JSON"),
         }
 
-        // Test 3: Partial JSON with name - Phase 2 behavior
+        // Test 3: Partial JSON with name
         // The PartialJson parser can complete partial JSON by filling in missing values
         let mut state3 = ParseState::new();
         let partial_with_name = r#"{"name": "test", "argum"#;
