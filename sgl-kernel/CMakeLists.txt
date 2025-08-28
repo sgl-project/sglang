@@ -60,7 +60,7 @@ FetchContent_Declare(
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        sgl
+    GIT_TAG        sgl-driver
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
