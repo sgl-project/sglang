@@ -28,7 +28,7 @@ use axum::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
