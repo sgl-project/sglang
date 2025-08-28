@@ -48,7 +48,7 @@ class FakeTokenizer:
         return []
 
 
-def send_one_batch(base_url, num_prompts, batch_size, profile=False):
+def send_one_batch(base_url, num_prompts, batch_size):
     padded_prompts = (prompts * ((num_prompts + len(prompts) - 1) // len(prompts)))[
         :num_prompts
     ]
@@ -89,7 +89,7 @@ def send_one_batch(base_url, num_prompts, batch_size, profile=False):
             disable_tqdm=False,
             lora_names=None,
             extra_request_body={},
-            profile=profile,
+            profile=None,
         )
     )
 
@@ -144,7 +144,7 @@ def main(args, server_args):
         else:
             other_args = [
                 "--speculative-algorithm",
-                server_args.speculative_algorithm or "EAGLE",
+                "EAGLE",
                 "--speculative-num-steps",
                 steps,
                 "--speculative-eagle-topk",
@@ -173,39 +173,10 @@ def main(args, server_args):
             ]
         )
 
-        if server_args.dtype:
-            other_args.extend(
-                [
-                    "--dtype",
-                    server_args.dtype,
-                ]
-            )
-
-        if server_args.disable_overlap_schedule:
-            other_args.extend(
-                [
-                    "--disable-overlap-schedule",
-                ]
-            )
-
-        if server_args.disable_cuda_graph:
-            other_args.extend(
-                [
-                    "--disable-cuda-graph",
-                ]
-            )
-
         if server_args.trust_remote_code:
             other_args.extend(
                 [
                     "--trust-remote-code",
-                ]
-            )
-
-        if server_args.disable_radix_cache:
-            other_args.extend(
-                [
-                    "--disable-radix-cache",
                 ]
             )
 
@@ -214,14 +185,6 @@ def main(args, server_args):
                 [
                     "--attention-backend",
                     server_args.attention_backend,
-                ]
-            )
-
-        if server_args.log_level:
-            other_args.extend(
-                [
-                    "--log-level",
-                    server_args.log_level,
                 ]
             )
 
@@ -250,7 +213,7 @@ def main(args, server_args):
 
             # Benchmark
             acc_length, step_time, speed, completion_tokens = send_one_batch(
-                base_url, max(args.num_prompts, batch_size), batch_size, args.profile
+                base_url, max(args.num_prompts, batch_size), batch_size
             )
         finally:
             kill_process_tree(process.pid)
@@ -310,11 +273,7 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int)
     parser.add_argument("--output", type=str, default="output.jsonl")
-    parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     server_args: ServerArgs = ServerArgs.from_cli_args(args)
-
-    if args.profile:
-        args.num_prompts = 1
 
     main(args, server_args)
