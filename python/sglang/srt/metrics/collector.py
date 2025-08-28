@@ -551,3 +551,14 @@ class TokenizerMetricsCollector:
 
     def observe_one_aborted_request(self):
         self.num_aborted_requests_total.labels(**self.labels).inc(1)
+
+
+class ExpertDispatchCollector:
+    def __init__(self, ep_size: int) -> None:
+        from prometheus_client import Gauge
+
+        self.gpu_physical_count = Gauge(
+            name="sglang:eplb_gpu_physical_count",
+            documentation="The number of physical experts on each GPU on each layer.",
+            labelnames=["layer", "rank"],
+        )
