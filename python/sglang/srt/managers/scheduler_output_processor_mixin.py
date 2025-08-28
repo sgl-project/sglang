@@ -282,9 +282,9 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.completion_time = time.time()
 
             if req.return_logprob and (
-                batch.spec_algorithm.is_none() and not self.enable_overlap
+                batch.spec_algorithm.is_none() or self.enable_overlap
             ):
-                # speculative worker handles logprob in speculative decoding
+                # non-overlap speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
                 if req.top_logprobs_num > 0:
