@@ -772,12 +772,31 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if (
-                    operation.host_indices is not None
-                ) and self.prefetch_rate_limit_check():
-                    hash_value, storage_hit_count = self._generic_storage_hit_query(
-                        operation
-                    )
+                # Check if this operation has already been queried for storage hits
+                if hasattr(operation, '_hash_value_cached'):
+                    # Restore cached values from previous query
+                    hash_value = operation._hash_value_cached
+                    storage_hit_count = operation._storage_hit_count_cached
+                else:
+                    # First time processing this operation
+                    hash_value = []
+                    storage_hit_count = 0
+                    
+                    if operation.host_indices is not None:
+                        if self.prefetch_rate_limit_check():
+                            # Query storage for available pages
+                            hash_value, storage_hit_count = self._generic_storage_hit_query(
+                                operation
+                            )
+                            # Cache the results to avoid re-querying
+                            operation._hash_value_cached = hash_value
+                            operation._storage_hit_count_cached = storage_hit_count
+                        else:
+                            # Rate limited - re-queue the operation to try again later
+                            # This prevents the operation from being stuck in ongoing_prefetch
+                            time.sleep(0.1)  # Small delay to avoid busy waiting
+                            self.prefetch_queue.put(operation)
+                            continue
 
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
