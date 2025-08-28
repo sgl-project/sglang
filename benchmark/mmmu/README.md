@@ -39,8 +39,11 @@ You can use `--extra-request-body` to specify additional OpenAI request paramete
 python3 bench_sglang.py --extra-request-body '{"max_new_tokens": 128, "temperature": 0.01}'
 ```
 
-### Evaluate hf
+### Evaluate HF
 
 ```
 python benchmark/mmmu/bench_hf.py --model-path Qwen/Qwen2-VL-7B-Instruct
 ```
+
+# Profiling MMMU
+You should use the standard instructions found in the dedicated profiling doc if running this benchmark with the profile option. We recommend the usage of `--concurrency 1` for consistency. If set, it will make profiling and debugging easier.
