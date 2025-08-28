@@ -10,11 +10,15 @@ import json
 import logging
 import math
 import os
+import threading
 import time
+import re
+import requests
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
+from urllib.parse import urlparse
 
 import huggingface_hub
 import numpy as np
@@ -60,6 +64,7 @@ from sglang.srt.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
+    default_weight_loader,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -1372,6 +1377,109 @@ class GGUFModelLoader(BaseModelLoader):
                         quant_method.process_weights_after_loading(module)
         return model
 
+class RemoteInstanceModelLoader(BaseModelLoader):
+    """Model loader that can load Tensors from remote sglang instance."""
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        if load_config.model_loader_extra_config:
+            raise ValueError(
+                f"Model loader extra config is not supported for "
+                f"load format {load_config.load_format}"
+            )
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        pass  # Nothing to download
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        logger.info("Loading weights from remote tensor engine ...")
+        load_config = self.load_config
+
+        assert load_config.load_format == LoadFormat.REMOTE_INSTANCE, (
+            f"Model loader {self.load_config.load_format} is not supported for "
+            f"load format {load_config.load_format}"
+        )
+
+        model_weights = model_config.model_path
+
+        if hasattr(model_config, "model_weights"):
+            model_weights = model_config.model_weights
+
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config)
+
+            def assign_group_port(url: str, rank: int) -> str:
+                parsed_url = urlparse(url)
+                if parsed_url.scheme != ConnectorType.INSTANCE:
+                    raise ValueError(f"Unsupported scheme for remote instance: {parsed_url.scheme}")
+
+                new_port = parsed_url.port + rank
+                # Reconstruct the URL with the new port.
+                new_netloc = f"{parsed_url.hostname}:{new_port}"
+                return parsed_url._replace(netloc=new_netloc).geturl()
+
+            model_weights = assign_group_port(model_weights, device_config.tp_rank)
+            with create_remote_connector(model_weights, device_config.device) as client:
+                connector_type = get_connector_type(client)
+                if connector_type == ConnectorType.INSTANCE:
+                    self.load_model_from_remote_engine(
+                        model, client, model_config, device_config)
+                else:
+                    raise ValueError(
+                        f"Unsupported connector type {connector_type} for "
+                        f"remote tensor model loading."
+                    )
+        return model.eval()
+
+    def load_model_from_remote_engine(
+        self, model, client, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        load_config = self.load_config
+
+        client.build_group(gpu_id=device_config.gpu_id, tp_rank=device_config.tp_rank, dst_instance_id=load_config.dst_instance_id)
+
+        model_weights = model_config.model_path
+        if hasattr(model_config, "model_weights"):
+            model_weights = model_config.model_weights
+
+        def trigger_send_weights_to_remote_instance_request():
+            url = load_config.seed_instance_url
+            parsed_group_url = urlparse(model_weights)
+            master_port = int(parsed_group_url.port)
+            requests.post(
+                f"{url}/send_weights_to_remote_instance",
+                json={
+                    "master_address": parsed_group_url.hostname,
+                    "master_port": master_port,
+                    "group_name": f"send_weights_{load_config.dst_instance_id}",
+                },
+            )
+
+        if device_config.tp_rank == 0:
+            t = threading.Thread(target=trigger_send_weights_to_remote_instance_request)
+            t.start()
+
+        start_get_weights_tic = time.time()
+        with set_default_torch_dtype(model_config.dtype):
+            params_dict = dict(model.named_parameters())
+            weight_names = []
+            for name, tensor in model.named_parameters():
+                weights = client.load_weights_from_remote_instance(name, tensor.dtype, tensor.shape)
+                weight_names.append(name)
+                default_weight_loader(params_dict[name], weights)
+
+            if hasattr(model, "post_load_weights"):
+                model.post_load_weights(weight_names=weight_names)
+        end_get_weights_tic = time.time()
+        logger.debug(f"finish getting all weights from remote engine, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s")
+        if device_config.tp_rank == 0:
+            t.join()
 
 class RemoteModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote database."""
@@ -1575,5 +1683,8 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.REMOTE:
         return RemoteModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
+        return RemoteInstanceModelLoader(load_config)
 
     return DefaultModelLoader(load_config)

@@ -889,6 +889,39 @@ class UpdateWeightsFromTensorReqOutput:
     success: bool
     message: str
 
+@dataclass
+class InitWeightsSendGroupForRemoteInstanceReqInput:
+    # The master address
+    master_address: str
+    # The master port
+    master_port: int
+    # The rank in the communication group
+    group_rank: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_send_group"
+    # The backend
+    backend: str = "nccl"
+
+@dataclass
+class InitWeightsSendGroupForRemoteInstanceReqOutput:
+    success: bool
+    message: str
+
+@dataclass
+class SendWeightsToRemoteInstanceReqInput:
+    # The master address
+    master_address: str
+    # The master port
+    master_port: int
+    # The group name
+    group_name: str = "weight_send_group"
+
+@dataclass
+class SendWeightsToRemoteInstanceReqOutput:
+    success: bool
+    message: str
 
 @dataclass
 class InitWeightsUpdateGroupReqInput:
