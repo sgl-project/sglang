@@ -122,7 +122,7 @@ void sgl_silu_and_mul_per_tensor_quant_fp8(torch::Tensor input_gate, torch::Tens
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
 
     silu_and_mul_per_tensor_absmax_kernel<scalar_t><<<grid, block, 0, stream>>>(
-        static_cast<scalar_t*>(input_gate.data_ptr()), static_cast<scalar_t*>(input_up.data_ptr()) static_cast<float*>(output_s.data_ptr()), num_elements, hidden_dim);
+        static_cast<scalar_t*>(input_gate.data_ptr()), static_cast<scalar_t*>(input_up.data_ptr()), static_cast<float*>(output_s.data_ptr()), num_elements, hidden_dim);
 
     silu_and_mul_per_tensor_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(
         static_cast<scalar_t*>(input_gate.data_ptr()),

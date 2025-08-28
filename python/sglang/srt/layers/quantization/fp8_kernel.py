@@ -1432,11 +1432,11 @@ else:
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                 if use_fused_silu_and_quant:
-                    input_1, input_2 = input.chunk(2, dim=-1)
-                    input_1 = input_1.contiguous()
-                    input_2 = input_2.contiguous()
+                    input_gate, input_up = input.chunk(2, dim=-1)
+                    input_gate = input_gate.contiguous()
+                    input_up = input_up.contiguous()
                     sgl_silu_and_mul_per_tensor_quant_fp8(
-                        input_1, input_2, output, scale, is_static=False
+                        input_gate, input_up, output, scale, is_static=False
                     )  # False for dynamic
                     # sgl_per_tensor_quant_fp8(
                     #     input_1, output, scale, is_static=False
