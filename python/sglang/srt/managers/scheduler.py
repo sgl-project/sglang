@@ -183,6 +183,9 @@ class GenerationBatchResult:
     bid: int
     can_run_cuda_graph: bool
 
+    # A CPU tensor storing locations of cache slots that should be freed. Only used in overlap + EAGLE mode.
+    free_cache_loc_cpu: Optional[torch.Tensor]
+
 
 @dataclass
 class EmbeddingBatchResult:
@@ -317,7 +320,7 @@ class Scheduler(
             logger.info("Overlap scheduler is disabled for embedding models.")
 
         # Launch a tensor parallel worker
-        if self.enable_overlap:
+        if self.enable_overlap and not self.spec_algorithm.is_eagle():
             TpWorkerClass = TpModelWorkerClient
         else:
             TpWorkerClass = TpModelWorker
@@ -334,9 +337,16 @@ class Scheduler(
 
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+            if self.enable_overlap:
+                from sglang.srt.speculative.eagle_worker_overlap_thread import (
+                    EAGLEWorkerClient as EAGLEWorkerClass,
+                )
+            else:
+                from sglang.srt.speculative.eagle_worker import (
+                    EAGLEWorker as EAGLEWorkerClass,
+                )
 
-            self.draft_worker = EAGLEWorker(
+            self.draft_worker = EAGLEWorkerClass(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 moe_ep_rank=moe_ep_rank,
@@ -820,7 +830,11 @@ class Scheduler(
                     tmp_batch = ScheduleBatch(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                        next_batch_sampling_info=(
+                            self.draft_worker.cur_sampling_info
+                            if self.enable_overlap and self.spec_algorithm.is_eagle()
+                            else self.tp_worker.cur_sampling_info
+                        ),
                     )
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
 
@@ -828,7 +842,13 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    (
+                        self.draft_worker.cur_sampling_info
+                        if self.enable_overlap and self.spec_algorithm.is_eagle()
+                        else self.tp_worker.cur_sampling_info
+                    )
+                    if batch
+                    else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
@@ -1789,6 +1809,38 @@ class Scheduler(
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 bid = model_worker_batch.bid
+            elif self.enable_overlap:
+                if batch.has_grammar:
+                    raise NotImplementedError(
+                        "Grammar + EAGLE + Overlap is not supported for now"
+                    )
+
+                model_worker_batch = batch.get_model_worker_batch()
+                if self.enable_overlap:
+                    # TODO (timmy): Do not alias seq_lens between forward and scheduler threads.
+                    # Optimistically estimate the seq_lens_cpu for the next draft forward
+                    model_worker_batch.seq_lens_cpu.add_(
+                        self.server_args.speculative_num_steps + 1
+                    )
+
+                # Populate fields needed to reuse batch for verify
+                model_worker_batch.extend_seq_lens = batch.extend_lens
+                model_worker_batch.extend_prefix_lens = batch.prefix_lens
+                model_worker_batch.extend_logprob_start_lens = (
+                    batch.extend_logprob_start_lens
+                )
+
+                (
+                    logits_output,
+                    next_token_ids,
+                    free_cache_loc_cpu,
+                    bid,
+                    can_run_cuda_graph,
+                    next_spec_info,
+                ) = self.draft_worker.forward_batch_speculative_generation(
+                    model_worker_batch
+                )
+                batch.spec_info = next_spec_info
             else:
                 (
                     logits_output,
@@ -1824,6 +1876,11 @@ class Scheduler(
                 pp_hidden_states_proxy_tensors=(
                     pp_hidden_states_proxy_tensors
                     if not self.pp_group.is_last_rank
+                    else None
+                ),
+                free_cache_loc_cpu=(
+                    free_cache_loc_cpu
+                    if self.enable_overlap and self.spec_algorithm.is_eagle()
                     else None
                 ),
                 next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
