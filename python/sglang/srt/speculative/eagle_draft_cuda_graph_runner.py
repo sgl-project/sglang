@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import bisect
-import os
 from typing import TYPE_CHECKING, Callable
 
 import torch
@@ -21,12 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-
-if os.environ.get("SGLANG_ENABLE_EXPERIMENTAL_EAGLE_OVERLAP_SCHEDULE", "0") == "1":
-    from sglang.srt.speculative.eagle_utils_for_overlap_scheduler import EagleDraftInput
-else:
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput
-
+from sglang.srt.speculative.eagle_utils import EagleDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -210,23 +204,12 @@ class EAGLEDraftCudaGraphRunner:
             global_dp_buffer_len = None
             global_num_tokens_for_logprob = None
 
-        if (
-            os.environ.get("SGLANG_ENABLE_EXPERIMENTAL_EAGLE_OVERLAP_SCHEDULE", "0")
-            == "1"
-        ):
-            spec_info = EagleDraftInput(
-                topk_p=topk_p,
-                topk_index=topk_index,
-                hidden_states=hidden_states,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
-            )
-        else:
-            spec_info = EagleDraftInput(
-                topk_p=topk_p,
-                topk_index=topk_index,
-                hidden_states=hidden_states,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
-            )
+        spec_info = EagleDraftInput(
+            topk_p=topk_p,
+            topk_index=topk_index,
+            hidden_states=hidden_states,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
 
         # Forward batch
         forward_batch = ForwardBatch(
