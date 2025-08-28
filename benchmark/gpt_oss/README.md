@@ -85,7 +85,7 @@ OPENAI_API_KEY=dummy python -m gpt_oss.evals \
 ```
 
 ### Reproduce the benchmark result of acceptance length
-
+> Note: For B200, change `--attention-backend` to `trtllm_mha` 
 ```bash
 git clone https://github.com/sgl-project/SpecForge.git
 cd SpecForge/benchmarks
