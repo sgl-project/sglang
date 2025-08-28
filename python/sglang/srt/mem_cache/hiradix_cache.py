@@ -431,9 +431,6 @@ class HiRadixCache(RadixCache):
 
     def free_operation(self, operation):
         self.cache_controller.mem_pool_host.free(
-            operation.host_indices[: operation.matched_length]
-        )
-        self.cache_controller.mem_pool_host.free(
             operation.host_indices[operation.min_completed_tokens :]
         )
 
@@ -447,32 +444,15 @@ class HiRadixCache(RadixCache):
         ]
 
         if self.tp_world_size > 1:
-            list_size = torch.tensor(len(free_request_ids), dtype=torch.int)
-            list_sizes = [
-                torch.zeros_like(list_size) for _ in range(self.tp_world_size)
-            ]
-            torch.distributed.all_gather(
-                list_sizes,
-                list_size,
+            gathered_free_ids = [None for _ in range(self.tp_world_size)]
+            torch.distributed.all_gather_object(
+                gathered_free_ids,
+                free_request_ids,
                 group=self.tp_group,
             )
-            list_size = list_size.item()
-            list_sizes = [s.item() for s in list_sizes]
-
-            max_list_size = max(list_sizes)
-            min_list_size = min(list_sizes)
-            if min_list_size == 0:
-                free_request_ids.clear()
-            else:
-                gathered_free_ids = [None for _ in range(self.tp_world_size)]
-                torch.distributed.all_gather_object(
-                    gathered_free_ids,
-                    free_request_ids,
-                    group=self.tp_group,
-                )
-                set_values = [set(free_ids) for free_ids in gathered_free_ids]
-                intersection = set.intersection(*set_values)
-                free_request_ids = list(intersection)
+            set_values = [set(free_ids) for free_ids in gathered_free_ids]
+            intersection = set.intersection(*set_values)
+            free_request_ids = list(intersection)
 
         with self.cache_controller.prefetch_free_dict_lock:
             free_operations = [
@@ -563,6 +543,7 @@ class HiRadixCache(RadixCache):
         if len(written_indices):
             self.cache_controller.mem_pool_host.update_prefetch(written_indices)
 
+        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
         operation.matched_length = matched_length
         operation.min_completed_tokens = min_completed_tokens
         last_host_node.release_host()

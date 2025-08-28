@@ -713,8 +713,6 @@ class HiCacheController:
                 != prev_completed_tokens + len(batch_hashes) * self.page_size
             ):
                 break  # Some operations fail or operation terminated by controller
-        # release pre-allocated memory
-        self.mem_pool_host.free(operation.host_indices[operation.completed_tokens :])
 
     def is_mooncake_backend(self):
         return self.storage_backend_type == "mooncake"
@@ -728,9 +726,6 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 self._page_transfer(operation)
 
-                if self.tp_world_size > 1:
-                    # to ensure all TP workers release the host memory at the same time
-                    torch.distributed.barrier(group=self.prefetch_io_tp_group)
                 with self.prefetch_free_dict_lock:
                     self.prefetch_free_dict[operation.request_id] = operation
             except Empty:
