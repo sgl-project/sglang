@@ -150,7 +150,7 @@ def cutlass_w4a8_moe(
             k,
             BLOCK_SIZE=512,
         )
-    elif  deepep_mode.is_deepep_normal() :
+    elif deepep_mode.is_deepep_normal():
         reorder_topk_ids, src2dst, _ = deepep_run_moe_deep_preprocess(
             topk_ids_, num_experts
         )
@@ -259,7 +259,7 @@ def cutlass_w4a8_moe(
             0,
             BLOCK_SIZE=512,
         )
-    elif deepep_mode.is_deepep_normal() :
+    elif deepep_mode.is_deepep_normal():
         num_tokens = src2dst.shape[0] // topk
         output = torch.empty(
             (num_tokens, c2.shape[1]),
