@@ -19,6 +19,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        assert model_runner.page_size ==1
+        print(f"Torch Native Backend Token Pool type: {type(model_runner.token_to_kv_pool)}")
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -263,7 +265,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             enable_gqa=use_gqa,
             causal=False,
         )
-
+        # print(f"Torch k shape {k.shape} v shape {v.shape} output shape  {o.shape}")
         return o
 
     def support_triton(self):

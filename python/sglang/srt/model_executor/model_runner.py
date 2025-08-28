@@ -40,6 +40,12 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.layers.attention.cudnn_backend import CuDNNBackend
+from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -1551,6 +1557,12 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif backend_str == "cudnn":
+            from sglang.srt.layers.attention.cudnn_backend import (
+                CuDNNBackend,
+            )
+            
+            return CuDNNBackend(self)
         elif backend_str == "trtllm_mla":
             if not self.use_mla_backend:
                 raise ValueError("trtllm_mla backend can only be used with MLA models.")
@@ -1571,7 +1583,6 @@ class ModelRunner:
             from sglang.srt.layers.attention.intel_amx_backend import (
                 IntelAMXAttnBackend,
             )
-
             return IntelAMXAttnBackend(self)
         elif backend_str == "dual_chunk_flash_attn":
             from sglang.srt.layers.attention.dual_chunk_flashattention_backend import (
@@ -1579,8 +1590,11 @@ class ModelRunner:
             )
 
             return DualChunkFlashAttentionBackend(self)
+        elif self.server_args.attention_backend == "cudnn":
+            return CuDNNBackend(self)
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
+            self.attn_backend = FlashAttentionBackend(self)
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"
