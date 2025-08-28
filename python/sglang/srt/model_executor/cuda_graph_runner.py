@@ -782,7 +782,7 @@ class CudaGraphRunner:
             pad_len = (
                 (bs - raw_bs)
                 * spec_info.draft_token_num
-                * (spec_info.draft_token_num + 1)
+                * (spec_info.draft_token_num + self.seq_len_fill_value)
             )
             pad_mask = torch.full(
                 (pad_len,),
