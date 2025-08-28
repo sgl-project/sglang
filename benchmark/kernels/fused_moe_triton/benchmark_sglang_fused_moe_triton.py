@@ -17,6 +17,8 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
     triton_kernel_moe_forward,
 )
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import TopK, TopKConfig, select_experts
 
 
 def get_model_config(model_name: str, tp_size: int):
@@ -80,13 +82,26 @@ def fused_moe_triton_api(
     input_gating,
     topk,
 ):
+    topk_op = TopK(
+        top_k=topk,
+        renormalize=False,
+        use_grouped_topk=False,
+    )
+    topk_op.use_triton_kernels = True
+    triton_topk_output = topk_op.forward_cuda(
+        hidden_states=x,
+        router_logits=input_gating,
+    )
+
+    moe_runner_config = MoeRunnerConfig(
+        inplace=False,
+    )
     return triton_kernel_moe_forward(
         x,
         w1,
         w2,
-        input_gating,
-        topk,
-        renormalize=False,
+        triton_topk_output,
+        moe_runner_config,
     )
 
 
@@ -103,14 +118,16 @@ def fused_moe_sglang_api(
     a2_scale=None,
     block_shape=None,
 ):
+    topk_output = select_experts(
+        hidden_states=x,
+        router_logits=input_gating,
+        topk_config=TopKConfig(top_k=topk, renormalize=False),
+    )
     return fused_moe_sglang(
         x,
         w1,
         w2,
-        input_gating,
-        topk,
-        renormalize=False,
-        inplace=True,
+        topk_output,
         use_fp8_w8a8=use_fp8_w8a8,
         w1_scale=w1_scale,
         w2_scale=w2_scale,

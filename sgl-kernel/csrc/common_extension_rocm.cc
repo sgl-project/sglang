@@ -33,6 +33,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_quick", torch::kCUDA, &gelu_quick);
+
   /*
    * From csrc/allreduce
    */
