@@ -46,4 +46,4 @@ python benchmark/mmmu/bench_hf.py --model-path Qwen/Qwen2-VL-7B-Instruct
 ```
 
 # Profiling MMMU
-You should use the standard instructions found in the dedicated profiling doc if running this benchmark with the profile option. We recommend the usage of `--concurrency 1` for consistency. If set, it will make profiling and debugging easier.
+You should use the standard instructions found in the [dedicated profiling doc](../../docs/developer_guide/benchmark_and_profiling.md) if running this benchmark with the profile option. We recommend using `--concurrency 1` for consistency, which makes profiling and debugging easier.
