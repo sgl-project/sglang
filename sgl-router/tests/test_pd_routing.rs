@@ -178,6 +178,8 @@ mod test_pd_routing {
                 log_level: None,
                 request_id_headers: None,
                 max_concurrent_requests: 64,
+                queue_size: 0,
+                queue_timeout_secs: 60,
                 cors_allowed_origins: vec![],
                 retry: RetryConfig::default(),
                 circuit_breaker: CircuitBreakerConfig::default(),
@@ -185,11 +187,12 @@ mod test_pd_routing {
                 disable_circuit_breaker: false,
                 health_check: sglang_router_rs::config::HealthCheckConfig::default(),
                 enable_igw: false,
+                rate_limit_tokens_per_second: None,
             };
 
             // Router creation will fail due to health checks, but config should be valid
             let app_context =
-                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64);
+                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64, None);
             let app_context = std::sync::Arc::new(app_context);
             let result = RouterFactory::create_router(&app_context).await;
             assert!(result.is_err());
