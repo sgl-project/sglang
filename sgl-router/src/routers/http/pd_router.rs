@@ -1,6 +1,5 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
-use super::header_utils;
 use super::pd_types::{api_path, PDRouterError};
 use crate::config::types::{
     CircuitBreakerConfig as ConfigCircuitBreakerConfig,
@@ -16,6 +15,7 @@ use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, StringOrArray,
     UserMessageContent,
 };
+use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -72,7 +72,7 @@ impl PDRouter {
 
     // Private helper method to perform health check on a new server
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
-        crate::routers::router::Router::wait_for_healthy_workers(
+        crate::routers::http::router::Router::wait_for_healthy_workers(
             &[url.to_string()],
             self.timeout_secs,
             self.interval_secs,
@@ -435,7 +435,7 @@ impl PDRouter {
             .map(|worker| worker.url().to_string())
             .collect();
         if !all_urls.is_empty() {
-            crate::routers::router::Router::wait_for_healthy_workers(
+            crate::routers::http::router::Router::wait_for_healthy_workers(
                 &all_urls,
                 timeout_secs,
                 interval_secs,
@@ -1935,6 +1935,14 @@ impl RouterTrait for PDRouter {
         self.execute_dual_dispatch(headers, body, context).await
     }
 
+    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        todo!()
+    }
+
+    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        todo!()
+    }
+
     async fn flush_cache(&self) -> Response {
         // Process both prefill and decode workers
         let (prefill_results, prefill_errors) = self
@@ -2040,7 +2048,7 @@ impl RouterTrait for PDRouter {
         let total_decode = self.decode_workers.read().unwrap().len();
 
         if healthy_prefill_count > 0 && healthy_decode_count > 0 {
-            Json(serde_json::json!({
+            Json(json!({
                 "status": "ready",
                 "prefill": {
                     "healthy": healthy_prefill_count,
