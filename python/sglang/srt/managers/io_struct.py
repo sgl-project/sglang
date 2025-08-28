@@ -124,6 +124,7 @@ class GenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    data_parallel_rank_decode: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -528,6 +529,7 @@ class TokenizedGenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    data_parallel_rank_decode: Optional[int] = None
 
     # For dp balance
     dp_balance_id: int = -1

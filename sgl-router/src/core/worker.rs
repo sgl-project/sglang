@@ -150,6 +150,43 @@ pub trait Worker: Send + Sync + fmt::Debug {
     fn can_handle(&self, _req: &serde_json::Value) -> bool {
         true
     }
+
+    /// Get the data parallelism size of a worker by querying its server info endpoint
+    /// This is a utility method that can be overridden by specific worker implementations
+    fn get_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> where Self: Sized {
+        let sync_client = reqwest::blocking::Client::new();
+        let mut req_builder = sync_client.get(format!("{}/get_server_info", worker_url));
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+
+        match req_builder.send() {
+            Ok(res) => {
+                if res.status().is_success() {
+                    let server_info = res
+                        .text()
+                        .map_err(|e| format!("failed to read text from response: {}", e))?;
+
+                    let server_info: serde_json::Value = serde_json::from_str(&server_info)
+                        .map_err(|e| format!("failed to decode JSON: {}", e))?;
+
+                    let dp_size = server_info
+                        .get("dp_size")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| String::from("dp_size not found or not an u64"))?;
+
+                    Ok(if dp_size > usize::MAX as u64 {
+                        return Err(format!("dp_size is too large: {}", dp_size));
+                    } else {
+                        dp_size as usize
+                    })
+                } else {
+                    Err(format!("unexpected status code: {}", res.status()))
+                }
+            }
+            Err(e) => Err(format!("error response: {}", e)),
+        }
+    }
 }
 
 /// Worker type classification
@@ -399,9 +436,9 @@ impl Worker for BasicWorker {
 #[derive(Debug, Clone)]
 pub struct DPAwareWorker {
     /// The underlying basic worker
-    base_worker: BasicWorker,
+    pub base_worker: BasicWorker,
     /// DP rank for this worker
-    dp_rank: usize,
+    pub dp_rank: usize,
     /// Total DP size
     dp_size: usize,
     /// Base URL without DP suffix
@@ -881,7 +918,7 @@ pub fn start_health_checker(
 
             // Perform health checks concurrently
             let health_checks = workers_to_check.iter().map(|worker| {
-                let worker_url = worker.url().to_string();
+                let worker_url = worker.base_url().to_string();
                 let was_healthy = worker.is_healthy();
 
                 async move {
