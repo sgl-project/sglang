@@ -1121,6 +1121,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
+        # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):
             if hidden_states[0].shape[0] == 0:
                 assert (
@@ -1961,15 +1962,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
 
+        quant_format = (
+            "mxfp4"
+            if self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8
+            else ""
+        )
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
-            (
-                True
-                if self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8
-                else False
-            ),
+            quant_format,
         )
 
         hidden_states = self.self_attn(

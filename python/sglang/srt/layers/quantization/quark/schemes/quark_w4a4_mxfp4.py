@@ -85,8 +85,9 @@ class QuarkW4A4MXFP4(QuarkScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # This path doesnt have support for bias currently
+        # This path does not have support for bias currently
         assert bias is None, "bias is not supported"
+
         three_d = False
         x_s = None
         y = None
