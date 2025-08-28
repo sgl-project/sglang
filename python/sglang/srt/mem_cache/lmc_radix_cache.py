@@ -27,11 +27,17 @@ from functools import partial
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
-from lmcache.integration.sglang.sglang_adapter import (
-    LMCacheLayerwiseConnector,
-    LoadMetadata,
-    StoreMetadata,
-)
+
+try:
+    from lmcache.integration.sglang.sglang_adapter import (
+        LMCacheLayerwiseConnector,
+        LoadMetadata,
+        StoreMetadata,
+    )
+except ImportError:
+    raise RuntimeError(
+        "LMCache is not installed. Please install it by running `pip install lmcache`"
+    )
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
