@@ -480,7 +480,7 @@ class EAGLEWorker(TpModelWorker):
             next_power_of_2(self.speculative_num_steps),
         )
 
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        batch.seq_lens_sum = torch.sum(batch.seq_lens_cpu).item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
     def _draft_preprocess_idle(self, batch: ModelWorkerBatch):
