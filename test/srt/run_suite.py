@@ -162,6 +162,9 @@ suites = {
 # Add AMD tests
 suite_amd = {
     "per-commit-amd": [
+        TestFile("hicache/test_hicache.py", 116),
+        TestFile("hicache/test_hicache_mla.py", 127),
+        TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
