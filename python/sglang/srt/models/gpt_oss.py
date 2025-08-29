@@ -194,8 +194,7 @@ class GptOssSparseMoeBlock(nn.Module):
 
 
 def _enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    # only enable fused set kv buffer when it is cuda device
-    # and kv cache pool dtype is bfloat16
+    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
     return _is_cuda and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
 
 
