@@ -588,7 +588,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, cache_loc, k, v, layer.k_scale, layer.v_scale
             )
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         k_cache = k_cache.view(
@@ -598,10 +598,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             -1, self.page_size, layer.tp_v_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
         kv_cache = (k_cache, v_cache)
-
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
+
+        # TODO: currently only support QKV fp8 O bf16 operator
+        # 1. make the quantization support fp4 kv cache
+        # 2. support fp8/fp4 mixed precised operator etc.
+        out_dtype = None
+        if q.dtype != k_cache.dtype and k_cache.dtype == torch.float8_e4m3fn:
+            out_dtype = q.dtype
+            q = q.to(k_cache.dtype)
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
@@ -627,6 +635,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             window_left=layer.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
             sinks=attention_sink,
+            out_dtype=out_dtype,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
