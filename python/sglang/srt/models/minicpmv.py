@@ -1195,7 +1195,7 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         prefix: str = "",
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        assert self.version == (4, 0) or self.version == (4, 5)
+        assert self.version == (4, 5)
 
     def init_llm(
         self,
