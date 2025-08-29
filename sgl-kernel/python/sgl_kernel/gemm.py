@@ -332,22 +332,12 @@ def scaled_fp4_grouped_quant(
     output_scales = torch.empty(
         l, padded_m, padded_k_int32, device=device, dtype=torch.int32
     )
-    input_offsets = torch.arange(0, (l + 1) * m, step=m, dtype=torch.int, device=device)
-    output_offsets = torch.arange(
-        0,
-        (l + 1) * padded_m,
-        step=padded_m,
-        dtype=torch.int,
-        device=device,
-    )
 
     torch.ops.sgl_kernel.silu_and_mul_scaled_fp4_experts_quant.default(
         output.view(l * m, k // 2),
         output_scales.view(l * padded_m, padded_k_int32),
         input_tensor.view(l * m, k),
         input_global_scale,
-        input_offsets,
-        output_offsets,
         mask,
         use_silu_and_mul=False,
     )
@@ -403,22 +393,12 @@ def silu_and_mul_scaled_fp4_grouped_quant(
     output_scales = torch.empty(
         l, padded_m, padded_k_int32, device=device, dtype=torch.int32
     )
-    input_offsets = torch.arange(0, (l + 1) * m, step=m, dtype=torch.int, device=device)
-    output_offsets = torch.arange(
-        0,
-        (l + 1) * padded_m,
-        step=padded_m,
-        dtype=torch.int,
-        device=device,
-    )
 
     torch.ops.sgl_kernel.silu_and_mul_scaled_fp4_experts_quant.default(
         output.view(l * m, k // 2),
         output_scales.view(l * padded_m, padded_k_int32),
         input_tensor.view(l * m, k_by_2),
         input_global_scale,
-        input_offsets,
-        output_offsets,
         mask,
         use_silu_and_mul=True,
     )

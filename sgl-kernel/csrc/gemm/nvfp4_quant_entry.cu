@@ -32,8 +32,6 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     torch::Tensor& output_scale,
     torch::Tensor const& input,
     torch::Tensor const& input_global_scale,
-    torch::Tensor const& input_offset_by_experts,
-    torch::Tensor const& output_scale_offset_by_experts,
     torch::Tensor const& mask,
     bool use_silu_and_mul);
 
@@ -66,8 +64,6 @@ void silu_and_mul_scaled_fp4_experts_quant(
     torch::Tensor& output_scale,
     torch::Tensor const& input,
     torch::Tensor const& input_global_scale,
-    torch::Tensor const& input_offset_by_experts,
-    torch::Tensor const& output_scale_offset_by_experts,
     torch::Tensor const& mask,
     bool use_silu_and_mul) {
 #if defined ENABLE_NVFP4 && ENABLE_NVFP4
@@ -76,8 +72,6 @@ void silu_and_mul_scaled_fp4_experts_quant(
       output_scale,
       input,
       input_global_scale,
-      input_offset_by_experts,
-      output_scale_offset_by_experts,
       mask,
       use_silu_and_mul);
 #endif

@@ -397,8 +397,6 @@ cvt_fp16_to_fp4_expert(
     float const* SFScale,
     uint32_t* out,
     uint32_t* SFout,
-    uint32_t* input_offset_by_experts,
-    uint32_t* output_scale_offset_by_experts,
     int32_t* mask,
     bool use_silu_and_mul,
     int n_experts) {
@@ -430,6 +428,8 @@ cvt_fp16_to_fp4_expert(
     tid_in_expert = tid % stride;
     actual_stride = stride;
   }
+  int m = numRows / n_experts;
+  int padded_m = (m + (128 - 1)) / 128 * 128;
 
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
   // TODO(kaixih@nvidia): For now, we assume mask is used together with
@@ -439,15 +439,15 @@ cvt_fp16_to_fp4_expert(
   int actualColsPerRow = use_silu_and_mul ? colsPerRow * 2 : colsPerRow;
 
   // Each global thread processes one element
-  for (int globalIdx = tid_in_expert + input_offset_by_experts[expert_idx] * colsPerRow;
-       globalIdx < input_offset_by_experts[expert_idx + 1] * colsPerRow;
+  for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow;
+       globalIdx < (expert_idx + 1) * m * colsPerRow;
        globalIdx += actual_stride) {
     // Calculate which row and column this global thread should process
     int rowIdx = globalIdx / colsPerRow;
     int colIdx = globalIdx % colsPerRow;
 
     // Find index within the experts
-    int rowIdx_in_expert = rowIdx - input_offset_by_experts[expert_idx];
+    int rowIdx_in_expert = rowIdx - expert_idx * m;
 
     // Early exit when using masks.
     if (use_mask && rowIdx_in_expert >= mask[expert_idx]) {
@@ -475,7 +475,7 @@ cvt_fp16_to_fp4_expert(
     // The actual output_scales dim is computed from the padded numCols.
     int32_t numCols_padded = (numCols + factor - 1) / factor * factor;
     int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
-    uint32_t* SFout_in_expert = SFout + output_scale_offset_by_experts[expert_idx] * numCols_SFout;
+    uint32_t* SFout_in_expert = SFout + expert_idx * padded_m * numCols_SFout;
 
     auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
@@ -635,8 +635,6 @@ void quant_impl(
         reinterpret_cast<float*>(input_global_scale),
         reinterpret_cast<uint32_t*>(output),
         reinterpret_cast<uint32_t*>(output_scale),
-        reinterpret_cast<uint32_t*>(input_offset_by_experts),
-        reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
         reinterpret_cast<int32_t*>(mask),
         use_silu_and_mul,
         n_experts);
@@ -802,29 +800,21 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     torch::Tensor& output_scale,
     torch::Tensor const& input,
     torch::Tensor const& input_global_scale,
-    torch::Tensor const& input_offset_by_experts,
-    torch::Tensor const& output_scale_offset_by_experts,
     torch::Tensor const& mask,
     bool use_silu_and_mul) {
   CHECK_INPUT(output, "output must be a CUDA tensor");
   CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");
   CHECK_INPUT(input, "input must be a CUDA tensor");
   CHECK_INPUT(input_global_scale, "input_global_scale must be a CUDA tensor");
-  CHECK_INPUT(input_offset_by_experts, "input_offset_by_experts must be a CUDA tensor");
-  CHECK_INPUT(output_scale_offset_by_experts, "output_scale_offset_by_experts must be a CUDA tensor");
   CHECK_INPUT(mask, "mask must be a CUDA tensor");
 
   TORCH_CHECK(output.dim() == 2);
   TORCH_CHECK(output_scale.dim() == 2);
   TORCH_CHECK(input.dim() == 2);
   TORCH_CHECK(input_global_scale.dim() == 1);
-  TORCH_CHECK(input_offset_by_experts.dim() == 1);
-  TORCH_CHECK(output_scale_offset_by_experts.dim() == 1);
 
   TORCH_CHECK(input.scalar_type() == HALF || input.scalar_type() == BF16);
   TORCH_CHECK(input_global_scale.scalar_type() == FLOAT);
-  TORCH_CHECK(input_offset_by_experts.scalar_type() == INT);
-  TORCH_CHECK(output_scale_offset_by_experts.scalar_type() == INT);
   TORCH_CHECK(mask.scalar_type() == INT);
   // output is uint8 (two nvfp4 values are packed into one uint8)
   // output_scale is int32 (four fp8 values are packed into one int32)
@@ -840,8 +830,6 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     k = k_by_2 / 2;
   }
   auto n_experts = input_global_scale.size(0);
-  TORCH_CHECK(input_offset_by_experts.size(0) == n_experts + 1);
-  TORCH_CHECK(output_scale_offset_by_experts.size(0) == n_experts + 1);
   TORCH_CHECK(mask.size(0) == n_experts);
   TORCH_CHECK(output.size(0) == m_topk);
   TORCH_CHECK(output.size(1) == k / 2);
@@ -860,8 +848,8 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
         output_scale.data_ptr(),
         input.data_ptr(),
         input_global_scale.data_ptr(),
-        input_offset_by_experts.data_ptr(),
-        output_scale_offset_by_experts.data_ptr(),
+        nullptr,  // input_offset_by_experts
+        nullptr,  // output_scale_offset_by_experts
         mask.data_ptr(),
         use_silu_and_mul,
         m_topk,
@@ -874,8 +862,8 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
         output_scale.data_ptr(),
         input.data_ptr(),
         input_global_scale.data_ptr(),
-        input_offset_by_experts.data_ptr(),
-        output_scale_offset_by_experts.data_ptr(),
+        nullptr,  // input_offset_by_experts
+        nullptr,  // output_scale_offset_by_experts
         mask.data_ptr(),
         use_silu_and_mul,
         m_topk,
