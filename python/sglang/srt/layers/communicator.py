@@ -48,13 +48,15 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_sm100_supported,
+    is_gfx95_supported,
 )
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_is_gfx95_supported = is_gfx95_supported()
 
-if _use_aiter:
+if _use_aiter and _is_gfx95_supported:
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
@@ -230,7 +232,7 @@ class LayerCommunicator:
                 if residual is None:
                     residual = hidden_states
 
-                    if _use_aiter and ("mxfp4" in qaunt_format):
+                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
                         hidden_states = fused_rms_mxfp4_quant(
                             hidden_states,
                             self.input_layernorm.weight,
@@ -243,7 +245,7 @@ class LayerCommunicator:
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
-                    if _use_aiter and ("mxfp4" in qaunt_format):
+                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in qaunt_format):
                         hidden_states, residual = fused_rms_mxfp4_quant(
                             hidden_states,
                             self.input_layernorm.weight,
