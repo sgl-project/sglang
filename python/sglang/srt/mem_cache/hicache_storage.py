@@ -175,11 +175,12 @@ class HiCacheFile(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
             return True
+
+        key = self._get_suffixed_key(key)
+        tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
             return True
