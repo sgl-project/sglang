@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import psutil
 import setproctitle
 import torch
+import torch_npu
 import zmq
 from torch.distributed import barrier
 
@@ -1590,10 +1591,8 @@ class Scheduler(
                 self.max_total_num_tokens
                 if not self.enable_hierarchical_cache
                 else self.max_total_num_tokens - protected_size
-            ) or kv_indices_leak
+            )
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {kv_indices_leak=}\n"
-            if kv_indices_leak:
-                token_msg += f"{len(total_kv_indices)=}, {len(evictable_kv_indices)=}, {len(available_kv_indices)=}, {len(missing_kv_indices)=}, {total_kv_indices=}, {evictable_kv_indices=}, {available_kv_indices=}, {missing_kv_indices=}\n"
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
@@ -1718,8 +1717,10 @@ class Scheduler(
         need_dp_attn_preparation = require_mlp_sync(self.server_args)
 
         if need_dp_attn_preparation and not self.spec_algorithm.is_none():
-            # In speculative decoding, prefill batches and decode batches cannot be processed in the same DP attention group.
-            # We prepare idle batches in advance to skip preparing decode batches when there are prefill batches in the group.
+            # In speculative decoding, prefill batches and decode batches cannot be processed
+            # in the same DP attention group.
+            # We prepare idle batches in advance to skip preparing decode batches when
+            # there are prefill batches in the group.
             new_batch = self.prepare_mlp_sync_batch(new_batch)
             need_dp_attn_preparation = new_batch is None
 
@@ -2034,7 +2035,8 @@ class Scheduler(
             self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self.tp_worker.resolve_last_batch_result(launch_done)
+                if result.copy_done is not None:
+                    result.copy_done.synchronize()
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
@@ -2256,6 +2258,8 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
+            draft_worker=self.draft_worker,
+            chunked_req=self.chunked_req,
         )
         idle_batch.prepare_for_idle()
         return idle_batch

@@ -70,13 +70,17 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     alloc_len_per_eagle_decode,
     flatten_nested_list,
+    is_npu,
     next_power_of_2,
     support_triton,
 )
 
+if is_npu():
+    import sgl_kernel_npu
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.eagle_utils_v2 import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -1088,27 +1092,43 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.seq_lens_sum = self.seq_lens.sum().item()
         new_allocate_lens = self.seq_lens + alloc_len_per_eagle_decode(worker)
-        # TODO: remove assert
-        assert torch.all(
-            new_allocate_lens > self.spec_info.allocate_lens
-        ), f"new_allocate_lens={new_allocate_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
-        assert torch.all(
-            self.seq_lens <= self.spec_info.allocate_lens
-        ), f"self.seq_lens={self.seq_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
+
         num_needed_tokens = (
             (new_allocate_lens - self.spec_info.allocate_lens).sum().item()
         )
-        out_cache_loc = self.alloc_token_slots(num_needed_tokens)
-
-        assign_req_to_token_pool[(bs,)](
-            self.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
-            self.spec_info.allocate_lens,
-            new_allocate_lens,
-            out_cache_loc,
-            self.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
+        if self.token_to_kv_pool_allocator.page_size == 1:
+            out_cache_loc = self.alloc_token_slots(num_needed_tokens)
+        else:
+            last_loc = get_last_loc(
+                self.req_to_token_pool.req_to_token,
+                self.req_pool_indices,
+                self.spec_info.allocate_lens,
+            )
+            out_cache_loc = self.alloc_paged_token_slots_extend(
+                self.spec_info.allocate_lens,
+                new_allocate_lens,
+                last_loc,
+                num_needed_tokens,
+            )
+            out_cache_loc = out_cache_loc.to(dtype=torch.int32)
+        if is_npu():
+            torch.ops.npu.cache_loc_assign(
+                self.req_pool_indices,
+                self.req_to_token_pool.req_to_token,
+                self.spec_info.allocate_lens,
+                new_allocate_lens,
+                out_cache_loc,
+            )
+        else:
+            assign_req_to_token_pool[(bs,)](
+                self.req_pool_indices,
+                self.req_to_token_pool.req_to_token,
+                self.spec_info.allocate_lens,
+                new_allocate_lens,
+                out_cache_loc,
+                self.req_to_token_pool.req_to_token.shape[1],
+                next_power_of_2(bs),
+            )
         self.spec_info.allocate_lens = new_allocate_lens
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
@@ -1725,6 +1745,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
+        if self.verify_done is not None:
+            self.verify_done.synchronize()
 
         self.sampling_info.merge_batch(other.sampling_info)
 

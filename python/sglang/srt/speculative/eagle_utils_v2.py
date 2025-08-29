@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from numpy.ma.core import negative
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -19,7 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -37,7 +38,11 @@ if is_cuda():
     from sgl_kernel.top_k import fast_topk
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
+elif is_npu():
+    import sgl_kernel_npu
 
+    tensor_zero = None
+    tensor_one = None
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,7 @@ class EagleDraftInput:
     topk_index: torch.Tensor = None
     # shape: (b, hidden_size)
     hidden_states: torch.Tensor = None
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Inputs for extend
     # shape: (b,)
@@ -64,8 +70,15 @@ class EagleDraftInput:
     allocate_lens: torch.Tensor = None
     new_seq_lens: torch.Tensor = None
     verify_done: torch.cuda.Event = None
+    draft_done: torch.cuda.Event = None
+
+    # Shape info for padding
+    num_tokens_per_batch: int = -1
+    num_tokens_for_logprob_per_batch: int = -1
 
     def filter_batch(self, new_indices: torch.Tensor):
+        if self.draft_done is not None:
+            self.draft_done.synchronize()
         self.topk_p = self.topk_p[new_indices]
         self.topk_index = self.topk_index[new_indices]
         self.hidden_states = self.hidden_states[new_indices]
@@ -103,15 +116,16 @@ class EagleDraftInput:
             dtype=torch.int64,
             device=batch.input_ids.device,
         )
-        assign_draft_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            topk,
-            num_steps,
-        )
+        if not batch.forward_mode.is_idle():
+            assign_draft_cache_locs[(bs,)](
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.out_cache_loc,
+                batch.req_to_token_pool.req_to_token.shape[1],
+                topk,
+                num_steps,
+            )
 
         # Get a forward batch
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
@@ -127,6 +141,12 @@ class EagleDraftInput:
         num_draft_tokens: int,
         draft_model_runner: Any,
     ):
+        if batch.forward_mode.is_idle():
+            # batch.forward_mode = ForwardMode.IDLE
+            batch.spec_info = self
+            forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+            # draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+            return forward_batch
         seq_lens_backup = batch.seq_lens
         seq_lens_cpu_backup = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
@@ -145,6 +165,27 @@ class EagleDraftInput:
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
+
+    @classmethod
+    def create_idle_input(
+        cls,
+        device: torch.device,
+        hidden_size: int,
+        dtype: torch.dtype,
+        topk: int,
+        capture_hidden_mode=CaptureHiddenMode.LAST,
+        verify_done=None,
+    ):
+        return cls(
+            verified_id=torch.empty((0,), device=device, dtype=torch.int32),
+            hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
+            topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
+            topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            capture_hidden_mode=capture_hidden_mode,
+            allocate_lens=torch.empty((0,), device=device, dtype=torch.int32),
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
+            verify_done=verify_done,
+        )
 
 
 @dataclass
@@ -198,34 +239,77 @@ class EagleVerifyInput:
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
+    @classmethod
+    def create_idle_input(cls, topk: int, num_steps: int, num_draft_tokens: int):
+        if is_npu():
+            device = "npu"
+        else:
+            device = "cuda"
+        return cls(
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
+            retrive_index=torch.full(
+                (0, num_draft_tokens), -1, dtype=torch.long, device=device
+            ),
+            retrive_next_token=torch.full(
+                (0, num_draft_tokens), -1, dtype=torch.long, device=device
+            ),
+            retrive_next_sibling=torch.full(
+                (0, num_draft_tokens), -1, dtype=torch.long, device=device
+            ),
+            retrive_cum_len=None,
+            topk=topk,
+            num_draft_tokens=num_draft_tokens,
+            num_steps=num_steps,
+        )
+
     def prepare_for_verify(
         self,
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
     ):
-        # Assign cache locations
-        bs = len(batch.req_pool_indices)
-        batch.input_ids = self.draft_token
-        device = batch.input_ids.device
-        batch.out_cache_loc = torch.empty(
-            (bs * self.num_draft_tokens,),
-            dtype=torch.int64,
-            device=device,
-        )
-
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + self.num_draft_tokens,
-            batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
+        if not batch.forward_mode.is_idle():
+            # Assign cache locations
+            bs = len(batch.req_pool_indices)
+            batch.input_ids = self.draft_token
+            device = batch.input_ids.device
+            if is_npu():
+                batch.out_cache_loc = torch.empty(
+                    (bs * self.num_draft_tokens,),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                torch.ops.npu.cache_loc_update(
+                    batch.req_pool_indices,
+                    batch.req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.seq_lens + self.num_draft_tokens,
+                    batch.out_cache_loc,
+                )
+            else:
+                batch.out_cache_loc = torch.empty(
+                    (bs * self.num_draft_tokens,),
+                    dtype=torch.int64,
+                    device=device,
+                )
+                assign_extend_cache_locs[(bs,)](
+                    batch.req_pool_indices,
+                    batch.req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.seq_lens + self.num_draft_tokens,
+                    batch.out_cache_loc,
+                    batch.req_to_token_pool.req_to_token.shape[1],
+                    next_power_of_2(bs),
+                )
 
         # Get a forward batch
         batch.spec_info = self
-        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
@@ -234,12 +318,14 @@ class EagleVerifyInput:
             target_worker.model_runner.graph_runner
             and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
         )
+        # can_run_cuda_graph = False
         if can_run_cuda_graph:
             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
         else:
-            target_worker.model_runner.attn_backend.init_forward_metadata(
-                verify_forward_batch
-            )
+            if not batch.forward_mode.is_idle():
+                target_worker.model_runner.attn_backend.init_forward_metadata(
+                    verify_forward_batch
+                )
 
         return verify_forward_batch, can_run_cuda_graph
 
@@ -252,6 +338,15 @@ class EagleVerifyInput:
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
         """
+        if batch.forward_mode.is_idle():
+            if is_npu():
+                device = "npu"
+            else:
+                device = "cuda"
+            predict = torch.empty(0, dtype=torch.long, device=device)
+            accept_length = torch.empty(0, dtype=torch.int32, device=device)
+            accept_index = torch.empty(0, dtype=torch.int32, device=device)
+            return predict, accept_length, accept_index
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
@@ -271,16 +366,30 @@ class EagleVerifyInput:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.num_draft_tokens)
 
-            verify_tree_greedy(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
-                candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
-                target_predict=target_predict,
-            )
+            if is_npu():
+                predict, accept_index, accept_length = verify_tree_greedy_native(
+                    candidates,
+                    self.retrive_index,
+                    self.retrive_next_token,
+                    self.retrive_next_sibling,
+                    target_predict,
+                    accept_index,
+                    accept_length,
+                    predict,
+                    2,
+                    1,
+                )
+            else:
+                verify_tree_greedy(
+                    predicts=predict,  # mutable
+                    accept_index=accept_index,  # mutable
+                    accept_token_num=accept_length,  # mutable
+                    candidates=candidates,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
+                    target_predict=target_predict,
+                )
         else:
             # Apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
@@ -387,6 +496,19 @@ def fill_accepted_out_cache_loc(
         tl.store(accepted_out_cache_loc + dst, value)
 
 
+def fill_accepted_out_cache_loc_native(
+    accept_index, out_cache_loc, accepted_out_cache_loc, bs
+):
+    masks = accept_index
+    dst = torch.sum(masks)
+    for i in bs:
+        src = accept_index[i]
+        if src > -1:
+            value = out_cache_loc[src]
+            accepted_out_cache_loc[dst] = value
+    return accepted_out_cache_loc
+
+
 @triton.jit
 def assign_draft_cache_locs(
     req_pool_indices,
@@ -449,7 +571,7 @@ def assign_extend_cache_locs(
         save_offset += BLOCK_SIZE
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=is_npu())
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -557,3 +679,73 @@ def _generate_simulated_accept_index(
     accept_length.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
+
+
+def verify_tree_greedy_native(
+    candidates,
+    retrive_index,
+    retrive_next_token,
+    retrive_next_sibling,
+    target_predict,
+    accept_index,
+    accept_token_num,
+    predicts,
+    num_speculative_tokens,
+    topk,
+):
+    batch_size, num_draft_tokens = candidates.shape
+
+    # Optimized common case for performance.
+    if num_draft_tokens == 2 and accept_index.shape[1] == 2 and topk == 1:
+        comparison_result = candidates[:, 1] == target_predict[:, 0]
+
+        predicts = target_predict.flatten()
+
+        accept_index = torch.arange(
+            0, num_draft_tokens * batch_size, device=candidates.device, dtype=torch.long
+        ).reshape(batch_size, num_draft_tokens)
+        comparison_result = comparison_result.to(torch.int64)
+        accept_index_mask = accept_index[:, 1] * comparison_result
+        accept_index[:, 1] = accept_index_mask - (1 - comparison_result)
+
+        accept_token_num = comparison_result.int()
+        return predicts, accept_index, accept_token_num
+
+    # BFS
+    for bx in range(batch_size):
+        cur_candidates = candidates[bx]
+        cur_retrive_index = retrive_index[bx]
+        cur_next_token = retrive_next_token[bx]
+        cur_next_sibling = retrive_next_sibling[bx]
+        cur_target = target_predict[bx]
+
+        last_accepted_idx = cur_retrive_index[0]
+        accept_index[bx, 0] = last_accepted_idx
+        num_accepted = 0
+        cur_node = 0
+
+        for _ in range(1, num_speculative_tokens):
+            cur_node = cur_next_token[cur_node]
+            found = False
+            while cur_node != -1:
+                draft_idx = cur_retrive_index[cur_node]
+                draft_token = cur_candidates[cur_node]
+                target_token = cur_target[last_accepted_idx - num_draft_tokens * bx]
+
+                if draft_token == target_token:
+                    predicts[last_accepted_idx] = target_token
+                    num_accepted += 1
+                    accept_index[bx, num_accepted] = draft_idx
+                    last_accepted_idx = draft_idx
+                    found = True
+                    break
+                else:
+                    cur_node = cur_next_sibling[cur_node]
+            if not found:
+                break
+
+        accept_token_num[bx] = num_accepted
+        predicts[last_accepted_idx] = cur_target[
+            last_accepted_idx - num_draft_tokens * bx
+        ]
+    return predicts, accept_index, accept_token_num

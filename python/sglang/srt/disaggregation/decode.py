@@ -751,7 +751,7 @@ class SchedulerDisaggregationDecodeMixin:
                         tmp_batch = ScheduleBatch(
                             reqs=None,
                             forward_mode=ForwardMode.DUMMY_FIRST,
-                            next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                            next_batch_sampling_info=self.cur_sampling_info,
                         )
                         self.set_next_batch_sampling_info_done(tmp_batch)
                     last_batch_in_queue = True
@@ -768,7 +768,7 @@ class SchedulerDisaggregationDecodeMixin:
             if self.last_batch and self.last_batch_in_queue:
                 tmp_batch, tmp_result = result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    self.cur_sampling_info if batch else None
                 )
                 self.process_batch_result(tmp_batch, tmp_result)
 
@@ -864,6 +864,9 @@ class SchedulerDisaggregationDecodeMixin:
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
+            self.server_args.enable_custom_logit_processor,
+            draft_worker=self.draft_worker,
+            chunked_req=self.chunked_req,
         )
 
         # construct fake completed prefill

@@ -26,13 +26,23 @@ from sglang.srt.speculative.eagle_utils_v2 import (
     EagleDraftInput,
     EagleVerifyInput,
     assign_extend_cache_locs,
-    fast_topk,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import empty_context, get_available_gpu_memory, next_power_of_2
+from sglang.srt.utils import (
+    empty_context,
+    fast_topk,
+    get_available_gpu_memory,
+    is_npu,
+    next_power_of_2,
+)
+
+if is_npu():
+    import sgl_kernel_npu
+    import torch_npu
+
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +186,16 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.num_steps,
             )
+        elif self.server_args.attention_backend == "ascend":
+            from sglang.srt.layers.attention.ascend_backend import (
+                AscendAttnMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = AscendAttnMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.num_steps,
+            )
         else:
             raise ValueError(
                 f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
@@ -218,7 +238,7 @@ class EAGLEWorker(TpModelWorker):
         Returns:
             batch_output: The results in a tuple
         """
-        if batch.forward_mode.is_decode():
+        if batch.forward_mode.is_decode_or_idle():
             old_spec_info = batch.spec_info
             spec_info = self.draft(batch)
             batch_output = self.verify(batch, spec_info, old_spec_info)
@@ -239,7 +259,17 @@ class EAGLEWorker(TpModelWorker):
 
     def draft(self, batch: ModelWorkerBatch):
         # Prepare for draft
+        if batch.forward_mode.is_idle():
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=self.model_config.hidden_size,
+                dtype=self.model_config.dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
         spec_info = batch.spec_info
+        spec_info.num_tokens_per_batch = self.topk
+        spec_info.num_tokens_for_logprob_per_batch = self.topk
         forward_batch, can_cuda_graph = spec_info.prepare_for_draft(
             batch,
             self.cuda_graph_runner,
@@ -254,7 +284,8 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch,
             )
         else:
-            self.draft_attn_backend.init_forward_metadata(forward_batch)
+            if not forward_batch.forward_mode.is_idle():
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
@@ -264,7 +295,12 @@ class EAGLEWorker(TpModelWorker):
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
-
+        if batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.num_steps,
+                self.num_draft_tokens,
+            )
         (
             tree_mask,
             position,
@@ -427,24 +463,30 @@ class EAGLEWorker(TpModelWorker):
 
         # Move the accepted tokens to the target KV cache locations
         batch.seq_lens = seq_lens_backup
-        self.move_accepted_tokens_to_target_kvcache(
-            batch,
-            accept_index,
-            accept_length,
-        )
-        all_verified_id = predict[accept_index]
-        verified_id = torch.empty_like(accept_length, dtype=torch.int32)
-        fill_new_verified_id[(bs,)](
-            all_verified_id,
-            accept_length,
-            verified_id,
-            self.num_draft_tokens,
-        )
+        if not batch.forward_mode.is_idle():
+            if self.topk > 1:
+                self.move_accepted_tokens_to_target_kvcache(
+                    batch,
+                    accept_index,
+                    accept_length,
+                )
+            all_verified_id = predict[accept_index]
+            verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+            fill_new_verified_id[(bs,)](
+                all_verified_id,
+                accept_length,
+                verified_id,
+                self.num_draft_tokens,
+            )
+        else:
+            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=logits_output.hidden_states,
         )
+        draft_input.num_tokens_per_batch = self.num_steps + 1
+        draft_input.num_tokens_for_logprob_per_batch = 1
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
             * self.num_draft_tokens
@@ -486,14 +528,21 @@ class EAGLEWorker(TpModelWorker):
         seq_lens_backup.record_stream(torch.cuda.current_stream())
 
         # Construct the return values
+        draft_done = torch_npu.npu.Event()
+        draft_done.record()
         draft_input = EagleDraftInput(
             topk_p=ret_topk_p,
             topk_index=ret_topk_index,
             hidden_states=ret_hidden_states,
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
-            allocate_lens=old_spec_info.allocate_lens,
+            allocate_lens=(
+                torch.empty((0,), device=self.device, dtype=torch.int32)
+                if old_spec_info is None
+                else old_spec_info.allocate_lens
+            ),
             verify_done=verify_done,
+            draft_done=draft_done,
         )
 
         return ForwardBatchOutput(
@@ -533,6 +582,8 @@ class EAGLEWorker(TpModelWorker):
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
             allocate_lens=batch.seq_lens,
+            num_tokens_per_batch=1,
+            num_tokens_for_logprob_per_batch=1,
         )
         batch.spec_info = draft_input
 
@@ -571,21 +622,34 @@ class EAGLEWorker(TpModelWorker):
         accepted_out_cache_loc = torch.zeros(
             size, dtype=torch.int64, device=self.device
         )
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + accept_length,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
-        fill_accepted_out_cache_loc[(size,)](
-            accept_index,
-            batch.out_cache_loc,
-            accepted_out_cache_loc,
-            next_power_of_2(size),
-        )
+        if is_npu():
+            torch.ops.npu.cache_loc_update(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.seq_lens + accept_length,
+                tgt_cache_loc,
+            )
+            accepted_out_cache_loc = fill_accepted_out_cache_loc_native(
+                accept_index, batch.out_cache_loc, accepted_out_cache_loc
+            )
+        else:
+            assign_extend_cache_locs[(bs,)](
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.seq_lens + accept_length,
+                tgt_cache_loc,
+                batch.req_to_token_pool.req_to_token.shape[1],
+                next_power_of_2(bs),
+            )
+
+            fill_accepted_out_cache_loc[(size,)](
+                accept_index,
+                batch.out_cache_loc,
+                accepted_out_cache_loc,
+                next_power_of_2(size),
+            )
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
         )
@@ -607,3 +671,12 @@ def load_token_map(token_map_path: str) -> List[int]:
         token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
     hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int64)
+
+
+def fill_accepted_out_cache_loc_native(
+    accept_index, out_cache_loc, accepted_out_cache_loc
+):
+    valid_mask = accept_index != -1
+    valid_indices = accept_index[valid_mask]
+    accepted_out_cache_loc[: len(valid_indices)] = out_cache_loc[valid_indices]
+    return accepted_out_cache_loc

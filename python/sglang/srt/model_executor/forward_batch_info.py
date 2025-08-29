@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.eagle_utils_v2 import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 _is_npu = is_npu()
@@ -366,7 +366,7 @@ class ForwardBatch:
 
         # For MLP sync
         if batch.global_num_tokens is not None:
-            from sglang.srt.speculative.eagle_utils import (
+            from sglang.srt.speculative.eagle_utils_v2 import (
                 EagleDraftInput,
                 EagleVerifyInput,
             )
@@ -386,11 +386,11 @@ class ForwardBatch:
                 else:
                     assert isinstance(batch.spec_info, EagleVerifyInput)
                     global_num_tokens = [
-                        x * batch.spec_info.draft_token_num
+                        x * batch.spec_info.num_draft_tokens
                         for x in batch.global_num_tokens
                     ]
                     global_num_tokens_for_logprob = [
-                        x * batch.spec_info.draft_token_num
+                        x * batch.spec_info.num_draft_tokens
                         for x in batch.global_num_tokens_for_logprob
                     ]
             else:
@@ -627,7 +627,7 @@ class ForwardBatch:
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
 
-        from sglang.srt.speculative.eagle_utils import EagleDraftInput
+        from sglang.srt.speculative.eagle_utils_v2 import EagleDraftInput
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
@@ -647,10 +647,8 @@ class ForwardBatch:
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
-            # when DP gather mode is all gather, we will use
-            # all_gather_into_tensor to gather hidden states, where transferred
-            # tokens should be padded to the same length. We will also use
-            # reduce-scatter instead of all-reduce after MLP.
+            # when DP gather mode is all gather, we will use all_gather_into_tensor to gather hidden states,
+            # where transferred tokens should be padded to the same length.
             max_num_tokens = max(global_num_tokens)
             global_num_tokens = [max_num_tokens] * sync_group_size
             buffer_len = max_num_tokens * sync_group_size
@@ -760,7 +758,7 @@ class ForwardBatch:
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
-                num_tokens = bs * self.spec_info.draft_token_num
+                num_tokens = bs * self.spec_info.num_draft_tokens
                 logits_output.next_token_logits = logits_output.next_token_logits[
                     :num_tokens
                 ]
