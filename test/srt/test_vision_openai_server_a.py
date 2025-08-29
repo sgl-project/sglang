@@ -165,7 +165,7 @@ class TestMinicpmvServer(ImageOpenAITestMixin):
         cls.base_url += "/v1"
 
 
-class TestMinicpmv4Server(TestOpenAIVisionServer):
+class TestMinicpmv4Server(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "openbmb/MiniCPM-V-4"
