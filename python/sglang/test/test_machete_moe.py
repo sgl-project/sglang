@@ -1,17 +1,18 @@
+from dataclasses import dataclass, fields
+from typing import Optional
+
 import pytest
 import torch
-from typing import Optional
-from dataclasses import dataclass, fields
-
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts_machete_impl
-from sglang.srt.layers.quantization.utils import quantize_weights
-from sgl_kernel import machete_prepack_B, ScalarType, scalar_types
+from sgl_kernel import ScalarType, machete_prepack_B, scalar_types
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts_machete_impl
 from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.quantization.utils import quantize_weights
 
 NUM_EXPERTS = [8, 64]
 TOP_KS = [2, 6]
+
 
 @dataclass
 class MacheteTypes:
@@ -23,18 +24,28 @@ class MacheteTypes:
     channel_scale_type: Optional[torch.dtype]
     token_scale_type: Optional[torch.dtype]
 
+
 def process_qweight(qweight, types):
     G, out_dim, in_dim = qweight.shape
     qweight = qweight.reshape([-1, in_dim]).view(torch.int32).T
-    qweight_processed = machete_prepack_B(qweight, types.act_type, types.weight_type, types.group_scale_type)
+    qweight_processed = machete_prepack_B(
+        qweight, types.act_type, types.weight_type, types.group_scale_type
+    )
     return qweight_processed.reshape([G, -1, out_dim])
+
 
 def process_weights_after_loading(qweight, scales, maybe_zeros, types):
     qweight = process_qweight(qweight, types)
-    scales = scales.reshape([-1, scales.shape[-1]]).permute([1,0]).contiguous().to(types.group_scale_type)
+    scales = (
+        scales.reshape([-1, scales.shape[-1]])
+        .permute([1, 0])
+        .contiguous()
+        .to(types.group_scale_type)
+    )
     if maybe_zeros is not None:
         pass
     return qweight, scales, maybe_zeros
+
 
 def torch_moe(a, w1, w2, score, topk):
     B, D = a.shape
@@ -77,13 +88,15 @@ def test_fused_moe(
     weight_bits: int,
 ):
     with torch.cuda.device("cuda:0"):
-        types = MacheteTypes(act_type=torch.float8_e4m3fn,
-                    weight_type=scalar_types.uint4b8,
-                    output_type=dtype,
-                    group_scale_type=dtype,
-                    group_zero_type=None if has_zp else dtype,
-                    channel_scale_type=None,
-                    token_scale_type=None)
+        types = MacheteTypes(
+            act_type=torch.float8_e4m3fn,
+            weight_type=scalar_types.uint4b8,
+            output_type=dtype,
+            group_scale_type=dtype,
+            group_zero_type=None if has_zp else dtype,
+            channel_scale_type=None,
+            token_scale_type=None,
+        )
 
         print(m, n, k, e, topk, dtype, group_size, has_zp, weight_bits)
         a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
@@ -100,7 +113,9 @@ def test_fused_moe(
         w1_qweight = torch.empty(
             (e, 2 * n, k // pack_factor), device="cuda", dtype=torch.uint8
         )
-        w2_qweight = torch.empty((e, k, n // pack_factor), device="cuda", dtype=torch.uint8)
+        w2_qweight = torch.empty(
+            (e, k, n // pack_factor), device="cuda", dtype=torch.uint8
+        )
         w1_scales = torch.empty((e, 2 * n, k // group_size), device="cuda", dtype=dtype)
         w2_scales = torch.empty((e, k, n // group_size), device="cuda", dtype=dtype)
         w1_qzeros = torch.empty(
@@ -147,9 +162,13 @@ def test_fused_moe(
             w_scales[expert_id] = scales
             if has_zp:
                 w_qzeros[expert_id] = qzeros
-        
-        w1_qweight, w1_scales, w1_qzeros = process_weights_after_loading(w1_qweight, w1_scales, w1_qzeros if has_zp else None, types)
-        w2_qweight, w2_scales, w2_qzeros = process_weights_after_loading(w2_qweight, w2_scales, w2_qzeros if has_zp else None, types)
+
+        w1_qweight, w1_scales, w1_qzeros = process_weights_after_loading(
+            w1_qweight, w1_scales, w1_qzeros if has_zp else None, types
+        )
+        w2_qweight, w2_scales, w2_qzeros = process_weights_after_loading(
+            w2_qweight, w2_scales, w2_qzeros if has_zp else None, types
+        )
 
         topk_output = select_experts(
             hidden_states=a,

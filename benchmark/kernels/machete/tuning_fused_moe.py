@@ -1,22 +1,27 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
 import argparse
 import json
+import random
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, TypedDict, Optional
+from typing import Any, Dict, List, Optional
 
 import ray
 import torch
 import triton
-import random
 from ray.experimental.tqdm_ray import tqdm
+from sgl_kernel import scalar_types
 from transformers import AutoConfig
+from utils import (
+    BenchmarkConfig,
+    TypeConfig,
+    create_moe_data,
+    get_configs_compute_bound,
+    get_schedule_name,
+    sort_config,
+)
 
-from sgl_kernel import ScalarType, scalar_types
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts_machete_impl
-
-from utils import (BenchmarkConfig, TypeConfig, sort_config, 
-                    get_configs_compute_bound, get_schedule_name, create_moe_data)
 
 MNK_SHAPES = [
     (1, 7168, 2048),
@@ -27,18 +32,20 @@ GROUP_SIZES_TO_TEST: list[Optional[int]] = [128]
 
 ddtype = torch.float16
 
-TUNE_TYPE = TypeConfig(act_type=torch.float8_e4m3fn,
-                 weight_type=scalar_types.uint4b8,
-                 output_type=ddtype,
-                 group_scale_type=ddtype,
-                 group_zero_type=None,
-                 channel_scale_type=None,
-                 token_scale_type=None)
+TUNE_TYPE = TypeConfig(
+    act_type=torch.float8_e4m3fn,
+    weight_type=scalar_types.uint4b8,
+    output_type=ddtype,
+    group_scale_type=ddtype,
+    group_zero_type=None,
+    channel_scale_type=None,
+    token_scale_type=None,
+)
 
 
 def generate_topk_dist(E, num_tokens, num_topks):
     topk_dist = []
-    for i in range(num_tokens*num_topks):
+    for i in range(num_tokens * num_topks):
         r = random.random()
         if len(topk_dist) < E and (len(topk_dist) == 0 or r < 0.2):
             topk_dist.append(1)
@@ -55,16 +62,18 @@ def generate_topk_dist(E, num_tokens, num_topks):
     topk_dist.sort(key=lambda x: -x)
     return topk_dist
 
+
 def create_hidden_states(num_tokens, dim, dtype, num_experts, num_topk, device):
     from copy import deepcopy
+
     hidden_states = torch.randn([num_tokens, dim], dtype=ddtype, device=device)
-    ll = [i for i in range(num_experts-1)]
+    ll = [i for i in range(num_experts - 1)]
     topks = []
     # Simulated fusion of shared_experts
     for i in range(num_tokens):
         ll_cp = deepcopy(ll)
         random.shuffle(ll_cp)
-        topks.append(ll_cp[:num_topk-1] + [num_experts-1])
+        topks.append(ll_cp[: num_topk - 1] + [num_experts - 1])
 
     topk_dist = generate_topk_dist(num_experts, num_tokens, num_topk)
     topks = torch.tensor(topks, device=device)
@@ -79,12 +88,13 @@ def save_configs(
 ) -> None:
     filename = f"experts_num={num_experts},awq_w4a8_machete_moe.json"
     d = {k: get_schedule_name(configs[k][0]) for k in configs}
-    #d["bench_time"] = {k: configs[k][1] for k in configs}
+    # d["bench_time"] = {k: configs[k][1] for k in configs}
 
     print(f"Writing best config to {filename}...")
     with open(filename, "w") as f:
         json.dump(d, f, indent=4)
         f.write("\n")
+
 
 def benchmark_config(
     config: BenchmarkConfig,
@@ -99,8 +109,17 @@ def benchmark_config(
     schedule = get_schedule_name(config)
 
     # create weight, hidden_states
-    tensors = create_moe_data(num_experts, [num_tokens, shard_intermediate_size, hidden_size], types, 128, 8)
-    hidden_states, topk_ids, topk_weights = create_hidden_states(num_tokens, hidden_size, torch.float8_e4m3fn, num_experts, topk, tensors.w_q.device)
+    tensors = create_moe_data(
+        num_experts, [num_tokens, shard_intermediate_size, hidden_size], types, 128, 8
+    )
+    hidden_states, topk_ids, topk_weights = create_hidden_states(
+        num_tokens,
+        hidden_size,
+        torch.float8_e4m3fn,
+        num_experts,
+        topk,
+        tensors.w_q.device,
+    )
 
     def run():
         fused_experts_machete_impl(
@@ -117,7 +136,7 @@ def benchmark_config(
             no_combine=False,
             has_zp=True,
             routed_scaling_factor=None,
-            schedule=schedule
+            schedule=schedule,
         )
 
     # JIT compilation & warmup
@@ -125,6 +144,7 @@ def benchmark_config(
         run()
     except:
         import traceback
+
         print("error schedule", schedule)
         traceback.print_exc()
     torch.cuda.synchronize()
@@ -144,7 +164,6 @@ def benchmark_config(
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-    
 
     latencies: List[float] = []
     torch.cuda.synchronize()
@@ -180,7 +199,7 @@ class BenchmarkWorker:
         best_config = None
         best_time = float("inf")
         types = TUNE_TYPE
-        all_times = []  
+        all_times = []
         for config in tqdm(search_space):
             try:
                 kernel_time = benchmark_config(
@@ -213,10 +232,9 @@ class BenchmarkWorker:
         return best_config, res
 
 
-
 def main(args: argparse.Namespace):
     print(args)
-    
+
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     if config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
         experts_num = (
@@ -228,16 +246,14 @@ def main(args: argparse.Namespace):
     else:
         experts_num = config.num_local_experts
         intermediate_size = config.intermediate_size
-    
+
     shard_intermediate_size = 2 * intermediate_size // args.tp_size
     topk = config.num_experts_per_tok
     hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
     dtype = config.torch_dtype
 
     if args.batch_size is None:
-        batch_sizes = [
-            1, 8, 16, 32, 64, 128
-        ]
+        batch_sizes = [1, 8, 16, 32, 64, 128]
     else:
         batch_sizes = [args.batch_size]
 
@@ -255,7 +271,6 @@ def main(args: argparse.Namespace):
             outputs.append(output)
             worker_idx = (worker_idx + 1) % num_gpus
         return ray.get(outputs)
-
 
     search_space = get_configs_compute_bound()
     print(f"Start tuning over {len(search_space)} configurations...")
@@ -277,7 +292,8 @@ def main(args: argparse.Namespace):
         ],
     )
     best_configs = {
-        M: [sort_config(config[0]), config[1]] for M, config in zip(batch_sizes, configs)
+        M: [sort_config(config[0]), config[1]]
+        for M, config in zip(batch_sizes, configs)
     }
     save_configs(best_configs, experts_num)
     end = time.perf_counter()
@@ -286,7 +302,9 @@ def main(args: argparse.Namespace):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="/data/models/DeepSeek/DeepSeek-R1-BF16-AWQ-ADD8/")
+    parser.add_argument(
+        "--model", type=str, default="/data/models/DeepSeek/DeepSeek-R1-BF16-AWQ-ADD8/"
+    )
     parser.add_argument("--tp-size", "--tp", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)

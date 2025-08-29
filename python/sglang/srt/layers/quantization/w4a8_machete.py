@@ -362,7 +362,9 @@ class MoeW4A8MacheteMethod:
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts_machete_impl
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            fused_experts_machete_impl,
+        )
 
         topk_weights, topk_ids, _ = topk_output
 
