@@ -46,9 +46,9 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_sm100_supported,
-    is_gfx95_supported,
 )
 
 _is_flashinfer_available = is_flashinfer_available()

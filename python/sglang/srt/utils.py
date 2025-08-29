@@ -2895,6 +2895,7 @@ def mxfp_supported():
     else:
         return False
 
+
 @lru_cache(maxsize=1)
 def is_gfx95_supported():
     """
@@ -2905,6 +2906,7 @@ def is_gfx95_supported():
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
         return False
+
 
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [

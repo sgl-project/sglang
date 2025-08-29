@@ -112,6 +112,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
@@ -119,7 +120,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
-    is_gfx95_supported,
 )
 
 _is_hip = is_hip()
@@ -1285,7 +1285,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
             else:
-                if _use_aiter and _is_gfx95_supported and self.q_b_proj.weight.dtype == torch.uint8:
+                if (
+                    _use_aiter
+                    and _is_gfx95_supported
+                    and self.q_b_proj.weight.dtype == torch.uint8
+                ):
                     q, k_nope = fused_rms_mxfp4_quant(
                         q,
                         self.q_a_layernorm.weight,
@@ -1362,7 +1366,9 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if not self._fuse_rope_for_trtllm_mla(forward_batch) and (not _use_aiter or not _is_gfx95_supported ):
+        if not self._fuse_rope_for_trtllm_mla(forward_batch) and (
+            not _use_aiter or not _is_gfx95_supported
+        ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator, positions
@@ -1974,7 +1980,8 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         quant_format = (
             "mxfp4"
-            if _is_gfx95_supported and self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8
+            if _is_gfx95_supported
+            and self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8
             else ""
         )
 
@@ -2515,7 +2522,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
-            if _use_aiter and _is_gfx95_supported and self.quant_config.get_name() == "quark":
+            if (
+                _use_aiter
+                and _is_gfx95_supported
+                and self.quant_config.get_name() == "quark"
+            ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )
