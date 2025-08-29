@@ -12,6 +12,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
+from sglang.srt.function_call.json_schema_composer import JSONSchemaComposer
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,8 @@ class Glm4MoeDetector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 format tool call."""
-        return self.bot_token in text
+        # Check for both traditional format and JSON array format when using JSON schema constraints
+        return self.bot_token in text or text.startswith("[") or text.startswith("{")
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -161,4 +163,12 @@ class Glm4MoeDetector(BaseFormatDetector):
             call_rule_fmt='"{name}" "\\n" ( {arguments_rule} "\\n" )?',
             key_value_rule_fmt='"<arg_key>{key}</arg_key>" "\\n" "<arg_value>" {valrule} "</arg_value>"',
             key_value_separator="\\n",
+        )
+
+    def build_json_schema(self, tools: List[Tool]):
+        return JSONSchemaComposer.build_json_schema(
+            tools,
+            tool_choice="required",
+            function_format="xml",
+            tool_call_separator="\n",  # XML format uses newline separator
         )

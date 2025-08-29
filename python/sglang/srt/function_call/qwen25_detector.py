@@ -11,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
+from sglang.srt.function_call.json_schema_composer import JSONSchemaComposer
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,8 @@ class Qwen25Detector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Qwen 2.5 format tool call."""
-        return self.bot_token in text
+        # Check for both traditional format and JSON array format when using JSON schema constraints
+        return self.bot_token in text or text.startswith("[") or text.startswith("{")
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -127,4 +129,12 @@ class Qwen25Detector(BaseFormatDetector):
             individual_call_end_token=self.eot_token.replace("\n", "\\n"),
             tool_call_separator="\\n",
             function_format="json",
+        )
+
+    def build_json_schema(self, tools: List[Tool]):
+        return JSONSchemaComposer.build_json_schema(
+            tools,
+            tool_choice="required",
+            function_format="json",
+            tool_call_separator=self.tool_call_separator,
         )

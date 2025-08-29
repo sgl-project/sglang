@@ -12,6 +12,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
+from sglang.srt.function_call.json_schema_composer import JSONSchemaComposer
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
@@ -26,17 +27,17 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
     Format Structure:
     ```
-    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>{function_name}\n```json\n{json_arguments}\n```<｜tool▁calls▁end｜><｜end▁of▁sentence｜>
+    REDACTED_SPECIAL_TOKENREDACTED_SPECIAL_TOKENfunctionREDACTED_SPECIAL_TOKEN{function_name}\n```json\n{json_arguments}\n```REDACTED_SPECIAL_TOKENREDACTED_SPECIAL_TOKEN
     ```
     Examples:
     ```
-    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Paris"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜>
+    REDACTED_SPECIAL_TOKENREDACTED_SPECIAL_TOKENfunctionREDACTED_SPECIAL_TOKENget_current_weather\n```json\n{"location": "Tokyo"}\n```REDACTED_SPECIAL_TOKEN\nREDACTED_SPECIAL_TOKENfunctionREDACTED_SPECIAL_TOKENget_current_weather\n```json\n{"location": "Paris"}\n```REDACTED_SPECIAL_TOKENREDACTED_SPECIAL_TOKENREDACTED_SPECIAL_TOKEN
     ```
 
     Key Components:
-    - Tool Calls Section: Wrapped between `<｜tool▁calls▁begin｜>` and `<｜tool▁calls▁end｜>`
-    - Individual Tool Call: Wrapped between `<｜tool▁call▁begin｜>` and `<｜tool▁call▁end｜>`
-    - Function Declaration: `function<｜tool▁sep｜>{function_name}`
+    - Tool Calls Section: Wrapped between `REDACTED_SPECIAL_TOKEN` and `REDACTED_SPECIAL_TOKEN`
+    - Individual Tool Call: Wrapped between `REDACTED_SPECIAL_TOKEN` and `REDACTED_SPECIAL_TOKEN`
+    - Function Declaration: `functionREDACTED_SPECIAL_TOKEN{function_name}`
     - Arguments: JSON code block between ````json` and ````
     - Supports multiple tool calls
 
@@ -45,16 +46,17 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-        self.bot_token = "<｜tool▁calls▁begin｜>"
-        self.eot_token = "<｜tool▁calls▁end｜>"
-        self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
+        self.bot_token = "REDACTED_SPECIAL_TOKEN"
+        self.eot_token = "REDACTED_SPECIAL_TOKEN"
+        self.func_call_regex = r"REDACTED_SPECIAL_TOKEN.*?REDACTED_SPECIAL_TOKEN"
+        self.func_detail_regex = r"REDACTED_SPECIAL_TOKEN(.*)REDACTED_SPECIAL_TOKEN(.*)\n```json\n(.*)\n```REDACTED_SPECIAL_TOKEN"
         self._last_arguments = ""
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
-        return self.bot_token in text
+        # Check for both traditional format and JSON array format when using JSON schema constraints
+        return self.bot_token in text or text.startswith("[") or text.startswith("{")
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -97,12 +99,12 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
         # Check if we have a tool call (either the start token or individual tool call)
         has_tool_call = (
-            self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
+            self.bot_token in current_text or "REDACTED_SPECIAL_TOKEN" in current_text
         )
 
         if not has_tool_call:
             self._buffer = ""
-            for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
+            for e_token in [self.eot_token, "```", "REDACTED_SPECIAL_TOKEN"]:
                 if e_token in new_text:
                     new_text = new_text.replace(e_token, "")
             return StreamingParseResult(normal_text=new_text)
@@ -113,7 +115,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
+                pattern=r"REDACTED_SPECIAL_TOKEN(.*)REDACTED_SPECIAL_TOKEN(.*)\n```json\n(.*)\n```.*",
                 string=current_text,
                 flags=re.DOTALL,
             )
@@ -179,7 +181,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
                         # Find the end of the current tool call and remove only that part from buffer
                         tool_call_end_pattern = (
-                            r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+                            r"REDACTED_SPECIAL_TOKEN.*?REDACTED_SPECIAL_TOKEN"
                         )
                         match = re.search(
                             tool_call_end_pattern, current_text, re.DOTALL
@@ -215,6 +217,14 @@ class DeepSeekV3Detector(BaseFormatDetector):
             sequence_start_token=self.bot_token,
             sequence_end_token=self.eot_token,
             tool_call_separator="",
-            call_rule_fmt='"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n" {arguments_rule} "\\n```<｜tool▁call▁end｜>"',
+            call_rule_fmt='"REDACTED_SPECIAL_TOKENfunctionREDACTED_SPECIAL_TOKEN{name}\\n```json\\n" {arguments_rule} "\\n```REDACTED_SPECIAL_TOKEN"',
             function_format="json",
+        )
+
+    def build_json_schema(self, tools: List[Tool]):
+        return JSONSchemaComposer.build_json_schema(
+            tools,
+            tool_choice="required",
+            function_format="json",
+            tool_call_separator="",  # DeepSeek format doesn't use separators
         )

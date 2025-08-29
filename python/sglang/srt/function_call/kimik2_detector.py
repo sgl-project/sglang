@@ -12,6 +12,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
+from sglang.srt.function_call.json_schema_composer import JSONSchemaComposer
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,8 @@ class KimiK2Detector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
-        return self.bot_token in text
+        # Check for both traditional format and JSON array format when using JSON schema constraints
+        return self.bot_token in text or text.startswith("[") or text.startswith("{")
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -242,4 +244,12 @@ class KimiK2Detector(BaseFormatDetector):
             tool_call_separator="",
             call_rule_fmt='"<|tool_call_begin|>functions.{name}:"[0-9]+"<|tool_call_argument_begin|>"{arguments_rule}"<|tool_call_end|>"',
             function_format="json",
+        )
+
+    def build_json_schema(self, tools: List[Tool]):
+        return JSONSchemaComposer.build_json_schema(
+            tools,
+            tool_choice="required",
+            function_format="json",
+            tool_call_separator="",  # KimiK2 format doesn't use separators
         )

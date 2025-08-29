@@ -13,6 +13,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
+from sglang.srt.function_call.json_schema_composer import JSONSchemaComposer
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self._function_name_sent: bool = False
 
     def has_tool_call(self, text: str) -> bool:
-        return self.tool_call_start_token in text
+        # Check for both traditional format and JSON array format when using JSON schema constraints
+        return self.tool_call_start_token in text or text.startswith("[") or text.startswith("{")
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools)
@@ -359,4 +361,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
             call_rule_fmt='"<function={name}>\\n" {arguments_rule} "\\n</function>"',
             key_value_rule_fmt='"<parameter={key}>\\n" {valrule} "\\n</parameter>"',
             key_value_separator="\\n",
+        )
+
+    def build_json_schema(self, tools: List[Tool]):
+        return JSONSchemaComposer.build_json_schema(
+            tools,
+            tool_choice="required",
+            function_format="xml",
+            tool_call_separator="\n",  # XML format uses newline separator
         )

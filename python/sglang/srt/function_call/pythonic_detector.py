@@ -12,6 +12,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
+from sglang.srt.function_call.json_schema_composer import JSONSchemaComposer
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,9 @@ class PythonicDetector(BaseFormatDetector):
         return text
 
     def has_tool_call(self, text: str) -> bool:
-        return bool(self.tool_call_regex.search(self._text_strip(text.strip())))
+        # Check for both traditional format and JSON array format when using JSON schema constraints
+        stripped_text = self._text_strip(text.strip())
+        return bool(self.tool_call_regex.search(stripped_text)) or stripped_text.startswith("[") or stripped_text.startswith("{")
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         # Try parsing the text as a Python list of function calls
@@ -228,4 +231,12 @@ class PythonicDetector(BaseFormatDetector):
             sequence_end_token="]",
             tool_call_separator=",",
             function_format="pythonic",
+        )
+
+    def build_json_schema(self, tools: List[Tool]):
+        return JSONSchemaComposer.build_json_schema(
+            tools,
+            tool_choice="required",
+            function_format="pythonic",
+            tool_call_separator=None,  # Pythonic format doesn't support multiple tool calls
         )
