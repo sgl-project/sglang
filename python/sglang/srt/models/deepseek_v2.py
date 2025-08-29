@@ -1354,7 +1354,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if not self._fuse_rope_for_trtllm_mla(forward_batch) and (not _use_aiter):
+        if not self._fuse_rope_for_trtllm_mla(forward_batch) and (not _use_aiter or not _is_gfx95_supported ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator, positions
