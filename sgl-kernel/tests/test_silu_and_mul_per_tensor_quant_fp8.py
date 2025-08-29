@@ -15,18 +15,43 @@ _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
+def torch_silu_and_mul_scaled_fp8_quant(
+    input: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    fp8_type_: torch.dtype = torch.float8_e4m3fn
+    output = torch.empty(
+        input.shape[0], input.shape[1] // 2, device=input.device, dtype=fp8_type_
+    )
+    input_gate, input_up = input.chunk(2, dim=-1)
+    input_gate = input_gate.float()
+    input_up = input_up.float()
+    input = (
+        ((torch.sigmoid(input_gate) * input_gate).bfloat16() * input_up)
+        .bfloat16()
+        .contiguous()
+    )
+    scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+    sgl_per_tensor_quant_fp8(input, output, scale, is_static=False)
+
+    return output, scale
+
+
 def sglang_silu_and_mul_scaled_fp8_quant(
     input: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     fp8_type_: torch.dtype = torch.float8_e4m3fn
-    output = torch.empty_like(input, device=input.device, dtype=fp8_type_)
+    output = torch.empty(
+        input.shape[0], input.shape[1] // 2, device=input.device, dtype=fp8_type_
+    )
 
     intermediate_cache = torch.empty(
         input.shape[0], input.shape[1] // 2, device=input.device, dtype=input.dtype
     )
     silu_and_mul(input, intermediate_cache)
     scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-    sgl_per_tensor_quant_fp8(intermediate_cache, output, scale, is_static=False)
+    sgl_per_tensor_quant_fp8(
+        intermediate_cache.contiguous(), output, scale, is_static=False
+    )
 
     return output, scale
 
@@ -35,7 +60,9 @@ def sglang_fused_silu_and_mul_scaled_fp8_quant(
     input: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     fp8_type_: torch.dtype = torch.float8_e4m3fn
-    output = torch.empty_like(input, device=input.device, dtype=fp8_type_)
+    output = torch.empty(
+        input.shape[0], input.shape[1] // 2, device=input.device, dtype=fp8_type_
+    )
     scale = torch.zeros(1, device=input.device, dtype=torch.float32)
     input_gate, input_up = input.chunk(2, dim=-1)
     input_gate = input_gate.contiguous()
@@ -56,17 +83,16 @@ def test_silu_and_mul_per_tensor_quant_compare_implementations(
     hidden_dim: int,
 ):
     device = torch.device("cuda")
-    x = torch.rand((num_tokens, hidden_dim), dtype=torch.float16, device=device)
+    x = torch.rand((num_tokens, hidden_dim), dtype=torch.float16, device=device) * 10
 
-    sglang_out, sglang_scale = sglang_silu_and_mul_scaled_fp8_quant(x)
-    fused_out, fused_scale = sglang_fused_silu_and_mul_scaled_fp8_quant(x)
-
-    torch.testing.assert_close(
-        sglang_out.float(), fused_out.float(), rtol=1e-3, atol=1e-3
-    )
-    torch.testing.assert_close(
-        sglang_scale.float(), fused_scale.float(), rtol=1e-3, atol=1e-3
-    )
+    sglang_out, sglang_scale = sglang_silu_and_mul_scaled_fp8_quant(x.clone())
+    fused_out, fused_scale = sglang_fused_silu_and_mul_scaled_fp8_quant(x.clone())
+    torch_out, torch_scale = torch_silu_and_mul_scaled_fp8_quant(x.clone())
+    sglang_out = sglang_out.float()
+    fused_out = fused_out.float()
+    torch_out = torch_out.float()
+    torch.testing.assert_close(sglang_out, fused_out, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(sglang_scale, fused_scale, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

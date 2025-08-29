@@ -77,7 +77,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
         self.use_fused_silu_and_quant = getattr(
-            config, "use_fused_silu_and_quant", True
+            config, "use_fused_silu_and_quant", False
         )
         if self.tp_size > config.num_experts:
             raise ValueError(

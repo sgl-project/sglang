@@ -22,14 +22,18 @@ def sglang_silu_and_mul_scaled_fp8_quant(
     input: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     fp8_type_: torch.dtype = torch.float8_e4m3fn
-    output = torch.empty_like(input, device=input.device, dtype=fp8_type_)
+    output = torch.empty(
+        input.shape[0], input.shape[1] // 2, device=input.device, dtype=fp8_type_
+    )
 
     intermediate_cache = torch.empty(
         input.shape[0], input.shape[1] // 2, device=input.device, dtype=input.dtype
     )
     silu_and_mul(input, intermediate_cache)
     scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-    sgl_per_tensor_quant_fp8(intermediate_cache, output, scale, is_static=False)
+    sgl_per_tensor_quant_fp8(
+        intermediate_cache.contiguous(), output, scale, is_static=False
+    )
 
     return output, scale
 
@@ -38,7 +42,9 @@ def sglang_fused_silu_and_mul_scaled_fp8_quant(
     input: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     fp8_type_: torch.dtype = torch.float8_e4m3fn
-    output = torch.empty_like(input, device=input.device, dtype=fp8_type_)
+    output = torch.empty(
+        input.shape[0], input.shape[1] // 2, device=input.device, dtype=fp8_type_
+    )
     scale = torch.zeros(1, device=input.device, dtype=torch.float32)
     input_gate, input_up = input.chunk(2, dim=-1)
     input_gate = input_gate.contiguous()
@@ -80,8 +86,8 @@ configs = list(itertools.product(batch_size_range, seq_len_range))
         x_names=["batch_size", "seq_len"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["sglang_fused", "sglang"],
-        line_names=["sglang_fused", "sglang"],
+        line_vals=["sglang", "sglang_fused"],
+        line_names=["sglang", "sglang_fused"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
         plot_name="silu-and-mul-per-tensor-quant-fp8-performance",
