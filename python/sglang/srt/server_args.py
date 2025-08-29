@@ -25,7 +25,6 @@ from typing import List, Literal, Optional, Union
 
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
-from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
@@ -39,12 +38,88 @@ from sglang.srt.utils import (
     is_hip,
     is_port_available,
     is_remote_url,
+    is_sm90_supported,
+    is_sm100_supported,
     is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Define constants
+LOAD_FORMAT_CHOICES = [
+    "auto",
+    "pt",
+    "safetensors",
+    "npcache",
+    "dummy",
+    "sharded_state",
+    "gguf",
+    "bitsandbytes",
+    "layered",
+    "remote",
+]
+
+QUANTIZATION_CHOICES = [
+    "awq",
+    "fp8",
+    "gptq",
+    "marlin",
+    "gptq_marlin",
+    "awq_marlin",
+    "bitsandbytes",
+    "gguf",
+    "modelopt",
+    "modelopt_fp4",
+    "petit_nvfp4",
+    "w8a8_int8",
+    "w8a8_fp8",
+    "moe_wna16",
+    "qoq",
+    "w4afp8",
+    "mxfp4",
+]
+
+ATTENTION_BACKEND_CHOICES = [
+    # Common
+    "triton",
+    "torch_native",
+    # NVIDIA specific
+    "cutlass_mla",
+    "fa3",
+    "flashinfer",
+    "flashmla",
+    "trtllm_mla",
+    "trtllm_mha",
+    "dual_chunk_flash_attn",
+    # AMD specific
+    "aiter",
+    "wave",
+    # Other platforms
+    "intel_amx",
+    "ascend",
+]
+
+DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
+
+
+# Allow external code to add more choices
+def add_load_format_choices(choices):
+    LOAD_FORMAT_CHOICES.extend(choices)
+
+
+def add_quantization_method_choices(choices):
+    QUANTIZATION_CHOICES.extend(choices)
+
+
+def add_attention_backend_choices(choices):
+    ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_disagg_transfer_backend_choices(choices):
+    DISAGG_TRANSFER_BACKEND_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -85,7 +160,6 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
-    cpu_offload_gb: int = 0
     page_size: Optional[int] = None
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
@@ -123,6 +197,7 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
+    gc_warning_threshold_secs: float = 0.0
 
     # API related
     api_key: Optional[str] = None
@@ -189,6 +264,7 @@ class ServerArgs:
         "flashinfer_cutlass",
         "flashinfer_mxfp4",
     ] = "auto"
+    flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -210,11 +286,12 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
-    hicache_write_policy: str = "write_through_selective"
+    hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
+    hicache_storage_backend_extra_config: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -223,6 +300,13 @@ class ServerArgs:
     ds_heavy_token_num: int = 256
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
+
+    # Offloading
+    cpu_offload_gb: int = 0
+    offload_group_size: int = -1
+    offload_num_in_group: int = 1
+    offload_prefetch_step: int = 1
+    offload_mode: str = "cpu"
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -631,10 +715,6 @@ class ServerArgs:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
                     )
-                if self.page_size != 1 and self.attention_backend == "flashinfer":
-                    raise ValueError(
-                        "Speculative decoding with page_size != 1 is not supported. Please set page_size to 1."
-                    )
 
             # Auto choose parameters
             if self.speculative_num_steps is None:
@@ -666,6 +746,15 @@ class ServerArgs:
                     "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+
+            if (
+                self.speculative_eagle_topk > 1
+                and self.page_size > 1
+                and self.attention_backend != "flashinfer"
+            ):
+                raise ValueError(
+                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                )
 
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
@@ -755,18 +844,7 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=[
-                "auto",
-                "pt",
-                "safetensors",
-                "npcache",
-                "dummy",
-                "sharded_state",
-                "gguf",
-                "bitsandbytes",
-                "layered",
-                "remote",
-            ],
+            choices=LOAD_FORMAT_CHOICES,
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -885,25 +963,7 @@ class ServerArgs:
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
-            choices=[
-                "awq",
-                "fp8",
-                "gptq",
-                "marlin",
-                "gptq_marlin",
-                "awq_marlin",
-                "bitsandbytes",
-                "gguf",
-                "modelopt",
-                "modelopt_fp4",
-                "petit_nvfp4",
-                "w8a8_int8",
-                "w8a8_fp8",
-                "moe_wna16",
-                "qoq",
-                "w4afp8",
-                "mxfp4",
-            ],
+            choices=QUANTIZATION_CHOICES,
             help="The quantization method.",
         )
         parser.add_argument(
@@ -973,12 +1033,6 @@ class ServerArgs:
             type=float,
             default=ServerArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
-        )
-        parser.add_argument(
-            "--cpu-offload-gb",
-            type=int,
-            default=ServerArgs.cpu_offload_gb,
-            help="How many GBs of RAM to reserve for CPU offloading.",
         )
         parser.add_argument(
             "--page-size",
@@ -1173,6 +1227,12 @@ class ServerArgs:
             help="Collect prompt/generation tokens histogram.",
         )
         parser.add_argument(
+            "--gc-warning-threshold-secs",
+            type=float,
+            default=ServerArgs.gc_warning_threshold_secs,
+            help="The threshold for long GC warning. If a GC takes longer than this, a warning will be logged. Set to 0 to disable.",
+        )
+        parser.add_argument(
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
@@ -1353,43 +1413,24 @@ class ServerArgs:
         )
 
         # Kernel backend
-        ATTN_BACKENDS = [
-            # Common
-            "triton",
-            "torch_native",
-            # NVIDIA specific
-            "cutlass_mla",
-            "fa3",
-            "flashinfer",
-            "flashmla",
-            "trtllm_mla",
-            "trtllm_mha",
-            "dual_chunk_flash_attn",
-            # AMD specific
-            "aiter",
-            "wave",
-            # Other platforms
-            "intel_amx",
-            "ascend",
-        ]
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=ATTN_BACKENDS,
+            choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
         parser.add_argument(
             "--prefill-attention-backend",
             type=str,
-            choices=ATTN_BACKENDS,
+            choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.prefill_attention_backend,
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
         )
         parser.add_argument(
             "--decode-attention-backend",
             type=str,
-            choices=ATTN_BACKENDS,
+            choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.decode_attention_backend,
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
         )
@@ -1489,9 +1530,17 @@ class ServerArgs:
                 "triton_kernel",
                 "flashinfer_trtllm",
                 "flashinfer_cutlass",
+                "flashinfer_mxfp4",
             ],
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
+        )
+        parser.add_argument(
+            "--flashinfer-mxfp4-moe-precision",
+            type=str,
+            choices=["mxfp4", "bf16"],
+            default=ServerArgs.flashinfer_mxfp4_moe_precision,
+            help="Choose the computation precision of flashinfer mxfp4 moe",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
@@ -1629,6 +1678,12 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_prefetch_policy,
             help="Control when prefetching from the storage backend should stop.",
         )
+        parser.add_argument(
+            "--hicache-storage-backend-extra-config",
+            type=str,
+            default=ServerArgs.hicache_storage_backend_extra_config,
+            help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+        )
 
         # Double Sparsity
         parser.add_argument(
@@ -1665,6 +1720,38 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The type of heavy channels in double sparsity attention",
+        )
+
+        # Offloading
+        parser.add_argument(
+            "--cpu-offload-gb",
+            type=int,
+            default=ServerArgs.cpu_offload_gb,
+            help="How many GBs of RAM to reserve for CPU offloading.",
+        )
+        parser.add_argument(
+            "--offload-group-size",
+            type=int,
+            default=ServerArgs.offload_group_size,
+            help="Number of layers per group in offloading.",
+        )
+        parser.add_argument(
+            "--offload-num-in-group",
+            type=int,
+            default=ServerArgs.offload_num_in_group,
+            help="Number of layers to be offloaded within a group.",
+        )
+        parser.add_argument(
+            "--offload-prefetch-step",
+            type=int,
+            default=ServerArgs.offload_prefetch_step,
+            help="Steps to prefetch in offloading.",
+        )
+        parser.add_argument(
+            "--offload-mode",
+            type=str,
+            default=ServerArgs.offload_mode,
+            help="Mode of offloading.",
         )
 
         # Optimization/debug options
@@ -1907,7 +1994,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "nixl", "ascend"],
+            choices=DISAGG_TRANSFER_BACKEND_CHOICES,
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -2227,8 +2314,12 @@ class ServerArgs:
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
+
         elif "Llama4" in model_arch:
-            assert self.attention_backend == "fa3", "fa3 is required for Llama4 model"
+            assert self.attention_backend in {
+                "fa3",
+                "aiter",
+            }, "fa3 or aiter is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
