@@ -7,7 +7,9 @@ use sglang_router_rs::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::routers::pd_types::{generate_room_id, get_hostname, RequestWithBootstrap};
+use sglang_router_rs::routers::http::pd_types::{
+    generate_room_id, get_hostname, RequestWithBootstrap,
+};
 
 fn create_test_worker() -> BasicWorker {
     BasicWorker::new(
