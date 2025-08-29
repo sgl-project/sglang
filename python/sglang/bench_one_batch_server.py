@@ -18,7 +18,7 @@ import json
 import multiprocessing
 import os
 import time
-from typing import Tuple
+from typing import List, Tuple
 
 import requests
 
@@ -26,7 +26,7 @@ from sglang.bench_serving import get_tokenizer, sample_random_requests
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 
@@ -38,12 +38,14 @@ class BenchArgs:
     output_len: Tuple[int] = (16,)
     temperature: float = 0.0
     return_logprob: bool = False
+    client_stream_interval: int = 1
     input_len_step_percentage: float = 0.0
     result_filename: str = "result.jsonl"
     base_url: str = ""
     skip_warmup: bool = False
     show_report: bool = False
     profile: bool = False
+    profile_steps: int = 3
     profile_by_stage: bool = False
 
     @staticmethod
@@ -61,6 +63,11 @@ class BenchArgs:
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
         parser.add_argument("--return-logprob", action="store_true")
         parser.add_argument(
+            "--client-stream-interval",
+            type=int,
+            default=BenchArgs.client_stream_interval,
+        )
+        parser.add_argument(
             "--input-len-step-percentage",
             type=float,
             default=BenchArgs.input_len_step_percentage,
@@ -72,6 +79,9 @@ class BenchArgs:
         parser.add_argument("--skip-warmup", action="store_true")
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
+        parser.add_argument(
+            "--profile-steps", type=int, default=BenchArgs.profile_steps
+        )
         parser.add_argument("--profile-by-stage", action="store_true")
 
     @classmethod
@@ -120,11 +130,13 @@ def run_one_case(
     output_len: int,
     temperature: float,
     return_logprob: bool,
+    stream_interval: int,
     input_len_step_percentage: float,
     run_name: str,
     result_filename: str,
     tokenizer,
     profile: bool = False,
+    profile_steps: int = 3,
     profile_by_stage: bool = False,
 ):
     requests.post(url + "/flush_cache")
@@ -155,7 +167,7 @@ def run_one_case(
     profile_link = None
     if profile:
         profile_link: str = run_profile(
-            url, 3, ["CPU", "GPU"], None, None, profile_by_stage
+            url, profile_steps, ["CPU", "GPU"], None, None, profile_by_stage
         )
 
     tic = time.perf_counter()
@@ -168,6 +180,7 @@ def run_one_case(
                 "max_new_tokens": output_len,
                 "ignore_eos": True,
                 "json_schema": json_schema,
+                "stream_interval": stream_interval,
             },
             "return_logprob": return_logprob,
             "stream": True,
@@ -239,14 +252,83 @@ def run_one_case(
     )
 
 
+def get_report_summary(
+    result: List[Tuple], server_args: ServerArgs, bench_args: BenchArgs
+):
+    import tabulate
+
+    summary = (
+        f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
+    )
+
+    headers = [
+        "batch size",
+        "latency (s)",
+        "input throughput (tok/s)",
+        "output throughput (tok/s)",
+        "acc length",
+        "ITL (ms)",
+        "input cost ($/1M)",
+        "output cost ($/1M)",
+    ]
+    if bench_args.profile:
+        headers.append("profile")
+    rows = []
+
+    for (
+        batch_size,
+        latency,
+        ttft,
+        input_throughput,
+        output_throughput,
+        _,
+        _,
+        acc_length,
+        trace_link,
+    ) in result:
+        if is_blackwell():
+            hourly_cost_per_gpu = 4  # $4/hour for one B200
+        else:
+            hourly_cost_per_gpu = 2  # $2/hour for one H100
+
+        hourly_cost = hourly_cost_per_gpu * server_args.tp_size
+        input_util = 0.7
+        accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
+        itl = 1 / (output_throughput / batch_size) * 1000
+        input_cost = 1e6 / (input_throughput * input_util) / 3600 * hourly_cost
+        output_cost = 1e6 / output_throughput / 3600 * hourly_cost
+        row = [
+            batch_size,
+            latency,
+            input_throughput,
+            output_throughput,
+            accept_length,
+            itl,
+            input_cost,
+            output_cost,
+        ]
+        if trace_link:
+            row.append(f"[Profile]({trace_link})")
+        rows.append(row)
+
+    summary += tabulate.tabulate(
+        rows, headers=headers, tablefmt="github", floatfmt=".2f"
+    )
+    return summary
+
+
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
     else:
         proc, base_url = launch_server_process(server_args)
 
-    tokenizer_id = server_args.tokenizer_path or server_args.model_path
-    tokenizer = get_tokenizer(tokenizer_id)
+    server_info = requests.get(base_url + "/get_server_info").json()
+    if "tokenizer_path" in server_info:
+        tokenizer_path = server_info["tokenizer_path"]
+    elif "prefill" in server_info:
+        tokenizer_path = server_info["prefill"][0]["tokenizer_path"]
+    tokenizer = get_tokenizer(tokenizer_path)
 
     # warmup
     if not bench_args.skip_warmup:
@@ -258,6 +340,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             output_len=16,
             temperature=bench_args.temperature,
             return_logprob=bench_args.return_logprob,
+            stream_interval=bench_args.client_stream_interval,
             input_len_step_percentage=bench_args.input_len_step_percentage,
             run_name="",
             result_filename="",
@@ -280,6 +363,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     ol,
                     temperature=bench_args.temperature,
                     return_logprob=bench_args.return_logprob,
+                    stream_interval=bench_args.client_stream_interval,
                     input_len_step_percentage=bench_args.input_len_step_percentage,
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
@@ -301,11 +385,13 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 ol,
                                 temperature=bench_args.temperature,
                                 return_logprob=bench_args.return_logprob,
+                                stream_interval=bench_args.client_stream_interval,
                                 input_len_step_percentage=bench_args.input_len_step_percentage,
                                 run_name=bench_args.run_name,
                                 result_filename=bench_args.result_filename,
                                 tokenizer=tokenizer,
                                 profile=bench_args.profile,
+                                profile_steps=bench_args.profile_steps,
                                 profile_by_stage=bench_args.profile_by_stage,
                             )[-1],
                         )
@@ -322,58 +408,14 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if not bench_args.show_report:
         return
 
-    summary = (
-        f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
-    )
-    summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
-
-    if bench_args.profile:
-        summary += " profile |"
-
-    summary += "\n"
-    summary += "| ---------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |"
-
-    if bench_args.profile:
-        summary += "-------------|"
-    summary += "\n"
-
-    for (
-        batch_size,
-        latency,
-        ttft,
-        input_throughput,
-        output_throughput,
-        overall_throughput,
-        last_gen_throughput,
-        acc_length,
-        trace_link,
-    ) in result:
-        hourly_cost = 2 * server_args.tp_size  # $2/hour for one H100
-        input_util = 0.7
-        accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
-        line = (
-            f"| {batch_size} | "
-            f"{latency:.2f} | "
-            f"{input_throughput:.2f} | "
-            f"{output_throughput:.2f} | "
-            f"{accept_length} | "
-            f"{1 / (output_throughput/batch_size) * 1000:.2f} | "
-            f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
-            f"{1e6 / output_throughput / 3600 * hourly_cost:.2f} |"
-        )
-        if trace_link:
-            line += f" [Profile]({trace_link}) |"
-        line += "\n"
-        summary += line
-
-    # print metrics table
+    summary = get_report_summary(result, server_args, bench_args)
     print(summary)
 
     if is_in_ci():
         write_github_step_summary(summary)
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
@@ -382,3 +424,7 @@ if __name__ == "__main__":
     bench_args = BenchArgs.from_cli_args(args)
 
     run_benchmark(server_args, bench_args)
+
+
+if __name__ == "__main__":
+    main()

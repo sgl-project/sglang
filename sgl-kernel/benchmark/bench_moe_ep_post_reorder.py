@@ -77,6 +77,7 @@ def benchmark(batch_size, provider):
                 end_expert_id,
                 topk,
                 hidden_size,
+                0,
                 block_size,
             )
 

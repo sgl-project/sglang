@@ -27,10 +27,10 @@ template <>
 inline bool can_use_brgemm<at::Half>(int M) {
   return true;
 }
-// TODO: add u8s8 brgemm, this requires PyTorch 2.7
+// this requires PyTorch 2.7 or above
 template <>
 inline bool can_use_brgemm<int8_t>(int M) {
-  return false;
+  return M > 4;
 }
 
 template <>
@@ -93,6 +93,8 @@ void fused_experts_fp8_kernel_impl(
     scalar_t* __restrict__ ic1,
     scalar_t* __restrict__ ic2,
     scalar_t* __restrict__ A_tmp,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
     const at::Float8_e4m3fn* __restrict__ packed_w1,
     const at::Float8_e4m3fn* __restrict__ packed_w2,
@@ -135,6 +137,8 @@ void shared_expert_fp8_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
     scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
     const at::Float8_e4m3fn* __restrict__ packed_w1,
     const at::Float8_e4m3fn* __restrict__ packed_w2,
@@ -194,4 +198,5 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg,
-    int64_t block_size_K);
+    int64_t block_size_K,
+    bool do_unpack = true);

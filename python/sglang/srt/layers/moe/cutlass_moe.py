@@ -1,11 +1,5 @@
 """CUTLASS based Fused MoE kernels."""
 
-import functools
-import json
-import logging
-import os
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
@@ -13,8 +7,8 @@ from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    import sgl_kernel
     from sgl_kernel import (
+        apply_shuffle_mul_sum,
         cutlass_fp4_group_mm,
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
@@ -122,6 +116,8 @@ def cutlass_fused_experts_fp8(
 
     if is_cuda:
         from sglang.srt.layers.quantization.fp8_kernel import (
+            per_group_transpose,
+            per_token_group_quant_fp8_hopper_moe_mn_major,
             sglang_per_token_group_quant_fp8,
         )
 
@@ -132,9 +128,7 @@ def cutlass_fused_experts_fp8(
     n = w2_q.size(1)
 
     topk = topk_ids.size(1)
-
-    a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
-    device = a_q.device
+    device = a.device
 
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
@@ -151,8 +145,9 @@ def cutlass_fused_experts_fp8(
         k,
     )
 
-    rep_a_q = a_q.view(dtype=torch.uint8)[a_map].view(dtype=a_q.dtype)
-    rep_a1_scales = a1_scale[a_map]
+    a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
+    rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
+    rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
@@ -206,9 +201,10 @@ def cutlass_fused_experts_fp8(
         expert_offsets[:-1],
         workspace,
     )
-    return (
-        c2[c_map].view(m, topk, k) * topk_weights.view(m, topk, 1).to(out_dtype)
-    ).sum(dim=1)
+
+    result = torch.empty((m, k), device=device, dtype=out_dtype)
+    apply_shuffle_mul_sum(c2, result, c_map, topk_weights.to(out_dtype))
+    return result
 
 
 FLOAT4_E2M1_MAX = 6.0

@@ -142,9 +142,10 @@ class SchedulerStats:
     spec_accept_length: float = 0.0
     avg_request_queue_latency: float = 0.0
     num_prefill_prealloc_queue_reqs: int = 0
-    num_prefill_infight_queue_reqs: int = 0
+    num_prefill_inflight_queue_reqs: int = 0
     num_decode_prealloc_queue_reqs: int = 0
     num_decode_transfer_queue_reqs: int = 0
+    total_retracted_reqs: int = 0
 
 
 class SchedulerMetricsCollector:
@@ -219,6 +220,13 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.total_retracted_reqs = Gauge(
+            name="sglang:total_retracted_reqs",
+            documentation="The total number of retracted requests due to kvcache full.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
         # Disaggregation queue metrics
         self.num_prefill_prealloc_queue_reqs = Gauge(
             name="sglang:num_prefill_prealloc_queue_reqs",
@@ -227,9 +235,9 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-        self.num_prefill_infight_queue_reqs = Gauge(
-            name="sglang:num_prefill_infight_queue_reqs",
-            documentation="The number of requests in the prefill infight queue.",
+        self.num_prefill_inflight_queue_reqs = Gauge(
+            name="sglang:num_prefill_inflight_queue_reqs",
+            documentation="The number of requests in the prefill inflight queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -279,13 +287,14 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.total_retracted_reqs, stats.total_retracted_reqs)
 
         # Disaggregation metrics
         self._log_gauge(
             self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
         )
         self._log_gauge(
-            self.num_prefill_infight_queue_reqs, stats.num_prefill_infight_queue_reqs
+            self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
         )
         self._log_gauge(
             self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs

@@ -1,0 +1,30 @@
+name: Release SGLang Router Docker Image
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "sgl-router/py_src/sglang_router/version.py"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push
+        run: |
+          version=$(cat sgl-router/py_src/sglang_router/version.py | cut -d'"' -f2)
+          tag=v${version}
+
+          docker build . -f docker/Dockerfile.router -t lmsysorg/sglang-router:${tag} --no-cache
+          docker push lmsysorg/sglang-router:${tag}

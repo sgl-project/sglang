@@ -1,5 +1,6 @@
 import logging
 import re
+from functools import lru_cache
 
 import torch
 

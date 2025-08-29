@@ -44,7 +44,10 @@ std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
     int64_t topk,
     bool renormalize,
     int64_t num_expert_group,
-    int64_t topk_group);
+    int64_t topk_group,
+    int64_t num_fused_shared_experts,
+    std::optional<double> routed_scaling_factor,
+    std::optional<at::Tensor> num_token_non_padded);
 
 std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     at::Tensor& hidden_states,
@@ -53,7 +56,10 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     int64_t topk,
     bool renormalize,
     int64_t num_expert_group,
-    int64_t topk_group);
+    int64_t topk_group,
+    int64_t num_fused_shared_experts,
+    std::optional<double> routed_scaling_factor,
+    std::optional<at::Tensor> num_token_non_padded);
 
 // attention
 void decode_attention_cpu(
@@ -182,15 +188,34 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
+    at::Tensor& hidden_states,
+    at::Tensor& qkv_a_proj_weight,
+    at::Tensor& q_b_proj_weight,
+    at::Tensor& w_kc,
+    at::Tensor& q_a_layernorm_weight,
+    at::Tensor& kv_a_layernorm_weight,
+    at::Tensor& positions,
+    at::Tensor& cos_sin_cache,
+    double eps,
+    bool use_int8_w8a8,
+    bool use_fp8_w8a16,
+    std::optional<at::Tensor> qkv_a_proj_scale,
+    std::optional<at::Tensor> q_b_proj_scale,
+    bool is_vnni,
+    std::optional<std::vector<int64_t>> block_size,
+    int64_t q_lora_rank,
+    int64_t kv_lora_rank,
+    int64_t qk_rope_head_dim);
+
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
 // shared mmeory all_reduce
-void shm_allreduce(
-    at::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, c10::intrusive_ptr<c10d::ReduceOp> op);
+void shm_allreduce(at::Tensor& data, int64_t op);
 
 // shared memory all_gather
-at::Tensor shm_allgather(at::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, int64_t dim);
+at::Tensor shm_allgather(at::Tensor& data, int64_t dim);
 
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
@@ -200,6 +225,9 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     int64_t head_size,
     at::Tensor& cos_sin_cache,
     bool is_neox);
+
+// CPU and memory binding
+std::string init_cpu_threads_env(const std::string& cpu_ids);
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
@@ -221,13 +249,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("topk_softmax_cpu", torch::kCPU, &topk_softmax_cpu);
   m.def(
       "grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, int num_expert_group, "
-      "int topk_group) -> (Tensor, Tensor)");
+      "int topk_group, int num_fused_shared_experts, float? routed_scaling_factor, Tensor? num_token_non_padded) -> "
+      "(Tensor, Tensor)");
   m.impl("grouped_topk_cpu", torch::kCPU, &grouped_topk_cpu);
 
   // biased group topk
   m.def(
       "biased_grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, Tensor correction_bias, int topk, bool "
-      "renormalize, int num_expert_group, int topk_group) -> (Tensor, Tensor)");
+      "renormalize, int num_expert_group, int topk_group, int num_fused_shared_experts, float? routed_scaling_factor, "
+      "Tensor? num_token_non_padded) -> (Tensor, Tensor)");
   m.impl("biased_grouped_topk_cpu", torch::kCPU, &biased_grouped_topk_cpu);
 
   // decode
@@ -294,6 +324,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "q_b_proj_scale, Tensor? "
       "kv_a_proj_scale, bool is_vnni, int[]? block_size) -> (Tensor, Tensor, Tensor)");
   m.impl("qkv_proj_with_rope", torch::kCPU, &qkv_proj_with_rope);
+  m.def(
+      "qkv_proj_with_rope_fused_weight(Tensor hidden_states, Tensor qkv_a_proj_weight, Tensor q_b_proj_weight, "
+      "Tensor w_kc, Tensor q_a_layernorm_weight, Tensor kv_a_layernorm_weight, Tensor positions, "
+      "Tensor cos_sin_cache, float eps, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? qkv_a_proj_scale, Tensor? "
+      "q_b_proj_scale,"
+      "bool is_vnni, int[]? block_size, int q_lora_rank, int kv_lora_rank,"
+      "int qk_rope_head_dim) -> (Tensor, Tensor, Tensor)");
+  m.impl("qkv_proj_with_rope_fused_weight", torch::kCPU, &qkv_proj_with_rope_fused_weight);
 
   // shared expert
   m.def(
@@ -304,12 +342,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // all reduce
   m.def("initialize(int size, int rank) -> ()");
-  m.impl("initialize", torch::kCPU, &initialize);
-  m.def(
-      "shm_allreduce(Tensor data, __torch__.torch.classes.c10d.ProcessGroup process_group, "
-      "__torch__.torch.classes.c10d.ReduceOp reduce_op) -> ()");
+  m.def("shm_allreduce(Tensor data, int reduce_op) -> ()");
   m.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
-  m.def("shm_allgather(Tensor data, __torch__.torch.classes.c10d.ProcessGroup process_group, int dim) -> Tensor");
+  m.def("shm_allgather(Tensor data, int dim) -> Tensor");
   m.impl("shm_allgather", torch::kCPU, &shm_allgather);
 
   // rope
@@ -317,6 +352,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
+
+  // CPU and memory binding
+  m.def("init_cpu_threads_env(str cpu_ids) -> str");
+}
+
+TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
+  m.impl("init_cpu_threads_env", init_cpu_threads_env);
+  m.impl("initialize", &initialize);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -22,6 +22,7 @@ def main():
     # Create an LLM.
     llm = sgl.Engine(
         model_path="Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+        enable_return_hidden_states=True,
     )
 
     sampling_params = {
