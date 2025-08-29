@@ -1009,7 +1009,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             attention_backend == "flashinfer"
             or attention_backend == "fa3"
             or attention_backend == "flashmla"
-            or attention_backend == "trtllm_mla"
             or attention_backend == "cutlass_mla"
         ):
             # Use MHA with chunked KV cache when prefilling on long sequences.
@@ -1034,6 +1033,15 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                     or sum_extend_prefix_lens == 0
                 )
+            ):
+                return AttnForwardMethod.MHA_CHUNKED_KV
+            else:
+                return _dispatch_mla_subtype()
+        elif attention_backend == "trtllm_mla":
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
@@ -1678,9 +1686,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
                 self.attn_mha.layer_id
             )
-            latent_cache = latent_cache_buf[
-                forward_batch.prefix_chunk_kv_indices[i]
-            ].contiguous()
+            latent_cache = (
+                latent_cache_buf[forward_batch.prefix_chunk_kv_indices[i]]
+                .contiguous()
+                .to(q.dtype)
+            )
 
             kv_a_normed, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
