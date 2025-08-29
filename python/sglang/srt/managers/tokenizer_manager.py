@@ -1100,6 +1100,8 @@ class TokenizerManager:
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
+        if self.server_args.tokenizer_worker_num > 1:
+            obj = MultiTokenizerWarpper(self.worker_id, obj)
         self.send_to_scheduler.send_pyobj(obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
