@@ -114,6 +114,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_non_idle_and_non_empty,
+    is_npu,
     is_sm100_supported,
     log_info_on_rank0,
     make_layers,
@@ -122,6 +123,7 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1184,13 +1186,19 @@ class DeepseekV2AttentionMLA(nn.Module):
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim :] = k_pe
 
-        latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank :] = k_pe
+        if not _is_npu:
+            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
+            latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
-        # Save latent cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-        )
+            # Save latent cache
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+            )
+        else:
+            # To reduce a time-costing split operation
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
 
         return q, k, v, forward_batch
 
