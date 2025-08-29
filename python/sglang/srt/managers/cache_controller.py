@@ -878,6 +878,8 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+            # The _split_node operation in the main thread may cause inconsistency between hash_value and host_indices
+            batch_hashes = batch_hashes[: len(operation.host_indices) // self.page_size]
             # Set one batch token, and record if success.
             # todo: allow partial success
             success = backup_set_func(batch_hashes, batch_host_indices)
@@ -886,6 +888,8 @@ class HiCacheController:
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
+            else:
+                logger.debug(f"Write pages {len(batch_hashes)}")
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
     def backup_thread_func(self):
