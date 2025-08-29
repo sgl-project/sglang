@@ -5,9 +5,9 @@ SGLang provides many optimizations specifically designed for the DeepSeek models
 This document outlines current optimizations for DeepSeek.
 For an overview of the implemented features see the completed [Roadmap](https://github.com/sgl-project/sglang/issues/2591).
 
-## Launch DeepSeek V3 with SGLang
+## Launch DeepSeek V3.1/V3/R1 with SGLang
 
-To run DeepSeek V3/R1 models, the requirements are as follows:
+To run DeepSeek V3.1/V3/R1 models, the recommended settings are as follows:
 
 | Weight Type | Configuration |
 |------------|-------------------|
