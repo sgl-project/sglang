@@ -195,7 +195,7 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: List, value=None):
+    def insert(self, key: List, value=None, chunked=False):
         if self.disable:
             return 0
 
@@ -240,7 +240,7 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req):
+    def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
@@ -261,7 +261,9 @@ class RadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
+        new_prefix_len = self.insert(
+            page_aligned_token_ids, page_aligned_kv_indices, chunked=chunked
+        )
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
