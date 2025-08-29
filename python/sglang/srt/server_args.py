@@ -286,7 +286,7 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
-    hicache_write_policy: str = "write_through_selective"
+    hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
@@ -746,6 +746,15 @@ class ServerArgs:
                     "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+
+            if (
+                self.speculative_eagle_topk > 1
+                and self.page_size > 1
+                and self.attention_backend != "flashinfer"
+            ):
+                raise ValueError(
+                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                )
 
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
