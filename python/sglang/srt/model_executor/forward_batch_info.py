@@ -306,6 +306,8 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    rids: list[str] = None
+
     @classmethod
     def init_new(
         cls,
@@ -346,6 +348,7 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            rids=batch.rids, 
         )
         device = model_runner.device
 
