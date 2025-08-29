@@ -658,6 +658,7 @@ def invoke_fused_moe_kernel(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
     use_fused_silu_and_quant: bool = False,
+    intermediate_cache_silu: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -674,6 +675,7 @@ def invoke_fused_moe_kernel(
                 A_scale,
                 use_per_token_if_dynamic=per_channel_quant,
                 use_fused_silu_and_quant=use_fused_silu_and_quant,
+                intermediate_cache_silu=intermediate_cache_silu,
             )
         else:
             # activation block-wise fp8 quantization
@@ -1463,15 +1465,15 @@ def fused_experts_impl(
     intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
         (M, topk_ids.shape[1], N),
     )
-    if not use_fused_silu_and_quant:
-        intermediate_cache2 = torch.empty(
-            (M * topk_ids.shape[1], N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+    intermediate_cache2 = torch.empty(
+        (M * topk_ids.shape[1], N // 2),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
     intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
         (M, topk_ids.shape[1], w2.shape[1]),
     )
+    intermediate_cache_silu = None
 
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
@@ -1504,10 +1506,9 @@ def fused_experts_impl(
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            if not use_fused_silu_and_quant:
-                intermediate_cache2 = intermediate_cache2[
-                    : tokens_in_chunk * topk_ids.shape[1]
-                ]
+            intermediate_cache2 = intermediate_cache2[
+                : tokens_in_chunk * topk_ids.shape[1]
+            ]
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
             config = get_config_func(tokens_in_chunk)
 
@@ -1554,9 +1555,11 @@ def fused_experts_impl(
                 if not use_fused_silu_and_quant:
                     silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
                 else:
+                    intermediate_cache_silu = intermediate_cache2
                     intermediate_cache2 = intermediate_cache1.view(
                         -1, N
                     )  # silu not applied
+
             else:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
@@ -1601,6 +1604,7 @@ def fused_experts_impl(
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
             use_fused_silu_and_quant=use_fused_silu_and_quant,
+            intermediate_cache_silu=intermediate_cache_silu,
         )
 
         if routed_scaling_factor is None:

@@ -147,14 +147,14 @@ def sgl_per_token_quant_fp8(
 
 
 def sgl_silu_and_mul_per_tensor_quant_fp8(
-    input_gate: torch.Tensor,
-    input_up: torch.Tensor,
+    input: torch.Tensor,
+    output: torch.Tensor,
     output_q: torch.Tensor,
     output_s: torch.Tensor,
     is_static: bool,
 ) -> None:
     torch.ops.sgl_kernel.sgl_silu_and_mul_per_tensor_quant_fp8.default(
-        input_gate, input_up, output_q, output_s, is_static
+        input, output, output_q, output_s, is_static
     )
 
 

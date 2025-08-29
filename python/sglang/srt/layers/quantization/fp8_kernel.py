@@ -1410,6 +1410,7 @@ else:
         num_token_padding: Optional[int] = None,
         use_per_token_if_dynamic: bool = False,
         use_fused_silu_and_quant: bool = False,
+        intermediate_cache_silu: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
@@ -1419,6 +1420,9 @@ else:
             assert (
                 scale is None and not use_per_token_if_dynamic
             ), "fused silu and quant only support dynamic per_tensor quant"
+            assert (
+                intermediate_cache_silu is not None
+            ), "intermediate_cache_silu is required"
         else:
             shape = input.shape
         if num_token_padding:
@@ -1435,11 +1439,11 @@ else:
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                 if use_fused_silu_and_quant:
-                    input_gate, input_up = input.chunk(2, dim=-1)
-                    input_gate = input_gate.contiguous()
-                    input_up = input_up.contiguous()
+                    # input_gate, input_up = input.chunk(2, dim=-1)
+                    # input_gate = input_gate.contiguous()
+                    # input_up = input_up.contiguous()
                     sgl_silu_and_mul_per_tensor_quant_fp8(
-                        input_gate, input_up, output, scale, is_static=False
+                        input, intermediate_cache_silu, output, scale, is_static=False
                     )  # False for dynamic
                     # sgl_per_tensor_quant_fp8(
                     #     input_1, output, scale, is_static=False

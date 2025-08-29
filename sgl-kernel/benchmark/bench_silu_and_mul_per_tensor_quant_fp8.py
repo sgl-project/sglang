@@ -45,12 +45,15 @@ def sglang_fused_silu_and_mul_scaled_fp8_quant(
     output = torch.empty(
         input.shape[0], input.shape[1] // 2, device=input.device, dtype=fp8_type_
     )
+    intermediate_cache = torch.empty(
+        input.shape[0], input.shape[1] // 2, device=input.device, dtype=input.dtype
+    )
     scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-    input_gate, input_up = input.chunk(2, dim=-1)
-    input_gate = input_gate.contiguous()
-    input_up = input_up.contiguous()
+    # input_gate, input_up = input.chunk(2, dim=-1)
+    # input_gate = input_gate.contiguous()
+    # input_up = input_up.contiguous()
     sgl_silu_and_mul_per_tensor_quant_fp8(
-        input_gate, input_up, output, scale, is_static=False
+        input, intermediate_cache, output, scale, is_static=False
     )
 
     return output, scale
