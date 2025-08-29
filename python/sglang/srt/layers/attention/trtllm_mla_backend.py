@@ -347,6 +347,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             return super().init_forward_metadata(forward_batch)
 
+    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
+        super().init_mha_chunk_metadata(forward_batch, disable_ragged_wrapper=True)
+
     def quantize_and_rope_for_fp8(
         self,
         q_nope: torch.Tensor,
@@ -535,8 +538,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
-        qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-        k = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype)
+        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
         v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
         if (
             forward_batch.attn_attend_prefix_cache is None
