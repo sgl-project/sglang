@@ -15,7 +15,7 @@
 
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from sglang.srt.function_call.base_format_detector import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool
 
 
 class JSONSchemaComposer:
@@ -24,9 +24,6 @@ class JSONSchemaComposer:
     This class generates JSON schemas that can be used with XGrammar to constrain
     model outputs to valid tool calling formats. The approach is inspired by VLLM's
     implementation and provides a unified schema that works across different model formats.
-    
-    The composer now supports both single and multiple tool call formats based on
-    the detector's tool_call_separator configuration.
     """
     
     @staticmethod
@@ -43,9 +40,7 @@ class JSONSchemaComposer:
                 - "none": No tools allowed
                 - "required": At least one tool call required
                 - Dict with function name: Specific named tool required
-            function_format: The expected output format (for backward compatibility)
-            tool_call_separator: Separator between multiple tool calls. If None, only single
-                tool calls are supported. If provided, multiple tool calls are supported.
+            tool_call_separator: The separator between multiple tool calls (for backward compatibility)
         
         Returns:
             JSON schema dict or None if no tools allowed
@@ -71,10 +66,10 @@ class JSONSchemaComposer:
         
         # Handle required tools case (default)
         if tool_choice == "required":
-            return JSONSchemaComposer._build_required_schema(tools, tool_call_separator)
+            return JSONSchemaComposer._build_required_schema(tools)
         
         # Default to required if tool_choice is not recognized
-        return JSONSchemaComposer._build_required_schema(tools, tool_call_separator)
+        return JSONSchemaComposer._build_required_schema(tools)
     
     @staticmethod
     def _build_named_tool_schema(tool: Tool) -> Dict[str, Any]:
@@ -102,13 +97,11 @@ class JSONSchemaComposer:
         }
     
     @staticmethod
-    def _build_required_schema(tools: List[Tool], tool_call_separator: Optional[str] = None) -> Dict[str, Any]:
+    def _build_required_schema(tools: List[Tool]) -> Dict[str, Any]:
         """Build schema for required tool calling (at least one tool).
         
         Args:
             tools: List of tools to generate schema for
-            tool_call_separator: Separator between multiple tool calls. If None, only single
-                tool calls are supported. If provided, multiple tool calls are supported.
             
         Returns:
             JSON schema for required tool calling
@@ -129,23 +122,15 @@ class JSONSchemaComposer:
                 "required": ["name", "parameters"]
             }
         
-        # Determine the schema structure based on tool_call_separator
-        if tool_call_separator is not None:
-            # Multiple tool calls supported - use array format
-            json_schema = {
-                "type": "array",
-                "minItems": 1,
-                "items": {
-                    "type": "object",
-                    "anyOf": [get_tool_schema(tool) for tool in tools]
-                }
-            }
-        else:
-            # Single tool call only - use object format with anyOf
-            json_schema = {
+        # Build the main schema
+        json_schema = {
+            "type": "array",
+            "minItems": 1,
+            "items": {
                 "type": "object",
                 "anyOf": [get_tool_schema(tool) for tool in tools]
             }
+        }
         
         # Handle $defs if present in any tool parameters
         all_defs = {}
@@ -229,4 +214,35 @@ class JSONSchemaComposer:
         if "pattern" in parameters:
             if not isinstance(parameters["pattern"], str):
                 raise ValueError("Pattern must be a string")
-            # Could add regex validation here if needed
+            # Could add regex validation here if needed    
+    @staticmethod
+    def build_schema_with_validation(
+        tools: List[Tool],
+        tool_choice: Union[str, Dict[str, Any]] = "required",
+        validate_parameters: bool = True,
+        tool_call_separator: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Build JSON schema with optional parameter validation.
+        
+        Args:
+            tools: List of Tool objects to generate schema for
+            tool_choice: Tool choice specification
+            validate_parameters: Whether to validate tool parameters
+            tool_call_separator: The separator between multiple tool calls (for backward compatibility)
+            
+        Returns:
+            JSON schema dict or None if no tools allowed
+            
+        Raises:
+            ValueError: If validation fails and validate_parameters is True
+        """
+        if validate_parameters:
+            for tool in tools:
+                if tool.function.parameters:
+                    JSONSchemaComposer._validate_tool_parameters(tool.function.parameters)
+        
+        return JSONSchemaComposer.build_json_schema(tools, tool_choice, tool_call_separator)
+
+
+
+

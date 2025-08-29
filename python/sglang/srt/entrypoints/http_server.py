@@ -795,7 +795,7 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
     A native API endpoint to parse function calls from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+    parser = FunctionCallParser(tools=obj.tools)
 
     # 2) Call the non-stream parsing method (non-stream)
     normal_text, calls = parser.parse_non_stream(obj.text)

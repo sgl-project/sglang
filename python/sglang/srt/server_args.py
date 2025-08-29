@@ -130,7 +130,6 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
-    tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
 
     # Data parallelism
@@ -1200,24 +1199,7 @@ class ServerArgs:
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
-        parser.add_argument(
-            "--tool-call-parser",
-            type=str,
-            choices=[  # TODO: use FunctionCallParser.DetectorMap.keys()
-                "qwen25",
-                "mistral",
-                "llama3",
-                "deepseekv3",
-                "pythonic",
-                "kimi_k2",
-                "qwen3_coder",
-                "glm45",
-                "step3",
-                "gpt-oss",
-            ],
-            default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'.",
-        )
+
         parser.add_argument(
             "--tool-server",
             type=str,

@@ -8,18 +8,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     ToolChoice,
 )
-from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+
 from sglang.srt.function_call.core_types import ToolCallItem
-from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
-from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
-from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
-from sglang.srt.function_call.kimik2_detector import KimiK2Detector
-from sglang.srt.function_call.llama32_detector import Llama32Detector
-from sglang.srt.function_call.mistral_detector import MistralDetector
-from sglang.srt.function_call.pythonic_detector import PythonicDetector
-from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
-from sglang.srt.function_call.qwen25_detector import Qwen25Detector
-from sglang.srt.function_call.step3_detector import Step3Detector
+from sglang.srt.function_call.json_detector import JSONDetector
 
 logger = logging.getLogger(__name__)
 
@@ -33,28 +24,12 @@ class FunctionCallParser:
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
-    ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
-        "llama3": Llama32Detector,
-        "qwen25": Qwen25Detector,
-        "mistral": MistralDetector,
-        "deepseekv3": DeepSeekV3Detector,
-        "pythonic": PythonicDetector,
-        "kimi_k2": KimiK2Detector,
-        "qwen3_coder": Qwen3CoderDetector,
-        "glm45": Glm4MoeDetector,
-        "step3": Step3Detector,
-        "gpt-oss": GptOssDetector,
-    }
+    # All models now use the unified JSON detector
+    # No need for enum mapping since there's only one detector
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
-        detector: Type[BaseFormatDetector] = None
-        detector_class = self.ToolCallParserEnum.get(tool_call_parser)
-        if detector_class:
-            detector = detector_class()
-        else:
-            raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
-
-        self.detector = detector
+    def __init__(self, tools: List[Tool]):
+        # All models now use the unified JSON detector
+        self.detector = JSONDetector()
         self.tools = tools
 
     def has_tool_call(self, text: str) -> bool:

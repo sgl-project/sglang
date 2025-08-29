@@ -150,8 +150,7 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 tools = [item.function.model_dump() for item in request.tools]
 
-            tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-            parser = FunctionCallParser(request.tools, tool_call_parser)
+            parser = FunctionCallParser(request.tools)
             tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
 
         # Use chat template
@@ -686,9 +685,8 @@ class OpenAIServingChat(OpenAIServingBase):
             # Handle tool calls
             tool_calls = None
             if request.tool_choice != "none" and request.tools:
-                tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
                 tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, tool_call_parser, finish_reason
+                    text, request.tools, finish_reason
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -782,11 +780,10 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         text: str,
         tools: List[Any],
-        tool_call_parser: Optional[str],
         finish_reason: Dict[str, Any],
     ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
         """Process tool calls in the response"""
-        parser = FunctionCallParser(tools, tool_call_parser)
+        parser = FunctionCallParser(tools)
         if parser.has_tool_call(text):
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
@@ -880,7 +877,6 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in parser_dict:
             parser_dict[index] = FunctionCallParser(
                 tools=request.tools,
-                tool_call_parser=self.tokenizer_manager.server_args.tool_call_parser,
             )
         parser = parser_dict[index]
 
