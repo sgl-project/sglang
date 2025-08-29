@@ -863,54 +863,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             out = out + bias
         return out.view(*output_shape)
 
-# TODO(tmorris): move this to a separate file
-from flashinfer.comm.mnnvl import CommBackend as CommBackend
-
-class SglangCommBackend(CommBackend):
-    def __init__(self):
-        self._group = get_tp_group()
-        # self._group = get_dp_group()
-
-    def Get_rank(self) -> int:
-        return self._group.rank_in_group
-
-    def Get_size(self) -> int:
-        return self._group.world_size
-
-    def allgather(self, data: int) -> list[int]:
-        tensor = torch.tensor([data], device="cuda")
-        gathered = self._group.all_gather(tensor)
-        return gathered.cpu().tolist()
-
-    def allgather_bytes(self, data: bytes):
-        device_id = torch.cuda.current_device()
-        device_str = f"cuda:{device_id}"
-        local_tensor = torch.ByteTensor(list(data)).unsqueeze(0).to(device_str)
-        gathered = self._group.all_gather(local_tensor, dim=0)
-        result = [bytes(gathered[i].cpu().tolist()) for i in range(self.Get_size())]
-        return result
-
-    def allgather(self, data: int | bytes):
-        device = f"cuda:{torch.cuda.current_device()}"
-
-        if isinstance(data, int):
-            # Handle integer case
-            local_tensor = torch.tensor([data], device=device, dtype=torch.int32)
-            gathered = self._group.all_gather(local_tensor)
-            return [int(x.item()) for x in gathered]
-
-        elif isinstance(data, bytes):
-            # Handle bytes case
-            local_tensor = torch.ByteTensor(list(data)).unsqueeze(0).to(device)
-            gathered = self._group.all_gather(local_tensor, dim=0)
-            return [bytes(gathered[i].cpu().tolist()) for i in range(self.Get_size())]
-
-        else:
-            raise TypeError(f"Unsupported type for allgather: {type(data)}")
-
-    def Split(self, color: int, key: int) -> 'vLLMCommBackend':
-        # vLLM handles this automatically via its groups
-        return self
 
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
@@ -933,31 +885,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.alltoall_workspace = None
         self.alltoall_prepare_workspace = None
         if get_moe_a2a_backend().is_flashinfer_alltoallv():
-            from flashinfer.comm.trtllm_alltoall import (
-                Mapping,
-                MnnvlConfig,
-                MnnvlMemory,
-                MnnvlMoe,
+            from sglang.srt.layers.flashinfer_alltoall import (
+                initialize_flashinfer_alltoall_workspaces,
             )
 
-            world_size = get_tensor_model_parallel_world_size()
-            rank = get_tensor_model_parallel_rank()
-            gpus_per_node = 4
-            mapping = Mapping(
-                world_size,
-                rank,
-                gpus_per_node,
-                tp_size=4,
-            )
-            config = MnnvlConfig(
-                comm_backend=SglangCommBackend(),
-                fabric_page_size=1 << 29,  # 512MB
-                allocation_granularity=0,  # Auto-detect
-            )
-            MnnvlMemory.initialize()
-            self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(mapping, config)
-            self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                mapping, config
+            self.alltoall_workspace, self.alltoall_prepare_workspace = (
+                initialize_flashinfer_alltoall_workspaces()
             )
 
     @property
@@ -1437,17 +1370,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             x_sf = torch.zeros(0, x_col // 16, dtype=torch.uint8, device=x.device)
         return x, x_sf
 
-    def pad_scaling_factors(self, x_sf: torch.Tensor) -> tuple[torch.Tensor, int]:
-        def pad_up(x: int, y: int) -> int:
-            return ((x + y - 1) // y) * y
-
-        sf_per_16bytes = 16 // x_sf.element_size()
-        x_sf_col_orig = x_sf.shape[1]
-        x_sf_col = pad_up(x_sf_col_orig, sf_per_16bytes)
-        if x_sf_col > x_sf_col_orig:
-            x_sf = torch.nn.functional.pad(x_sf, (0, x_sf_col - x_sf_col_orig))
-        return x_sf, x_sf_col_orig
-
     def apply(
         self,
         layer: FusedMoE,
@@ -1526,7 +1448,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.moe_ep_rank,
                     layer.moe_ep_size,
                 )
-                x_sf, x_sf_col_orig = self.pad_scaling_factors(x_sf)
                 x_sf = MnnvlMoe.mnnvl_moe_alltoallv(
                     x_sf,
                     alltoall_info,
@@ -1534,8 +1455,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.moe_ep_rank,
                     layer.moe_ep_size,
                 )
-                # Undo padding
-                x_sf = x_sf[:, :x_sf_col_orig].contiguous()
                 x_sf = nvfp4_block_scale_interleave(x_sf)
 
             output = flashinfer_cutlass_fused_moe(
