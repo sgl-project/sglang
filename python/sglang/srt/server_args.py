@@ -19,7 +19,6 @@ import json
 import logging
 import os
 import random
-import sys
 import tempfile
 from typing import List, Literal, Optional, Union
 
@@ -154,11 +153,13 @@ class ServerArgs:
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
-    max_queued_requests: Optional[int] = sys.maxsize
+    max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
+    enable_priority_scheduling: bool = False
+    priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     hybrid_kvcache_ratio: Optional[float] = None
@@ -1019,6 +1020,19 @@ class ServerArgs:
             choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
             help="The scheduling policy of the requests.",
         )
+        parser.add_argument(
+            "--enable-priority-scheduling",
+            action="store_true",
+            default=ServerArgs.enable_priority_scheduling,
+            help="Enable requests with higher priority values to be scheduled first.",
+        )
+        parser.add_argument(
+            "--priority-scheduling-preemption-threshold",
+            type=int,
+            default=ServerArgs.priority_scheduling_preemption_threshold,
+            help="Minimum difference in priorities for an incoming request to have to preempt running request(s).",
+        )
+        # todo - consider adding validation for above with cache aware priroity mode. error out?
         parser.add_argument(
             "--schedule-conservativeness",
             type=float,
