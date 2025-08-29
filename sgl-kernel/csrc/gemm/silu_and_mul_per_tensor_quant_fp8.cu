@@ -32,7 +32,7 @@ __global__ void silu_and_mul_per_tensor_absmax_kernel(
     vec_t input_vec;
     vec_t input_vec_2;
     input_vec.cast_load(input + i * vec_size);
-    input_vec_2.cast_load(input + i * vec_size + hidden_dim);
+    input_vec_2.cast_load(input_2 + i * vec_size);
 
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
@@ -115,16 +115,16 @@ void sgl_silu_and_mul_per_tensor_quant_fp8(
   TORCH_CHECK(is_static == false, "Static mode is not supported for silu_and_mul_per_tensor_quant_fp8");
 
   const int block_size = 256;
-  const int num_elements = input.numel();
-  const int num_blocks = min((num_elements + block_size - 1) / block_size, 1024);
-  const int hidden_dim = input.size(-1);
+  const int64_t num_elements = input_gate.numel();
+  const uint32_t num_blocks = min((num_elements + block_size - 1) / block_size, 1024);
+  const int hidden_dim = input_gate.size(-1);
 
   dim3 grid(num_blocks);
   dim3 block(block_size);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input_gate.scalar_type(), scalar_t, [&] {
     silu_and_mul_per_tensor_absmax_kernel<scalar_t><<<grid, block, 0, stream>>>(
         static_cast<scalar_t*>(input_gate.data_ptr()),
         static_cast<scalar_t*>(input_up.data_ptr()),
@@ -132,12 +132,11 @@ void sgl_silu_and_mul_per_tensor_quant_fp8(
         num_elements,
         hidden_dim);
 
-    silu_and_mul_per_tensor_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(
+    per_tensor_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(
         static_cast<scalar_t*>(input_gate.data_ptr()),
         static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
         static_cast<float*>(output_s.data_ptr()),
-        num_elements,
-        hidden_dim);
+        num_elements);
     return true;
   });
 }
