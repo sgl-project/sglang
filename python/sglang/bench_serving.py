@@ -700,6 +700,7 @@ def get_dataset(args, tokenizer, model_id):
             output_len=args.random_output_len,
             range_ratio=args.random_range_ratio,
             processor=processor,
+            image_format=args.random_image_format,
             image_resolution=args.random_image_resolution,
         )
     elif args.dataset_name == "generated-shared-prefix":
@@ -1190,7 +1191,8 @@ def sample_random_image_requests(
     output_len: int,
     range_ratio: float,
     processor: AutoProcessor,
-    image_resolution: str = "1080p",
+    image_format: str,
+    image_resolution: str,
 ) -> List[DatasetRow]:
     """Generate requests with random images.
 
@@ -1234,7 +1236,7 @@ def sample_random_image_requests(
         arr = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
         img = Image.fromarray(arr)
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
+        img.save(buf, format=image_format, quality=85)
         encoded = pybase64.b64encode(buf.getvalue()).decode("utf-8")
         image_data = f"data:image/jpeg;base64,{encoded}"
         image_bytes = len(image_data.encode("utf-8"))
@@ -2052,6 +2054,15 @@ if __name__ == "__main__":
         help=(
             "Resolution of random images for random-image dataset. "
             "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
+        ),
+    )
+    parser.add_argument(
+        "--random-image-format",
+        type=str,
+        default="jpeg",
+        help=(
+            "Format of random images for random-image dataset. "
+            "Supports jpeg and png."
         ),
     )
     parser.add_argument(
