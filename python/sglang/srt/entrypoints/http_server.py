@@ -137,6 +137,19 @@ def set_global_state(global_state: _GlobalState):
     global _global_state
     _global_state = global_state
 
+# Function to setup all middlewares for multi-tokenizer compatibility
+def setup_middlewares(api_key: Optional[str], enable_metrics: bool):
+    """Setup all middlewares for both single and multi-process modes"""
+    worker_pid = os.getpid()
+
+    if api_key:
+        add_api_key_middleware(app, api_key)
+        logger.info(f"Worker {worker_pid} added API key middleware")
+
+    if enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
+        logger.info(f"Worker {worker_pid} added prometheus middleware")
 
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
@@ -184,6 +197,9 @@ async def lifespan(fast_api_app: FastAPI):
     if server_args is None:
         # for multi-tokenizer
         fast_api_app.server_args = await init_multi_tokenizer()
+        setup_middlewares(
+            fast_api_app.server_args.api_key, fast_api_app.server_args.enable_metrics
+        )
         fast_api_app.warmup_thread = threading.Thread(
             target=_wait_and_warmup,
             args=(
@@ -275,30 +291,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# Function to setup all middlewares for multi-process compatibility
-def setup_middlewares():
-    """Setup all middlewares for both single and multi-process modes"""
-    worker_pid = os.getpid()
-
-    # Setup API key middleware
-    api_key = os.environ.get("SGLANG_API_KEY", "")
-    if api_key:
-        add_api_key_middleware(app, api_key)
-        logger.info(f"Worker {worker_pid} added API key middleware")
-
-    # Setup prometheus middleware
-    # Check if metrics are enabled via environment variable
-    enable_metrics = get_bool_env_var("SGLANG_ENABLE_METRICS", "false")
-    if enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
-        logger.info(f"Worker {worker_pid} added prometheus middleware")
-
-
-# Call setup function at module level for multi-process compatibility
-setup_middlewares()
 
 
 @app.exception_handler(HTTPException)
@@ -1183,15 +1175,6 @@ def launch_server(
     )
 
     if server_args.tokenizer_worker_num > 1:
-        # Set environment variables for middlewares in main process
-        if server_args.api_key:
-            os.environ["SGLANG_API_KEY"] = server_args.api_key
-            logger.info("Main process set SGLANG_API_KEY")
-
-        if server_args.enable_metrics:
-            os.environ["SGLANG_ENABLE_METRICS"] = "true"
-            logger.info("Main process set SGLANG_ENABLE_METRICS=true")
-
         port_args_shm, server_args_shm, scheduler_info_shm = (
             write_data_for_multi_tokenizer(
                 port_args,
