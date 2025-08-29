@@ -33,7 +33,6 @@ class JSONSchemaComposer:
     def build_json_schema(
         tools: List[Tool],
         tool_choice: Union[str, Dict[str, Any]] = "required",
-        function_format: Literal["pythonic", "json", "xml"] = "json",
         tool_call_separator: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build a JSON schema for tool calling constraints.
@@ -231,32 +230,3 @@ class JSONSchemaComposer:
             if not isinstance(parameters["pattern"], str):
                 raise ValueError("Pattern must be a string")
             # Could add regex validation here if needed
-    
-    @staticmethod
-    def build_schema_with_validation(
-        tools: List[Tool],
-        tool_choice: Union[str, Dict[str, Any]] = "required",
-        validate_parameters: bool = True,
-    ) -> Optional[Dict[str, Any]]:
-        """Build JSON schema with optional parameter validation.
-        
-        Args:
-            tools: List of Tool objects to generate schema for
-            tool_choice: Tool choice specification
-            validate_parameters: Whether to validate tool parameters
-            
-        Returns:
-            JSON schema dict or None if no tools allowed
-            
-        Raises:
-            ValueError: If validation fails and validate_parameters is True
-        """
-        if validate_parameters:
-            for tool in tools:
-                if tool.function.parameters:
-                    JSONSchemaComposer._validate_tool_parameters(tool.function.parameters)
-        
-        return JSONSchemaComposer.build_json_schema(tools, tool_choice)
-
-
-

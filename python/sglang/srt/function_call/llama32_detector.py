@@ -10,6 +10,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.json_schema_composer import JSONSchemaComposer
+from sglang.srt.function_call.ebnf_composer import EBNFComposer
 
 logger = logging.getLogger(__name__)
 
@@ -39,16 +40,11 @@ class Llama32Detector(BaseFormatDetector):
         # prefix the output with the <|python_tag|> token
         # Also check for JSON array format when using JSON schema constraints
         has_call = "<|python_tag|>" in text or text.startswith("{") or text.startswith("[")
-        if has_call:
-            logger.debug(f"Llama32Detector: Detected tool call in text starting with: {text[:50]}...")
         return has_call
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse function calls from text, handling multiple JSON objects."""
-        logger.debug(f"Llama32Detector: Parsing text: {text[:100]}...")
-        
         if "<|python_tag|>" not in text and not text.startswith("{") and not text.startswith("["):
-            logger.debug("Llama32Detector: No tool call markers found, returning normal text")
             return StreamingParseResult(normal_text=text, calls=[])
 
         if "<|python_tag|>" in text:
@@ -95,17 +91,19 @@ class Llama32Detector(BaseFormatDetector):
                     idx = next_obj_start
                     continue
 
+        # Validate and flatten all_actions to ensure it contains only objects, not arrays
+        if all_actions:
+            flattened_actions = []
+            for action in all_actions:
+                if isinstance(action, list):
+                    # If we have a nested array, flatten it
+                    flattened_actions.extend(action)
+                else:
+                    flattened_actions.append(action)
+            all_actions = flattened_actions
+
         # Only process if we found valid JSON objects
-        logger.debug(f"Llama32Detector: Found {len(all_actions)} actions: {all_actions}")
         calls = self.parse_base_json(all_actions, tools) if all_actions else []
-        logger.debug(f"Llama32Detector: Parsed {len(calls)} tool calls: {calls}")
-        
-        # Update tool indices to point to the correct tools
-        tool_indices = self._get_tool_indices(tools)
-        for call in calls:
-            if call.name in tool_indices:
-                call.tool_index = tool_indices[call.name]
-                logger.debug(f"Llama32Detector: Updated tool_index for {call.name} to {call.tool_index}")
         
         # Use safe_idx to avoid idx containing the last part of an invalid JSON object
         trailing_text = (
@@ -126,7 +124,6 @@ class Llama32Detector(BaseFormatDetector):
         return JSONSchemaComposer.build_json_schema(
             tools,
             tool_choice="required",
-            function_format="json",
             tool_call_separator=self.tool_call_separator,
         )
     
