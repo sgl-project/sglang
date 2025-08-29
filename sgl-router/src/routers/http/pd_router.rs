@@ -1,6 +1,5 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
-use super::header_utils;
 use super::pd_types::{api_path, PDRouterError};
 use crate::config::types::{
     CircuitBreakerConfig as ConfigCircuitBreakerConfig,
@@ -16,6 +15,7 @@ use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, StringOrArray,
     UserMessageContent,
 };
+use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -28,7 +28,7 @@ use axum::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -72,7 +72,7 @@ impl PDRouter {
 
     // Private helper method to perform health check on a new server
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
-        crate::routers::router::Router::wait_for_healthy_workers(
+        crate::routers::http::router::Router::wait_for_healthy_workers(
             &[url.to_string()],
             self.timeout_secs,
             self.interval_secs,
@@ -435,7 +435,7 @@ impl PDRouter {
             .map(|worker| worker.url().to_string())
             .collect();
         if !all_urls.is_empty() {
-            crate::routers::router::Router::wait_for_healthy_workers(
+            crate::routers::http::router::Router::wait_for_healthy_workers(
                 &all_urls,
                 timeout_secs,
                 interval_secs,
@@ -808,6 +808,57 @@ impl PDRouter {
         .await
     }
 
+    async fn handle_decode_error_response(
+        &self,
+        res: reqwest::Response,
+        context: &PDRequestContext,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+    ) -> Response {
+        let status = res.status();
+
+        if context.is_stream {
+            // Handle streaming error response
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let error_payload = match res.bytes().await {
+                Ok(error_body) => {
+                    if let Ok(error_json) = serde_json::from_slice::<Value>(&error_body) {
+                        json!({ "message": error_json, "status": status.as_u16() })
+                    } else {
+                        json!({ "message": String::from_utf8_lossy(&error_body).to_string(), "status": status.as_u16() })
+                    }
+                }
+                Err(e) => {
+                    json!({ "message": format!("Decode server error: {}", e), "status": status.as_u16() })
+                }
+            };
+
+            let sse_data = format!(
+                "data: {{'error': {}}}",
+                serde_json::to_string(&error_payload).unwrap_or_default()
+            );
+            let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
+
+            let decode_url = decode.url().to_string();
+            self.create_streaming_response(
+                error_stream,
+                status,
+                None,
+                context.return_logprob,
+                Some(decode_url),
+                Some(response_headers),
+                prefill,
+                decode,
+            )
+        } else {
+            // Handle non-streaming error response
+            match res.bytes().await {
+                Ok(error_body) => (status, error_body).into_response(),
+                Err(e) => (status, format!("Decode server error: {}", e)).into_response(),
+            }
+        }
+    }
+
     // Internal method that performs the actual dual dispatch (without retry logic)
     async fn execute_dual_dispatch_internal(
         &self,
@@ -881,16 +932,9 @@ impl PDRouter {
                             status
                         );
 
-                        // Return the error response from decode server
-                        match res.bytes().await {
-                            Ok(error_body) => {
-                                return (status, error_body).into_response();
-                            }
-                            Err(e) => {
-                                return (status, format!("Decode server error: {}", e))
-                                    .into_response();
-                            }
-                        }
+                        return self
+                            .handle_decode_error_response(res, &context, prefill, decode)
+                            .await;
                     }
 
                     // Process prefill response for logprobs
@@ -1034,13 +1078,8 @@ impl PDRouter {
                             status
                         );
 
-                        // Return the error response from decode server
-                        match res.bytes().await {
-                            Ok(error_body) => (status, error_body).into_response(),
-                            Err(e) => {
-                                (status, format!("Decode server error: {}", e)).into_response()
-                            }
-                        }
+                        self.handle_decode_error_response(res, &context, prefill, decode)
+                            .await
                     } else if context.is_stream {
                         // Streaming response without logprobs - direct passthrough
                         let decode_url = decode.url().to_string();
@@ -1243,10 +1282,19 @@ impl PDRouter {
         let decode_workers = self.decode_workers.clone();
 
         tokio::spawn(async move {
+            // Use a flag to track whether stream completed successfully
+            let mut stream_completed = false;
+
             futures_util::pin_mut!(stream);
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
+                        // Check for stream end marker to decrement load early
+                        let is_done = chunk
+                            .as_ref()
+                            .windows(12)
+                            .any(|window| window == b"data: [DONE]");
+
                         let result = if return_logprob && prefill_logprobs.is_some() {
                             // Try to merge logprobs
                             Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -1256,6 +1304,12 @@ impl PDRouter {
                         };
 
                         if tx.send(Ok(result)).is_err() {
+                            break;
+                        }
+
+                        // If we see the done marker, decrement load immediately
+                        if is_done {
+                            stream_completed = true;
                             break;
                         }
                     }
@@ -1270,20 +1324,30 @@ impl PDRouter {
                 }
             }
 
-            // Decrement load after streaming is complete
+            // Always decrement load after streaming (either completes or errors)
+            // Find and decrement prefill worker
             if let Ok(prefill_workers_guard) = prefill_workers.read() {
                 for worker in prefill_workers_guard.iter() {
                     if worker.url() == prefill_url.as_str() {
                         worker.decrement_load();
+                        debug!(
+                            "Decremented load for prefill worker: {} (stream_completed: {})",
+                            prefill_url, stream_completed
+                        );
                         break;
                     }
                 }
             }
 
+            // Find and decrement decode worker
             if let Ok(decode_workers_guard) = decode_workers.read() {
                 for worker in decode_workers_guard.iter() {
                     if worker.url() == decode_url_str.as_str() {
                         worker.decrement_load();
+                        debug!(
+                            "Decremented load for decode worker: {} (stream_completed: {})",
+                            decode_url_str, stream_completed
+                        );
                         break;
                     }
                 }
@@ -1871,6 +1935,14 @@ impl RouterTrait for PDRouter {
         self.execute_dual_dispatch(headers, body, context).await
     }
 
+    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        todo!()
+    }
+
+    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        todo!()
+    }
+
     async fn flush_cache(&self) -> Response {
         // Process both prefill and decode workers
         let (prefill_results, prefill_errors) = self
@@ -1976,7 +2048,7 @@ impl RouterTrait for PDRouter {
         let total_decode = self.decode_workers.read().unwrap().len();
 
         if healthy_prefill_count > 0 && healthy_decode_count > 0 {
-            Json(serde_json::json!({
+            Json(json!({
                 "status": "ready",
                 "prefill": {
                     "healthy": healthy_prefill_count,

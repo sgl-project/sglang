@@ -11,7 +11,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
 
 logger = logging.getLogger(__name__)
@@ -167,12 +167,16 @@ class HiCacheHF3FS(HiCacheStorage):
 
     @staticmethod
     def from_env_config(
-        rank: int, bytes_per_page: int, dtype: torch.dtype
+        bytes_per_page: int,
+        dtype: torch.dtype,
+        storage_config: HiCacheStorageConfig = None,
     ) -> "HiCacheHF3FS":
         from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
             Hf3fsGlobalMetadataClient,
             Hf3fsLocalMetadataClient,
         )
+
+        rank = storage_config.tp_rank if storage_config is not None else 0
 
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
