@@ -37,7 +37,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager, _Communicator
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_workerids_from_rids, get_zmq_socket, kill_process_tree
+from sglang.srt.utils import (
+    get_worker_ids_from_req_rids,
+    get_zmq_socket,
+    kill_process_tree,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -393,7 +397,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
             worker_ids = [recv_obj.worker_id]
             recv_obj = recv_obj.obj
         else:
-            worker_ids = get_workerids_from_rids(recv_obj.rids)
+            worker_ids = get_worker_ids_from_req_rids(recv_obj.rids)
 
         if len(worker_ids) == 0:
             logger.error(f"Cannot find worker_id from rids {recv_obj.rids}")

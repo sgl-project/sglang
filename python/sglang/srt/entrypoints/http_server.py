@@ -137,6 +137,7 @@ def set_global_state(global_state: _GlobalState):
     global _global_state
     _global_state = global_state
 
+
 # Function to setup all middlewares for multi-tokenizer compatibility
 def setup_middlewares(api_key: Optional[str], enable_metrics: bool):
     """Setup all middlewares for both single and multi-process modes"""
@@ -150,6 +151,7 @@ def setup_middlewares(api_key: Optional[str], enable_metrics: bool):
         add_prometheus_middleware(app)
         enable_func_timer()
         logger.info(f"Worker {worker_pid} added prometheus middleware")
+
 
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""

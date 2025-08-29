@@ -2787,7 +2787,7 @@ def lru_cache_frozenset(maxsize=128):
     return decorator
 
 
-def get_workerids_from_rids(rids):
+def get_worker_ids_from_req_rids(rids):
     if isinstance(rids, list):
         worker_ids = [int(rid.split("_")[0]) for rid in rids]
     elif isinstance(rids, str):

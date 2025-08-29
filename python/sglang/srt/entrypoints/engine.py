@@ -815,7 +815,13 @@ def _launch_subprocesses(
         ),
     )
     detoken_proc.start()
-    if server_args.tokenizer_worker_num == 1:
+    if server_args.tokenizer_worker_num > 1:
+        # Launch tokenizer process
+        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+
+        # Initialize templates
+        template_manager = None
+    else:
         # Launch tokenizer process
         tokenizer_manager = TokenizerManager(server_args, port_args)
 
@@ -827,12 +833,6 @@ def _launch_subprocesses(
             chat_template=server_args.chat_template,
             completion_template=server_args.completion_template,
         )
-    else:
-        # Launch tokenizer process
-        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-
-        # Initialize templates
-        template_manager = None
 
     # Wait for the model to finish loading
     scheduler_infos = []

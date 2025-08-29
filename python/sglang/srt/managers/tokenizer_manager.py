@@ -266,14 +266,14 @@ class TokenizerManager:
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        if self.server_args.tokenizer_worker_num == 1:
-            self.send_to_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-            )
-        else:
+        if self.server_args.tokenizer_worker_num > 1:
             # for multi tokenizer mode
             self.send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
+            )
+        else:
+            self.send_to_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
 
         # Request states
@@ -1619,12 +1619,12 @@ class TokenizerManager:
                 )
                 continue
 
-            originRid = rid
+            origin_rid = rid
             if self.server_args.tokenizer_worker_num > 1:
-                originRid = get_origin_rid(rid)
+                origin_rid = get_origin_rid(rid)
             # Build meta_info and return value
             meta_info = {
-                "id": originRid,
+                "id": origin_rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
@@ -1930,9 +1930,9 @@ class TokenizerManager:
         if is_health_check_generate_req(recv_obj):
             return
         state = self.rid_to_state[recv_obj.rid]
-        rid = recv_obj.rid
+        origin_rid = recv_obj.rid
         if self.server_args.tokenizer_worker_num > 1:
-            rid = get_origin_rid(rid)
+            origin_rid = get_origin_rid(origin_rid)
         state.finished = True
         if recv_obj.finished_reason:
             out = {
@@ -1945,7 +1945,7 @@ class TokenizerManager:
             out = {
                 "text": "",
                 "meta_info": {
-                    "id": rid,
+                    "id": origin_rid,
                     "finish_reason": {
                         "type": "abort",
                         "message": "Abort before prefill",

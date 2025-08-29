@@ -39,7 +39,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
     freeze_gc,
-    get_workerids_from_rids,
+    get_worker_ids_from_req_rids,
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
@@ -120,7 +120,7 @@ class DetokenizerManager(MultiTokenizerMixin):
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
 
-    def mtm_event_loop(self):
+    def multi_tokenizer_manager_event_loop(self):
         """The event loop that handles requests, for multi tokenizer manager mode only"""
         self.create_sockets_mapping()
         while True:
@@ -130,7 +130,7 @@ class DetokenizerManager(MultiTokenizerMixin):
                 continue
             # Extract worker_id from rid
             if isinstance(recv_obj.rids, list):
-                worker_ids = get_workerids_from_rids(recv_obj.rids)
+                worker_ids = get_worker_ids_from_req_rids(recv_obj.rids)
             else:
                 raise RuntimeError(
                     f"for tokenizer_worker_num > 1, recv_obj.rids must be a list"
@@ -322,10 +322,10 @@ def run_detokenizer_process(
 
     try:
         manager = DetokenizerManager(server_args, port_args)
-        if server_args.tokenizer_worker_num == 1:
-            manager.event_loop()
+        if server_args.tokenizer_worker_num > 1:
+            manager.multi_tokenizer_manager_event_loop()
         else:
-            manager.mtm_event_loop()
+            manager.event_loop()
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
