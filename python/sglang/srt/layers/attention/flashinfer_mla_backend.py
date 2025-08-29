@@ -96,7 +96,7 @@ class FlashInferMhaChunkKVRunner:
     def update_wrapper(
         self,
         forward_batch: ForwardBatch,
-        disable_ragged_wrapper: bool = False,
+        disable_flashinfer_ragged: bool = False,
     ):
         assert forward_batch.num_prefix_chunks is not None
         num_prefix_chunks = forward_batch.num_prefix_chunks
@@ -129,7 +129,7 @@ class FlashInferMhaChunkKVRunner:
                 causal=False,
             )
         # ragged prefill
-        if not disable_ragged_wrapper:
+        if not disable_flashinfer_ragged:
             self.ragged_wrapper.begin_forward(
                 qo_indptr=qo_indptr,
                 kv_indptr=qo_indptr,
@@ -494,10 +494,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         return 1
 
     def init_mha_chunk_metadata(
-        self, forward_batch: ForwardBatch, disable_ragged_wrapper: bool = False
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
     ):
         """Init the metadata for a forward pass."""
-        self.mha_chunk_kv_cache.update_wrapper(forward_batch, disable_ragged_wrapper)
+        self.mha_chunk_kv_cache.update_wrapper(forward_batch, disable_flashinfer_ragged)
 
     def forward_extend(
         self,
