@@ -192,6 +192,20 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.stream_reasoning)
         self.assertEqual(request.chat_template_kwargs, {"custom_param": "value"})
 
+    def test_chat_completion_reasoning_effort(self):
+        """Test chat completion with reasoning effort"""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={
+                "enabled": True,
+                "reasoning_effort": "high",
+            },
+        )
+        self.assertEqual(request.reasoning_effort, "high")
+        self.assertEqual(request.chat_template_kwargs, {"thinking": True})
+
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""
         transcript = "Good morning! It's 7:00 AM, and I'm just waking up. Today is going to be a busy day, "
