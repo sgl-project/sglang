@@ -295,6 +295,10 @@ class ServerArgs:
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
 
+    # Sparse attention
+    is_sparse_attn: bool = True
+    sparse_attn_algo: str = "lserver"
+
     def __post_init__(self):
         # Check deprecated arguments
         def print_deprecated_warning(message: str):
@@ -2004,6 +2008,17 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action="store_true",
             help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
+        parser.add_argument(
+            "--is-sparse-attn",
+            action="store_true",
+            help="Whether to use sparse attention.",
+        )
+        parser.add_argument(
+            "--sparse-attn-algo",
+            type=str,
+            default=ServerArgs.sparse_attn_algo,
+            help="The algorithm to use for sparse attention.",
         )
 
     @classmethod
