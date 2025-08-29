@@ -73,6 +73,7 @@ suites = {
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_gpt_oss_1gpu.py", 600),
+        TestFile("test_harmony_parser.py", 20),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_hybrid_attn_backend.py", 100),
         TestFile("test_input_embeddings.py", 38),
@@ -161,6 +162,9 @@ suites = {
 # Add AMD tests
 suite_amd = {
     "per-commit-amd": [
+        TestFile("hicache/test_hicache.py", 116),
+        TestFile("hicache/test_hicache_mla.py", 127),
+        TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
@@ -274,6 +278,8 @@ suite_ascend = {
     "per-commit-2-ascend-npu": [
         TestFile("ascend/test_ascend_tp2_bf16.py", 400),
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
+        TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
+        TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
     ],
     "per-commit-4-ascend-npu": [
         TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),

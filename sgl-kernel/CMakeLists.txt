@@ -45,27 +45,22 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        664c4f7b3ed1959414905025728eef5568209479
+    GIT_TAG        a49a78ffefc86a87160dfe0ccc3a3a2d1622c918
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
 
-# DeepGEMM
-if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
-  set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
-  set(DeepGEMM_TAG "blackwell")
-elseif("${CUDA_VERSION}" VERSION_EQUAL "12.9")
-  set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
-  set(DeepGEMM_TAG "blackwell")
-else()
-  set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
-  set(DeepGEMM_TAG "391755ada0ffefa9a6a52b6f14dcaf22d1a463e0")
-endif()
+FetchContent_Declare(
+    repo-fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt
+    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
+    GIT_SHALLOW    OFF
+)
 
 FetchContent_Declare(
     repo-deepgemm
-    GIT_REPOSITORY ${DeepGEMM_REPO}
-    GIT_TAG        ${DeepGEMM_TAG}
+    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
+    GIT_TAG        sgl
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -83,7 +78,7 @@ FetchContent_Populate(repo-triton)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        9220fb3443b5a5d274f00ca5552f798e225239b7
+    GIT_TAG        018b551825c8e5579206e6eb9d3229fa679202b3
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -179,11 +174,28 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_101,code=sm_101"
-        "-gencode=arch=compute_101a,code=sm_101a"
         "-gencode=arch=compute_120,code=sm_120"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
+
+    # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
+    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_103,code=sm_103"
+            "-gencode=arch=compute_103a,code=sm_103a"
+            "-gencode=arch=compute_110,code=sm_110"
+            "-gencode=arch=compute_110a,code=sm_110a"
+            "-gencode=arch=compute_121,code=sm_121"
+            "-gencode=arch=compute_121a,code=sm_121a"
+            "--compress-mode=size"
+        )
+    else()
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_101,code=sm_101"
+            "-gencode=arch=compute_101a,code=sm_101a"
+        )
+    endif()
+
 else()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-use_fast_math"
@@ -266,12 +278,6 @@ set(SOURCES
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
     "csrc/moe/marlin_moe_wna16/ops.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
@@ -307,8 +313,6 @@ target_include_directories(common_ops PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
-set_source_files_properties("csrc/gemm/per_token_group_quant_8bit" PROPERTIES COMPILE_OPTIONS "--use_fast_math")
-
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
@@ -450,13 +454,38 @@ install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 set(DEEPGEMM_SOURCES
     "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
 )
-# JIT Logic
-# DeepGEMM
 
-install(DIRECTORY "${repo-deepgemm_SOURCE_DIR}/deep_gemm/"
-        DESTINATION "deep_gemm"
-        PATTERN ".git*" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)
+Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
+
+# Link against necessary libraries, including nvrtc for JIT compilation.
+target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
+
+# Add include directories needed by DeepGEMM.
+target_include_directories(deep_gemm_cpp PRIVATE
+    ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
+    ${repo-cutlass_SOURCE_DIR}/include
+    ${repo-fmt_SOURCE_DIR}/include
+)
+
+# Apply the same compile options as common_ops.
+target_compile_options(deep_gemm_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+
+# Create an empty __init__.py to make `deepgemm` a Python package.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
+install(
+    FILES ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py
+    DESTINATION deep_gemm
+    RENAME __init__.py
+)
+
+# Install the compiled DeepGEMM API library.
+install(TARGETS deep_gemm_cpp LIBRARY DESTINATION deep_gemm)
+
+# Install the source files required by DeepGEMM for runtime JIT compilation.
+install(
+    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
+    DESTINATION deep_gemm
+)
 
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
         DESTINATION "deep_gemm/include/cute")

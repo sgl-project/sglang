@@ -1,6 +1,7 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code)]
 
+pub mod mock_mcp_server;
 pub mod mock_worker;
 pub mod test_app;
 
@@ -16,6 +17,7 @@ pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         config.clone(),
         reqwest::Client::new(),
         config.max_concurrent_requests,
+        config.rate_limit_tokens_per_second,
     ))
 }
 

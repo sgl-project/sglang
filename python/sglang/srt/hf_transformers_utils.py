@@ -126,6 +126,14 @@ def get_config(
         kwargs["gguf_file"] = model
         model = Path(model).parent
 
+    if is_remote_url(model):
+        # BaseConnector implements __del__() to clean up the local dir.
+        # Since config files need to exist all the time, so we DO NOT use
+        # with statement to avoid closing the client.
+        client = create_remote_connector(model)
+        client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
+        model = client.get_local_dir()
+
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
@@ -368,13 +376,22 @@ def get_processor(
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
     try:
-        processor = AutoProcessor.from_pretrained(
-            tokenizer_name,
-            *args,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        if "InternVL3_5" in tokenizer_name:
+            processor = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        else:
+            processor = AutoProcessor.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
     except ValueError as e:
         error_message = str(e)
