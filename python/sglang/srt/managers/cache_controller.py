@@ -639,6 +639,7 @@ class HiCacheController:
         key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
             hash_values,
             host_indices,
+            self.storage_config.tp_rank,
         )
         get_result = self.storage_backend.batch_get(
             key_strs,
@@ -841,6 +842,7 @@ class HiCacheController:
         key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
             hash_values,
             host_indices,
+            self.storage_config.tp_rank,
         )
         success = self.storage_backend.batch_set(
             key_strs,
