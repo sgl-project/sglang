@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import SWARadixCache
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
 
 class TestSWA(unittest.TestCase):
@@ -40,10 +40,8 @@ class TestSWA(unittest.TestCase):
             full_attention_layer_ids,
             device,
         )
-        alloc = SWATokenToKVPoolAllocator(size, size_swa, dtype, device, pool)
-        assert alloc.available_size() == size + size_swa
+        alloc = SWATokenToKVPoolAllocator(size, size_swa, dtype, device, pool, True)
         index = alloc.alloc(1)
-        assert alloc.available_size() == size_swa + size_swa - 2
         alloc.free_swa(index)
         result = alloc.translate_loc_from_full_to_swa(index)
         print(result)

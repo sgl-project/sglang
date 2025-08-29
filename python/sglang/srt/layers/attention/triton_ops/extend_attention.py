@@ -181,6 +181,7 @@ def _fwd_kernel(
                 kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
                 mask=mask_n,
                 other=0,
+                cache_modifier=".cg",
             )
 
             # load k in transposed way
@@ -193,6 +194,7 @@ def _fwd_kernel(
                 K_Buffer + offs_buf_k,
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
+                cache_modifier=".cg",
             )
 
             qk = tl.dot(q.to(k.dtype), k)
@@ -206,6 +208,7 @@ def _fwd_kernel(
                     K_Buffer + offs_kpe,
                     mask=mask_n[None, :],
                     other=0.0,
+                    cache_modifier=".cg",
                 )
                 qk += tl.dot(qpe.to(kpe.dtype), kpe)
             qk *= sm_scale
@@ -235,6 +238,7 @@ def _fwd_kernel(
                 V_Buffer + offs_buf_v,
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
+                cache_modifier=".cg",
             )
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
@@ -458,7 +462,7 @@ def extend_attention_fwd(
     HAS_SINK = sinks is not None
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    num_stages = 2
 
     extra_kargs = {}
     if _is_hip:
