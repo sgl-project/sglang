@@ -35,6 +35,7 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 from transformers import (
+    AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -310,12 +311,17 @@ async def async_request_openai_chat_completions(
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
     async with _create_bench_client_session() as session:
+        if request_func_input.output_len > 2:
+            print(
+                f"!!!!! request_func_input.output_len: {request_func_input.output_len}"
+            )
         payload = {
             "model": request_func_input.model,
             "messages": messages,
             "temperature": 0.0,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
+            "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
@@ -640,7 +646,30 @@ def get_tokenizer(
     )
 
 
-def get_dataset(args, tokenizer):
+def get_processor(
+    pretrained_model_name_or_path: str,
+) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    assert (
+        pretrained_model_name_or_path is not None
+        and pretrained_model_name_or_path != ""
+    )
+    if pretrained_model_name_or_path.endswith(
+        ".json"
+    ) or pretrained_model_name_or_path.endswith(".model"):
+        from sglang.srt.hf_transformers_utils import get_processor
+
+        return get_processor(pretrained_model_name_or_path)
+
+    if pretrained_model_name_or_path is not None and not os.path.exists(
+        pretrained_model_name_or_path
+    ):
+        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
+    return AutoProcessor.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=True
+    )
+
+
+def get_dataset(args, tokenizer, model_id):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
@@ -666,14 +695,15 @@ def get_dataset(args, tokenizer):
         )
     elif args.dataset_name == "random-image":
         assert not tokenize_prompt, "random-image does not support --tokenize-prompt"
+        assert args.apply_chat_template, "random-image requires apply_chat_template"
+        processor = get_processor(model_id)
         input_requests = sample_random_image_requests(
             num_requests=args.num_prompts,
             num_images=args.random_image_num_images,
             input_len=args.random_input_len,
             output_len=args.random_output_len,
             range_ratio=args.random_range_ratio,
-            tokenizer=tokenizer,
-            apply_chat_template=args.apply_chat_template,
+            processor=processor,
             image_resolution=args.random_image_resolution,
         )
     elif args.dataset_name == "generated-shared-prefix":
@@ -689,11 +719,12 @@ def get_dataset(args, tokenizer):
         )
     elif args.dataset_name == "mmmu":
         assert not tokenize_prompt
+        assert args.apply_chat_template, "mmmu requires apply_chat_template"
+        processor = get_processor(model_id)
         input_requests = sample_mmmu_requests(
             num_requests=args.num_prompts,
-            tokenizer=tokenizer,
+            processor=processor,
             fixed_output_len=args.random_output_len,
-            apply_chat_template=args.apply_chat_template,
             random_sample=True,
         )
     else:
@@ -812,9 +843,8 @@ class DatasetRow:
 
 def sample_mmmu_requests(
     num_requests: int,
-    tokenizer: PreTrainedTokenizerBase,
+    processor: AutoProcessor,
     fixed_output_len: Optional[int] = None,
-    apply_chat_template: bool = True,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
     """
@@ -893,46 +923,12 @@ def sample_mmmu_requests(
                 question = example.get("question")
 
                 # Construct the prompt
-                prompt = f"Question: {question}\n\nAnswer: "
-                if apply_chat_template:
-                    try:
-                        prompt = tokenizer.apply_chat_template(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "image_url",
-                                            "image_url": {"url": image_data},
-                                        },
-                                        {"type": "text", "text": prompt},
-                                    ],
-                                }
-                            ],
-                            add_generation_prompt=True,
-                            tokenize=False,
-                        )
-                    except Exception as e:
-                        # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
-                        print(
-                            f"Error applying chat template: {e}, fallback to <image> tag"
-                        )
-                        prompt = f"<image>{prompt}"
-
-                # Calculate token lengths for text only (without image data)
-                prompt_token_ids = tokenizer.encode(prompt)
-                prompt_len = len(prompt_token_ids)
-
+                text_prompt = f"Question: {question}\n\nAnswer: "
                 output_len = fixed_output_len if fixed_output_len is not None else 256
-
-                filtered_dataset.append(
-                    DatasetRow(
-                        prompt=prompt,
-                        prompt_len=prompt_len,
-                        output_len=output_len,
-                        image_data=[image_data],
-                    )
+                data_row = create_mm_data_row(
+                    text_prompt, [image], [image_data], output_len, processor
                 )
+                filtered_dataset.append(data_row)
 
         except Exception as e:
             print(f"Error processing example {i}: {e}")
@@ -1160,14 +1156,44 @@ def parse_random_image_resolution(image_resolution: str) -> Tuple[int, int]:
     )
 
 
+def create_mm_data_row(text_prompt, images, images_base64, output_len, processor):
+    try:
+        content_items = [
+            {"type": "image_url", "image_url": {"url": img_url}}
+            for img_url in images_base64
+        ]
+        content_items.append({"type": "text", "text": text_prompt})
+        prompt_str = processor.apply_chat_template(
+            [{"role": "user", "content": content_items}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+    except Exception:
+        # Some tokenizers do not support list content; fall back to a placeholder in the text
+        prompt_str = f"<image>{text_prompt}"
+
+    prompt_len = processor(
+        text=[prompt_str],
+        images=images,
+        padding=False,
+        return_tensors="pt",
+    )["input_ids"].numel()
+
+    return DatasetRow(
+        prompt=text_prompt,
+        prompt_len=prompt_len,
+        output_len=output_len,
+        image_data=images_base64,
+    )
+
+
 def sample_random_image_requests(
     num_requests: int,
     num_images: int,
     input_len: int,
     output_len: int,
     range_ratio: float,
-    tokenizer: PreTrainedTokenizerBase,
-    apply_chat_template: bool = True,
+    processor: AutoProcessor,
     image_resolution: str = "1080p",
 ) -> List[DatasetRow]:
     """Generate requests with random images.
@@ -1206,53 +1232,41 @@ def sample_random_image_requests(
         int(output_len * range_ratio), output_len + 1, size=num_requests
     )
 
-    def _gen_random_image_data_uri(width: int = width, height: int = height) -> str:
+    def _gen_random_image_data_uri(
+        width: int = width, height: int = height
+    ) -> (Image, str, int):
         arr = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
-        img = Image.fromarray(arr, mode="RGB")
+        img = Image.fromarray(arr)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
         encoded = pybase64.b64encode(buf.getvalue()).decode("utf-8")
-        return f"data:image/jpeg;base64,{encoded}"
+        image_data = f"data:image/jpeg;base64,{encoded}"
+        image_bytes = len(image_data.encode("utf-8"))
+        return img, image_data, image_bytes
 
     dataset: List[DatasetRow] = []
+    total_image_bytes = 0
     for i in range(num_requests):
         # Generate text prompt
-        text_prompt = gen_prompt(tokenizer, int(input_lens[i]))
+        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
 
         # Generate image list
-        images = [_gen_random_image_data_uri() for _ in range(num_images)]
-
-        prompt_str = text_prompt
-        if apply_chat_template:
-            try:
-                content_items = [
-                    {"type": "image_url", "image_url": {"url": img_url}}
-                    for img_url in images
-                ]
-                content_items.append({"type": "text", "text": text_prompt})
-                prompt_str = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": content_items}],
-                    add_generation_prompt=True,
-                    tokenize=False,
-                )
-            except Exception:
-                # Some tokenizers do not support list content; fall back to a placeholder in the text
-                prompt_str = f"<image>{text_prompt}"
-
-        prompt_token_ids = tokenizer.encode(prompt_str)
-        prompt_token_len = len(prompt_token_ids)
-
-        dataset.append(
-            DatasetRow(
-                prompt=prompt_str,
-                prompt_len=prompt_token_len,
-                output_len=int(output_lens[i]),
-                image_data=images,
-            )
+        images, images_base64, images_bytes = zip(
+            *[_gen_random_image_data_uri() for _ in range(num_images)]
         )
+        total_image_bytes += sum(list(images_bytes))
+
+        data_row = create_mm_data_row(
+            text_prompt, images, images_base64, int(output_lens[i]), processor
+        )
+
+        dataset.append(data_row)
 
     print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
+    print(
+        f"\nCreated {len(dataset)} random images with average {total_image_bytes//num_requests} bytes per request"
+    )
     return dataset
 
 
@@ -1896,7 +1910,7 @@ def run_benchmark(args_: argparse.Namespace):
     model_id = args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer)
+    input_requests = get_dataset(args, tokenizer, model_id)
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
