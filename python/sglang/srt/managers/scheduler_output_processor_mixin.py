@@ -197,15 +197,15 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        logits_output, next_token_ids, can_run_graph = (
+        logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
-            result.can_run_graph,
+            result.can_run_cuda_graph,
         )
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            logits_output, next_token_ids, can_run_graph = (
+            logits_output, next_token_ids, can_run_cuda_graph = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )
             next_token_logprobs = logits_output.next_token_logprobs
@@ -293,7 +293,7 @@ class SchedulerOutputProcessorMixin:
             self.current_scheduler_metrics_enabled()
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
-            self.log_decode_stats(can_run_graph, running_batch=batch)
+            self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
 
     def add_input_logprob_return_values(
         self: Scheduler,

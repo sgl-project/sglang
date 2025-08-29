@@ -138,7 +138,7 @@ class SchedulerMetricsMixin:
         self._publish_kv_events()
 
     def log_decode_stats(
-        self, can_run_graph: bool, running_batch: ScheduleBatch = None
+        self, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
     ):
         batch = running_batch or self.running_batch
 
@@ -193,7 +193,7 @@ class SchedulerMetricsMixin:
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         msg += (
-            f"{'cpu graph' if self.device == 'cpu' else 'cuda graph'}: {can_run_graph}, "
+            f"{'cpu graph' if self.device == 'cpu' else 'cuda graph'}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )

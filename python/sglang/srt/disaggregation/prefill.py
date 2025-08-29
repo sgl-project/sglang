@@ -778,7 +778,7 @@ class SchedulerDisaggregationPrefillMixin:
                         extend_input_len_per_req=None,
                         extend_logprob_start_len_per_req=None,
                         bid=bids[next_mb_id],
-                        can_run_graph=result.can_run_graph,
+                        can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result_disagg_prefill(
                         mbs[next_mb_id], output_result

@@ -172,7 +172,7 @@ class TpModelWorkerClient:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
             # Run forward
-            logits_output, next_token_ids, can_run_graph = (
+            logits_output, next_token_ids, can_run_cuda_graph = (
                 self.worker.forward_batch_generation(
                     model_worker_batch, model_worker_batch.launch_done
                 )
@@ -201,7 +201,7 @@ class TpModelWorkerClient:
             copy_done.record()
 
             self.output_queue.put(
-                (copy_done, logits_output, next_token_ids, can_run_graph)
+                (copy_done, logits_output, next_token_ids, can_run_cuda_graph)
             )
 
     def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
@@ -209,7 +209,7 @@ class TpModelWorkerClient:
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
         """
-        copy_done, logits_output, next_token_ids, can_run_graph = (
+        copy_done, logits_output, next_token_ids, can_run_cuda_graph = (
             self.output_queue.get()
         )
 
@@ -226,7 +226,7 @@ class TpModelWorkerClient:
                     logits_output.input_token_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
-        return logits_output, next_token_ids, can_run_graph
+        return logits_output, next_token_ids, can_run_cuda_graph
 
     def forward_batch_generation(
         self, model_worker_batch: ModelWorkerBatch

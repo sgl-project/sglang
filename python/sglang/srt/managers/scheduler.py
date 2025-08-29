@@ -181,7 +181,7 @@ class GenerationBatchResult:
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
     bid: int
-    can_run_graph: bool
+    can_run_cuda_graph: bool
 
 
 @dataclass
@@ -929,7 +929,7 @@ class Scheduler(
                             "extend_logprob_start_len_per_req", None
                         ),
                         bid=bids[next_mb_id],
-                        can_run_graph=result.can_run_graph,
+                        can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
@@ -1778,11 +1778,11 @@ class Scheduler(
                     model_worker_batch.hicache_consumer_index
                 )
                 if self.pp_group.is_last_rank:
-                    logits_output, next_token_ids, can_run_graph = (
+                    logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 else:
-                    pp_hidden_states_proxy_tensors, _, can_run_graph = (
+                    pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
                 bid = model_worker_batch.bid
@@ -1792,7 +1792,7 @@ class Scheduler(
                     next_token_ids,
                     bid,
                     num_accepted_tokens,
-                    can_run_graph,
+                    can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
                 bs = batch.batch_size()
                 self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
@@ -1827,7 +1827,7 @@ class Scheduler(
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 bid=bid,
-                can_run_graph=can_run_graph,
+                can_run_cuda_graph=can_run_cuda_graph,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()

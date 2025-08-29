@@ -375,7 +375,7 @@ class EAGLEWorker(TpModelWorker):
         else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch, can_run_graph = (
+            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
 
@@ -394,7 +394,7 @@ class EAGLEWorker(TpModelWorker):
                 verify_output.verified_id,
                 model_worker_batch.bid,
                 sum(verify_output.accept_length_per_req_cpu),
-                can_run_graph,
+                can_run_cuda_graph,
             )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
@@ -715,8 +715,10 @@ class EAGLEWorker(TpModelWorker):
             ).cpu()
 
         # Forward
-        logits_output, _, can_run_graph = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True
+        logits_output, _, can_run_cuda_graph = (
+            self.target_worker.forward_batch_generation(
+                model_worker_batch, skip_sample=True
+            )
         )
 
         vocab_mask = None
@@ -765,7 +767,7 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.spec_info = res.draft_input
 
-        return logits_output, res, model_worker_batch, can_run_graph
+        return logits_output, res, model_worker_batch, can_run_cuda_graph
 
     def add_logprob_values(
         self,
