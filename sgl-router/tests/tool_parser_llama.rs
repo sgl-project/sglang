@@ -341,14 +341,84 @@ async fn test_llama_streaming_multiple_tools() {
 
     let result = parser.parse_incremental(text, &mut state).await.unwrap();
 
-    // Current implementation may handle this differently
+    // Should get first tool complete
     match result {
         sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-            // At minimum should get first tool
             assert_eq!(tool.function.name, "func1");
         }
+        _ => panic!("Expected first tool to be complete"),
+    }
+
+    // Process remaining buffer to get second tool
+    let result2 = parser.parse_incremental("", &mut state).await.unwrap();
+    match result2 {
+        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
+            assert_eq!(tool.function.name, "func2");
+        }
+        _ => panic!("Expected second tool to be complete"),
+    }
+}
+
+#[tokio::test]
+async fn test_llama_streaming_multiple_tools_chunked() {
+    // Test streaming multiple tool calls arriving in chunks
+    let parser = LlamaParser::new();
+    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+
+    // First chunk - incomplete first JSON
+    let chunk1 = r#"<|python_tag|>{"name": "get_weather", "arguments""#;
+    let result1 = parser.parse_incremental(chunk1, &mut state).await.unwrap();
+
+    // Should be incomplete or have tool name
+    match result1 {
+        sglang_router_rs::tool_parser::StreamResult::Incomplete
+        | sglang_router_rs::tool_parser::StreamResult::ToolName { .. }
+        | sglang_router_rs::tool_parser::StreamResult::ToolArguments { .. } => {
+            // Expected - could get tool name or be incomplete or even partial args
+        }
+        _ => panic!(
+            "Expected incomplete or tool name for partial JSON, got: {:?}",
+            result1
+        ),
+    }
+
+    // Second chunk - complete first JSON and separator
+    let chunk2 = r#": {"city": "Paris"}};{"name": "#;
+    let result2 = parser.parse_incremental(chunk2, &mut state).await.unwrap();
+
+    // Should get first tool complete
+    match result2 {
+        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
+            assert_eq!(tool.function.name, "get_weather");
+            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
+            assert_eq!(args["city"], "Paris");
+        }
+        _ => panic!("Expected first tool to be complete after separator"),
+    }
+
+    // Third chunk - complete second JSON
+    let chunk3 = r#""get_time", "arguments": {"timezone": "UTC"}}"#;
+    let result3 = parser.parse_incremental(chunk3, &mut state).await.unwrap();
+
+    // Should get second tool complete
+    match result3 {
+        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
+            assert_eq!(tool.function.name, "get_time");
+            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
+            assert_eq!(args["timezone"], "UTC");
+        }
         _ => {
-            // Also acceptable if waiting for more
+            // If not complete yet, try one more empty chunk
+            let result4 = parser.parse_incremental("", &mut state).await.unwrap();
+            match result4 {
+                sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
+                    assert_eq!(tool.function.name, "get_time");
+                    let args: serde_json::Value =
+                        serde_json::from_str(&tool.function.arguments).unwrap();
+                    assert_eq!(args["timezone"], "UTC");
+                }
+                _ => panic!("Expected second tool to be complete"),
+            }
         }
     }
 }
