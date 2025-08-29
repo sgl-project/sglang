@@ -194,6 +194,8 @@ class ServerArgs:
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
     collect_tokens_histogram: bool = False
+    prompt_tokens_buckets: Optional[List[str]] = None
+    generation_tokens_buckets: Optional[List[str]] = None
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
@@ -1216,6 +1218,20 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.collect_tokens_histogram,
             help="Collect prompt/generation tokens histogram.",
+        )
+        parser.add_argument(
+            "--prompt-tokens-buckets",
+            type=str,
+            nargs="+",
+            default=ServerArgs.prompt_tokens_buckets,
+            help="The buckets rule of prompt tokens.",
+        )
+        parser.add_argument(
+            "--generation-tokens-buckets",
+            type=str,
+            nargs="+",
+            default=ServerArgs.generation_tokens_buckets,
+            help="The buckets rule of generation tokens.",
         )
         parser.add_argument(
             "--gc-warning-threshold-secs",
