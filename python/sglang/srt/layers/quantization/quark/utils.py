@@ -151,7 +151,15 @@ def mxfp4_to_f32(x, is_threed):
 
 
 def e8m0_to_f32(x):
+    # Convert the input tensor `x` (assumed to be in e8m0 format) to float32.
+    # e8m0 is a custom 8-bit floating point format with 8 bits for exponent, 0 for mantissa.
+    # This means the value is essentially 2^(exponent - 127), similar to how IEEE-754 stores floats.
+
+    # Convert x to float32 for computation, and compute the power of 2 by subtracting the bias (127).
     x_f32 = 2 ** ((x.to(torch.float32)) - 127)
+
+    # If the exponent value was 255 (i.e., 2^(128)), this is a special case usually used to represent NaN or Inf.
+    # Since this custom format has no mantissa, treat 2^128 as NaN.
     x_f32[x_f32 == 128] = float("nan")
     return x_f32
 

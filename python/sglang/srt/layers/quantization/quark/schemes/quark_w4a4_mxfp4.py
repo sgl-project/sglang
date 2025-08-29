@@ -101,7 +101,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
             elif len(x) == 3:
                 x, x_s, y = x
 
-        use_prequant_kernel = (
+        use_fused_quant_gemm = (
             x_s is None and y is not None and layer.weight.shape[0] == y.shape[1]
         )
 
@@ -110,7 +110,9 @@ class QuarkW4A4MXFP4(QuarkScheme):
             x = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
 
-        if use_prequant_kernel or x_s is not None:
+        # use_fused_quant_gemm = true, x_q is a bf16/fp16 num
+        # x_s is not None = true, x_q is uint8 num
+        if use_fused_quant_gemm or x_s is not None:
             x_q = x
         else:
             x_q, x_s = dynamic_mxfp4_quant(x)
@@ -123,7 +125,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
                 dtype=self.out_dtype,
             )
 
-        if use_prequant_kernel:
+        if use_fused_quant_gemm:
             gemm_afp4wfp4_pre_quant(x_q, layer.weight, layer.weight_scale, y.dtype, y)
             y = y.to(x.dtype)
         else:
