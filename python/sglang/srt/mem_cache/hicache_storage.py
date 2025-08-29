@@ -41,12 +41,13 @@ class HiCacheStorage(ABC):
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
 
     def register_page_retriever(
-        self, page_retriever: Callable[Tuple[str, torch.Tensor], Optional[Any]]
+        self, page_retriever: Callable[[list[str], torch.Tensor], Optional[Tuple]]
     ) -> None:
         """
-        Register a page retriever function.
-        The page retriever function should take a page key and a host memory indices tensor,
-        and return a tensor of the page data.
+        Register a page retriever function for rebuilding missing prefix pages during storage operations.
+
+        The page retriever function should take page keys and host indices as parameters and return
+        page data in a format suitable for the specific storage backend.
         """
         self.page_retriever = page_retriever
 
@@ -207,23 +208,23 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
         prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
     ) -> bool:
-        for key, value in zip(keys, values):
-            if not self.set(key, value):
-                return False
+        # for key, value in zip(keys, values):
+        #     if not self.set(key, value):
+        #         return False
 
-        if prefix_pages is not None and self.page_retriever is not None:
+        if prefix_pages and self.page_retriever:
             prefix_page_hashes, prefix_host_indices, page_size = prefix_pages
 
             missing_pages = 0
             for i, page_key in enumerate(prefix_page_hashes):
                 if not self.exists(page_key):
                     data = self.page_retriever(
-                        page_key,
+                        [page_key],
                         prefix_host_indices[i * page_size : (i + 1) * page_size],
                     )
                     if data is not None and isinstance(data, torch.Tensor):
                         self.set(page_key, data)
-                    missing_pages += 1
+                        missing_pages += 1
 
             if missing_pages > 0:
                 logger.info(

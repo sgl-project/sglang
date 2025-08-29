@@ -265,7 +265,12 @@ class HiCacheController:
             self.storage_config = self._generate_storage_config(
                 model_name, storage_backend_extra_config
             )
-            self.should_pass_through_prefix_pages = False
+
+            # todo: support prefix pages for other storage backends
+            self.should_pass_through_prefix_pages = self.storage_backend_type in [
+                "file"
+            ]
+
             # In MLA backend, only one rank needs to backup the KV cache
             self.backup_skip = (
                 self.storage_config.is_mla_model
@@ -279,7 +284,6 @@ class HiCacheController:
                 from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 
                 self.storage_backend = HiCacheFile(self.storage_config)
-                self.should_pass_through_prefix_pages = True
             elif storage_backend == "nixl":
                 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 
@@ -316,8 +320,9 @@ class HiCacheController:
 
             if self.should_pass_through_prefix_pages:
                 self.storage_backend.register_page_retriever(
-                    self.retrieve_host_page_data
+                    self._retrieve_host_page_data
                 )
+
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
@@ -465,16 +470,6 @@ class HiCacheController:
             )
             self.prefetch_thread.start()
             self.backup_thread.start()
-
-    def retrieve_host_page_data(
-        self, page_key: str, host_indices: torch.Tensor
-    ) -> Optional[Any]:
-        if self.storage_backend_type == "mooncake":
-            buffer_info = self.mem_pool_host.get_buffer_meta([page_key], host_indices)
-            return buffer_info
-        else:
-            page_data = self.mem_pool_host.get_flat_data_page(host_indices[0])
-            return page_data
 
     def write(
         self,
@@ -848,34 +843,62 @@ class HiCacheController:
         self.backup_queue.put(operation)
         return operation.id
 
+    def _retrieve_host_page_data(
+        self, page_keys: list[str], host_indices: torch.Tensor
+    ) -> Optional[Tuple]:
+        """
+        Retrieve page data from host memory according to the storage backend type and layout.
+        """
+
+        if self.storage_backend_type == "mooncake":
+            return self.mem_pool_host.get_buffer_meta(
+                page_keys,
+                host_indices,
+                self.storage_config.tp_rank,
+            )
+        elif (
+            self.storage_backend_type == "hf3fs"
+            and self.mem_pool_host.layout == "page_first"
+        ):
+            return self.mem_pool_host.get_buffer_with_hash(page_keys, host_indices)
+        else:
+            return self.mem_pool_host.get_flat_data_page(host_indices[0])
+
     # non-zero copy
-    def _generic_page_set(self, hash_values, host_indices) -> bool:
+    def _generic_page_set(
+        self, hash_values, host_indices, prefix_pages: Optional[Tuple] = None
+    ) -> bool:
         data = [
-            self.mem_pool_host.get_flat_data_page(host_indices[i * self.page_size])
+            self._retrieve_host_page_data(
+                [], host_indices[i * self.page_size : (i + 1) * self.page_size]
+            )
             for i in range(len(hash_values))
         ]
-        return self.storage_backend.batch_set(hash_values, data)
+        return self.storage_backend.batch_set(
+            hash_values, data, prefix_pages=prefix_pages
+        )
 
     # zero copy
-    def _mooncake_page_set(self, hash_values, host_indices) -> bool:
-        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-            hash_values,
-            host_indices,
-            self.storage_config.tp_rank,
+    def _mooncake_page_set(
+        self, hash_values, host_indices, prefix_pages: Optional[Tuple] = None
+    ) -> bool:
+        key_strs, buffer_ptrs, buffer_sizes = self._retrieve_host_page_data(
+            hash_values, host_indices
         )
         success = self.storage_backend.batch_set(
             key_strs,
             target_location=buffer_ptrs,
             target_sizes=buffer_sizes,
+            prefix_pages=prefix_pages,
         )
         return success
 
     # zero copy
-    def _3fs_zero_copy_page_set(self, hash_values, host_indices) -> bool:
-        hashes, dsts = self.mem_pool_host.get_buffer_with_hash(
-            hash_values, host_indices
-        )
-        return self.storage_backend.batch_set(hashes, dsts)
+    def _3fs_zero_copy_page_set(
+        self, hash_values, host_indices, prefix_pages: Optional[Tuple] = None
+    ) -> bool:
+        hashes, dsts = self._retrieve_host_page_data(hash_values, host_indices)
+        return self.storage_backend.batch_set(hashes, dsts, prefix_pages=prefix_pages)
 
     # Backup batch by batch
     def _page_backup(self, operation):
@@ -908,7 +931,7 @@ class HiCacheController:
 
             # Set one batch token, and record if success.
             # todo: allow partial success
-            success = backup_set_func(batch_hashes, batch_host_indices)
+            success = backup_set_func(batch_hashes, batch_host_indices, prefix_pages)
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
