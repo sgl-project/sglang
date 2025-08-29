@@ -164,3 +164,7 @@ exclude = [
 [tool.codespell]
 ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"
 skip = "*.json,*.jsonl,*.patch,*.txt"
+
+
+[project.scripts]
+sglang = "sglang.launch_server:main"
