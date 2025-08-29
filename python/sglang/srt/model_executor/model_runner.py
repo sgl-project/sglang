@@ -66,7 +66,6 @@ from sglang.srt.layers.quantization import (
 )
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import (
@@ -121,6 +120,7 @@ from sglang.srt.utils import (
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
     is_npu,
+    is_sm100_supported,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cuda_arch,
@@ -1440,14 +1440,12 @@ class ModelRunner:
             else self.server_args.attention_backend
         )
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
-            assert (
-                self.server_args.speculative_algorithm is None
-            ), "Currently HybridAttentionBackend does not support speculative decoding."
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
             )
 
             attn_backend = HybridAttnBackend(
+                self,
                 decode_backend=self._get_attention_backend_from_str(
                     self.decode_attention_backend_str
                 ),
