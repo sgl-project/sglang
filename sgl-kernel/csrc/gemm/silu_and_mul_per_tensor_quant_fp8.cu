@@ -115,8 +115,8 @@ void sgl_silu_and_mul_per_tensor_quant_fp8(
   TORCH_CHECK(is_static == false, "Static mode is not supported for silu_and_mul_per_tensor_quant_fp8");
 
   const int block_size = 256;
-  const int64_t num_elements = input_gate.numel();
-  const uint32_t num_blocks = min((num_elements + block_size - 1) / block_size, 1024);
+  const int num_elements = input_gate.numel();
+  const int num_blocks = min((num_elements + block_size - 1) / block_size, 1024);
   const int hidden_dim = input_gate.size(-1);
 
   dim3 grid(num_blocks);
