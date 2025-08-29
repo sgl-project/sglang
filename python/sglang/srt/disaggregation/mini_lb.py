@@ -483,7 +483,9 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
             load_balancer.add_prefill_server(
                 PrefillConfig(url=server_url, bootstrap_port=content["bootstrap_port"])
             )
-            logger.info(f"Converted decode server to prefill: {server_url}; bootstrap port: {content['bootstrap_port']}")
+            logger.info(
+                f"Converted decode server to prefill: {server_url}; bootstrap port: {content['bootstrap_port']}"
+            )
         return Response(status_code=200)
     else:
         raise HTTPException(

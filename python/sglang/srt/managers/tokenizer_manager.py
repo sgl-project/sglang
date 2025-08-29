@@ -1358,9 +1358,15 @@ class TokenizerManager:
                 check_count -= 1
                 logger.info("Waiting for all requests to finish...")
                 if check_count <= 0:
-                    return False, "Maybe caused by: 1. Server stuck, 2. 60s is not enough", None
+                    return (
+                        False,
+                        "Maybe caused by: 1. Server stuck, 2. 60s is not enough",
+                        None,
+                    )
             await self.flush_cache()
-            logger.info("All requests are finished and cache flushed, can convert p/d role")
+            logger.info(
+                "All requests are finished and cache flushed, can convert p/d role"
+            )
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 # start a bootstarp server first
