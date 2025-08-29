@@ -89,6 +89,10 @@ class ForwardMode(IntEnum):
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
+    # Used in disaggregated decode worker
+    # Represent a batch of requests having their KV cache ready to start decoding
+    FAKE_EXTEND = auto()
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -137,6 +141,9 @@ class ForwardMode(IntEnum):
 
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
+
+    def is_fake_extend(self):
+        return self == ForwardMode.FAKE_EXTEND
 
 
 @total_ordering
