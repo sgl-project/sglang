@@ -439,8 +439,7 @@ cvt_fp16_to_fp4_expert(
   int actualColsPerRow = use_silu_and_mul ? colsPerRow * 2 : colsPerRow;
 
   // Each global thread processes one element
-  for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow;
-       globalIdx < (expert_idx + 1) * m * colsPerRow;
+  for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow; globalIdx < (expert_idx + 1) * m * colsPerRow;
        globalIdx += actual_stride) {
     // Calculate which row and column this global thread should process
     int rowIdx = globalIdx / colsPerRow;
