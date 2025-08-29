@@ -44,7 +44,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req_pool_indices.append(req.req_pool_idx)
 
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
+                len(req.prefix_indices) : len(req.fill_ids)
             ]
             assert (
                 offset + req.extend_input_len <= total_size
@@ -106,7 +106,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.output_ids = []
         for req in self.reqs:
             self.output_ids.append(req.output_ids[-1])
-            self.tree_cache.cache_unfinished_req(req)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
