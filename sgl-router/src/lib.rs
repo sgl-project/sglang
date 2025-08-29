@@ -5,6 +5,7 @@ use std::collections::HashMap;
 pub mod core;
 #[cfg(feature = "grpc-client")]
 pub mod grpc;
+pub mod mcp;
 pub mod metrics;
 pub mod middleware;
 pub mod policies;
@@ -85,6 +86,9 @@ struct Router {
     health_check_endpoint: String,
     // IGW (Inference Gateway) configuration
     enable_igw: bool,
+    queue_size: usize,
+    queue_timeout_secs: u64,
+    rate_limit_tokens_per_second: Option<usize>,
 }
 
 impl Router {
@@ -176,6 +180,9 @@ impl Router {
             log_level: self.log_level.clone(),
             request_id_headers: self.request_id_headers.clone(),
             max_concurrent_requests: self.max_concurrent_requests,
+            queue_size: self.queue_size,
+            queue_timeout_secs: self.queue_timeout_secs,
+            rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
             cors_allowed_origins: self.cors_allowed_origins.clone(),
             retry: config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -190,8 +197,8 @@ impl Router {
                 timeout_duration_secs: self.cb_timeout_duration_secs,
                 window_duration_secs: self.cb_window_duration_secs,
             },
-            disable_retries: false,
-            disable_circuit_breaker: false,
+            disable_retries: self.disable_retries,
+            disable_circuit_breaker: self.disable_circuit_breaker,
             health_check: config::HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -263,6 +270,9 @@ impl Router {
         health_check_endpoint = String::from("/health"),
         // IGW defaults
         enable_igw = false,
+        queue_size = 100,
+        queue_timeout_secs = 60,
+        rate_limit_tokens_per_second = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -317,6 +327,9 @@ impl Router {
         health_check_interval_secs: u64,
         health_check_endpoint: String,
         enable_igw: bool,
+        queue_size: usize,
+        queue_timeout_secs: u64,
+        rate_limit_tokens_per_second: Option<usize>,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -370,6 +383,9 @@ impl Router {
             health_check_interval_secs,
             health_check_endpoint,
             enable_igw,
+            queue_size,
+            queue_timeout_secs,
+            rate_limit_tokens_per_second,
         })
     }
 
