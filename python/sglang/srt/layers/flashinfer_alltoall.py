@@ -1,12 +1,13 @@
 import logging
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_moe_expert_parallel_rank,
     get_moe_ep_group,
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
 )
 from sglang.srt.utils import is_flashinfer_available
 
@@ -21,10 +22,12 @@ if is_flashinfer_available():
         MnnvlMoe,
     )
 
+
 class TorchDistributedCommBackend(CommBackend):
     """
     Use torch distributed instead of MPI to set up flashinfer MNNVL workspaces during initialization
     """
+
     def __init__(self, group: ProcessGroup):
         self._group = group
 
@@ -43,7 +46,9 @@ class TorchDistributedCommBackend(CommBackend):
         # No need to split, we already use the proper group
         return self
 
+
 _alltoall_workspaces = None
+
 
 def initialize_flashinfer_alltoall_workspaces():
     global _alltoall_workspaces
@@ -66,8 +71,6 @@ def initialize_flashinfer_alltoall_workspaces():
     )
     MnnvlMemory.initialize()
     alltoall_workspace = MnnvlMoe.get_moe_workspaces(mapping, config)
-    alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-        mapping, config
-    )
+    alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(mapping, config)
     _alltoall_workspaces = (alltoall_workspace, alltoall_prepare_workspace)
     return _alltoall_workspaces
