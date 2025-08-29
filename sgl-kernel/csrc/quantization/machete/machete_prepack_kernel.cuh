@@ -1,9 +1,9 @@
 #pragma once
 
-#include "quantization/extensions/cute_utils.cuh"
-#include "quantization/extensions/torch_utils.hpp"
 #include "dispatch_policy_machete.cuh"
 #include "machete_mm_kernel.cuh"
+#include "quantization/extensions/cute_utils.cuh"
+#include "quantization/extensions/torch_utils.hpp"
 
 namespace machete {
 

@@ -3,9 +3,9 @@
 #include <Python.h>
 #include <torch/all.h>
 
+#include "machete_mm_kernel.cuh"
 #include "quantization/extensions/scalar_type.hpp"
 #include "quantization/extensions/torch_utils.hpp"
-#include "machete_mm_kernel.cuh"
 
 namespace machete {
 

@@ -1,6 +1,6 @@
-#include "quantization/extensions/scalar_type.hpp"
 #include "machete_mm_launcher.cuh"
 #include "machete_prepack_launcher.cuh"
+#include "quantization/extensions/scalar_type.hpp"
 
 // Adapted form https://github.com/vllm-project/vllm/blob/main/csrc/quantization/machete/machete_pytorch.cu
 

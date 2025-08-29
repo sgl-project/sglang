@@ -1,7 +1,7 @@
 #pragma once
 
-#include "cutlass/numeric_conversion.h"
 #include "cute_utils.cuh"
+#include "cutlass/numeric_conversion.h"
 
 // this file extends:
 //   https://github.com/NVIDIA/cutlass/blob/cutlass-3.5.0/include/cutlass/numeric_conversion.h

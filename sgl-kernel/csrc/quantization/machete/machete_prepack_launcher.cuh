@@ -1,8 +1,8 @@
 #pragma once
 
+#include "machete_prepack_kernel.cuh"
 #include "quantization/extensions/scalar_type.hpp"
 #include "quantization/extensions/torch_utils.hpp"
-#include "machete_prepack_kernel.cuh"
 
 namespace machete {
 

@@ -47,8 +47,8 @@
 #include "cutlass/detail/collective.hpp"
 // clang-format on
 
-#include "quantization/extensions/cute_utils.cuh"
 #include "dispatch_policy_machete.cuh"
+#include "quantization/extensions/cute_utils.cuh"
 
 namespace machete {
 

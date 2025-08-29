@@ -1,7 +1,7 @@
 #pragma once
 
-#include "quantization/extensions/vllm_collective_builder.cuh"
 #include "machete_mainloop.cuh"
+#include "quantization/extensions/vllm_collective_builder.cuh"
 
 namespace cutlass::gemm::collective {
 using namespace cute;

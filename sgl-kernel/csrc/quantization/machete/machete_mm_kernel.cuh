@@ -19,13 +19,13 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 // clang-format on
 
+#include "machete_collective_builder.cuh"
+#include "machete_interleaving_utils.cuh"
+#include "machete_prepacked_layout.cuh"
 #include "quantization/extensions/cute_utils.cuh"
 #include "quantization/extensions/epilogue/scaled_mm_epilogues_c3x.hpp"
 #include "quantization/extensions/torch_utils.hpp"
 #include "quantization/extensions/vllm_numeric_conversion.cuh"
-#include "machete_collective_builder.cuh"
-#include "machete_interleaving_utils.cuh"
-#include "machete_prepacked_layout.cuh"
 #include "sm90_gemm_tma_warpspecialized_cooperative_machete.hpp"
 
 namespace machete {

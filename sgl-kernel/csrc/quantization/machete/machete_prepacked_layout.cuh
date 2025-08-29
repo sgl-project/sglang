@@ -20,9 +20,9 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 // clang-format on
 
-#include "quantization/extensions/cute_utils.cuh"
 #include "machete_collective_builder.cuh"
 #include "machete_interleaving_utils.cuh"
+#include "quantization/extensions/cute_utils.cuh"
 
 namespace machete {
 
