@@ -462,6 +462,34 @@ class ChatCompletionRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def normalize_reasoning_inputs(cls, values: Dict):
+        r = values.get("reasoning")
+        if r is None:
+            return values
+
+        if isinstance(r, dict):
+            effort = r.get("effort") or r.get("reasoning_effort")
+            if effort in {"low", "medium", "high"}:
+                values["reasoning_effort"] = effort
+
+            enabled = (
+                r.get("enabled")
+                if r.get("enabled") is not None
+                else r.get("enable", False)
+            )
+            if isinstance(enabled, str):
+                enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
+            if enabled:
+                ctk = values.get("chat_template_kwargs")
+                if not isinstance(ctk, dict):
+                    ctk = {}
+                ctk.setdefault("thinking", True)
+                values["chat_template_kwargs"] = ctk
+
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
     def set_json_schema(cls, values):
         response_format = values.get("response_format")
         if not response_format:
