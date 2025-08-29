@@ -85,8 +85,10 @@ OPENAI_API_KEY=dummy python -m gpt_oss.evals \
 ```
 
 ### Reproduce the benchmark result of acceptance length
-
+> Note: On B200, if top k is 1, set `--attention-backend trtllm_mha`
 ```bash
+git clone https://github.com/sgl-project/SpecForge.git
+cd SpecForge/benchmarks
 config_list=(
     "1,0,0,0"
     "1,3,1,4"
@@ -137,8 +139,6 @@ python3 -m sglang.launch_server --model openai/gpt-oss-120b --speculative-algo E
 Benchmark Command
 
 ```bash
-git clone https://github.com/sgl-project/SpecForge.git
-cd SpecForge/benchmarks
 config_list=(
     "1,0,0,0"
     "1,3,1,4"
