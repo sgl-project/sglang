@@ -4,15 +4,12 @@ from __future__ import annotations
 Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
 
-import logging
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import triton
-
-logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
@@ -50,11 +47,11 @@ global_zero_init_workspace_buffer = None
 
 @dataclass
 class TRTLLMMLAPrefillMetadata:
-    """Metadata for TRTLLM MLA decode operations."""
+    """Metadata for TRTLLM MLA prefill operations."""
 
     max_seq_len: int
-    cum_seq_lens: torch.Tensor = None
-    seq_lens: torch.Tensor = None
+    cum_seq_lens: torch.Tensor
+    seq_lens: torch.Tensor
 
 
 @dataclass
@@ -100,7 +97,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         # Workspace allocation
-        self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 10240
+        self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
         global global_zero_init_workspace_buffer
         if global_zero_init_workspace_buffer is None:
             global_zero_init_workspace_buffer = torch.zeros(
@@ -113,8 +110,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
         self.decode_cuda_graph_kv_indices = None
-        self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
         self.forward_prefill_metadata: Optional[TRTLLMMLAPrefillMetadata] = None
+        self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
