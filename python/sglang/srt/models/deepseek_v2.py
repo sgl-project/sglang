@@ -132,13 +132,18 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
 
-if _use_aiter and _is_gfx95_supported:
-    from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
+_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
+if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
-    from sglang.srt.layers.quantization.rocm_mxfp4_utils import *
+    from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
+        batched_gemm_afp4wfp4_pre_quant,
+        fused_flatten_mxfp4_quant,
+        fused_rms_mxfp4_quant,
+    )
     from sglang.srt.layers.rocm_linear_utils import (
         aiter_dsv3_router_gemm,
+        fused_qk_rope_cat,
         get_dsv3_gemm_output_zero_allocator_size,
     )
 
@@ -295,7 +300,7 @@ class MoEGate(nn.Module):
         ):
             # router gemm output float32
             logits = dsv3_router_gemm(hidden_states, self.weight)
-        elif _use_aiter and _is_gfx95_supported and hidden_states.shape[0] <= 256:
+        elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
             logits = aiter_dsv3_router_gemm(
                 hidden_states, self.weight, gemm_output_zero_allocator
             )
@@ -1285,11 +1290,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
             else:
-                if (
-                    _use_aiter
-                    and _is_gfx95_supported
-                    and self.q_b_proj.weight.dtype == torch.uint8
-                ):
+                if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                     q, k_nope = fused_rms_mxfp4_quant(
                         q,
                         self.q_a_layernorm.weight,
@@ -1332,7 +1333,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = q_nope_out[:, :expected_m, :]
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
-            if _use_aiter and _is_gfx95_supported and self.w_kc.dtype == torch.uint8:
+            if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
                 x = q_nope.transpose(0, 1)
                 q_nope_out = torch.empty(
                     x.shape[0],
@@ -1399,7 +1400,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 **extra_args,
             )
         else:
-            if _use_aiter and _is_gfx95_supported:
+            if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
                 q, k = fused_qk_rope_cat(
@@ -1440,7 +1441,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
-            if _use_aiter and _is_gfx95_supported and self.w_vc.dtype == torch.uint8:
+            if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
                 attn_bmm_output = torch.empty(
                     x.shape[0],
@@ -2160,8 +2161,7 @@ class DeepseekV2Model(nn.Module):
 
         self.gemm_output_zero_allocator_size = 0
         if (
-            _use_aiter
-            and _is_gfx95_supported
+            _use_aiter_gfx95
             and config.n_routed_experts == 256
             and self.embed_tokens.embedding_dim == 7168
         ):
@@ -2522,11 +2522,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
-            if (
-                _use_aiter
-                and _is_gfx95_supported
-                and self.quant_config.get_name() == "quark"
-            ):
+            if _use_aiter_gfx95 and self.quant_config.get_name() == "quark":
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )

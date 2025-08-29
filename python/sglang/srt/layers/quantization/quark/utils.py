@@ -166,7 +166,13 @@ def e8m0_to_f32(x):
 
 def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format: str):
     if "mxfp4" in quant_format:
+        # when dtype is bf16, the processing flow is to dynamic quantize bf16 tensor to uint8 tensor
+        # do w_kc (bf16) first to get the w_kc(uint8) w_s_kc(uint8)
+        # and w_vc repeating the same procedure of w_kc to get  w_vc(uint8) w_s_vc(uint8)
         if w.dtype == torch.bfloat16:
+            w_kc, w_vc = w.unflatten(
+                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             w_kc, w_s_kc = b_dynamic_mxfp4_quant(w_kc.transpose(-2, -1))
             w_kc = w_kc.transpose(-2, -1)
             w_s_kc = w_s_kc.transpose(-2, -1)
@@ -174,6 +180,13 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
             w_s_kc = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
             w_s_vc = w_s_vc.contiguous().transpose(1, 2)
         elif w.dtype == torch.uint8:  # static quant for mxfp4
+            # when dtype is uint8, it means the w has been quantized to mxfp4 format
+            # but we must separate it to w_kc and w_vc.
+            # The quantized tensor size is only half of original tensor size
+            # and the scaling factor is 1/32, the transpose behavior will be not correct
+            # need to upcast it to fp32 to separate w to w_kc and w_vc
+            # to ensure the following transpose behavior is correct
+            # and then do mxfp4 quant again
             w = mxfp4_to_f32(w, True).to(torch.bfloat16)
             w_scales = self_attn.kv_b_proj.weight_scale.repeat_interleave(32, dim=-1)
             w_scales = e8m0_to_f32(w_scales).to(torch.bfloat16)
