@@ -210,7 +210,7 @@ def sglang_per_token_group_quant_int8(
         dtype=torch.float32,
     )
 
-    sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
+    sgl_per_token_group_quant_8bit(x, x_q, x_s, group_size, eps, int8_min, int8_max)
 
     return x_q, x_s
 
