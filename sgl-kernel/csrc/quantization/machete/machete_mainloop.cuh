@@ -45,10 +45,10 @@
 #include "cutlass/trace.h"
 
 #include "cutlass/detail/collective.hpp"
+#include "quantization/extensions/cute_utils.cuh"
 // clang-format on
 
 #include "dispatch_policy_machete.cuh"
-#include "quantization/extensions/cute_utils.cuh"
 
 namespace machete {
 
