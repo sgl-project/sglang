@@ -311,10 +311,6 @@ async def async_request_openai_chat_completions(
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
     async with _create_bench_client_session() as session:
-        if request_func_input.output_len > 2:
-            print(
-                f"!!!!! request_func_input.output_len: {request_func_input.output_len}"
-            )
         payload = {
             "model": request_func_input.model,
             "messages": messages,
