@@ -5,7 +5,7 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
-      - "scripts/**"
+      - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
@@ -13,7 +13,7 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
-      - "scripts/**"
+      - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
