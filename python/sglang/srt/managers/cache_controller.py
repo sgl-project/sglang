@@ -772,12 +772,19 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if (
-                    operation.host_indices is not None
-                ) and self.prefetch_rate_limit_check():
-                    hash_value, storage_hit_count = self._generic_storage_hit_query(
-                        operation
-                    )
+                hash_value = []
+                storage_hit_count = 0
+                
+                if operation.host_indices is not None:
+                    if self.prefetch_rate_limit_check():
+                        # Query storage for available pages
+                        hash_value, storage_hit_count = self._generic_storage_hit_query(
+                            operation
+                        )
+                    else:
+                        # Rate limited - re-queue the operation to try again later
+                        self.prefetch_queue.put(operation)
+                        continue
 
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
