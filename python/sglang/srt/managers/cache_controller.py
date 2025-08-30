@@ -18,7 +18,7 @@ import math
 import threading
 import time
 from queue import Empty, Full, PriorityQueue, Queue
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 
@@ -182,12 +182,14 @@ class StorageOperation:
         token_ids: List[int],
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
+        self.prefix_pages = prefix_pages
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -263,6 +265,12 @@ class HiCacheController:
             self.storage_config = self._generate_storage_config(
                 model_name, storage_backend_extra_config
             )
+
+            # todo: support prefix pages for other storage backends
+            self.should_pass_through_prefix_pages = self.storage_backend_type in [
+                "file"
+            ]
+
             # In MLA backend, only one rank needs to backup the KV cache
             self.backup_skip = (
                 self.storage_config.is_mla_model
@@ -309,6 +317,12 @@ class HiCacheController:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
                 )
+
+            if self.should_pass_through_prefix_pages:
+                self.storage_backend.register_page_retriever(
+                    self._retrieve_host_page_data
+                )
+
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
@@ -818,42 +832,73 @@ class HiCacheController:
         host_indices: torch.Tensor,
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
-        operation = StorageOperation(host_indices, token_ids, hash_value=hash_value)
+        operation = StorageOperation(
+            host_indices, token_ids, hash_value=hash_value, prefix_pages=prefix_pages
+        )
         self.backup_queue.put(operation)
         return operation.id
 
+    def _retrieve_host_page_data(
+        self, page_keys: list[str], host_indices: torch.Tensor
+    ) -> Optional[Tuple]:
+        """
+        Retrieve page data from host memory according to the storage backend type and layout.
+        """
+
+        if self.storage_backend_type == "mooncake":
+            return self.mem_pool_host.get_buffer_meta(
+                page_keys,
+                host_indices,
+                self.storage_config.tp_rank,
+            )
+        elif (
+            self.storage_backend_type == "hf3fs"
+            and self.mem_pool_host.layout == "page_first"
+        ):
+            return self.mem_pool_host.get_buffer_with_hash(page_keys, host_indices)
+        else:
+            return self.mem_pool_host.get_flat_data_page(host_indices[0])
+
     # non-zero copy
-    def _generic_page_set(self, hash_values, host_indices) -> bool:
+    def _generic_page_set(
+        self, hash_values, host_indices, prefix_pages: Optional[Tuple] = None
+    ) -> bool:
         data = [
-            self.mem_pool_host.get_flat_data_page(host_indices[i * self.page_size])
+            self._retrieve_host_page_data(
+                [], host_indices[i * self.page_size : (i + 1) * self.page_size]
+            )
             for i in range(len(hash_values))
         ]
-        return self.storage_backend.batch_set(hash_values, data)
+        return self.storage_backend.batch_set(
+            hash_values, data, prefix_pages=prefix_pages
+        )
 
     # zero copy
-    def _mooncake_page_set(self, hash_values, host_indices) -> bool:
-        key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(
-            hash_values,
-            host_indices,
-            self.storage_config.tp_rank,
+    def _mooncake_page_set(
+        self, hash_values, host_indices, prefix_pages: Optional[Tuple] = None
+    ) -> bool:
+        key_strs, buffer_ptrs, buffer_sizes = self._retrieve_host_page_data(
+            hash_values, host_indices
         )
         success = self.storage_backend.batch_set(
             key_strs,
             target_location=buffer_ptrs,
             target_sizes=buffer_sizes,
+            prefix_pages=prefix_pages,
         )
         return success
 
     # zero copy
-    def _3fs_zero_copy_page_set(self, hash_values, host_indices) -> bool:
-        hashes, dsts = self.mem_pool_host.get_buffer_with_hash(
-            hash_values, host_indices
-        )
-        return self.storage_backend.batch_set(hashes, dsts)
+    def _3fs_zero_copy_page_set(
+        self, hash_values, host_indices, prefix_pages: Optional[Tuple] = None
+    ) -> bool:
+        hashes, dsts = self._retrieve_host_page_data(hash_values, host_indices)
+        return self.storage_backend.batch_set(hashes, dsts, prefix_pages=prefix_pages)
 
     # Backup batch by batch
     def _page_backup(self, operation):
@@ -876,9 +921,17 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+
+            # Set prefix pages in the last batch
+            prefix_pages = (
+                operation.prefix_pages
+                if i + batch_size >= len(operation.hash_value)
+                else None
+            )
+
             # Set one batch token, and record if success.
             # todo: allow partial success
-            success = backup_set_func(batch_hashes, batch_host_indices)
+            success = backup_set_func(batch_hashes, batch_host_indices, prefix_pages)
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
