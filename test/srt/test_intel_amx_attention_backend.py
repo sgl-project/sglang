@@ -107,7 +107,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
                 "--attention-backend",
                 "intel_amx",
                 "--mem-fraction-static",
-                "0.05",
+                "0.4",
                 "--disable-radix",
                 "--trust-remote-code",
                 "--disable-overlap-schedule",

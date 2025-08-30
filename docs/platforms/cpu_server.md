@@ -84,7 +84,6 @@ git checkout <YOUR-DESIRED-VERSION>
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
-pip install intel-openmp
 pip install -e "python[all_cpu]"
 
 # Build the CPU backend kernels
@@ -134,6 +133,11 @@ Notes:
     export SGLANG_CPU_OMP_THREADS_BIND="0-39|43-82|86-125|128-167|171-210|214-253"
     ```
 
+    Please beware that with SGLANG_CPU_OMP_THREADS_BIND set,
+    the available memory amounts of the ranks cannot be determined in prior.
+    You may need to set proper `--mem-fraction-static` or `--max-total-tokens`
+    to avoid out-of-memory error.
+
 3. A warmup step is automatically triggered when the service is started.
 The server is ready when you see the log `The server is fired up and ready to roll!`.
 
@@ -159,7 +163,7 @@ python -m sglang.bench_serving -h
 ```
 
 Additionally, the requests can be formed with
-[OpenAI Completions API](https://docs.sglang.ai/backend/openai_api_completions.html)
+[OpenAI Completions API](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
 and sent via the command line (e.g. using `curl`) or via your own script.
 
 ## Example: Running DeepSeek-R1
@@ -175,7 +179,6 @@ python -m sglang.launch_server                 \
     --quantization w8a8_int8                   \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 65536                    \
     --tp 6
 ```
 
@@ -189,7 +192,6 @@ python -m sglang.launch_server                 \
     --device cpu                               \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 65536                    \
     --tp 6
 ```
 
