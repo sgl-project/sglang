@@ -23,8 +23,10 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import random
 import signal
 import threading
+import time
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
@@ -67,6 +69,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
+    get_bool_env_var,
     get_zmq_socket,
     is_cuda,
     kill_process_tree,
@@ -93,8 +96,8 @@ class Engine(EngineBase):
         3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
 
     Note:
-    1. The HTTP server, Engine, and TokenizerManager both run in the main process.
-    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
+    2. Inter-process communication (IPC) is handled via the ZMQ library, with each process using a different port.
     """
 
     def __init__(self, **kwargs):
@@ -259,7 +262,7 @@ class Engine(EngineBase):
                     f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
                 )
 
-        logger.info(f"data_parallel_rank: {data_parallel_rank}")
+        logger.debug(f"data_parallel_rank: {data_parallel_rank}")
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -450,15 +453,20 @@ class Engine(EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[
+        if load_format == "flattened_bucket":
+            serialized_named_tensors = named_tensors
+        else:
+            serialized_named_tensors = [
                 MultiprocessingSerializer.serialize(named_tensors)
                 for _ in range(self.server_args.tp_size)
-            ],
+            ]
+        obj = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
             flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
+
         return loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
@@ -529,6 +537,22 @@ class Engine(EngineBase):
         return loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
+
+    def freeze_gc(self):
+        """
+        To maintain a high performance server with low latency, we want to reduce the
+        stalls caused by the garbage collector scanning through a large number of objects.
+
+        It is usually helpful to start the server and warm it up with real requests to
+        initialize many of the long-lived objects that do not need to be garbage collected.
+
+        After sufficient warmup, we can call this function to freeze the garbage collector
+        so that all objects created before this point are considered out of scope for garbage
+        collection.
+        """
+
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.freeze_gc())
 
     """
     Execute an RPC call on all scheduler processes.
@@ -627,9 +651,15 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if not server_args.enable_symm_mem:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
-    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    # flashinfer uses this environment variable for various kernels from MoE to quant kernels
+    os.environ["TRTLLM_ENABLE_PDL"] = "1"
+
+    # Can also be passed as argument
+    os.environ["SGLANG_RUN_ID"] = (
+        f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
+    )
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -642,15 +672,15 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.10",
+            "0.3.0rc1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
-    if _is_cuda:
+    if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.2",
+            "0.3.7",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

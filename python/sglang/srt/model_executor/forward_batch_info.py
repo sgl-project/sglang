@@ -40,9 +40,10 @@ import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
-    DPPaddingMode,
+    DpPaddingMode,
     get_attention_dp_rank,
     get_attention_tp_size,
+    set_dp_buffer_len,
 )
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import (
@@ -240,6 +241,9 @@ class ForwardBatch:
     prefix_chunk_num_tokens: Optional[List[int]] = None
     # KV Indices for each chunk
     prefix_chunk_kv_indices: Optional[List[torch.Tensor]] = None
+    # For MLA chunked prefix cache used in chunked prefill
+    # Tell attention backend whether lse needs to be returned
+    mha_return_lse: Optional[bool] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -274,13 +278,13 @@ class ForwardBatch:
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The padding mode for DP attention
-    dp_padding_mode: Optional[DPPaddingMode] = None
+    dp_padding_mode: Optional[DpPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
     # this will be recomputed in LogitsMetadata.from_forward_batch
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
-    gathered_buffer: Optional[torch.Tensor] = None
+    global_dp_buffer_len: Optional[int] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -628,7 +632,7 @@ class ForwardBatch:
                 (global_num_tokens[i] - 1) // attn_tp_size + 1
             ) * attn_tp_size
 
-        dp_padding_mode = DPPaddingMode.get_dp_padding_mode(global_num_tokens)
+        dp_padding_mode = DpPaddingMode.get_dp_padding_mode(global_num_tokens)
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -642,22 +646,37 @@ class ForwardBatch:
         else:
             buffer_len = sum(global_num_tokens)
 
-        self.gathered_buffer = torch.zeros(
-            (buffer_len, model_runner.model_config.hidden_size),
-            dtype=model_runner.dtype,
-            device=model_runner.device,
-        )
-
         if len(global_num_tokens) > 1:
             num_tokens = global_num_tokens[get_attention_dp_rank()]
         else:
             num_tokens = global_num_tokens[0]
 
-        if self.forward_mode.is_decode():
-            setattr(self, "raw_bs", self.batch_size)
-            self.batch_size = num_tokens
+        self.global_dp_buffer_len = buffer_len
+        set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
 
         bs = self.batch_size
+
+        if self.forward_mode.is_decode():
+            if self.is_extend_in_batch and dp_padding_mode.is_max_len():
+                setattr(self, "_original_forward_mode", self.forward_mode)
+                self.forward_mode = ForwardMode.EXTEND
+                self.extend_num_tokens = bs
+                self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
+                self.extend_prefix_lens = self.seq_lens - 1
+                self.extend_start_loc = torch.arange(
+                    bs, dtype=torch.int32, device=self.seq_lens.device
+                )
+                self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
+                self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+                self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
+            else:
+                setattr(self, "_original_batch_size", self.batch_size)
+                if self.spec_info is not None:
+                    bs = self.batch_size = (
+                        num_tokens // self.spec_info.num_tokens_per_batch
+                    )
+                else:
+                    bs = self.batch_size = num_tokens
 
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
@@ -689,6 +708,7 @@ class ForwardBatch:
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
 
+        # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
@@ -712,7 +732,9 @@ class ForwardBatch:
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
 
-        bs = getattr(self, "raw_bs", self.batch_size)
+        self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
+        self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
+        bs = self.batch_size
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft

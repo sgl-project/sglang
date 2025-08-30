@@ -457,26 +457,40 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace) {
-  struct MmaConfig0 {
+  struct MmaConfigSmallM {
+    // Swap A/B
+    using ElementA = cutlass::float_e4m3_t;
+    using MmaTileShape = Shape<_128, _32, _128>;
+    using ClusterShape = Shape<_2, _1, _1>;
+    // TODO: Check Pingpong or Cooperative
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
+    using ScaleConfig =
+        cutlass::detail::Sm90BlockwiseScaleConfig<128, 1, 128, cute::GMMA::Major::K, cute::GMMA::Major::K>;
+    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  };
+
+  struct MmaConfigH20LargeK {
     using ElementA = cutlass::float_e4m3_t;
     using MmaTileShape = Shape<_64, _128, _128>;
     using ClusterShape = Shape<_2, _1, _1>;
     using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;
     using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
-    using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
-
+    using ScaleConfig =
+        cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128, cute::GMMA::Major::K, cute::GMMA::Major::K>;
     using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
     using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
   };
 
-  struct MmaConfig1 {
+  struct MmaConfigHx00AndH20SmallK {
     using ElementA = cutlass::float_e4m3_t;
     using MmaTileShape = Shape<_128, _128, _128>;
     using ClusterShape = Shape<_1, _2, _1>;
     using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
     using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
-    using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
-
+    using ScaleConfig =
+        cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128, cute::GMMA::Major::K, cute::GMMA::Major::K>;
     using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
     using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
   };
@@ -484,26 +498,34 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
   int num_experts = (int)expert_offsets.size(0);
   torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
   torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
+  torch::Tensor output_t = output.t();
+  torch::Tensor a_t = a.t();
+  torch::Tensor b_t = b.transpose(1, 2);
+  torch::Tensor scales_a_t = scales_a.t();
+  torch::Tensor scales_b_t = scales_b.transpose(1, 2);
 
-  if (at::cuda::getCurrentDeviceProperties()->multiProcessorCount == 78 && a.size(1) > 128) {
-    // For H20 with K > 128, use Pingpong Schedule
-    run_get_group_gemm_starts<MmaConfig0::LayoutSFA, MmaConfig0::LayoutSFB, MmaConfig0::ScaleConfig>(
+  const std::string H20_device_type_str("NVIDIA H20");
+  bool is_h20_device = std::string(at::cuda::getCurrentDeviceProperties()->name) == H20_device_type_str;
+
+  if (a.size(0) <= 2048) {
+    run_get_group_gemm_starts<MmaConfigSmallM::LayoutSFA, MmaConfigSmallM::LayoutSFB, MmaConfigSmallM::ScaleConfig>(
         expert_offsets,
         a_ptrs,
         b_ptrs,
         out_ptrs,
         a_scales_ptrs,
         b_scales_ptrs,
-        a,
-        b,
-        output,
-        scales_a,
-        scales_b,
+        b_t,
+        a_t,
+        output_t,
+        scales_b_t,
+        scales_a_t,
         layout_sfa,
         layout_sfb,
         problem_sizes,
-        problem_sizes_transpose);
-    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig0, cutlass::layout::RowMajor>(
+        problem_sizes_transpose,
+        true);
+    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfigSmallM, cutlass::layout::ColumnMajor>(
         out_ptrs,
         a_ptrs,
         b_ptrs,
@@ -514,41 +536,82 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
         stride_c,
         layout_sfa,
         layout_sfb,
-        problem_sizes,
+        problem_sizes_transpose,
         expert_offsets,
         workspace);
+    output = output_t.t();
   } else {
-    // For H20 with K <= 128, and H100 & H200 & H800, use Cooperative Schedule
-    run_get_group_gemm_starts<MmaConfig1::LayoutSFA, MmaConfig1::LayoutSFB, MmaConfig1::ScaleConfig>(
-        expert_offsets,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        a,
-        b,
-        output,
-        scales_a,
-        scales_b,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        problem_sizes_transpose);
-    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig1, cutlass::layout::RowMajor>(
-        out_ptrs,
-        a_ptrs,
-        b_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        stride_a,
-        stride_b,
-        stride_c,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        expert_offsets,
-        workspace);
+    if (is_h20_device && a.size(1) > 128) {
+      // For H20 with K > 128, use Pingpong Schedule
+      run_get_group_gemm_starts<
+          MmaConfigH20LargeK::LayoutSFA,
+          MmaConfigH20LargeK::LayoutSFB,
+          MmaConfigH20LargeK::ScaleConfig>(
+          expert_offsets,
+          a_ptrs,
+          b_ptrs,
+          out_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          a,
+          b,
+          output,
+          scales_a,
+          scales_b,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          problem_sizes_transpose);
+      launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfigH20LargeK, cutlass::layout::RowMajor>(
+          out_ptrs,
+          a_ptrs,
+          b_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          stride_a,
+          stride_b,
+          stride_c,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          expert_offsets,
+          workspace);
+    } else {
+      // For H20 with K <= 128, and H100 & H200 & H800, use Cooperative Schedule
+      run_get_group_gemm_starts<
+          MmaConfigHx00AndH20SmallK::LayoutSFA,
+          MmaConfigHx00AndH20SmallK::LayoutSFB,
+          MmaConfigHx00AndH20SmallK::ScaleConfig>(
+          expert_offsets,
+          a_ptrs,
+          b_ptrs,
+          out_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          a,
+          b,
+          output,
+          scales_a,
+          scales_b,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          problem_sizes_transpose);
+      launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfigHx00AndH20SmallK, cutlass::layout::RowMajor>(
+          out_ptrs,
+          a_ptrs,
+          b_ptrs,
+          a_scales_ptrs,
+          b_scales_ptrs,
+          stride_a,
+          stride_b,
+          stride_c,
+          layout_sfa,
+          layout_sfb,
+          problem_sizes,
+          expert_offsets,
+          workspace);
+    }
   }
 }
 
@@ -645,7 +708,11 @@ void fp8_blockwise_scaled_grouped_mm(
 
 #if defined(CUTLASS_ARCH_MMA_SM100A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
-  if (sm_version == 100) {
+  if (sm_version == 100
+#if CUDA_VERSION >= 12090
+      || sm_version == 103
+#endif
+  ) {
     if (output.scalar_type() == torch::kBFloat16) {
       sm100_fp8_blockwise_group_mm_dispatch_shape<cutlass::bfloat16_t>(
           output,
@@ -739,5 +806,5 @@ void fp8_blockwise_scaled_grouped_mm(
   }
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(
-      can_implement, "No implemented fp8_blockwise_scaled_mm for current compute capability: ", sm_version);
+      can_implement, "No implemented fp8_blockwise_scaled_grouped_mm for current compute capability: ", sm_version);
 }

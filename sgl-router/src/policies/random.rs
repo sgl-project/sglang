@@ -2,6 +2,7 @@
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy};
 use crate::core::Worker;
+use crate::metrics::RouterMetrics;
 use rand::Rng;
 
 /// Random selection policy
@@ -28,8 +29,12 @@ impl LoadBalancingPolicy for RandomPolicy {
             return None;
         }
 
-        let mut rng = rand::thread_rng();
-        let random_idx = rng.gen_range(0..healthy_indices.len());
+        let mut rng = rand::rng();
+        let random_idx = rng.random_range(0..healthy_indices.len());
+        let worker = workers[healthy_indices[random_idx]].url();
+
+        RouterMetrics::record_processed_request(worker);
+        RouterMetrics::record_policy_decision(self.name(), worker);
         Some(healthy_indices[random_idx])
     }
 

@@ -1,12 +1,19 @@
+import re
 from typing import Dict, Optional, Tuple, Type
+
+from sglang.srt.harmony_parser import HarmonyParser
 
 
 class StreamingParseResult:
     """Result of streaming incremental parsing."""
 
-    def __init__(self, normal_text: str = "", reasoning_text: str = ""):
-        self.normal_text = normal_text
-        self.reasoning_text = reasoning_text
+    def __init__(
+        self,
+        normal_text: Optional[str] = None,
+        reasoning_text: Optional[str] = None,
+    ):
+        self.normal_text = normal_text or ""
+        self.reasoning_text = reasoning_text or ""
 
 
 class BaseReasoningFormatDetector:
@@ -185,6 +192,64 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class GptOssDetector(BaseReasoningFormatDetector):
+    """
+    Detector for T4-style reasoning format (GPT-OSS), using the HarmonyParser.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+        super().__init__(
+            "<|channel|>analysis<|message|>",
+            "<|end|>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+        self.parser = HarmonyParser()
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        events = self.parser.parse(text)
+        # Flush the buffer for one-shot parsing
+        events += self.parser.parse("")
+
+        reasoning_text = "".join(
+            [e.content for e in events if e.event_type == "reasoning"]
+        )
+        normal_parts = []
+        for e in events:
+            if e.event_type == "normal":
+                normal_parts.append(e.content)
+            elif e.event_type == "tool_call":
+                # Use raw_text to preserve structural markers for function call detector
+                normal_parts.append(e.raw_text if e.raw_text else e.content)
+        normal_text = "".join(normal_parts)
+        # Tool call events preserve raw text with structural markers
+
+        return StreamingParseResult(
+            normal_text=normal_text,
+            reasoning_text=reasoning_text,
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        events = self.parser.parse(new_text)
+
+        reasoning_text = "".join(
+            [e.content for e in events if e.event_type == "reasoning"]
+        )
+        normal_parts = []
+        for e in events:
+            if e.event_type == "normal":
+                normal_parts.append(e.content)
+            elif e.event_type == "tool_call":
+                # Use raw_text to preserve structural markers for function call detector
+                normal_parts.append(e.raw_text if e.raw_text else e.content)
+        normal_text = "".join(normal_parts)
+
+        return StreamingParseResult(
+            normal_text=normal_text,
+            reasoning_text=reasoning_text,
+        )
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -198,10 +263,12 @@ class ReasoningParser:
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
+        "deepseek-v3": Qwen3Detector,
+        "glm45": Qwen3Detector,
+        "gpt-oss": GptOssDetector,
+        "kimi": KimiDetector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
-        "glm45": Qwen3Detector,
-        "kimi": KimiDetector,
         "step3": DeepSeekR1Detector,
     }
 
@@ -209,7 +276,7 @@ class ReasoningParser:
         self,
         model_type: Optional[str] = None,
         stream_reasoning: bool = True,
-        force_reasoning: bool = False,
+        force_reasoning: Optional[bool] = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -218,19 +285,25 @@ class ReasoningParser:
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
 
-        if model_type.lower() == "qwen3-thinking":
+        # Special cases where we override force_reasoning
+        if model_type.lower() in {"qwen3-thinking", "gpt-oss"}:
             force_reasoning = True
 
-        self.detector = detector_class(
-            stream_reasoning=stream_reasoning, force_reasoning=force_reasoning
-        )
+        # Only pass force_reasoning if explicitly set, let detectors use their defaults
+        kwargs = {"stream_reasoning": stream_reasoning}
+        if force_reasoning is not None:
+            kwargs["force_reasoning"] = force_reasoning
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, str]:
+        self.detector = detector_class(**kwargs)
+
+    def parse_non_stream(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:
         """Non-streaming call: one-time parsing"""
         ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
 
-    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, str]:
+    def parse_stream_chunk(
+        self, chunk_text: str
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text

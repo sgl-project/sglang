@@ -52,7 +52,11 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
@@ -106,15 +110,10 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         self.language_model = Qwen2ForCausalLM(
             config.text_config, quant_config, prefix=add_prefix("model", prefix)
         )
+        self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        # Get all special token IDs for audio
-        audio_token_id: int = getattr(
-            mm_inputs, "audio_token_id", mm_inputs.im_token_id
-        )
-
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens([audio_token_id])
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # Extract audio features from input items
@@ -143,7 +142,9 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            audio_data_embedding_func=self.get_audio_feature,
+            data_embedding_funcs={
+                Modality.AUDIO: self.get_audio_feature,
+            },
             positions=positions,
         )
 

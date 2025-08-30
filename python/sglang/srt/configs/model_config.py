@@ -32,6 +32,7 @@ from sglang.srt.hf_transformers_utils import (
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +65,12 @@ class ModelConfig:
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
-
+        # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.model_impl = model_impl
 
-        # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
@@ -134,6 +134,12 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Ernie4_5_MoeForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
+
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
@@ -161,19 +167,20 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if get_bool_env_var(
-                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
+                reason = "Target model's" if is_draft_model else "User-specified"
+                msg = (
+                    f"Warning: {reason} context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
+                    f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config."
+                )
+                if (
+                    get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN")
+                    or is_in_ci()  # FIXME: fix this special case
                 ):
-                    logger.warning(
-                        f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
-                        f"This may lead to incorrect model outputs or CUDA errors."
-                    )
+                    logger.warning(msg)
                     self.context_len = context_length
                 else:
                     raise ValueError(
-                        f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
-                        f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
-                        f"To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+                        f"{msg} To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
                     )
             else:
                 self.context_len = context_length
@@ -277,12 +284,10 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
 
-        config = self.hf_config
-
         # multimodal
-        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
-            config, "image_token_index", None
-        )
+        self.image_token_id = getattr(
+            self.hf_config, "image_token_id", None
+        ) or getattr(self.hf_config, "image_token_index", None)
 
     @staticmethod
     def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
@@ -338,6 +343,19 @@ class ModelConfig:
                 "kv_n_heads",
                 self.hf_config.num_attention_heads,
             )
+        if self.hf_config.model_type in ["nemotron-nas"]:
+            nkvh = {
+                self.hf_config.num_attention_heads // block.attention.n_heads_in_group
+                for block in self.hf_config.block_configs
+                if not block.attention.no_op
+            }
+            if len(nkvh) == 0:
+                raise RuntimeError("Couldn't determine number of kv heads")
+            if len(nkvh) > 1:
+                raise ValueError(
+                    "Variable GQA (VGQA) is not yet supported for nemotron-nas in sglang"
+                )
+            return next(iter(nkvh))
 
         attributes = [
             # For Falcon:
@@ -639,6 +657,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
+        or "Qwen3ForSequenceClassification" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
         or "Contriever" in model_architectures
@@ -656,6 +675,8 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
+    "Glm4vForConditionalGeneration",
+    "Glm4vMoeForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
