@@ -102,6 +102,20 @@ class HiCacheStorage(ABC):
         """
         pass
 
+    @abstractmethod
+    def delete(self, key: str) -> bool:
+        """
+        Delete the entry associated with the given key.
+        """
+        pass
+
+    @abstractmethod
+    def clear(self) -> bool:
+        """
+        Clear all entries in the storage.
+        """
+        pass
+
     def batch_exists(self, keys: List[str]) -> int:
         """
         Check if the keys exist in the storage.

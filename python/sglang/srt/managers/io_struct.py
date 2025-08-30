@@ -815,6 +815,15 @@ class BatchEmbeddingOut:
 
 
 @dataclass
+class ClearHiCacheReqInput:
+    pass
+
+
+@dataclass
+class ClearHiCacheReqOutput:
+    success: bool
+
+@dataclass
 class FlushCacheReqInput:
     pass
 
