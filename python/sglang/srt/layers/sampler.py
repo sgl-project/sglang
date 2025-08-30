@@ -165,6 +165,184 @@ class Sampler(nn.Module):
         return batch_next_token_ids
 
 
+# Multi-channel architecture overview (MossTTSD example)
+# - Channels (C):
+#   - The model is organized into C parallel token streams.
+#   - Each channel can have its own vocabulary size (vocab_size_list[i]) and its
+#     own embedding and lm head parameters (heterogeneous token spaces like text/speech).
+#
+# - Inputs:
+#   - Accept IDs in shape [T, C] (or a flattened 1D form that can be reshaped).
+#   - Convention: channel 0 carries text+speech tokens; channels 1..C-1 carry speech
+#     tokens and may be padded with a speech pad token when absent.
+#
+# - Embeddings fusion:
+#   - Compute per-position embeddings for each channel independently.
+#   - Sum embeddings across channels to form a single hidden representation.
+#   - Feed the fused representation into a shared backbone (e.g., Qwen3Model) so
+#     cross-channel interactions happen in the backbone.
+#
+# - Outputs:
+#   - Each channel has its own lm head to produce per-channel logits.
+#   - The model forward returns a List[LogitsProcessorOutput] of length C, one per channel.
+#
+# - Downstream implication:
+#   - Consumers should expect per-channel logits and typically produce one next-token
+#     ID per channel.
+#
+# - Application features:
+#   - Text-to-Speech: use channel 0 for text, and use the remaining channels for
+#     speech units (e.g., phoneme, pitch, duration, style) with their own vocabularies.
+#   - Token-level fusion: sum per-channel embeddings and model them jointly in the
+#     shared backbone to capture cross-channel interactions.
+#   - Control and extensibility: decode or constrain channels independently, and
+#     fall back to single-channel by padding when multi-channel inputs are absent.
+class MultiChannelSampler(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
+        self.tp_sync_group = get_tp_group().device_group
+
+        if is_dp_attention_enabled():
+            self.tp_sync_group = get_attention_tp_group().device_group
+
+    def forward(
+        self,
+        logits_output: List[LogitsProcessorOutput],
+        sampling_info: SamplingBatchInfo,
+        return_logprob: bool,
+        top_logprobs_nums: List[int],
+        token_ids_logprobs: List[List[int]],
+    ):
+        """Run a sampler & compute logprobs and update logits_output accordingly.
+
+        Args:
+            logits_output: List of logits from the model forward
+            sampling_info: Metadata for sampling
+            return_logprob: If set, store the output logprob information to
+                logits_output
+            top_logprobs_nums: Number of top lobprobs per sequence in a batch
+            batch_next_token_ids: next token IDs. If set, skip sampling and only
+                compute output logprobs It is used for speculative decoding which
+                performs sampling in draft workers.
+        """
+        logits = [logit.next_token_logits for logit in logits_output]
+
+        # Apply the custom logit processors if registered in the sampling info.
+        if sampling_info.has_custom_logit_processor:
+            for logit in logits:
+                apply_custom_logit_processor(logit, sampling_info)
+
+        if self.use_nan_detection:
+            for i, logit in enumerate(logits):
+                if torch.any(torch.isnan(logit)):
+                    logger.warning(
+                        "Detected errors during sampling! NaN in the logits."
+                    )
+                    logits[i] = torch.where(
+                        torch.isnan(logit), torch.full_like(logit, -1e5), logit
+                    )
+                    if crash_on_warnings():
+                        raise ValueError(
+                            "Detected errors during sampling! NaN in the logits."
+                        )
+
+        if sampling_info.is_all_greedy:
+            # Use torch.argmax if all requests use greedy sampling
+            batch_next_token_ids = [torch.argmax(logit, dim=-1) for logit in logits]
+            if return_logprob:
+                logprobs = [
+                    torch.nn.functional.log_softmax(logit, dim=-1) for logit in logits
+                ]
+        else:
+            # Post process logits
+            for i, logit in enumerate(logits):
+                logit.div_(sampling_info.temperatures)
+                logits[i] = torch.softmax(logit, dim=-1)
+            probs = logits
+            del logits
+
+            if True:  # Keep this redundant check to simplify some internal code sync
+                batch_next_token_ids = []
+                if global_server_args_dict["sampling_backend"] == "flashinfer":
+                    for prob in probs:
+                        if sampling_info.need_min_p_sampling:
+                            prob = top_k_renorm_prob(prob, sampling_info.top_ks)
+                            prob = top_p_renorm_prob(prob, sampling_info.top_ps)
+                            token_ids = min_p_sampling_from_probs(
+                                prob, sampling_info.min_ps
+                            )
+                        else:
+                            token_ids = top_k_top_p_sampling_from_probs(
+                                prob.contiguous(),
+                                sampling_info.top_ks,
+                                sampling_info.top_ps,
+                                filter_apply_order="joint",
+                                check_nan=self.use_nan_detection,
+                            )
+                        batch_next_token_ids.append(token_ids)
+                elif global_server_args_dict["sampling_backend"] == "pytorch":
+                    # A slower fallback implementation with torch native operations.
+                    for prob in probs:
+                        token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                            prob,
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            sampling_info.min_ps,
+                            sampling_info.need_min_p_sampling,
+                        )
+                        batch_next_token_ids.append(token_ids)
+                else:
+                    raise ValueError(
+                        f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
+                    )
+            if return_logprob:
+                # clamp to avoid -inf
+                logprobs = [
+                    torch.log(prob).clamp(min=torch.finfo(prob.dtype).min)
+                    for prob in probs
+                ]
+
+        # Attach logprobs to logits_output (in-place modification)
+        if return_logprob:
+            for i, logit in enumerate(logits_output):
+                if any(x > 0 for x in top_logprobs_nums):
+                    (
+                        logit.next_token_top_logprobs_val,
+                        logit.next_token_top_logprobs_idx,
+                    ) = get_top_logprobs(logprobs[i], top_logprobs_nums)
+
+                if any(x is not None for x in token_ids_logprobs):
+                    (
+                        logit.next_token_token_ids_logprobs_val,
+                        logit.next_token_token_ids_logprobs_idx,
+                    ) = get_token_ids_logprobs(logprobs[i], token_ids_logprobs)
+
+                logit.next_token_logprobs = logprobs[i][
+                    torch.arange(
+                        len(batch_next_token_ids[i]), device=sampling_info.device
+                    ),
+                    batch_next_token_ids[i],
+                ]
+
+        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+            # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
+            # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
+            # the last all-reduce, the last lm_head matmul, and all sampling kernels.
+            # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
+            # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
+            # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
+
+            for i in range(len(batch_next_token_ids)):
+                torch.distributed.all_reduce(
+                    batch_next_token_ids[i],
+                    op=dist.ReduceOp.MIN,
+                    group=self.tp_sync_group,
+                )
+
+        return torch.stack(batch_next_token_ids, dim=1)
+
+
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,

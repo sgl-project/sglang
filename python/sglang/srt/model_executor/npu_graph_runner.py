@@ -89,6 +89,18 @@ class NPUGraphRunner(CudaGraphRunner):
                     else None
                 ),
             )
+        elif isinstance(output, list) and self.model_runner.server_args.multi_channel:
+            return [
+                LogitsProcessorOutput(
+                    next_token_logits=out.next_token_logits[: self.raw_num_token],
+                    hidden_states=(
+                        out.hidden_states[: self.raw_num_token]
+                        if out.hidden_states is not None
+                        else None
+                    ),
+                )
+                for out in output
+            ]
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
