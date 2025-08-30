@@ -50,13 +50,19 @@ logger = logging.getLogger(__name__)
 class MultiTokenizerMixin:
     """Mixin class for MultiTokenizerManager and DetokenizerManager"""
 
+    def _get_fields(self, cls):
+        if cls not in self._fields_cache:
+            self._fields_cache[cls] = [f.name for f in dataclasses.fields(cls)]
+        return self._fields_cache[cls]
+
     def create_sockets_mapping(self):
         if not hasattr(self, "tokenizer_mapping"):
             self.tokenizer_mapping = {}
-
         # Create ZMQ context if needed
         if not hasattr(self, "_zmq_context"):
             self._zmq_context = zmq.Context()
+        if not hasattr(self, "_fields_cache"):
+            self._fields_cache = {}
 
     def init_tokenizer_mapping(
         self, recv_obj: MultiTokenizerRegisterReq, worker_id: str
@@ -86,265 +92,30 @@ class MultiTokenizerMixin:
         return False
 
     def _handle_output_by_index(self, output, i):
-        if isinstance(output, BatchTokenIDOut):
-            new_output = BatchTokenIDOut(
-                rids=[output.rids[i]],
-                finished_reasons=(
-                    [output.finished_reasons[i]]
-                    if len(output.finished_reasons) > i
-                    else None
-                ),
-                decoded_texts=(
-                    [output.decoded_texts[i]] if len(output.decoded_texts) > i else None
-                ),
-                decode_ids=(
-                    [output.decode_ids[i]] if len(output.decode_ids) > i else None
-                ),
-                read_offsets=(
-                    [output.read_offsets[i]] if len(output.read_offsets) > i else None
-                ),
-                output_ids=(
-                    [output.output_ids[i]]
-                    if output.output_ids and len(output.output_ids) > i
-                    else None
-                ),
-                skip_special_tokens=(
-                    [output.skip_special_tokens[i]]
-                    if len(output.skip_special_tokens) > i
-                    else None
-                ),
-                spaces_between_special_tokens=(
-                    [output.spaces_between_special_tokens[i]]
-                    if len(output.spaces_between_special_tokens) > i
-                    else None
-                ),
-                no_stop_trim=(
-                    [output.no_stop_trim[i]] if len(output.no_stop_trim) > i else None
-                ),
-                prompt_tokens=(
-                    [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
-                ),
-                completion_tokens=(
-                    [output.completion_tokens[i]]
-                    if len(output.completion_tokens) > i
-                    else None
-                ),
-                cached_tokens=(
-                    [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
-                ),
-                spec_verify_ct=(
-                    [output.spec_verify_ct[i]]
-                    if len(output.spec_verify_ct) > i
-                    else None
-                ),
-                input_token_logprobs_val=(
-                    [output.input_token_logprobs_val[i]]
-                    if output.input_token_logprobs_val
-                    else None
-                ),
-                input_token_logprobs_idx=(
-                    [output.input_token_logprobs_idx[i]]
-                    if output.input_token_logprobs_idx
-                    else None
-                ),
-                output_token_logprobs_val=(
-                    [output.output_token_logprobs_val[i]]
-                    if output.output_token_logprobs_val
-                    else None
-                ),
-                output_token_logprobs_idx=(
-                    [output.output_token_logprobs_idx[i]]
-                    if output.output_token_logprobs_idx
-                    else None
-                ),
-                input_top_logprobs_val=(
-                    [output.input_top_logprobs_val[i]]
-                    if output.input_top_logprobs_val
-                    else None
-                ),
-                input_top_logprobs_idx=(
-                    [output.input_top_logprobs_idx[i]]
-                    if output.input_top_logprobs_idx
-                    else None
-                ),
-                output_top_logprobs_val=(
-                    [output.output_top_logprobs_val[i]]
-                    if output.output_top_logprobs_val
-                    else None
-                ),
-                output_top_logprobs_idx=(
-                    [output.output_top_logprobs_idx[i]]
-                    if output.output_top_logprobs_idx
-                    else None
-                ),
-                input_token_ids_logprobs_val=(
-                    [output.input_token_ids_logprobs_val[i]]
-                    if output.input_token_ids_logprobs_val
-                    else None
-                ),
-                input_token_ids_logprobs_idx=(
-                    [output.input_token_ids_logprobs_idx[i]]
-                    if output.input_token_ids_logprobs_idx
-                    else None
-                ),
-                output_token_ids_logprobs_val=(
-                    [output.output_token_ids_logprobs_val[i]]
-                    if output.output_token_ids_logprobs_val
-                    else None
-                ),
-                output_token_ids_logprobs_idx=(
-                    [output.output_token_ids_logprobs_idx[i]]
-                    if output.output_token_ids_logprobs_idx
-                    else None
-                ),
-                output_hidden_states=(
-                    [output.output_hidden_states[i]]
-                    if output.output_hidden_states
-                    else None
-                ),
-            )
-        elif isinstance(output, BatchEmbeddingOut):
-            new_output = BatchEmbeddingOut(
-                rids=[output.rids[i]],
-                finished_reasons=(
-                    [output.finished_reasons[i]]
-                    if len(output.finished_reasons) > i
-                    else None
-                ),
-                embeddings=(
-                    [output.embeddings[i]] if len(output.embeddings) > i else None
-                ),
-                prompt_tokens=(
-                    [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
-                ),
-                cached_tokens=(
-                    [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
-                ),
-            )
-        elif isinstance(output, BatchStrOut):
-            new_output = BatchStrOut(
-                rids=[output.rids[i]],
-                finished_reasons=(
-                    [output.finished_reasons[i]]
-                    if len(output.finished_reasons) > i
-                    else None
-                ),
-                output_strs=(
-                    [output.output_strs[i]] if len(output.output_strs) > i else None
-                ),
-                output_ids=(
-                    [output.output_ids[i]]
-                    if output.output_ids and len(output.output_ids) > i
-                    else None
-                ),
-                prompt_tokens=(
-                    [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
-                ),
-                completion_tokens=(
-                    [output.completion_tokens[i]]
-                    if len(output.completion_tokens) > i
-                    else None
-                ),
-                cached_tokens=(
-                    [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
-                ),
-                spec_verify_ct=(
-                    [output.spec_verify_ct[i]]
-                    if len(output.spec_verify_ct) > i
-                    else None
-                ),
-                input_token_logprobs_val=(
-                    [output.input_token_logprobs_val[i]]
-                    if output.input_token_logprobs_val
-                    else None
-                ),
-                input_token_logprobs_idx=(
-                    [output.input_token_logprobs_idx[i]]
-                    if output.input_token_logprobs_idx
-                    else None
-                ),
-                output_token_logprobs_val=(
-                    [output.output_token_logprobs_val[i]]
-                    if output.output_token_logprobs_val
-                    else None
-                ),
-                output_token_logprobs_idx=(
-                    [output.output_token_logprobs_idx[i]]
-                    if output.output_token_logprobs_idx
-                    else None
-                ),
-                input_top_logprobs_val=(
-                    [output.input_top_logprobs_val[i]]
-                    if output.input_top_logprobs_val
-                    else None
-                ),
-                input_top_logprobs_idx=(
-                    [output.input_top_logprobs_idx[i]]
-                    if output.input_top_logprobs_idx
-                    else None
-                ),
-                output_top_logprobs_val=(
-                    [output.output_top_logprobs_val[i]]
-                    if output.output_top_logprobs_val
-                    else None
-                ),
-                output_top_logprobs_idx=(
-                    [output.output_top_logprobs_idx[i]]
-                    if output.output_top_logprobs_idx
-                    else None
-                ),
-                input_token_ids_logprobs_val=(
-                    [output.input_token_ids_logprobs_val[i]]
-                    if output.input_token_ids_logprobs_val
-                    else None
-                ),
-                input_token_ids_logprobs_idx=(
-                    [output.input_token_ids_logprobs_idx[i]]
-                    if output.input_token_ids_logprobs_idx
-                    else None
-                ),
-                output_token_ids_logprobs_val=(
-                    [output.output_token_ids_logprobs_val[i]]
-                    if output.output_token_ids_logprobs_val
-                    else None
-                ),
-                output_token_ids_logprobs_idx=(
-                    [output.output_token_ids_logprobs_idx[i]]
-                    if output.output_token_ids_logprobs_idx
-                    else None
-                ),
-                output_hidden_states=(
-                    [output.output_hidden_states[i]]
-                    if output.output_hidden_states
-                    else None
-                ),
-            )
-        elif isinstance(output, BatchMultimodalOut):
-            new_output = BatchMultimodalOut(
-                rids=[output.rids[i]],
-                finished_reasons=(
-                    [output.finished_reasons[i]]
-                    if len(output.finished_reasons) > i
-                    else None
-                ),
-                outputs=([output.outputs[i]] if len(output.outputs) > i else None),
-                prompt_tokens=(
-                    [output.prompt_tokens[i]] if len(output.prompt_tokens) > i else None
-                ),
-                completion_tokens=(
-                    [output.completion_tokens[i]]
-                    if len(output.completion_tokens) > i
-                    else None
-                ),
-                cached_tokens=(
-                    [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
-                ),
-            )
+        if not isinstance(output, (BatchTokenIDOut, BatchEmbeddingOut, BatchStrOut, BatchMultimodalOut)):
+            return output
         else:
-            new_output = output
-        return new_output
+            field_names = self._get_fields(type(output))
+            kwargs = {}
+            for field_name in field_names:
+                value = getattr(output, field_name, None)
+                if value is None:
+                    kwargs[field_name] = None
+                elif isinstance(value, list):
+                    kwargs[field_name] = [value[i]] if len(value) > i else None
+                else:
+                    kwargs[field_name] = value
+            return type(output)(**kwargs)
 
-
+    def clear_tokenizer_mapping(self):
+        if hasattr(self, "tokenizer_mapping"):
+            for socket in self.tokenizer_mapping.values():
+                try:
+                    socket.close()
+                except Exception as e:
+                    logger.warning(f"Failed to close socket: {e}")
+            self.tokenizer_mapping.clear()
+        
 class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
     """A router to receive requests from MultiTokenizerManager"""
 

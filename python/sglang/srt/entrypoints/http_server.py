@@ -1242,6 +1242,7 @@ def launch_server(
             port_args_shm.unlink()
             server_args_shm.unlink()
             scheduler_info_shm.unlink()
+            _global_state.tokenizer_manager.clear_tokenizer_mapping()
         else:
             warmup_thread.join()
 
