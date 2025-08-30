@@ -1283,7 +1283,7 @@ def sample_image_requests(
         buf = io.BytesIO()
         img.save(buf, format=image_format, quality=85)
         encoded = pybase64.b64encode(buf.getvalue()).decode("utf-8")
-        image_data = f"data:image/jpeg;base64,{encoded}"
+        image_data = f"data:image/{image_format};base64,{encoded}"
         image_bytes = len(image_data.encode("utf-8"))
         return img, image_data, image_bytes
 
