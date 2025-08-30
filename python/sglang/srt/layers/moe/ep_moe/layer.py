@@ -782,7 +782,7 @@ class DeepEPMoE(EPMoE):
         return hidden_states
 
 
-def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
+def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_deepep():
         return DeepEPMoE
 
@@ -795,8 +795,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
             return FusedMoE
         try:
             # Check the quantization argument directly
-            quantization = global_server_args_dict.get("quantization")
-            if quantization == "modelopt_fp4":
+            if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
                 from sglang.srt.layers.moe.fused_moe_triton.layer import (
                     FlashInferFP4MoE,
                 )
@@ -805,7 +804,8 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
         except:
             pass
 
-    if should_use_flashinfer_trtllm_moe():
+    if should_use_flashinfer_trtllm_moe() and quant_config is not None:
+        # FIXME: FlashInferFusedMoE only supports fp8 quant now
         return FlashInferFusedMoE
     if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE

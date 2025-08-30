@@ -105,7 +105,6 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "weight_loader_disable_mmap",
     "enable_multimodal",
     "enable_symm_mem",
-    "quantization",
     "enable_custom_logit_processor",
     "disaggregation_mode",
 ]

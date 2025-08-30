@@ -88,7 +88,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
         )
 
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
             + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok,
