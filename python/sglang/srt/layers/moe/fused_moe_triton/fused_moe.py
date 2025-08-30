@@ -1,3 +1,4 @@
+# NOTE: this file will be separated into sglang/srt/layers/moe/moe_funner/triton_utils.py
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/fused_moe.py
 
 """Fused MoE kernel."""
@@ -15,7 +16,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -37,6 +37,10 @@ from sglang.srt.utils import (
     is_hip,
     next_power_of_2,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
