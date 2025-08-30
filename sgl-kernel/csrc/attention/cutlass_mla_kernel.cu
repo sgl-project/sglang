@@ -28,22 +28,7 @@ limitations under the License.
 #include "cutlass_sm100_mla/kernel/sm100_mla_tile_scheduler.hpp"
 
 // clang-format off
-#if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
-void cutlass_mla_decode(
-    torch::Tensor const& out,
-    torch::Tensor const& q_nope,
-    torch::Tensor const& q_pe,
-    torch::Tensor const& kv_c_and_k_pe_cache,
-    torch::Tensor const& seq_lens,
-    torch::Tensor const& page_table,
-    torch::Tensor const& workspace,
-    int64_t num_kv_splits) {
-  TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_decode");
-}
-int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count, int64_t num_kv_splits) {
-  TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_get_workspace_size");
-}
-#else
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12040
 
 #define CUTLASS_CHECK(status)                                                       \
   {                                                                                 \
@@ -207,6 +192,8 @@ void runMla(
     }                                        \
   }()
 
+#endif
+
 void cutlass_mla_decode(
     torch::Tensor const& out,
     torch::Tensor const& q_nope,
@@ -217,6 +204,9 @@ void cutlass_mla_decode(
     torch::Tensor const& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
+#if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
+  TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_decode");
+#else
   auto in_dtype = q_nope.dtype();
   at::cuda::CUDAGuard device_guard{(char)q_nope.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope.get_device());
@@ -243,9 +233,13 @@ void cutlass_mla_decode(
     });
     return true;
   });
+#endif
 }
 
 int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count, int64_t num_kv_splits) {
+#if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
+  TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_get_workspace_size");
+#else
   // Workspace size depends on ElementAcc and ElementLSE (same as ElementAcc)
   // which are float, so Element type here doesn't matter.
   using MlaSm100Type = MlaSm100<cutlass::half_t, true>;
@@ -263,7 +257,7 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
   MlaSm100Type::Fmha::set_split_kv(arguments);
 
   return MlaSm100Type::Fmha::get_workspace_size(arguments);
+#endif
 }
 
-#endif
 // clang-format on
