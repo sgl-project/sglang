@@ -52,7 +52,7 @@ from sglang.srt.utils import (
 
 _is_npu = is_npu()
 
-is_one_device_per_process = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
+IS_ONE_DEVICE_PER_PROCESS = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
 
 
 @dataclass
@@ -254,7 +254,7 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
-        device_id = 0 if is_one_device_per_process else local_rank
+        device_id = 0 if IS_ONE_DEVICE_PER_PROCESS else local_rank
         if is_cuda_alike():
             self.device = torch.device(f"cuda:{device_id}")
         elif _is_npu:
@@ -853,7 +853,7 @@ class GroupCoordinator:
         )
         return obj_list
 
-    def all_gather_object(self, obj: Any):
+    def all_gather_object(self, obj: Any) -> List[Any]:
         objs = [None] * self.world_size
         torch.distributed.all_gather_object(objs, obj, group=self.cpu_group)
         return objs
