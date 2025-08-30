@@ -69,6 +69,7 @@ class TpModelWorker:
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
+        self.dp_rank = dp_rank
 
         # Init model and tokenizer
         self.model_config = ModelConfig.from_server_args(
@@ -91,6 +92,8 @@ class TpModelWorker:
             moe_ep_size=server_args.ep_size,
             pp_rank=pp_rank,
             pp_size=server_args.pp_size,
+            dp_rank=dp_rank,
+            dp_size=server_args.dp_size,
             nccl_port=nccl_port,
             dp_rank=dp_rank,
             server_args=server_args,
