@@ -33,11 +33,16 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import set_kv_buffer_kernel
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    direct_register_custom_op,
+    get_bool_env_var,
+    is_cuda,
+    is_npu,
+    next_power_of_2,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,46 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 if _is_npu:
     import torch_npu
+
+if _is_cuda:
+    from functools import lru_cache
+
+    from sgl_kernel import set_kv_buffer_kernel
+
+    @lru_cache
+    def _register_set_kv_kernel():
+        """Register only once."""
+
+        def set_kv_buffer_impl(
+            k_cache: torch.Tensor,
+            v_cache: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            loc: torch.Tensor,
+        ) -> None:
+            set_kv_buffer_kernel(
+                k_cache=k_cache,
+                v_cache=v_cache,
+                k=k,
+                v=v,
+                loc=loc,
+            )
+
+        def set_kv_buffer_fake(
+            k_cache: torch.Tensor,
+            v_cache: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            loc: torch.Tensor,
+        ) -> None:
+            pass
+
+        direct_register_custom_op(
+            op_name="set_kv_buffer",
+            op_func=set_kv_buffer_impl,
+            mutates_args=["k_cache", "v_cache"],
+            fake_impl=set_kv_buffer_fake,
+        )
 
 
 class ReqToTokenPool:
@@ -213,6 +258,8 @@ class MHATokenToKVPool(KVCache):
             f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
         )
         self.mem_usage = (k_size + v_size) / GB
+        if _is_cuda:
+            _register_set_kv_kernel()
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -397,7 +444,7 @@ class MHATokenToKVPool(KVCache):
             cache_v = cache_v.view(self.store_dtype)
 
         if _is_cuda:
-            set_kv_buffer_kernel(
+            torch.ops.sglang.set_kv_buffer(
                 k_cache=self.k_buffer[layer_id - self.start_layer],
                 v_cache=self.v_buffer[layer_id - self.start_layer],
                 k=cache_k,
