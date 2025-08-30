@@ -49,6 +49,11 @@ if _is_cuda:
         sgl_per_token_quant_fp8,
     )
 
+    try:
+        from sgl_kernel import sgl_silu_and_mul_per_tensor_quant_fp8
+    except ImportError:
+        logging.warning(f"Failed to import sgl_silu_and_mul_per_tensor_quant_fp8")
+
 if _is_hip:
     if _use_aiter:
         try:
@@ -1404,10 +1409,22 @@ else:
         scale: Optional[torch.Tensor] = None,
         num_token_padding: Optional[int] = None,
         use_per_token_if_dynamic: bool = False,
+        use_fused_silu_and_quant: bool = False,
+        intermediate_cache_silu: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
-        shape = input.shape
+        if use_fused_silu_and_quant:
+            ## double hidden dimension, silu is not applied yet.
+            shape = (input.shape[0], input.shape[1] // 2)
+            assert (
+                scale is None and not use_per_token_if_dynamic
+            ), "fused silu and quant only support dynamic per_tensor quant"
+            assert (
+                intermediate_cache_silu is not None
+            ), "intermediate_cache_silu is required"
+        else:
+            shape = input.shape
         if num_token_padding:
             shape = (max(num_token_padding, input.shape[0]), shape[1])
         output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
@@ -1421,9 +1438,20 @@ else:
                 sgl_per_token_quant_fp8(input, output, scale)
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                sgl_per_tensor_quant_fp8(
-                    input, output, scale, is_static=False
-                )  # False for dynamic
+                if use_fused_silu_and_quant:
+                    # input_gate, input_up = input.chunk(2, dim=-1)
+                    # input_gate = input_gate.contiguous()
+                    # input_up = input_up.contiguous()
+                    sgl_silu_and_mul_per_tensor_quant_fp8(
+                        input, intermediate_cache_silu, output, scale, is_static=False
+                    )  # False for dynamic
+                    # sgl_per_tensor_quant_fp8(
+                    #     input_1, output, scale, is_static=False
+                    # )  # False for dynamic
+                else:
+                    sgl_per_tensor_quant_fp8(
+                        input, output, scale, is_static=False
+                    )  # False for dynamic
         else:
             # Static scaling
             assert (

@@ -661,6 +661,15 @@ class InternVLChatModel(nn.Module):
 
             loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
+        # Skip params that are created by quantization wrappers and are not expected in the ckpt
+        _quant_only_fragments = (
+            "weight_scale",  # per-matrix FP8 scales (e.g., w2_weight_scale, w13_weight_scale)
+        )
+        unloaded_params = {
+            n
+            for n in unloaded_params
+            if not any(frag in n for frag in _quant_only_fragments)
+        }
         if unloaded_params:
             raise RuntimeError(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"

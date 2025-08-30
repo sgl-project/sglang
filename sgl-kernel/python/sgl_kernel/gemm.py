@@ -146,6 +146,18 @@ def sgl_per_token_quant_fp8(
     torch.ops.sgl_kernel.sgl_per_token_quant_fp8.default(input, output_q, output_s)
 
 
+def sgl_silu_and_mul_per_tensor_quant_fp8(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    is_static: bool,
+) -> None:
+    torch.ops.sgl_kernel.sgl_silu_and_mul_per_tensor_quant_fp8.default(
+        input, output, output_q, output_s, is_static
+    )
+
+
 def cutlass_scaled_fp4_mm(
     a: torch.Tensor,
     b: torch.Tensor,
