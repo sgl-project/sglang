@@ -95,6 +95,7 @@ impl RouterFactory {
             prefill_policy,
             decode_policy,
             ctx.client.clone(),
+            ctx.router_config.request_timeout_secs,
             ctx.router_config.worker_startup_timeout_secs,
             ctx.router_config.worker_startup_check_interval_secs,
             ctx.router_config.retry.clone(),
