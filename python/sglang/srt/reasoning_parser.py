@@ -25,11 +25,13 @@ class BaseReasoningFormatDetector:
         think_end_token: str,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
+        is_hybrid: bool = False,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
+        self.is_hybrid = is_hybrid
 
         self._buffer = ""
         self.stripped_think_start = False
@@ -138,13 +140,19 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        is_hybrid: bool = False,
+    ):
         # DeepSeek-R1 is assumed to be reasoning until `</think>` token
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
+            is_hybrid=is_hybrid,
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
@@ -165,12 +173,18 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        is_hybrid: bool = True,
+    ):
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            is_hybrid=is_hybrid,
         )
 
 
@@ -183,12 +197,18 @@ class KimiDetector(BaseReasoningFormatDetector):
     and the rest of the text as `normal_text`.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        is_hybrid: bool = False,
+    ):
         super().__init__(
             "◁think▷",
             "◁/think▷",
             force_reasoning=False,
             stream_reasoning=stream_reasoning,
+            is_hybrid=is_hybrid,
         )
 
 
@@ -197,12 +217,18 @@ class GptOssDetector(BaseReasoningFormatDetector):
     Detector for T4-style reasoning format (GPT-OSS), using the HarmonyParser.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        is_hybrid: bool = False,
+    ):
         super().__init__(
             "<|channel|>analysis<|message|>",
             "<|end|>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            is_hybrid=is_hybrid,
         )
         self.parser = HarmonyParser()
 
@@ -277,6 +303,7 @@ class ReasoningParser:
         model_type: Optional[str] = None,
         stream_reasoning: bool = True,
         force_reasoning: Optional[bool] = None,
+        is_hybrid: Optional[bool] = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -289,10 +316,15 @@ class ReasoningParser:
         if model_type.lower() in {"qwen3-thinking", "gpt-oss"}:
             force_reasoning = True
 
+        if model_type.lower() == "qwen3":
+            is_hybrid = True
+
         # Only pass force_reasoning if explicitly set, let detectors use their defaults
         kwargs = {"stream_reasoning": stream_reasoning}
         if force_reasoning is not None:
             kwargs["force_reasoning"] = force_reasoning
+        if force_reasoning is not None:
+            kwargs["is_hybrid"] = is_hybrid
 
         self.detector = detector_class(**kwargs)
 
