@@ -770,3 +770,6 @@ void causal_conv1d_fwd(
     const std::optional<at::Tensor>& has_initial_state,
     bool silu_activation,
     int64_t pad_slot_id);
+
+at::Tensor
+allocate_pin_memory(int64_t size, at::ScalarType dtype, bool write_combined, std::optional<int64_t> numa_affinity);

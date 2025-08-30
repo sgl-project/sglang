@@ -358,6 +358,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("store_kv_cache(Tensor k_cache, Tensor v_cache, Tensor out_loc, Tensor k, Tensor v) -> ()");
   m.impl("store_kv_cache", &store_kv_cache);
+  m.def("allocate_pin_memory(int size, ScalarType dtype, bool write_combined, int? numa_affinity) -> Tensor");
+  m.impl("allocate_pin_memory", &allocate_pin_memory);
 
   /*
    * From FlashInfer

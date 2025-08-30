@@ -22,6 +22,24 @@ enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
+# NUMA
+if(DEFINED ENV{CONDA_PREFIX})
+    set(CONDA_LIB_DIR "$ENV{CONDA_PREFIX}/lib")
+    message(STATUS "Using Conda lib dir: ${CONDA_LIB_DIR}")
+    link_directories(${CONDA_LIB_DIR})
+    set(CONDA_INCLUDE_DIR "$ENV{CONDA_PREFIX}/include")
+    include_directories(${CONDA_INCLUDE_DIR})
+
+    # Look for libnuma in Conda's lib directory
+    find_library(NUMA_LIB numa HINTS "${CONDA_LIB_DIR}")
+    if(NUMA_LIB)
+        message(STATUS "Found libnuma: ${NUMA_LIB}")
+    else()
+        message(FATAL_ERROR "libnuma not found in Conda environment at ${CONDA_LIB_DIR}\n"
+                            "Please install it using: conda install libnuma numactl\n")
+    endif()
+endif()
+
 message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
     message("CUDA_VERSION ${CUDA_VERSION} >= 13.0")
@@ -315,6 +333,7 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
 
     "csrc/memory/store.cu"
+    "csrc/memory/numa_pin_memory.cu"
     "csrc/kvcacheio/transfer.cu"
 
     "csrc/speculative/eagle_utils.cu"
@@ -365,7 +384,7 @@ add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB} c10 cuda cublas cublasLt mscclpp_static)
 
 # flash attention
 target_compile_definitions(common_ops PRIVATE
