@@ -114,9 +114,6 @@ class EPMoE(FusedMoE):
             with_bias=with_bias,
         )
 
-        self.start_expert_id = self.moe_ep_rank * self.num_local_experts
-        self.end_expert_id = self.start_expert_id + self.num_local_experts - 1
-
         self.intermediate_size = intermediate_size
 
         if isinstance(quant_config, Fp8Config):
