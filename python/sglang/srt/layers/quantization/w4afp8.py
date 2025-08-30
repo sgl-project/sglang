@@ -20,7 +20,6 @@ from sglang.srt.utils import set_weight_attrs
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.ep_moe.layer import EPMoE
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -282,47 +281,116 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: EPMoE,
         x: torch.Tensor,
-        topk_output: StandardTopKOutput,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
+        deepep_mode: Optional["DispatchOutputFormat"] = None,
     ) -> torch.Tensor:
-
+        
         # TODO(ch-wan): move it out of this class
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+        from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import DispatchOutputFormat
+        
+        if deepep_mode is None:
+            local_topk_ids = topk_ids
+            local_topk_ids = torch.where(
+                topk_ids == -1,
+                layer.num_experts,
+                topk_ids,
+            )
 
-        topk_weights, topk_ids, _ = topk_output
-        local_topk_ids = topk_ids
-        local_topk_ids = torch.where(
-            topk_ids == -1,
-            layer.num_experts,
-            topk_ids,
-        )
-
-        output = cutlass_w4a8_moe(
-            layer.start_expert_id,
-            layer.end_expert_id,
-            layer.num_experts,
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
-            topk_weights,
-            topk_ids,
-            local_topk_ids,
-            self.a_strides1,
-            self.b_strides1,
-            self.c_strides1,
-            self.a_strides2,
-            self.b_strides2,
-            self.c_strides2,
-            self.s_strides13,
-            self.s_strides2,
-            self.expert_offsets,
-            self.problem_sizes1,
-            self.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
-        )
-        if moe_runner_config.routed_scaling_factor is not None:
-            output *= moe_runner_config.routed_scaling_factor
-        return output
+            output = cutlass_w4a8_moe(
+                layer.start_expert_id,
+                layer.end_expert_id,
+                layer.num_experts,
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                topk_weights,
+                topk_ids,
+                local_topk_ids,
+                self.a_strides1,
+                self.b_strides1,
+                self.c_strides1,
+                self.a_strides2,
+                self.b_strides2,
+                self.c_strides2,
+                self.s_strides13,
+                self.s_strides2,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
+            )
+            if moe_runner_config.routed_scaling_factor is not None:
+                output *= moe_runner_config.routed_scaling_factor
+            return output
+        
+        elif deepep_mode == DispatchOutputFormat.DEEPEP_NORMAL:
+            num_tokens = x.shape[0]
+            if num_tokens > 0:
+                output = cutlass_w4a8_moe(
+                    layer.start_expert_id,
+                    layer.end_expert_id,
+                    layer.num_experts,
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale_inv,
+                    layer.w2_weight_scale_inv,
+                    topk_weights,
+                    topk_ids,
+                    None,
+                    self.a_strides1,
+                    self.b_strides1,
+                    self.c_strides1,
+                    self.a_strides2,
+                    self.b_strides2,
+                    self.c_strides2,
+                    self.s_strides13,
+                    self.s_strides2,
+                    self.expert_offsets,
+                    self.problem_sizes1,
+                    self.problem_sizes2,
+                    layer.w13_input_scale,
+                    layer.w2_input_scale,
+                    deepep_mode=deepep_mode,
+                )
+                return output
+            else:
+                return x
+            
+        elif deepep_mode == DispatchOutputFormat.DEEPEP_LL:
+            output = cutlass_w4a8_moe(
+                layer.start_expert_id,
+                layer.end_expert_id,
+                layer.num_experts,
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                None,
+                topk_ids,
+                masked_m,
+                self.a_strides1,
+                self.b_strides1,
+                self.c_strides1,
+                self.a_strides2,
+                self.b_strides2,
+                self.c_strides2,
+                self.s_strides13,
+                self.s_strides2,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
+                deepep_mode=deepep_mode,
+            )
+            
+            return output
