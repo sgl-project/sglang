@@ -348,8 +348,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
-            layer.weight = Parameter(weight, requires_grad=False)
-            layer.weight_scale_inv = Parameter(weight_scale, requires_grad=False)
+            layer.weight.data = weight
+            layer.weight_scale_inv.data = weight_scale
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
