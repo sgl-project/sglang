@@ -49,7 +49,7 @@ use std::collections::HashMap;
 
 // ============= Message Types =============
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ChatMessage {
     System {
@@ -88,6 +88,101 @@ pub enum ChatMessage {
         content: String,
         name: String,
     },
+}
+
+// Custom deserializer to avoid ambiguous matching with untagged enums.
+// We select the variant based on the explicit `role` field to preserve
+// assistant/tool/function semantics and prevent losing fields like `tool_calls`.
+impl<'de> serde::Deserialize<'de> for ChatMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let role = value
+            .get("role")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| serde::de::Error::missing_field("role"))?;
+
+        match role {
+            "system" => {
+                #[derive(serde::Deserialize)]
+                struct SystemMsg {
+                    role: String,
+                    content: String,
+                    #[serde(default)]
+                    name: Option<String>,
+                }
+                let m: SystemMsg = serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(ChatMessage::System { role: m.role, content: m.content, name: m.name })
+            }
+            "user" => {
+                #[derive(serde::Deserialize)]
+                struct UserMsg {
+                    role: String,
+                    content: UserMessageContent,
+                    #[serde(default)]
+                    name: Option<String>,
+                }
+                let m: UserMsg = serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(ChatMessage::User { role: m.role, content: m.content, name: m.name })
+            }
+            "assistant" => {
+                #[derive(serde::Deserialize)]
+                struct AssistantMsg {
+                    role: String,
+                    #[serde(default)]
+                    content: Option<String>,
+                    #[serde(default)]
+                    name: Option<String>,
+                    #[serde(default)]
+                    tool_calls: Option<Vec<ToolCall>>,
+                    #[serde(default)]
+                    function_call: Option<FunctionCallResponse>,
+                    #[serde(default)]
+                    reasoning_content: Option<String>,
+                }
+                let m: AssistantMsg = serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(ChatMessage::Assistant {
+                    role: m.role,
+                    content: m.content,
+                    name: m.name,
+                    tool_calls: m.tool_calls,
+                    function_call: m.function_call,
+                    reasoning_content: m.reasoning_content,
+                })
+            }
+            "tool" => {
+                #[derive(serde::Deserialize)]
+                struct ToolMsg {
+                    role: String,
+                    content: String,
+                    tool_call_id: String,
+                }
+                let m: ToolMsg = serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(ChatMessage::Tool { role: m.role, content: m.content, tool_call_id: m.tool_call_id })
+            }
+            "function" => {
+                #[derive(serde::Deserialize)]
+                struct FunctionMsg {
+                    role: String,
+                    content: String,
+                    name: String,
+                }
+                let m: FunctionMsg = serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(ChatMessage::Function { role: m.role, content: m.content, name: m.name })
+            }
+            _ => Err(serde::de::Error::custom(format!(
+                "Unsupported chat message role: {}",
+                role
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
