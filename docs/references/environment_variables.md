@@ -6,14 +6,18 @@ SGLang supports various environment variables that can be used to configure its 
 
 ## General Configuration
 
-| Environment Variable | Description | Default Value |
-| --- | --- | --- |
-| `SGLANG_USE_MODELSCOPE` | Enable using models from ModelScope | `false` |
-| `SGLANG_HOST_IP` | Host IP address for the server | `0.0.0.0` |
-| `SGLANG_PORT` | Port for the server | auto-detected |
-| `SGLANG_LOGGING_CONFIG_PATH` | Custom logging configuration path | Not set |
-| `SGLANG_DISABLE_REQUEST_LOGGING` | Disable request logging | `false` |
-| `SGLANG_HEALTH_CHECK_TIMEOUT` | Timeout for health check in seconds | `20` |
+| Environment Variable             | Description                                 | Default Value |
+|----------------------------------|---------------------------------------------|---------------|
+| `SGLANG_USE_MODELSCOPE`          | Enable using models from ModelScope         | `false`       |
+| `SGLANG_HOST_IP`                 | Host IP address for the server              | `0.0.0.0`     |
+| `SGLANG_PORT`                    | Port for the server                         | Auto-detected |
+| `SGLANG_LOGGING_CONFIG_PATH`     | Custom logging configuration file path      | Not set       |
+| `SGLANG_DISABLE_REQUEST_LOGGING` | Disable HTTP request logging                | `false`       |
+| `SGLANG_HEALTH_CHECK_TIMEOUT`    | Health check timeout (seconds)              | `20`          |
+| `SGLANG_UVICORN_DEFAULT_FORMAT`  | Uvicorn default log format (Python logging) | Not set       |
+| `SGLANG_UVICORN_ACCESS_FORMAT`   | Uvicorn HTTP access log format              | Not set       |
+| `SGLANG_UVICORN_DATE_FORMAT`     | Uvicorn log timestamp format                | Not set       |
+
 
 ## Performance Tuning
 
