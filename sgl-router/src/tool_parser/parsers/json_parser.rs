@@ -356,6 +356,81 @@ impl ToolParser for JsonParser {
             return Ok(StreamResult::Incomplete);
         }
 
+        // Extract JSON content first to check for separators
+        let extracted_json = self.extract_json_content(&state.buffer);
+
+        // Handle multiple JSON objects with separators
+        // Check if we have a separator and potentially multiple JSON objects
+        let separator = &self.token_config.separator;
+        if !separator.is_empty() && extracted_json.contains(separator.as_str()) {
+            // Try to find a complete JSON object before the separator
+            if let Some(separator_pos) = extracted_json.find(separator.as_str()) {
+                // Get JSON before separator
+                let before_separator = &extracted_json[..separator_pos];
+
+                // Try to parse the JSON before the separator
+                match serde_json::from_str::<Value>(before_separator) {
+                    Ok(value) => {
+                        // Parse tool calls from this JSON
+                        let tools = self.parse_json_value(&value)?;
+                        if !tools.is_empty() {
+                            // We need to figure out how much to remove from the original buffer
+                            // Find where the separator is in the original buffer and remove up to and including it
+                            if let Some(sep_in_original) = state.buffer.find(separator.as_str()) {
+                                let remaining =
+                                    state.buffer[sep_in_original + separator.len()..].to_string();
+                                state.buffer = remaining;
+                            }
+
+                            // Return the first tool as complete
+                            if let Some(tool) = tools.into_iter().next() {
+                                return Ok(StreamResult::ToolComplete(tool));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Failed to parse, continue to try other methods
+                    }
+                }
+            }
+        }
+
+        // Handle multiple start tokens (e.g., multiple <|python_tag|> markers)
+        if !self.token_config.start_tokens.is_empty() {
+            let start_token = &self.token_config.start_tokens[0];
+            if !start_token.is_empty() {
+                // Find all occurrences of start token
+                let occurrences: Vec<_> =
+                    state.buffer.match_indices(start_token.as_str()).collect();
+                if occurrences.len() > 1 {
+                    // We have multiple start tokens, try to process the first complete one
+                    let first_pos = occurrences[0].0;
+                    let second_pos = occurrences[1].0;
+
+                    // Extract content between first and second start token
+                    let first_json_section = &state.buffer[first_pos..second_pos];
+                    let json_content = self.extract_json_content(first_json_section);
+
+                    // Try to parse this as complete JSON
+                    if let Ok(value) = serde_json::from_str::<Value>(json_content) {
+                        // Parse tool calls from this JSON
+                        let tools = self.parse_json_value(&value)?;
+                        if !tools.is_empty() {
+                            // Remove the processed section from buffer
+                            let remaining = state.buffer[second_pos..].to_string();
+                            state.buffer = remaining;
+
+                            // Return the first tool as complete
+                            if let Some(tool) = tools.into_iter().next() {
+                                return Ok(StreamResult::ToolComplete(tool));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Regular single JSON parsing
         // Extract JSON content
         let json_content = self.extract_json_content(&state.buffer);
 
@@ -364,16 +439,23 @@ impl ToolParser for JsonParser {
             Ok((value, consumed)) => {
                 // Check if we have a complete JSON structure
                 if consumed == json_content.len() {
-                    // Complete JSON, parse tool calls
-                    let tools = self.parse_json_value(&value)?;
-                    if !tools.is_empty() {
-                        // Clear buffer since we consumed everything
-                        state.buffer.clear();
+                    // Check if this is truly complete or just has null from incomplete parsing
+                    // We need to ensure the JSON actually ends properly (not cut off mid-key)
+                    let trimmed = json_content.trim();
+                    let looks_complete = trimmed.ends_with('}') || trimmed.ends_with(']');
 
-                        // Return the first tool as complete
-                        // TODO simplified version, address more complex version
-                        if let Some(tool) = tools.into_iter().next() {
-                            return Ok(StreamResult::ToolComplete(tool));
+                    if looks_complete {
+                        // Complete JSON, parse tool calls
+                        let tools = self.parse_json_value(&value)?;
+                        if !tools.is_empty() {
+                            // Clear buffer since we consumed everything
+                            state.buffer.clear();
+
+                            // Return the first tool as complete
+                            // TODO simplified version, address more complex version
+                            if let Some(tool) = tools.into_iter().next() {
+                                return Ok(StreamResult::ToolComplete(tool));
+                            }
                         }
                     }
                 } else {
