@@ -145,6 +145,7 @@ class PrefillBootstrapQueue:
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
+            self.scheduler.tree_cache,
             self.is_mla_backend,
         )
         return kv_manager

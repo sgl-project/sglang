@@ -41,6 +41,7 @@ class CommonKVManager(BaseKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
+        tree_cache: RadixCache,
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args

@@ -167,12 +167,14 @@ class MooncakeKVManager(BaseKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
+        tree_cache: RadixCache,
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
         self.local_ip = get_local_ip_auto()
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
+        self.tree_cache = tree_cache
         self.init_engine()
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -697,6 +699,7 @@ class MooncakeKVManager(BaseKVManager):
                                 )
                                 break
 
+                        self.tree_cache.check_hicache_events()
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
                         # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices

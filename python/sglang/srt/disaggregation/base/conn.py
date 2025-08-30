@@ -52,6 +52,7 @@ class BaseKVManager(ABC):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
+        tree_cache: RadixCache,
         is_mla_backend: Optional[bool] = False,
     ): ...
 
