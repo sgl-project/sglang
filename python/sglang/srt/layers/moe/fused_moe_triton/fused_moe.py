@@ -27,7 +27,6 @@ from sglang.srt.layers.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.utils import (
-    ceil_div,
     cpu_has_amx_support,
     direct_register_custom_op,
     get_bool_env_var,
@@ -35,7 +34,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    next_power_of_2,
+    log_warning_on_rank0,
 )
 
 _is_hip = is_hip()
@@ -877,7 +876,8 @@ def get_moe_configs(
         )
         if os.path.exists(try_config_file_path):
             with open(try_config_file_path) as f:
-                logger.warning(
+                log_warning_on_rank0(
+                    logger,
                     f"Config file not found at {config_file_path}. Fallback to triton version {try_triton_version} and use MoE kernel config from {try_config_file_path}. Performance might be sub-optimal!",
                 )
                 # If a configuration has been found, return it
@@ -885,12 +885,12 @@ def get_moe_configs(
 
     # If no optimized configuration is available, we will use the default
     # configuration
-    logger.warning(
+    log_warning_on_rank0(
+        logger,
         (
             "Using default MoE kernel config. Performance might be sub-optimal! "
-            "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
+            f"Config file not found at {config_file_path}, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
         ),
-        config_file_path,
     )
     return None
 

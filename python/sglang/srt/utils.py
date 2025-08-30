@@ -41,9 +41,11 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 import uuid
 import warnings
 from collections import OrderedDict, defaultdict
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -2355,6 +2357,13 @@ def log_info_on_rank0(logger, msg):
 
     if get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
+
+
+def log_warning_on_rank0(logger, msg):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.warning(msg)
 
 
 def load_json_config(data: str):

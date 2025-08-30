@@ -31,7 +31,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -117,8 +117,9 @@ class ModelConfig:
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
-                logger.info(
-                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
+                log_info_on_rank0(
+                    logger,
+                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal.",
                 )
             else:
                 enable_multimodal = True
