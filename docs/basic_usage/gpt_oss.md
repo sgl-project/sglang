@@ -6,7 +6,7 @@ Please refer to [https://github.com/sgl-project/sglang/issues/8833](https://gith
 
 ### Responses API
 
-GPT‑OSS is compatible with the OpenAI Responses API. Use `client.responses.create(...)` with `model`, `instructions`, `input`, and optional `tools` to enable built‑in tool use.
+GPT‑OSS is compatible with the OpenAI Responses API. Use `client.responses.create(...)` with `model`, `instructions`, `input`, and optional `tools` to enable built‑in tool use. You can set reasoning level via `instructions`, e.g., "Reasoning: high" (also supports "medium" and "low") — levels: low (fast), medium (balanced), high (deep).
 
 ### Built-in Tools
 
@@ -68,6 +68,16 @@ tools = [
     {"type": "code_interpreter"},
     {"type": "web_search_preview"},
 ]
+
+# Reasoning level example
+response = client.responses.create(
+    model="openai/gpt-oss-120b",
+    instructions="You are a helpful assistant."
+    reasoning_effort="high" # Supports high, medium, or low
+    input="In one sentence, explain the transformer architecture.",
+)
+print("====== reasoning: high ======")
+print(response.output_text)
 
 # Test python tool
 response = client.responses.create(
