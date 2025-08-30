@@ -1262,7 +1262,6 @@ def sample_image_requests(
         )
 
     # Sample text lengths
-    print(f"range_ratio: {range_ratio}")
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1), input_len + 1, size=num_requests
     )
