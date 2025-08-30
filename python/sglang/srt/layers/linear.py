@@ -210,7 +210,7 @@ class ReplicatedLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                torch.empty(self.output_size, dtype=self.params_dtype)
+                torch.zeros(self.output_size, dtype=self.params_dtype)
             )
             set_weight_attrs(
                 self.bias,
@@ -333,7 +333,7 @@ class ColumnParallelLinear(LinearBase):
         )
         if bias:
             self.bias = Parameter(
-                torch.empty(self.output_size_per_partition, dtype=params_dtype)
+                torch.zeros(self.output_size_per_partition, dtype=params_dtype)
             )
             set_weight_attrs(
                 self.bias,
@@ -1218,7 +1218,7 @@ class RowParallelLinear(LinearBase):
         )
 
         if bias:
-            self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
+            self.bias = Parameter(torch.zeros(self.output_size, dtype=params_dtype))
             set_weight_attrs(
                 self.bias,
                 {
