@@ -167,13 +167,19 @@ class FusedMoE(torch.nn.Module):
         if enable_flashinfer_cutlass_moe and quant_config is None:
             logger.warning("Disable flashinfer MoE when quantization config is None.")
             enable_flashinfer_cutlass_moe = False
-
+        self.moe_shared_expert_rank_num = global_server_args_dict[
+            "moe_shared_expert_rank_num"
+        ]
         self.enable_flashinfer_cutlass_moe = enable_flashinfer_cutlass_moe
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
+        self.moe_ep_size = (
+            get_moe_expert_parallel_world_size() - self.moe_shared_expert_rank_num
+        )
+        self.moe_ep_rank = (
+            get_moe_expert_parallel_rank() - self.moe_shared_expert_rank_num
+        )
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
-        assert num_experts % self.moe_ep_size == 0
+        assert (num_experts-self.num_fused_shared_experts) % self.moe_ep_size == 0
         self.num_local_experts = num_experts // self.moe_ep_size
         if self.moe_ep_size > 1:
             # TODO(ch-wan): support shared experts fusion
@@ -182,11 +188,19 @@ class FusedMoE(torch.nn.Module):
                 (self.num_experts,), -1, dtype=torch.int32, device="cpu"
             )
             # Create a expert map for the local experts
-            self.expert_map_cpu[
-                self.moe_ep_rank
-                * self.num_local_experts : (self.moe_ep_rank + 1)
-                * self.num_local_experts
-            ] = torch.arange(0, self.num_local_experts, dtype=torch.int32, device="cpu")
+            if self.moe_ep_rank >= 0:
+                self.expert_map_cpu[
+                    self.moe_ep_rank
+                    * self.num_local_experts : (self.moe_ep_rank + 1)
+                    * self.num_local_experts
+                ] = torch.arange(
+                    0, self.num_local_experts, dtype=torch.int32, device="cpu"
+                )
+            else:
+                 self.num_local_experts = self.num_fused_shared_experts
+                 self.expert_map_cpu[num_experts - self.num_fused_shared_experts:] = torch.arange(
+                    0, self.num_local_experts, dtype=torch.int32, device="cpu"
+                )
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size

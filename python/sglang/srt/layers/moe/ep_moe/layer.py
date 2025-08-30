@@ -364,7 +364,8 @@ class DeepEPMoE(EPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = get_deepep_mode()
-
+        self.rank = torch.distributed.get_rank()
+        
         # TODO: move to the beginning of the file
         from sglang.srt.distributed.parallel_state import get_tp_group
         from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
@@ -741,7 +742,9 @@ class DeepEPMoE(EPMoE):
         seg_indptr = seg_indptr.to(torch.int64)
 
         import torch_npu
-
+        if self.moe_ep_rank < 0:
+            seg_indptr = None
+            
         # gmm1: gate_up_proj
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
@@ -778,6 +781,9 @@ class DeepEPMoE(EPMoE):
             group_list=seg_indptr,
             output_dtype=output_dtype,
         )[0]
+
+        if self.moe_ep_rank < 0:
+            hidden_states /= self.routed_scaling_factor
 
         return hidden_states
 

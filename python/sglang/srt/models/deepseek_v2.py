@@ -352,6 +352,18 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
+        self.rank = torch.distributed.get_rank()
+        self.moe_shared_expert_rank_num = global_server_args_dict[
+            "moe_shared_expert_rank_num"
+        ]
+        self.num_experts = (
+            config.n_routed_experts
+            + self.num_fused_shared_experts
+            + global_server_args_dict["ep_num_redundant_experts"]
+        )
+        self.num_local_experts = self.num_experts // (
+            self.tp_size - self.moe_shared_expert_rank_num
+        )
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
