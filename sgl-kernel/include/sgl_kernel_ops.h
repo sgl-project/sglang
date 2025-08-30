@@ -756,3 +756,6 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
  * From csrc/memory
  */
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
+
+at::Tensor
+allocate_pin_memory(int64_t size, at::ScalarType dtype, bool write_combined, std::optional<int64_t> numa_affinity);
