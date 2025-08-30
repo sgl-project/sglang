@@ -34,9 +34,9 @@ auto allocate_pin_memory(
     return at::from_blob(
         data_ptr,
         {size},
-        [size](void* data_ptr) {
+        [size_bytes](void* data_ptr) {
           const auto result = ::cudaHostUnregister(data_ptr);
-          ::numa_free(data_ptr, size);
+          ::numa_free(data_ptr, size_bytes);
           TORCH_CHECK(result == ::cudaSuccess, "Failed to unregister pinned memory: ", ::cudaGetErrorString(result));
         },
         options,
