@@ -695,11 +695,22 @@ class ServerArgs:
         if self.speculative_algorithm in ("EAGLE", "EAGLE3"):
             if self.max_running_requests is None:
                 self.max_running_requests = 48
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using "
-                "eagle speculative decoding."
-            )
+            if (
+                not self.disable_overlap_schedule
+                and os.environ.get(
+                    "SGLANG_ENABLE_EXPERIMENTAL_EAGLE_OVERLAP_SCHEDULE", "0"
+                )
+                == "1"
+            ):
+                logger.warning(
+                    "Using experimental overlap scheduler + eagle speculative decoding."
+                )
+            else:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled because of using "
+                    "eagle speculative decoding."
+                )
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(
