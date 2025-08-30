@@ -202,6 +202,14 @@ class FusedMoE(torch.nn.Module):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         assert self.quant_method is not None
 
+        moe_quant_params = {}
+        if self.quant_method.__class__.__name__ in (
+            "GPTQMarlinMoEMethod",
+            "CompressedTensorsWNA16MarlinMoEMethod",
+            "CompressedTensorsWNA16MoEMethod",
+        ):
+            moe_quant_params["intermediate_size_full"] = intermediate_size
+
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
         # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
@@ -225,6 +233,7 @@ class FusedMoE(torch.nn.Module):
                 else self.weight_loader_fused
             ),
             with_bias=with_bias,
+            **moe_quant_params,
         )
 
     def _load_per_tensor_weight_scale(
