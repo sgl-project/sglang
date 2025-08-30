@@ -40,6 +40,7 @@ from sglang.srt.configs import (
     DeepseekVL2Config,
     ExaoneConfig,
     KimiVLConfig,
+    LongcatFlashConfig,
     MultiModalityConfig,
     Step3VLConfig,
 )
@@ -56,6 +57,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
     Step3VLConfig.model_type: Step3VLConfig,
+    LongcatFlashConfig.model_type: LongcatFlashConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():

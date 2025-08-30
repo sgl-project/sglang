@@ -310,7 +310,11 @@ class ModelRunner:
             else self.model_config.num_hidden_layers
         )
         self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(self.model, "end_layer", model_num_layers)
+        self.end_layer = getattr(
+            self.model,
+            "end_layer",
+            max(self.model_config.num_attention_layers, model_num_layers),
+        )
         self.num_effective_layers = self.end_layer - self.start_layer
         assert (
             (not model_has_mtp_layers)
