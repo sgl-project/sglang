@@ -211,6 +211,10 @@ class PrefetchOperation(StorageOperation):
 
         self.start_time = time.monotonic()
 
+        self.storage_hit_count = 0
+        self.min_completed_tokens = 0
+        self.matched_length = 0
+
         super().__init__(host_indices, token_ids, last_hash)
 
     def increment(self, num_tokens: int):
@@ -381,6 +385,9 @@ class HiCacheController:
             self.prefetch_revoke_queue = Queue()
             self.ack_backup_queue = Queue()
 
+            self.prefetch_free_dict_lock = threading.Lock()
+            self.prefetch_free_dict = {}
+
             self.prefetch_thread.start()
             self.backup_thread.start()
 
@@ -436,6 +443,9 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+
+            with self.prefetch_free_dict_lock:
+                self.prefetch_free_dict = {}
 
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
@@ -703,8 +713,6 @@ class HiCacheController:
                 != prev_completed_tokens + len(batch_hashes) * self.page_size
             ):
                 break  # Some operations fail or operation terminated by controller
-        # release pre-allocated memory
-        self.mem_pool_host.free(operation.host_indices[operation.completed_tokens :])
 
     def is_mooncake_backend(self):
         return self.storage_backend_type == "mooncake"
@@ -718,13 +726,8 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 self._page_transfer(operation)
 
-                if self.tp_world_size > 1:
-                    # to ensure all TP workers release the host memory at the same time
-                    torch.distributed.barrier(group=self.prefetch_io_tp_group)
-                # operation terminated by controller, release pre-allocated memory
-                self.mem_pool_host.free(
-                    operation.host_indices[operation.completed_tokens :]
-                )
+                with self.prefetch_free_dict_lock:
+                    self.prefetch_free_dict[operation.request_id] = operation
             except Empty:
                 continue
 
@@ -794,7 +797,8 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     if operation.host_indices is not None:
-                        self.mem_pool_host.free(operation.host_indices)
+                        with self.prefetch_free_dict_lock:
+                            self.prefetch_free_dict[operation.request_id] = operation
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
@@ -802,9 +806,7 @@ class HiCacheController:
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
-                    # free the pre-allocated memory for pages that are not hit
-                    self.mem_pool_host.free(operation.host_indices[storage_hit_count:])
-                    operation.host_indices = operation.host_indices[:storage_hit_count]
+                    operation.storage_hit_count = storage_hit_count
                     logger.debug(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
@@ -876,6 +878,8 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+            # The _split_node operation in the main thread may cause inconsistency between hash_value and host_indices
+            batch_hashes = batch_hashes[: len(operation.host_indices) // self.page_size]
             # Set one batch token, and record if success.
             # todo: allow partial success
             success = backup_set_func(batch_hashes, batch_host_indices)
@@ -884,6 +888,8 @@ class HiCacheController:
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
+            else:
+                logger.debug(f"Write pages {len(batch_hashes)}")
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
     def backup_thread_func(self):

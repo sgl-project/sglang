@@ -379,6 +379,7 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.check_revoked_prefetch()
             self.check_backup_progress()
+            self.check_free_prefetch()
 
     def check_revoked_prefetch(self):
         queue_size = torch.tensor(
@@ -428,6 +429,40 @@ class HiRadixCache(RadixCache):
                     host_node.backuped_storage = True
             host_node.release_host()
             del self.ongoing_backup[ack_id]
+
+    def free_operation(self, operation):
+        self.cache_controller.mem_pool_host.free(
+            operation.host_indices[operation.min_completed_tokens :]
+        )
+
+    def check_free_prefetch(self):
+        with self.cache_controller.prefetch_free_dict_lock:
+            free_request_ids = list(self.cache_controller.prefetch_free_dict.keys())
+        free_request_ids = [
+            request_id
+            for request_id in free_request_ids
+            if request_id not in self.ongoing_prefetch
+        ]
+
+        if self.tp_world_size > 1:
+            gathered_free_ids = [None for _ in range(self.tp_world_size)]
+            torch.distributed.all_gather_object(
+                gathered_free_ids,
+                free_request_ids,
+                group=self.tp_group,
+            )
+            set_values = [set(free_ids) for free_ids in gathered_free_ids]
+            intersection = set.intersection(*set_values)
+            free_request_ids = list(intersection)
+
+        with self.cache_controller.prefetch_free_dict_lock:
+            free_operations = [
+                self.cache_controller.prefetch_free_dict.pop(free_request_id)
+                for free_request_id in free_request_ids
+            ]
+
+        for operation in free_operations:
+            self.free_operation(operation)
 
     def can_terminate_prefetch(self, operation: PrefetchOperation):
         can_terminate = True
@@ -510,9 +545,8 @@ class HiRadixCache(RadixCache):
             self.cache_controller.mem_pool_host.update_prefetch(written_indices)
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.mem_pool_host.free(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
+        operation.matched_length = matched_length
+        operation.min_completed_tokens = min_completed_tokens
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
@@ -574,6 +608,10 @@ class HiRadixCache(RadixCache):
         if host_indices is None:
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            last_host_node.release_host()
+            # no sufficient host memory to prefetch
+            return
         operation = self.cache_controller.prefetch(
             req_id, host_indices, new_input_tokens, last_hash
         )
