@@ -2378,6 +2378,10 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.tree_cache.cache_finished_req(req)
+
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
