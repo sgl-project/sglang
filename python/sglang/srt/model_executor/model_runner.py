@@ -42,6 +42,7 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.utils import divide
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -76,6 +77,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
+    # MambaTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -85,6 +87,8 @@ from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
+    HybridReqToTokenPool,
+    # MambaHybridPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -303,13 +307,12 @@ class ModelRunner:
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
 
-        # TODO: hard code,fixme
         if self.is_hybrid_gdn:
             logger.warning(
                 "Hybrid GDN model detected, disable radix cache and update max_running_requests to 128"
             )
             self.server_args.disable_radix_cache = True
-            global_server_args_dict.update({"max_running_requests": 128})
+
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
@@ -1311,6 +1314,36 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     pre_alloc_size=pre_alloc_size,
                 )
+            elif self.is_hybrid_gdn:
+                config = self.model_config.hf_config
+                world_size = get_attention_tp_size()
+                conv_dim = (
+                    config.linear_key_head_dim * config.linear_num_key_heads * 2
+                    + config.linear_value_head_dim * config.linear_num_value_heads
+                )
+                conv_state_shape = (
+                    divide(conv_dim, world_size),
+                    config.linear_conv_kernel_dim - 1,
+                )
+
+                temporal_state_shape = (
+                    divide(config.linear_num_value_heads, world_size),
+                    config.linear_key_head_dim,
+                    config.linear_value_head_dim,
+                )
+
+                self.req_to_token_pool = HybridReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    conv_state_shape=conv_state_shape,
+                    temporal_state_shape=temporal_state_shape,
+                    conv_dtype=torch.bfloat16,
+                    ssm_dtype=torch.float32,
+                    mamba_layers=config.linear_layer_ids,
+                )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
@@ -1626,6 +1659,18 @@ class ModelRunner:
             )
 
             return DualChunkFlashAttentionBackend(self)
+        elif backend_str == "hybrid_linear_attn":
+            assert self.is_hybrid_gdn, "hybrid_linear_attn backend can only be used with hybrid GDN models."
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend, MambaAttnBackend
+            )
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend
+            )
+            full_attn_backend = FlashAttentionBackend(self)
+            linear_attn_backend = MambaAttnBackend(self)
+            full_attn_layers = self.model_config.hf_config.full_attention_layer_ids
+            return HybridLinearAttnBackend(full_attn_backend, linear_attn_backend, full_attn_layers)
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
 
@@ -1723,12 +1768,6 @@ class ModelRunner:
             self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
-        if self.is_hybrid_gdn:
-            forward_batch.extend_start_loc = self.model.prepare_extend_start_loc(
-                forward_batch
-            )
-            kwargs["request_ids_to_seq_ids"] = forward_batch.request_ids_to_seq_ids
-            kwargs["finished_requests_ids"] = forward_batch.finished_requests_ids
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         return self.model.forward(
@@ -1754,12 +1793,6 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
-        if self.is_hybrid_gdn:
-            forward_batch.extend_start_loc = self.model.prepare_extend_start_loc(
-                forward_batch
-            )
-            kwargs["request_ids_to_seq_ids"] = forward_batch.request_ids_to_seq_ids
-            kwargs["finished_requests_ids"] = forward_batch.finished_requests_ids
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
@@ -1773,12 +1806,6 @@ class ModelRunner:
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        if self.is_hybrid_gdn:
-            forward_batch.extend_start_loc = self.model.prepare_extend_start_loc(
-                forward_batch
-            )
-            kwargs["request_ids_to_seq_ids"] = forward_batch.request_ids_to_seq_ids
-            kwargs["finished_requests_ids"] = forward_batch.finished_requests_ids
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,

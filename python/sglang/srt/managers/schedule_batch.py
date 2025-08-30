@@ -629,9 +629,6 @@ class Req:
             self.multimodal_inputs.merge(image_inputs)
 
     def finished(self) -> bool:
-        # (yizhang2077) hook mamba here
-        if self.finished_reason is not None:
-            global_scheduler_batch_dict["finished_requests_ids"].add(self.rid)
         # Whether request reached finished condition
         return self.finished_reason is not None
 
@@ -767,7 +764,6 @@ class Req:
         self.is_chunked = 0
         self.req_pool_idx = None
         self.already_computed = 0
-        global_scheduler_batch_dict["retracted_requests_ids"].add(self.rid)
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1767,12 +1763,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
-            finished_requests_ids=copy.deepcopy(
-                global_scheduler_batch_dict["finished_requests_ids"]
-            ),
-            request_ids_to_seq_ids=copy.deepcopy(
-                global_scheduler_batch_dict["request_ids_to_seq_ids"]
-            ),
         )
 
     def copy(self):
@@ -1915,9 +1905,6 @@ class ModelWorkerBatch:
     # Overlap event
     launch_done: Optional[threading.Event] = None
 
-    # (yizhang) Mamba related
-    finished_requests_ids: Optional[Set] = None
-    request_ids_to_seq_ids: Optional[Dict] = None
 
 
 @triton.jit
@@ -2030,10 +2017,3 @@ def get_last_loc_triton(
     )
     return result
 
-
-# (yizhang2077) hook for mamba
-global_scheduler_batch_dict: Dict[str, Any] = {
-    "request_ids_to_seq_ids": {},  # Maps request IDs to sequence IDs
-    "finished_requests_ids": set(),
-    "retracted_requests_ids": set(),
-}

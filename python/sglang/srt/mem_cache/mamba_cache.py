@@ -5,7 +5,6 @@ from typing import Dict, List, Tuple
 import torch
 
 from sglang.srt.managers.schedule_batch import (
-    global_scheduler_batch_dict,
     global_server_args_dict,
 )
 

@@ -416,20 +416,12 @@ class Qwen3GatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        cache_params: Optional[MambaCacheParams] = None,
+        # cache_params: Optional[MambaCacheParams] = None,
     ):
-        has_initial_states = None
-        if forward_batch.extend_prefix_lens is not None:
-            has_initial_states = forward_batch.extend_prefix_lens > 0
-
-        # Set up dimensions for reshapes later
+        # if cache_params is None:
+        #     raise ValueError("cache_params cannot be None")
         seq_len, _ = hidden_states.shape
-        conv_state, recurrent_state = None, None
-
-        if cache_params is None:
-            raise ValueError("cache_params cannot be None")
-
-        has_prefill = forward_batch.forward_mode.is_prefill_or_idle()
+        has_prefill = forward_batch.forward_mode.is_prefill()
 
         projected_states, _ = self.in_proj(hidden_states)
 
@@ -456,92 +448,33 @@ class Qwen3GatedDeltaNet(nn.Module):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
 
-        if has_prefill:
-            # - "cache_indices" updates the conv_state cache in positions
-            #   pointed to by "mamba_cache_params.state_indices_tensor"
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv.transpose(0, 1),
-                conv_weights,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=cache_params.conv_state,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_params.state_indices_tensor,
-                query_start_loc=forward_batch.extend_start_loc,
-            ).transpose(0, 1)[:seq_len]
+        kwargs = {
+            "mixed_qkv": mixed_qkv,
+            "conv_weights": conv_weights,
+            "bias": self.conv1d.bias,
+            "activation": self.activation,
+            "key_dim": self.key_dim,
+            "value_dim": self.value_dim,
+            "attention_tp_size": self.attn_tp_size,
+            "head_k_dim": self.head_k_dim,
+            "head_v_dim": self.head_v_dim,
+            "a": a,
+            "b": b,
+            "A_log": self.A_log,
+            "dt_bias": self.dt_bias,
+            "layer_id": self.layer_id,
+            "seq_len": seq_len,
+        }
 
-            # TODO: Why is this needed?
-            mixed_qkv = mixed_qkv.contiguous()
-        else:
-            mixed_qkv = causal_conv1d_update(
-                mixed_qkv,
-                cache_params.conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=cache_params.state_indices_tensor,
-            )
-
-        query, key, value = torch.split(
-            mixed_qkv,
-            [
-                self.key_dim // self.attn_tp_size,
-                self.key_dim // self.attn_tp_size,
-                self.value_dim // self.attn_tp_size,
-            ],
-            dim=-1,
+        core_attn_out = forward_batch.attn_backend.forward(
+            q = None,
+            k = None,
+            v = None,
+            layer = None,
+            forward_batch=forward_batch,
+            **kwargs,
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-            (query, key),
-        )
-        value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
-
-        beta = b.sigmoid()
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
-        if has_prefill:
-            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        else:
-            g = fused_gdn_gating(self.A_log, a, self.dt_bias)
-
-        g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
-
-        if has_prefill:
-            recurrent_state = cache_params.ssm_state[cache_params.state_indices_tensor]
-            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state=None,  # NOTE: In my view, the initial state is not used in training and prefill stage.
-                output_final_state=recurrent_state is not None,
-                cu_seqlens=forward_batch.extend_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-
-            if recurrent_state is not None and cache_params is not None:
-                last_recurrent_state = last_recurrent_state.to(
-                    cache_params.ssm_state.dtype, copy=False
-                )
-                cache_params.ssm_state[cache_params.state_indices_tensor] = (
-                    last_recurrent_state
-                )
-        else:
-            core_attn_out = fused_recurrent_gated_delta_rule_update(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state_source=cache_params.ssm_state,
-                initial_state_indices=cache_params.state_indices_tensor,
-                cu_seqlens=forward_batch.extend_start_loc,
-                # head_first=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-
+        
         if self.share_norm:
             z_shape_og = z.shape
             # reshape input data into 2D tensor
@@ -624,7 +557,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-        mamba_cache_params: MambaCacheParams,
+        # mamba_cache_params: MambaCacheParams,
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
@@ -637,7 +570,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
-                mamba_cache_params,
+                # mamba_cache_params,
             )
 
         # Fully Connected
@@ -956,7 +889,7 @@ class Qwen3HybridMoeModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        mamba_cache_params: MambaCacheParams,
+        # mamba_cache_params: MambaCacheParams,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
@@ -975,16 +908,12 @@ class Qwen3HybridMoeModel(nn.Module):
             if isinstance(layer, Qwen3HybridAttentionDecoderLayer):
                 num_attn += 1
 
-            layer_mamba_cache_params = None
-            if isinstance(layer, Qwen3HybridLinearDecoderLayer):
-                layer_mamba_cache_params = mamba_cache_params.at_layer_id(i - num_attn)
 
             hidden_states, residual = layer(
                 layer_id=i,
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
-                mamba_cache_params=layer_mamba_cache_params,
                 forward_batch=forward_batch,
             )
 
@@ -1037,13 +966,13 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         # Used to track and store by the Mamba cache between steps.
         self.mamba_cache: Optional[MambaCacheManager] = None
 
-    def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
-        self.init_mamba_cache_once()
-        return self.mamba_cache.copy_inputs_before_cuda_graphs(input_buffers, **kwargs)
+    # def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
+    #     self.init_mamba_cache_once()
+    #     return self.mamba_cache.copy_inputs_before_cuda_graphs(input_buffers, **kwargs)
 
-    def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
-        self.init_mamba_cache_once()
-        return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
+    # def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
+    #     self.init_mamba_cache_once()
+    #     return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
 
     def _get_linear_cache_shape(self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
         config = self.config
@@ -1085,26 +1014,6 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
             temporal_state_shape,
         )
 
-    def prepare_extend_start_loc(self, forward_batch: ForwardBatch):
-        # extend_start_loc shape is batch_size, while hybrid attention need batch_size + 1
-        # ugly code, but works :)
-        input_ids = forward_batch.input_ids
-        if forward_batch.extend_start_loc is not None:
-            extend_start_loc = torch.cat(
-                [
-                    forward_batch.extend_start_loc,
-                    torch.tensor(
-                        [input_ids.shape[0]], dtype=torch.int32, device=input_ids.device
-                    ),
-                ],
-                dim=0,
-            )
-        else:
-            extend_start_loc = torch.arange(
-                input_ids.shape[0] + 1, dtype=torch.int32, device=input_ids.device
-            )
-        return extend_start_loc
-
     @torch.no_grad()
     def forward(
         self,
@@ -1114,12 +1023,12 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        self.init_mamba_cache_once()
+        # self.init_mamba_cache_once()
 
-        mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
+        # mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
 
         hidden_states = self.model(
-            input_ids, positions, forward_batch, mamba_cache_params, inputs_embeds
+            input_ids, positions, forward_batch, inputs_embeds
         )
 
         return self.logits_processor(

@@ -343,3 +343,19 @@ class Qwen3HybridMoeConfig(PretrainedConfig):
                 layer_type_list.append(HybridLayerType.mamba2.value)
 
         return layer_type_list
+
+    @property
+    def linear_layer_ids(self):
+        return [
+            i
+            for i, type_value in enumerate(self.layers_block_type)
+            if type_value == HybridLayerType.linear_attention.value
+        ]
+
+    @property
+    def full_attention_layer_ids(self):
+        return [
+            i
+            for i, type_value in enumerate(self.layers_block_type)
+            if type_value == HybridLayerType.full_attention.value
+        ]

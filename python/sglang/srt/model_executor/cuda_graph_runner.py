@@ -328,12 +328,6 @@ class CudaGraphRunner:
             )
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
-            self.extend_start_loc = {
-                bs: torch.zeros((bs + 1,), dtype=torch.int32) for bs in self.capture_bs
-            }
-
-            if self.model_runner.is_hybrid_gdn:
-                self.mamba_cache_dict = {}
 
             # pipeline parallelism
             if self.pp_size > 1:
@@ -542,12 +536,6 @@ class CudaGraphRunner:
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
-        if self.model_runner.is_hybrid_gdn:
-            self.mamba_cache_dict[bs] = {
-                "seqlen_agnostic_capture_inputs": self.model_runner.model.get_seqlen_agnostic_capture_inputs(
-                    bs
-                )
-            }
 
         if self.is_encoder_decoder:
             encoder_lens = self.encoder_lens[:bs]
@@ -638,7 +626,6 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
-            extend_start_loc=self.extend_start_loc[bs],
         )
 
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
@@ -671,12 +658,6 @@ class CudaGraphRunner:
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
-            if self.model_runner.is_hybrid_gdn:
-                kwargs["seqlen_agnostic_capture_inputs"] = self.mamba_cache_dict[bs][
-                    "seqlen_agnostic_capture_inputs"
-                ]
-                kwargs["request_ids_to_seq_ids"] = forward_batch.request_ids_to_seq_ids
-                kwargs["finished_requests_ids"] = forward_batch.finished_requests_ids
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
                 forward_batch.positions,
@@ -834,24 +815,6 @@ class CudaGraphRunner:
             self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
-        if (
-            self.model_runner.is_hybrid_gdn
-            and "seqlen_agnostic_capture_inputs" in self.mamba_cache_dict[self.bs]
-        ):
-            self.model_runner.model.copy_inputs_before_cuda_graphs(
-                self.mamba_cache_dict[self.bs],
-                **{
-                    "request_ids_to_seq_ids": forward_batch.request_ids_to_seq_ids,
-                    "finished_requests_ids": forward_batch.finished_requests_ids,
-                },
-            )
-            extend_start_loc = self.model_runner.model.prepare_extend_start_loc(
-                forward_batch
-            )
-            self.extend_start_loc[self.bs][: extend_start_loc.size(0)].copy_(
-                extend_start_loc
-            )
-            forward_batch.extend_start_loc = self.extend_start_loc[self.bs]
         # Replay
         self.graphs[self.bs].replay()
 

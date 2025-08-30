@@ -101,6 +101,121 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size))
 
+class MambaPool:
+    def __init__(
+        self,
+        size: int,
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
+        num_mamba_layers: int,
+        conv_state_shape: Tuple[int, int],
+        temporal_state_shape: Tuple[int, int],
+        device: str,
+    ):
+        conv_state = torch.empty(
+            size=(num_mamba_layers, size + 1) + conv_state_shape,
+            dtype=conv_dtype,
+            device=device,
+        )
+        temporal_state = torch.empty(
+            size=(num_mamba_layers, size + 1) + temporal_state_shape,
+            dtype=ssm_dtype,
+            device=device,
+        )
+
+        self.mamba_cache = (conv_state, temporal_state)
+        self.size = size
+        self.free_slots = list(range(size))
+
+    def get_mamba_params(self, layer_id: int):
+        return self.mamba_cache[0][layer_id], self.mamba_cache[1][layer_id]
+
+    def get_mamba_size(self):
+        return np.prod(self.mamba_cache[0].shape) * self.mamba_cache[0].dtype.itemsize + \
+            np.prod(self.mamba_cache[1].shape) * self.mamba_cache[1].dtype.itemsize
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int) -> Optional[List[int]]:
+        if need_size > len(self.free_slots):
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        return select_index
+
+    def free(self, free_index: Union[int, List[int]]):
+        if isinstance(free_index, (int,)):
+            self.free_slots.append(free_index)
+        else:
+            self.free_slots.extend(free_index)
+
+    def clear(self):
+        self.free_slots = list(range(self.size))
+
+class HybridReqToTokenPool(ReqToTokenPool):
+    """A memory pool that maps a request to its token locations."""
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
+        mamba_layers: List[int],
+        conv_state_shape: Tuple[int, int],
+        temporal_state_shape: Tuple[int, int],
+    ):
+        super().__init__(
+            size=size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
+        
+        self.mamba_pool = MambaPool(
+            # size,
+            128, # TODO: fixme
+            conv_dtype,
+            ssm_dtype,
+            len(mamba_layers),
+            conv_state_shape,
+            temporal_state_shape,
+            device
+        )
+        self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layers)}
+        
+        self.device = device
+        self.full_to_mamba_index_mapping: torch.Tensor = torch.empty(size, dtype=torch.int32, device=self.device)
+
+    def alloc(self, need_size: int) -> Optional[List[int]]:
+        select_index = super().alloc(need_size)
+        if select_index == None:
+            return None
+        mamba_index = self.mamba_pool.alloc(need_size)
+        assert len(select_index) == len(mamba_index)
+        self.full_to_mamba_index_mapping[select_index] = torch.tensor(mamba_index, dtype=torch.int32, device=self.device)
+        return select_index
+
+    def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        return self.full_to_mamba_index_mapping[req_indices]
+
+    def get_mamba_params(self, layer_id: int):
+        assert layer_id in self.mamba_map
+        return self.mamba_pool.get_mamba_params(self.mamba_map[layer_id])
+
+    def free(self, free_index: Union[int, List[int]]):
+        mamba_index = self.full_to_mamba_index_mapping[free_index]
+        super().free(free_index)
+        self.mamba_pool.free(mamba_index.tolist())
+
+    def clear(self):
+        super().clear()
+        self.mamba_pool.clear()
 
 class KVCache(abc.ABC):
     @abc.abstractmethod
