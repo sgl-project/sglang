@@ -495,6 +495,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                # If TP all-reduce was enqueued on a separate stream, ensure completion before LayerNorm
+                pending = getattr(hidden_states, "_sglang_pending_allreduce_event", None)
+                if pending is not None:
+                    torch.cuda.current_stream().wait_event(pending)
+                    try:
+                        delattr(hidden_states, "_sglang_pending_allreduce_event")
+                    except Exception:
+                        pass
                 hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 

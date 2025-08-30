@@ -166,7 +166,15 @@ class MixtralMoE(nn.Module):
             else:
                 final_hidden_states.add_(current_hidden_states)
 
-        return tensor_model_parallel_all_reduce(final_hidden_states)
+    out = tensor_model_parallel_all_reduce(final_hidden_states)
+    pending = getattr(out, "_sglang_pending_allreduce_event", None)
+    if pending is not None:
+        torch.cuda.current_stream().wait_event(pending)
+        try:
+            delattr(out, "_sglang_pending_allreduce_event")
+        except Exception:
+            pass
+    return out
 
 
 class MixtralAttention(nn.Module):

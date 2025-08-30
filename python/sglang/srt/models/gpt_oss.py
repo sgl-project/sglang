@@ -188,6 +188,13 @@ class GptOssSparseMoeBlock(nn.Module):
 
         if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            pending = getattr(final_hidden_states, "_sglang_pending_allreduce_event", None)
+            if pending is not None:
+                torch.cuda.current_stream().wait_event(pending)
+                try:
+                    delattr(final_hidden_states, "_sglang_pending_allreduce_event")
+                except Exception:
+                    pass
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
         return ans

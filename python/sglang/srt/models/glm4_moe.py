@@ -562,6 +562,13 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )
+                pending = getattr(final_hidden_states, "_sglang_pending_allreduce_event", None)
+                if pending is not None:
+                    torch.cuda.current_stream().wait_event(pending)
+                    try:
+                        delattr(final_hidden_states, "_sglang_pending_allreduce_event")
+                    except Exception:
+                        pass
             if shared_output is not None:
                 final_hidden_states += shared_output
         else:
@@ -571,6 +578,13 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )
+                pending = getattr(final_hidden_states, "_sglang_pending_allreduce_event", None)
+                if pending is not None:
+                    torch.cuda.current_stream().wait_event(pending)
+                    try:
+                        delattr(final_hidden_states, "_sglang_pending_allreduce_event")
+                    except Exception:
+                        pass
         return final_hidden_states
 
 

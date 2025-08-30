@@ -1322,6 +1322,13 @@ class RowParallelLinear(LinearBase):
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             output = tensor_model_parallel_all_reduce(output_parallel)
+            pending = getattr(output, "_sglang_pending_allreduce_event", None)
+            if pending is not None:
+                torch.cuda.current_stream().wait_event(pending)
+                try:
+                    delattr(output, "_sglang_pending_allreduce_event")
+                except Exception:
+                    pass
         else:
             output = output_parallel
 

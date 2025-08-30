@@ -495,6 +495,13 @@ class DeepseekV2MoE(nn.Module):
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            pending = getattr(final_hidden_states, "_sglang_pending_allreduce_event", None)
+            if pending is not None:
+                torch.cuda.current_stream().wait_event(pending)
+                try:
+                    delattr(final_hidden_states, "_sglang_pending_allreduce_event")
+                except Exception:
+                    pass
         return final_hidden_states
 
     def forward_normal(
@@ -534,6 +541,13 @@ class DeepseekV2MoE(nn.Module):
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            pending = getattr(final_hidden_states, "_sglang_pending_allreduce_event", None)
+            if pending is not None:
+                torch.cuda.current_stream().wait_event(pending)
+                try:
+                    delattr(final_hidden_states, "_sglang_pending_allreduce_event")
+                except Exception:
+                    pass
         return final_hidden_states
 
     def forward_cpu(
@@ -592,6 +606,13 @@ class DeepseekV2MoE(nn.Module):
         )
         if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            pending = getattr(final_hidden_states, "_sglang_pending_allreduce_event", None)
+            if pending is not None:
+                torch.cuda.current_stream().wait_event(pending)
+                try:
+                    delattr(final_hidden_states, "_sglang_pending_allreduce_event")
+                except Exception:
+                    pass
         return final_hidden_states
 
     def forward_deepep(

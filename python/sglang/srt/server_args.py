@@ -319,6 +319,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
+    disable_tp_allreduce_overlap: bool = False
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
@@ -1810,6 +1811,9 @@ class ServerArgs:
             help="Enable NCCL symmetric memory for fast collectives.",
         )
         parser.add_argument(
+            "--disable-tp-allreduce-overlap",
+            action="store_true",
+            help="Disable overlapping TP all-reduce with compute using a dedicated comm stream.",
             "--disable-flashinfer-cutlass-moe-fp4-allgather",
             action="store_true",
             help="Disables quantize before all-gather for flashinfer cutlass moe.",

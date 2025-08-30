@@ -258,6 +258,12 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
+        # Async TP all-reduce overlap controls and comm stream
+        self.enable_tp_ar_overlap: bool = get_bool_env_var(
+            "SGLANG_ENABLE_TP_ALLREDUCE_OVERLAP", "false"
+        )
+        self._comm_stream: Optional[torch.cuda.Stream] = None
+
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
@@ -507,10 +513,30 @@ class GroupCoordinator:
             and hasattr(input_, "symmetric_memory")
             and input_.symmetric_memory
         ):
-            with self.pynccl_comm.change_state(
-                enable=True, stream=torch.cuda.current_stream()
-            ):
+            # Use dedicated comm stream for overlap if enabled and not capturing CUDA graph
+            stream_to_use = torch.cuda.current_stream()
+            is_capturing = False
+            try:
+                # Available in recent PyTorch
+                is_capturing = bool(getattr(torch.cuda, "is_current_stream_capturing", lambda: False)())
+            except Exception:
+                is_capturing = False
+            if self.enable_tp_ar_overlap and not is_capturing:
+                if self._comm_stream is None:
+                    with torch.cuda.device(self.device):
+                        self._comm_stream = torch.cuda.Stream()
+                self._comm_stream.wait_stream(torch.cuda.current_stream())
+                stream_to_use = self._comm_stream
+
+            with self.pynccl_comm.change_state(enable=True, stream=stream_to_use):
                 self.pynccl_comm.all_reduce(input_)
+                if self.enable_tp_ar_overlap and not is_capturing:
+                    event = torch.cuda.Event()
+                    stream_to_use.record_event(event)
+                    try:
+                        setattr(input_, "_sglang_pending_allreduce_event", event)
+                    except Exception:
+                        torch.cuda.current_stream().wait_event(event)
                 return input_
 
         outplace_all_reduce_method = None
