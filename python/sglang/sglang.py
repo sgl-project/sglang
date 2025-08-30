@@ -4,27 +4,11 @@ Design note: CLI shape and future structure
 
 - Top-level form: 'sglang <command> [args]'
 - Current commands:
-  - 'serve': launch the HTTP inference server. This replaces 'python -m sglang.launch_server' and the previous 'sglang' without subcommand. Exact server flags and semantics remain owned by sglang.srt.server_args.prepare_server_args.
+  - 'serve': launch the HTTP inference server. This replaces 'python -m sglang.launch_server'. Exact server flags and semantics remain owned by sglang.srt.server_args.prepare_server_args.
 - Future commands (illustrative, not implemented here):
   - 'chat', 'eval', 'convert', 'cache', 'admin', 'doctor', 'version'
-  Each command should live in its own module and be wired here via a thin dispatcher, e.g.:
-      sglang.cli.chat:main(argv)      -> 'sglang chat ...'
-      sglang.cli.eval:main(argv)      -> 'sglang eval ...'
-      sglang.cli.convert:main(argv)   -> 'sglang convert ...'
-  This file must stay a minimal router: no business logic or flag schemas beyond subcommand selection.
-
-Behavioral contract
-
-- 'sglang' without a subcommand prints usage and exits with code 2 (intentional to avoid ambiguity).
-- Unknown commands also print usage and exit 2.
-- 'sglang serve' delegates to prepare_server_args(rest) then sglang.srt.entrypoints.http_server.launch_server(args).
-- The dispatcher must not alter how server arguments are parsed/validated; it only slices argv to strip the subcommand and passes the rest through unchanged.
-
-Rationale
-
-- Keeps a single executable name 'sglang' as the UX anchor, while allowing future subcommands to branch cleanly.
-- Avoids ambiguity of invoking 'sglang' without a verb, while preserving the historical module entry point 'python -m sglang.launch_server'.
-
+  Each command should live in this and be wired here via a thin dispatcher, e.g.:
+      sglang.cli.bench:main(argv)      -> 'sglang bench ...'
 """
 
 import os
