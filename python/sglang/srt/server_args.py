@@ -382,6 +382,9 @@ class ServerArgs:
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
 
+    # LMCache
+    enable_lmcache: bool = False
+
     def __post_init__(self):
         # Check deprecated arguments
         if self.enable_ep_moe:
@@ -1990,6 +1993,7 @@ class ServerArgs:
         )
 
         # PD disaggregation
+        
         parser.add_argument(
             "--disaggregation-mode",
             type=str,
@@ -2107,6 +2111,14 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action="store_true",
             help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
+
+        # LMCache
+        logger.info("Adding LMCache arguments")
+        parser.add_argument(
+            "--enable-lmcache",
+            action="store_true",
+            help="Enable LMCache for the model.",
         )
 
     @classmethod
