@@ -167,4 +167,4 @@ skip = "*.json,*.jsonl,*.patch,*.txt"
 
 
 [project.scripts]
-sglang = "sglang.launch_server:main"
+sglang = "sglang.sglang:main"
