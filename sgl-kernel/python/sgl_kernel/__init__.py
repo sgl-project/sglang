@@ -25,6 +25,8 @@ from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     downcast_fp8,
     fused_add_rmsnorm,
+    fused_add_rmsnorm_quant,
+    fused_rmsnorm_quant,
     gelu_and_mul,
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
