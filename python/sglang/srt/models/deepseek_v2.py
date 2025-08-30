@@ -2414,18 +2414,26 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
 
         num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
+
         for layer_id in range(num_hidden_layers):
             if is_nextn:
                 layer = self.model.decoder
             else:
                 layer = self.model.layers[layer_id]
 
-            for module in [
-                layer.self_attn.fused_qkv_a_proj_with_mqa,
-                layer.self_attn.q_b_proj,
+            module_list = [
                 layer.self_attn.kv_b_proj,
                 layer.self_attn.o_proj,
-            ]:
+            ]
+
+            if self.config.q_lora_rank is not None:
+                module_list.append(layer.self_attn.fused_qkv_a_proj_with_mqa)
+                module_list.append(layer.self_attn.q_b_proj)
+            else:
+                module_list.append(layer.self_attn.kv_a_proj_with_mqa)
+                module_list.append(layer.self_attn.q_proj)
+
+            for module in module_list:
                 requant_weight_ue8m0_inplace(
                     module.weight, module.weight_scale_inv, weight_block_size
                 )
