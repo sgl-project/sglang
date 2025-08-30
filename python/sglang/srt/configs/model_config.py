@@ -93,7 +93,6 @@ class ModelConfig:
         self.modelopt_checkpoint_restore_path = modelopt_checkpoint_restore_path
         self.modelopt_checkpoint_save_path = modelopt_checkpoint_save_path
         self.modelopt_quant = modelopt_quant
-        self.impl = impl
 
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
@@ -360,7 +359,6 @@ class ModelConfig:
             modelopt_checkpoint_restore_path=server_args.modelopt_checkpoint_restore_path,
             modelopt_checkpoint_save_path=server_args.modelopt_checkpoint_save_path,
             modelopt_quant=server_args.modelopt_quant,
-            impl=server_args.impl,
             **kwargs,
         )
 
