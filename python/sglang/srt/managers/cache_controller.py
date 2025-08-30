@@ -714,15 +714,15 @@ class HiCacheController:
             except Empty:
                 continue
 
-    def prefetch_rate_limit_check(self) -> bool:
+    def prefetch_rate_limited(self) -> bool:
         """
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
         # cancel prefetch if too much memory is occupied
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
-            return False
+            return True
         # todo: more sophisticated rate limiting based on storage backend performance
-        return True
+        return False
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash

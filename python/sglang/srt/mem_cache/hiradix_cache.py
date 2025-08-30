@@ -558,7 +558,7 @@ class HiRadixCache(RadixCache):
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limit_check()
+            or self.cache_controller.prefetch_rate_limited()
         ):
             return
 
