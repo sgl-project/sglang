@@ -282,6 +282,9 @@ class ServerArgs:
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
 
+    # Moe external shared expert
+    moe_shared_expert_rank_num: int = 0
+
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
@@ -653,6 +656,9 @@ class ServerArgs:
             logger.warning(
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
+
+        if self.enable_deepep_moe and self.moe_shared_expert_rank_num > 0:
+            logger.info("Moe shared expert externalization is enabled.")
 
         if (self.enable_eplb or (self.init_expert_location is not None)) and (
             self.ep_dispatch_algorithm is None
@@ -1611,6 +1617,12 @@ class ServerArgs:
             "--enable-expert-distribution-metrics",
             action="store_true",
             help="Enable logging metrics for expert balancedness",
+        )
+        parser.add_argument(
+            "--moe-shared-expert-rank-num",
+            type=int,
+            default=0,
+            help="The number of moe shared expert-ranks",
         )
         parser.add_argument(
             "--deepep-config",
