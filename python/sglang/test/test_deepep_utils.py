@@ -8,13 +8,15 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.utils import get_int_env_var
+
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
     ip = os.getenv("MASTER_ADDR", "127.0.0.1")
-    port = int(os.getenv("MASTER_PORT", "8361"))
-    num_nodes = int(os.getenv("WORLD_SIZE", 1))
-    node_rank = int(os.getenv("RANK", 0))
+    port = get_int_env_var("MASTER_PORT", 8361)
+    num_nodes = get_int_env_var("WORLD_SIZE", 1)
+    node_rank = get_int_env_var("RANK", 0)
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
 
     dist.init_process_group(

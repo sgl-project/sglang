@@ -317,9 +317,7 @@ def format_results(results: List[TaskResult]) -> str:
     return "\n".join(output)
 
 
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
+from sglang.srt.utils import get_bool_env_var
 
 
 def write_in_github_step_summary(results: List[TaskResult]):
