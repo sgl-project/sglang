@@ -678,7 +678,7 @@ def get_dataset(args, tokenizer, model_id):
             prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
-    elif args.dataset_name.startswith("random") and args.dataset_name != "random-image":
+    elif args.dataset_name.startswith("random"):
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -689,19 +689,20 @@ def get_dataset(args, tokenizer, model_id):
             random_sample=args.dataset_name == "random",
             return_text=not tokenize_prompt,
         )
-    elif args.dataset_name == "random-image":
-        assert not tokenize_prompt, "random-image does not support --tokenize-prompt"
-        assert args.apply_chat_template, "random-image requires apply_chat_template"
+    elif args.dataset_name == "image":
+        assert not tokenize_prompt, "image dataset does not support --tokenize-prompt"
+        assert args.apply_chat_template, "image dataset requires apply_chat_template"
         processor = get_processor(model_id)
-        input_requests = sample_random_image_requests(
+        input_requests = sample_image_requests(
             num_requests=args.num_prompts,
-            num_images=args.random_image_num_images,
+            image_count=args.image_count,
             input_len=args.random_input_len,
             output_len=args.random_output_len,
             range_ratio=args.random_range_ratio,
             processor=processor,
-            image_format=args.random_image_format,
-            image_resolution=args.random_image_resolution,
+            image_content=args.image_content,
+            image_format=args.image_format,
+            image_resolution=args.image_resolution,
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
@@ -1123,7 +1124,7 @@ def sample_random_requests(
     return input_requests
 
 
-def parse_random_image_resolution(image_resolution: str) -> Tuple[int, int]:
+def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     """Parse image resolution into (width, height).
 
     Supports presets '1080p', '720p', '360p' and custom 'heightxwidth' format
@@ -1148,7 +1149,7 @@ def parse_random_image_resolution(image_resolution: str) -> Tuple[int, int]:
                 return (width, height)
 
     raise ValueError(
-        f"Unsupported random-image resolution: {image_resolution}. "
+        f"Unsupported image resolution: {image_resolution}. "
         "Choose from 4k, 1080p, 720p, 360p, or provide custom 'heightxwidth' (e.g., 1080x1920)."
     )
 
@@ -1184,19 +1185,20 @@ def create_mm_data_row(text_prompt, images, images_base64, output_len, processor
     )
 
 
-def sample_random_image_requests(
+def sample_image_requests(
     num_requests: int,
-    num_images: int,
+    image_count: int,
     input_len: int,
     output_len: int,
     range_ratio: float,
     processor: AutoProcessor,
+    image_content: str,
     image_format: str,
     image_resolution: str,
 ) -> List[DatasetRow]:
-    """Generate requests with random images.
+    """Generate requests with images.
 
-    - Each request includes ``num_images`` random images.
+    - Each request includes ``image_count`` images.
     - Supported resolutions: 4k (3840x2160), 1080p (1920x1080), 720p (1280x720), 360p (640x360),
       or custom 'heightxwidth' (e.g., 1080x1920).
     - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
@@ -1211,18 +1213,19 @@ def sample_random_image_requests(
         ) from e
 
     # Parse resolution (supports presets and 'heightxwidth')
-    width, height = parse_random_image_resolution(image_resolution)
+    width, height = parse_image_resolution(image_resolution)
 
     # Check for potentially problematic combinations and warn user
-    if width * height >= 1920 * 1080 and num_images * num_requests >= 100:
+    if width * height >= 1920 * 1080 and image_count * num_requests >= 100:
         warnings.warn(
-            f"High resolution ({width}x{height}) with {num_images * num_requests} total images "
+            f"High resolution ({width}x{height}) with {image_count * num_requests} total images "
             f"may take a long time. Consider reducing resolution or image count.",
             UserWarning,
             stacklevel=2,
         )
 
     # Sample text lengths
+    print(f"range_ratio: {range_ratio}")
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1), input_len + 1, size=num_requests
     )
@@ -1233,7 +1236,12 @@ def sample_random_image_requests(
     def _gen_random_image_data_uri(
         width: int = width, height: int = height
     ) -> (Image, str, int):
-        arr = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
+        if image_content == "blank":
+            # Generate blank white image
+            arr = np.full((height, width, 3), 255, dtype=np.uint8)
+        else:
+            # Generate random colored image
+            arr = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
         img = Image.fromarray(arr)
         buf = io.BytesIO()
         img.save(buf, format=image_format, quality=85)
@@ -1250,7 +1258,7 @@ def sample_random_image_requests(
 
         # Generate image list
         images, images_base64, images_bytes = zip(
-            *[_gen_random_image_data_uri() for _ in range(num_images)]
+            *[_gen_random_image_data_uri() for _ in range(image_count)]
         )
         total_image_bytes += sum(list(images_bytes))
 
@@ -1263,7 +1271,7 @@ def sample_random_image_requests(
     print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
     print(
-        f"\nCreated {len(dataset)} random images with average {total_image_bytes//num_requests} bytes per request"
+        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes//num_requests} bytes per request"
     )
     return dataset
 
@@ -1734,11 +1742,11 @@ async def benchmark(
         output_file_name = args.output_file
     else:
         now = datetime.now().strftime("%m%d")
-        if args.dataset_name == "random-image":
+        if args.dataset_name == "image":
             output_file_name = (
                 f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
-                f"{args.random_output_len}_{args.random_image_num_images}imgs_"
-                f"{args.random_image_resolution}.jsonl"
+                f"{args.random_output_len}_{args.image_count}imgs_"
+                f"{args.image_resolution}.jsonl"
             )
         elif args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
@@ -1986,7 +1994,7 @@ if __name__ == "__main__":
             "random-ids",
             "generated-shared-prefix",
             "mmmu",
-            "random-image",
+            "image",
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -2025,45 +2033,48 @@ if __name__ == "__main__":
         "--random-input-len",
         type=int,
         default=1024,
-        help="Number of input tokens per request, used only for random dataset.",
+        help="Number of input tokens per request, used only for random and image dataset.",
     )
     parser.add_argument(
         "--random-output-len",
         default=1024,
         type=int,
-        help="Number of output tokens per request, used only for random dataset.",
+        help="Number of output tokens per request, used only for random and image dataset.",
     )
     parser.add_argument(
         "--random-range-ratio",
         type=float,
         default=0.0,
         help="Range of sampled ratio of input/output length, "
-        "used only for random dataset.",
+        "used only for random and image dataset.",
     )
-    # random-image dataset args
+    # image dataset args
     parser.add_argument(
-        "--random-image-num-images",
+        "--image-count",
         type=int,
         default=1,
-        help="Number of images per request (only available with the random-image dataset)",
+        help="Number of images per request (only available with the image dataset)",
     )
     parser.add_argument(
-        "--random-image-resolution",
+        "--image-resolution",
         type=str,
         default="1080p",
         help=(
-            "Resolution of random images for random-image dataset. "
+            "Resolution of images for image dataset. "
             "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
         ),
     )
     parser.add_argument(
-        "--random-image-format",
+        "--image-format",
         type=str,
         default="jpeg",
-        help=(
-            "Format of random images for random-image dataset. "
-            "Supports jpeg and png."
-        ),
+        help=("Format of images for image dataset. " "Supports jpeg and png."),
+    )
+    parser.add_argument(
+        "--image-content",
+        type=str,
+        default="random",
+        help=("Content for images for image dataset. " "Supports random and blank."),
     )
     parser.add_argument(
         "--request-rate",
