@@ -72,7 +72,6 @@ class ModelConfig:
         self.quantization = quantization
         self.model_impl = model_impl
         self.modelopt_quant = modelopt_quant
-        self.impl = impl
 
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
@@ -307,7 +306,6 @@ class ModelConfig:
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
             modelopt_quant=server_args.modelopt_quant,
-            impl=server_args.impl,
             **kwargs,
         )
 
