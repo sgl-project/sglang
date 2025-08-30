@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import logging
 import random
+import time
 import urllib
 from http import HTTPStatus
 from itertools import chain
@@ -18,6 +19,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import PDRegistryRequest
+from sglang.srt.managers.io_struct import ConvertDisaggregationRoleReqInput
 from sglang.srt.utils import maybe_wrap_ipv6_address
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
@@ -68,6 +70,16 @@ class MiniLoadBalancer:
 
     def add_decode_server(self, new_decode_server: str):
         self.decode_servers.append(new_decode_server)
+
+    def remove_prefill_server(self, prefill_url: str):
+        index_to_remove = self.prefill_servers.index(prefill_url)
+        bootstrap_port = self.prefill_configs[index_to_remove].bootstrap_port
+        del self.prefill_configs[index_to_remove]
+        del self.prefill_servers[index_to_remove]
+        return bootstrap_port
+
+    def remove_decode_server(self, decode_url: str):
+        self.decode_servers.remove(decode_url)
 
     def select_pair(self):
         # TODO: return some message instead of panic
@@ -430,6 +442,81 @@ async def register(obj: PDRegistryRequest):
     )
 
     return Response(status_code=200)
+
+
+@app.post("/convert_pd_role")
+async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
+    """Convert identity of a PD server"""
+    start_time = time.perf_counter()
+
+    server_url = obj.server_url
+    if server_url in load_balancer.prefill_servers:
+        if len(load_balancer.prefill_servers) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot convert {server_url} to decode, at least one prefill server is required.",
+            )
+        current_role = "prefill"
+        bootstrap_port = load_balancer.remove_prefill_server(server_url)
+    elif server_url in load_balancer.decode_servers:
+        if len(load_balancer.decode_servers) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot convert {server_url} to prefill, at least one decode server is required.",
+            )
+        current_role = "decode"
+        load_balancer.remove_decode_server(server_url)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid URL:{server_url}. The server may be not registered.",
+        )
+
+    # Convert P/D role
+    async with aiohttp.ClientSession() as session:
+        response = await session.post(
+            f"{server_url}/convert_pd_role", json=dataclasses.asdict(obj)
+        )
+        content = await response.json()
+
+    # clean connection pool in decode server
+    if current_role == "prefill":
+        parsed_url = urllib.parse.urlparse(server_url)
+        hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
+        obj.clean_connection_pool = f"{hostname}:{bootstrap_port}"
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for decode_server in load_balancer.decode_servers:
+                tasks.append(
+                    session.post(
+                        f"{decode_server}/convert_pd_role", json=dataclasses.asdict(obj)
+                    )
+                )
+            for i, response in enumerate(asyncio.as_completed(tasks)):
+                await response
+
+    finished_time = time.perf_counter()
+    logger.info(
+        f"Convert role finished in {(finished_time-start_time):.2f}s, response: {content}"
+    )
+
+    if content["success"]:
+        if current_role == "prefill":
+            load_balancer.add_decode_server(server_url)
+            logger.info(f"Converted prefill server to decode: {server_url}")
+        else:
+            load_balancer.add_prefill_server(
+                PrefillConfig(url=server_url, bootstrap_port=content["bootstrap_port"])
+            )
+            logger.info(
+                f"Converted decode server to prefill: {server_url}; bootstrap port: {content['bootstrap_port']}"
+            )
+        return Response(status_code=200)
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to convert identity for server: {server_url}",
+        )
 
 
 def run(prefill_configs, decode_addrs, host, port, timeout):

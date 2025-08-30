@@ -75,6 +75,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    ConvertDisaggregationRoleReqInput,
+    ConvertDisaggregationRoleReqOutput,
     EmbeddingReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -123,7 +125,7 @@ from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, is_port_available
 from sglang.srt.utils import (
     configure_gc_warning,
     dataclass_to_string_truncated,
@@ -401,6 +403,9 @@ class TokenizerManager:
         self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.convert_pd_role_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -474,6 +479,10 @@ class TokenizerManager:
                 (
                     LoRAUpdateResult,
                     self.update_lora_adapter_communicator.handle_recv,
+                ),
+                (
+                    ConvertDisaggregationRoleReqOutput,
+                    self.convert_pd_role_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -1326,6 +1335,76 @@ class TokenizerManager:
             await self.set_internal_state_communicator(obj)
         )
         return [res.internal_state for res in responses]
+
+    async def convert_pd_role(
+        self, obj: ConvertDisaggregationRoleReqInput
+    ) -> Tuple[bool, str]:
+        if not self.server_args.enable_pd_convert:
+            return False, "PD role conversion is not enabled.", None
+
+        def set_env_vars(env_vars: Optional[Dict[str, Any]]):
+            if env_vars:
+                for k, v in env_vars.items():
+                    if v is not None:
+                        os.environ[k] = v
+                    else:
+                        os.environ.pop(k, None)
+
+        bootstrap_port = None
+        if obj.clean_connection_pool is None:
+            check_count = 60
+            while len(self.rid_to_state) > 0:
+                await asyncio.sleep(1)
+                check_count -= 1
+                logger.info("Waiting for all requests to finish...")
+                if check_count <= 0:
+                    return (
+                        False,
+                        "Maybe caused by: 1. Server stuck, 2. 60s is not enough",
+                        None,
+                    )
+            await self.flush_cache()
+            logger.info(
+                "All requests are finished and cache flushed, can convert p/d role"
+            )
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                # start a bootstarp server first
+                kv_bootstrap_server_class = get_kv_class(
+                    self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
+                )
+                # find a free port
+                bootstrap_port = 8998
+                while True:
+                    if is_port_available(bootstrap_port):
+                        break
+                    else:
+                        bootstrap_port += 1
+                self.bootstrap_server = kv_bootstrap_server_class(
+                    bootstrap_port,
+                )
+                self.server_args.disaggregation_bootstrap_port = bootstrap_port
+                obj.bootstrap_port = bootstrap_port
+                set_env_vars(obj.disaggregation_prefill_envs)
+            else:
+                # stop the bootstrap server
+                self.bootstrap_server.close()
+                del self.bootstrap_server
+                set_env_vars(obj.disaggregation_decode_envs)
+
+        responses: List[ConvertDisaggregationRoleReqOutput] = (
+            await self.convert_pd_role_communicator(obj)
+        )
+
+        # wait scheduler event loop ready
+        await self.flush_cache()
+        if obj.clean_connection_pool:
+            pass
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.disaggregation_mode = DisaggregationMode.DECODE
+        else:
+            self.disaggregation_mode = DisaggregationMode.PREFILL
+        return responses[0].success, responses[0].message, bootstrap_port
 
     async def get_load(self) -> dict:
         # TODO(lsyin): fake load report server

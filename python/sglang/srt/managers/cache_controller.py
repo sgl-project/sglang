@@ -418,7 +418,7 @@ class HiCacheController:
             extra_config=extra_config,
         )
 
-    def reset(self):
+    def reset(self, del_controller=False):
         self.stop_event.set()
         self.write_thread.join()
         self.load_thread.join()
@@ -436,6 +436,9 @@ class HiCacheController:
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
+
+        if del_controller:
+            return
 
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
@@ -922,3 +925,10 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def __del__(self):
+        if hasattr(self.storage_backend, "unregister_buffer"):
+            self.storage_backend.unregister_buffer(self.mem_pool_host.kv_buffer)
+        logger.info(
+            "HiCacheController is destroyed, all resources and thread released."
+        )

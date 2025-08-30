@@ -19,6 +19,7 @@ Life cycle of a request in the prefill server
 
 from __future__ import annotations
 
+import gc
 import logging
 import threading
 from collections import deque
@@ -28,6 +29,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
+from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -43,6 +45,9 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_policy import SchedulePolicy
+from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -266,6 +271,10 @@ class PrefillBootstrapQueue:
         else:
             return bootstrapped_reqs, failed_reqs
 
+    def __del__(self):
+        self.kv_manager.stop_all_threads()
+        del self.kv_manager
+
 
 class SchedulerDisaggregationPrefillMixin:
     """
@@ -276,7 +285,7 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
-        while True:
+        while not self.stop_prefill_event.is_set():
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
@@ -308,7 +317,7 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
 
-        while True:
+        while not self.stop_prefill_event.is_set():
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
@@ -863,3 +872,52 @@ class SchedulerDisaggregationPrefillMixin:
                 data, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0]
             )
         return data
+
+    def convert_prefill_resources(self: Scheduler) -> None:
+        """convert prefill resources to decode resources."""
+        if not self.server_args.enable_pd_convert:
+            return
+        del self.stop_prefill_event
+        logger.info("Converting prefill resources...")
+
+        del self.req_to_metadata_buffer_idx_allocator
+        del self.disagg_metadata_buffers
+
+        # get the right model_runner
+        if isinstance(self.tp_worker, TpModelWorkerClient):
+            model_runner = self.tp_worker.worker.model_runner
+        else:
+            model_runner = self.tp_worker.model_runner
+
+        # release queues and kv_manager
+        del self.disagg_prefill_bootstrap_queue
+        del self.disagg_prefill_inflight_queue
+
+        # reuse the cuda graph runner
+        model_runner.server_args = self.server_args
+        if hasattr(self, "decode_graph_runner"):
+            model_runner.graph_runner = self.decode_graph_runner
+            model_runner.cuda_graph_mem_usage = self.decode_cuda_graph_mem_usage
+            del self.decode_graph_runner
+        elif not self.server_args.disable_cuda_graph:
+            model_runner.init_device_graphs()
+
+        max_num_reqs = self.req_to_token_pool.size
+        pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
+        self.req_to_token_pool.set_prealloc_size(pre_alloc_size)
+
+        # reinitialize the disaggregation resources for decode
+        self.disaggregation_mode = DisaggregationMode.DECODE
+        if not isinstance(self.tree_cache, ChunkCache):
+            self.policy.tree_cache = None
+            del self.tree_cache
+            del self.policy
+            self.init_memory_pool_and_cache()
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
+        self.init_disaggregation()
+        gc.collect()
+        torch.cuda.empty_cache()
