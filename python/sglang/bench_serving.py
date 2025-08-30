@@ -749,6 +749,8 @@ ASYNC_REQUEST_FUNCS = {
 class BenchmarkMetrics:
     completed: int
     total_input: int
+    total_input_text: int
+    total_input_vision: int
     total_output: int
     total_output_retokenized: int
     request_throughput: float
@@ -836,6 +838,8 @@ class DatasetRow:
     prompt: str
     prompt_len: int
     output_len: int
+    text_prompt_len: int
+    vision_prompt_len: int
     image_data: Optional[List[str]] = None
 
 
@@ -1013,7 +1017,13 @@ def sample_sharegpt_requests(
             continue
 
         filtered_dataset.append(
-            DatasetRow(prompt=prompt, prompt_len=prompt_len, output_len=output_len)
+            DatasetRow(
+                prompt=prompt,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                text_prompt_len=prompt_len,
+                vision_prompt_len=0,
+            )
         )
 
     print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
@@ -1098,6 +1108,8 @@ def sample_random_requests(
                     prompt=input_content,
                     prompt_len=int(input_lens[i]),
                     output_len=int(output_lens[i]),
+                    text_prompt_len=int(input_lens[i]),
+                    vision_prompt_len=0,
                 )
             )
     else:
@@ -1116,6 +1128,8 @@ def sample_random_requests(
                     prompt=input_content,
                     prompt_len=int(input_lens[i]),
                     output_len=int(output_lens[i]),
+                    text_prompt_len=int(input_lens[i]),
+                    vision_prompt_len=0,
                 )
             )
 
@@ -1170,6 +1184,7 @@ def create_mm_data_row(text_prompt, images, images_base64, output_len, processor
         # Some tokenizers do not support list content; fall back to a placeholder in the text
         prompt_str = f"<image>{text_prompt}"
 
+    # Calculate total tokens (text + vision)
     prompt_len = processor(
         text=[prompt_str],
         images=images,
@@ -1177,10 +1192,32 @@ def create_mm_data_row(text_prompt, images, images_base64, output_len, processor
         return_tensors="pt",
     )["input_ids"].numel()
 
+    # Calculate text-only tokens
+    try:
+        # Create text-only version of the prompt
+        text_only_prompt = processor.apply_chat_template(
+            [{"role": "user", "content": text_prompt}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        text_prompt_len = processor(
+            text=[text_only_prompt],
+            padding=False,
+            return_tensors="pt",
+        )["input_ids"].numel()
+    except Exception:
+        # Fallback: just tokenize the text prompt directly
+        text_prompt_len = len(processor.tokenizer.encode(text_prompt))
+
+    # Vision tokens = total tokens - text tokens
+    vision_prompt_len = prompt_len - text_prompt_len
+
     return DatasetRow(
         prompt=text_prompt,
         prompt_len=prompt_len,
         output_len=output_len,
+        text_prompt_len=text_prompt_len,
+        vision_prompt_len=vision_prompt_len,
         image_data=images_base64,
     )
 
@@ -1344,7 +1381,11 @@ def sample_generated_shared_prefix_requests(
 
             input_requests.append(
                 DatasetRow(
-                    prompt=full_prompt, prompt_len=prompt_len, output_len=output_len
+                    prompt=full_prompt,
+                    prompt_len=prompt_len,
+                    output_len=output_len,
+                    text_prompt_len=prompt_len,
+                    vision_prompt_len=0,
                 )
             )
             total_input_tokens += prompt_len
@@ -1404,6 +1445,8 @@ def calculate_metrics(
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
     total_input = 0
+    total_input_text = 0
+    total_input_vision = 0
     completed = 0
     itls: List[float] = []
     tpots: List[float] = []
@@ -1418,6 +1461,8 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i].prompt_len
+            total_input_text += input_requests[i].text_prompt_len
+            total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
@@ -1439,6 +1484,8 @@ def calculate_metrics(
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
+        total_input_text=total_input_text,
+        total_input_vision=total_input_vision,
         total_output=sum(output_lens),
         total_output_retokenized=sum(retokenized_output_lens),
         request_throughput=completed / dur_s,
@@ -1639,6 +1686,10 @@ async def benchmark(
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
+    print(
+        "{:<40} {:<10}".format("Total input vision tokens:", metrics.total_input_vision)
+    )
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
     print(
         "{:<40} {:<10}".format(
@@ -1708,6 +1759,8 @@ async def benchmark(
             "duration": benchmark_duration,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
+            "total_input_text_tokens": metrics.total_input_text,
+            "total_input_vision_tokens": metrics.total_input_vision,
             "total_output_tokens": metrics.total_output,
             "total_output_tokens_retokenized": metrics.total_output_retokenized,
             "request_throughput": metrics.request_throughput,
