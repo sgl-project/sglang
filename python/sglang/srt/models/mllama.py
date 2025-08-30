@@ -844,7 +844,7 @@ class MllamaForConditionalGeneration(nn.Module):
         num_concurrent_media, num_tiles = pixel_values.shape[1:3]
         num_patches = self.vision_model.num_patches
         image_len = num_concurrent_media * num_tiles * num_patches
-        mm_inputs.num_image_tokens = image_len
+        mm_inputs.num_mm_tokens = image_len
 
         pad_ids = pad_values * ((image_len + len(pad_values)) // len(pad_values))
 
