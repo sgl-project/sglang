@@ -96,6 +96,7 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "embed_tokens": "embed_tokens",
     }
 
     result = set()
@@ -131,4 +132,6 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
     )
 
 
+# TODO: [PR #4274] For future use to simplify the mapping between HF module names and customized module names.
+EMBEDDING_NAMES = ["embed_tokens"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]
