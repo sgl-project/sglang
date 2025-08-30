@@ -42,8 +42,8 @@ using QuantType = cutlass::int4b_t;        // 4-bit integer type
 using ElementAccumulator = float;          // Accumulator type
 using ElementScale = cutlass::bfloat16_t;  // Scale type
 using ElementScalePacked = cutlass::Array<ElementScale, 4>;
-using ElementC = cutlass::half_t;  // Default output type (FP16)
-using ElementD = ElementC;         // Default output type (FP16)
+using ElementC = cutlass::bfloat16_t;  // Default output type (FP16)
+using ElementD = ElementC;             // Default output type (FP16)
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
 // Architecture-specific configurations

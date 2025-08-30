@@ -1531,6 +1531,7 @@ class ServerArgs:
                 "triton_kernel",
                 "flashinfer_trtllm",
                 "flashinfer_cutlass",
+                "cutlass_w4afp8",
                 "flashinfer_mxfp4",
             ],
             default=ServerArgs.moe_runner_backend,
