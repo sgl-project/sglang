@@ -178,6 +178,7 @@ class HiCacheNixl(HiCacheStorage):
         keys: List[str],
         target_locations: Optional[List[torch.Tensor | int]] = None,
         target_sizes: Optional[List[int]] = None,
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
     ) -> List[torch.Tensor | None]:
         if not keys:
             return []

@@ -4,7 +4,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -162,6 +162,7 @@ class MooncakeStore(HiCacheStorage):
         values: Optional[List[torch.Tensor]] = None,
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
+        prefix_pages: Optional[Tuple[List[str], torch.Tensor, int]] = None,
     ) -> bool:
         assert len(keys) == len(target_location) == len(target_sizes)
         if len(keys) == 0:
