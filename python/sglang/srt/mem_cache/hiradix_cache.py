@@ -124,7 +124,7 @@ class HiRadixCache(RadixCache):
             node = node.parent
             height += 1
         return height
-    
+
     def clear_storage_backend(self):
         if self.enable_storage:
             self.cache_controller.storage_backend.clear()

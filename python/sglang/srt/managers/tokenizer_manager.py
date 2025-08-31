@@ -73,9 +73,9 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
-    CloseSessionReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
     ExpertDistributionReq,
@@ -1000,7 +1000,9 @@ class TokenizerManager:
     async def clear_hicache_storage(self) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
         # Delegate to the scheduler to handle HiCacheStorage clearing
-        return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[0]
+        return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
+            0
+        ]
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:

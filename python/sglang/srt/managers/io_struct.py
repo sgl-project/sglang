@@ -823,6 +823,7 @@ class ClearHiCacheReqInput:
 class ClearHiCacheReqOutput:
     success: bool
 
+
 @dataclass
 class FlushCacheReqInput:
     pass
