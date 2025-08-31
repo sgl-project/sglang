@@ -125,6 +125,15 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
+    def clear_storage_backend(self):
+        if self.enable_storage:
+            self.cache_controller.storage_backend.clear()
+            logger.info("Hierarchical cache storage backend cleared successfully!")
+            return True
+        else:
+            logger.warning("Hierarchical cache storage backend is not enabled.")
+            return False
+
     def write_backup(self, node: TreeNode, write_back=False):
         host_indices = self.cache_controller.write(
             device_indices=node.value,
