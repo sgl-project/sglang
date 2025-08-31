@@ -383,7 +383,7 @@ async fn handle_pod_event(
             // Handle PD mode with specific pod types
             let result = if pd_mode && pod_info.pod_type.is_some() {
                 // Need to import PDRouter type
-                use crate::routers::pd_router::PDRouter;
+                use crate::routers::http::pd_router::PDRouter;
 
                 // Try to downcast to PDRouter
                 if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
@@ -453,7 +453,7 @@ async fn handle_pod_deletion(
 
         // Handle PD mode removal
         if pd_mode && pod_info.pod_type.is_some() {
-            use crate::routers::pd_router::PDRouter;
+            use crate::routers::http::pd_router::PDRouter;
 
             // Try to downcast to PDRouter for PD-specific removal
             if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
@@ -581,7 +581,7 @@ mod tests {
     async fn create_test_router() -> Arc<dyn RouterTrait> {
         use crate::config::PolicyConfig;
         use crate::policies::PolicyFactory;
-        use crate::routers::router::Router;
+        use crate::routers::http::router::Router;
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Random);
         let router = Router::new(

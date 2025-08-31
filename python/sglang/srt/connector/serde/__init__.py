@@ -15,7 +15,7 @@ def create_serde(serde_type: str) -> Tuple[Serializer, Deserializer]:
 
     if serde_type == "safe":
         s = SafeSerializer()
-        d = SafeDeserializer(torch.uint8)
+        d = SafeDeserializer()
     else:
         raise ValueError(f"Unknown serde type: {serde_type}")
 
