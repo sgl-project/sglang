@@ -438,6 +438,8 @@ class WorkloadGenerator:
                 "median_latency": sorted(self.performance_metrics["latency"])[
                     len(self.performance_metrics["latency"]) // 2
                 ],
+                "input_token_throughput": sum(self.performance_metrics["prompt_len"])
+                / (self.finished_time - self.start_time),
                 "throughput": self.pbar.total / (self.finished_time - self.start_time),
                 "cache_hit_rate": (
                     0
@@ -461,7 +463,10 @@ class WorkloadGenerator:
         print(f"  P90 latency: {performance_data['summary']['p90_latency']:.2f}")
         print(f"  Median latency: {performance_data['summary']['median_latency']:.2f}")
         print(
-            f"  Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
+            f"  Input token throughput: {performance_data['summary']['input_token_throughput']:.2f} tokens per second"
+        )
+        print(
+            f"  Request Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
         print(f"  Cache Hit Rate: {performance_data['summary']['cache_hit_rate']:.6f}")
         return performance_data

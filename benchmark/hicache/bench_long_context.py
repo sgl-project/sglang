@@ -75,6 +75,8 @@ class ContextWorkloadGenerator(WorkloadGenerator):
                 self.performance_metrics["ttft"].append(response.ttft)
                 self.performance_metrics["itl"].extend(response.itl)
                 self.performance_metrics["latency"].append(response.latency)
+                self.performance_metrics["prompt_len"].append(response.prompt_len)
+                self.performance_metrics["cached_tokens"].append(response.cached_tokens)
                 self.completed_requests += 1
 
             except queue.Empty:
