@@ -1,7 +1,7 @@
 use clap::{ArgAction, Parser};
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, MetricsConfig, PolicyConfig,
-    RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
+    MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
@@ -70,6 +70,7 @@ Examples:
     --decode http://127.0.0.3:30003 \
     --decode http://127.0.0.4:30004 \
     --prefill-policy cache_aware --decode-policy power_of_two
+
 "#)]
 struct CliArgs {
     /// Host address to bind the router server
@@ -105,35 +106,35 @@ struct CliArgs {
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 600)]
     worker_startup_timeout_secs: u64,
 
     /// Interval in seconds between checks for worker startup
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 30)]
     worker_startup_check_interval: u64,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.3)]
     cache_threshold: f32,
 
     /// Absolute threshold for load balancing
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 64)]
     balance_abs_threshold: usize,
 
     /// Relative threshold for load balancing
-    #[arg(long, default_value_t = 1.0001)]
+    #[arg(long, default_value_t = 1.5)]
     balance_rel_threshold: f32,
 
     /// Interval in seconds between cache eviction operations
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 120)]
     eviction_interval: u64,
 
     /// Maximum size of the approximation tree for cache-aware routing
-    #[arg(long, default_value_t = 16777216)] // 2^24
+    #[arg(long, default_value_t = 67108864)] // 2^26
     max_tree_size: usize,
 
     /// Maximum payload size in bytes
-    #[arg(long, default_value_t = 268435456)] // 256MB
+    #[arg(long, default_value_t = 536870912)] // 512MB
     max_payload_size: usize,
 
     /// Enable data parallelism aware schedule
@@ -189,11 +190,11 @@ struct CliArgs {
     request_id_headers: Vec<String>,
 
     /// Request timeout in seconds
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
 
     /// Maximum number of concurrent requests allowed
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 256)]
     max_concurrent_requests: usize,
 
     /// CORS allowed origins
@@ -202,23 +203,23 @@ struct CliArgs {
 
     // Retry configuration
     /// Maximum number of retries
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 5)]
     retry_max_retries: u32,
 
     /// Initial backoff in milliseconds for retries
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 50)]
     retry_initial_backoff_ms: u64,
 
     /// Maximum backoff in milliseconds for retries
-    #[arg(long, default_value_t = 10000)]
+    #[arg(long, default_value_t = 30000)]
     retry_max_backoff_ms: u64,
 
     /// Backoff multiplier for exponential backoff
-    #[arg(long, default_value_t = 2.0)]
+    #[arg(long, default_value_t = 1.5)]
     retry_backoff_multiplier: f32,
 
     /// Jitter factor for retry backoff
-    #[arg(long, default_value_t = 0.1)]
+    #[arg(long, default_value_t = 0.2)]
     retry_jitter_factor: f32,
 
     /// Disable retries
@@ -227,24 +228,50 @@ struct CliArgs {
 
     // Circuit breaker configuration
     /// Number of failures before circuit breaker opens
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 10)]
     cb_failure_threshold: u32,
 
     /// Number of successes before circuit breaker closes
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 3)]
     cb_success_threshold: u32,
 
     /// Timeout duration in seconds for circuit breaker
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 60)]
     cb_timeout_duration_secs: u64,
 
     /// Window duration in seconds for circuit breaker
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 120)]
     cb_window_duration_secs: u64,
 
     /// Disable circuit breaker
     #[arg(long, default_value_t = false)]
     disable_circuit_breaker: bool,
+
+    // Health check configuration
+    /// Number of consecutive health check failures before marking worker unhealthy
+    #[arg(long, default_value_t = 3)]
+    health_failure_threshold: u32,
+
+    /// Number of consecutive health check successes before marking worker healthy
+    #[arg(long, default_value_t = 2)]
+    health_success_threshold: u32,
+
+    /// Timeout in seconds for health check requests
+    #[arg(long, default_value_t = 5)]
+    health_check_timeout_secs: u64,
+
+    /// Interval in seconds between runtime health checks
+    #[arg(long, default_value_t = 60)]
+    health_check_interval_secs: u64,
+
+    /// Health check endpoint path
+    #[arg(long, default_value = "/health")]
+    health_check_endpoint: String,
+
+    // IGW (Inference Gateway) configuration
+    /// Enable Inference Gateway mode
+    #[arg(long, default_value_t = false)]
+    enable_igw: bool,
 }
 
 impl CliArgs {
@@ -286,7 +313,12 @@ impl CliArgs {
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         // Determine routing mode
-        let mode = if self.pd_disaggregation {
+        let mode = if self.enable_igw {
+            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            }
+        } else if self.pd_disaggregation {
             let decode_urls = self.decode.clone();
 
             // Validate PD configuration if not using service discovery
@@ -362,6 +394,8 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             max_concurrent_requests: self.max_concurrent_requests,
+            queue_size: 100,        // Default queue size
+            queue_timeout_secs: 60, // Default timeout
             cors_allowed_origins: self.cors_allowed_origins.clone(),
             retry: RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -378,6 +412,15 @@ impl CliArgs {
             },
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
+            health_check: HealthCheckConfig {
+                failure_threshold: self.health_failure_threshold,
+                success_threshold: self.health_success_threshold,
+                timeout_secs: self.health_check_timeout_secs,
+                check_interval_secs: self.health_check_interval_secs,
+                endpoint: self.health_check_endpoint.clone(),
+            },
+            enable_igw: self.enable_igw,
+            rate_limit_tokens_per_second: None,
         })
     }
 
@@ -439,10 +482,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Skip --prefill and its URL
             i += 2;
             // Also skip bootstrap port if present
-            if i < raw_args.len() && !raw_args[i].starts_with("--") {
-                if raw_args[i].parse::<u16>().is_ok() || raw_args[i].to_lowercase() == "none" {
-                    i += 1;
-                }
+            if i < raw_args.len()
+                && !raw_args[i].starts_with("--")
+                && (raw_args[i].parse::<u16>().is_ok() || raw_args[i].to_lowercase() == "none")
+            {
+                i += 1;
             }
         } else {
             filtered_args.push(raw_args[i].clone());
@@ -458,17 +502,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Host: {}:{}", cli_args.host, cli_args.port);
     println!(
         "Mode: {}",
-        if cli_args.pd_disaggregation {
+        if cli_args.enable_igw {
+            "IGW (Inference Gateway)"
+        } else if cli_args.pd_disaggregation {
             "PD Disaggregated"
         } else {
             "Regular"
         }
     );
-    println!("Policy: {}", cli_args.policy);
 
-    if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
-        println!("Prefill nodes: {:?}", prefill_urls);
-        println!("Decode nodes: {:?}", cli_args.decode);
+    if !cli_args.enable_igw {
+        println!("Policy: {}", cli_args.policy);
+
+        if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
+            println!("Prefill nodes: {:?}", prefill_urls);
+            println!("Decode nodes: {:?}", cli_args.decode);
+        }
     }
 
     // Convert to RouterConfig

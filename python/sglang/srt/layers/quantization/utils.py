@@ -77,6 +77,19 @@ def is_layer_skipped(
                 )
     else:
         is_skipped = prefix in ignored_layers
+        if "gate_up_proj" in prefix:
+            prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
+            prefix_up = prefix.replace("gate_up_proj", "up_proj")
+            if prefix_gate in ignored_layers and prefix_up in ignored_layers:
+                is_skipped = True
+        elif "experts" in prefix:
+            is_skipped = any(
+                [
+                    prefix in layer_name
+                    for layer_name in ignored_layers
+                    if "experts" in layer_name
+                ]
+            )
 
     assert is_skipped is not None
     return is_skipped
@@ -146,6 +159,10 @@ def requantize_with_max_scale(
     return max_w_scale, weight
 
 
+def update_tensor_inplace(old: torch.Tensor, new: torch.Tensor) -> None:
+    old.copy_(new)
+
+
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/layer_utils.py
 # Newly generated tensors need to replace existing tensors that are
 # already registered as parameters by vLLM (and won't be freed)
@@ -170,6 +187,27 @@ def replace_parameter(
         if not isinstance(new, torch.nn.Parameter):
             new = torch.nn.Parameter(new, requires_grad=False)
         mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
+
+
+def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
+    assert a.shape == b.shape
+    assert a.dtype == b.dtype == torch.float8_e4m3fn
+
+    a_u8 = a.view(torch.uint8)
+    b_u8 = b.view(torch.uint8)
+    diff_u8 = (a_u8.to(torch.int16) - b_u8.to(torch.int16)).abs()
+
+    numel = a.numel()
+
+    count_diff_sign = ((a_u8 >= 0) & (b_u8 < 0)).sum().item()
+    count_tiny_diff = (diff_u8 >= 1).sum().item()
+    count_large_diff = (diff_u8 >= 2).sum().item()
+
+    assert (
+        (count_diff_sign == 0)
+        and (count_tiny_diff / numel < 0.005)
+        and (count_large_diff == 0)
+    ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=}"
 
 
 # Match dynamic rules with module name (prefix) and override quantize
@@ -318,6 +356,30 @@ def pack_cols(
     q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
     q_res = q_res.contiguous()
 
+    return q_res
+
+
+def pack_rows(
+    q_w: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+):
+    assert q_w.shape == (size_k, size_n)
+
+    pack_factor = get_pack_factor(num_bits)
+    assert size_k % pack_factor == 0
+
+    orig_device = q_w.device
+
+    q_w = q_w.cpu().numpy().astype(numpy.uint32)
+
+    q_res = numpy.zeros((size_k // pack_factor, size_n), dtype=numpy.uint32)
+
+    for i in range(pack_factor):
+        q_res |= q_w[i::pack_factor, :] << num_bits * i
+
+    q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
     return q_res
 
 

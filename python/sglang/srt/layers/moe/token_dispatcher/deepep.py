@@ -2,27 +2,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    List,
-    NamedTuple,
-    Optional,
-    Protocol,
-    Tuple,
-    Union,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled
 from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     BaseDispatcher,
     BaseDispatcherConfig,
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -72,7 +62,7 @@ class DeepEPNormalOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.deepep_normal
+        return DispatchOutputFormat.DEEPEP_NORMAL
 
 
 class DeepEPLLOutput(NamedTuple):
@@ -86,7 +76,7 @@ class DeepEPLLOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.deepep_ll
+        return DispatchOutputFormat.DEEPEP_LL
 
 
 class AscendDeepEPLLOutput(NamedTuple):
@@ -101,7 +91,7 @@ class AscendDeepEPLLOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.deepep_ll
+        return DispatchOutputFormat.ASCENT_LL
 
 
 assert isinstance(DeepEPNormalOutput, DispatchOutput)
@@ -128,8 +118,8 @@ class DeepEPBuffer:
         hidden_size: int,
         param_bytes: int,
         deepep_mode: DeepEPMode,
-        num_max_dispatch_tokens_per_rank: int = None,
-        num_experts: int = None,
+        num_max_dispatch_tokens_per_rank: int = -1,
+        num_experts: int = -1,
     ):
         if cls._buffer is not None:
             return cls._buffer
@@ -156,8 +146,8 @@ class DeepEPBuffer:
                     num_rdma_bytes,
                 )
         if deepep_mode.enable_low_latency():
-            assert num_max_dispatch_tokens_per_rank is not None
-            assert num_experts is not None and num_experts % group.size() == 0
+            assert num_max_dispatch_tokens_per_rank != -1
+            assert num_experts != -1 and num_experts % group.size() == 0
             num_rdma_bytes = max(
                 Buffer.get_low_latency_rdma_size_hint(
                     num_max_dispatch_tokens_per_rank,
@@ -181,7 +171,7 @@ class DeepEPBuffer:
             ).multi_processor_count
             if (
                 (deepep_mode != DeepEPMode.LOW_LATENCY)
-                and not global_server_args_dict["enable_two_batch_overlap"]
+                and not is_tbo_enabled()
                 and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
             ):
                 logger.warning(
@@ -226,7 +216,7 @@ class DeepEPConfig(BaseDispatcherConfig):
     _instance = None
 
     def __init__(self):
-        config_str = global_server_args_dict["deepep_config"]
+        config_str = get_deepep_config()
         if config_str:
             config_parsed = load_json_config(config_str)
             if torch.distributed.get_rank() == 0:
