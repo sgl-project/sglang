@@ -274,6 +274,7 @@ class ServerArgs:
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
+    eplb_min_rebalancing_utilization_threshold: float = 1.0
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_approx", "per_pass", "per_token"]
     ] = None
@@ -746,6 +747,15 @@ class ServerArgs:
                     "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+
+            if (
+                self.speculative_eagle_topk > 1
+                and self.page_size > 1
+                and self.attention_backend != "flashinfer"
+            ):
+                raise ValueError(
+                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                )
 
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
@@ -1585,6 +1595,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.eplb_rebalance_layers_per_chunk,
             help="Number of layers to rebalance per forward pass.",
+        )
+        parser.add_argument(
+            "--eplb-min-rebalancing-utilization-threshold",
+            type=float,
+            default=ServerArgs.eplb_min_rebalancing_utilization_threshold,
+            help="Minimum threshold for GPU average utilization to trigger EPLB rebalancing. Must be in the range [0.0, 1.0].",
         )
         parser.add_argument(
             "--expert-distribution-recorder-mode",
