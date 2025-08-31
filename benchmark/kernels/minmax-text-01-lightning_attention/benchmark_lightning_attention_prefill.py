@@ -1,6 +1,5 @@
 import itertools
 import math
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -9,6 +8,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from einops import rearrange
+
+from sglang.srt.utils import get_bool_env_var
 
 
 # Adapted from https://github.com/OpenNLPLab/lightning-attention/blob/main/lightning_attn/ops/triton/lightning_attn2.py
@@ -197,7 +198,7 @@ def lightning_attn_func(q, k, v, s):
     return o
 
 
-debug = eval(os.environ.get("debug", default="False"))
+debug = get_bool_env_var("debug", "False")
 
 BLOCK = 256
 

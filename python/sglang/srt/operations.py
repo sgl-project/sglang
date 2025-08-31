@@ -8,11 +8,12 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Sequence
 import torch
 
 from sglang.srt.layers.dp_attention import set_dp_buffer_len
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_OPERATIONS_ENABLE_PROFILE", "0")))
+_ENABLE_PROFILE = get_bool_env_var("SGLANG_OPERATIONS_ENABLE_PROFILE", "0")
 
 if _ENABLE_PROFILE:
     import nvtx

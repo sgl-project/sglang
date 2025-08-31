@@ -16,7 +16,9 @@ from wave_lang.kernel.wave.templates.extend_attention import get_extend_attentio
 from wave_lang.kernel.wave.utils.general_utils import get_default_scheduling_params
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 
-dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
+from sglang.srt.utils import get_int_env_var
+
+dump_generated_mlir = get_int_env_var("WAVE_DUMP_MLIR", 0)
 
 
 @functools.lru_cache

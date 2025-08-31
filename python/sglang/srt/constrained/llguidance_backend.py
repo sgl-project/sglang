@@ -32,6 +32,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class GuidanceGrammar(BaseGrammarObject):
         self.ll_matcher = LLMatcher(
             self.llguidance_tokenizer,
             self.serialized_grammar,
-            log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
+            log_level=get_int_env_var("LLGUIDANCE_LOG_LEVEL", 1),
         )
         self.finished = False
         self.bitmask = None

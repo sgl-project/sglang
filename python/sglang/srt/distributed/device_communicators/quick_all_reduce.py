@@ -15,7 +15,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import get_int_env_var, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +202,7 @@ class QuickAllReduce:
         # quickallreduce should not be created.
 
         # ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
-        qr_max_size = int(os.environ.get("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", 0))
+        qr_max_size = get_int_env_var("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", 0)
         if qr_max_size > 0:
             if qr_max_size < 1:
                 logger.info(

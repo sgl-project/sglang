@@ -18,7 +18,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 def _can_p2p(rank: int, world_size: int) -> bool:
     # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
-    SGLANG_SKIP_P2P_CHECK = os.getenv("SGLANG_SKIP_P2P_CHECK", "0") == "1"
+    SGLANG_SKIP_P2P_CHECK = get_bool_env_var("SGLANG_SKIP_P2P_CHECK", "0")
     for i in range(world_size):
         if i == rank:
             continue
