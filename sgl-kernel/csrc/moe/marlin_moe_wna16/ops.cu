@@ -24,6 +24,7 @@
 #endif
 
 #include "kernel.h"
+#include "kernel_marlin.cuh"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                        \
   static_assert(                                                                         \
