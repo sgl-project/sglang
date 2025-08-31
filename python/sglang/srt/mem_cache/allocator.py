@@ -20,7 +20,7 @@ Page-aligned memory pool.
 """
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Union
 
 import torch
 import triton
@@ -220,19 +220,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: SWAKVPool,
         need_sort: bool,
+        allocator_class: BaseTokenToKVPoolAllocator = TokenToKVPoolAllocator,
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
-        self.full_attn_allocator = TokenToKVPoolAllocator(
+        self.full_attn_allocator = allocator_class(
             size,
             dtype,
             device,
             kvcache.full_kv_pool,
             need_sort,
         )
-        self.swa_attn_allocator = TokenToKVPoolAllocator(
+        self.swa_attn_allocator = allocator_class(
             size_swa,
             dtype,
             device,

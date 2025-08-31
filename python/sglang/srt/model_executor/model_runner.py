@@ -1281,150 +1281,11 @@ class ModelRunner:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
-        if self.server_args.attention_backend == "ascend":
-            if self.use_mla_backend:
-                self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    kv_lora_rank=self.model_config.kv_lora_rank,
-                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                )
-            else:
-                self.token_to_kv_pool = AscendTokenToKVPool(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    layer_num=self.model_config.num_hidden_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                )
-        elif self.use_mla_backend:
-            self.token_to_kv_pool = MLATokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                kv_lora_rank=self.model_config.kv_lora_rank,
-                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-            )
-        elif self.server_args.enable_double_sparsity:
-            self.token_to_kv_pool = DoubleSparseTokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                heavy_channel_num=self.server_args.ds_heavy_channel_num,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-            )
-        else:
-            if self.is_hybrid:
-                self.token_to_kv_pool = SWAKVPool(
-                    size=self.full_max_total_num_tokens,
-                    size_swa=self.swa_max_total_num_tokens,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-                    full_attention_layer_ids=self.model_config.full_attention_layer_ids,
-                    enable_kvcache_transpose=False,
-                    device=self.device,
-                )
-            else:
-                mha_token_to_kv_pool_args = dict(
-                    size=self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
-                )
-                if not self.is_elastic:
-                    self.token_to_kv_pool = MHATokenToKVPool(
-                        **mha_token_to_kv_pool_args
-                    )
-                else:
-                    # add enable overlap schedule args to elastic mha token to kv pool
-                    elastic_mha_token_to_kv_pool_args = mha_token_to_kv_pool_args
-                    elastic_mha_token_to_kv_pool_args["enable_overlap_schedule"] = (
-                        not self.server_args.disable_overlap_schedule
-                    )
-                    self.token_to_kv_pool = ElasticMHATokenToKVPool(
-                        **elastic_mha_token_to_kv_pool_args
-                    )
+        self.token_to_kv_pool = self._create_kv_pool()
 
         # Initialize token_to_kv_pool_allocator
-        need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if self.server_args.attention_backend == "ascend":
-                self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=self.token_to_kv_pool,
-                    need_sort=need_sort,
-                )
-            else:
-                if self.page_size == 1:
-                    if self.is_hybrid:
-                        self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                            self.full_max_total_num_tokens,
-                            self.swa_max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
-                    else:
-                        allocator_cls = (
-                            ElasticTokenToKVPoolAllocator
-                            if self.is_elastic
-                            else TokenToKVPoolAllocator
-                        )
-                        self.token_to_kv_pool_allocator = allocator_cls(
-                            self.max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
-                else:
-                    assert not self.is_hybrid
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+            self.token_to_kv_pool_allocator = self._create_allocator()
         else:
             assert self.is_draft_worker
 
@@ -1432,6 +1293,130 @@ class ModelRunner:
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+
+    def _create_kv_pool(self):
+        """Create the appropriate KV pool based on configuration."""
+        base_args = self._build_common_kv_args()
+
+        if self.server_args.attention_backend == "ascend":
+            if self.use_mla_backend:
+                return AscendMLAPagedTokenToKVPool(
+                    **self._build_mla_pool_args(base_args),
+                )
+            else:
+                return AscendTokenToKVPool(
+                    **self._build_mha_pool_args(base_args),
+                )
+        elif self.use_mla_backend:
+            return MLATokenToKVPool(
+                **self._build_mla_pool_args(base_args),
+            )
+
+        elif self.server_args.enable_double_sparsity:
+            return DoubleSparseTokenToKVPool(
+                heavy_channel_num=self.server_args.ds_heavy_channel_num,
+                **base_args,
+            )
+
+        elif self.is_elastic:
+            token_to_kv_pool_class = ElasticMHATokenToKVPool
+            base_args["enable_overlap_schedule"] = (
+                not self.server_args.disable_overlap_schedule
+            )
+        else:
+            token_to_kv_pool_class = MHATokenToKVPool
+
+        if not self.is_hybrid:
+            # MHA case
+            return token_to_kv_pool_class(**self._build_mha_pool_args(base_args))
+        else:
+            # SWA case
+            return SWAKVPool(
+                **self._build_swa_pool_args(base_args, token_to_kv_pool_class)
+            )
+
+    def _build_common_kv_args(self):
+        # Common kwargs shared by most KV pool constructors
+        return {
+            "size": self.max_total_num_tokens,
+            "page_size": self.page_size,
+            "dtype": self.kv_cache_dtype,
+            "layer_num": self.num_effective_layers,
+            "device": self.device,
+            "enable_memory_saver": self.server_args.enable_memory_saver,
+            "start_layer": self.start_layer,
+            "end_layer": self.end_layer,
+        }
+
+    def _build_mha_pool_args(self, base_args: dict):
+        # Args for non-hybrid MHA-like pools
+        args_to_update = {
+            "head_num": self.model_config.get_num_kv_heads(get_attention_tp_size()),
+            "head_dim": self.model_config.head_dim,
+        }
+        base_args.update(args_to_update)
+        return base_args
+
+    def _build_mla_pool_args(self, base_args: dict):
+        # Args for MLA pool
+        args_to_update = {
+            "kv_lora_rank": self.model_config.kv_lora_rank,
+            "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+        }
+        base_args.update(args_to_update)
+        return base_args
+
+    def _build_swa_pool_args(self, base_args: dict, token_to_kv_pool_class):
+        # Args for hybrid SWA pool
+        args_to_update = {
+            "size": self.full_max_total_num_tokens,
+            "size_swa": self.swa_max_total_num_tokens,
+            "swa_attention_layer_ids": self.model_config.swa_attention_layer_ids,
+            "full_attention_layer_ids": self.model_config.full_attention_layer_ids,
+            "enable_kvcache_transpose": False,
+            "token_to_kv_pool_class": token_to_kv_pool_class,
+        }
+        base_args.update(args_to_update)
+        return base_args
+
+    def _create_allocator(self):
+        """Create the appropriate allocator based on configuration."""
+
+        if self.server_args.attention_backend == "ascend":
+            return AscendPagedTokenToKVPoolAllocator(
+                page_size=self.page_size, **self._build_allocator_args()
+            )
+        elif self.page_size == 1:
+            allocator_cls = (
+                ElasticTokenToKVPoolAllocator
+                if self.is_elastic
+                else TokenToKVPoolAllocator
+            )
+            if self.is_hybrid:
+                return SWATokenToKVPoolAllocator(
+                    size=self.full_max_total_num_tokens,
+                    size_swa=self.swa_max_total_num_tokens,
+                    allocator_class=allocator_cls,
+                    **self._build_allocator_args(),
+                )
+            else:
+                return allocator_cls(
+                    **self._build_allocator_args(),
+                )
+        else:
+            assert not self.is_hybrid
+            return PagedTokenToKVPoolAllocator(
+                page_size=self.page_size, **self._build_allocator_args()
+            )
+
+    def _build_allocator_args(self):
+        return {
+            "size": self.max_total_num_tokens,
+            "dtype": self.kv_cache_dtype,
+            "device": self.device,
+            "kvcache": self.token_to_kv_pool,
+            "need_sort": self.server_args.disaggregation_mode in ("decode", "prefill"),
+        }
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
