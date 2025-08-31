@@ -20,7 +20,7 @@ import concurrent.futures
 import logging
 import os
 from enum import IntEnum, auto
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union, List
 
 import torch
 import torch.nn.functional as F
@@ -2035,6 +2035,9 @@ class DeepseekV2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+        
+        # For EAGLE3 support
+        self.layers_to_capture = []
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -2054,6 +2057,8 @@ class DeepseekV2Model(nn.Module):
             dtype=torch.float32,
             device=device,
         )
+
+        aux_hidden_states = []
 
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -2078,6 +2083,12 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
 
         for i in range(normal_start_layer, normal_end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual
+                    if residual is not None
+                    else hidden_states
+                )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
@@ -2085,6 +2096,12 @@ class DeepseekV2Model(nn.Module):
                 )
 
         if normal_end_layer != self.end_layer:
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual
+                    if residual is not None
+                    else hidden_states
+                )
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers[normal_end_layer : self.end_layer],
                 enable_tbo=True,
@@ -2111,7 +2128,10 @@ class DeepseekV2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class DeepseekV2ForCausalLM(nn.Module):
@@ -2141,6 +2161,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.capture_aux_hidden_states = False
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -2212,10 +2233,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return hidden_states
@@ -2718,6 +2742,21 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
