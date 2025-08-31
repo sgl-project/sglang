@@ -38,17 +38,16 @@ class MambaAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
-        query_start_loc = torch.zeros(
-            (bs + 1,), dtype=torch.int32, device=self.device
-        )
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
         elif forward_batch.forward_mode.is_prefill():
-            query_start_loc[1 : bs + 1] = torch.cumsum(
-                forward_batch.extend_seq_lens, dim=0
+            query_start_loc = torch.empty(
+                (bs + 1,), dtype=torch.int32, device=self.device
             )
+            query_start_loc[:bs] = forward_batch.extend_start_loc
+            query_start_loc[bs] = forward_batch.extend_start_loc[-1] + forward_batch.extend_seq_lens[-1]
         else:
             raise NotImplementedError("Only prefill/decode/idle modes are supported.")
         mamba_cache_indices = (
