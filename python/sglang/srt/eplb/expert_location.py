@@ -343,7 +343,9 @@ def compute_logical_to_rank_dispatch_physical_map(
 ):
     r = random.Random(seed)
 
-    num_local_physical_experts = num_physical_experts // num_gpus
+    num_local_gpu_physical_experts = num_physical_experts // num_gpus
+    # TODO: suppose 8 GPUs per host
+    num_local_host_physical_experts = num_local_gpu_physical_experts * 8
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype
 
@@ -367,13 +369,28 @@ def compute_logical_to_rank_dispatch_physical_map(
                     physical_expert_id
                     for physical_expert_id in candidate_physical_expert_ids
                     if _compute_gpu_id_of_physical_expert(
-                        physical_expert_id, num_local_physical_experts
+                        physical_expert_id, num_local_gpu_physical_experts
                     )
                     == gpu_id
                 ]
                 if len(same_gpu_physical_expert_ids) > 0:
+                    # 1. Prefer same-GPU experts
                     output_partial[gpu_id] = same_gpu_physical_expert_ids[0]
+                else:
+                    # 2. Otherwise, prefer same-host experts
+                    host_id = gpu_id // 8
+                    same_host_physical_expert_ids = [
+                        physical_expert_id
+                        for physical_expert_id in candidate_physical_expert_ids
+                        if _compute_host_id_of_physical_expert(
+                            physical_expert_id, num_local_host_physical_experts
+                        )
+                        == host_id
+                    ]
+                    if len(same_host_physical_expert_ids) > 0:
+                        output_partial[gpu_id] = same_host_physical_expert_ids[0]
 
+            # 3. Fill remaining slots with fair random choices
             num_remain = torch.sum(output_partial == -1).item()
             output_partial[output_partial == -1] = torch.tensor(
                 _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r),
@@ -399,9 +416,15 @@ def _logical_to_all_physical_raw(
 
 
 def _compute_gpu_id_of_physical_expert(
-    physical_expert_id: int, num_local_physical_experts: int
+    physical_expert_id: int, num_local_gpu_physical_experts: int
 ) -> int:
-    return physical_expert_id // num_local_physical_experts
+    return physical_expert_id // num_local_gpu_physical_experts
+
+
+def _compute_host_id_of_physical_expert(
+    physical_expert_id: int, num_local_host_physical_experts: int
+) -> int:
+    return physical_expert_id // num_local_host_physical_experts
 
 
 def _fair_choices(arr: List, k: int, r: random.Random) -> List:
