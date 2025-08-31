@@ -913,6 +913,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
 
+    mminput_cache = {}
+
     @classmethod
     def init_new(
         cls,
@@ -1292,6 +1294,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
+                elif isinstance(pixel_values, dict):
+                    use_cache_marks = pixel_values["use_cache_mark"]
+                    hash_keys = pixel_values["hash_keys"]
+                    split_tensors = pixel_values["send_data"]
+                    take_to_idx = pixel_values["img_heights"]
+                    delete_keys = pixel_values["delete_keys"]
+
+                    real_pixel_values = []
+                    take_start_idx = 0
+                    take_end_idx = 0
+                    take_idx = 0
+                    for send_idx in range(len(use_cache_marks)):
+                        if use_cache_marks[send_idx]:
+                            real_pixel_values.append(
+                                self.mminput_cache[hash_keys[send_idx]]
+                            )
+
+                        else:
+                            take_start_idx = take_end_idx
+                            take_end_idx = take_start_idx + take_to_idx[take_idx]
+                            real_pixel_values.append(
+                                split_tensors[take_start_idx:take_end_idx].to(
+                                    self.device, non_blocking=True
+                                )
+                            )
+                            self.mminput_cache[hash_keys[send_idx]] = real_pixel_values[
+                                -1
+                            ]
+                            take_idx += 1
+                    # synchoronize hash_table with processor
+                    for delete_key in delete_keys:
+                        self.mminput_cache.pop(delete_key)
+
+                    mm_item.feature = torch.cat(real_pixel_values)
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
