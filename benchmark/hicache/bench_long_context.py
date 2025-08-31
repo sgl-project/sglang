@@ -33,7 +33,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
         self.dataset = json.load(open(args.dataset_path))
 
         init_requests = []
-        for i in range(min(args.num_clients, len(self.dataset["queries"]))):
+        for i in range(len(self.dataset["queries"])):
             context_id = self.dataset["queries"][i]["context"]
             init_requests.append(
                 (
@@ -52,7 +52,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
         self.ready_queue = ReadyQueue(init_requests=init_requests)
 
         self.response_queue = queue.Queue()
-        self.pbar = tqdm(total=args.num_clients * args.num_rounds)
+        self.pbar = tqdm(total=len(self.dataset["queries"]))
         self.performance_metrics = {
             "ttft": [],
             "latency": [],
@@ -85,7 +85,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
 if __name__ == "__main__":
     args = parse_args()
     args.num_rounds = 1
-    args.max_parallel = 128
+    args.max_parallel = 24
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
     for request_rate in [24, 16, 12, 8, 4, 2, 1]:
