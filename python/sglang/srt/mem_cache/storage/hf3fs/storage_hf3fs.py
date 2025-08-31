@@ -393,8 +393,14 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return len(keys)
 
-    def clear(self) -> None:
-        self.metadata_client.clear(self.rank)
+    def clear(self) -> bool:
+        try:
+            self.metadata_client.clear(self.rank)
+            logger.info(f"Cleared HiCacheHF3FS for rank {self.rank}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear HiCacheHF3FS: {e}")
+            return False
 
     def close(self) -> None:
         try:
