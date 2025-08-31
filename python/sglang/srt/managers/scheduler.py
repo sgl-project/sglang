@@ -69,6 +69,8 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    ClearHiCacheReqInput,
+    ClearHiCacheReqOutput,
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -515,6 +517,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
+                (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -2207,6 +2210,16 @@ class Scheduler(
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
 
+    def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
+        if self.enable_hierarchical_cache:
+            self.tree_cache.clear_storage_backend()
+            logger.info("Hierarchical cache cleared successfully!")
+            if_success = True
+        else:
+            logging.warning("Hierarchical cache is not enabled.")
+            if_success = False
+        return ClearHiCacheReqOutput(success=if_success)
+
     def flush_cache(self):
         """Flush the memory pool and cache."""
         if (
@@ -2378,6 +2391,10 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.tree_cache.cache_finished_req(req)
+
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
