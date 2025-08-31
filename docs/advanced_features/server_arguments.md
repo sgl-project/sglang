@@ -236,7 +236,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-hierarchical-cache` | Enable hierarchical cache. | False |
 | `--hicache-ratio` | The ratio of the size of host KV cache memory pool to the size of device pool. | 2.0 |
 | `--hicache-size` | The size of the hierarchical cache. | 0 |
-| `--hicache-write-policy` | The write policy for hierarchical cache. | write_through_selective |
+| `--hicache-write-policy` | The write policy for hierarchical cache. | write_through |
 | `--hicache-io-backend` | The IO backend for hierarchical cache. |  |
 | `--hicache-storage-backend` | The storage backend for hierarchical cache. | None |
 

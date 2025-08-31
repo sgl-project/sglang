@@ -159,6 +159,7 @@ class MooncakeStore(HiCacheStorage):
     def batch_set(
         self,
         keys: List[str],
+        values: Optional[List[torch.Tensor]] = None,
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
