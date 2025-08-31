@@ -695,7 +695,7 @@ class RerankResponse(BaseModel):
 class TokenizeRequest(BaseModel):
     """Request schema for the /tokenize endpoint."""
 
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     prompt: Union[str, List[str]]
     add_special_tokens: bool = Field(
         default=True,
@@ -714,7 +714,7 @@ class TokenizeResponse(BaseModel):
 class DetokenizeRequest(BaseModel):
     """Request schema for the /detokenize endpoint."""
 
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     tokens: Union[List[int], List[List[int]]]
     skip_special_tokens: bool = Field(
         default=True,
