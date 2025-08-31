@@ -33,7 +33,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
         self.dataset = json.load(open(args.dataset_path))
 
         init_requests = []
-        for i in range(len(self.dataset["queries"])):
+        for i in range(min(args.num_clients, len(self.dataset["queries"]))):
             context_id = self.dataset["queries"][i]["context"]
             init_requests.append(
                 (
