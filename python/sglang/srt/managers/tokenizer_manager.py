@@ -1335,13 +1335,11 @@ class TokenizerManager:
         # Many DP ranks
         return [res.internal_state for res in responses]
 
-    async def set_internal_state(
-        self, obj: SetInternalStateReq
-    ) -> SetInternalStateReqOutput:
+    async def set_internal_state(self, obj: SetInternalStateReq) -> List[bool]:
         responses: List[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )
-        return [res.internal_state for res in responses]
+        return [res.updated for res in responses]
 
     async def get_load(self) -> dict:
         # TODO(lsyin): fake load report server
