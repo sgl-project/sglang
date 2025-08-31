@@ -249,7 +249,7 @@ class MambaAttnBackend(AttentionBackend):
         )
         value = rearrange(value, "l (h d) -> 1 l h d", d=head_v_dim)
         beta = b.sigmoid()
-        g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+        g = fused_gdn_gating(A_log, a, dt_bias)
         g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
         recurrent_state = ssm_states[self.forward_metadata.mamba_cache_indices]
         core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
