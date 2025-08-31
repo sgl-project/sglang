@@ -52,9 +52,7 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         self.forward_metadata: Optional[ForwardMetaData] = None
 
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-        self._triton_backend = TritonAttnBackend(
-            model_runner=model_runner, skip_prefill=False
-        )
+        self._triton_backend = TritonAttnBackend(model_runner=model_runner, skip_prefill=False)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         assert (
@@ -85,11 +83,11 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
             cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, page_table=page_table
         )
 
-        # print("=" * 120)
-        # print(_red("forward_batch.encoder_lens:"), forward_batch.encoder_lens)
-        # print(_red("page_table:"), page_table)
-        # print(_red("max_seqlens_k:"), max_seqlen_k)
-        # print(_red("cu_seqlens_k:"), cu_seqlens_k)
+        print("=" * 120)
+        print(_red("forward_batch.encoder_lens:"), forward_batch.encoder_lens)
+        print(_red("page_table:"), page_table)
+        print(_red("max_seqlens_k:"), max_seqlen_k)
+        print(_red("cu_seqlens_k:"), cu_seqlens_k)
 
         self._triton_backend.init_forward_metadata(forward_batch)
 
@@ -151,7 +149,20 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
         v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
 
+        # torch.distributed.breakpoint()
+
         metadata = self.forward_metadata
+        if layer.layer_id == 0:
+            print(_yellow(f"{layer.is_cross_attention=}"))
+            print(_yellow(f"{forward_batch.encoder_out_cache_loc=}"))
+            print(_yellow("k:"), "\n", k.shape, "\n", k.reshape(-1)[:-8], "\n", k.sum().item())
+            print(_yellow("v:"), "\n", v.shape, "\n", v.reshape(-1)[:-8], "\n", v.sum().item())
+            print(_yellow("cu_seqlens_q:"), metadata.cu_seqlens_q)
+            print(_yellow("out_cache_loc:"), forward_batch.out_cache_loc.reshape(-1))
+            print(_yellow("k_cache:"), "\n", k_cache.shape, "\n", k_cache.view(-1, layer.tp_k_head_num, layer.head_dim)[forward_batch.out_cache_loc].reshape(-1)[:8], "\n", torch.where(k_cache.reshape(-1) != 0.)[0], "\n", k_cache.sum().item())
+            print(_yellow("v_cache:"), "\n", v_cache.shape, "\n", v_cache.view(-1, layer.tp_v_head_num, layer.head_dim)[forward_batch.out_cache_loc].reshape(-1)[:8], "\n", torch.where(v_cache.reshape(-1) != 0.)[0], "\n", v_cache.sum().item())
+            print(_yellow("page_table:"), metadata.page_table)
+
         out = self.flash_attn_func(
             q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
             k=k_cache,
@@ -161,7 +172,8 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
             page_table=metadata.page_table,
             softcap=layer.logit_cap,
             softmax_scale=layer.scaling,
-            window_size=(layer.sliding_window_size, 0),
+            window_size=(layer.sliding_window_size, 0) if layer.sliding_window_size is not None and layer.sliding_window_size > 0 else (None, None),
+            causal=True,
             learnable_sink=sinks.to(torch.bfloat16) if sinks is not None else None,
         )[0]
 
@@ -174,23 +186,16 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
             save_kv_cache=False,
             sinks=sinks,
         )
-        # if layer.layer_id == 0:
-        #     print(_yellow(f"{layer.is_cross_attention=}"))
-        #     print(_yellow(f"{forward_batch.encoder_out_cache_loc=}"))
-        #     print(_yellow("k:"), "\n", k.shape, "\n", k.reshape(-1)[:-8], "\n", k.sum().item())
-        #     print(_yellow("v:"), "\n", v.shape, "\n", v.reshape(-1)[:-8], "\n", v.sum().item())
-        #     print(_yellow("cu_seqlens_q:"), metadata.cu_seqlens_q)
-        #     print(_yellow("out_cache_loc:"), forward_batch.out_cache_loc.reshape(-1))
-        #     print(_yellow("k_cache:"), "\n", k_cache.shape, k_cache[forward_batch.out_cache_loc].reshape(-1)[:8], "\n", torch.where(k_cache.reshape(-1) != 0.)[0], "\n", k_cache.sum().item())
-        #     print(_yellow("v_cache:"), "\n", v_cache.shape, v_cache[forward_batch.out_cache_loc].reshape(-1)[:8], "\n", torch.where(v_cache.reshape(-1) != 0.)[0], "\n", v_cache.sum().item())
-        #     print(_yellow("page_table:"), metadata.page_table)
-        #     print(_yellow("out:"), out.reshape(-1)[:8])
 
-        # max_diff = (out.reshape(-1) - ref.reshape(-1)).float().abs().max().item()
-        # if max_diff > 0.02:
-        #     print(_yellow("out:"), out.reshape(-1)[:8])
-        #     print(_green("ref:\n"), ref.reshape(-1)[:8])
-        #     assert False, "FUCK"
+        max_diff = (out.reshape(-1) - ref.reshape(-1)).float().abs().max().item()
+        print(_yellow(f"out: {layer.layer_id=}"), "\n", out.reshape(-1)[:8], "\n", out.reshape(-1)[-8:])
+        print(_green(f"ref: {layer.layer_id=}"), "\n", ref.reshape(-1)[:8], "\n", ref.reshape(-1)[-8:])
+        if max_diff > 0.2:
+            print(_yellow("sliding_window_size:"), "\n", f"{layer.sliding_window_size=}")
+            print(_red("big difference!!!"), f"{layer.layer_id=} {max_diff=:<.5f}", flush=True)
+            torch.distributed.breakpoint()
+        else:
+            print(_green("okay"), f"{layer.layer_id=}", flush=True)
 
         return out.view(-1, layer.tp_q_head_num * layer.head_dim)
 
