@@ -226,6 +226,7 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             logical_to_rank_dispatch_physical_map=(
                 compute_logical_to_rank_dispatch_physical_map(
+                    server_args=server_args,
                     logical_to_all_physical_map=logical_to_all_physical_map,
                     num_gpus=ep_size,
                     num_physical_experts=num_physical_experts,
@@ -335,6 +336,7 @@ def _pad_nested_array(arr, pad_value):
 
 # TODO optimize performance (rewrite and/or run in separate process with overlap)
 def compute_logical_to_rank_dispatch_physical_map(
+    server_args: ServerArgs,
     logical_to_all_physical_map: torch.Tensor,
     num_gpus: int,
     num_physical_experts: int,
@@ -344,8 +346,8 @@ def compute_logical_to_rank_dispatch_physical_map(
     r = random.Random(seed)
 
     num_local_gpu_physical_experts = num_physical_experts // num_gpus
-    # TODO: suppose 8 GPUs per host
-    num_local_host_physical_experts = num_local_gpu_physical_experts * 8
+    num_gpus_per_node = server_args.ep_size // server_args.nnodes
+    num_local_node_physical_experts = num_local_gpu_physical_experts * num_gpus_per_node
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype
 
@@ -377,18 +379,18 @@ def compute_logical_to_rank_dispatch_physical_map(
                     # 1. Prefer same-GPU experts
                     output_partial[gpu_id] = same_gpu_physical_expert_ids[0]
                 else:
-                    # 2. Otherwise, prefer same-host experts
-                    host_id = gpu_id // 8
-                    same_host_physical_expert_ids = [
+                    # 2. Otherwise, prefer same-node experts
+                    node_id = gpu_id // num_gpus_per_node
+                    same_node_physical_expert_ids = [
                         physical_expert_id
                         for physical_expert_id in candidate_physical_expert_ids
                         if _compute_host_id_of_physical_expert(
-                            physical_expert_id, num_local_host_physical_experts
+                            physical_expert_id, num_local_node_physical_experts
                         )
-                        == host_id
+                        == node_id
                     ]
-                    if len(same_host_physical_expert_ids) > 0:
-                        output_partial[gpu_id] = same_host_physical_expert_ids[0]
+                    if len(same_node_physical_expert_ids) > 0:
+                        output_partial[gpu_id] = same_node_physical_expert_ids[0]
 
             # 3. Fill remaining slots with fair random choices
             num_remain = torch.sum(output_partial == -1).item()
