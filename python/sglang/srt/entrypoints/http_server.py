@@ -480,6 +480,16 @@ async def flush_cache():
     )
 
 
+@app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
+async def clear_hicache_storage_backend():
+    """Clear the hierarchical cache storage backend."""
+    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
+    return Response(
+        content="Hierarchical cache storage backend cleared.\n",
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.api_route("/start_profile", methods=["GET", "POST"])
 async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     """Start profiling."""
