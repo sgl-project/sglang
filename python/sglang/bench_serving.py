@@ -1929,8 +1929,8 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
-    if not hasattr(args, "slowdown_factor"):
-        args.slowdown_factor = 1.0
+    if not hasattr(args, "mooncake_slowdown_factor"):
+        args.mooncake_slowdown_factor = 1.0
 
     print(f"benchmark_args={args}")
 
@@ -2205,12 +2205,6 @@ if __name__ == "__main__":
         '--use-trace-timestamps',
         action="store_true",
         help="Use timestamps from the trace file for request scheduling. Only valid for 'mooncake' dataset."
-    )
-    parser.add_argument(
-        "--slowdown-factor",
-        type=float,
-        default=1.0,
-        help="A factor to slow down the trace replay. Only used with --use-trace-timestamps. (Default: 1.0)",
     )
     parser.add_argument(
         "--max-concurrency",
