@@ -20,6 +20,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
+from sglang.srt.function_call.long_cat_detector import LongCatDetector
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class FunctionCallParser:
         "glm45": Glm4MoeDetector,
         "step3": Step3Detector,
         "gpt-oss": GptOssDetector,
+        "longcat": LongCatDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
