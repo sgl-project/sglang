@@ -564,7 +564,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        if hidden_states.shape[0] != 0:
+        if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -811,7 +811,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        if hidden_states.shape[0] != 0:
+        if not forward_batch.forward_mode.is_idle():
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -911,7 +911,7 @@ class Qwen3HybridMoeModel(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if hidden_states.shape[0] != 0:
+        if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
