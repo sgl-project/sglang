@@ -103,7 +103,7 @@ sequenceDiagram
     F->>R: find_pooled_parser_for_model()
     R->>R: pattern_match("deepseek-r1")
     R->>P: get_pooled_parser("deepseek_r1")
-    
+
     alt Parser exists in pool
         P-->>F: Arc<Mutex<Parser>>
     else Create new parser
@@ -111,7 +111,7 @@ sequenceDiagram
         P->>P: insert into pool
         P-->>F: Arc<Mutex<Parser>>
     end
-    
+
     F-->>C: PooledParser
 
     C->>BP: lock().parse_reasoning_streaming_incremental()
@@ -119,7 +119,7 @@ sequenceDiagram
         C->>BP: parse_reasoning_streaming_incremental(chunk)
         BP->>BP: buffer.push_str(chunk)
         BP->>BP: check partial tokens
-        
+
         alt Complete token found
             BP->>PR: create result
             BP->>BP: clear buffer
@@ -390,7 +390,7 @@ Algorithm:
    - `stripped_think_start`: Prevent double processing
    - `buffer`: Accumulated partial content
 
-   
+
 ## 4. Extensibility Guide
 
 ### Adding a New Parser
@@ -415,7 +415,7 @@ impl MyModelParser {
             max_buffer_size: 65536,
             initial_in_reasoning: false, // or true for implicit
         };
-        
+
         Self {
             base: BaseReasoningParser::new(config)
                 .with_model_type("mymodel".to_string()),
@@ -425,11 +425,11 @@ impl MyModelParser {
 
 impl ReasoningParser for MyModelParser {
     // Delegate to base or implement custom logic
-    fn detect_and_parse_reasoning(&mut self, text: &str) 
+    fn detect_and_parse_reasoning(&mut self, text: &str)
         -> Result<ParserResult, ParseError> {
         self.base.detect_and_parse_reasoning(text)
     }
-    
+
     // ... other trait methods
 }
 ```
@@ -463,7 +463,7 @@ For parsers requiring custom logic beyond configuration:
 
 ```rust
 impl ReasoningParser for CustomParser {
-    fn parse_reasoning_streaming_incremental(&mut self, text: &str) 
+    fn parse_reasoning_streaming_incremental(&mut self, text: &str)
         -> Result<ParserResult, ParseError> {
         // Custom state machine
         // Custom token detection
