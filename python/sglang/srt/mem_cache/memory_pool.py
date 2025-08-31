@@ -1000,6 +1000,7 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
                     layer_num,
                     self.size // self.page_size + 1,
                     self.page_size,
+                    1,
                     self.kv_lora_rank,
                 ),
                 dtype=self.store_dtype,
@@ -1010,6 +1011,7 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
                     layer_num,
                     self.size // self.page_size + 1,
                     self.page_size,
+                    1,
                     self.qk_rope_head_dim,
                 ),
                 dtype=self.store_dtype,
@@ -1082,9 +1084,11 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
 
         if cache_v is None:
             cache_k, cache_v = cache_k.split(
