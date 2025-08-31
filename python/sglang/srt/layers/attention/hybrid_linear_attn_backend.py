@@ -148,7 +148,8 @@ class MambaAttnBackend(AttentionBackend):
         layer_id = kwargs["layer_id"]
 
         conv_states, ssm_states = self.req_to_token_pool.get_mamba_params(layer_id)
-        query_start_loc, cache_indices = astuple(self.forward_metadata)
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
 
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
