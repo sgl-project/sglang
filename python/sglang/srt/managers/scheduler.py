@@ -67,6 +67,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -510,6 +512,8 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
+                (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
@@ -623,6 +627,8 @@ class Scheduler(
                     hicache_mem_layout=server_args.hicache_mem_layout,
                     hicache_storage_backend=server_args.hicache_storage_backend,
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
+                    model_name=server_args.served_model_name,
+                    storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -1018,14 +1024,26 @@ class Scheduler(
                     req
                     for req in recv_reqs
                     if isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            TokenizedEmbeddingReqInput,
+                            BatchTokenizedGenerateReqInput,
+                            BatchTokenizedEmbeddingReqInput,
+                        ),
                     )
                 ]
                 control_reqs = [
                     req
                     for req in recv_reqs
                     if not isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            TokenizedEmbeddingReqInput,
+                            BatchTokenizedGenerateReqInput,
+                            BatchTokenizedEmbeddingReqInput,
+                        ),
                     )
                 ]
             else:
@@ -1253,6 +1271,17 @@ class Scheduler(
         else:
             self._add_request_to_queue(req)
 
+    def handle_batch_generate_request(
+        self,
+        recv_req: BatchTokenizedGenerateReqInput,
+    ):
+        """Handle optimized batch generate request."""
+        logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
+
+        # Process each request in the batch
+        for tokenized_req in recv_req:
+            self.handle_generate_request(tokenized_req)
+
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1269,10 +1298,11 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
-            last_hash = req.last_host_node.get_last_hash_value()
-            matched_len = len(req.prefix_indices) + req.host_hit_length
-            # todo, free-form fetching, calculating hash keys on the fly
-            if (matched_len > 0 and last_hash is not None) or matched_len == 0:
+            if req.last_node.backuped:
+                # only to initiate the prefetch if the last node is backuped
+                # otherwise, the allocated GPU memory must be locked for integrity
+                last_hash = req.last_host_node.get_last_hash_value()
+                matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
                 self.tree_cache.prefetch_from_storage(
                     req.rid, req.last_host_node, new_input_tokens, last_hash
@@ -1334,6 +1364,19 @@ class Scheduler(
         # Copy more attributes
         req.logprob_start_len = len(req.origin_input_ids) - 1
         self._add_request_to_queue(req)
+
+    def handle_batch_embedding_request(
+        self,
+        recv_req: BatchTokenizedEmbeddingReqInput,
+    ):
+        """Handle optimized batch embedding request."""
+        logger.debug(
+            f"Processing batch embedding request with {len(recv_req)} requests"
+        )
+
+        # Process each request in the batch
+        for tokenized_req in recv_req:
+            self.handle_embedding_request(tokenized_req)
 
     def self_check_during_idle(self):
         self.check_memory()
@@ -1460,7 +1503,7 @@ class Scheduler(
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req)
+            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
             self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -2335,6 +2378,10 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.tree_cache.cache_finished_req(req)
+
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -2513,7 +2560,15 @@ def is_health_check_generate_req(recv_req):
 
 
 def is_work_request(recv_req):
-    return isinstance(recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+    return isinstance(
+        recv_req,
+        (
+            TokenizedGenerateReqInput,
+            TokenizedEmbeddingReqInput,
+            BatchTokenizedGenerateReqInput,
+            BatchTokenizedEmbeddingReqInput,
+        ),
+    )
 
 
 def run_scheduler_process(

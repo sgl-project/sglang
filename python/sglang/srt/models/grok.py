@@ -842,10 +842,6 @@ class Grok1ForCausalLM(nn.Module):
         if self.is_weights_presharded:
             setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
 
-        default_replicate_lm_head = False
-        self.replicate_lm_head = getattr(
-            config, "replicate_lm_head", default_replicate_lm_head
-        )
         self.replicate_embedding = getattr(config, "replicate_embedding", False)
 
         self.model = Grok1Model(

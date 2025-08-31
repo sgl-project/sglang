@@ -25,7 +25,6 @@ from typing import List, Literal, Optional, Union
 
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
-from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
@@ -39,12 +38,88 @@ from sglang.srt.utils import (
     is_hip,
     is_port_available,
     is_remote_url,
+    is_sm90_supported,
+    is_sm100_supported,
     is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Define constants
+LOAD_FORMAT_CHOICES = [
+    "auto",
+    "pt",
+    "safetensors",
+    "npcache",
+    "dummy",
+    "sharded_state",
+    "gguf",
+    "bitsandbytes",
+    "layered",
+    "remote",
+]
+
+QUANTIZATION_CHOICES = [
+    "awq",
+    "fp8",
+    "gptq",
+    "marlin",
+    "gptq_marlin",
+    "awq_marlin",
+    "bitsandbytes",
+    "gguf",
+    "modelopt",
+    "modelopt_fp4",
+    "petit_nvfp4",
+    "w8a8_int8",
+    "w8a8_fp8",
+    "moe_wna16",
+    "qoq",
+    "w4afp8",
+    "mxfp4",
+]
+
+ATTENTION_BACKEND_CHOICES = [
+    # Common
+    "triton",
+    "torch_native",
+    # NVIDIA specific
+    "cutlass_mla",
+    "fa3",
+    "flashinfer",
+    "flashmla",
+    "trtllm_mla",
+    "trtllm_mha",
+    "dual_chunk_flash_attn",
+    # AMD specific
+    "aiter",
+    "wave",
+    # Other platforms
+    "intel_amx",
+    "ascend",
+]
+
+DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
+
+
+# Allow external code to add more choices
+def add_load_format_choices(choices):
+    LOAD_FORMAT_CHOICES.extend(choices)
+
+
+def add_quantization_method_choices(choices):
+    QUANTIZATION_CHOICES.extend(choices)
+
+
+def add_attention_backend_choices(choices):
+    ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_disagg_transfer_backend_choices(choices):
+    DISAGG_TRANSFER_BACKEND_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -199,6 +274,7 @@ class ServerArgs:
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
+    eplb_min_rebalancing_utilization_threshold: float = 1.0
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_approx", "per_pass", "per_token"]
     ] = None
@@ -211,11 +287,12 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
-    hicache_write_policy: str = "write_through_selective"
+    hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
+    hicache_storage_backend_extra_config: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -639,10 +716,6 @@ class ServerArgs:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
                     )
-                if self.page_size != 1 and self.attention_backend == "flashinfer":
-                    raise ValueError(
-                        "Speculative decoding with page_size != 1 is not supported. Please set page_size to 1."
-                    )
 
             # Auto choose parameters
             if self.speculative_num_steps is None:
@@ -674,6 +747,15 @@ class ServerArgs:
                     "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+
+            if (
+                self.speculative_eagle_topk > 1
+                and self.page_size > 1
+                and self.attention_backend != "flashinfer"
+            ):
+                raise ValueError(
+                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                )
 
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
@@ -763,18 +845,7 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=[
-                "auto",
-                "pt",
-                "safetensors",
-                "npcache",
-                "dummy",
-                "sharded_state",
-                "gguf",
-                "bitsandbytes",
-                "layered",
-                "remote",
-            ],
+            choices=LOAD_FORMAT_CHOICES,
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -893,25 +964,7 @@ class ServerArgs:
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
-            choices=[
-                "awq",
-                "fp8",
-                "gptq",
-                "marlin",
-                "gptq_marlin",
-                "awq_marlin",
-                "bitsandbytes",
-                "gguf",
-                "modelopt",
-                "modelopt_fp4",
-                "petit_nvfp4",
-                "w8a8_int8",
-                "w8a8_fp8",
-                "moe_wna16",
-                "qoq",
-                "w4afp8",
-                "mxfp4",
-            ],
+            choices=QUANTIZATION_CHOICES,
             help="The quantization method.",
         )
         parser.add_argument(
@@ -1361,43 +1414,24 @@ class ServerArgs:
         )
 
         # Kernel backend
-        ATTN_BACKENDS = [
-            # Common
-            "triton",
-            "torch_native",
-            # NVIDIA specific
-            "cutlass_mla",
-            "fa3",
-            "flashinfer",
-            "flashmla",
-            "trtllm_mla",
-            "trtllm_mha",
-            "dual_chunk_flash_attn",
-            # AMD specific
-            "aiter",
-            "wave",
-            # Other platforms
-            "intel_amx",
-            "ascend",
-        ]
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=ATTN_BACKENDS,
+            choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
         parser.add_argument(
             "--prefill-attention-backend",
             type=str,
-            choices=ATTN_BACKENDS,
+            choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.prefill_attention_backend,
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
         )
         parser.add_argument(
             "--decode-attention-backend",
             type=str,
-            choices=ATTN_BACKENDS,
+            choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.decode_attention_backend,
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
         )
@@ -1563,6 +1597,12 @@ class ServerArgs:
             help="Number of layers to rebalance per forward pass.",
         )
         parser.add_argument(
+            "--eplb-min-rebalancing-utilization-threshold",
+            type=float,
+            default=ServerArgs.eplb_min_rebalancing_utilization_threshold,
+            help="Minimum threshold for GPU average utilization to trigger EPLB rebalancing. Must be in the range [0.0, 1.0].",
+        )
+        parser.add_argument(
             "--expert-distribution-recorder-mode",
             type=str,
             default=ServerArgs.expert_distribution_recorder_mode,
@@ -1644,6 +1684,12 @@ class ServerArgs:
             choices=["best_effort", "wait_complete", "timeout"],
             default=ServerArgs.hicache_storage_prefetch_policy,
             help="Control when prefetching from the storage backend should stop.",
+        )
+        parser.add_argument(
+            "--hicache-storage-backend-extra-config",
+            type=str,
+            default=ServerArgs.hicache_storage_backend_extra_config,
+            help="A dictionary in JSON string format containing extra configuration for the storage backend.",
         )
 
         # Double Sparsity
@@ -1955,7 +2001,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "nixl", "ascend"],
+            choices=DISAGG_TRANSFER_BACKEND_CHOICES,
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -2275,6 +2321,7 @@ class ServerArgs:
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
+
         elif "Llama4" in model_arch:
             assert self.attention_backend in {
                 "fa3",
