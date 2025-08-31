@@ -384,7 +384,7 @@ def compute_logical_to_rank_dispatch_physical_map(
                     same_node_physical_expert_ids = [
                         physical_expert_id
                         for physical_expert_id in candidate_physical_expert_ids
-                        if _compute_host_id_of_physical_expert(
+                        if _compute_node_id_of_physical_expert(
                             physical_expert_id, num_local_node_physical_experts
                         )
                         == node_id
@@ -423,7 +423,7 @@ def _compute_gpu_id_of_physical_expert(
     return physical_expert_id // num_local_gpu_physical_experts
 
 
-def _compute_host_id_of_physical_expert(
+def _compute_node_id_of_physical_expert(
     physical_expert_id: int, num_local_host_physical_experts: int
 ) -> int:
     return physical_expert_id // num_local_host_physical_experts
