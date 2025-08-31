@@ -220,7 +220,8 @@ class MambaAttnBackend(AttentionBackend):
         conv_states, ssm_states = self.req_to_token_pool.get_mamba_params(layer_id)
         has_initial_states = forward_batch.extend_prefix_lens > 0
 
-        query_start_loc, cache_indices = astuple(self.forward_metadata)
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
 
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
