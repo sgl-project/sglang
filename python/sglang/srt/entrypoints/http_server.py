@@ -913,6 +913,12 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     response_class=ORJSONResponse,
     dependencies=[Depends(validate_json_request)],
 )
+@app.post(
+    "/tokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+    include_in_schema=False,
+)
 async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
     """OpenAI-compatible tokenization endpoint."""
     return await raw_request.app.state.openai_serving_tokenize.handle_request(
@@ -924,6 +930,12 @@ async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
     "/v1/detokenize",
     response_class=ORJSONResponse,
     dependencies=[Depends(validate_json_request)],
+)
+@app.post(
+    "/detokenize",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+    include_in_schema=False,
 )
 async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request):
     """OpenAI-compatible detokenization endpoint."""
