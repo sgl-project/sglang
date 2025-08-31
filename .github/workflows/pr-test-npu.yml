@@ -5,14 +5,14 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
-      - "scripts/**"
+      - "scripts/ci/**"
       - "test/**"
       - ".github/workflows/pr-test-npu.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "python/**"
-      - "scripts/**"
+      - "scripts/ci/**"
       - "test/**"
       - ".github/workflows/pr-test-npu.yml"
   workflow_dispatch:
