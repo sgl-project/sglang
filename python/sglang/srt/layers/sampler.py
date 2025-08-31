@@ -27,6 +27,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 class Sampler(nn.Module):
@@ -77,7 +78,12 @@ class Sampler(nn.Module):
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+
         else:
+            # Post process original logits. if temperatures are all 1.0, no need to rescale
+            if return_logprob and RETURN_ORIGINAL_LOGPROB:
+                logprobs = torch.softmax(logits, dim=-1)
+
             # Post process logits
             logits.div_(sampling_info.temperatures)
             logits[:] = torch.softmax(logits, dim=-1)
@@ -116,7 +122,12 @@ class Sampler(nn.Module):
 
             if return_logprob:
                 # clamp to avoid -inf
-                logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
+                if RETURN_ORIGINAL_LOGPROB:
+                    logprobs = torch.log(logprobs).clamp(
+                        min=torch.finfo(logprobs.dtype).min
+                    )
+                else:
+                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
@@ -201,7 +212,10 @@ def top_p_normalize_probs_torch(
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
 
-def get_top_logprobs(logprobs: torch.Tensor, top_logprobs_nums: List[int]):
+def get_top_logprobs(
+    logprobs: torch.Tensor,
+    top_logprobs_nums: List[int],
+):
     max_k = max(top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()
@@ -212,10 +226,17 @@ def get_top_logprobs(logprobs: torch.Tensor, top_logprobs_nums: List[int]):
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-    return output_top_logprobs_val, output_top_logprobs_idx
+
+    return (
+        output_top_logprobs_val,
+        output_top_logprobs_idx,
+    )
 
 
-def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]]):
+def get_token_ids_logprobs(
+    logprobs: torch.Tensor,
+    token_ids_logprobs: List[List[int]],
+):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
     for i, token_ids in enumerate(token_ids_logprobs):
@@ -226,7 +247,10 @@ def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List
             output_token_ids_logprobs_val.append([])
             output_token_ids_logprobs_idx.append([])
 
-    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
+    return (
+        output_token_ids_logprobs_val,
+        output_token_ids_logprobs_idx,
+    )
 
 
 def apply_custom_logit_processor(
