@@ -1,4 +1,7 @@
-use crate::tool_parser::json_parser::JsonParser;
+use crate::tool_parser::parsers::{
+    DeepSeekParser, Glm4MoeParser, GptOssParser, JsonParser, KimiK2Parser, LlamaParser,
+    MistralParser, PythonicParser, QwenParser, Step3Parser,
+};
 use crate::tool_parser::traits::ToolParser;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,15 +53,28 @@ impl ParserRegistry {
             }
         }
 
-        // Try prefix matching (e.g., "gpt-4" matches "gpt-*")
-        for (pattern, parser_name) in &self.model_mapping {
-            if pattern.ends_with('*') {
-                let prefix = &pattern[..pattern.len() - 1];
-                if model.starts_with(prefix) {
-                    if let Some(parser) = self.parsers.get(parser_name) {
-                        return Some(parser.clone());
-                    }
+        // Try prefix matching with more specific patterns first
+        // Collect all matching patterns and sort by specificity (longer = more specific)
+        let mut matches: Vec<(&String, &String)> = self
+            .model_mapping
+            .iter()
+            .filter(|(pattern, _)| {
+                if pattern.ends_with('*') {
+                    let prefix = &pattern[..pattern.len() - 1];
+                    model.starts_with(prefix)
+                } else {
+                    false
                 }
+            })
+            .collect();
+
+        // Sort by pattern length in descending order (longer patterns are more specific)
+        matches.sort_by_key(|(pattern, _)| std::cmp::Reverse(pattern.len()));
+
+        // Return the first matching parser
+        for (_, parser_name) in matches {
+            if let Some(parser) = self.parsers.get(parser_name) {
+                return Some(parser.clone());
             }
         }
 
@@ -84,7 +100,32 @@ impl ParserRegistry {
         // JSON parser - most common format
         self.register_parser("json", Arc::new(JsonParser::new()));
 
-        // Note: Additional parsers (mistral, qwen, llama) will be added in later phases
+        // Mistral parser - [TOOL_CALLS] [...] format
+        self.register_parser("mistral", Arc::new(MistralParser::new()));
+
+        // Qwen parser - <tool_call>...</tool_call> format
+        self.register_parser("qwen", Arc::new(QwenParser::new()));
+
+        // Pythonic parser - [func(arg=val)] format
+        self.register_parser("pythonic", Arc::new(PythonicParser::new()));
+
+        // Llama parser - <|python_tag|>{...} or plain JSON format
+        self.register_parser("llama", Arc::new(LlamaParser::new()));
+
+        // DeepSeek V3 parser - Unicode tokens with JSON blocks
+        self.register_parser("deepseek", Arc::new(DeepSeekParser::new()));
+
+        // GLM-4 MoE parser - XML-style key-value format
+        self.register_parser("glm4_moe", Arc::new(Glm4MoeParser::new()));
+
+        // Step3 parser - StepTML XML format
+        self.register_parser("step3", Arc::new(Step3Parser::new()));
+
+        // Kimi K2 parser - Token-based with indexed functions
+        self.register_parser("kimik2", Arc::new(KimiK2Parser::new()));
+
+        // GPT-OSS parser - Channel format
+        self.register_parser("gpt_oss", Arc::new(GptOssParser::new()));
     }
 
     /// Register default model mappings
@@ -97,20 +138,57 @@ impl ParserRegistry {
         // Anthropic models
         self.map_model("claude-*", "json");
 
-        // Mistral models (will use json until mistral parser is implemented)
-        self.map_model("mistral-*", "json");
-        self.map_model("mixtral-*", "json");
+        // Mistral models - use Mistral parser
+        self.map_model("mistral-*", "mistral");
+        self.map_model("mixtral-*", "mistral");
 
-        // Qwen models (will use json until qwen parser is implemented)
-        self.map_model("qwen*", "json");
+        // Qwen models - use Qwen parser
+        self.map_model("qwen*", "qwen");
+        self.map_model("Qwen*", "qwen");
 
-        // Llama models (will use json until llama parser is implemented)
+        // Llama models
+        // Llama 4 uses pythonic format
+        self.map_model("llama-4*", "pythonic");
+        self.map_model("meta-llama-4*", "pythonic");
+        // Llama 3.2 uses python_tag format
+        self.map_model("llama-3.2*", "llama");
+        self.map_model("meta-llama-3.2*", "llama");
+        // Other Llama models use JSON
         self.map_model("llama-*", "json");
         self.map_model("meta-llama-*", "json");
+
+        // DeepSeek models
+        // DeepSeek V3 uses custom Unicode token format
+        self.map_model("deepseek-v3*", "deepseek");
+        self.map_model("deepseek-ai/DeepSeek-V3*", "deepseek");
+        // DeepSeek V2 uses pythonic format
+        self.map_model("deepseek-*", "pythonic");
+
+        // GLM models
+        // GLM-4 MoE uses XML-style format
+        self.map_model("glm-4-moe*", "glm4_moe");
+        self.map_model("THUDM/glm-4-moe*", "glm4_moe");
+        self.map_model("glm-4.5*", "glm4_moe");
+        // Other GLM models may use JSON
+        self.map_model("glm-*", "json");
+
+        // Step3 models
+        self.map_model("step3*", "step3");
+        self.map_model("Step-3*", "step3");
+
+        // Kimi models
+        self.map_model("kimi-k2*", "kimik2");
+        self.map_model("Kimi-K2*", "kimik2");
+        self.map_model("moonshot*/Kimi-K2*", "kimik2");
+
+        // GPT-OSS models (T4-style)
+        self.map_model("gpt-oss*", "gpt_oss");
+        self.map_model("t4-*", "gpt_oss");
 
         // Other models default to JSON
         self.map_model("gemini-*", "json");
         self.map_model("palm-*", "json");
+        self.map_model("gemma-*", "json");
     }
 
     /// Set the default parser

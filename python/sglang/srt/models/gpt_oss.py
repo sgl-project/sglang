@@ -58,7 +58,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id, is_sm100_supported
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     add_prefix,
     is_cuda,
     is_flashinfer_available,
+    is_sm100_supported,
     make_layers,
 )
 
@@ -1028,10 +1029,6 @@ class GptOssForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        params_checker = {k: False for k, v in params_dict.items()}
-
-        for other_loaded_param_name in other_loaded_param_names:
-            params_checker[other_loaded_param_name] = True
 
         for name, loaded_weight in weights:
             loaded_weight = _WeightCreator.maybe_materialize(loaded_weight)
@@ -1068,7 +1065,6 @@ class GptOssForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                params_checker[name] = True
                 break
             else:
                 for mapping in expert_params_mapping:
@@ -1091,7 +1087,6 @@ class GptOssForCausalLM(nn.Module):
                         name,
                         shard_id=shard_id,
                     )
-                    params_checker[name] = True
                     break
                 else:
                     if name.endswith(".bias") and name not in params_dict:
@@ -1110,16 +1105,8 @@ class GptOssForCausalLM(nn.Module):
                                 param, "weight_loader", default_weight_loader
                             )
                             weight_loader(param, loaded_weight)
-                        params_checker[name] = True
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-
-        not_loaded_params = [k for k, v in params_checker.items() if not v]
-        if tp_rank == 0:
-            if len(not_loaded_params) > 0:
-                raise Exception(f"Not all parameters loaded: {not_loaded_params}")
-            else:
-                logging.info("All parameters loaded successfully.")
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

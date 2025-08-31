@@ -39,6 +39,8 @@ class HiRadixCache(RadixCache):
         hicache_mem_layout: str,
         hicache_storage_backend: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[str] = None,
     ):
 
         if hicache_io_backend == "direct":
@@ -87,6 +89,8 @@ class HiRadixCache(RadixCache):
             io_backend=hicache_io_backend,
             storage_backend=hicache_storage_backend,
             prefetch_threshold=self.prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
         )
 
         # record the nodes with ongoing write through
@@ -98,7 +102,7 @@ class HiRadixCache(RadixCache):
         self.ongoing_backup = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
-            1 if hicache_write_policy == "write_through" else 3
+            1 if hicache_write_policy == "write_through" else 2
         )
         self.write_through_threshold_storage = (
             1 if hicache_write_policy == "write_through" else 3
@@ -151,8 +155,9 @@ class HiRadixCache(RadixCache):
         self.ongoing_backup[operation_id] = node
         node.protect_host()
 
-    def inc_hit_count(self, node: TreeNode):
-        if self.cache_controller.write_policy == "write_back":
+    def _inc_hit_count(self, node: TreeNode, chunked=False):
+        # skip the hit count update for chunked requests
+        if self.cache_controller.write_policy == "write_back" or chunked:
             return
         node.hit_count += 1
 
@@ -430,9 +435,12 @@ class HiRadixCache(RadixCache):
         if self.prefetch_stop_policy == "best_effort":
             return can_terminate
 
-        completed = (
-            operation.completed_tokens == len(operation.hash_value) * self.page_size
-        )
+        if len(operation.hash_value) == 0:
+            completed = False
+        else:
+            completed = (
+                operation.completed_tokens == len(operation.hash_value) * self.page_size
+            )
 
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
@@ -536,6 +544,8 @@ class HiRadixCache(RadixCache):
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
+        while not last_host_node.backuped:
+            last_host_node = last_host_node.parent
 
         return MatchResult(
             device_indices=value,
@@ -663,11 +673,11 @@ class HiRadixCache(RadixCache):
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: List, value):
-        node.last_access_time = time.monotonic()
+    def insert(self, key: List, value, chunked=False):
         if len(key) == 0:
             return 0
 
+        node = self.root_node
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
 
@@ -684,7 +694,7 @@ class HiRadixCache(RadixCache):
                     self.token_to_kv_pool_host.update_synced(node.host_value)
                     self.evictable_size_ += len(node.value)
                 else:
-                    self.inc_hit_count(node)
+                    self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
             else:
                 # partial match, split the node
@@ -694,7 +704,7 @@ class HiRadixCache(RadixCache):
                     self.token_to_kv_pool_host.update_synced(new_node.host_value)
                     self.evictable_size_ += len(new_node.value)
                 else:
-                    self.inc_hit_count(new_node)
+                    self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
                 node = new_node
 
@@ -728,7 +738,7 @@ class HiRadixCache(RadixCache):
                     last_hash = new_node.hash_value[-1]
 
             if self.cache_controller.write_policy != "write_back":
-                self.inc_hit_count(new_node)
+                self._inc_hit_count(new_node, chunked)
         return total_prefix_length
 
     def _collect_leaves_device(self):

@@ -1,4 +1,3 @@
-use super::header_utils;
 use crate::config::types::{
     CircuitBreakerConfig as ConfigCircuitBreakerConfig,
     HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
@@ -12,6 +11,7 @@ use crate::policies::LoadBalancingPolicy;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest,
 };
+use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::{
     body::Body,
@@ -393,7 +393,7 @@ impl Router {
 
     // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
-        let headers = super::header_utils::copy_request_headers(&req);
+        let headers = header_utils::copy_request_headers(&req);
 
         match self.select_first_worker() {
             Ok(worker_url) => {
@@ -490,6 +490,13 @@ impl Router {
                     false
                 };
 
+                // Keep a clone for potential cleanup on retry
+                let worker_for_cleanup = if load_incremented {
+                    Some(worker.clone_worker())
+                } else {
+                    None
+                };
+
                 let response = self
                     .send_typed_request(
                         headers,
@@ -502,6 +509,19 @@ impl Router {
                     .await;
 
                 worker.record_outcome(response.status().is_success());
+
+                // For retryable failures, we need to decrement load since send_typed_request
+                // won't have done it (it only decrements on success or non-retryable failures)
+                if is_retryable_status(response.status()) && load_incremented {
+                    if let Some(cleanup_worker) = worker_for_cleanup {
+                        cleanup_worker.decrement_load();
+                        RouterMetrics::set_running_requests(
+                            cleanup_worker.url(),
+                            cleanup_worker.load(),
+                        );
+                    }
+                }
+
                 response
             },
             // should_retry predicate
@@ -647,7 +667,7 @@ impl Router {
 
         if !is_stream {
             // For non-streaming requests, preserve headers
-            let response_headers = super::header_utils::preserve_response_headers(res.headers());
+            let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let response = match res.bytes().await {
                 Ok(body) => {
@@ -657,13 +677,25 @@ impl Router {
                     response
                 }
                 Err(e) => {
+                    // IMPORTANT: Decrement load on error before returning
+                    if load_incremented {
+                        if let Ok(workers_guard) = self.workers.read() {
+                            if let Some(worker) =
+                                workers_guard.iter().find(|w| w.url() == worker_url)
+                            {
+                                worker.decrement_load();
+                                RouterMetrics::set_running_requests(worker_url, worker.load());
+                            }
+                        }
+                    }
+
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
 
             // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented && !is_stream {
+            if load_incremented {
                 if let Ok(workers_guard) = self.workers.read() {
                     if let Some(worker) = workers_guard.iter().find(|w| w.url() == worker_url) {
                         worker.decrement_load();
@@ -1164,6 +1196,14 @@ impl RouterTrait for Router {
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/completions")
             .await
+    }
+
+    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        todo!()
+    }
+
+    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        todo!()
     }
 
     async fn flush_cache(&self) -> Response {

@@ -1,6 +1,9 @@
 //! Factory for creating router instances
 
-use super::{pd_router::PDRouter, router::Router, RouterTrait};
+use super::{
+    http::{pd_router::PDRouter, router::Router},
+    RouterTrait,
+};
 use crate::config::{PolicyConfig, RoutingMode};
 use crate::policies::PolicyFactory;
 use crate::server::AppContext;
@@ -17,7 +20,9 @@ impl RouterFactory {
             return Self::create_igw_router(ctx).await;
         }
 
-        // Default to proxy mode
+        // TODO: Add gRPC mode check here when implementing gRPC support
+
+        // Default to HTTP proxy mode
         match &ctx.router_config.mode {
             RoutingMode::Regular { worker_urls } => {
                 Self::create_regular_router(worker_urls, &ctx.router_config.policy, ctx).await
@@ -99,6 +104,29 @@ impl RouterFactory {
         .await?;
 
         Ok(Box::new(router))
+    }
+
+    /// Create a gRPC router with injected policy
+    pub async fn create_grpc_router(
+        _worker_urls: &[String],
+        _policy_config: &PolicyConfig,
+        _ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        // For now, return an error as gRPC router is not yet implemented
+        Err("gRPC router is not yet implemented".to_string())
+    }
+
+    /// Create a gRPC PD router (placeholder for now)
+    pub async fn create_grpc_pd_router(
+        _prefill_urls: &[(String, Option<u16>)],
+        _decode_urls: &[String],
+        _prefill_policy_config: Option<&PolicyConfig>,
+        _decode_policy_config: Option<&PolicyConfig>,
+        _main_policy_config: &PolicyConfig,
+        _ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        // For now, return an error as gRPC PD router is not yet implemented
+        Err("gRPC PD router is not yet implemented".to_string())
     }
 
     /// Create an IGW router (placeholder for future implementation)

@@ -1,6 +1,7 @@
 import pytest
 import torch
 from sgl_kernel import cutlass_w4a8_moe_mm
+from utils import is_hopper
 
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
@@ -38,6 +39,10 @@ def pack_interleave(num_experts, ref_weight, ref_scale):
     return w_q, w_scale
 
 
+@pytest.mark.skipif(
+    not is_hopper(),
+    reason="cutlass_w4a8_moe_mm is only supported on sm90",
+)
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 def test_int4_fp8_grouped_gemm_single_expert(batch_size):
     # Test parameters
@@ -127,6 +132,10 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
         raise
 
 
+@pytest.mark.skipif(
+    not is_hopper(),
+    reason="cutlass_w4a8_moe_mm is only supported on sm90",
+)
 @pytest.mark.parametrize("batch_size", [2, 4, 8, 16])
 @pytest.mark.parametrize("k", [512, 1024])
 @pytest.mark.parametrize("n", [1024, 2048])

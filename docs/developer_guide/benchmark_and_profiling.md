@@ -31,6 +31,7 @@
 [Pytorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html) is a convenient basic tool to inspect kernel execution time, call stack, and kernel overlap and occupancy.
 
 ### Profile a server with `sglang.bench_serving`
+
 ```bash
 # set trace path
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
@@ -43,6 +44,8 @@ python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-
 ```
 
 Please make sure that the `SGLANG_TORCH_PROFILER_DIR` should be set at both server and client side, otherwise the trace file cannot be generated correctly . A secure way will be setting `SGLANG_TORCH_PROFILER_DIR` in the `.*rc` file of shell (e.g. `~/.bashrc` for bash shells).
+
+For more details, please refer to [Bench Serving Guide](./bench_serving.md).
 
 ### Profile a server with `sglang.bench_offline_throughput`
 ```bash

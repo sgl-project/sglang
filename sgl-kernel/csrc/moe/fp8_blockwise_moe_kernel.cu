@@ -708,7 +708,11 @@ void fp8_blockwise_scaled_grouped_mm(
 
 #if defined(CUTLASS_ARCH_MMA_SM100A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
-  if (sm_version == 100) {
+  if (sm_version == 100
+#if CUDA_VERSION >= 12090
+      || sm_version == 103
+#endif
+  ) {
     if (output.scalar_type() == torch::kBFloat16) {
       sm100_fp8_blockwise_group_mm_dispatch_shape<cutlass::bfloat16_t>(
           output,
@@ -802,5 +806,5 @@ void fp8_blockwise_scaled_grouped_mm(
   }
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(
-      can_implement, "No implemented fp8_blockwise_scaled_mm for current compute capability: ", sm_version);
+      can_implement, "No implemented fp8_blockwise_scaled_grouped_mm for current compute capability: ", sm_version);
 }

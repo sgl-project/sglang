@@ -46,6 +46,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
     is_cuda,
     next_power_of_2,
 )
@@ -54,6 +55,7 @@ if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
+RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 @contextmanager
@@ -137,8 +139,15 @@ class EAGLEWorker(TpModelWorker):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
         if self.speculative_algorithm.is_eagle3():
-            # EAGLE3 models don't share lm_head
-            self.draft_model_runner.model.set_embed(embed)
+            # most cases EAGLE3 models don't share lm_head
+            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+            if (
+                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                and self.draft_model_runner.model.load_lm_head_from_target
+            ):
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
+            else:
+                self.draft_model_runner.model.set_embed(embed)
 
             # grab hot token ids
             if self.draft_model_runner.model.hot_token_id is not None:
@@ -781,15 +790,20 @@ class EAGLEWorker(TpModelWorker):
         token_ids_logprobs = batch.token_ids_logprobs
         accepted_indices = res.accepted_indices
         assert len(accepted_indices) == len(logits_output.next_token_logits)
+
         temperatures = batch.sampling_info.temperatures
         num_draft_tokens = batch.spec_info.draft_token_num
         # acceptance indices are the indices in a "flattened" batch.
         # dividing it to num_draft_tokens will yield the actual batch index.
         temperatures = temperatures[accepted_indices // num_draft_tokens]
-
-        logprobs = torch.nn.functional.log_softmax(
-            logits_output.next_token_logits / temperatures, dim=-1
-        )
+        if RETURN_ORIGINAL_LOGPROB:
+            logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits, dim=-1
+            )
+        else:
+            logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits / temperatures, dim=-1
+            )
         batch_next_token_ids = res.verified_id
         num_tokens_per_req = [accept + 1 for accept in res.accept_length_per_req_cpu]
 
@@ -806,13 +820,19 @@ class EAGLEWorker(TpModelWorker):
             (
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums_repeat_interleaved)
+            ) = get_top_logprobs(
+                logprobs,
+                top_logprobs_nums_repeat_interleaved,
+            )
 
         if any(x is not None for x in token_ids_logprobs):
             (
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs_repeat_interleaved)
+            ) = get_token_ids_logprobs(
+                logprobs,
+                token_ids_logprobs_repeat_interleaved,
+            )
 
         logits_output.next_token_logprobs = logprobs[
             torch.arange(len(batch_next_token_ids), device=batch.sampling_info.device),

@@ -24,6 +24,9 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the worker's type (Regular, Prefill, or Decode)
     fn worker_type(&self) -> WorkerType;
 
+    /// Get the worker's connection mode (HTTP or gRPC)
+    fn connection_mode(&self) -> ConnectionMode;
+
     /// Check if the worker is currently healthy
     fn is_healthy(&self) -> bool;
 
@@ -54,6 +57,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Decrement the load counter
     fn decrement_load(&self);
+
+    /// Reset the load counter to 0 (for sync/recovery)
+    fn reset_load(&self) {
+        // Default implementation - does nothing
+        // Workers that track load should override this
+    }
 
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
@@ -146,6 +155,30 @@ pub trait Worker: Send + Sync + fmt::Debug {
     }
 }
 
+/// Connection mode for worker communication
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConnectionMode {
+    /// HTTP/REST connection
+    Http,
+    /// gRPC connection
+    Grpc {
+        /// Optional port for gRPC endpoint (if different from URL)
+        port: Option<u16>,
+    },
+}
+
+impl fmt::Display for ConnectionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectionMode::Http => write!(f, "HTTP"),
+            ConnectionMode::Grpc { port } => match port {
+                Some(p) => write!(f, "gRPC(port:{})", p),
+                None => write!(f, "gRPC"),
+            },
+        }
+    }
+}
+
 /// Worker type classification
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkerType {
@@ -207,6 +240,8 @@ pub struct WorkerMetadata {
     pub url: String,
     /// Worker type
     pub worker_type: WorkerType,
+    /// Connection mode
+    pub connection_mode: ConnectionMode,
     /// Additional labels/tags
     pub labels: std::collections::HashMap<String, String>,
     /// Health check configuration
@@ -227,9 +262,18 @@ pub struct BasicWorker {
 
 impl BasicWorker {
     pub fn new(url: String, worker_type: WorkerType) -> Self {
+        Self::with_connection_mode(url, worker_type, ConnectionMode::Http)
+    }
+
+    pub fn with_connection_mode(
+        url: String,
+        worker_type: WorkerType,
+        connection_mode: ConnectionMode,
+    ) -> Self {
         let metadata = WorkerMetadata {
             url: url.clone(),
             worker_type,
+            connection_mode,
             labels: std::collections::HashMap::new(),
             health_config: HealthConfig::default(),
         };
@@ -290,6 +334,10 @@ impl Worker for BasicWorker {
 
     fn worker_type(&self) -> WorkerType {
         self.metadata.worker_type.clone()
+    }
+
+    fn connection_mode(&self) -> ConnectionMode {
+        self.metadata.connection_mode.clone()
     }
 
     fn is_healthy(&self) -> bool {
@@ -364,6 +412,10 @@ impl Worker for BasicWorker {
             .ok();
     }
 
+    fn reset_load(&self) {
+        self.load_counter.store(0, Ordering::Relaxed);
+    }
+
     fn processed_requests(&self) -> usize {
         self.processed_counter.load(Ordering::Relaxed)
     }
@@ -424,6 +476,10 @@ impl Worker for DPAwareWorker {
         self.base_worker.worker_type()
     }
 
+    fn connection_mode(&self) -> ConnectionMode {
+        self.base_worker.connection_mode()
+    }
+
     fn is_healthy(&self) -> bool {
         self.base_worker.is_healthy()
     }
@@ -447,6 +503,10 @@ impl Worker for DPAwareWorker {
 
     fn decrement_load(&self) {
         self.base_worker.decrement_load();
+    }
+
+    fn reset_load(&self) {
+        self.base_worker.reset_load();
     }
 
     fn processed_requests(&self) -> usize {
@@ -587,6 +647,28 @@ impl WorkerFactory {
             decode_urls.into_iter().map(Self::create_decode).collect();
 
         (regular_workers, prefill_workers, decode_workers)
+    }
+
+    /// Create a gRPC worker
+    pub fn create_grpc(url: String, worker_type: WorkerType, port: Option<u16>) -> Box<dyn Worker> {
+        Box::new(BasicWorker::with_connection_mode(
+            url,
+            worker_type,
+            ConnectionMode::Grpc { port },
+        ))
+    }
+
+    /// Create a gRPC worker with custom circuit breaker configuration
+    pub fn create_grpc_with_config(
+        url: String,
+        worker_type: WorkerType,
+        port: Option<u16>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        Box::new(
+            BasicWorker::with_connection_mode(url, worker_type, ConnectionMode::Grpc { port })
+                .with_circuit_breaker_config(circuit_breaker_config),
+        )
     }
 
     /// Create a DP-aware worker of specified type
@@ -825,6 +907,10 @@ pub fn start_health_checker(
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
+        // Counter for periodic load reset (every 10 health check cycles)
+        let mut check_count = 0u64;
+        const LOAD_RESET_INTERVAL: u64 = 10;
+
         loop {
             interval.tick().await;
 
@@ -834,6 +920,8 @@ pub fn start_health_checker(
                 break;
             }
 
+            check_count += 1;
+
             // Check health of all workers
             let workers_to_check = match workers.read() {
                 Ok(guard) => guard.iter().map(|w| w.clone_worker()).collect::<Vec<_>>(),
@@ -842,6 +930,22 @@ pub fn start_health_checker(
                     continue;
                 }
             };
+
+            // Periodically reset load counters to prevent drift
+            // Only do this when we believe all workers should be idle
+            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
+                let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
+                // Only reset if load appears to be very low (likely drift)
+                if max_load <= 2 {
+                    tracing::debug!(
+                        "Resetting load counters to prevent drift (max_load: {})",
+                        max_load
+                    );
+                    for worker in &workers_to_check {
+                        worker.reset_load();
+                    }
+                }
+            }
 
             // Perform health checks concurrently
             let health_checks = workers_to_check.iter().map(|worker| {

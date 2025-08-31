@@ -87,6 +87,11 @@ name = "tokenizer_benchmark"
 harness = false
 path = "benches/tokenizer_benchmark.rs"
 
+[[bench]]
+name = "tool_parser_benchmark"
+harness = false
+path = "benches/tool_parser_benchmark.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

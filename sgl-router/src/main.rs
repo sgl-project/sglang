@@ -394,6 +394,8 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             max_concurrent_requests: self.max_concurrent_requests,
+            queue_size: 100,        // Default queue size
+            queue_timeout_secs: 60, // Default timeout
             cors_allowed_origins: self.cors_allowed_origins.clone(),
             retry: RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -418,6 +420,7 @@ impl CliArgs {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
+            rate_limit_tokens_per_second: None,
         })
     }
 

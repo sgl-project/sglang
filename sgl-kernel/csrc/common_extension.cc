@@ -159,8 +159,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "silu_and_mul_scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
-      "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
-      "Tensor output_scale_offset_by_experts, Tensor mask) -> ()");
+      "Tensor input, Tensor input_global_scale, Tensor mask, bool use_silu_and_mul) -> ()");
   m.impl("silu_and_mul_scaled_fp4_experts_quant", torch::kCUDA, &silu_and_mul_scaled_fp4_experts_quant);
 
   m.def(
