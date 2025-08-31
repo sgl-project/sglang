@@ -1568,8 +1568,8 @@ class Scheduler(
 
         need_dp_attn_preparation = require_mlp_sync(self.server_args)
 
-        if need_dp_attn_preparation and not self.spec_algorithm.is_none():
-            # In speculative decoding, prefill batches and decode batches cannot be processed in the same DP attention group.
+        if need_dp_attn_preparation and (not self.spec_algorithm.is_none() or self.server_args.attention_backend == "hybrid_linear_attn"):
+            # In speculative decoding and hybrid_linear_attn, prefill batches and decode batches cannot be processed in the same DP attention group.
             # We prepare idle batches in advance to skip preparing decode batches when there are prefill batches in the group.
             new_batch = self.prepare_mlp_sync_batch(new_batch)
             need_dp_attn_preparation = new_batch is None

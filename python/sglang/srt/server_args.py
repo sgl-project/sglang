@@ -615,6 +615,12 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.disable_radix_cache = True
 
+        if self.attention_backend == "hybrid_linear_attn":
+            logger.warning(
+                "Mixed chunk is disabled because of using hybrid linear attention backend"
+            )
+            self.enable_mixed_chunk = False
+
         # Set page size
         if self.page_size is None:
             self.page_size = 1
