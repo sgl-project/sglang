@@ -147,8 +147,7 @@ class KVCache(abc.ABC):
             )
             self.mem_usage = k_size_GB + v_size_GB
         else:
-            kv_size = kv_size_bytes
-            kv_size_GB = kv_size / GB
+            kv_size_GB = kv_size_bytes / GB
             logger.info(
                 f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
             )
