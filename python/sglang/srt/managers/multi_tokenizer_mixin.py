@@ -92,7 +92,10 @@ class MultiTokenizerMixin:
         return False
 
     def _handle_output_by_index(self, output, i):
-        if not isinstance(output, (BatchTokenIDOut, BatchEmbeddingOut, BatchStrOut, BatchMultimodalOut)):
+        if not isinstance(
+            output,
+            (BatchTokenIDOut, BatchEmbeddingOut, BatchStrOut, BatchMultimodalOut),
+        ):
             return output
         else:
             field_names = self._get_fields(type(output))
@@ -115,7 +118,8 @@ class MultiTokenizerMixin:
                 except Exception as e:
                     logger.warning(f"Failed to close socket: {e}")
             self.tokenizer_mapping.clear()
-        
+
+
 class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
     """A router to receive requests from MultiTokenizerManager"""
 
