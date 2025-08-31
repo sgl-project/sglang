@@ -106,6 +106,15 @@ class TestHiCacheStorageBenchmark(CustomTestCase):
             time.sleep(2)
         raise TimeoutError("Server failed to start within timeout")
 
+    @classmethod
+    def tearDownClass(cls):
+        """Clean up test environment"""
+        kill_process_tree(cls.process.pid)
+
+        import shutil
+
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+
     def flush_cache(self) -> bool:
         """Flush device cache to force remote storage access"""
         try:
