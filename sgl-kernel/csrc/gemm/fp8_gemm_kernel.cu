@@ -1395,14 +1395,8 @@ void sm120_fp8_dispatch_bias(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
-  using CTAShapeDefault = Shape<_256, _128, _64>;
+  using CTAShapeDefault = Shape<_128, _128, _128>;
   using ClusterShapeDefault = Shape<_1, _1, _1>;
-
-  using CTAShape128 = Shape<_128, _128, _128>;
-  using ClusterShape128 = Shape<_1, _1, _1>;
-
-  using CTAShape64 = Shape<_128, _64, _128>;
-  using ClusterShape64 = Shape<_1, _1, _1>;
 
   using MainloopScheduleType = cutlass::gemm::collective::KernelScheduleAuto;
   using EpilogueScheduleType = cutlass::epilogue::collective::EpilogueScheduleAuto;
@@ -1422,26 +1416,6 @@ void sm120_fp8_dispatch_bias(
       EpilogueScheduleType,
       TileSchedulerType,
       true>;
-  using BiasGemm128 = DeviceGemmFp8RowwiseSm120<
-      ElementInput,
-      ElementOutput,
-      AccumElementType,
-      CTAShape128,
-      ClusterShape128,
-      MainloopScheduleType,
-      EpilogueScheduleType,
-      TileSchedulerType,
-      true>;
-  using BiasGemm64 = DeviceGemmFp8RowwiseSm120<
-      ElementInput,
-      ElementOutput,
-      AccumElementType,
-      CTAShape64,
-      ClusterShape64,
-      MainloopScheduleType,
-      EpilogueScheduleType,
-      TileSchedulerType,
-      true>;
 
   using GemmDefault = DeviceGemmFp8RowwiseSm120<
       ElementInput,
@@ -1453,52 +1427,11 @@ void sm120_fp8_dispatch_bias(
       EpilogueScheduleType,
       TileSchedulerType,
       false>;
-  using Gemm128 = DeviceGemmFp8RowwiseSm120<
-      ElementInput,
-      ElementOutput,
-      AccumElementType,
-      CTAShape128,
-      ClusterShape128,
-      MainloopScheduleType,
-      EpilogueScheduleType,
-      TileSchedulerType,
-      false>;
-  using Gemm64 = DeviceGemmFp8RowwiseSm120<
-      ElementInput,
-      ElementOutput,
-      AccumElementType,
-      CTAShape64,
-      ClusterShape64,
-      MainloopScheduleType,
-      EpilogueScheduleType,
-      TileSchedulerType,
-      false>;
-
-  uint32_t const m = a.size(0);
-  uint32_t const mp2 = next_pow_2(m);
-  uint32_t const n = b.size(1);
-  uint32_t const np2 = next_pow_2(n);
 
   if (bias) {
-    if (mp2 <= 128) {
-      if (np2 <= 64) {
-        return launch_sm120_fp8_scaled_mm<BiasGemm64, true>(out, a, b, scales_a, scales_b, bias);
-      } else {
-        return launch_sm120_fp8_scaled_mm<BiasGemm128, true>(out, a, b, scales_a, scales_b, bias);
-      }
-    } else {
-      return launch_sm120_fp8_scaled_mm<BiasGemmDefault, true>(out, a, b, scales_a, scales_b, bias);
-    }
+    return launch_sm120_fp8_scaled_mm<BiasGemmDefault, true>(out, a, b, scales_a, scales_b, bias);
   } else {
-    if (mp2 <= 128) {
-      if (np2 <= 64) {
-        return launch_sm120_fp8_scaled_mm<Gemm64, false>(out, a, b, scales_a, scales_b, bias);
-      } else {
-        return launch_sm120_fp8_scaled_mm<Gemm128, false>(out, a, b, scales_a, scales_b, bias);
-      }
-    } else {
-      return launch_sm120_fp8_scaled_mm<GemmDefault, false>(out, a, b, scales_a, scales_b, bias);
-    }
+    return launch_sm120_fp8_scaled_mm<GemmDefault, false>(out, a, b, scales_a, scales_b, bias);
   }
 }
 
