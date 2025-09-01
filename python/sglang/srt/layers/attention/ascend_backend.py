@@ -446,6 +446,13 @@ class AscendAttnBackend(AttentionBackend):
                     device=query.device,
                 )
 
+                if torch.compiler.is_dynamo_compiling():
+                    # fake source code to extract into separate submodule in compiler backend
+                    # ideally we need to develop torch.fx transformation
+                    forward_batch.req_to_token_pool.req_to_token.add_(forward_batch.req_to_token_pool.req_to_token)
+                    forward_batch.req_pool_indices.add_(forward_batch.req_pool_indices)
+                    forward_batch.seq_lens.add_(forward_batch.seq_lens)
+
                 torch_npu._npu_paged_attention(
                     query=query,
                     key_cache=k_cache,

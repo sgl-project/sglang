@@ -89,6 +89,7 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.piecewise_graph_runner import PiecewiseGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
@@ -207,6 +208,8 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+
+        self.skip_attn_backend_init = False
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -349,8 +352,15 @@ class ModelRunner:
             self.init_attention_backend()
             self.init_device_graphs()
         elif self.device == "npu":
-            self.init_attention_backend()
-            self.init_device_graphs()
+            if self.server_args.enable_piecewise_graph:
+                self.graph_runner = None
+                self.cuda_graph_mem_usage = 0
+                self.skip_attn_backend_init = True
+                self.init_attention_backend()
+                self.init_piecewise_graph()
+            else:
+                self.init_attention_backend()
+                self.init_device_graphs()
         else:
             self.graph_runner = None
             self.cuda_graph_mem_usage = 0
@@ -1427,6 +1437,28 @@ class ModelRunner:
         else:
             self.attn_backend = self._get_attention_backend()
 
+    def init_piecewise_graph(self):
+        """Compile piecewise graph."""
+        self.graph_runner = None
+
+        if not self.is_generation:
+            return
+
+        if not self.server_args.enable_piecewise_graph:
+            return
+
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Capture piecewise graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+        )
+        self.graph_runner = PiecewiseGraphRunner(self, self.server_args.compilation_config)
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Capture piecewise graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+        )
+
     def _get_attention_backend(self):
         """Init attention kernel backend."""
         self.decode_attention_backend_str = (
@@ -1663,7 +1695,7 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        if not skip_attn_backend_init:
+        if not skip_attn_backend_init and not self.skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
