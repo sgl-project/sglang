@@ -476,6 +476,8 @@ class DeepEPMoE(EPMoE):
         # TODO use zero_allocator
         combine_signal = torch.zeros(
             (num_local_experts, ceil_div(num_tokens_static, block_m)),
+            dtype=torch.int32,
+            device=hidden_states.device,
         )
 
         down_start_event = torch.cuda.Event()
