@@ -594,16 +594,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Helper to pad K dimension to multiple of 4 for FlashInfer compatibility
             def _pad_k_to_4(tensor):
                 """Pad last dimension to multiple of 4 if needed. Output is contiguous."""
+                import logging
                 K = tensor.shape[-1]
                 pad_k = (-K) % 4
                 if pad_k == 0:
                     return tensor
+                logging.debug(f"SGLang MXFP4: padded K by {pad_k} from {K} to {K+pad_k} for scale-shuffle")
                 return torch.nn.functional.pad(tensor, (0, pad_k), value=0).contiguous()
             
             epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
             for i in range(self.num_experts):
                 gemm1_weights_mxfp4_shuffled.append(
-                    shuffle_matrix_a(w13_weight[i].view(torch.uint8), epilogue_tile_m)
+                    shuffle_matrix_a(w13_weight[i].to(torch.uint8), epilogue_tile_m)
                 )
                 # Pad scale factors to ensure K % 4 == 0 for FlashInfer
                 w13_scale_padded = _pad_k_to_4(w13_weight_scale[i].to(torch.uint8))
@@ -618,7 +620,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
 
                 gemm2_weights_mxfp4_shuffled.append(
-                    shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
+                    shuffle_matrix_a(w2_weight[i].to(torch.uint8), epilogue_tile_m)
                 )
                 # Pad scale factors to ensure K % 4 == 0 for FlashInfer
                 w2_scale_padded = _pad_k_to_4(w2_weight_scale[i].to(torch.uint8))
