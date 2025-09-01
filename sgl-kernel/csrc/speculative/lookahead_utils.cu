@@ -7,14 +7,13 @@
 #include "pytorch_extension_utils_rocm.h"
 #endif
 
-
 template <typename IdType>
 __global__ void LookaheadVerifyTreeGreedy(
-    IdType* accept_index,      // mutable
-    IdType* accept_token_ids,  // mutable
-    IdType* accept_token_num,  // mutable
-    IdType* total_accept_num,  // mutable
-    IdType* last_verified_ids, // mutable
+    IdType* accept_index,       // mutable
+    IdType* accept_token_ids,   // mutable
+    IdType* accept_token_num,   // mutable
+    IdType* total_accept_num,   // mutable
+    IdType* last_verified_ids,  // mutable
     IdType* candidates,
     IdType* retrive_index,
     IdType* retrive_next_token,
@@ -108,13 +107,13 @@ __global__ void AcceptFlattenIndex(
 // retrive_next_sibling: [bs, num_draft_tokens]
 // target_predict: [bs, num_draft_tokens]
 void lookahead_verify_tree_greedy(
-    at::Tensor accept_token_num,  // mutable
-    at::Tensor accept_token_ids,  // mutable
-    at::Tensor last_verified_ids, // mutable
-    at::Tensor flatten_index,     // mutable
-    at::Tensor total_accept_num,  // mutable
+    at::Tensor accept_token_num,   // mutable
+    at::Tensor accept_token_ids,   // mutable
+    at::Tensor last_verified_ids,  // mutable
+    at::Tensor flatten_index,      // mutable
+    at::Tensor total_accept_num,   // mutable
     at::Tensor candidates,
-    at::Tensor retrive_index, // 感觉这个不需要
+    at::Tensor retrive_index,  // 感觉这个不需要
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
     at::Tensor target_predict,
@@ -215,67 +214,65 @@ __global__ void reconstructIndicesFromTreeMask(
     int* retrive_next_sibling,
     int batch_size,
     int draft_token_num) {
-    
-    int bid = blockIdx.x;
-    int tid = threadIdx.x;
-    
-    if (bid >= batch_size || tid >= draft_token_num) {
-      return;
-    }
-    int base_offset = draft_token_num * draft_token_num;
-    // token_idx: [bid * draft_token_num, (bid + 1) * draft_token_num)
-    int token_idx = bid * draft_token_num;
-    // tree_mask_idx: [bid * base_offset, (bid + 1) * base_offset)
-    int tree_mask_offset = bid * base_offset;
+  int bid = blockIdx.x;
+  int tid = threadIdx.x;
 
-    int depth = 0;
-    int parent_idx = -1;
+  if (bid >= batch_size || tid >= draft_token_num) {
+    return;
+  }
+  int base_offset = draft_token_num * draft_token_num;
+  // token_idx: [bid * draft_token_num, (bid + 1) * draft_token_num)
+  int token_idx = bid * draft_token_num;
+  // tree_mask_idx: [bid * base_offset, (bid + 1) * base_offset)
+  int tree_mask_offset = bid * base_offset;
 
-    for (int i = tid - 1, start_idx = tree_mask_offset + tid * draft_token_num; i >= 0; i--) {
-      if (tree_mask[start_idx + i]) {
-        depth++;
-        if (parent_idx == -1) {
-          parent_idx = i;
-        }
+  int depth = 0;
+  int parent_idx = -1;
+
+  for (int i = tid - 1, start_idx = tree_mask_offset + tid * draft_token_num; i >= 0; i--) {
+    if (tree_mask[start_idx + i]) {
+      depth++;
+      if (parent_idx == -1) {
+        parent_idx = i;
       }
     }
-    retrive_index[token_idx + tid] = token_idx + tid;
-    positions[token_idx + tid] = depth + verified_seq_len[bid];
+  }
+  retrive_index[token_idx + tid] = token_idx + tid;
+  positions[token_idx + tid] = depth + verified_seq_len[bid];
 
-    // 按列查找第 tid 列 tid+1 行开始的第一个不为 false 的元素作为 next_token_idx
-    int next_token_idx = -1;
+  // 按列查找第 tid 列 tid+1 行开始的第一个不为 false 的元素作为 next_token_idx
+  int next_token_idx = -1;
+  for (int i = tid + 1; i < draft_token_num; i++) {
+    if (tree_mask[tree_mask_offset + i * draft_token_num + tid]) {
+      next_token_idx = i;
+      break;
+    }
+  }
+  retrive_next_token[token_idx + tid] = next_token_idx;
+
+  // 根据 parent_idx 查找 next_sibling_idx
+  int next_sibling_idx = -1;
+  if (parent_idx != -1) {
     for (int i = tid + 1; i < draft_token_num; i++) {
-      if (tree_mask[tree_mask_offset + i * draft_token_num + tid]) {
-        next_token_idx = i;
-        break;
-      }
-    }
-    retrive_next_token[token_idx + tid] = next_token_idx;
-
-    // 根据 parent_idx 查找 next_sibling_idx
-    int next_sibling_idx = -1;
-    if (parent_idx != -1) {
-      for (int i = tid + 1; i < draft_token_num; i++) {
-        int start_idx = tree_mask_offset + i * draft_token_num + parent_idx;
-        if (tree_mask[start_idx]) {
-          bool is_sibling = true;
-          int end_idx = tree_mask_offset + i * draft_token_num + i;
-          for (int j = start_idx + 1; j < end_idx; ++j) {
-            if (tree_mask[j]) {
-              is_sibling = false;
-              break;
-            }
-          }
-          if (is_sibling) {
-            next_sibling_idx = i;
+      int start_idx = tree_mask_offset + i * draft_token_num + parent_idx;
+      if (tree_mask[start_idx]) {
+        bool is_sibling = true;
+        int end_idx = tree_mask_offset + i * draft_token_num + i;
+        for (int j = start_idx + 1; j < end_idx; ++j) {
+          if (tree_mask[j]) {
+            is_sibling = false;
             break;
           }
         }
+        if (is_sibling) {
+          next_sibling_idx = i;
+          break;
+        }
       }
     }
-    retrive_next_sibling[token_idx + tid] = next_sibling_idx;
+  }
+  retrive_next_sibling[token_idx + tid] = next_sibling_idx;
 }
-
 
 void reconstruct_indices_from_tree_mask(
     at::Tensor tree_mask,
@@ -286,18 +283,17 @@ void reconstruct_indices_from_tree_mask(
     at::Tensor retrive_next_sibling,
     int64_t batch_size,
     int64_t draft_token_num) {
-    
-    dim3 grid(batch_size);
-    dim3 block(draft_token_num);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    
-    reconstructIndicesFromTreeMask<<<grid, block, 0, stream>>>(
-        static_cast<bool*>(tree_mask.data_ptr()),
-        static_cast<int*>(verified_seq_len.data_ptr()),
-        static_cast<int*>(positions.data_ptr()),
-        static_cast<int*>(retrive_index.data_ptr()),
-        static_cast<int*>(retrive_next_token.data_ptr()),
-        static_cast<int*>(retrive_next_sibling.data_ptr()),
-        int(batch_size),
-        int(draft_token_num));
+  dim3 grid(batch_size);
+  dim3 block(draft_token_num);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  reconstructIndicesFromTreeMask<<<grid, block, 0, stream>>>(
+      static_cast<bool*>(tree_mask.data_ptr()),
+      static_cast<int*>(verified_seq_len.data_ptr()),
+      static_cast<int*>(positions.data_ptr()),
+      static_cast<int*>(retrive_index.data_ptr()),
+      static_cast<int*>(retrive_next_token.data_ptr()),
+      static_cast<int*>(retrive_next_sibling.data_ptr()),
+      int(batch_size),
+      int(draft_token_num));
 }

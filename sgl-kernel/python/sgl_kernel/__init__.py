@@ -93,11 +93,11 @@ from sgl_kernel.sampling import (
 )
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,
+    lookahead_verify_tree_greedy,
+    reconstruct_indices_from_tree_mask,
     segment_packbits,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
-    reconstruct_indices_from_tree_mask,
-    lookahead_verify_tree_greedy,
 )
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__

@@ -1,33 +1,30 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Type, Callable
+import logging
+import threading
+from typing import TYPE_CHECKING, Callable, List, Type
 
 import numpy as np
 import torch
 import triton
-import threading
-
-import logging
 
 logger = logging.getLogger(__name__)
 
 
 from dataclasses import dataclass
 
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
-    get_last_loc,
-)
+from sgl_kernel import lookahead_verify_tree_greedy
+
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import ScheduleBatch, get_last_loc
 from sglang.srt.speculative.eagle_utils import (
     assign_req_to_token_pool,
     create_flashinfer_kv_indices_triton,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-
-from sgl_kernel import lookahead_verify_tree_greedy
 from sglang.srt.utils import next_power_of_2
+
 
 @dataclass
 class LookaheadVerifyInput:
@@ -39,13 +36,11 @@ class LookaheadVerifyInput:
         retrive_index: torch.Tensor,
         retrive_next_token: torch.Tensor,
         retrive_next_sibling: torch.Tensor,
-
         accept_length: torch.Tensor,
         accept_token_ids: torch.Tensor,
         last_verified_ids: torch.Tensor,
         flatten_index: torch.Tensor,
         total_accept_num: torch.Tensor,
-
         draft_token_num: int,
     ):
         self.draft_token = draft_token
@@ -106,18 +101,19 @@ class LookaheadVerifyInput:
     ):
         bs = len(req_pool_indices)
 
-        cum_kv_seq_len = torch.zeros(
-            (bs + 1,), dtype=torch.int32, device=self.device
-        )
+        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
 
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        self.qo_indptr = torch.arange(
-            0, bs + 1, dtype=torch.int32, device=self.device
-        ) * self.draft_token_num
+        self.qo_indptr = (
+            torch.arange(0, bs + 1, dtype=torch.int32, device=self.device)
+            * self.draft_token_num
+        )
 
-        kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device=self.device)
+        kv_indices = torch.empty(
+            cum_kv_seq_len[-1], dtype=torch.int32, device=self.device
+        )
 
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
@@ -130,10 +126,9 @@ class LookaheadVerifyInput:
         )
         return kv_indices, cum_kv_seq_len, self.qo_indptr, self.custom_mask
 
-
     def _fill_requests(
-        self, 
-        batch: ScheduleBatch, 
+        self,
+        batch: ScheduleBatch,
         logits_output: torch.Tensor,
         accept_index_flatten: torch.Tensor,
     ):
@@ -150,17 +145,15 @@ class LookaheadVerifyInput:
                 batch.seq_lens_sum += 1
             req.check_finished()
 
-
     def _free_cache(
-        self, 
-        batch: ScheduleBatch, 
-        page_size: int, 
-        accept_index_flatten: torch.Tensor
+        self, batch: ScheduleBatch, page_size: int, accept_index_flatten: torch.Tensor
     ):
         bs = batch.batch_size()
         if page_size == 1:
-            evict_index_flatten = self.flatten_index[self.total_accept_num:]
-            batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_index_flatten])
+            evict_index_flatten = self.flatten_index[self.total_accept_num :]
+            batch.token_to_kv_pool_allocator.free(
+                batch.out_cache_loc[evict_index_flatten]
+            )
             batch.out_cache_loc = batch.out_cache_loc[accept_index_flatten]
         else:
             # Shift the accepted tokens to the beginning.
@@ -224,13 +217,15 @@ class LookaheadVerifyInput:
         logits_output: LogitsProcessorOutput,
         page_size: int,
     ) -> torch.Tensor:
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).to(torch.int32)
+        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).to(
+            torch.int32
+        )
         lookahead_verify_tree_greedy(
             accept_token_num=self.accept_length,  # mutable, at least 1
-            accept_token_ids=self.accept_token_ids, # mutable
-            last_verified_ids=self.last_verified_ids, # mutable
-            flatten_index=self.flatten_index, # mutable
-            total_accept_num=self.total_accept_num, # mutable
+            accept_token_ids=self.accept_token_ids,  # mutable
+            last_verified_ids=self.last_verified_ids,  # mutable
+            flatten_index=self.flatten_index,  # mutable
+            total_accept_num=self.total_accept_num,  # mutable
             candidates=self.draft_token,
             retrive_index=self.retrive_index,
             retrive_next_token=self.retrive_next_token,
@@ -240,7 +235,7 @@ class LookaheadVerifyInput:
             eos_token_id=batch.eos_id,
         )
 
-        accept_index_flatten = self.flatten_index[:self.total_accept_num]
+        accept_index_flatten = self.flatten_index[: self.total_accept_num]
 
         self._free_cache(batch, page_size, accept_index_flatten)
         self._fill_requests(batch, logits_output, accept_index_flatten)

@@ -280,7 +280,7 @@ class ServerArgs:
     speculative_lookahead_max_bfs_breadth: int = 7
     speculative_lookahead_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_lookahead_branch_length: int = 18
-    speculative_lookahead_capacity: int = 10*1000*1000
+    speculative_lookahead_capacity: int = 10 * 1000 * 1000
 
     # Expert parallelism
     ep_size: int = 1

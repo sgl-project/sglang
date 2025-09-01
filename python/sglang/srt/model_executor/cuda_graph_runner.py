@@ -866,6 +866,7 @@ class CudaGraphRunner:
 
         elif self.model_runner.spec_algorithm.is_lookahead():
             from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+
             custom_mask = torch.zeros(
                 (num_tokens * self.num_tokens_per_bs),
                 dtype=torch.bool,
@@ -884,7 +885,7 @@ class CudaGraphRunner:
                 None,
                 None,
                 None,
-                self.num_tokens_per_bs
+                self.num_tokens_per_bs,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 

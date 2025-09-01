@@ -289,9 +289,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
 
   m.def(
-    "reconstruct_indices_from_tree_mask(Tensor tree_mask, Tensor verified_seq_len, Tensor positions, "
-    "Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
-    "int batch_size, int draft_token_num) -> ()");
+      "reconstruct_indices_from_tree_mask(Tensor tree_mask, Tensor verified_seq_len, Tensor positions, "
+      "Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "int batch_size, int draft_token_num) -> ()");
   m.impl("reconstruct_indices_from_tree_mask", torch::kCUDA, &reconstruct_indices_from_tree_mask);
 
   m.def(
