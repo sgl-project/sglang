@@ -49,9 +49,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
+# TODO may improve flags
 ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP = get_bool_env_var("SGLANG_ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP")
 ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP = get_bool_env_var("SGLANG_ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP")
 ENABLE_DEEPEP_COMBINE_OVERLAP = ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP or ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP
+DEEPEP_LL_COMBINE_SEND_NUM_SMS = get_int_env_var("SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32)
 
 logger = logging.getLogger(__name__)
 
