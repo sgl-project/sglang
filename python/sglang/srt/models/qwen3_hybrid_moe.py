@@ -972,7 +972,18 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False) -> Set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -994,6 +1005,10 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+
+            if is_mtp and name not in ['fc.weight', 'pre_fc_norm_embedding.weight', 'pre_fc_norm_hidden.weight']:
+                name = f"model.{name}"
+                
             if "rotary_emb.inv_freq" in name:
                 continue
 

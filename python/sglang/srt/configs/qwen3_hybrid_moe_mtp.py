@@ -1,0 +1,113 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""Inference-only Qwen3HybridMoE MTP Speculative Decoding."""
+import logging
+from typing import Iterable, Optional, Tuple
+
+import torch
+from torch import nn
+from transformers import PretrainedConfig
+
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+)
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.qwen3_hybrid_moe import Qwen3HybridMoEForCausalLM, Qwen3HybridMoeModel
+from sglang.srt.models.qwen3_moe import Qwen3MoeModel
+from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
+
+
+
+class Qwen3HybridMoEForCausalLMMTP(Qwen3HybridMoEForCausalLM):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.config = config
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.quant_config = quant_config
+        # if not set, model load will be broken in Qwen3HybridMoEForCausalLM load_weights()
+        self.pp_group = get_pp_group()
+        # self.determine_num_fused_shared_experts("Qwen3HybridMoEForCausalLMMTP")
+
+        # currently based on the provided ckpt, we: 
+        # (1) do not use_dedicated_mtp_embeddings provided in ckpt since not provided and directly use the target model embeddings 
+        # (2) hardcode bias=False since not provided
+        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        if getattr(
+            config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)
+        ):
+            logger.warning_once(
+                "Using Gemma RMSNorm for input normalization and post attn normalization."
+            )
+            RMSNorm_cls = GemmaRMSNorm
+        else:
+            RMSNorm_cls = RMSNorm
+        self.pre_fc_norm_embedding = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
+        self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
+
+        self.model = Qwen3HybridMoeModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("model.shared_head.head", prefix),
+            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+        )
+        self.logits_processor = LogitsProcessor(config)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+
+        hidden_states = inputs_embeds # QQ: hidden_states should be something else?
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
+
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, hidden_states,
+        )
+
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False):
+        super().load_weights(weights, is_mtp=True)
+
+
+EntryClass = [Qwen3HybridMoEForCausalLMMTP]

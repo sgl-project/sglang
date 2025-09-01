@@ -1344,6 +1344,7 @@ class ModelRunner:
                     conv_dtype=torch.bfloat16,
                     ssm_dtype=torch.float32,
                     mamba_layers=config.linear_layer_ids,
+                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(

@@ -826,6 +826,17 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
+        # QQ: can be optimized
+        if self.target_worker.model_runner.is_hybrid_gdn:
+            # res.draft_input.accept_length is on GPU but may be empty for last verify?
+            accepted_length = torch.tensor(res.accept_length_per_req_cpu, 
+                                        device=logits_output.hidden_states.device, 
+                                        dtype=torch.int32
+                                        ) + 1
+            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+                accepted_length, 
+            )
+
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
 

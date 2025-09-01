@@ -49,11 +49,20 @@ class MambaAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = self._get_cached_arange(bs, str(self.device))
         elif forward_batch.forward_mode.is_prefill():
-            query_start_loc = torch.empty(
-                (bs + 1,), dtype=torch.int32, device=self.device
-            )
-            query_start_loc[:bs] = forward_batch.extend_start_loc
-            query_start_loc[bs] = forward_batch.extend_start_loc[-1] + forward_batch.extend_seq_lens[-1]
+            if forward_batch.forward_mode.is_target_verify():
+                query_start_loc = torch.arange(
+                    0, 
+                    forward_batch.input_ids.shape[0] + 1, 
+                    step=forward_batch.spec_info.draft_token_num, 
+                    dtype=torch.int32, 
+                    device=forward_batch.input_ids.device
+                )
+            else:
+                query_start_loc = torch.empty(
+                    (bs + 1,), dtype=torch.int32, device=self.device
+                )
+                query_start_loc[:bs] = forward_batch.extend_start_loc
+                query_start_loc[bs] = forward_batch.extend_start_loc[-1] + forward_batch.extend_seq_lens[-1]
         else:
             raise NotImplementedError("Only prefill/decode/idle modes are supported.")
         mamba_cache_indices = (
@@ -217,8 +226,14 @@ class MambaAttnBackend(AttentionBackend):
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
 
-        conv_states, ssm_states = self.req_to_token_pool.get_mamba_params(layer_id)
-        has_initial_states = forward_batch.extend_prefix_lens > 0
+
+
+        if forward_batch.forward_mode.is_target_verify():
+            conv_states, ssm_states, mixed_qkv_cache, query_cache, key_cache, value_cache, g_cache, beta_cache = self.req_to_token_pool.get_mamba_params(layer_id)
+            has_initial_states = torch.ones(seq_len // forward_batch.spec_info.draft_token_num, dtype=torch.bool, device=forward_batch.input_ids.device)
+        else:
+            conv_states, ssm_states = self.req_to_token_pool.get_mamba_params(layer_id)
+            has_initial_states = forward_batch.extend_prefix_lens > 0
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
@@ -228,7 +243,7 @@ class MambaAttnBackend(AttentionBackend):
             conv_weights,
             bias,
             activation=activation,
-            conv_states=conv_states,
+            conv_states=conv_states.clone() if forward_batch.forward_mode.is_target_verify() else conv_states,
             has_initial_state=has_initial_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
@@ -259,14 +274,34 @@ class MambaAttnBackend(AttentionBackend):
             g=g,
             beta=beta,
             initial_state=recurrent_state,  # unified use existing state (zeros for new sequences)
-            output_final_state=recurrent_state is not None,
+            output_final_state=True,
             cu_seqlens=query_start_loc,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
 
         last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-        ssm_states[self.forward_metadata.mamba_cache_indices] = last_recurrent_state
+        if not forward_batch.forward_mode.is_target_verify():
+            ssm_states[self.forward_metadata.mamba_cache_indices] = last_recurrent_state
+        else:
+            mixed_qkv_cache[self.forward_metadata.mamba_cache_indices] = (
+                mixed_qkv.view((-1,) + mixed_qkv_cache.shape[1:])
+            )
+            query_cache[self.forward_metadata.mamba_cache_indices] = (
+                query.view((-1,) + query_cache.shape[1:])
+            )
+            key_cache[self.forward_metadata.mamba_cache_indices] = (
+                key.view((-1,) + key_cache.shape[1:])
+            )
+            value_cache[self.forward_metadata.mamba_cache_indices] = (
+                value.view((-1,) + value_cache.shape[1:])
+            )
+            g_cache[self.forward_metadata.mamba_cache_indices] = (
+                g.view((-1,) + g_cache.shape[1:])
+            )
+            beta_cache[self.forward_metadata.mamba_cache_indices] = (
+                beta.view((-1,) + beta_cache.shape[1:])
+            )            
         return core_attn_out
 
 class HybridLinearAttnBackend(AttentionBackend):
@@ -410,3 +445,64 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
 
+    def update_mamba_state_after_mtp_verify(self, accepted_length):
+        num_attn = 0
+        request_number = accepted_length.shape[0]
+        # QQ: step = self.mamba_cache.mamba_cache[2][2] is the spec num_draft token num
+        num_draft_tokens = self.mamba_cache.mamba_cache[2].shape[2]
+        # QQ: can be parallelized
+        for i in range(len(self.model.layers)):
+            layer = self.model.layers[i]
+            if isinstance(layer, Qwen3HybridAttentionDecoderLayer):
+                num_attn += 1
+
+            if isinstance(layer, Qwen3HybridLinearDecoderLayer):
+                try:
+                    conv_weights = layer.linear_attn.conv1d.weight.view(
+                        layer.linear_attn.conv1d.weight.size(0), 
+                        layer.linear_attn.conv1d.weight.size(2)
+                        )
+                    query_start_loc = accepted_length.cumsum(-1, dtype=accepted_length.dtype)
+                    query_start_loc = torch.cat([torch.zeros(1, dtype=query_start_loc.dtype, device=query_start_loc.device), query_start_loc])
+
+                    mask = torch.arange(num_draft_tokens, device=accepted_length.device).unsqueeze(0) < accepted_length.unsqueeze(1)
+
+                    layer_id = i - num_attn
+                    mamba_cache  = self.attn_backend_list[1].req_to_token_pool.get_mamba_params(layer_id)
+
+                    conv_state = mamba_cache[0][mask]
+                    ssm_state = mamba_cache[1][mask]
+                    mixed_qkv = mamba_cache[2][mask]
+                    query = mamba_cache[3][mask].unsqueeze(0)
+                    key = mamba_cache[4][mask].unsqueeze(0)
+                    value = mamba_cache[5][mask].unsqueeze(0)
+                    g = mamba_cache[6][mask].unsqueeze(0)
+                    beta = mamba_cache[7][mask].unsqueeze(0)
+                    state_indices_tensor = self.attn_backend_list[1].forward_metadata.mamba_cache_indices
+                    has_initial_states = torch.ones(request_number, dtype=torch.bool, device=accepted_length.device)
+
+                    _ = causal_conv1d_fn(
+                        mixed_qkv.transpose(0, 1),
+                        conv_weights,
+                        layer.linear_attn.conv1d.bias,
+                        activation=layer.linear_attn.activation,
+                        conv_states=conv_state,
+                        has_initial_state=has_initial_states,
+                        cache_indices=state_indices_tensor,
+                        query_start_loc=query_start_loc,
+                    )
+                    _, last_recurrent_state = chunk_gated_delta_rule(
+                        q=query,
+                        k=key,
+                        v=value,
+                        g=g,
+                        beta=beta,
+                        initial_state=ssm_state[state_indices_tensor],
+                        output_final_state=True,
+                        cu_seqlens=query_start_loc,
+                        head_first=False,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                    ssm_state[state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype, copy=False)
+                except:
+                    torch.distributed.breakpoint()
