@@ -103,6 +103,9 @@ class MambaAttnBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        num_padding = torch.count_nonzero(seq_lens==self.get_cuda_graph_seq_len_fill_value()).item()
+        # Make sure req_pool_indices is correct for padding reqs
+        req_pool_indices[bs-num_padding:] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(
             req_pool_indices
         )
@@ -110,6 +113,9 @@ class MambaAttnBackend(AttentionBackend):
         self.query_start_loc_list[bs - 1].copy_(
             torch.arange(0, bs + 1, dtype=torch.int32, device="cuda")
         )
+        if num_padding > 0:
+            self.query_start_loc_list[bs - 1][bs-num_padding:] = bs-num_padding
+        
         self.forward_metadata = ForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
