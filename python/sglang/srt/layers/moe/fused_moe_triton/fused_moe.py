@@ -657,6 +657,8 @@ def invoke_fused_moe_kernel(
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    use_fused_silu_and_quant: bool = False,
+    intermediate_cache_silu: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -669,7 +671,11 @@ def invoke_fused_moe_kernel(
             padded_size = padding_size
             # activations apply per-token quantization when weights apply per-channel quantization by default
             A, A_scale = scaled_fp8_quant(
-                A, A_scale, use_per_token_if_dynamic=per_channel_quant
+                A,
+                A_scale,
+                use_per_token_if_dynamic=per_channel_quant,
+                use_fused_silu_and_quant=use_fused_silu_and_quant,
+                intermediate_cache_silu=intermediate_cache_silu,
             )
         else:
             # activation block-wise fp8 quantization
@@ -1032,6 +1038,7 @@ def inplace_fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    use_fused_silu_and_quant: bool = False,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -1060,6 +1067,7 @@ def inplace_fused_experts(
         routed_scaling_factor,
         gemm1_alpha,
         gemm1_limit,
+        use_fused_silu_and_quant,
     )
 
 
@@ -1088,6 +1096,7 @@ def inplace_fused_experts_fake(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    use_fused_silu_and_quant: bool = False,
 ) -> None:
     pass
 
@@ -1244,6 +1253,7 @@ def fused_experts(
             moe_runner_config.routed_scaling_factor,
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
+            moe_runner_config.use_fused_silu_and_quant,
         )
         return hidden_states
     else:
@@ -1403,6 +1413,7 @@ def fused_experts_impl(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    use_fused_silu_and_quant: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1462,6 +1473,7 @@ def fused_experts_impl(
     intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
         (M, topk_ids.shape[1], w2.shape[1]),
     )
+    intermediate_cache_silu = None
 
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
@@ -1540,7 +1552,14 @@ def fused_experts_impl(
                     gemm1_limit,
                 )
             elif _is_cuda or _is_hip:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                if not use_fused_silu_and_quant:
+                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                else:
+                    intermediate_cache_silu = intermediate_cache2
+                    intermediate_cache2 = intermediate_cache1.view(
+                        -1, N
+                    )  # silu not applied
+
             else:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
@@ -1584,6 +1603,8 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            use_fused_silu_and_quant=use_fused_silu_and_quant,
+            intermediate_cache_silu=intermediate_cache_silu,
         )
 
         if routed_scaling_factor is None:

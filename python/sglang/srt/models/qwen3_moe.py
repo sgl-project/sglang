@@ -76,6 +76,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
+        self.use_fused_silu_and_quant = getattr(
+            config, "use_fused_silu_and_quant", False
+        )
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -87,8 +90,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             use_grouped_topk=False,
         )
+        experts_type = get_moe_impl_class()
+        extra_kwargs = {}
+        if experts_type.__name__ == "FusedMoE":
+            extra_kwargs = {"use_fused_silu_and_quant": self.use_fused_silu_and_quant}
 
-        self.experts = get_moe_impl_class()(
+        self.experts = experts_type(
             num_experts=config.num_experts
             + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok,
@@ -97,6 +104,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
+            **extra_kwargs,
         )
 
         self.gate = ReplicatedLinear(
