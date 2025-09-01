@@ -523,6 +523,10 @@ class ModelRunner:
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
 
+        if self.dp_size > 1:
+            logger.info("Disable chunked prefix cache when dp size > 1.")
+            server_args.disable_chunked_prefix_cache = True
+
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
 
