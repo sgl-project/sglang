@@ -102,6 +102,20 @@ class HiCacheStorage(ABC):
         """
         pass
 
+    @abstractmethod
+    def delete(self, key: str) -> bool:
+        """
+        Delete the entry associated with the given key.
+        """
+        pass
+
+    @abstractmethod
+    def clear(self) -> bool:
+        """
+        Clear all entries in the storage.
+        """
+        pass
+
     def batch_exists(self, keys: List[str]) -> int:
         """
         Check if the keys exist in the storage.
@@ -214,12 +228,14 @@ class HiCacheFile(HiCacheStorage):
             logger.warning(f"Key {key} does not exist. Cannot delete.")
             return
 
-    def clear(self) -> None:
+    def clear(self) -> bool:
         try:
             for filename in os.listdir(self.file_path):
                 file_path = os.path.join(self.file_path, filename)
                 if os.path.isfile(file_path):
                     os.remove(file_path)
             logger.info("Cleared all entries in HiCacheFile storage.")
+            return True
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
+            return False
