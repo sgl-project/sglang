@@ -467,6 +467,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         ptr_list = []
         key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        indices = indices.tolist()
         v_offset = (
             self.layer_num
             * self.size
