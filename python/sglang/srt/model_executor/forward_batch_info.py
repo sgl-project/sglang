@@ -241,6 +241,9 @@ class ForwardBatch:
     prefix_chunk_num_tokens: Optional[List[int]] = None
     # KV Indices for each chunk
     prefix_chunk_kv_indices: Optional[List[torch.Tensor]] = None
+    # For MLA chunked prefix cache used in chunked prefill
+    # Tell attention backend whether lse needs to be returned
+    mha_return_lse: Optional[bool] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
