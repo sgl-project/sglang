@@ -432,9 +432,9 @@ class DeepEPMoE(EPMoE):
             hidden_states, topk_idx, topk_weights, forward_batch
         )
 
-        overlap_args = self._compute_overlap_args(dispatch_output)
+        combine_overlap_args = self._compute_combine_overlap_args(dispatch_output)
 
-        hidden_states = self.moe_impl(dispatch_output)
+        hidden_states = self.moe_impl(dispatch_output, down_signals=combine_overlap_args["signal"])
 
         if hook_overlap_on_combine is not None:
             hook_overlap_on_combine()
@@ -444,13 +444,13 @@ class DeepEPMoE(EPMoE):
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
             forward_batch,
-            overlap_args=overlap_args,
+            overlap_args=combine_overlap_args,
         )
 
         return hidden_states
 
     @staticmethod
-    def _compute_overlap_args(dispatch_output):
+    def _compute_combine_overlap_args(dispatch_output):
         if not ENABLE_DEEPEP_COMBINE_OVERLAP:
             return None
 
@@ -490,7 +490,7 @@ class DeepEPMoE(EPMoE):
             forward_batch=forward_batch,
         )
 
-    def moe_impl(self, dispatch_output: DispatchOutput):
+    def moe_impl(self, dispatch_output: DispatchOutput, down_signals: Optional[torch.Tensor]):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         if _use_aiter:
@@ -508,7 +508,7 @@ class DeepEPMoE(EPMoE):
                 get_moe_runner_backend().is_flashinfer_cutedsl()
             )
             if enable_flashinfer_cutedsl_moe:
-                return self.forward_flashinfer_cutedsl(dispatch_output)
+                return self.forward_flashinfer_cutedsl(dispatch_output, down_signals=down_signals)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -693,6 +693,7 @@ class DeepEPMoE(EPMoE):
     def forward_flashinfer_cutedsl(
         self,
         dispatch_output: DeepEPLLOutput,
+        down_signals: Optional[torch.Tensor],
     ):
         hidden_states, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
@@ -703,6 +704,7 @@ class DeepEPMoE(EPMoE):
             x=hidden_states,
             masked_m=masked_m,
             moe_runner_config=self.moe_runner_config,
+            down_signals=down_signals,
         )
         return output
 
