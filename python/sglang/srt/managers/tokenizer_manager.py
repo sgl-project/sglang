@@ -1389,7 +1389,7 @@ class TokenizerManager:
                         os.environ.pop(k, None)
 
         bootstrap_port = None
-        if obj.clean_connection_pool is None:
+        if obj.failed_bootstrap_addr is None:
             check_count = 60
             while len(self.rid_to_state) > 0:
                 await asyncio.sleep(1)
@@ -1434,14 +1434,13 @@ class TokenizerManager:
             await self.convert_pd_role_communicator(obj)
         )
 
-        # wait scheduler event loop ready
-        await self.flush_cache()
-        if obj.clean_connection_pool:
-            pass
-        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disaggregation_mode = DisaggregationMode.DECODE
-        else:
-            self.disaggregation_mode = DisaggregationMode.PREFILL
+        if obj.failed_bootstrap_addr is None:
+            # wait scheduler event loop ready
+            await self.flush_cache()
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.disaggregation_mode = DisaggregationMode.DECODE
+            else:
+                self.disaggregation_mode = DisaggregationMode.PREFILL
         return responses[0].success, responses[0].message, bootstrap_port
 
     async def get_load(self) -> dict:

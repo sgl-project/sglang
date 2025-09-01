@@ -483,7 +483,7 @@ async def convert_pd_role(obj: ConvertDisaggregationRoleReqInput):
     if current_role == "prefill":
         parsed_url = urllib.parse.urlparse(server_url)
         hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
-        obj.clean_connection_pool = f"{hostname}:{bootstrap_port}"
+        obj.failed_bootstrap_addr = f"{hostname}:{bootstrap_port}"
         async with aiohttp.ClientSession() as session:
             tasks = []
             for decode_server in load_balancer.decode_servers:

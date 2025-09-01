@@ -2540,39 +2540,18 @@ class Scheduler(
 
     def convert_disaggregation_role(self, recv_req: ConvertDisaggregationRoleReqInput):
         """Convert the disaggregation role of the scheduler."""
-        if recv_req.clean_connection_pool:
-            kv_manager = self.disagg_decode_prealloc_queue.kv_manager
-            kv_manager._handle_node_failure(recv_req.clean_connection_pool)
-            with kv_manager.session_pool_lock:
-                if recv_req.clean_connection_pool in kv_manager.session_pool:
-                    del kv_manager.session_pool[recv_req.clean_connection_pool]
+        if recv_req.failed_bootstrap_addr:
+            self.disagg_decode_prealloc_queue.handle_failure_node(
+                recv_req.failed_bootstrap_addr
+            )
             return ConvertDisaggregationRoleReqOutput(
                 success=True,
                 message="clean connection pool successfully.",
             )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # disaggregation
-            self.server_args.disaggregation_bootstrap_port = None
-            self.server_args.disaggregation_decode_dp = None
-            self.server_args.disaggregation_decode_tp = None
-            # tree cache
-            self.server_args.disable_radix_cache = True
-            self.enable_hierarchical_cache = False
-            # cuda graph
-            self.server_args.disable_cuda_graph = recv_req.disable_cuda_graph
-            if recv_req.cuda_graph_max_bs:
-                # ServerArgs init will set cuda_graph_max_bs to a num.
-                self.server_args.cuda_graph_max_bs = recv_req.cuda_graph_max_bs
-            self.server_args.cuda_graph_bs = recv_req.cuda_graph_bs
-            self.server_args.disable_cuda_graph_padding = (
-                recv_req.disable_cuda_graph_padding
-            )
-            self.server_args.enable_profile_cuda_graph = (
-                recv_req.enable_profile_cuda_graph
-            )
-            self.server_args.disaggregation_mode = "decode"
-            self.server_args.__post_init__()
+            # change server args for prefill mode
+            self.convert_prefill_server_args(recv_req)
             # stop prefill event loop
             self.stop_prefill_event.set()
             return ConvertDisaggregationRoleReqOutput(
@@ -2580,43 +2559,8 @@ class Scheduler(
                 message="The role of this server is now DECODE.",
             )
         else:
-            # disaggregation
-            self.server_args.disaggregation_bootstrap_port = recv_req.bootstrap_port
-            self.server_args.disaggregation_decode_dp = (
-                recv_req.disaggregation_decode_dp
-            )
-            self.server_args.disaggregation_decode_tp = (
-                recv_req.disaggregation_decode_tp
-            )
-            self.server_args.disaggregation_prefill_pp = (
-                recv_req.disaggregation_prefill_pp
-            )
-            # tree cache
-            self.server_args.disable_radix_cache = recv_req.disable_radix_cache
-            self.enable_hierarchical_cache = recv_req.enable_hierarchical_cache
-            self.server_args.enable_hierarchical_cache = (
-                recv_req.enable_hierarchical_cache
-            )
-            if self.enable_hierarchical_cache:
-                self.server_args.hicache_ratio = recv_req.hicache_ratio
-                self.server_args.hicache_size = recv_req.hicache_size
-                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
-                self.server_args.hicache_io_backend = recv_req.hicache_io_backend
-                self.enable_hicache_storage = (
-                    recv_req.hicache_storage_backend is not None
-                )
-                self.server_args.hicache_storage_backend = (
-                    recv_req.hicache_storage_backend
-                )
-                self.server_args.hicache_storage_prefetch_policy = (
-                    recv_req.hicache_storage_prefetch_policy
-                )
-                self.server_args.hicache_mem_layout = recv_req.hicache_mem_layout
-            # cuda graph
-            self.server_args.disable_cuda_graph = True
-
-            self.server_args.disaggregation_mode = "prefill"
-            self.server_args.__post_init__()
+            # change server args for prefill mode
+            self.convert_decode_server_args(recv_req)
             # stop decode event loop
             self.stop_decode_event.set()
             return ConvertDisaggregationRoleReqOutput(

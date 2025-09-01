@@ -437,6 +437,12 @@ class DecodePreallocQueue:
 
         return preallocated_reqs
 
+    def handle_failure_node(self, failed_bootstrap_addr: str):
+        self.kv_manager._handle_node_failure(failed_bootstrap_addr)
+        with self.kv_manager.session_pool_lock:
+            if failed_bootstrap_addr in self.kv_manager.session_pool:
+                del self.kv_manager.session_pool[failed_bootstrap_addr]
+
     @property
     def num_tokens_pre_allocated(self):
         return sum(
@@ -907,6 +913,34 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
         self.waiting_queue.extend(alloc_reqs)
+
+    def convert_decode_server_args(self: Scheduler, recv_req):
+        """convert decode server args to prefill"""
+        # disaggregation
+        self.server_args.disaggregation_bootstrap_port = recv_req.bootstrap_port
+        self.server_args.disaggregation_decode_dp = recv_req.disaggregation_decode_dp
+        self.server_args.disaggregation_decode_tp = recv_req.disaggregation_decode_tp
+        self.server_args.disaggregation_prefill_pp = recv_req.disaggregation_prefill_pp
+        # tree cache
+        self.server_args.disable_radix_cache = recv_req.disable_radix_cache
+        self.enable_hierarchical_cache = recv_req.enable_hierarchical_cache
+        self.server_args.enable_hierarchical_cache = recv_req.enable_hierarchical_cache
+        if self.enable_hierarchical_cache:
+            self.server_args.hicache_ratio = recv_req.hicache_ratio
+            self.server_args.hicache_size = recv_req.hicache_size
+            self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+            self.server_args.hicache_io_backend = recv_req.hicache_io_backend
+            self.enable_hicache_storage = recv_req.hicache_storage_backend is not None
+            self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
+            self.server_args.hicache_storage_prefetch_policy = (
+                recv_req.hicache_storage_prefetch_policy
+            )
+            self.server_args.hicache_mem_layout = recv_req.hicache_mem_layout
+        # cuda graph
+        self.server_args.disable_cuda_graph = True
+        self.server_args.disaggregation_mode = "prefill"
+        # check server args
+        self.server_args.__post_init__()
 
     def convert_decode_resources(self: Scheduler):
         """convert decode resources to prefill resources."""

@@ -873,6 +873,28 @@ class SchedulerDisaggregationPrefillMixin:
             )
         return data
 
+    def convert_prefill_server_args(self: Scheduler, recv_req) -> None:
+        # disaggregation
+        self.server_args.disaggregation_bootstrap_port = None
+        self.server_args.disaggregation_decode_dp = None
+        self.server_args.disaggregation_decode_tp = None
+        # tree cache
+        self.server_args.disable_radix_cache = True
+        self.enable_hierarchical_cache = False
+        # cuda graph
+        self.server_args.disable_cuda_graph = recv_req.disable_cuda_graph
+        if recv_req.cuda_graph_max_bs:
+            # ServerArgs init will set cuda_graph_max_bs to a num.
+            self.server_args.cuda_graph_max_bs = recv_req.cuda_graph_max_bs
+        self.server_args.cuda_graph_bs = recv_req.cuda_graph_bs
+        self.server_args.disable_cuda_graph_padding = (
+            recv_req.disable_cuda_graph_padding
+        )
+        self.server_args.enable_profile_cuda_graph = recv_req.enable_profile_cuda_graph
+        self.server_args.disaggregation_mode = "decode"
+        # check server args
+        self.server_args.__post_init__()
+
     def convert_prefill_resources(self: Scheduler) -> None:
         """convert prefill resources to decode resources."""
         if not self.server_args.enable_pd_convert:
