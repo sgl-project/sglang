@@ -186,10 +186,33 @@ pub async fn create_tokenizer_async(
 
 /// Factory function to create tokenizer from a model name or path (blocking version)
 pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
-    // Simply call the async version using block_in_place
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(create_tokenizer_async(model_name_or_path))
-    })
+    // Check if it's a file path
+    let path = Path::new(model_name_or_path);
+    if path.exists() {
+        return create_tokenizer_from_file(model_name_or_path);
+    }
+
+    // Check if it's a GPT model name that should use Tiktoken
+    if model_name_or_path.contains("gpt-")
+        || model_name_or_path.contains("davinci")
+        || model_name_or_path.contains("curie")
+        || model_name_or_path.contains("babbage")
+        || model_name_or_path.contains("ada")
+    {
+        let tokenizer = TiktokenTokenizer::from_model_name(model_name_or_path)?;
+        return Ok(Arc::new(tokenizer));
+    }
+
+    // Only use tokio for HuggingFace downloads
+    // Check if we're already in a tokio runtime
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // We're in a runtime, use block_in_place
+        tokio::task::block_in_place(|| handle.block_on(create_tokenizer_async(model_name_or_path)))
+    } else {
+        // No runtime, create a temporary one
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(create_tokenizer_async(model_name_or_path))
+    }
 }
 
 /// Get information about a tokenizer file
