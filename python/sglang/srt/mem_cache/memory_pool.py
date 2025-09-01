@@ -112,12 +112,12 @@ class MambaPool:
         temporal_state_shape: Tuple[int, int],
         device: str,
     ):
-        conv_state = torch.empty(
+        conv_state = torch.zeros(
             size=(num_mamba_layers, size + 1) + conv_state_shape,
             dtype=conv_dtype,
             device=device,
         )
-        temporal_state = torch.empty(
+        temporal_state = torch.zeros(
             size=(num_mamba_layers, size + 1) + temporal_state_shape,
             dtype=ssm_dtype,
             device=device,
@@ -126,6 +126,7 @@ class MambaPool:
         self.mamba_cache = (conv_state, temporal_state)
         self.size = size
         self.free_slots = list(range(size))
+        self.mem_usage = self.get_mamba_size() / GB
 
     def get_mamba_params(self, layer_id: int):
         return self.mamba_cache[0][layer_id], self.mamba_cache[1][layer_id]
@@ -151,6 +152,7 @@ class MambaPool:
             self.free_slots.append(free_index)
         else:
             self.free_slots.extend(free_index)
+        self.mamba_cache[0][:, free_index] = self.mamba_cache[1][:, free_index] = 0
 
     def clear(self):
         self.free_slots = list(range(self.size))
@@ -212,6 +214,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_index = self.full_to_mamba_index_mapping[free_index]
         super().free(free_index)
         self.mamba_pool.free(mamba_index.tolist())
+        self.full_to_mamba_index_mapping[free_index] = -1
 
     def clear(self):
         super().clear()

@@ -416,10 +416,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        # cache_params: Optional[MambaCacheParams] = None,
     ):
-        # if cache_params is None:
-        #     raise ValueError("cache_params cannot be None")
         seq_len, _ = hidden_states.shape
         has_prefill = forward_batch.forward_mode.is_prefill()
 
@@ -464,6 +461,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             "dt_bias": self.dt_bias,
             "layer_id": self.layer_id,
             "seq_len": seq_len,
+            "z": z,
         }
 
         core_attn_out = forward_batch.attn_backend.forward(
@@ -551,13 +549,13 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-        # mamba_cache_params: MambaCacheParams,
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
@@ -570,15 +568,16 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
-                # mamba_cache_params,
             )
-
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -738,6 +737,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
         )
 
         self.alt_stream = alt_stream
@@ -822,8 +822,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -871,9 +873,6 @@ class Qwen3HybridMoeModel(nn.Module):
         self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
-        # self.make_empty_intermediate_tensors = (
-        #     make_empty_intermediate_tensors_factory(
-        #         ["hidden_states", "residual"], config.hidden_size))
 
         if getattr(
             config, "use_gemma_rms_norm", getattr(config, "apply_layernorm_1p", False)
@@ -902,13 +901,8 @@ class Qwen3HybridMoeModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
 
         residual = None
-        num_attn = 0
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            if isinstance(layer, Qwen3HybridAttentionDecoderLayer):
-                num_attn += 1
-
-
             hidden_states, residual = layer(
                 layer_id=i,
                 positions=positions,
@@ -923,8 +917,6 @@ class Qwen3HybridMoeModel(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        if hidden_states.shape[0] <= 3:
-            self.infer_count += 1
         return hidden_states
 
 
@@ -963,57 +955,6 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         self.lm_head = self.lm_head.float()
         self.logits_processor = LogitsProcessor(config)
 
-        # Used to track and store by the Mamba cache between steps.
-        self.mamba_cache: Optional[MambaCacheManager] = None
-
-    # def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
-    #     self.init_mamba_cache_once()
-    #     return self.mamba_cache.copy_inputs_before_cuda_graphs(input_buffers, **kwargs)
-
-    # def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
-    #     self.init_mamba_cache_once()
-    #     return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
-
-    def _get_linear_cache_shape(self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-        config = self.config
-        world_size = get_attention_tp_size()
-        conv_dim = (
-            config.linear_key_head_dim * config.linear_num_key_heads * 2
-            + config.linear_value_head_dim * config.linear_num_value_heads
-        )
-        conv_state_shape = (
-            divide(conv_dim, world_size),
-            config.linear_conv_kernel_dim - 1,
-        )
-
-        temporal_state_shape = (
-            divide(config.linear_num_value_heads, world_size),
-            config.linear_key_head_dim,
-            config.linear_value_head_dim,
-        )
-        return conv_state_shape, temporal_state_shape
-
-    def init_mamba_cache_once(self):
-        if self.mamba_cache is not None:
-            return
-        layers_block_type_value = self.config.layers_block_type
-        if self.config.hybrid_linear_attention:
-            num_mamba_layers = sum(
-                type_value == HybridLayerType.linear_attention.value
-                for type_value in layers_block_type_value
-            )
-            conv_state_shape, temporal_state_shape = self._get_linear_cache_shape()
-        else:
-            raise NotImplementedError("Only hybrid linear attention is supported now.")
-
-        self.mamba_cache = MambaCacheManager(
-            torch.bfloat16,
-            torch.float32,
-            num_mamba_layers,
-            conv_state_shape,
-            temporal_state_shape,
-        )
-
     @torch.no_grad()
     def forward(
         self,
@@ -1023,10 +964,6 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        # self.init_mamba_cache_once()
-
-        # mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
-
         hidden_states = self.model(
             input_ids, positions, forward_batch, inputs_embeds
         )

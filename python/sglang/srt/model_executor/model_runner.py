@@ -309,9 +309,10 @@ class ModelRunner:
 
         if self.is_hybrid_gdn:
             logger.warning(
-                "Hybrid GDN model detected, disable radix cache and update max_running_requests to 128"
+                "Hybrid GDN model detected, disable radix cache and chunked prefill"
             )
             self.server_args.disable_radix_cache = True
+            self.server_args.chunked_prefill_size = -1
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to

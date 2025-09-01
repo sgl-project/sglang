@@ -252,7 +252,7 @@ class MambaAttnBackend(AttentionBackend):
             v=value,
             g=g,
             beta=beta,
-            initial_state=None,  # NOTE: In my view, the initial state is not used in training and prefill stage.
+            initial_state=recurrent_state,
             output_final_state=recurrent_state is not None,
             cu_seqlens=query_start_loc,
             head_first=False,
@@ -380,21 +380,8 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_idle():
-            if q is None:
-                mixed_qkv = kwargs["mixed_qkv"]
-                key_dim = kwargs["key_dim"]
-                value_dim = kwargs["value_dim"]
-                attn_tp_size = kwargs["attention_tp_size"]
-                _, _, value = torch.split(
-                    mixed_qkv,
-                    [
-                        key_dim // attn_tp_size,
-                        key_dim // attn_tp_size,
-                        value_dim // attn_tp_size,
-                    ],
-                    dim=-1,
-                )
-                return torch.empty_like(value)
+            if layer is None:
+                return torch.empty_like(kwargs["z"])
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
