@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Union, Dict, Any
+from typing import TYPE_CHECKING, Optional, Union, Dict, Any, Callable
 
 import torch
 
@@ -425,6 +425,7 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        hook_overlap_on_combine: Optional[Callable] = None,
         alt_stream: Optional = None,
     ):
         dispatch_output = self.dispatch(
@@ -434,6 +435,9 @@ class DeepEPMoE(EPMoE):
         overlap_args = self._compute_overlap_args(dispatch_output)
 
         hidden_states = self.moe_impl(dispatch_output)
+
+        if hook_overlap_on_combine is not None:
+            hook_overlap_on_combine()
 
         hidden_states = self.combine(
             hidden_states,
