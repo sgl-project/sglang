@@ -140,7 +140,7 @@ class HiCacheFile(HiCacheStorage):
             storage_config.tp_size,
             storage_config.model_name,
         )
-        model_name = "-".join(model_name.split("/"))
+        model_name = "-".join(model_name.split("/")) if model_name else ""
         self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
