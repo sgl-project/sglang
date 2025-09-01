@@ -92,13 +92,13 @@ def count_logical_expert_tokens(
     # Flatten the expert IDs and count occurrences
     flat_ids = logical_expert_ids.flatten()
     # Filter out invalid IDs (like -1 for padding)
-    valid_mask = flat_ids >= 0
-    valid_ids = flat_ids[valid_mask]
+    # valid_mask = flat_ids >= 0
+    # valid_ids = flat_ids[valid_mask]
 
     logical_counts.scatter_add_(
         dim=0,
-        index=valid_ids.long(),
-        src=torch.ones_like(valid_ids, dtype=torch.int32),
+        index=flat_ids.long(),
+        src=torch.ones_like(flat_ids, dtype=torch.int32),
     )
 
     return logical_counts

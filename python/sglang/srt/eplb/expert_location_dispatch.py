@@ -149,6 +149,7 @@ def _topk_ids_logical_to_physical_dynamic(
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
+    # topk_ids = torch.ones_like(topk_ids, device=device)
     return topk_ids
 
 
@@ -172,42 +173,22 @@ def _topk_ids_logical_to_physical_probability(
         Physical expert IDs with same shape as topk_ids
     """
     topk_ids_original_shape = topk_ids.shape
-    device = topk_ids.device
     topk_ids = topk_ids.flatten()
-
-    # Get the mapping from logical to physical experts
     log2phy_map = info.partial_logical_to_all_physical_map
-    # num_valid_physical = info.partial_logical_to_all_physical_map_num_valid
-
-    # Verify probability tensor has correct shape
-    # expected_shape = log2phy_map.shape
-    # if logical_expert_probabilities.shape != expected_shape:
-    #     raise ValueError(
-    #         f"Probability tensor shape {logical_expert_probabilities.shape} "
-    #         f"does not match expected shape {expected_shape}"
-    #     )
-    # Create mask for valid physical experts (-1 indicates invalid)
-    # valid_mask = log2phy_map != -1
-
-    # # Zero out probabilities for invalid physical experts
-    # masked_probabilities = logical_expert_probabilities * valid_mask
 
     topk_probs = logical_expert_probabilities[topk_ids]
-
-    # # # Check for zero-sum probabilities and handle them
-    # prob_sums = topk_probs.sum(dim=-1)
-    # zero_sum_mask = prob_sums <= 0
-
-    # if zero_sum_mask.any():
-    #     # print(f"Warning: Found {zero_sum_mask.sum()} tokens with zero-sum probabilities. Assigning 1 to all values and reapplying mask.")
-    #     # For tokens with zero-sum probabilities, assign 1 to all values and reapply mask
-    #     topk_probs[zero_sum_mask] = 1.0
-    #     # Reapply the mask to zero out invalid experts
-    #     topk_probs = topk_probs * valid_mask[topk_ids]
-
-    chosen_dispatch_index = torch.multinomial(topk_probs.float(), 1).flatten()
-
+    # topk_probs = torch.rand(topk_ids.shape[0], logical_expert_probabilities.shape[1], device=topk_ids.device)
+    chosen_dispatch_index = _sample_from_probs_fast(topk_probs.float())
     topk_ids = log2phy_map[topk_ids, chosen_dispatch_index]
-
     topk_ids = topk_ids.view(topk_ids_original_shape)
+    # topk_ids = torch.ones_like(topk_ids)
     return topk_ids
+
+
+def _sample_from_probs_fast(probs: torch.Tensor) -> torch.Tensor:
+    probs = probs / probs.sum(dim=1, keepdim=True)
+    cumprobs = torch.cumsum(probs, dim=1)
+    rand_vals = torch.rand(probs.shape[0], 1, device=probs.device, dtype=probs.dtype)
+    indices = torch.searchsorted(cumprobs, rand_vals, right=True)
+
+    return indices.flatten()
