@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from memattention.updater.flashattention.cache_updater import LServerUpdaterFlashAttentionBackend
+from memattention.cache_manager.cache_manager import ManagerConfig
 
 
 @dataclass
@@ -335,8 +336,20 @@ class FlashAttentionBackend(AttentionBackend):
         self.speculative_step_id = speculative_step_id
         self.sparse_attn = model_runner.server_args.is_sparse_attn
         self.sparse_attn_algo = model_runner.server_args.sparse_attn_algo
-        self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend()
-        self.sparse_cache_updater.start_retrive_loop()
+        manager_config = ManagerConfig(
+            keys=model_runner.token_to_kv_pool.k_buffer,
+            values=model_runner.token_to_kv_pool.v_buffer,
+            num_layers=model_runner.token_to_kv_pool.layer_num,
+            use_cuda_graph=not model_runner.server_args.disable_cuda_graph,
+            max_bs=1,
+            page_size=self.page_size,
+            retrive_budget_per_seq=1024,
+            device=model_runner.device,
+            async_retrive=True,
+        )
+        
+        self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)
+        self.sparse_cache_updater.cache_manager.start_retrive_loop()
 
         # Local attention settings
         self.attention_chunk_size = (
@@ -941,6 +954,9 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
+        if self.sparse_attn:
+            self.sparse_cache_updater.call_begin_forward_attn_decode(q, forward_batch, metadata, layer)
+        
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
             self.attention_chunk_size is not None
@@ -982,6 +998,8 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
             # Do multi-head attention
+            if self.sparse_attn:
+                self.sparse_cache_updater.call_begin_forward_attn_decode(q, forward_batch, metadata, layer)
 
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
