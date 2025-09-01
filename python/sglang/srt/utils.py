@@ -2116,7 +2116,8 @@ def set_cuda_arch():
 @lru_cache(maxsize=1)
 def is_sm120_supported(device=None) -> bool:
     """Check if running on Blackwell (RTX 5090)"""
-    return torch.cuda.get_device_capability(device)[0] >= 12
+    major, minor = torch.cuda.get_device_capability(device)
+    return (major, minor) >= (12, 0)
 
 
 def next_power_of_2(n: int):
