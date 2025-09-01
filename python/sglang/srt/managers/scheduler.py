@@ -69,6 +69,8 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    ClearHiCacheReqInput,
+    ClearHiCacheReqOutput,
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -515,6 +517,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
+                (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -2206,6 +2209,16 @@ class Scheduler(
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
+
+    def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
+        if self.enable_hierarchical_cache:
+            self.tree_cache.clear_storage_backend()
+            logger.info("Hierarchical cache cleared successfully!")
+            if_success = True
+        else:
+            logging.warning("Hierarchical cache is not enabled.")
+            if_success = False
+        return ClearHiCacheReqOutput(success=if_success)
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
