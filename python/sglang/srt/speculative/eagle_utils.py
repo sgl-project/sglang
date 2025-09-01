@@ -786,6 +786,7 @@ def assign_req_to_token_pool(
         save_offset += BLOCK_SIZE
         load_offset += BLOCK_SIZE
 
+
 @triton.jit
 def assign_req_to_token_pool_async(
     req_pool_indices,
@@ -807,7 +808,7 @@ def assign_req_to_token_pool_async(
     start = tl.load(start_offset + length_offset, mask=length_offset < pid)
     end = tl.load(end_offset + length_offset, mask=length_offset < pid)
     out_offset = tl.sum(end - start, axis=0)
-    
+
     flatten_index_ptr = flatten_index + out_offset
 
     save_offset = tl.arange(0, BLOCK_SIZE) + kv_start
@@ -822,6 +823,7 @@ def assign_req_to_token_pool_async(
         tl.store(token_pool + save_offset, data, mask=mask)
         save_offset += BLOCK_SIZE
         load_offset += BLOCK_SIZE
+
 
 @triton.jit
 def assign_draft_cache_locs(
