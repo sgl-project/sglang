@@ -25,7 +25,6 @@ from sglang.srt.utils import (
     is_hip,
 )
 
-
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -711,7 +710,6 @@ def invoke_fused_moe_kernel(
         )
 
 
-
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit
 def _moe_sum_reduce_kernel(
@@ -796,5 +794,3 @@ def moe_sum_reduce_triton(
         num_warps=num_warps,
     )
     return
-
-

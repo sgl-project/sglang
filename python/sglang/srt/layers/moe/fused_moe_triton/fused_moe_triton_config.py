@@ -6,13 +6,14 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-import triton
 import torch
-from sglang.srt.utils import get_device_name, is_hip
+import triton
 
+from sglang.srt.utils import get_device_name, is_hip
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+
 
 def get_config_file_name(
     E: int, N: int, dtype: Optional[str], block_shape: Optional[int] = None

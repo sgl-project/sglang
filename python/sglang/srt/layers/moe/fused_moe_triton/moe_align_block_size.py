@@ -7,12 +7,12 @@ import triton
 
 from sglang.srt.utils import is_cuda, is_hip
 
-
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
 
 def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
@@ -85,6 +85,3 @@ def moe_align_block_size(
         fuse_sorted_ids_padding,
     )
     return sorted_ids, expert_ids, num_tokens_post_pad
-
-
-
