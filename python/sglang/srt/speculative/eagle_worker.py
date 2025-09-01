@@ -203,6 +203,8 @@ class EAGLEWorker(TpModelWorker):
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
 
+        return backend_map[backend_type]()
+
     def _create_decode_backend(self):
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,
