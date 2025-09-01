@@ -620,6 +620,7 @@ class DeepseekV2MoE(nn.Module):
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
+            alt_stream=self.alt_stream,
         )
 
         if shared_output is not None:
