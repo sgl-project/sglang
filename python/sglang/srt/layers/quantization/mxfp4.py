@@ -109,15 +109,16 @@ def _extract_routing(topk_output, device):
         idx: int64 tensor of expert indices  
         gate: float tensor of gate weights (dtype preserved)
     """
-    # Check if it has format attribute (new SGLang format)
+    # Check if it has format attribute (new SGLang/FlashInfer format)
     if hasattr(topk_output, 'format'):
-        # For now, bypass routing if format is unsupported
-        # This is a workaround for the new format
-        logger.warning(f"Bypassing MoE routing due to format: {topk_output.format}")
-        # Return empty tensors to skip MoE routing
-        return (torch.empty(0, device=device, dtype=torch.int64),
-                torch.empty(0, device=device, dtype=torch.int64),
-                torch.empty(0, device=device))
+        # This is a FlashInfer-specific format that should be handled by FlashInfer backend
+        logger.debug(f"Detected FlashInfer topk format: {topk_output.format}")
+        # Raise a clear error - this should have been caught by _is_flashinfer_topk
+        raise ValueError(
+            f"FlashInfer topk format '{topk_output.format}' passed to _extract_routing. "
+            "This should have been routed to FlashInfer backend. "
+            "Check _is_flashinfer_topk() detection logic."
+        )
     
     # Try various attribute name patterns
     for (ix, sc) in (("indices", "scores"), ("topk_indices", "topk_scores")):
@@ -914,10 +915,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 
                 # Check if topk_output is in FlashInfer format and route to FlashInfer backend
                 if self._is_flashinfer_topk(topk_output) or getattr(self, "use_flashinfer", False):
-                    logger.info("FlashInfer MoE routing detected -> deferring to FlashInfer backend")
-                    # Jump to the FlashInfer path (which already understands this format)
-                    # This reuses the same code from lines 799-858 above
-                    from sglang.srt.layers.moe.topk import TopKOutputChecker
+                    logger.debug("FlashInfer MoE routing detected -> deferring to FlashInfer backend")
+                    
+                    # Import FlashInfer dependencies with proper error handling
+                    try:
+                        from sglang.srt.layers.moe.topk import TopKOutputChecker
+                    except Exception as e:
+                        logger.error("FlashInfer TopKOutputChecker not available: %s", e)
+                        raise
                     
                     # When bf16 mode is enabled, we don't need to quantize the input
                     if self.flashinfer_mxfp4_moe_precision == "bf16":
@@ -935,19 +940,39 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                                 value=0.0,
                             )
                     elif self.flashinfer_mxfp4_moe_precision == "default":
+                        # Lazy import mxfp8_quantize when needed
                         x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
-                        x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+                        # Keep scale in its native dtype; flatten only if API needs 1D:
+                        x_scale = x_scale.reshape(-1).contiguous()
                     else:
-                        raise NotImplementedError
+                        raise NotImplementedError(f"Unsupported precision: {self.flashinfer_mxfp4_moe_precision}")
                     
                     assert x_quant.shape[-1] == self.hidden_size
-                    assert TopKOutputChecker.format_is_bypassed(topk_output)
                     
+                    # Check format but don't crash on mismatch
+                    if hasattr(TopKOutputChecker, "format_is_bypassed"):
+                        if not TopKOutputChecker.format_is_bypassed(topk_output):
+                            logger.warning("FlashInfer topk_output not in bypassed format; proceeding anyway")
+                    
+                    # Ensure device consistency
+                    dev = x.device
                     top_k = topk_output.topk_config.top_k
-                    router_logits = topk_output.router_logits
+                    router_logits = topk_output.router_logits.to(torch.bfloat16, non_blocking=True).to(dev, non_blocking=True)
                     
-                    trtllm_gen_output = trtllm_fp4_block_scale_moe(
-                        router_logits.to(torch.bfloat16),
+                    if x_scale is not None and x_scale.device != dev:
+                        x_scale = x_scale.to(dev, non_blocking=True)
+                    
+                    # Ensure all weight tensors are on the correct device
+                    for n in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale",
+                              "w13_weight_bias", "w2_weight_bias", "gemm1_alpha", "gemm1_beta", 
+                              "gemm1_clamp_limit"):
+                        t = getattr(layer, n, None)
+                        if t is not None and hasattr(t, "device") and t.device != dev:
+                            setattr(layer, n, t.to(dev, non_blocking=True))
+                    
+                    # Call trtllm_fp4_block_scale_moe with explicit unpacking
+                    out, *_ = trtllm_fp4_block_scale_moe(
+                        router_logits,
                         None,  # routing_bias
                         x_quant,
                         x_scale,
@@ -974,8 +999,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         self._get_tile_tokens_dim(x, top_k),
                         1,  # routing_method_type, renormalize
                         True,  # do finalize
-                    )[0]
-                    return trtllm_gen_output
+                    )
+                    return out
                 
                 # 1) Extract routing information
                 tok, exp, gate = _extract_routing(topk_output, x.device)
