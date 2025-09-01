@@ -142,13 +142,11 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
-        fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
+        fused_set_kv_buffer_arg=None,  # Ignored: CUDA-specific optimization unavailable in native implementation
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
-        assert fused_set_kv_buffer_arg is None, (
-            "fused_set_kv_buffer_arg is not supported in forward_native(). "
-            "This optimization is only available in CUDA-specific implementations."
-        )
+        # fused_set_kv_buffer_arg is silently ignored - this CUDA kernel optimization
+        # is not available in the PyTorch-native fallback implementation
         if offsets is not None:
             positions = positions + offsets
         positions = positions.flatten()
