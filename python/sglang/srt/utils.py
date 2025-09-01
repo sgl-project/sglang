@@ -2113,6 +2113,12 @@ def set_cuda_arch():
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
 
 
+@lru_cache(maxsize=1)
+def is_sm120_supported(device=None) -> bool:
+    """Check if running on Blackwell (RTX 5090)"""
+    return torch.cuda.get_device_capability(device)[0] >= 12
+
+
 def next_power_of_2(n: int):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 

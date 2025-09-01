@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
@@ -2304,11 +2305,18 @@ class ServerArgs:
                     "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                 )
             else:
-                if self.moe_runner_backend == "triton_kernel":
+                # Check for Blackwell (RTX 5090) and force FlashInfer MOE
+                if is_sm120_supported():
+                    # Force FlashInfer on Blackwell - Triton MOE crashes with PTX errors
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.warning(
+                        "Detected Blackwell GPU (SM120), forcing FlashInfer MOE backend (Triton MOE incompatible with Blackwell)"
+                    )
+                elif self.moe_runner_backend == "triton_kernel":
                     assert (
                         self.ep_size == 1
                     ), "Triton kernel MoE is only supported when ep_size == 1"
-                if (
+                elif (
                     self.moe_runner_backend == "auto"
                     and self.ep_size == 1
                     and is_triton_kernels_available()
