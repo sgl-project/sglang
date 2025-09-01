@@ -5,7 +5,7 @@ import torch
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported
 
 try:
     from vllm import _custom_ops as ops
@@ -53,6 +53,7 @@ if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
+use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
@@ -458,7 +459,7 @@ def _requant_weight_ue8m0(
         import deep_gemm.utils.layout
 
         sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
-        sf = deep_gemm.utils.layout.get_col_major_tma_aligned_packed_tensor(sf)
+        sf = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
         return sf
 
     out_s = _transform_scale(out_s, mn=out_w.shape[-2])
@@ -556,7 +557,10 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+        pad_output = (
+            not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+            and not cutlass_fp8_supported
+        )
     output_padding = 17 if pad_output else None
 
     # View input as 2D matrix for fp8 methods
@@ -592,7 +596,7 @@ def apply_fp8_linear(
                 cutlass_compatible_b = (
                     weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
                 )
-                if not cutlass_compatible_b:
+                if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
                     # Massage the input to be 2D
                     qinput = qinput.view(-1, qinput.shape[-1])
                     output = triton_scaled_mm(
@@ -735,14 +739,25 @@ def apply_fp8_linear(
                     assert (
                         weight_scale.numel() == weight.shape[1]
                     ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
-                    output = fp8_scaled_mm(
-                        qinput,
-                        weight,
-                        x_scale,
-                        weight_scale,
-                        out_dtype=input.dtype,
-                        bias=bias,
+
+                    cutlass_compatible_b = (
+                        weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
                     )
+                    if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
+                        # Massage the input to be 2D
+                        qinput = qinput.view(-1, qinput.shape[-1])
+                        output = triton_scaled_mm(
+                            qinput, weight, x_scale, weight_scale, input.dtype, bias
+                        )
+                    else:
+                        output = fp8_scaled_mm(
+                            qinput,
+                            weight,
+                            x_scale,
+                            weight_scale,
+                            out_dtype=input.dtype,
+                            bias=bias,
+                        )
                 return output.view(*output_shape)
             except (ImportError, NameError, AttributeError):
                 pass
@@ -789,3 +804,12 @@ def apply_fp8_linear(
                 bias,
                 input.dtype,
             )
+
+
+def can_auto_enable_marlin_fp8() -> bool:
+    try:
+        major, minor = get_device_capability()
+        sm = major * 10 + minor
+        return 80 <= sm < 89
+    except Exception:
+        return False

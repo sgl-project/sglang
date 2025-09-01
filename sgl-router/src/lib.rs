@@ -3,14 +3,19 @@ pub mod config;
 pub mod logging;
 use std::collections::HashMap;
 pub mod core;
+#[cfg(feature = "grpc-client")]
+pub mod grpc;
+pub mod mcp;
 pub mod metrics;
 pub mod middleware;
-pub mod openai_api_types;
 pub mod policies;
+pub mod protocols;
+pub mod reasoning_parser;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
 pub mod tokenizer;
+pub mod tool_parser;
 pub mod tree;
 use crate::metrics::PrometheusConfig;
 
@@ -79,6 +84,11 @@ struct Router {
     health_check_timeout_secs: u64,
     health_check_interval_secs: u64,
     health_check_endpoint: String,
+    // IGW (Inference Gateway) configuration
+    enable_igw: bool,
+    queue_size: usize,
+    queue_timeout_secs: u64,
+    rate_limit_tokens_per_second: Option<usize>,
 }
 
 impl Router {
@@ -107,7 +117,12 @@ impl Router {
         };
 
         // Determine routing mode
-        let mode = if self.pd_disaggregation {
+        let mode = if self.enable_igw {
+            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            }
+        } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
@@ -165,6 +180,9 @@ impl Router {
             log_level: self.log_level.clone(),
             request_id_headers: self.request_id_headers.clone(),
             max_concurrent_requests: self.max_concurrent_requests,
+            queue_size: self.queue_size,
+            queue_timeout_secs: self.queue_timeout_secs,
+            rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
             cors_allowed_origins: self.cors_allowed_origins.clone(),
             retry: config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -179,8 +197,8 @@ impl Router {
                 timeout_duration_secs: self.cb_timeout_duration_secs,
                 window_duration_secs: self.cb_window_duration_secs,
             },
-            disable_retries: false,
-            disable_circuit_breaker: false,
+            disable_retries: self.disable_retries,
+            disable_circuit_breaker: self.disable_circuit_breaker,
             health_check: config::HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -188,6 +206,7 @@ impl Router {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
             },
+            enable_igw: self.enable_igw,
         })
     }
 }
@@ -249,6 +268,11 @@ impl Router {
         health_check_timeout_secs = 5,
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
+        // IGW defaults
+        enable_igw = false,
+        queue_size = 100,
+        queue_timeout_secs = 60,
+        rate_limit_tokens_per_second = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -302,6 +326,10 @@ impl Router {
         health_check_timeout_secs: u64,
         health_check_interval_secs: u64,
         health_check_endpoint: String,
+        enable_igw: bool,
+        queue_size: usize,
+        queue_timeout_secs: u64,
+        rate_limit_tokens_per_second: Option<usize>,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -354,6 +382,10 @@ impl Router {
             health_check_timeout_secs,
             health_check_interval_secs,
             health_check_endpoint,
+            enable_igw,
+            queue_size,
+            queue_timeout_secs,
+            rate_limit_tokens_per_second,
         })
     }
 

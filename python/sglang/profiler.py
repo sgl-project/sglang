@@ -9,7 +9,6 @@ import argparse
 import json
 import os
 import time
-import urllib.parse
 from argparse import ArgumentParser
 from pathlib import Path
 from typing import List, Optional

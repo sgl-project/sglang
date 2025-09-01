@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copied from vLLM: https://github.com/zyongye/vllm/blob/6a70830065701b163e36a86fd331b41b5feac401/vllm/entrypoints/context.py
+# Copied from vLLM
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -83,6 +83,14 @@ class HarmonyContext(ConversationContext):
         if isinstance(output, dict) and "output_ids" in output:
             output_token_ids = output["output_ids"]
 
+            # TODO: REMOVE here:
+            # Very hacky, find the first occurrence of token 200006 and cut from there
+            try:
+                start_index = output_token_ids.index(200006)
+                output_token_ids = output_token_ids[start_index:]
+            except ValueError:
+                pass
+
             for token_id in output_token_ids:
                 self.parser.process(token_id)
             output_msgs = self.parser.messages
@@ -107,6 +115,8 @@ class HarmonyContext(ConversationContext):
         return self._messages
 
     def need_builtin_tool_call(self) -> bool:
+        if not self.messages:
+            return False
         last_msg = self.messages[-1]
         recipient = last_msg.recipient
         return recipient is not None and (
@@ -187,6 +197,15 @@ class StreamingHarmonyContext(HarmonyContext):
         if isinstance(output, dict) and "output_ids" in output:
             # RequestOutput from SGLang with outputs
             output_token_ids = output["output_ids"]
+
+            # TODO: REMOVE here:
+            # Very hacky, find the first occurrence of token 200006 and cut from there
+            # Find the first occurrence of token 200006 and cut from there
+            try:
+                start_index = output_token_ids.index(200006)
+                output_token_ids = output_token_ids[start_index:]
+            except ValueError:
+                pass
 
             for token_id in output_token_ids:
                 self.parser.process(token_id)

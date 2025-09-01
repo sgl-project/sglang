@@ -39,6 +39,8 @@ jobs:
           - python-version: "3.10"
             cuda-version: "12.4"
           - python-version: "3.10"
+            cuda-version: "12.8"
+          - python-version: "3.10"
             cuda-version: "12.9"
     name: Build Wheel (CUDA ${{ matrix.cuda-version }})
     steps:

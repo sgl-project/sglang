@@ -21,8 +21,6 @@ limitations under the License.
 
 #include "utils.h"
 
-#define WARP_SIZE 32
-
 #define VEC_SIZE 4
 using Vec = int4;
 

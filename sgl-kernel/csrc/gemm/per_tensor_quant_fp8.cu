@@ -69,7 +69,7 @@ __global__ void per_tensor_quant_fp8_kernel(
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       float val = fmax(fmin(static_cast<float>(input_vec[j]) * scale_val, FP8_E4M3_MAX), -FP8_E4M3_MAX);
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
       output_arr[j] = static_cast<DST_DTYPE>(val);
 #else
       output_arr[j] = c10::Float8_e4m3fnuz(
@@ -83,7 +83,7 @@ __global__ void per_tensor_quant_fp8_kernel(
   const int32_t remaining_start = num_vec_elems * VEC_SIZE;
   for (int32_t idx = remaining_start + gid; idx < num_elements; idx += grid_size) {
     float val = fmax(-FP8_E4M3_MAX, fmin(static_cast<float>(input[idx]) * scale_val, FP8_E4M3_MAX));
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) || defined(HIP_FP8_TYPE_E4M3)
     output[idx] = static_cast<DST_DTYPE>(val);
 #else
     output[idx] = c10::Float8_e4m3fnuz(

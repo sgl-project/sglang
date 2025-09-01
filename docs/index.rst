@@ -79,6 +79,7 @@ The core features include:
    developer_guide/contribution_guide.md
    developer_guide/development_guide_using_docker.md
    developer_guide/benchmark_and_profiling.md
+   developer_guide/bench_serving.md
 
 .. toctree::
    :maxdepth: 1

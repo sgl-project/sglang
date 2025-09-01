@@ -544,7 +544,9 @@ def process_result(response, sample, answer_dict, out_samples):
     }
 
 
-def eval_result(model_answer_path, answer_dict):
+def eval_result(model_answer_path, answer_dict, eval_output_path=None):
+    if eval_output_path is None:
+        eval_output_path = model_answer_path
     print("Evaluating...")
     output_dict = json.load(open(model_answer_path))
     # answer_dict = json.load(open(answer_path))
@@ -639,7 +641,7 @@ def eval_result(model_answer_path, answer_dict):
         "acc": overall_acc,
     }
     pprint.pprint(printable_results)
-    out = model_answer_path
+    out = eval_output_path
     with open(out, "w", encoding="utf-8") as outfile:
         json.dump(printable_results, outfile)
         print(f"eval out saved to {out}")

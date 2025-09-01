@@ -234,7 +234,7 @@ def initialize_dp_attention(
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
-        device=torch.device("cuda"),
+        device=torch.device(server_args.device),
     )
 
 
