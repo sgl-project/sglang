@@ -1,11 +1,15 @@
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+from .fused_moe import (
     fused_experts,
+)
+from .fused_moe_triton_config import (
     get_config_file_name,
-    moe_align_block_size,
     try_get_optimal_moe_config,
+)
+from .moe_align_block_size import (
+    moe_align_block_size,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
