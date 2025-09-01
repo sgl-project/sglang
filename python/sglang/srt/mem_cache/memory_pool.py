@@ -166,7 +166,7 @@ class MambaPool:
         self.mem_usage = self.get_mamba_size() / GB
 
     def get_mamba_params(self, layer_id: int):
-        return (self.mamba_cache[i][layer_id] for i in range(len(self.mamba_cache)))
+        return [self.mamba_cache[i][layer_id] for i in range(len(self.mamba_cache))]
 
     def get_mamba_size(self):
         return np.prod(self.mamba_cache[0].shape) * self.mamba_cache[0].dtype.itemsize + \

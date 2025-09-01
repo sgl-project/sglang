@@ -1662,7 +1662,7 @@ class ModelRunner:
 
             return DualChunkFlashAttentionBackend(self)
         elif backend_str == "hybrid_linear_attn":
-            assert self.is_hybrid_gdn, "hybrid_linear_attn backend can only be used with hybrid GDN models."
+            # assert self.is_hybrid_gdn, "hybrid_linear_attn backend can only be used with hybrid GDN models."
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
                 HybridLinearAttnBackend, MambaAttnBackend
             )

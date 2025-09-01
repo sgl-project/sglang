@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.models.qwen3_hybrid_moe import fused_gdn_gating
+from sglang.srt.models.qwen3_hybrid_moe import fused_gdn_gating, Qwen3HybridAttentionDecoderLayer, Qwen3HybridLinearDecoderLayer
 from sglang.srt.layers.attention.mamba.ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -227,12 +227,11 @@ class MambaAttnBackend(AttentionBackend):
         seq_len = kwargs["seq_len"]
 
 
-
         if forward_batch.forward_mode.is_target_verify():
             conv_states, ssm_states, mixed_qkv_cache, query_cache, key_cache, value_cache, g_cache, beta_cache = self.req_to_token_pool.get_mamba_params(layer_id)
             has_initial_states = torch.ones(seq_len // forward_batch.spec_info.draft_token_num, dtype=torch.bool, device=forward_batch.input_ids.device)
         else:
-            conv_states, ssm_states = self.req_to_token_pool.get_mamba_params(layer_id)
+            conv_states, ssm_states, *rest = self.req_to_token_pool.get_mamba_params(layer_id)
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
         query_start_loc = self.forward_metadata.query_start_loc
@@ -445,14 +444,14 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
 
-    def update_mamba_state_after_mtp_verify(self, accepted_length):
+    def update_mamba_state_after_mtp_verify(self, accepted_length, model):
         num_attn = 0
         request_number = accepted_length.shape[0]
-        # QQ: step = self.mamba_cache.mamba_cache[2][2] is the spec num_draft token num
-        num_draft_tokens = self.mamba_cache.mamba_cache[2].shape[2]
+        # QQ: step = spec num_draft token num
+        num_draft_tokens = self.attn_backend_list[1].req_to_token_pool.mamba_pool.mamba_cache[2].shape[2]
         # QQ: can be parallelized
-        for i in range(len(self.model.layers)):
-            layer = self.model.layers[i]
+        for i in range(len(model.model.layers)):
+            layer = model.model.layers[i]
             if isinstance(layer, Qwen3HybridAttentionDecoderLayer):
                 num_attn += 1
 
@@ -465,20 +464,21 @@ class HybridLinearAttnBackend(AttentionBackend):
                     query_start_loc = accepted_length.cumsum(-1, dtype=accepted_length.dtype)
                     query_start_loc = torch.cat([torch.zeros(1, dtype=query_start_loc.dtype, device=query_start_loc.device), query_start_loc])
 
-                    mask = torch.arange(num_draft_tokens, device=accepted_length.device).unsqueeze(0) < accepted_length.unsqueeze(1)
-
                     layer_id = i - num_attn
                     mamba_cache  = self.attn_backend_list[1].req_to_token_pool.get_mamba_params(layer_id)
 
-                    conv_state = mamba_cache[0][mask]
-                    ssm_state = mamba_cache[1][mask]
-                    mixed_qkv = mamba_cache[2][mask]
-                    query = mamba_cache[3][mask].unsqueeze(0)
-                    key = mamba_cache[4][mask].unsqueeze(0)
-                    value = mamba_cache[5][mask].unsqueeze(0)
-                    g = mamba_cache[6][mask].unsqueeze(0)
-                    beta = mamba_cache[7][mask].unsqueeze(0)
+                    conv_state = mamba_cache[0]
+                    ssm_state = mamba_cache[1]
+
                     state_indices_tensor = self.attn_backend_list[1].forward_metadata.mamba_cache_indices
+                    mask = torch.arange(num_draft_tokens, device=accepted_length.device).unsqueeze(0) < accepted_length.unsqueeze(1)
+
+                    mixed_qkv = mamba_cache[2][state_indices_tensor][mask]
+                    query = mamba_cache[3][state_indices_tensor][mask].unsqueeze(0)
+                    key = mamba_cache[4][state_indices_tensor][mask].unsqueeze(0)
+                    value = mamba_cache[5][state_indices_tensor][mask].unsqueeze(0)
+                    g = mamba_cache[6][state_indices_tensor][mask].unsqueeze(0)
+                    beta = mamba_cache[7][state_indices_tensor][mask].unsqueeze(0)
                     has_initial_states = torch.ones(request_number, dtype=torch.bool, device=accepted_length.device)
 
                     _ = causal_conv1d_fn(
