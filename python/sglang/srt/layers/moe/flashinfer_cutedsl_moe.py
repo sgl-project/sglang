@@ -30,6 +30,8 @@ def flashinfer_cutedsl_moe_masked(
     w2_blockscale: torch.Tensor,
     w2_alpha,
     masked_m: torch.Tensor,
+    down_sm_count: Optional[int] = None,
+    down_signals: Optional[torch.Tensor] = None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -152,5 +154,7 @@ def flashinfer_cutedsl_moe_masked(
         sf_vec_size=sf_vec_size,
         alpha=w2_alpha.view(1, 1, num_experts),
         alpha_dtype=get_cute_dtype(w2_alpha),
+        sm_count=down_sm_count,
+        dst_signals=down_signals,
     )  # in logical [m, k, l]
     return out.permute(2, 0, 1)
