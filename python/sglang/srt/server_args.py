@@ -178,7 +178,7 @@ class ServerArgs:
     watchdog_timeout: float = 300
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
-    base_gpu_id: int = 0
+    base_gpu_id: int = int(os.environ.get("SGLANG_BASE_GPU_ID", 0))
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
 

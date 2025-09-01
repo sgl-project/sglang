@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -46,6 +47,96 @@ from sglang.srt.utils import (
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
 has_triton_kernels = is_triton_kernels_available()
+
+logger = logging.getLogger(__name__)
+
+# Set allocator hints once at module load
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:64,expandable_segments:True")
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
+_CFG_CACHE = None
+
+def _load_mxfp4_cfg():
+    """Load MXFP4 config from model's config.json, with env overrides."""
+    global _CFG_CACHE
+    if _CFG_CACHE is not None:
+        return _CFG_CACHE
+    
+    cfg = {"group_size": 128, "pack_layout": "mxfp4_row"}
+    
+    # Try to read the mounted config (works in your start.sh model dir layout)
+    for p in ("/models/config.json", "/models/model_config.json"):
+        try:
+            import json
+            if os.path.exists(p):
+                with open(p, "r") as f:
+                    j = json.load(f)
+                # These keys are model/quant pack dependent; guard with .get
+                cfg["group_size"] = int(j.get("quantization_config", {}).get("group_size", cfg["group_size"]))
+                cfg["pack_layout"] = j.get("quantization_config", {}).get("pack_layout", cfg["pack_layout"])
+                break
+        except Exception:
+            pass
+    
+    # env overrides remain possible
+    cfg["group_size"] = int(os.getenv("SGLANG_MXFP4_GROUP_SIZE", cfg["group_size"]))
+    cfg["pack_layout"] = os.getenv("SGLANG_MXFP4_PACK_LAYOUT", cfg["pack_layout"])
+    _CFG_CACHE = cfg
+    return cfg
+
+def _group_size_from_cfg():
+    """Get group size from model config, default to 128."""
+    return _load_mxfp4_cfg()["group_size"]
+
+
+def _pack_layout_from_cfg():
+    """Get pack layout from model config, default to mxfp4_row."""
+    return _load_mxfp4_cfg()["pack_layout"]
+
+
+def _extract_routing(topk_output, device):
+    """
+    Extract routing information from topk_output.
+    Returns (token_idx: [R], expert_idx: [R], gate: [R])
+    R = total routed pairs (tokens × top_k).
+    Supports multiple SGLang formats.
+    
+    Returns:
+        tok: int64 tensor of token indices
+        idx: int64 tensor of expert indices  
+        gate: float tensor of gate weights (dtype preserved)
+    """
+    # Try various attribute name patterns
+    for (ix, sc) in (("indices", "scores"), ("topk_indices", "topk_scores")):
+        if hasattr(topk_output, ix) and hasattr(topk_output, sc):
+            idx = getattr(topk_output, ix).reshape(-1).to(device, dtype=torch.int64)
+            gate = getattr(topk_output, sc).reshape(-1).to(device)
+            T, K = getattr(topk_output, ix).shape
+            tok = torch.arange(T, device=device, dtype=torch.int64).repeat_interleave(K)
+            
+            # Assert shapes match
+            assert tok.numel() == idx.numel() == gate.numel(), \
+                f"Routing tensors mismatch: tok={tok.numel()}, idx={idx.numel()}, gate={gate.numel()}"
+            return tok, idx, gate
+
+    # Alternative format with explicit fields
+    if all(hasattr(topk_output, f) for f in ("token_ids", "expert_ids", "scores")):
+        tok = topk_output.token_ids.to(device, dtype=torch.int64)
+        idx = topk_output.expert_ids.to(device, dtype=torch.int64)
+        gate = topk_output.scores.to(device)
+        
+        # Assert shapes match
+        assert tok.numel() == idx.numel() == gate.numel(), \
+            f"Routing tensors mismatch: tok={tok.numel()}, idx={idx.numel()}, gate={gate.numel()}"
+        return tok, idx, gate
+
+    raise RuntimeError(
+        f"Unsupported topk_output format for MoE routing. "
+        f"Available attributes: {dir(topk_output)}"
+    )
 
 
 if is_flashinfer_available():
@@ -573,22 +664,85 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w13_weight
             del layer.w2_weight
         else:
-            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
-
-            w13_weight = upcast_from_mxfp(
-                layer.w13_weight, layer.w13_weight_scale, dtype=torch.bfloat16, axis=-1
-            )
-            w2_weight = upcast_from_mxfp(
-                layer.w2_weight, layer.w2_weight_scale, dtype=torch.bfloat16, axis=-1
-            )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+            # Check if we should use weight-only path (never materializes full BF16)
+            try:
+                from .mxfp4_weightonly import use_weightonly_mxfp4, check_mxfp4_memory_usage
+                use_weightonly = use_weightonly_mxfp4()
+            except ImportError:
+                use_weightonly = False
+            
+            if use_weightonly:
+                # Keep weights in MXFP4 format - we'll use weight-only GEMM
+                logger.info("Using MXFP4 weight-only path (SM120+ detected)")
+                logger.info("Weights stay compressed (~13GB), no BF16 materialization")
+                self.use_weightonly_gemm = True
+                
+                # Register as buffers (not Parameters) for inference
+                self.register_buffer("w13_weight_packed", layer.w13_weight, persistent=False)
+                self.register_buffer("w13_weight_scale", layer.w13_weight_scale, persistent=False)
+                self.register_buffer("w2_weight_packed", layer.w2_weight, persistent=False)
+                self.register_buffer("w2_weight_scale", layer.w2_weight_scale, persistent=False)
+                
+                # Store biases if present (use getattr for safety)
+                self.register_buffer("w13_bias", getattr(layer, "w13_weight_bias", None), persistent=False)
+                self.register_buffer("w2_bias", getattr(layer, "w2_weight_bias", None), persistent=False)
+                
+                # Get number of experts from weight shape
+                self.num_experts = int(self.w13_weight_packed.shape[0])
+                
+                # One-shot buffer device sync after registration
+                if torch.cuda.is_available():
+                    dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+                    self._to_device_(dev)
+                
+                # Clean up layer references
+                del layer.w13_weight, layer.w2_weight
+                del layer.w13_weight_scale, layer.w2_weight_scale
+                
+                # Check memory usage
+                check_mxfp4_memory_usage()
+            else:
+                # Original path: full upcast to BF16 (uses 30GB)
+                from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+                
+                # Hard guard against BF16 upcast on SM120
+                if torch.cuda.is_available():
+                    major, minor = torch.cuda.get_device_capability()
+                    if major >= 12 and os.getenv("SGLANG_MXFP4_FORCE_UPCAST", "0") != "1":
+                        logger.error(
+                            "Attempted BF16 upcast with MXFP4 on SM120 — would allocate ~30GiB weights. "
+                            "This will cause OOM on single RTX 5090. Use weight-only path instead."
+                        )
+                        raise RuntimeError(
+                            "MXFP4 BF16 upcast disabled on SM120+ to prevent OOM (would use 30GB). "
+                            "Use SGLANG_MXFP4_WEIGHTONLY=1 or set SGLANG_MXFP4_FORCE_UPCAST=1 to override."
+                        )
+                
+                logger.info("Using standard MXFP4 upcast path (will use ~30GB)")
+                self.use_weightonly_gemm = False
+                
+                w13_weight = upcast_from_mxfp(
+                    layer.w13_weight, layer.w13_weight_scale, dtype=torch.bfloat16, axis=-1
+                )
+                w2_weight = upcast_from_mxfp(
+                    layer.w2_weight, layer.w2_weight_scale, dtype=torch.bfloat16, axis=-1
+                )
+                del layer.w13_weight
+                del layer.w2_weight
+                del layer.w13_weight_scale
+                del layer.w2_weight_scale
+                layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
+                layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
+    def _to_device_(self, device):
+        """Move all buffers to the specified device."""
+        for name in ("w13_weight_packed", "w13_weight_scale", "w2_weight_packed", 
+                    "w2_weight_scale", "w13_bias", "w2_bias"):
+            t = getattr(self, name, None)
+            if t is not None and t.device != device:
+                setattr(self, name, t.to(device, non_blocking=True))
+    
     def _get_tile_tokens_dim(self, x: torch.Tensor, top_k: int):
         # Number of tokens in the input tensor.
         num_tokens = x.shape[0]
@@ -709,17 +863,130 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     moe_runner_config=moe_runner_config,
                 )
         else:
-            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+            # Check if we're using weight-only path
+            if hasattr(self, 'use_weightonly_gemm') and self.use_weightonly_gemm:
+                # Use weight-only GEMM that never materializes full BF16 weights
+                from .mxfp4_weightonly import mxfp4_weight_only_gemm, mxfp4_weight_only_gemm_grouped
+                
+                # Ensure buffers are on correct device
+                for name in ("w13_weight_packed", "w13_weight_scale", "w2_weight_packed", 
+                            "w2_weight_scale", "w13_bias", "w2_bias"):
+                    t = getattr(self, name, None)
+                    if t is not None and t.device != x.device:
+                        setattr(self, name, t.to(x.device, non_blocking=True))
+                
+                T, H = x.shape
+                out = torch.zeros_like(x)
+                
+                # 1) Extract routing information
+                tok, exp, gate = _extract_routing(topk_output, x.device)
+                
+                # Ensure correct dtypes for deterministic iteration
+                # tok/exp as int64, gate as x.dtype
+                tok = tok.to(dtype=torch.int64)
+                exp = exp.to(dtype=torch.int64)
+                gate = gate.to(dtype=x.dtype)
+                
+                # Optional: Validate gate weights sum to ~1 per token
+                if os.getenv("SGLANG_VALIDATE_GATE", "0") == "1":
+                    # Per-token sum of gates should be ~1.0
+                    topk = tok.numel() // T
+                    s = gate.view(T, topk).sum(-1)
+                    assert torch.allclose(s, torch.ones_like(s), atol=1e-3), \
+                        f"Gate weights not normalized: {s}"
+                
+                # 2) Fast grouping in one pass for better performance
+                # Sort by expert ID to get contiguous segments
+                order = torch.argsort(exp)
+                exp_s = exp[order]
+                tok_s = tok[order]
+                gate_s = gate[order]
+                
+                # Find boundaries where expert ID changes
+                change = torch.ones_like(exp_s, dtype=torch.bool)
+                change[1:] = exp_s[1:] != exp_s[:-1]
+                starts = torch.nonzero(change, as_tuple=False).flatten()
+                ends = torch.cat([starts[1:], torch.tensor([exp_s.numel()], device=exp_s.device)])
+                
+                # Build per-expert lists for batched execution
+                X_list, Wq1_list, S1_list, B1_list = [], [], [], []
+                Wq2_list, S2_list, B2_list = [], [], []
+                tok_list, gate_list = [], []
+                
+                for s, eidx in zip(starts.tolist(), ends.tolist()):
+                    e = int(exp_s[s].item())
+                    idx = slice(s, eidx)
+                    tok_e = tok_s[idx]     # [R_e] token indices for this expert
+                    gate_e = gate_s[idx]   # [R_e] gate weights for this expert
+                    
+                    if tok_e.numel() == 0:
+                        continue
+                    
+                    # Gather expert inputs (vectorized)
+                    X_e = x.index_select(0, tok_e).contiguous()  # [R_e, H]
+                    
+                    # Collect inputs for batched execution
+                    X_list.append(X_e)
+                    tok_list.append(tok_e)
+                    gate_list.append(gate_e)
+                    Wq1_list.append(self.w13_weight_packed[e])
+                    S1_list.append(self.w13_weight_scale[e])
+                    Wq2_list.append(self.w2_weight_packed[e])
+                    S2_list.append(self.w2_weight_scale[e])
+                    if self.w13_bias is not None:
+                        B1_list.append(self.w13_bias[e])
+                    else:
+                        B1_list.append(None)
+                    if self.w2_bias is not None:
+                        B2_list.append(self.w2_bias[e])
+                    else:
+                        B2_list.append(None)
+                
+                # Pass 1: W13 (gate_up) - batched execution
+                Y1_list = mxfp4_weight_only_gemm_grouped(
+                    X_list, Wq1_list, S1_list,
+                    group_size=_group_size_from_cfg(),
+                    pack_layout=_pack_layout_from_cfg(), 
+                    sm="120"
+                )
+                
+                # Bias + activation
+                for i, Y in enumerate(Y1_list):
+                    if B1_list[i] is not None:
+                        Y1_list[i] = Y + B1_list[i]
+                    Y1_list[i] = torch.nn.functional.silu(Y1_list[i])
+                
+                # Pass 2: W2 (down) - batched execution
+                Y2_list = mxfp4_weight_only_gemm_grouped(
+                    Y1_list, Wq2_list, S2_list,
+                    group_size=_group_size_from_cfg(),
+                    pack_layout=_pack_layout_from_cfg(), 
+                    sm="120"
+                )
+                
+                # Bias for W2
+                for i, Y in enumerate(Y2_list):
+                    if B2_list[i] is not None:
+                        Y2_list[i] = Y + B2_list[i]
+                
+                # Single scatter-add pass with gate weights
+                for tok_e, gate_e, Y in zip(tok_list, gate_list, Y2_list):
+                    out.index_add_(0, tok_e, Y * gate_e.unsqueeze(1))
+                
+                return out
+            else:
+                # Standard path with pre-upcast weights
+                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
-            return fused_experts(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_output=topk_output,
-                moe_runner_config=moe_runner_config,
-                b1=layer.w13_weight_bias,
-                b2=layer.w2_weight_bias,
-            )
+                return fused_experts(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_output=topk_output,
+                    moe_runner_config=moe_runner_config,
+                    b1=layer.w13_weight_bias,
+                    b2=layer.w2_weight_bias,
+                )
 
 
 class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
