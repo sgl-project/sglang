@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional, Union, Dict, Any, Callable
 
 import torch
@@ -365,6 +366,7 @@ class DeepEPMoE(EPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = get_deepep_mode()
+        self.device_module = torch.get_device_module()
 
         # TODO: move to the beginning of the file
         from sglang.srt.distributed.parallel_state import get_tp_group
@@ -439,13 +441,22 @@ class DeepEPMoE(EPMoE):
         if hook_overlap_on_combine is not None:
             hook_overlap_on_combine()
 
-        hidden_states = self.combine(
-            hidden_states,
-            dispatch_output.topk_idx,
-            dispatch_output.topk_weights,
-            forward_batch,
-            overlap_args=combine_overlap_args,
-        )
+        combine_context = nullcontext()
+        if ENABLE_DEEPEP_COMBINE_OVERLAP:
+            alt_stream.wait_event(down_overlap_args["down_start_event"])
+            combine_context = torch.cuda.stream(alt_stream)
+
+        with combine_context:
+            hidden_states = self.combine(
+                hidden_states,
+                dispatch_output.topk_idx,
+                dispatch_output.topk_weights,
+                forward_batch,
+                overlap_args=combine_overlap_args,
+            )
+
+        if ENABLE_DEEPEP_COMBINE_OVERLAP:
+            self.device_module.current_stream().wait_stream(alt_stream)
 
         return hidden_states
 
