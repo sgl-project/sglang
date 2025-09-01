@@ -150,8 +150,8 @@ def mxfp4_weight_only_gemm(
     M, K = x.shape
     K_packed, N = w_packed.shape  # K is packed (K_packed = K // 2 for MXFP4)
     
-    # Allocate output (this is the only large allocation)
-    output = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    # Allocate output with zeros for in-place accumulation
+    output = torch.zeros((M, N), dtype=torch.bfloat16, device=x.device)
     
     # Configure kernel
     BLOCK_SIZE_M = 128
@@ -180,31 +180,30 @@ def mxfp4_weight_only_gemm(
             BLOCK_SIZE_K=BLOCK_SIZE_K,
         )
     else:
-        # Fallback: chunk-wise dequantization to limit memory usage
-        # This is still better than full upcast - we process in chunks
+        # Fallback: tile over K and N to cap peak memory
         from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
         
-        chunk_size = 4096  # Process 4K rows at a time
-        for i in range(0, K, chunk_size):
-            end_i = min(i + chunk_size, K)
-            
-            # Dequantize only this chunk
-            w_chunk = upcast_from_mxfp(
-                w_packed[i:end_i], 
-                w_scale[i//group_size:(end_i-1)//group_size+1],
-                dtype=torch.bfloat16, 
-                axis=-1
+        tile_k, tile_n = 4096, 2048
+        for ks in range(0, K, tile_k):
+            ke = min(ks + tile_k, K)
+            # Dequantize only K-slab → [ke-ks, N] BF16
+            # Note: w_packed is [K_packed, N] where K_packed = K // 2
+            ks_packed = ks // 2
+            ke_packed = (ke + 1) // 2  # Round up for odd K
+            wk = upcast_from_mxfp(
+                w_packed[ks_packed:ke_packed],
+                w_scale[ks // group_size : (ke-1) // group_size + 1],
+                dtype=torch.bfloat16, axis=-1
             )
+            # Ensure the unpacked weight has correct shape
+            if wk.shape[0] != (ke - ks):
+                wk = wk[:ke-ks]  # Trim if needed
             
-            # Compute partial GEMM
-            x_chunk = x[:, i:end_i]
-            if i == 0:
-                output = torch.mm(x_chunk, w_chunk)
-            else:
-                output += torch.mm(x_chunk, w_chunk)
-            
-            # Free the chunk immediately
-            del w_chunk
+            xk = x[:, ks:ke].contiguous()
+            for ns in range(0, N, tile_n):
+                ne = min(ns + tile_n, N)
+                output[:, ns:ne].add_(xk @ wk[:, ns:ne])
+            del wk
             torch.cuda.empty_cache()
     
     return output

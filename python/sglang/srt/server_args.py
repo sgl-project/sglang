@@ -2305,30 +2305,27 @@ class ServerArgs:
                     "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                 )
             else:
-                # Check for env var override first
-                import os
-                if os.environ.get("SGLANG_DISABLE_TRITON_MOE", "0") == "1":
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    self.enable_triton_kernel_moe = False
-                    self.enable_flashinfer_mxfp4_moe = True
-                    self.enable_flashinfer_trtllm_moe = True
-                    logger.warning(
-                        "SGLANG_DISABLE_TRITON_MOE=1 detected, forcing FlashInfer MOE backend"
-                    )
-                # Check for Blackwell (RTX 5090) and force FlashInfer MOE
-                elif is_sm120_supported():
-                    # Force FlashInfer on Blackwell - Triton MOE crashes with PTX errors
-                    self.moe_runner_backend = "flashinfer_trtllm"
-                    self.enable_triton_kernel_moe = False
-                    self.enable_flashinfer_mxfp4_moe = True
-                    self.enable_flashinfer_trtllm_moe = True
-                    logger.warning(
-                        "Detected Blackwell GPU (SM120), forcing FlashInfer MOE backend (Triton MOE incompatible with Blackwell)"
-                    )
-                elif self.moe_runner_backend == "triton_kernel":
-                    assert (
-                        self.ep_size == 1
-                    ), "Triton kernel MoE is only supported when ep_size == 1"
+                if self.moe_runner_backend == "triton_kernel":
+                    import os
+                    if os.environ.get("SGLANG_DISABLE_TRITON_MOE", "0") == "1":
+                        self.moe_runner_backend = "flashinfer_trtllm"
+                        self.enable_triton_kernel_moe = False
+                        self.enable_flashinfer_mxfp4_moe = True
+                        self.enable_flashinfer_trtllm_moe = True
+                        logger.warning(
+                            "SGLANG_DISABLE_TRITON_MOE=1 detected, forcing FlashInfer MOE backend"
+                        )
+                    # Check for Blackwell (RTX 5090) and force FlashInfer MOE
+                    elif is_sm120_supported():
+                        self.moe_runner_backend = "flashinfer_trtllm"
+                        self.enable_triton_kernel_moe = False
+                        self.enable_flashinfer_mxfp4_moe = True
+                        self.enable_flashinfer_trtllm_moe = True
+                        logger.warning(
+                            "Detected Blackwell GPU (SM120), forcing FlashInfer MOE backend (Triton MOE incompatible with Blackwell)"
+                        )
+                    else:
+                        assert self.ep_size == 1, "Triton kernel MoE is only supported when ep_size == 1"
                 elif (
                     self.moe_runner_backend == "auto"
                     and self.ep_size == 1

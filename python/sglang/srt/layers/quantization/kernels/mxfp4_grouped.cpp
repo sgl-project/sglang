@@ -60,9 +60,11 @@ std::vector<at::Tensor> grouped_forward(
 
     // Expect Wq packed row-major by output rows; N derived from metadata or shape.
     TORCH_CHECK(Wq.dim() >= 2, "Wq must be at least 2D packed tensor");
-    // For MXFP4, Wq is typically [K_packed, N] where K_packed = K // 2
-    // We store transposed as [N, K_packed] for better memory access
-    const auto N = Wq.size(1);  // Assuming Wq is [K_packed, N]
+    // For MXFP4, Wq is [K_packed, N] where K_packed = K // 2
+    const bool wq_is_kpacked_by_n = (Wq.dim() >= 2); // true in your pack
+    const auto Kp = Wq.size(0);               // K_packed
+    const auto N  = Wq.size(1);               // output channels
+    TORCH_CHECK(Kp * 2 >= K, "Packed K must cover logical K"); // 2 FP4 per byte
 
     // Y allocation
     auto Y = at::empty({M, N}, X.options()); // BF16
@@ -75,10 +77,14 @@ std::vector<at::Tensor> grouped_forward(
     d.M = M; d.N = N; d.K = K;
     d.group_size = group_size;
     d.pack_layout = layout;
-    d.lda = K;        // row-major
-    d.ldwq = Wq.stride(0); // stride between rows of packed weights
+    // Leading dims (row-major):
+    // A: [M,K]   lda = K
+    // Wq: [Kp,N] ldwq = N   (advance by columns across contiguous N)
+    // Y: [M,N]   ldy = N
+    d.lda  = K;       // A: [M,K] row-major
+    d.ldwq = N;       // Wq: [Kp,N] → leading dim is N (not stride(0))
     d.lds = S.numel() > 0 ? S.stride(0) : 0;
-    d.ldy = N;
+    d.ldy  = N;
 
     descs.push_back(d);
     Y_list.push_back(Y);

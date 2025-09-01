@@ -9,6 +9,9 @@
 #include <vector>
 #include <stdint.h>
 #include <assert.h>
+#include <cstdlib>
+#include <string>
+#include <stdexcept>
 
 // Only compile CUTLASS code if flag is set
 #ifdef USE_CUTLASS_FP4
@@ -254,8 +257,13 @@ extern "C" void launch_grouped_mxfp4_weightonly(
       stream
     );
 #else
+    // Hard guard unless explicitly allowed
+    const char* ok = std::getenv("SGLANG_ALLOW_STUB_KERNEL");
+    if (!ok || std::string(ok) != "1") {
+      throw std::runtime_error("mxfp4_grouped: stub backend linked. "
+                               "Build with -DUSE_CUTLASS_FP4 or -DUSE_FLASHINFER_BACKEND");
+    }
     // Fallback stub - just zero the output for build sanity
-    // This should never run in production
     const int64_t size = d.M * d.N;
     cudaMemsetAsync(d.Y, 0, size * sizeof(__nv_bfloat16), stream);
 #endif

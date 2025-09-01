@@ -677,15 +677,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 logger.info("Weights stay compressed (~13GB), no BF16 materialization")
                 self.use_weightonly_gemm = True
                 
-                # Register as buffers (not Parameters) for inference
-                self.register_buffer("w13_weight_packed", layer.w13_weight, persistent=False)
-                self.register_buffer("w13_weight_scale", layer.w13_weight_scale, persistent=False)
-                self.register_buffer("w2_weight_packed", layer.w2_weight, persistent=False)
-                self.register_buffer("w2_weight_scale", layer.w2_weight_scale, persistent=False)
+                # Store as regular attributes (Mxfp4MoEMethod is not a nn.Module)
+                self.w13_weight_packed = layer.w13_weight
+                self.w13_weight_scale = layer.w13_weight_scale
+                self.w2_weight_packed = layer.w2_weight
+                self.w2_weight_scale = layer.w2_weight_scale
                 
                 # Store biases if present (use getattr for safety)
-                self.register_buffer("w13_bias", getattr(layer, "w13_weight_bias", None), persistent=False)
-                self.register_buffer("w2_bias", getattr(layer, "w2_weight_bias", None), persistent=False)
+                self.w13_bias = getattr(layer, "w13_weight_bias", None)
+                self.w2_bias = getattr(layer, "w2_weight_bias", None)
                 
                 # Get number of experts from weight shape
                 self.num_experts = int(self.w13_weight_packed.shape[0])
@@ -736,11 +736,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         torch.cuda.empty_cache()
 
     def _to_device_(self, device):
-        """Move all buffers to the specified device."""
-        for name in ("w13_weight_packed", "w13_weight_scale", "w2_weight_packed", 
-                    "w2_weight_scale", "w13_bias", "w2_bias"):
+        """Move attributes to CUDA device; accepts int or torch.device."""
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        for name in (
+            "w13_weight_packed", "w13_weight_scale",
+            "w2_weight_packed", "w2_weight_scale",
+            "w13_bias", "w2_bias",
+        ):
             t = getattr(self, name, None)
-            if t is not None and t.device != device:
+            if t is not None and hasattr(t, "device") and t.device != device:
                 setattr(self, name, t.to(device, non_blocking=True))
     
     def _get_tile_tokens_dim(self, x: torch.Tensor, top_k: int):
@@ -869,10 +874,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 from .mxfp4_weightonly import mxfp4_weight_only_gemm, mxfp4_weight_only_gemm_grouped
                 
                 # Ensure buffers are on correct device
-                for name in ("w13_weight_packed", "w13_weight_scale", "w2_weight_packed", 
+                for name in ("w13_weight_packed", "w13_weight_scale", "w2_weight_packed",
                             "w2_weight_scale", "w13_bias", "w2_bias"):
                     t = getattr(self, name, None)
-                    if t is not None and t.device != x.device:
+                    if t is not None and hasattr(t, "device") and t.device != x.device:
                         setattr(self, name, t.to(x.device, non_blocking=True))
                 
                 T, H = x.shape
