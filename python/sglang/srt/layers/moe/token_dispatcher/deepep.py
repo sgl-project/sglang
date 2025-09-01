@@ -612,6 +612,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 handle=self.handle,
                 overlap=True,
                 packed_recv_count=self.packed_recv_count,
+                # TODO overlap_args may use stronger typing
                 comp_signal=overlap_args["signal"],
                 block_m=overlap_args["block_m"],
                 threshold=overlap_args["threshold"],
