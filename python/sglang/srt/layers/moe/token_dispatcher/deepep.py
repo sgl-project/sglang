@@ -49,6 +49,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
+ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP = get_bool_env_var("SGLANG_ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP")
+ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP = get_bool_env_var("SGLANG_ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP")
+ENABLE_DEEPEP_COMBINE_OVERLAP = ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP or ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP
+
 logger = logging.getLogger(__name__)
 
 
@@ -566,7 +570,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             )
         )
         # TODO unconditionally execute this
-        if enable_combine_overlap:
+        if ENABLE_DEEPEP_COMBINE_OVERLAP:
             self.packed_recv_count = packed_recv_count
         return packed_recv_hidden, packed_recv_count, event, hook
 
@@ -594,7 +598,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
-        if enable_combine_overlap:
+        if ENABLE_DEEPEP_COMBINE_OVERLAP:
             # TODO let ant change DeepEP to unify the two APIs?
             combined_hidden_states, event, hook = buffer.ll_overlap_combine(
                 x=hidden_states,
