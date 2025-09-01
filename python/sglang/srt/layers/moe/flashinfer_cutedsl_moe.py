@@ -32,6 +32,7 @@ def flashinfer_cutedsl_moe_masked(
     masked_m: torch.Tensor,
     down_sm_count: Optional[int] = None,
     down_signals: Optional[torch.Tensor] = None,
+    down_start_event: Optional[torch.cuda.Event] = None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -139,6 +140,9 @@ def flashinfer_cutedsl_moe_masked(
         a2_global_scale,
         masked_m,
     )
+
+    if down_start_event is not None:
+        down_start_event.record()
 
     # Gemm2
     out = torch.empty_like(hidden_states)
