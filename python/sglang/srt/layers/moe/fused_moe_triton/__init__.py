@@ -6,9 +6,9 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoeWeightScaleSupported,
 )
 
-from .fused_moe import fused_experts
-from .fused_moe_triton_config import get_config_file_name, try_get_optimal_moe_config
-from .moe_align_block_size import moe_align_block_size
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import get_config_file_name, try_get_optimal_moe_config
+from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import moe_align_block_size
 
 _config: Optional[Dict[str, Any]] = None
 
