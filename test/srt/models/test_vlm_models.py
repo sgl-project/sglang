@@ -8,7 +8,7 @@ import sys
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import kill_process_tree, is_hip
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -16,6 +16,8 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+
+_is_hip = is_hip()
 
 # VLM models for testing
 MODELS = [
@@ -145,22 +147,29 @@ class TestVLMModels(CustomTestCase):
                 stdout_file = open("/tmp/server_stdout.log", "w")
                 stderr_file = open("/tmp/server_stderr.log", "w")
 
+            # Prepare server arguments
+            server_args = [
+                "--trust-remote-code",
+                "--cuda-graph-max-bs",
+                "32",
+                "--enable-multimodal",
+                "--mem-fraction-static",
+                str(self.parsed_args.mem_fraction_static),  # Use class variable
+                "--log-level",
+                log_level,
+            ]
+            
+            # Use triton attention backend for AMD/ROCm compatibility
+            if _is_hip:
+                server_args.extend(["--attention-backend", "triton"])
+
             # Launch server for testing
             process = popen_launch_server(
                 model.model,
                 base_url=self.base_url,
                 timeout=self.time_out,
                 api_key=self.api_key,
-                other_args=[
-                    "--trust-remote-code",
-                    "--cuda-graph-max-bs",
-                    "32",
-                    "--enable-multimodal",
-                    "--mem-fraction-static",
-                    str(self.parsed_args.mem_fraction_static),  # Use class variable
-                    "--log-level",
-                    log_level,
-                ],
+                other_args=server_args,
                 env=process_env,
                 return_stdout_stderr=(
                     (stdout_file, stderr_file) if capture_output else None
