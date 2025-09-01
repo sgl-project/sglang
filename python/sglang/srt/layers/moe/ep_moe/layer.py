@@ -429,26 +429,10 @@ class DeepEPMoE(EPMoE):
         dispatch_output = self.dispatch(
             hidden_states, topk_idx, topk_weights, forward_batch
         )
+
+        overlap_args = self._compute_overlap_args()
+
         hidden_states = self.moe_impl(dispatch_output)
-
-        if ENABLE_DEEPEP_COMBINE_OVERLAP:
-            num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
-            # TODO do not hardcode
-            block_m, block_n = 128, 128
-
-            # TODO use zero_allocator
-            combine_signal = torch.zeros(
-                (num_local_experts, ceil_div(num_tokens_static, block_m)),
-            )
-
-            overlap_args = dict(
-                signal=combine_signal.flatten(),
-                block_m=block_m,
-                threshold=ceil_div(hidden_dim, block_n),
-                num_sms=DEEPEP_LL_COMBINE_SEND_NUM_SMS,
-            )
-        else:
-            overlap_args = None
 
         hidden_states = self.combine(
             hidden_states,
@@ -459,6 +443,29 @@ class DeepEPMoE(EPMoE):
         )
 
         return hidden_states
+
+    @staticmethod
+    def _compute_overlap_args():
+        if not ENABLE_DEEPEP_COMBINE_OVERLAP:
+            return None
+
+        num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
+        # TODO do not hardcode
+        block_m, block_n = 128, 128
+
+        # TODO use zero_allocator
+        combine_signal = torch.zeros(
+            (num_local_experts, ceil_div(num_tokens_static, block_m)),
+        )
+
+        overlap_args = dict(
+            signal=combine_signal.flatten(),
+            block_m=block_m,
+            threshold=ceil_div(hidden_dim, block_n),
+            num_sms=DEEPEP_LL_COMBINE_SEND_NUM_SMS,
+        )
+
+        return overlap_args
 
     def dispatch(
         self,
