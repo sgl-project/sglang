@@ -13,107 +13,20 @@ from typing import Dict
 from urllib.parse import urlparse
 
 import requests
+from test_hicache_storage_e2e import HiCacheStorageBaseTest
 
-from sglang.bench_serving import get_tokenizer
-from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    is_in_ci,
-    popen_launch_server,
-    run_bench_serving,
-    write_github_step_summary,
-)
+from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 
-class TestHiCacheStorageBenchmark(CustomTestCase):
+class TestHiCacheStorageBenchmark(HiCacheStorageBaseTest):
     """Benchmark tests for HiCache Storage functionality"""
 
     @classmethod
-    def setUpClass(cls):
-        """Set up test environment and launch server once for all tests"""
-        cls.temp_dir = tempfile.mkdtemp()
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        cls.base_port = str(parsed_url.port)
-
-        # Prepare tokenizer for prompt generation
-        cls.tokenizer = get_tokenizer(cls.model)
-
-        # Launch server with HiCache enabled
-        cls.process = cls._launch_server_with_hicache()
-        cls._wait_for_server_ready()
-
-        print(f"Benchmark server launched successfully at {cls.base_url}")
-        print(f"Cache directory: {cls.temp_dir}")
-
-    @classmethod
-    def _launch_server_with_hicache(cls, storage_backend="file"):
-        """Launch server with HiCache enabled for benchmarking"""
-        server_args = [
-            "--enable-hierarchical-cache",
-            "--mem-fraction-static",
-            "0.8",
-            "--hicache-ratio",
-            "1.2",
-            "--page-size",
-            "64",
-            "--hicache-storage-backend",
-            storage_backend,
-            "--enable-cache-report",
-            "--hicache-write-policy",
-            "write_through",
-            "--hicache-storage-prefetch-policy",
-            "wait_complete",
-            "--log-level",
-            "info",
-        ]
-
-        if storage_backend == "file":
-            env_vars = {
-                **os.environ,
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
-            }
-        else:
-            env_vars = os.environ
-
-        process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=server_args,
-            env=env_vars,
-        )
-        return process
-
-    @classmethod
-    def _wait_for_server_ready(cls, timeout: int = 60) -> bool:
-        """Wait for server to be ready"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"{cls.base_url}/health", timeout=5)
-                if response.status_code == 200:
-                    return True
-            except requests.RequestException:
-                pass
-            time.sleep(2)
-        raise TimeoutError("Server failed to start within timeout")
-
-    @classmethod
-    def tearDownClass(cls):
-        """Clean up test environment"""
-        kill_process_tree(cls.process.pid)
-
-        import shutil
-
-        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args = ["--tp-size", "2", "--hicache-storage-backend", "file"]
+        return server_args, {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
 
     def flush_cache(self) -> bool:
         """Flush device cache to force remote storage access"""

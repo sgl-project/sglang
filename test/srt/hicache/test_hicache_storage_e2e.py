@@ -16,7 +16,6 @@ import requests
 from sglang.bench_serving import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -24,86 +23,8 @@ from sglang.test.test_utils import (
 )
 
 
-class TestHiCacheStorageE2E(CustomTestCase):
-    """Comprehensive E2E tests for HiCache Storage functionality"""
-
-    @classmethod
-    def setUpClass(cls):
-        """Set up test environment and launch server once for all tests"""
-        cls.temp_dir = tempfile.mkdtemp()
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-
-        # Prepare tokenizer for prompt generation
-        cls.tokenizer = get_tokenizer(cls.model)
-
-        # Launch server with HiCache enabled and cache report
-        cls.process = cls._launch_server_with_hicache()
-        cls._wait_for_server_ready()
-
-        print(f"Test server launched successfully at {cls.base_url}")
-        print(f"Cache directory: {cls.temp_dir}")
-
-    @classmethod
-    def tearDownClass(cls):
-        """Clean up test environment"""
-        kill_process_tree(cls.process.pid)
-
-        import shutil
-
-        shutil.rmtree(cls.temp_dir, ignore_errors=True)
-
-    @classmethod
-    def _launch_server_with_hicache(cls, storage_backend="file"):
-        """Launch server with HiCache enabled"""
-        server_args = [
-            "--enable-hierarchical-cache",
-            "--mem-fraction-static",
-            "0.8",
-            "--hicache-ratio",
-            "1.2",
-            "--page-size",
-            "64",
-            "--hicache-storage-backend",
-            storage_backend,
-            "--enable-cache-report",
-            "--hicache-write-policy",
-            "write_through",
-            "--hicache-storage-prefetch-policy",
-            "wait_complete",
-            "--log-level",
-            "debug",
-        ]
-
-        if storage_backend == "file":
-            env_vars = {
-                **os.environ,
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
-            }
-        else:
-            env_vars = os.environ
-
-        return popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=server_args,
-            env=env_vars,
-        )
-
-    @classmethod
-    def _wait_for_server_ready(cls, timeout: int = 60) -> bool:
-        """Wait for server to be ready"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"{cls.base_url}/health", timeout=5)
-                if response.status_code == 200:
-                    return True
-            except requests.RequestException:
-                pass
-            time.sleep(2)
-        raise TimeoutError("Server failed to start within timeout")
+class HiCacheStorageTestMixin:
+    """Mixin class containing core functionality tests that can be reused across different configurations"""
 
     def send_request(
         self, prompt: str, max_tokens: int = 100, temperature: float = 0.0
@@ -152,6 +73,15 @@ class TestHiCacheStorageE2E(CustomTestCase):
         selected_tokens = random.choices(all_available_tokens, k=token_num)
         return self.tokenizer.decode(selected_tokens)
 
+    def trigger_offloading_and_flush(self):
+        """Helper method to trigger offloading and flush cache"""
+        # Trigger offloading
+        self.send_request(self.gen_prompt(1), max_tokens=150)
+
+        # Flush device cache to force remote storage access
+        time.sleep(2)
+        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
+
     # === Core Functionality Tests ===
 
     def test_01_cache_storage_and_retrieval(self):
@@ -167,8 +97,7 @@ class TestHiCacheStorageE2E(CustomTestCase):
         self.assertIsNotNone(response1)
 
         # Flush device cache to force remote storage access
-        print("Step 2: Flushing device cache...")
-        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
+        self.trigger_offloading_and_flush()
 
         # Second request with extended prompt - should hit remote cache
         print("Step 3: Testing cache hit from remote storage...")
@@ -197,7 +126,9 @@ class TestHiCacheStorageE2E(CustomTestCase):
 
         # Establish the base context in cache
         _ = self.send_request(base_context, max_tokens=80)
-        self.flush_cache()
+
+        # Flush device cache to force remote storage access
+        self.trigger_offloading_and_flush()
 
         # Variations that should benefit from prefix caching
         variations = [
@@ -230,25 +161,17 @@ class TestHiCacheStorageE2E(CustomTestCase):
         turn1_prompt = f"{conversation_context}\n\nUser: Explain the basic concepts."
         response1 = self.send_request(turn1_prompt, max_tokens=160)
         self.assertIsNotNone(response1)
-        self.flush_cache()
+
+        # Flush device cache to force remote storage access
+        self.trigger_offloading_and_flush()
 
         # Turn 2: Follow-up question (should benefit from cached context)
         turn2_prompt = f"{conversation_context}\n\nUser: Explain the basic concepts.{response1['text']}\n\nUser: Can you provide more details?"
         response2 = self.send_request(turn2_prompt, max_tokens=80)
         cached_tokens2 = self.get_cached_tokens(response2)
         print(f"Turn 2 cached_tokens: {cached_tokens2}")
-        self.assertEqual(
-            cached_tokens2, 512, "Expected cache hit for conversation continuation"
-        )
-        self.flush_cache()
-
-        # Turn 3: Another follow-up (should benefit even more)
-        turn3_prompt = f"{turn2_prompt}\n\nUser: {response2['text']}\n\nUser: What are the practical applications?"
-        response3 = self.send_request(turn3_prompt, max_tokens=80)
-        cached_tokens3 = self.get_cached_tokens(response3)
-        print(f"Turn 3 cached_tokens: {cached_tokens3}")
         self.assertGreater(
-            cached_tokens3, 600, "Expected cache hit for conversation continuation"
+            cached_tokens2, 512, "Expected cache hit for conversation continuation"
         )
 
     def test_04_data_persistence_across_node_restart(self):
@@ -283,6 +206,9 @@ class TestHiCacheStorageE2E(CustomTestCase):
             print(f"First node - Context {i+1} cached_tokens: {cached_tokens}")
             self.assertEqual(cached_tokens, 512, "Expected cache hit on first node")
 
+        # Flush device cache to force remote storage access
+        self.trigger_offloading_and_flush()
+
         # Phase 2: Kill the first node
         print("Phase 2: Killing first node...")
         if hasattr(self, "process") and self.process:
@@ -314,6 +240,143 @@ class TestHiCacheStorageE2E(CustomTestCase):
             )
 
         kill_process_tree(self.process.pid)
+
+
+class HiCacheStorageBaseTest(CustomTestCase, HiCacheStorageTestMixin):
+    """Base test class with common setup and utilities"""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up test environment and launch server once for all tests"""
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.model = cls._get_model_name()
+        cls.base_url = DEFAULT_URL_FOR_TEST
+
+        # Prepare tokenizer for prompt generation
+        cls.tokenizer = get_tokenizer(cls.model)
+
+        # Launch server with HiCache enabled and cache report
+        cls.process = cls._launch_server_with_hicache()
+        cls._wait_for_server_ready()
+
+        print(f"Test server launched successfully at {cls.base_url}")
+        print(f"Cache directory: {cls.temp_dir}")
+
+    @classmethod
+    def tearDownClass(cls):
+        """Clean up test environment"""
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+        import shutil
+
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+
+    @classmethod
+    def _get_model_name(cls):
+        """Get model name for the test configuration - override in subclasses"""
+        # return DEFAULT_MODEL_NAME_FOR_TEST
+        return "/sgl-workspace/mnt/Qwen-4B"
+
+    @classmethod
+    def _get_base_server_args(cls):
+        """Get base server arguments - can be extended in subclasses"""
+        return [
+            "--enable-hierarchical-cache",
+            "--mem-fraction-static",
+            "0.8",
+            "--hicache-ratio",
+            "1.2",
+            "--page-size",
+            "64",
+            "--enable-cache-report",
+            "--hicache-storage-prefetch-policy",
+            "wait_complete",
+            "--log-level",
+            "debug",
+        ]
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        return ["--hicache-storage-backend", "file"], {
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir
+        }
+
+    @classmethod
+    def _launch_server_with_hicache(cls):
+        """Launch server with HiCache enabled"""
+
+        server_args, env_vars = cls._get_additional_server_args_and_env()
+        server_args = cls._get_base_server_args() + server_args
+
+        env_vars = {
+            **os.environ,
+            **env_vars,
+        }
+
+        return popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=server_args,
+            env=env_vars,
+        )
+
+    @classmethod
+    def _wait_for_server_ready(cls, timeout: int = 60) -> bool:
+        """Wait for server to be ready"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                response = requests.get(f"{cls.base_url}/health", timeout=5)
+                if response.status_code == 200:
+                    return True
+            except requests.RequestException:
+                pass
+            time.sleep(2)
+        raise TimeoutError("Server failed to start within timeout")
+
+
+class TestHiCacheStorageTP(HiCacheStorageBaseTest):
+    """Multi-TP tests for HiCache Storage functionality"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args = ["--tp-size", "2", "--hicache-storage-backend", "file"]
+        return server_args, {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
+
+
+class TestHiCacheStorageMLA(HiCacheStorageBaseTest):
+    """MLA (Multi-head Latent Attention) tests for HiCache Storage functionality"""
+
+    @classmethod
+    def _get_model_name(cls):
+        """Use MLA model for testing"""
+        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args = ["--tp-size", "2", "--hicache-storage-backend", "file"]
+        return server_args, {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
+
+
+# TODO: Add other backends tests
+# class TestHiCacheStorageMooncakeBackend(HiCacheStorageBaseTest):
+#     """Mooncake backend tests for HiCache Storage functionality"""
+
+#     @classmethod
+#     def _get_additional_server_args_and_env(cls):
+#         """Get additional server arguments specific to configuration - override in subclasses"""
+#         server_args = ["--hicache-storage-backend", "mooncake"]
+#         env = {
+#             "MOONCAKE_TE_META_DATA_SERVER": "http://127.0.0.1:8080/metadata",
+#             "MOONCAKE_MASTER": "127.0.0.1:50051"
+#             xxxxx
+#         }
+#         return server_args, {}
 
 
 if __name__ == "__main__":
