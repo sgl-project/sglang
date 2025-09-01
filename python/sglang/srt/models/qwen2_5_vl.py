@@ -89,15 +89,16 @@ class Qwen2_5_VLMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            skip_bias_add=True,
         )
         self.act = ACT2FN[hidden_act]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         gate_up, _ = self.gate_up_proj(x)
         gate, up = gate_up.chunk(2, dim=-1)
         x = self.act(gate) * up
-        x_down, _ = self.down_proj(x)
-        return x_down
+        x_down, x_down_bias = self.down_proj(x)
+        return x_down, x_down_bias
 
 
 class Qwen2_5_VisionBlock(nn.Module):
@@ -168,14 +169,24 @@ class Qwen2_5_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
+        pending_residual: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
         x2d = x.reshape(-1, H)
-        hidden_states = self.norm1(x2d).reshape(S, B, H)
+        # If we have a pending residual from the previous block's MLP,
+        # fuse it into norm1 via the fused add+RMSNorm path.
+        if pending_residual is not None:
+            pend2d = pending_residual.reshape(-1, H)
+            x_norm_2d, x_base_2d = self.norm1(x2d, residual=pend2d)
+        else:
+            x_norm_2d = self.norm1(x2d)
+            x_base_2d = x2d
+        x_norm = x_norm_2d.reshape(S, B, H)
+        x_base = x_base_2d.reshape(S, B, H)
 
         # Attention expects [B, S, H]
-        hidden_states = rearrange(hidden_states, "s b h -> b s h")
+        hidden_states = rearrange(x_norm, "s b h -> b s h")
         attn = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
@@ -185,14 +196,19 @@ class Qwen2_5_VisionBlock(nn.Module):
 
         # norm2 with fused residual-add: also 2D
         attn2d = attn.reshape(-1, H)
-        x_norm_2d, x_after_add_2d = self.norm2(x2d, residual=attn2d)
+        x_norm_2d, x_after_add_2d = self.norm2(x_base_2d, residual=attn2d)
         x_norm = x_norm_2d.reshape(S, B, H)
         x_after_add = x_after_add_2d.reshape(S, B, H)
 
         # MLP and final residual
-        mlp_out = self.mlp(x_norm)
-        x = x_after_add + mlp_out
-        return x
+        mlp_out, mlp_bias = self.mlp(x_norm)
+        if mlp_bias is not None:
+            mlp_out = mlp_out.reshape(-1, H)
+            mlp_out.add_(mlp_bias)
+            mlp_out = mlp_out.reshape(S, B, H)
+        next_pending = mlp_out
+        next_base = x_after_add
+        return next_base, next_pending
 
 
 class Qwen2_5_VisionPatchMerger(nn.Module):
@@ -439,14 +455,22 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         # transformers
         x = x.unsqueeze(1)
+        pending = None
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
             else:
                 cu_seqlens_now = cu_window_seqlens
-            x = blk(
-                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+            x, pending = blk(
+                x,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+                pending_residual=pending,
             )
+
+        # Flush any remaining pending residual after the last block.
+        if pending is not None:
+            x = x + pending
 
         # adapter
         x = self.merger(x)
