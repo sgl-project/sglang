@@ -434,7 +434,8 @@ class DeepEPMoE(EPMoE):
         if ENABLE_DEEPEP_COMBINE_OVERLAP:
             overlap_args = dict(
                 signal=TODO,
-                block_m=TODO,
+                # TODO do not hardcode
+                block_m=128,
                 threshold=TODO,
                 num_sms=TODO,
             )
