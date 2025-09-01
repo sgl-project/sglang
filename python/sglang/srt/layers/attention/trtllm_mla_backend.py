@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from sglang.srt.layers.attention.flashinfer_mla_backend import (
+    FlashInferMLAAttnBackend,
+    FlashInferMLAMultiStepDraftBackend,
+)
 from sglang.srt.layers.attention.utils import (
     TRITON_PAD_NUM_PAGE_PER_BLOCK,
     create_flashmla_kv_indices_triton,
@@ -39,6 +42,8 @@ DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 # compute the LCM with other padding constraints.
 TRTLLM_BLOCK_CONSTRAINT = 128
 
+global_zero_init_workspace_buffer = None
+
 
 @dataclass
 class TRTLLMMLADecodeMetadata:
@@ -46,6 +51,7 @@ class TRTLLMMLADecodeMetadata:
 
     workspace: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
+    max_seq_len: Optional[int] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -83,13 +89,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        self.workspace_buffer = torch.empty(
-            self.workspace_size, dtype=torch.int8, device=self.device
-        )
+        global global_zero_init_workspace_buffer
+        if global_zero_init_workspace_buffer is None:
+            global_zero_init_workspace_buffer = torch.zeros(
+                self.workspace_size,
+                dtype=torch.uint8,
+                device=model_runner.device,
+            )
+        self.workspace_buffer = global_zero_init_workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
-        self.cuda_graph_kv_indices = None
+        self.decode_cuda_graph_kv_indices = None
         self.forward_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -160,14 +171,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MLA."""
+
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
 
-        self.cuda_graph_kv_indices = torch.full(
+        self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_workspace = torch.empty(
+        self.decode_cuda_graph_workspace = torch.empty(
             self.workspace_size, dtype=torch.int8, device=self.device
         )
+
+        super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -180,8 +194,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         spec_info: Optional[SpecInfo],
     ):
         """Initialize metadata for CUDA graph capture."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (forward_mode.is_decode_or_idle() and spec_info is None):
+
+        # Delegate to parent for non-decode modes.
+        if not forward_mode.is_decode_or_idle():
             return super().init_forward_metadata_capture_cuda_graph(
                 bs,
                 num_tokens,
@@ -192,9 +207,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 spec_info,
             )
 
-        # Custom fast-path for decode/idle without speculative execution.
-        max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
-        block_kv_indices = self.cuda_graph_kv_indices[:bs, :max_seqlen_pad]
+        # Custom fast-path for decode/idle.
+        # Capture with full width so future longer sequences are safe during replay
+        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
 
         create_flashmla_kv_indices_triton[(bs,)](
             self.req_to_token,
@@ -203,12 +219,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             None,
             block_kv_indices,
             self.req_to_token.stride(0),
-            max_seqlen_pad,
+            max_blocks_per_seq,
             NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
             PAGED_SIZE=self.page_size,
         )
 
-        metadata = TRTLLMMLADecodeMetadata(self.cuda_graph_workspace, block_kv_indices)
+        # Record the true maximum sequence length for this capture batch so that
+        # the kernel launch path (which requires an int not a tensor) can reuse
+        # it safely during both capture and replay.
+        max_seq_len_val = int(seq_lens.max().item())
+
+        metadata = TRTLLMMLADecodeMetadata(
+            self.decode_cuda_graph_workspace,
+            block_kv_indices,
+            max_seq_len_val,
+        )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
@@ -224,8 +249,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Replay CUDA graph with new inputs."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (forward_mode.is_decode_or_idle() and spec_info is None):
+        # Delegate to parent for non-decode modes.
+        if not forward_mode.is_decode_or_idle():
             return super().init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -252,17 +277,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PAGED_SIZE=self.page_size,
         )
 
+        # Update stored max_seq_len so subsequent kernel calls use the correct value
+        # Prefer CPU tensor to avoid GPU synchronization when available.
+        if seq_lens_cpu is not None:
+            metadata.max_seq_len = int(seq_lens_cpu.max().item())
+        else:
+            metadata.max_seq_len = int(seq_lens.max().item())
+
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is None
-        ):
+        # Delegate to parent for non-decode modes.
+        if not forward_batch.forward_mode.is_decode_or_idle():
             return super().init_forward_metadata(forward_batch)
 
         bs = forward_batch.batch_size
@@ -282,8 +311,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.seq_lens.device,
         )
 
+        max_seq_len_val = int(max_seq)
         self.forward_metadata = TRTLLMMLADecodeMetadata(
-            self.workspace_buffer, block_kv_indices
+            self.workspace_buffer, block_kv_indices, max_seq_len_val
         )
         forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
 
@@ -458,12 +488,27 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=metadata.block_kv_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
-            max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
+            max_seq_len=metadata.max_seq_len,
             bmm1_scale=bmm1_scale,
         )
 
-        # Extract value projection part and reshape
-        raw_out_v = raw_out[..., : layer.v_head_dim].contiguous()
-        output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
+        # Reshape output directly without slicing
+        output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return output
+
+
+class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
+    """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
+
+    def __init__(
+        self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int
+    ):
+        super().__init__(model_runner, topk, speculative_num_steps)
+
+        for i in range(self.speculative_num_steps):
+            self.attn_backends[i] = TRTLLMMLABackend(
+                model_runner,
+                skip_prefill=True,
+                kv_indptr_buf=self.kv_indptr[i],
+                q_indptr_decode_buf=self.q_indptr_decode,
+            )

@@ -179,7 +179,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-lora` | Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility. | False |
 | `--max-lora-rank` | The maximum LoRA rank that should be supported. If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of larger LoRA rank after server startup. | None |
 | `--lora-target-modules` | The union set of all target modules where LoRA should be applied (e.g., `q_proj`, `k_proj`, `gate_proj`). If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of different target modules after server startup. You can also set it to `all` to enable LoRA for all supported modules. However, enabling LoRA on additional modules introduces a minor performance overhead. If your application is performance-sensitive, we recommend only specifying the modules for which you plan to load adapters. | None |
-| `--lora-paths` | The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}. | None |
+| `--lora-paths` | The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool} | None |
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | 8 |
 | `--max-loaded-loras` | If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`. | None |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | triton |
@@ -213,12 +213,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--ep-size` | The expert parallelism size. | 1 |
-| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | None |
-| `--enable-flashinfer-cutlass-moe` | Enabling Flashinfer Cutlass MoE implementation for high throughput. | False |
-| `--enable-flashinfer-trtllm-moe` | Enabling Flashinfer Trtllm MoE implementation for low latency. | False |
+| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | none |
+| `--moe-runner-backend` | Select the runner backend for MoE. | 'triton' |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | 0 |
-| `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in expert parallel. | None |
+| `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in EPLB. | None |
 | `--init-expert-location` | Initial location of EP experts. | trivial |
 | `--enable-eplb` | Enable EPLB algorithm. | False |
 | `--eplb-algorithm` | Chosen EPLB algorithm. | auto |
@@ -237,7 +236,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-hierarchical-cache` | Enable hierarchical cache. | False |
 | `--hicache-ratio` | The ratio of the size of host KV cache memory pool to the size of device pool. | 2.0 |
 | `--hicache-size` | The size of the hierarchical cache. | 0 |
-| `--hicache-write-policy` | The write policy for hierarchical cache. | write_through_selective |
+| `--hicache-write-policy` | The write policy for hierarchical cache. | write_through |
 | `--hicache-io-backend` | The IO backend for hierarchical cache. |  |
 | `--hicache-storage-backend` | The storage backend for hierarchical cache. | None |
 
@@ -280,7 +279,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-chunked-prefix-cache` | Disable chunked prefix cache. | False |
 | `--disable-fast-image-processor` | Disable fast image processor. | False |
 | `--enable-return-hidden-states` | Enable returning hidden states. | False |
-| `--enable-triton-kernel-moe` | Enable Triton kernel for MoE. | False |
 
 ## Debug tensor dumps
 

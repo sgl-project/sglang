@@ -10,6 +10,7 @@ use kube::{
 };
 use std::collections::{HashMap, HashSet};
 
+use rustls;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task;
@@ -74,11 +75,10 @@ impl PodInfo {
             return false;
         }
 
-        pod.metadata.labels.as_ref().map_or(false, |labels| {
-            selector
-                .iter()
-                .all(|(k, v)| labels.get(k).map_or(false, |label_value| label_value == v))
-        })
+        pod.metadata
+            .labels
+            .as_ref()
+            .is_some_and(|labels| selector.iter().all(|(k, v)| labels.get(k) == Some(v)))
     }
 
     /// Check if a pod should be included in service discovery
@@ -187,6 +187,8 @@ pub async fn start_service_discovery(
             code: 400,
         }));
     }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Initialize Kubernetes client
     let client = Client::try_default().await?;
@@ -381,7 +383,7 @@ async fn handle_pod_event(
             // Handle PD mode with specific pod types
             let result = if pd_mode && pod_info.pod_type.is_some() {
                 // Need to import PDRouter type
-                use crate::routers::pd_router::PDRouter;
+                use crate::routers::http::pd_router::PDRouter;
 
                 // Try to downcast to PDRouter
                 if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
@@ -451,7 +453,7 @@ async fn handle_pod_deletion(
 
         // Handle PD mode removal
         if pd_mode && pod_info.pod_type.is_some() {
-            use crate::routers::pd_router::PDRouter;
+            use crate::routers::http::pd_router::PDRouter;
 
             // Try to downcast to PDRouter for PD-specific removal
             if let Some(pd_router) = router.as_any().downcast_ref::<PDRouter>() {
@@ -579,7 +581,7 @@ mod tests {
     async fn create_test_router() -> Arc<dyn RouterTrait> {
         use crate::config::PolicyConfig;
         use crate::policies::PolicyFactory;
-        use crate::routers::router::Router;
+        use crate::routers::http::router::Router;
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Random);
         let router = Router::new(
@@ -592,6 +594,7 @@ mod tests {
             None,
             crate::config::types::RetryConfig::default(),
             crate::config::types::CircuitBreakerConfig::default(),
+            crate::config::types::HealthCheckConfig::default(),
         )
         .await
         .unwrap();
