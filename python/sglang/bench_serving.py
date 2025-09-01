@@ -640,6 +640,7 @@ def get_tokenizer(
         pretrained_model_name_or_path, trust_remote_code=True
     )
 
+
 def get_dataset(args, tokenizer):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
@@ -711,7 +712,7 @@ def get_dataset(args, tokenizer):
             all_requests_data = [json.loads(line) for line in f if line.strip()]
 
         # Limit the number of requests based on --num-prompts
-        input_requests = all_requests_data[:args.num_prompts]
+        input_requests = all_requests_data[: args.num_prompts]
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -767,6 +768,7 @@ class BenchmarkMetrics:
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 MOONCAKE_DATASET_URL = "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl"
+
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
     """Read and cache a file from a url."""
@@ -840,14 +842,14 @@ async def get_mooncake_request_over_time(
     if not input_requests:
         return
 
-    input_requests.sort(key=lambda r: r['timestamp'])
+    input_requests.sort(key=lambda r: r["timestamp"])
 
     start_time = time.perf_counter()
-    trace_start_time_ms = input_requests[0]['timestamp']
+    trace_start_time_ms = input_requests[0]["timestamp"]
 
     for record in input_requests:
         # Calculate when this entire session should start
-        relative_arrival_time_s = (record['timestamp'] - trace_start_time_ms) / 1000.0
+        relative_arrival_time_s = (record["timestamp"] - trace_start_time_ms) / 1000.0
         target_arrival_time_s = relative_arrival_time_s * slowdown_factor
 
         current_elapsed_time_s = time.perf_counter() - start_time
@@ -862,7 +864,9 @@ async def get_mooncake_request_over_time(
         user_query_base = ""
         hash_ids = record.get("hash_ids", [])
         for hash_id in hash_ids:
-            user_query_base += f"{hash_id}" + " ".join(["hi"] * 128) # Shorter for multi-round
+            user_query_base += f"{hash_id}" + " ".join(
+                ["hi"] * 128
+            )  # Shorter for multi-round
         user_query_base += "Tell me a story based on this context."
 
         output_len_per_round = record.get("output_length", 256)
@@ -870,7 +874,9 @@ async def get_mooncake_request_over_time(
 
         for i in range(num_rounds):
             # Add user query for the current round
-            chat_history.append({"role": "user", "content": f"Round {i+1}: {user_query_base}"})
+            chat_history.append(
+                {"role": "user", "content": f"Round {i+1}: {user_query_base}"}
+            )
 
             # Form the full prompt from history
             try:
@@ -878,7 +884,9 @@ async def get_mooncake_request_over_time(
                     chat_history, tokenize=False, add_generation_prompt=True
                 )
             except Exception:
-                full_prompt_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
+                full_prompt_text = "\n".join(
+                    [f"{msg['role']}: {msg['content']}" for msg in chat_history]
+                )
 
             prompt_len = len(tokenizer.encode(full_prompt_text))
 
@@ -892,6 +900,7 @@ async def get_mooncake_request_over_time(
             # We use a placeholder because we don't know the real response
             placeholder_response = " ".join(["story"] * output_len_per_round)
             chat_history.append({"role": "assistant", "content": placeholder_response})
+
 
 def sample_mmmu_requests(
     num_requests: int,
@@ -1446,7 +1455,9 @@ async def get_request(
     slowdown_factor: float = 1.0,
 ) -> AsyncGenerator[DatasetRow, None]:
     if use_trace_timestamps:
-        print(f"Using trace timestamps for request generation with slowdown factor {slowdown_factor}.")
+        print(
+            f"Using trace timestamps for request generation with slowdown factor {slowdown_factor}."
+        )
         # Sort requests by timestamp for correct replay
         input_requests.sort(key=lambda r: r.timestamp)
 
@@ -1573,8 +1584,8 @@ async def benchmark(
     flush_cache: bool = False,
     warmup_requests: int = 1,
     use_trace_timestamps: bool = False,
-    mooncake_slowdown_factor = 1.0,
-    mooncake_num_rounds = 1,
+    mooncake_slowdown_factor=1.0,
+    mooncake_num_rounds=1,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1615,7 +1626,7 @@ async def benchmark(
             prompt=prompt_text,
             prompt_len=prompt_len,
             output_len=output_len,
-            image_data=None, # Mooncake doesn't have image data
+            image_data=None,  # Mooncake doesn't have image data
         )
     else:
         # For all other datasets, input_requests is a list of DatasetRow objects
@@ -1677,12 +1688,16 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
-    if backend == "sglang" and args.dataset_name == "mooncake": # Assuming mooncake is mainly for sglang or similar backends
+    if (
+        backend == "sglang" and args.dataset_name == "mooncake"
+    ):  # Assuming mooncake is mainly for sglang or similar backends
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
         request_generator = get_mooncake_request_over_time(
             input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
         )
-        print(f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}")
+        print(
+            f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
+        )
         pbar_total *= args.mooncake_num_rounds
     else:
         request_generator = get_request(input_requests, request_rate)
@@ -1750,7 +1765,11 @@ async def benchmark(
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
-    print("{:<40} {:<10}".format("Traffic request rate:", "trace" if use_trace_timestamps else request_rate))
+    print(
+        "{:<40} {:<10}".format(
+            "Traffic request rate:", "trace" if use_trace_timestamps else request_rate
+        )
+    )
     print(
         "{:<40} {:<10}".format(
             "Max request concurrency:",
@@ -1872,7 +1891,9 @@ async def benchmark(
         elif args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
-            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
+            output_file_name = (
+                f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
+            )
 
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
@@ -2202,9 +2223,9 @@ if __name__ == "__main__":
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
     )
     parser.add_argument(
-        '--use-trace-timestamps',
+        "--use-trace-timestamps",
         action="store_true",
-        help="Use timestamps from the trace file for request scheduling. Only valid for 'mooncake' dataset."
+        help="Use timestamps from the trace file for request scheduling. Only valid for 'mooncake' dataset.",
     )
     parser.add_argument(
         "--max-concurrency",
@@ -2335,15 +2356,15 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
         help="Slowdown factor for replaying the mooncake trace. "
-             "A value of 2.0 means the replay is twice as slow. "
-             "NOTE: --request-rate is IGNORED in mooncake mode.",
+        "A value of 2.0 means the replay is twice as slow. "
+        "NOTE: --request-rate is IGNORED in mooncake mode.",
     )
     mooncake_group.add_argument(
         "--mooncake-num-rounds",
         type=int,
         default=1,
         help="Number of conversation rounds for each session in the mooncake dataset. "
-             "A value > 1 will enable true multi-turn session benchmarking.",
+        "A value > 1 will enable true multi-turn session benchmarking.",
     )
     args = parser.parse_args()
     run_benchmark(args)
