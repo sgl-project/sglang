@@ -442,10 +442,31 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        # Debug prints for batch information
+        print(f"DEBUG: [EagleWorker] " + "="*80, flush=True)
+        if hasattr(batch, 'req_pool_indices') and batch.req_pool_indices is not None:
+            device_index = batch.req_pool_indices.device.index
+        else:
+            device_index = 0  # fallback
+            
+        if device_index == 0:
+            print(f"DEBUG: [EagleWorker] forward_batch_speculative_generation called", flush=True)
+            print(f"DEBUG: [EagleWorker] batch.forward_mode = {batch.forward_mode.name} ({batch.forward_mode.value})", flush=True)
+            print(f"DEBUG: [EagleWorker] batch.is_extend_in_batch = {batch.is_extend_in_batch}", flush=True)
+            print(f"DEBUG: [EagleWorker] batch.batch_size() = {batch.batch_size()}", flush=True)
+            if hasattr(batch, 'seq_lens') and batch.seq_lens is not None:
+                print(f"DEBUG: [EagleWorker] batch.seq_lens = {batch.seq_lens}", flush=True)
+            if hasattr(batch, 'extend_lens') and batch.extend_lens is not None:
+                print(f"DEBUG: [EagleWorker] batch.extend_lens = {batch.extend_lens}", flush=True)
+            
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
             )
+            if device_index == 0:
+                print(f"DEBUG: [EagleWorker- TARGET EXTEND] Target extend completed, next_token_ids: {next_token_ids}, seq_lens_cpu: {seq_lens_cpu}", flush=True)
+                print(f"DEBUG: [EagleWorker- DRAFT EXTEND] Starting DRAFT EXTEND", flush=True)
+                print(f"DEBUG: [EagleWorker- DRAFT EXTEND] batch.seq_lens = {batch.seq_lens}", flush=True)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
@@ -457,11 +478,22 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
+            if device_index == 0:
+                print(f"DEBUG: [EagleWorker- VERIFY PATH] VERIFY PATH", flush=True)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
+                if device_index == 0:
+                    print(f"DEBUG: [EagleWorker- VERIFY PATH] Starting DRAFT", flush=True)
                 spec_info = self.draft(batch)
+                if device_index == 0:
+                    print(f"DEBUG: [EagleWorker- VERIFY PATH] Draft completed", flush=True)
+            if device_index == 0:
+                print(f"DEBUG: [EagleWorker- VERIFY PATH] Starting VERIFY", flush=True)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+            if device_index == 0:
+                print(f"DEBUG: [EagleWorker] Verify completed, verified_id: {verify_output.verified_id}", flush=True)
+                print(f"DEBUG: [EagleWorker] accept_length_per_req_cpu: {verify_output.accept_length_per_req_cpu}", flush=True)
 
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
@@ -471,7 +503,11 @@ class EAGLEWorker(TpModelWorker):
                     or batch.spec_info.verified_id.shape[0] > 0
                 ):
                     # decode is not finished
+                    if device_index == 0:
+                        print(f"DEBUG: [EagleWorker] Starting DRAFT EXTEND AFTER DECODE", flush=True)
                     self.forward_draft_extend_after_decode(batch)
+                    if device_index == 0:
+                        print(f"DEBUG: [EagleWorker] Draft extend after decode completed", flush=True)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -802,7 +838,17 @@ class EAGLEWorker(TpModelWorker):
         self.model_runner.token_to_kv_pool_allocator.clear()
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        # Debug prints for prepare_for_verify
+        if hasattr(batch, 'req_pool_indices') and batch.req_pool_indices is not None:
+            device_index = batch.req_pool_indices.device.index
+        else:
+            device_index = 0
+            
+        if device_index == 0:
+            print(f"DEBUG: [EagleWorker] Before spec_info.prepare_for_verify", flush=True)
         spec_info.prepare_for_verify(batch, self.page_size)
+        if device_index == 0:
+            print(f"DEBUG: [EagleWorker] After spec_info.prepare_for_verify", flush=True)
         batch.return_hidden_states = False
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -988,6 +1034,7 @@ class EAGLEWorker(TpModelWorker):
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        device_index = hidden_states.device.index
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
@@ -995,7 +1042,11 @@ class EAGLEWorker(TpModelWorker):
             num_tokens_for_logprob_per_batch=1,
         )
         batch.return_hidden_states = False
+        if device_index == 0:
+            print(f"DEBUG: [EagleWorker] Before batch.spec_info.prepare_for_extend", flush=True)
         batch.spec_info.prepare_for_extend(batch)
+        if device_index == 0:
+            print(f"DEBUG: [EagleWorker] After batch.spec_info.prepare_for_extend", flush=True)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
@@ -1026,6 +1077,12 @@ class EAGLEWorker(TpModelWorker):
             )
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+        # Debug prints for prepare functions
+        if hasattr(batch, 'req_pool_indices') and batch.req_pool_indices is not None:
+            device_index = batch.req_pool_indices.device.index
+        else:
+            device_index = 0
+            
         assert isinstance(batch.spec_info, EagleDraftInput)
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
@@ -1038,7 +1095,11 @@ class EAGLEWorker(TpModelWorker):
 
         if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
             batch = batch.copy()
+            if device_index == 0:
+                print(f"DEBUG: [EagleWorker] Before batch.prepare_for_idle", flush=True)
             batch.prepare_for_idle()
+            if device_index == 0:
+                print(f"DEBUG: [EagleWorker] After batch.prepare_for_idle", flush=True)
             hidden_size = (
                 self.model_config.hidden_size * 3
                 if self.speculative_algorithm.is_eagle3()
@@ -1054,10 +1115,14 @@ class EAGLEWorker(TpModelWorker):
 
         batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        if device_index == 0:
+            print(f"DEBUG: [EagleWorker] Before batch.spec_info.prepare_extend_after_decode", flush=True)
         batch.spec_info.prepare_extend_after_decode(
             batch,
             self.speculative_num_steps,
         )
+        if device_index == 0:
+            print(f"DEBUG: [EagleWorker] After batch.spec_info.prepare_extend_after_decode", flush=True)
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND
             if not batch.forward_mode.is_idle()
