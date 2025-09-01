@@ -365,7 +365,6 @@ class DeepEPMoE(EPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = get_deepep_mode()
-        self.device_module = torch.get_device_module()
 
         # TODO: move to the beginning of the file
         from sglang.srt.distributed.parallel_state import get_tp_group
@@ -433,14 +432,9 @@ class DeepEPMoE(EPMoE):
             hidden_states, topk_idx, topk_weights, forward_batch
         )
 
-        if ENABLE_DEEPEP_COMBINE_OVERLAP:
-            combine_overlap_args = self._compute_combine_overlap_args(dispatch_output)
-            down_signals = combine_overlap_args["signal"]
-            alt_stream.wait_stream(self.device_module.current_stream())
-        else:
-            combine_overlap_args = down_signals = None
+        combine_overlap_args = self._compute_combine_overlap_args(dispatch_output)
 
-        hidden_states = self.moe_impl(dispatch_output, down_signals=down_signals)
+        hidden_states = self.moe_impl(dispatch_output, down_signals=combine_overlap_args["signal"])
 
         if hook_overlap_on_combine is not None:
             hook_overlap_on_combine()
@@ -457,6 +451,9 @@ class DeepEPMoE(EPMoE):
 
     @staticmethod
     def _compute_combine_overlap_args(dispatch_output):
+        if not ENABLE_DEEPEP_COMBINE_OVERLAP:
+            return None
+
         hidden_states = dispatch_output.hidden_states_fp8
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
