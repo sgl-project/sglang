@@ -622,7 +622,8 @@ class DeepseekV2MoE(nn.Module):
         if ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP:
             def hook_overlap_on_combine():
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(hidden_states)
+                if hidden_states.shape[0] > 0:
+                    shared_output = self._forward_shared_experts(hidden_states)
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
