@@ -836,7 +836,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
     is_hybrid: bool = False
-    eos_token_id: int|None = None
+    eos_token_id: int | None = None
 
     # Batch configs
     model_config: ModelConfig = None
@@ -918,7 +918,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]] = None
+    spec_info: Optional[
+        Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+    ] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1944,7 +1946,9 @@ class ModelWorkerBatch:
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput, LookaheadVerifyInput]] = None
+    spec_info: Optional[
+        Union[EagleVerifyInput, EagleDraftInput, LookaheadVerifyInput]
+    ] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1

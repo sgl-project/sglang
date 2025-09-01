@@ -60,49 +60,57 @@ Lookahead::Lookahead(size_t capacity, const Param& param) {
   root_ = getNode();
 
   if (!(param_.branch_length > 1)) {
-    throw std::runtime_error("param_.branch_length must be greater than 1, current value: " + std::to_string(param_.branch_length));
+    throw std::runtime_error(
+        "param_.branch_length must be greater than 1, current value: " + std::to_string(param_.branch_length));
   }
   if (!(param_.min_match_window_size > 0)) {
-    throw std::runtime_error("min_match_window_size must be greater than 0, current value: " + std::to_string(param_.min_match_window_size));
+    throw std::runtime_error(
+        "min_match_window_size must be greater than 0, current value: " + std::to_string(param_.min_match_window_size));
   }
   if (!(param_.min_match_window_size <= param_.max_match_window_size)) {
-    throw std::runtime_error("min_match_window_size must be less than or equal to max_match_window_size, current min_match_window_size: " +
-                             std::to_string(param_.min_match_window_size) + ", max_match_window_size: " +
-                             std::to_string(param_.max_match_window_size));
+    throw std::runtime_error(
+        "min_match_window_size must be less than or equal to max_match_window_size, current min_match_window_size: " +
+        std::to_string(param_.min_match_window_size) +
+        ", max_match_window_size: " + std::to_string(param_.max_match_window_size));
   }
   if (!(param_.max_match_window_size < param_.branch_length)) {
-    throw std::runtime_error("max_match_window_size must be less than branch_length, current max_match_window_size: " +
-                             std::to_string(param_.max_match_window_size) + ", branch_length: " +
-                             std::to_string(param_.branch_length));
+    throw std::runtime_error(
+        "max_match_window_size must be less than branch_length, current max_match_window_size: " +
+        std::to_string(param_.max_match_window_size) + ", branch_length: " + std::to_string(param_.branch_length));
   }
   if (!(param_.min_bfs_breadth > 0)) {
-    throw std::runtime_error("min_bfs_breadth must be greater than 0, current value: " + std::to_string(param_.min_bfs_breadth));
+    throw std::runtime_error(
+        "min_bfs_breadth must be greater than 0, current value: " + std::to_string(param_.min_bfs_breadth));
   }
   if (!(param_.min_bfs_breadth <= param_.max_bfs_breadth)) {
-    throw std::runtime_error("min_bfs_breadth must be less than or equal to max_bfs_breadth, current min_bfs_breadth: " +
-                             std::to_string(param_.min_bfs_breadth) + ", max_bfs_breadth: " +
-                             std::to_string(param_.max_bfs_breadth));
+    throw std::runtime_error(
+        "min_bfs_breadth must be less than or equal to max_bfs_breadth, current min_bfs_breadth: " +
+        std::to_string(param_.min_bfs_breadth) + ", max_bfs_breadth: " + std::to_string(param_.max_bfs_breadth));
   }
   if (!(param_.draft_token_num > 0)) {
-    throw std::runtime_error("draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
+    throw std::runtime_error(
+        "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
   }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
       if (!(config <= param_.draft_token_num)) {
-        throw std::runtime_error("batch_draft_token_num config value " + std::to_string(config) +
-                                 " must be less than or equal to draft_token_num: " + std::to_string(param_.draft_token_num));
+        throw std::runtime_error(
+            "batch_draft_token_num config value " + std::to_string(config) +
+            " must be less than or equal to draft_token_num: " + std::to_string(param_.draft_token_num));
       }
     }
   }
   for (auto config : param_.batch_min_match_window_size) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
       if (!(config >= param_.min_match_window_size)) {
-        throw std::runtime_error("batch_min_match_window_size config value " + std::to_string(config) +
-                                 " must be greater than or equal to min_match_window_size: " + std::to_string(param_.min_match_window_size));
+        throw std::runtime_error(
+            "batch_min_match_window_size config value " + std::to_string(config) +
+            " must be greater than or equal to min_match_window_size: " + std::to_string(param_.min_match_window_size));
       }
       if (!(config <= param_.max_match_window_size)) {
-        throw std::runtime_error("batch_min_match_window_size config value " + std::to_string(config) +
-                                 " must be less than or equal to max_match_window_size: " + std::to_string(param_.max_match_window_size));
+        throw std::runtime_error(
+            "batch_min_match_window_size config value " + std::to_string(config) +
+            " must be less than or equal to max_match_window_size: " + std::to_string(param_.max_match_window_size));
       }
     }
   }

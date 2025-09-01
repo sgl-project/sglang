@@ -770,7 +770,7 @@ class EAGLEWorker(TpModelWorker):
             hidden_states = logits_output.hidden_states
 
         return score_list, token_list, parents_list
-    
+
     def reset(self):
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()

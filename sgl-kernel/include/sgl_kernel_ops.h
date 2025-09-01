@@ -467,11 +467,11 @@ void reconstruct_indices_from_tree_mask(
     int64_t draft_token_num);
 
 void lookahead_verify_tree_greedy(
-    at::Tensor accept_token_num,  // mutable
-    at::Tensor accept_token_ids,  // mutable
-    at::Tensor last_verified_ids, // mutable
-    at::Tensor flatten_index,     // mutable
-    at::Tensor total_accept_num,  // mutable
+    at::Tensor accept_token_num,   // mutable
+    at::Tensor accept_token_ids,   // mutable
+    at::Tensor last_verified_ids,  // mutable
+    at::Tensor flatten_index,      // mutable
+    at::Tensor total_accept_num,   // mutable
     at::Tensor candidates,
     at::Tensor retrive_index,
     at::Tensor retrive_next_token,
