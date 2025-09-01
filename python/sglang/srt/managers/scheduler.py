@@ -2139,20 +2139,22 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if self.disaggregation_mode == DisaggregationMode.NULL:
+        is_idle_state = (
+            len(self.waiting_queue) == 0
+            and self.running_batch.is_empty()
+            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+        )
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
             is_idle_state = (
-                len(self.waiting_queue) == 0
-                and self.running_batch.is_empty()
-                and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
-            )
-        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            is_idle_state = (
-                len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                is_idle_state
+                and len(self.disagg_prefill_bootstrap_queue.queue) == 0
                 and len(self.disagg_prefill_inflight_queue) == 0
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             is_idle_state = (
-                len(self.disagg_decode_prealloc_queue.queue) == 0
+                is_idle_state
+                and len(self.disagg_decode_prealloc_queue.queue) == 0
                 and len(self.disagg_decode_transfer_queue.queue) == 0
             )
         if is_idle_state:
