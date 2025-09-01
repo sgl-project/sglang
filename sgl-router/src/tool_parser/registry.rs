@@ -1,11 +1,14 @@
-use crate::tool_parser::json_parser::JsonParser;
-use crate::tool_parser::llama_parser::LlamaParser;
-use crate::tool_parser::mistral_parser::MistralParser;
-use crate::tool_parser::pythonic_parser::PythonicParser;
-use crate::tool_parser::qwen_parser::QwenParser;
+use crate::tool_parser::parsers::{
+    DeepSeekParser, Glm4MoeParser, GptOssParser, JsonParser, KimiK2Parser, LlamaParser,
+    MistralParser, PythonicParser, QwenParser, Step3Parser,
+};
 use crate::tool_parser::traits::ToolParser;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Global singleton registry instance - created once and reused
+pub static GLOBAL_REGISTRY: Lazy<ParserRegistry> = Lazy::new(ParserRegistry::new_internal);
 
 /// Registry for tool parsers and model mappings
 pub struct ParserRegistry {
@@ -18,8 +21,19 @@ pub struct ParserRegistry {
 }
 
 impl ParserRegistry {
-    /// Create a new parser registry with default mappings
-    pub fn new() -> Self {
+    /// Get the global singleton instance
+    pub fn new() -> &'static Self {
+        &GLOBAL_REGISTRY
+    }
+
+    /// Create a new instance for testing (not the singleton)
+    #[cfg(test)]
+    pub fn new_for_testing() -> Self {
+        Self::new_internal()
+    }
+
+    /// Internal constructor for creating the singleton instance
+    fn new_internal() -> Self {
         let mut registry = Self {
             parsers: HashMap::new(),
             model_mapping: HashMap::new(),
@@ -112,6 +126,21 @@ impl ParserRegistry {
 
         // Llama parser - <|python_tag|>{...} or plain JSON format
         self.register_parser("llama", Arc::new(LlamaParser::new()));
+
+        // DeepSeek V3 parser - Unicode tokens with JSON blocks
+        self.register_parser("deepseek", Arc::new(DeepSeekParser::new()));
+
+        // GLM-4 MoE parser - XML-style key-value format
+        self.register_parser("glm4_moe", Arc::new(Glm4MoeParser::new()));
+
+        // Step3 parser - StepTML XML format
+        self.register_parser("step3", Arc::new(Step3Parser::new()));
+
+        // Kimi K2 parser - Token-based with indexed functions
+        self.register_parser("kimik2", Arc::new(KimiK2Parser::new()));
+
+        // GPT-OSS parser - Channel format
+        self.register_parser("gpt_oss", Arc::new(GptOssParser::new()));
     }
 
     /// Register default model mappings
@@ -143,8 +172,33 @@ impl ParserRegistry {
         self.map_model("llama-*", "json");
         self.map_model("meta-llama-*", "json");
 
-        // DeepSeek models - DeepSeek v3 would need custom parser, v2 uses pythonic
+        // DeepSeek models
+        // DeepSeek V3 uses custom Unicode token format
+        self.map_model("deepseek-v3*", "deepseek");
+        self.map_model("deepseek-ai/DeepSeek-V3*", "deepseek");
+        // DeepSeek V2 uses pythonic format
         self.map_model("deepseek-*", "pythonic");
+
+        // GLM models
+        // GLM-4 MoE uses XML-style format
+        self.map_model("glm-4-moe*", "glm4_moe");
+        self.map_model("THUDM/glm-4-moe*", "glm4_moe");
+        self.map_model("glm-4.5*", "glm4_moe");
+        // Other GLM models may use JSON
+        self.map_model("glm-*", "json");
+
+        // Step3 models
+        self.map_model("step3*", "step3");
+        self.map_model("Step-3*", "step3");
+
+        // Kimi models
+        self.map_model("kimi-k2*", "kimik2");
+        self.map_model("Kimi-K2*", "kimik2");
+        self.map_model("moonshot*/Kimi-K2*", "kimik2");
+
+        // GPT-OSS models (T4-style)
+        self.map_model("gpt-oss*", "gpt_oss");
+        self.map_model("t4-*", "gpt_oss");
 
         // Other models default to JSON
         self.map_model("gemini-*", "json");
@@ -163,8 +217,8 @@ impl ParserRegistry {
     }
 }
 
-impl Default for ParserRegistry {
+impl Default for &'static ParserRegistry {
     fn default() -> Self {
-        Self::new()
+        ParserRegistry::new()
     }
 }
