@@ -73,6 +73,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    ClearHiCacheReqInput,
+    ClearHiCacheReqOutput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -386,6 +388,9 @@ class TokenizerManager:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.clear_hicache_storage_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -446,6 +451,10 @@ class TokenizerManager:
                 (
                     SlowDownReqOutput,
                     self.slow_down_communicator.handle_recv,
+                ),
+                (
+                    ClearHiCacheReqOutput,
+                    self.clear_hicache_storage_communicator.handle_recv,
                 ),
                 (
                     FlushCacheReqOutput,
@@ -988,6 +997,13 @@ class TokenizerManager:
     async def flush_cache(self) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
+    async def clear_hicache_storage(self) -> ClearHiCacheReqOutput:
+        """Clear the hierarchical cache storage."""
+        # Delegate to the scheduler to handle HiCacheStorage clearing
+        return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
+            0
+        ]
+
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
             return
@@ -1319,13 +1335,11 @@ class TokenizerManager:
         # Many DP ranks
         return [res.internal_state for res in responses]
 
-    async def set_internal_state(
-        self, obj: SetInternalStateReq
-    ) -> SetInternalStateReqOutput:
+    async def set_internal_state(self, obj: SetInternalStateReq) -> List[bool]:
         responses: List[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )
-        return [res.internal_state for res in responses]
+        return [res.updated for res in responses]
 
     async def get_load(self) -> dict:
         # TODO(lsyin): fake load report server
