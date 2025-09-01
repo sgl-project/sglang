@@ -256,7 +256,7 @@ class MambaAttnBackend(AttentionBackend):
             v=value,
             g=g,
             beta=beta,
-            initial_state=recurrent_state,
+            initial_state=recurrent_state,  # unified use existing state (zeros for new sequences)
             output_final_state=recurrent_state is not None,
             cu_seqlens=query_start_loc,
             head_first=False,

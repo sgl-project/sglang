@@ -45,12 +45,12 @@ class MambaCacheManager:
         # TODO: FIX ME
         max_batch_size = global_server_args_dict["max_running_requests"]
 
-        conv_state = torch.empty(
+        conv_state = torch.zeros(
             size=(num_mamba_layers, max_batch_size + 1) + conv_state_shape,
             dtype=conv_dtype,
             device="cuda",
         )
-        temporal_state = torch.empty(
+        temporal_state = torch.zeros(
             size=(num_mamba_layers, max_batch_size + 1) + temporal_state_shape,
             dtype=ssm_dtype,
             device="cuda",
