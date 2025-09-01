@@ -231,11 +231,14 @@ class HFRunner:
 
         # Load the model and tokenizer
         if self.model_type == "generation":
-            config = AutoConfig.from_pretrained(model_path)
-            if model_archs := getattr(config, "architectures"):
-                model_cls = getattr(transformers, model_archs[0])
-            else:
+            config = AutoConfig.from_pretrained(
+                model_path, trust_remote_code=self.trust_remote_code
+            )
+            if self.trust_remote_code:
                 model_cls = AutoModelForCausalLM
+            else:
+                model_arch = getattr(config, "architectures")[0]
+                model_cls = getattr(transformers, model_arch)
             self.base_model = model_cls.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
@@ -488,7 +491,7 @@ class SRTRunner:
         tp_size: int = 1,
         model_impl: str = "auto",
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-        lora_paths: List[str] = None,
+        lora_paths: Optional[Union[List[str], List[dict[str, str]]]] = None,
         max_loras_per_batch: int = 4,
         attention_backend: Optional[str] = None,
         prefill_attention_backend: Optional[str] = None,
@@ -568,8 +571,8 @@ class SRTRunner:
         else:
             self.tokenizer = None
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str):
-        return self.engine.load_lora_adapter(lora_name, lora_path)
+    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
+        return self.engine.load_lora_adapter(lora_name, lora_path, pinned)
 
     def unload_lora_adapter(self, lora_name: str):
         return self.engine.unload_lora_adapter(lora_name)

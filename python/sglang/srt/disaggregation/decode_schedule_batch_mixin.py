@@ -76,6 +76,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req_pool_indices, dtype=torch.int64, device=self.device
         )
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.orig_seq_lens = torch.tensor(
+            seq_lens, dtype=torch.int32, device=self.device
+        )
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 

@@ -1,6 +1,9 @@
 //! Factory for creating router instances
 
-use super::{pd_router::PDRouter, router::Router, RouterTrait};
+use super::{
+    http::{pd_router::PDRouter, router::Router},
+    RouterTrait,
+};
 use crate::config::{PolicyConfig, RoutingMode};
 use crate::policies::PolicyFactory;
 use crate::server::AppContext;
@@ -11,29 +14,40 @@ pub struct RouterFactory;
 
 impl RouterFactory {
     /// Create a router instance from application context
-    pub fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+    pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        // Check if IGW mode is enabled
+        if ctx.router_config.enable_igw {
+            return Self::create_igw_router(ctx).await;
+        }
+
+        // TODO: Add gRPC mode check here when implementing gRPC support
+
+        // Default to HTTP proxy mode
         match &ctx.router_config.mode {
             RoutingMode::Regular { worker_urls } => {
-                Self::create_regular_router(worker_urls, &ctx.router_config.policy, ctx)
+                Self::create_regular_router(worker_urls, &ctx.router_config.policy, ctx).await
             }
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
                 prefill_policy,
                 decode_policy,
-            } => Self::create_pd_router(
-                prefill_urls,
-                decode_urls,
-                prefill_policy.as_ref(),
-                decode_policy.as_ref(),
-                &ctx.router_config.policy,
-                ctx,
-            ),
+            } => {
+                Self::create_pd_router(
+                    prefill_urls,
+                    decode_urls,
+                    prefill_policy.as_ref(),
+                    decode_policy.as_ref(),
+                    &ctx.router_config.policy,
+                    ctx,
+                )
+                .await
+            }
         }
     }
 
     /// Create a regular router with injected policy
-    fn create_regular_router(
+    async fn create_regular_router(
         worker_urls: &[String],
         policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
@@ -50,13 +64,17 @@ impl RouterFactory {
             ctx.router_config.worker_startup_check_interval_secs,
             ctx.router_config.dp_aware,
             ctx.router_config.api_key.clone(),
-        )?;
+            ctx.router_config.retry.clone(),
+            ctx.router_config.circuit_breaker.clone(),
+            ctx.router_config.health_check.clone(),
+        )
+        .await?;
 
         Ok(Box::new(router))
     }
 
     /// Create a PD router with injected policy
-    fn create_pd_router(
+    async fn create_pd_router(
         prefill_urls: &[(String, Option<u16>)],
         decode_urls: &[String],
         prefill_policy_config: Option<&PolicyConfig>,
@@ -79,8 +97,41 @@ impl RouterFactory {
             ctx.client.clone(),
             ctx.router_config.worker_startup_timeout_secs,
             ctx.router_config.worker_startup_check_interval_secs,
-        )?;
+            ctx.router_config.retry.clone(),
+            ctx.router_config.circuit_breaker.clone(),
+            ctx.router_config.health_check.clone(),
+        )
+        .await?;
 
         Ok(Box::new(router))
+    }
+
+    /// Create a gRPC router with injected policy
+    pub async fn create_grpc_router(
+        _worker_urls: &[String],
+        _policy_config: &PolicyConfig,
+        _ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        // For now, return an error as gRPC router is not yet implemented
+        Err("gRPC router is not yet implemented".to_string())
+    }
+
+    /// Create a gRPC PD router (placeholder for now)
+    pub async fn create_grpc_pd_router(
+        _prefill_urls: &[(String, Option<u16>)],
+        _decode_urls: &[String],
+        _prefill_policy_config: Option<&PolicyConfig>,
+        _decode_policy_config: Option<&PolicyConfig>,
+        _main_policy_config: &PolicyConfig,
+        _ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        // For now, return an error as gRPC PD router is not yet implemented
+        Err("gRPC PD router is not yet implemented".to_string())
+    }
+
+    /// Create an IGW router (placeholder for future implementation)
+    async fn create_igw_router(_ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        // For now, return an error indicating IGW is not yet implemented
+        Err("IGW mode is not yet implemented".to_string())
     }
 }

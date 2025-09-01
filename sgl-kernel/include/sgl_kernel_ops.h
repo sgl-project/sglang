@@ -130,6 +130,7 @@ int64_t cutlass_mla_get_workspace_size(
     int64_t num_batches,
     int64_t sm_count = 0,
     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
+
 /*
  * From csrc/elementwise
  */
@@ -150,11 +151,29 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor cos_sin_cache,
     at::Tensor pos_ids,
     bool interleave,
+    bool enable_pdl,
+    int64_t cuda_stream,
+    const std::optional<at::Tensor>& v,
+    const std::optional<at::Tensor>& k_buffer,
+    const std::optional<at::Tensor>& v_buffer,
+    const std::optional<at::Tensor>& kv_cache_loc);
+
+void downcast_fp8(
+    at::Tensor& k,
+    at::Tensor& v,
+    at::Tensor& k_out,
+    at::Tensor& v_out,
+    at::Tensor& k_scale,
+    at::Tensor& v_scale,
+    at::Tensor& loc,
+    int64_t mult,
+    int64_t offset,
     int64_t cuda_stream);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
+
 /*
  * From csrc/gemm
  */
@@ -217,8 +236,42 @@ void bmm_fp8(
     int64_t cublas_handle,
     int64_t cuda_stream);
 void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
-
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
+
+torch::Tensor gptq_marlin_gemm(
+    torch::Tensor& a,
+    std::optional<torch::Tensor> c_or_none,
+    torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& global_scale_or_none,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& g_idx_or_none,
+    std::optional<torch::Tensor> const& perm_or_none,
+    torch::Tensor& workspace,
+    sglang::ScalarTypeId const& b_q_type_id,
+    int64_t size_m,
+    int64_t size_n,
+    int64_t size_k,
+    bool is_k_full,
+    bool use_atomic_add,
+    bool use_fp32_reduce,
+    bool is_zp_float);
+
+torch::Tensor gptq_gemm(
+    torch::Tensor a,
+    torch::Tensor b_q_weight,
+    torch::Tensor b_gptq_qzeros,
+    torch::Tensor b_gptq_scales,
+    torch::Tensor b_g_idx,
+    bool use_shuffle,
+    int64_t bit);
+
+void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
+
+torch::Tensor
+gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits);
+
+torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
 
 /*
  * From csrc/moe
@@ -243,7 +296,8 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
-    double routed_scaling_factor);
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
 
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
@@ -335,14 +389,67 @@ void scaled_fp4_experts_quant(
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts);
 
-namespace marlin_moe_wna16 {
+void silu_and_mul_scaled_fp4_experts_quant(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& mask,
+    bool use_silu_and_mul);
+/*
+ * From csrc/moe/cutlass_moe/w4a8
+ */
+void get_cutlass_w4a8_moe_mm_data(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
 
-torch::Tensor
-gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits);
+void cutlass_w4a8_moe_mm(
+    torch::Tensor& d_tensors,
+    torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors,
+    torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides,
+    torch::Tensor const& d_strides,
+    torch::Tensor const& s_strides,
+    int64_t chunk_size,
+    int64_t topk);
 
-torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
-
-}  // namespace marlin_moe_wna16
+torch::Tensor moe_wna16_marlin_gemm(
+    torch::Tensor& a,
+    std::optional<torch::Tensor> const& c_or_none,
+    torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& g_idx_or_none,
+    std::optional<torch::Tensor> const& perm_or_none,
+    torch::Tensor& workspace,
+    torch::Tensor& sorted_token_ids,
+    torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded,
+    torch::Tensor& topk_weights,
+    int64_t moe_block_size,
+    int64_t top_k,
+    bool mul_topk_weights,
+    bool is_ep,
+    sglang::ScalarTypeId const& b_q_type_id,
+    int64_t size_m,
+    int64_t size_n,
+    int64_t size_k,
+    bool is_k_full,
+    bool use_atomic_add,
+    bool use_fp32_reduce,
+    bool is_zp_float);
 
 /*
  * From csrc/speculative
@@ -418,6 +525,7 @@ void transfer_kv_per_layer_pf_lf(
     at::Tensor dst_v,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
+    int64_t layer_id,
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
@@ -462,6 +570,7 @@ void transfer_kv_per_layer_mla_pf_lf(
     at::Tensor dst,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
+    int64_t layer_id,
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
@@ -494,35 +603,6 @@ void transfer_kv_direct(
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
     int64_t page_size);
-
-/*
- * From csrc/moe/cutlass_moe/w4a8
- */
-void get_cutlass_w4a8_moe_mm_data(
-    const torch::Tensor& topk_ids,
-    torch::Tensor& expert_offsets,
-    torch::Tensor& problem_sizes1,
-    torch::Tensor& problem_sizes2,
-    torch::Tensor& input_permutation,
-    torch::Tensor& output_permutation,
-    const int64_t num_experts,
-    const int64_t n,
-    const int64_t k);
-
-void cutlass_w4a8_moe_mm(
-    torch::Tensor& d_tensors,
-    torch::Tensor const& a_tensors,
-    torch::Tensor const& b_tensors,
-    torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales,
-    torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides,
-    torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
-    int64_t chunk_size,
-    int64_t topk);
 
 /*
  * From FlashInfer
@@ -561,31 +641,9 @@ void top_p_sampling_from_probs(
     double top_p_val,
     bool deterministic,
     std::optional<at::Generator> gen);
-torch::Tensor moe_wna16_marlin_gemm(
-    torch::Tensor& a,
-    std::optional<torch::Tensor> const& c_or_none,
-    torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales,
-    std::optional<torch::Tensor> const& b_zeros_or_none,
-    std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none,
-    torch::Tensor& workspace,
-    torch::Tensor& sorted_token_ids,
-    torch::Tensor& expert_ids,
-    torch::Tensor& num_tokens_past_padded,
-    torch::Tensor& topk_weights,
-    int64_t moe_block_size,
-    int64_t top_k,
-    bool mul_topk_weights,
-    bool is_ep,
-    sglang::ScalarTypeId const& b_q_type_id,
-    int64_t size_m,
-    int64_t size_n,
-    int64_t size_k,
-    bool is_k_full,
-    bool use_atomic_add,
-    bool use_fp32_reduce,
-    bool is_zp_float);
+
+void top_k_mask_logits(
+    at::Tensor logits, at::Tensor mask_logits, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
 namespace flash {
 /*
@@ -693,3 +751,8 @@ void qserve_w4a8_per_group_gemm(
  * From csrc/spatial
  */
 std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device);
+
+/*
+ * From csrc/memory
+ */
+void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);

@@ -14,9 +14,18 @@
 """Pydantic models for OpenAI API protocol"""
 
 import time
+import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TypeAlias, Union
 
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseInputItemParam,
+    ResponseOutputItem,
+    ResponseReasoningItem,
+)
+from openai.types.responses.response import ToolChoice
+from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     Field,
@@ -25,6 +34,8 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
+
+DEFAULT_MODEL_NAME = "default"
 
 
 class ModelCard(BaseModel):
@@ -84,6 +95,7 @@ class UsageInfo(BaseModel):
     completion_tokens: Optional[int] = 0
     # only used to return cached tokens when --enable-cache-report is set
     prompt_tokens_details: Optional[Dict[str, int]] = None
+    reasoning_tokens: Optional[int] = 0
 
 
 class StreamOptions(BaseModel):
@@ -96,6 +108,23 @@ class JsonSchemaResponseFormat(BaseModel):
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
     strict: Optional[bool] = False
+
+
+class ResponseFormat(BaseModel):
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: Optional[JsonSchemaResponseFormat] = None
+
+
+class StructuresResponseFormat(BaseModel):
+    begin: str
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    end: str
+
+
+class StructuralTagResponseFormat(BaseModel):
+    type: Literal["structural_tag"]
+    structures: List[StructuresResponseFormat]
+    triggers: List[str]
 
 
 class FileRequest(BaseModel):
@@ -156,7 +185,7 @@ class BatchResponse(BaseModel):
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
     echo: bool = False
@@ -190,6 +219,7 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -230,6 +260,7 @@ class CompletionResponse(BaseModel):
     model: str
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class CompletionResponseStreamChoice(BaseModel):
@@ -316,7 +347,7 @@ class ToolCall(BaseModel):
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant", "tool"]
+    role: Literal["system", "assistant", "tool", "function"]
     content: Union[str, List[ChatCompletionMessageContentTextPart], None] = Field(
         default=None
     )
@@ -330,9 +361,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
     def _normalize_role(cls, v):
         if isinstance(v, str):
             v_lower = v.lower()
-            if v_lower not in {"system", "assistant", "tool"}:
+            if v_lower not in {"system", "assistant", "tool", "function"}:
                 raise ValueError(
-                    "'role' must be one of 'system', 'assistant', or 'tool' (case-insensitive)."
+                    "'role' must be one of 'system', 'assistant', 'tool', or 'function' (case-insensitive)."
                 )
             return v_lower
         raise ValueError("'role' must be a string")
@@ -346,23 +377,6 @@ class ChatCompletionMessageUserParam(BaseModel):
 ChatCompletionMessageParam = Union[
     ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam
 ]
-
-
-class ResponseFormat(BaseModel):
-    type: Literal["text", "json_object", "json_schema"]
-    json_schema: Optional[JsonSchemaResponseFormat] = None
-
-
-class StructuresResponseFormat(BaseModel):
-    begin: str
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    end: str
-
-
-class StructuralTagResponseFormat(BaseModel):
-    type: Literal["structural_tag"]
-    structures: List[StructuresResponseFormat]
-    triggers: List[str]
 
 
 class Function(BaseModel):
@@ -398,7 +412,7 @@ class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
@@ -428,6 +442,13 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
+        default="medium",
+        description="Constrains effort on reasoning for reasoning models. "
+        "'low' is the least effort, 'high' is the most effort. Reducing reasoning effort can "
+        "result in faster responses and fewer tokens used on reasoning in a response. "
+        "Currently only supported for OpenAI models.",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -437,6 +458,66 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_reasoning_inputs(cls, values: Dict):
+        r = values.get("reasoning")
+        if r is None:
+            return values
+
+        if isinstance(r, dict):
+            effort = r.get("effort") or r.get("reasoning_effort")
+            if effort in {"low", "medium", "high"}:
+                values["reasoning_effort"] = effort
+
+            enabled = (
+                r.get("enabled")
+                if r.get("enabled") is not None
+                else r.get("enable", False)
+            )
+            if isinstance(enabled, str):
+                enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
+            if enabled:
+                ctk = values.get("chat_template_kwargs")
+                if not isinstance(ctk, dict):
+                    ctk = {}
+                ctk.setdefault("thinking", True)
+                values["chat_template_kwargs"] = ctk
+
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_json_schema(cls, values):
+        response_format = values.get("response_format")
+        if not response_format:
+            return values
+
+        if response_format.get("type") != "json_schema":
+            return values
+
+        schema = response_format.pop("schema", None)
+        json_schema = response_format.get("json_schema")
+
+        if json_schema:
+            return values
+
+        if schema:
+            name_ = schema.get("title", "Schema")
+            strict_ = False
+            if "properties" in schema and "strict" in schema["properties"]:
+                item = schema["properties"].pop("strict", None)
+                if item and item.get("default", False):
+                    strict_ = True
+
+            response_format["json_schema"] = {
+                "name": name_,
+                "schema": schema,
+                "strict": strict_,
+            }
+
         return values
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -500,6 +581,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class DeltaMessage(BaseModel):
@@ -552,7 +634,7 @@ class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
     input: EmbeddingInput
-    model: str
+    model: str = DEFAULT_MODEL_NAME
     encoding_format: str = "float"
     dimensions: Optional[int] = None
     user: Optional[str] = None
@@ -586,7 +668,7 @@ class ScoringRequest(BaseModel):
     )
     apply_softmax: bool = False
     item_first: bool = False
-    model: str
+    model: str = DEFAULT_MODEL_NAME
 
 
 class ScoringResponse(BaseModel):
@@ -619,6 +701,196 @@ OpenAIServingRequest = Union[
 ]
 
 
+# Response API protocol definitions
+class ResponseReasoningParam(BaseModel):
+    """Reasoning parameters for responses."""
+
+    effort: Optional[Literal["low", "medium", "high"]] = Field(
+        default="medium",
+        description="Constrains effort on reasoning for reasoning models.",
+    )
+
+
+class ResponseTool(BaseModel):
+    """Tool definition for responses."""
+
+    type: Literal["web_search_preview", "code_interpreter"] = Field(
+        description="Type of tool to enable"
+    )
+
+
+ResponseInputOutputItem: TypeAlias = Union[
+    ResponseInputItemParam,
+    "ResponseReasoningItem",
+    ResponseFunctionToolCall,
+]
+
+
+class ResponsesRequest(BaseModel):
+    """Request body for v1/responses endpoint."""
+
+    # Core OpenAI API fields (ordered by official documentation)
+    background: Optional[bool] = False
+    include: Optional[
+        List[
+            Literal[
+                "code_interpreter_call.outputs",
+                "computer_call_output.output.image_url",
+                "file_search_call.results",
+                "message.input_image.image_url",
+                "message.output_text.logprobs",
+                "reasoning.encrypted_content",
+            ]
+        ]
+    ] = None
+    input: Union[str, List[ResponseInputOutputItem]]
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = None
+    max_tool_calls: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
+    model: Optional[str] = None  # Made optional to match vLLM
+    parallel_tool_calls: Optional[bool] = True
+    previous_response_id: Optional[str] = None
+    reasoning: Optional[ResponseReasoningParam] = None
+    service_tier: Literal["auto", "default", "flex", "scale", "priority"] = "auto"
+    store: Optional[bool] = True
+    stream: Optional[bool] = False
+    temperature: Optional[float] = None
+    tool_choice: Literal["auto", "required", "none"] = "auto"
+    tools: List[ResponseTool] = Field(default_factory=list)
+    top_logprobs: Optional[int] = 0
+    top_p: Optional[float] = None
+    truncation: Optional[Literal["auto", "disabled"]] = "disabled"
+    user: Optional[str] = None
+
+    # Extra SGLang parameters
+    request_id: str = Field(
+        default_factory=lambda: f"resp_{uuid.uuid4().hex}",
+        description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
+    )
+    priority: int = Field(default=0, description="Request priority")
+
+    # SGLang-specific sampling parameters
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    stop: Optional[Union[str, List[str]]] = None
+    top_k: int = -1
+    min_p: float = 0.0
+    repetition_penalty: float = 1.0
+
+    # Default sampling parameters
+    _DEFAULT_SAMPLING_PARAMS = {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "top_k": -1,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+    }
+
+    def to_sampling_params(
+        self, default_max_tokens: int, default_params: Optional[Dict] = None
+    ) -> Dict[str, Any]:
+        """Convert to sampling parameters for generation."""
+        if default_params is None:
+            default_params = {}
+
+        # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
+        if self.max_output_tokens is not None:
+            max_tokens = min(self.max_output_tokens, default_max_tokens)
+        else:
+            max_tokens = default_max_tokens
+
+        # Avoid exceed the context length by minus 2 token
+        max_tokens -= 2
+
+        # Get parameters with defaults
+        temperature = self.temperature
+        if temperature is None:
+            temperature = default_params.get(
+                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
+            )
+
+        top_p = self.top_p
+        if top_p is None:
+            top_p = default_params.get("top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
+
+        params = {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+            "stop": self.stop,
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "repetition_penalty": self.repetition_penalty,
+        }
+
+        # Apply any additional default parameters
+        for key, value in default_params.items():
+            if key not in params or params[key] is None:
+                params[key] = value
+
+        return params
+
+
+class PromptTokenUsageInfo(BaseModel):
+    """Prompt token usage details."""
+
+    cached_tokens: int = 0
+
+
+class ResponsesResponse(BaseModel):
+    """Response body for v1/responses endpoint."""
+
+    id: str = Field(default_factory=lambda: f"resp_{time.time()}")
+    object: Literal["response"] = "response"
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+
+    output: List[
+        Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
+    ] = Field(default_factory=list)
+    status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
+    usage: Optional[UsageInfo] = None
+    parallel_tool_calls: bool = True
+    tool_choice: str = "auto"
+    tools: List[ResponseTool] = Field(default_factory=list)
+
+    @classmethod
+    def from_request(
+        cls,
+        request: ResponsesRequest,
+        sampling_params: Any,
+        model_name: str,
+        created_time: int,
+        output: List[
+            Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
+        ],
+        status: str,
+        usage: Optional[UsageInfo],
+    ) -> "ResponsesResponse":
+        """Create a response from a request."""
+        return cls(
+            id=request.request_id,
+            created_at=created_time,
+            model=model_name,
+            output=output,
+            status=status,
+            usage=usage,
+            parallel_tool_calls=request.parallel_tool_calls or True,
+            tool_choice=request.tool_choice,
+            tools=request.tools,
+        )
+
+
+class RequestResponseMetadata(BaseModel):
+    """Metadata for request/response tracking."""
+
+    request_id: str
+    final_usage_info: Optional[UsageInfo] = None
+
+
 @dataclass
 class MessageProcessingResult:
     """Result of processing chat messages and applying templates.
@@ -645,3 +917,13 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[Any] = None
+
+
+class ResponseReasoningTextContent(BaseModel):
+    text: str
+    type: Literal["reasoning_text"] = "reasoning_text"
+
+
+ResponseInputOutputItem: TypeAlias = Union[
+    ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
+]
