@@ -476,8 +476,8 @@ class DeepEPMoE(EPMoE):
         # TODO use zero_allocator
         combine_signal = torch.zeros(
             # TODO their deepep requires the size to be this large, temp use theirs to avoid changing their code
-            # but should optimize later
-            # (num_local_experts, ceil_div(num_tokens_static, block_m)),
+            #      but should optimize later
+            #      this may be better: (num_local_experts, ceil_div(num_tokens_static, block_m)),
             num_local_experts * ceil_div(num_tokens_static, 64),
             dtype=torch.int32,
             device=hidden_states.device,
@@ -486,14 +486,15 @@ class DeepEPMoE(EPMoE):
         down_start_event = torch.cuda.Event()
 
         combine_overlap_args = dict(
-            signal=combine_signal.flatten(),
+            signal=combine_signal,
             block_m=block_m,
             threshold=ceil_div(hidden_dim, block_n),
             num_sms=DEEPEP_LL_COMBINE_SEND_NUM_SMS,
         )
 
         down_overlap_args = dict(
-            down_signals=combine_signal,
+            down_signals=combine_signal[:num_local_experts * ceil_div(num_tokens_static, block_m)].view(
+                num_local_experts, ceil_div(num_tokens_static, block_m)),
             down_start_event=down_start_event,
         )
 
