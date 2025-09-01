@@ -14,7 +14,6 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
-from sglang.srt.layers.moe.token_dispatcher.deepep import DEEPEP_LL_COMBINE_SEND_NUM_SMS
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -820,6 +819,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.enable_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
         self._cache_permute_indices = {}
 
+        from sglang.srt.layers.moe.token_dispatcher.deepep import DEEPEP_LL_COMBINE_SEND_NUM_SMS
         device_properties = torch.cuda.get_device_properties(device="cuda")
         total_num_sms = device_properties.multi_processor_count
         self.down_sm_count = total_num_sms - DEEPEP_LL_COMBINE_SEND_NUM_SMS
