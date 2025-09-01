@@ -591,15 +591,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             gemm2_scales_mxfp4_shuffled = []
             gemm1_bias_shuffled = []
             gemm2_bias_shuffled = []
+            # Helper to pad K dimension to multiple of 4 for FlashInfer compatibility
+            def _pad_k_to_4(tensor):
+                """Pad last dimension to multiple of 4 if needed. Output is contiguous."""
+                K = tensor.shape[-1]
+                pad_k = (-K) % 4
+                if pad_k == 0:
+                    return tensor
+                return torch.nn.functional.pad(tensor, (0, pad_k), value=0).contiguous()
+            
             epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
             for i in range(self.num_experts):
                 gemm1_weights_mxfp4_shuffled.append(
                     shuffle_matrix_a(w13_weight[i].view(torch.uint8), epilogue_tile_m)
                 )
+                # Pad scale factors to ensure K % 4 == 0 for FlashInfer
+                w13_scale_padded = _pad_k_to_4(w13_weight_scale[i].to(torch.uint8))
+                assert w13_scale_padded.shape[-1] % 4 == 0, f"w13 scale K not aligned: {w13_scale_padded.shape[-1]}"
                 gemm1_scales_mxfp4_shuffled.append(
-                    shuffle_matrix_sf_a(
-                        w13_weight_scale[i].view(torch.uint8), epilogue_tile_m
-                    )
+                    shuffle_matrix_sf_a(w13_scale_padded, epilogue_tile_m)
                 )
                 gemm1_bias_shuffled.append(
                     shuffle_matrix_a(
@@ -610,10 +620,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 gemm2_weights_mxfp4_shuffled.append(
                     shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
                 )
+                # Pad scale factors to ensure K % 4 == 0 for FlashInfer
+                w2_scale_padded = _pad_k_to_4(w2_weight_scale[i].to(torch.uint8))
+                assert w2_scale_padded.shape[-1] % 4 == 0, f"w2 scale K not aligned: {w2_scale_padded.shape[-1]}"
                 gemm2_scales_mxfp4_shuffled.append(
-                    shuffle_matrix_sf_a(
-                        w2_weight_scale[i].view(torch.uint8), epilogue_tile_m
-                    )
+                    shuffle_matrix_sf_a(w2_scale_padded, epilogue_tile_m)
                 )
                 gemm2_bias_shuffled.append(
                     shuffle_matrix_a(w2_bias[i].clone().reshape(-1, 1), epilogue_tile_m)
