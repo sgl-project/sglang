@@ -591,14 +591,31 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
-        combined_hidden_states, event, hook = buffer.low_latency_combine(
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            self.handle,
-            async_finish=not self.return_recv_hook,
-            return_recv_hook=self.return_recv_hook,
-        )
+        if enable_combine_overlap:
+            # TODO let ant change DeepEP to unify the two APIs?
+            combined_hidden_states, event, hook = buffer.ll_overlap_combine(
+                x=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                handle=self.handle,
+                overlap=True,
+                packed_recv_count=self.masked_m,
+                comp_signal=signal,
+                block_m=block_m,
+                threshold=threshold,
+                num_sms=num_sms,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+            )
+        else:
+            combined_hidden_states, event, hook = buffer.low_latency_combine(
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                self.handle,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+            )
         self.handle = None
         return combined_hidden_states, event, hook
 
