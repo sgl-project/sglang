@@ -432,9 +432,9 @@ class DeepEPMoE(EPMoE):
             hidden_states, topk_idx, topk_weights, forward_batch
         )
 
-        combine_overlap_args = self._compute_combine_overlap_args(dispatch_output)
+        combine_overlap_args, down_overlap_args = self._compute_overlap_args(dispatch_output)
 
-        hidden_states = self.moe_impl(dispatch_output, down_signals=combine_overlap_args["signal"])
+        hidden_states = self.moe_impl(dispatch_output, down_overlap_args=down_overlap_args)
 
         if hook_overlap_on_combine is not None:
             hook_overlap_on_combine()
@@ -450,9 +450,9 @@ class DeepEPMoE(EPMoE):
         return hidden_states
 
     @staticmethod
-    def _compute_combine_overlap_args(dispatch_output):
+    def _compute_overlap_args(dispatch_output):
         if not ENABLE_DEEPEP_COMBINE_OVERLAP:
-            return None
+            return None, None
 
         hidden_states = dispatch_output.hidden_states_fp8
         if isinstance(hidden_states, tuple):
@@ -467,14 +467,21 @@ class DeepEPMoE(EPMoE):
             (num_local_experts, ceil_div(num_tokens_static, block_m)),
         )
 
-        overlap_args = dict(
+        down_start_event = torch.cuda.Event()
+
+        combine_overlap_args = dict(
             signal=combine_signal.flatten(),
             block_m=block_m,
             threshold=ceil_div(hidden_dim, block_n),
             num_sms=DEEPEP_LL_COMBINE_SEND_NUM_SMS,
         )
 
-        return overlap_args
+        down_overlap_args = dict(
+            down_signals=combine_signal,
+            down_start_event=down_start_event,
+        )
+
+        return combine_overlap_args, down_overlap_args
 
     def dispatch(
         self,
@@ -490,7 +497,7 @@ class DeepEPMoE(EPMoE):
             forward_batch=forward_batch,
         )
 
-    def moe_impl(self, dispatch_output: DispatchOutput, down_signals: Optional[torch.Tensor]):
+    def moe_impl(self, dispatch_output: DispatchOutput, down_overlap_args: Optional[Dict[str, Any]],):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         if _use_aiter:
@@ -508,7 +515,7 @@ class DeepEPMoE(EPMoE):
                 get_moe_runner_backend().is_flashinfer_cutedsl()
             )
             if enable_flashinfer_cutedsl_moe:
-                return self.forward_flashinfer_cutedsl(dispatch_output, down_signals=down_signals)
+                return self.forward_flashinfer_cutedsl(dispatch_output, down_overlap_args=down_overlap_args)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -693,7 +700,7 @@ class DeepEPMoE(EPMoE):
     def forward_flashinfer_cutedsl(
         self,
         dispatch_output: DeepEPLLOutput,
-        down_signals: Optional[torch.Tensor],
+        down_overlap_args: Optional[Dict[str, Any]],
     ):
         hidden_states, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
@@ -704,7 +711,7 @@ class DeepEPMoE(EPMoE):
             x=hidden_states,
             masked_m=masked_m,
             moe_runner_config=self.moe_runner_config,
-            down_signals=down_signals,
+            down_overlap_args=down_overlap_args,
         )
         return output
 

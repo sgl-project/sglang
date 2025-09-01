@@ -1359,7 +1359,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
-        down_signals: Optional[torch.Tensor] = None,
+        down_overlap_args: Optional[Dict[str, Any]],
     ) -> torch.Tensor:
         assert (
             moe_runner_config.activation == "silu"
@@ -1385,6 +1385,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_alpha=layer.g2_alphas,
             masked_m=masked_m,
             down_sm_count=self.down_sm_count,
-            down_signals=down_signals,
+            down_signals=down_overlap_args["down_signals"],
+            down_start_event=down_overlap_args["down_start_event"],
         )
         return out
