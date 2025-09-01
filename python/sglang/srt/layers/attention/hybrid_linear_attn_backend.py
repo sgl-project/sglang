@@ -112,18 +112,8 @@ class MambaAttnBackend(AttentionBackend):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(
             req_pool_indices
         )
-<<<<<<< HEAD
-        self.state_indices_list[bs - 1][:len(mamba_indices)].copy_(mamba_indices)
-        self.query_start_loc_list[bs - 1].copy_(
-            torch.arange(0, bs + 1, dtype=torch.int32, device="cuda")
-        )
-        if num_padding > 0:
-            self.query_start_loc_list[bs - 1][bs-num_padding:] = bs-num_padding
-        
-=======
         self.state_indices_list[bs - 1][:len(mamba_indices)] = mamba_indices
         self.query_start_loc_list[bs - 1] = self._get_cached_arange(bs, "cuda")
->>>>>>> a1e062522 (No copy over ForwardMetadata and use lru_cache to store aranged query_start_loc)
         self.forward_metadata = ForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
