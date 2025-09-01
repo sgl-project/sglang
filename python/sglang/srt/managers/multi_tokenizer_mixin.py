@@ -85,7 +85,7 @@ class MultiTokenizerMixin:
         return False
 
     def _handle_output_by_index(self, output, i):
-        """NOTE: A maintainable method is need here."""
+        """NOTE: A maintainable method is better here."""
         if isinstance(output, BatchTokenIDOut):
             new_output = BatchTokenIDOut(
                 rids=[output.rids[i]],
