@@ -1,4 +1,5 @@
 from dataclasses import astuple, dataclass
+from functools import lru_cache
 from typing import Optional, Union
 
 from einops import rearrange
@@ -36,12 +37,17 @@ class MambaAttnBackend(AttentionBackend):
         self.state_indices_list = []
         self.query_start_loc_list = []
 
+    @classmethod
+    @lru_cache(maxsize=128)
+    def _get_cached_arange(cls, bs: int, device_str: str) -> torch.Tensor:
+        """Cache torch.arange tensors for common batch sizes to avoid repeated allocation."""
+        device = torch.device(device_str)
+        return torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
         if forward_batch.forward_mode.is_decode_or_idle():
-            query_start_loc = torch.arange(
-                0, bs + 1, dtype=torch.int32, device=self.device
-            )
+            query_start_loc = self._get_cached_arange(bs, str(self.device))
         elif forward_batch.forward_mode.is_prefill():
             query_start_loc = torch.empty(
                 (bs + 1,), dtype=torch.int32, device=self.device
@@ -82,10 +88,8 @@ class MambaAttnBackend(AttentionBackend):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(
             req_pool_indices
         )
-        self.state_indices_list[bs - 1][:len(mamba_indices)].copy_(mamba_indices)
-        self.query_start_loc_list[bs - 1].copy_(
-            torch.arange(0, bs + 1, dtype=torch.int32, device="cuda")
-        )
+        self.state_indices_list[bs - 1][:len(mamba_indices)] = mamba_indices
+        self.query_start_loc_list[bs - 1] = self._get_cached_arange(bs, "cuda")
         self.forward_metadata = ForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -108,6 +112,7 @@ class MambaAttnBackend(AttentionBackend):
         mamba_indices = self.req_to_token_pool.get_mamba_indices(
             req_pool_indices
         )
+<<<<<<< HEAD
         self.state_indices_list[bs - 1][:len(mamba_indices)].copy_(mamba_indices)
         self.query_start_loc_list[bs - 1].copy_(
             torch.arange(0, bs + 1, dtype=torch.int32, device="cuda")
@@ -115,6 +120,10 @@ class MambaAttnBackend(AttentionBackend):
         if num_padding > 0:
             self.query_start_loc_list[bs - 1][bs-num_padding:] = bs-num_padding
         
+=======
+        self.state_indices_list[bs - 1][:len(mamba_indices)] = mamba_indices
+        self.query_start_loc_list[bs - 1] = self._get_cached_arange(bs, "cuda")
+>>>>>>> a1e062522 (No copy over ForwardMetadata and use lru_cache to store aranged query_start_loc)
         self.forward_metadata = ForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
