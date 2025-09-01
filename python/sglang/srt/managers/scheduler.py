@@ -2182,8 +2182,8 @@ class Scheduler(
         else:
             warning_msg = (
                 f"Cache not flushed because there are pending requests. "
-                f"#waiting_queue: {len(self.waiting_queue)}, "
-                f"#running_batch: {len(self.running_batch.reqs)}"
+                f"#queue-req: {len(self.waiting_queue)}, "
+                f"#running-req: {len(self.running_batch.reqs)}"
             )
 
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
