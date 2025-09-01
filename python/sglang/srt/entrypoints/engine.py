@@ -816,7 +816,7 @@ def _launch_subprocesses(
     )
     detoken_proc.start()
     if server_args.tokenizer_worker_num > 1:
-        # Launch tokenizer process
+        # Launch multi-tokenizer router
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
 
         # Initialize templates
