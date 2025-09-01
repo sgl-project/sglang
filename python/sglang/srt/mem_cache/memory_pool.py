@@ -246,7 +246,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return self.full_to_mamba_index_mapping[req_indices]
 
     def get_mamba_params(self, layer_id: int):
-        assert layer_id in self.mamba_map
+        try:
+            assert layer_id in self.mamba_map
+        except:
+            torch.distributed.breakpoint()
         return self.mamba_pool.get_mamba_params(self.mamba_map[layer_id])
 
     def free(self, free_index: Union[int, List[int]]):

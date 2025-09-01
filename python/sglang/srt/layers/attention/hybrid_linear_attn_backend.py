@@ -452,57 +452,53 @@ class HybridLinearAttnBackend(AttentionBackend):
         # QQ: can be parallelized
         for i in range(len(model.model.layers)):
             layer = model.model.layers[i]
-            if isinstance(layer, Qwen3HybridAttentionDecoderLayer):
-                num_attn += 1
-
             if isinstance(layer, Qwen3HybridLinearDecoderLayer):
-                try:
-                    conv_weights = layer.linear_attn.conv1d.weight.view(
-                        layer.linear_attn.conv1d.weight.size(0), 
-                        layer.linear_attn.conv1d.weight.size(2)
-                        )
-                    query_start_loc = accepted_length.cumsum(-1, dtype=accepted_length.dtype)
-                    query_start_loc = torch.cat([torch.zeros(1, dtype=query_start_loc.dtype, device=query_start_loc.device), query_start_loc])
-
-                    layer_id = i - num_attn
-                    mamba_cache  = self.attn_backend_list[1].req_to_token_pool.get_mamba_params(layer_id)
-
-                    conv_state = mamba_cache[0]
-                    ssm_state = mamba_cache[1]
-
-                    state_indices_tensor = self.attn_backend_list[1].forward_metadata.mamba_cache_indices
-                    mask = torch.arange(num_draft_tokens, device=accepted_length.device).unsqueeze(0) < accepted_length.unsqueeze(1)
-
-                    mixed_qkv = mamba_cache[2][state_indices_tensor][mask]
-                    query = mamba_cache[3][state_indices_tensor][mask].unsqueeze(0)
-                    key = mamba_cache[4][state_indices_tensor][mask].unsqueeze(0)
-                    value = mamba_cache[5][state_indices_tensor][mask].unsqueeze(0)
-                    g = mamba_cache[6][state_indices_tensor][mask].unsqueeze(0)
-                    beta = mamba_cache[7][state_indices_tensor][mask].unsqueeze(0)
-                    has_initial_states = torch.ones(request_number, dtype=torch.bool, device=accepted_length.device)
-
-                    _ = causal_conv1d_fn(
-                        mixed_qkv.transpose(0, 1),
-                        conv_weights,
-                        layer.linear_attn.conv1d.bias,
-                        activation=layer.linear_attn.activation,
-                        conv_states=conv_state,
-                        has_initial_state=has_initial_states,
-                        cache_indices=state_indices_tensor,
-                        query_start_loc=query_start_loc,
+                # try:
+                conv_weights = layer.linear_attn.conv1d.weight.view(
+                    layer.linear_attn.conv1d.weight.size(0), 
+                    layer.linear_attn.conv1d.weight.size(2)
                     )
-                    _, last_recurrent_state = chunk_gated_delta_rule(
-                        q=query,
-                        k=key,
-                        v=value,
-                        g=g,
-                        beta=beta,
-                        initial_state=ssm_state[state_indices_tensor],
-                        output_final_state=True,
-                        cu_seqlens=query_start_loc,
-                        head_first=False,
-                        use_qk_l2norm_in_kernel=True,
-                    )
-                    ssm_state[state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype, copy=False)
-                except:
-                    torch.distributed.breakpoint()
+                query_start_loc = accepted_length.cumsum(-1, dtype=accepted_length.dtype)
+                query_start_loc = torch.cat([torch.zeros(1, dtype=query_start_loc.dtype, device=query_start_loc.device), query_start_loc])
+
+                mamba_cache  = self.attn_backend_list[1].req_to_token_pool.get_mamba_params(i)
+
+                conv_state = mamba_cache[0]
+                ssm_state = mamba_cache[1]
+
+                state_indices_tensor = self.attn_backend_list[1].forward_metadata.mamba_cache_indices
+                mask = torch.arange(num_draft_tokens, device=accepted_length.device).unsqueeze(0) < accepted_length.unsqueeze(1)
+
+                mixed_qkv = mamba_cache[2][state_indices_tensor][mask]
+                query = mamba_cache[3][state_indices_tensor][mask].unsqueeze(0)
+                key = mamba_cache[4][state_indices_tensor][mask].unsqueeze(0)
+                value = mamba_cache[5][state_indices_tensor][mask].unsqueeze(0)
+                g = mamba_cache[6][state_indices_tensor][mask].unsqueeze(0)
+                beta = mamba_cache[7][state_indices_tensor][mask].unsqueeze(0)
+                has_initial_states = torch.ones(request_number, dtype=torch.bool, device=accepted_length.device)
+
+                _ = causal_conv1d_fn(
+                    mixed_qkv.transpose(0, 1),
+                    conv_weights,
+                    layer.linear_attn.conv1d.bias,
+                    activation=layer.linear_attn.activation,
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_states,
+                    cache_indices=state_indices_tensor,
+                    query_start_loc=query_start_loc,
+                )
+                _, last_recurrent_state = chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=ssm_state[state_indices_tensor],
+                    output_final_state=True,
+                    cu_seqlens=query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                ssm_state[state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype, copy=False)
+                # except:
+                #     torch.distributed.breakpoint()
