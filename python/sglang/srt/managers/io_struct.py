@@ -534,6 +534,21 @@ class TokenizedGenerateReqInput:
 
 
 @dataclass
+class BatchTokenizedGenerateReqInput:
+    # The batch of tokenized requests
+    batch: List[TokenizedGenerateReqInput]
+
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, i):
+        return self.batch[i]
+
+    def __iter__(self):
+        return iter(self.batch)
+
+
+@dataclass
 class EmbeddingReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
@@ -669,6 +684,21 @@ class TokenizedEmbeddingReqInput:
 
 
 @dataclass
+class BatchTokenizedEmbeddingReqInput:
+    # The batch of tokenized embedding requests
+    batch: List[TokenizedEmbeddingReqInput]
+
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, i):
+        return self.batch[i]
+
+    def __iter__(self):
+        return iter(self.batch)
+
+
+@dataclass
 class BatchTokenIDOut:
     # The request id
     rids: List[str]
@@ -782,6 +812,16 @@ class BatchEmbeddingOut:
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
+
+
+@dataclass
+class ClearHiCacheReqInput:
+    pass
+
+
+@dataclass
+class ClearHiCacheReqOutput:
+    success: bool
 
 
 @dataclass
@@ -1003,6 +1043,11 @@ class ProfileReq:
 class ProfileReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class FreezeGCReq:
+    pass
 
 
 @dataclass

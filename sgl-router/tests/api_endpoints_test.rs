@@ -45,12 +45,16 @@ impl TestContext {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1087,12 +1091,16 @@ mod error_tests {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1438,12 +1446,16 @@ mod pd_mode_tests {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
         };
 
         // Create app context
@@ -1593,12 +1605,16 @@ mod request_id_tests {
             log_level: None,
             request_id_headers: Some(vec!["custom-id".to_string(), "trace-id".to_string()]),
             max_concurrent_requests: 64,
+            queue_size: 0,
+            queue_timeout_secs: 60,
+            rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+            enable_igw: false,
         };
 
         let ctx = TestContext::new_with_config(
