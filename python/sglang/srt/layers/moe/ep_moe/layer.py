@@ -493,6 +493,7 @@ class DeepEPMoE(EPMoE):
         )
 
         down_overlap_args = dict(
+            # TODO after improving DeepEP's `combine_signal`, simplify this
             down_signals=combine_signal[:num_local_experts * ceil_div(num_tokens_static, block_m)].view(
                 num_local_experts, ceil_div(num_tokens_static, block_m)),
             down_start_event=down_start_event,
