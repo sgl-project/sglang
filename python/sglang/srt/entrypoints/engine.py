@@ -60,6 +60,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -814,18 +815,24 @@ def _launch_subprocesses(
         ),
     )
     detoken_proc.start()
+    if server_args.tokenizer_worker_num > 1:
+        # Launch multi-tokenizer router
+        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
 
-    # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+        # Initialize templates
+        template_manager = None
+    else:
+        # Launch tokenizer process
+        tokenizer_manager = TokenizerManager(server_args, port_args)
 
-    # Initialize templates
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
-    )
+        # Initialize templates
+        template_manager = TemplateManager()
+        template_manager.initialize_templates(
+            tokenizer_manager=tokenizer_manager,
+            model_path=server_args.model_path,
+            chat_template=server_args.chat_template,
+            completion_template=server_args.completion_template,
+        )
 
     # Wait for the model to finish loading
     scheduler_infos = []
