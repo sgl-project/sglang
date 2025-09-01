@@ -924,6 +924,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         logger.error("FlashInfer TopKOutputChecker not available: %s", e)
                         raise
                     
+                    # Ensure trtllm_fp4_block_scale_moe is available
+                    if 'trtllm_fp4_block_scale_moe' not in globals():
+                        logger.error("trtllm_fp4_block_scale_moe not imported - FlashInfer not available")
+                        raise RuntimeError("FlashInfer backend required but not available")
+                    
                     # When bf16 mode is enabled, we don't need to quantize the input
                     if self.flashinfer_mxfp4_moe_precision == "bf16":
                         assert x.dtype == torch.bfloat16
@@ -940,7 +945,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                                 value=0.0,
                             )
                     elif self.flashinfer_mxfp4_moe_precision == "default":
-                        # Lazy import mxfp8_quantize when needed
+                        # Ensure mxfp8_quantize is available
+                        if 'mxfp8_quantize' not in globals():
+                            logger.error("mxfp8_quantize not imported - FlashInfer not available")
+                            raise RuntimeError("FlashInfer mxfp8_quantize required but not available")
                         x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
                         # Keep scale in its native dtype; flatten only if API needs 1D:
                         x_scale = x_scale.reshape(-1).contiguous()
@@ -957,7 +965,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     # Ensure device consistency
                     dev = x.device
                     top_k = topk_output.topk_config.top_k
-                    router_logits = topk_output.router_logits.to(torch.bfloat16, non_blocking=True).to(dev, non_blocking=True)
+                    router_logits = topk_output.router_logits.to(dtype=torch.bfloat16, device=dev, non_blocking=True)
                     
                     if x_scale is not None and x_scale.device != dev:
                         x_scale = x_scale.to(dev, non_blocking=True)
