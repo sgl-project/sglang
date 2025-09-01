@@ -109,6 +109,16 @@ def _extract_routing(topk_output, device):
         idx: int64 tensor of expert indices  
         gate: float tensor of gate weights (dtype preserved)
     """
+    # Check if it has format attribute (new SGLang format)
+    if hasattr(topk_output, 'format'):
+        # For now, bypass routing if format is unsupported
+        # This is a workaround for the new format
+        logger.warning(f"Bypassing MoE routing due to format: {topk_output.format}")
+        # Return empty tensors to skip MoE routing
+        return (torch.empty(0, device=device, dtype=torch.int64),
+                torch.empty(0, device=device, dtype=torch.int64),
+                torch.empty(0, device=device))
+    
     # Try various attribute name patterns
     for (ix, sc) in (("indices", "scores"), ("topk_indices", "topk_scores")):
         if hasattr(topk_output, ix) and hasattr(topk_output, sc):
@@ -355,7 +365,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.topk_indices_dtype = None
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         self.with_bias = False
-        self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        
+        # Broaden FlashInfer detection to catch all FlashInfer backends
+        backend = get_moe_runner_backend()
+        self.use_flashinfer = (
+            getattr(backend, "is_flashinfer_mxfp4", lambda: False)()
+            or getattr(backend, "is_flashinfer_trtllm", lambda: False)()
+            or getattr(backend, "is_flashinfer_any", lambda: False)()  # if exists
+        )
         self.flashinfer_mxfp4_moe_precision = global_server_args_dict[
             "flashinfer_mxfp4_moe_precision"
         ]
@@ -776,6 +793,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         return tile_tokens_dim
 
+    def _is_flashinfer_topk(self, topk_output) -> bool:
+        """Check if topk_output is FlashInfer-formatted."""
+        return (
+            hasattr(topk_output, "format")
+            or hasattr(topk_output, "expert_location_dispatch_info")
+            or hasattr(topk_output, "topk_config")  # keep future-proof
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -886,6 +911,71 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 
                 T, H = x.shape
                 out = torch.zeros_like(x)
+                
+                # Check if topk_output is in FlashInfer format and route to FlashInfer backend
+                if self._is_flashinfer_topk(topk_output) or getattr(self, "use_flashinfer", False):
+                    logger.info("FlashInfer MoE routing detected -> deferring to FlashInfer backend")
+                    # Jump to the FlashInfer path (which already understands this format)
+                    # This reuses the same code from lines 799-858 above
+                    from sglang.srt.layers.moe.topk import TopKOutputChecker
+                    
+                    # When bf16 mode is enabled, we don't need to quantize the input
+                    if self.flashinfer_mxfp4_moe_precision == "bf16":
+                        assert x.dtype == torch.bfloat16
+                        x_quant = x
+                        x_scale = None
+                        
+                        # May be fused later if this code branch is frequently needed
+                        origin_hidden_states_dim = x_quant.shape[-1]
+                        if self.hidden_size != origin_hidden_states_dim:
+                            x_quant = torch.nn.functional.pad(
+                                x_quant,
+                                (0, self.hidden_size - origin_hidden_states_dim),
+                                mode="constant",
+                                value=0.0,
+                            )
+                    elif self.flashinfer_mxfp4_moe_precision == "default":
+                        x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
+                        x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+                    else:
+                        raise NotImplementedError
+                    
+                    assert x_quant.shape[-1] == self.hidden_size
+                    assert TopKOutputChecker.format_is_bypassed(topk_output)
+                    
+                    top_k = topk_output.topk_config.top_k
+                    router_logits = topk_output.router_logits
+                    
+                    trtllm_gen_output = trtllm_fp4_block_scale_moe(
+                        router_logits.to(torch.bfloat16),
+                        None,  # routing_bias
+                        x_quant,
+                        x_scale,
+                        layer.w13_weight,  # uint8 (e2m1 x 2)
+                        layer.w13_weight_scale,  # uint8 (e4m3 x 2)
+                        layer.w13_weight_bias,  # fp32 per expert per channel
+                        layer.gemm1_alpha,  # fp32 per expert
+                        layer.gemm1_beta,  # fp32 per expert
+                        layer.gemm1_clamp_limit,  # fp32 per expert
+                        layer.w2_weight,  # uint8 (e2m1 x 2)
+                        layer.w2_weight_scale,  # ue8m0
+                        layer.w2_weight_bias,  # fp32 per expert per channel
+                        None,  # output1_scale_scalar
+                        None,  # output1_scale_gate_scalar
+                        None,  # output2_scale_scalar
+                        layer.num_experts,
+                        top_k,
+                        None,  # n_group      # TODO: support n_group
+                        None,  # topk_group   # TODO: support topk_group
+                        self.intermediate_size,  # padded to multiple of 256
+                        layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
+                        layer.num_local_experts,  # local num experts
+                        None,
+                        self._get_tile_tokens_dim(x, top_k),
+                        1,  # routing_method_type, renormalize
+                        True,  # do finalize
+                    )[0]
+                    return trtllm_gen_output
                 
                 # 1) Extract routing information
                 tok, exp, gate = _extract_routing(topk_output, x.device)
