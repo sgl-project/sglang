@@ -434,6 +434,7 @@ class DeepEPMoE(EPMoE):
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
             forward_batch,
+            overlap_args=TODO,
         )
         return hidden_states
 
