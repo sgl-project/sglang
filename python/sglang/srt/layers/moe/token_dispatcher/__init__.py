@@ -6,7 +6,6 @@ from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
-    AscendDeepEPLLOutput,
     DeepEPConfig,
     DeepEPDispatcher,
     DeepEPLLOutput,
@@ -15,7 +14,6 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 
 __all__ = [
-    "AscendDeepEPLLOutput",
     "BaseDispatcher",
     "BaseDispatcherConfig",
     "DispatchOutput",
