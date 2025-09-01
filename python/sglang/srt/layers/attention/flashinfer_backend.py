@@ -1048,7 +1048,7 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = None
         else:
             assert isinstance(
-                spec_info, (EagleDraftInput, LookaheadVerifyInput, LookaheadVerifyInput)
+                spec_info, (EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput)
             )
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
