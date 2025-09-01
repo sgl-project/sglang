@@ -431,7 +431,7 @@ class DeepEPMoE(EPMoE):
             hidden_states, topk_idx, topk_weights, forward_batch
         )
 
-        overlap_args = self._compute_overlap_args(dispatch_output, alt_stream)
+        overlap_args = self._compute_overlap_args(dispatch_output)
 
         hidden_states = self.moe_impl(dispatch_output)
 
@@ -446,7 +446,7 @@ class DeepEPMoE(EPMoE):
         return hidden_states
 
     @staticmethod
-    def _compute_overlap_args(dispatch_output, alt_stream):
+    def _compute_overlap_args(dispatch_output):
         if not ENABLE_DEEPEP_COMBINE_OVERLAP:
             return None
 
@@ -468,7 +468,6 @@ class DeepEPMoE(EPMoE):
             block_m=block_m,
             threshold=ceil_div(hidden_dim, block_n),
             num_sms=DEEPEP_LL_COMBINE_SEND_NUM_SMS,
-            stream=alt_stream,
         )
 
         return overlap_args
