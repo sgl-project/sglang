@@ -132,6 +132,13 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "LongcatFlashForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "LongcatFlashForCausalLMNextN"
+            self.hf_config.num_hidden_layers = self.hf_config.num_nextn_predict_layers
+
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
         if (
@@ -199,6 +206,8 @@ class ModelConfig:
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "LongcatFlashForCausalLM" in self.hf_config.architectures
+            or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -270,6 +279,9 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+        self.num_attention_layers = self.num_hidden_layers
+        if "LongcatFlashForCausalLM" in self.hf_config.architectures:
+            self.num_attention_layers = self.num_hidden_layers * 2
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
