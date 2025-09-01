@@ -56,6 +56,7 @@ FetchContent_Declare(
     GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
     GIT_SHALLOW    OFF
 )
+FetchContent_Populate(repo-fmt)
 
 FetchContent_Declare(
     repo-deepgemm
