@@ -138,7 +138,7 @@ def set_global_state(global_state: _GlobalState):
     _global_state = global_state
 
 
-# Function to setup all middlewares for multi-tokenizer compatibility
+# Function to set up all middlewares for multi-tokenizer compatibility
 def setup_middlewares(api_key: Optional[str], enable_metrics: bool):
     """Setup all middlewares for both single and multi-process modes"""
     worker_pid = os.getpid()
@@ -159,7 +159,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     main_pid = get_main_process_id()
     logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
 
-    # Read port_args, server_args, and scheduler_info from shared memory
+    # Read configuration from shared memory
     port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
     server_args_data = read_from_shared_memory(f"server_args_{main_pid}")
     scheduler_info_data = read_from_shared_memory(f"scheduler_info_{main_pid}")
@@ -170,7 +170,7 @@ async def init_multi_tokenizer() -> ServerArgs:
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
 
-    # Launch tokenizer process
+    # Launch multi-tokenizer manager process
     tokenizer_manager = MultiTokenizerManager(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
@@ -179,7 +179,7 @@ async def init_multi_tokenizer() -> ServerArgs:
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
-    # register multi tokenizer
+    # Register this tokenizer with the main tokenizer manager
     await tokenizer_manager.register_to_main_tokenizer_manager()
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
@@ -197,7 +197,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 async def lifespan(fast_api_app: FastAPI):
     server_args = getattr(fast_api_app, "server_args", None)
     if server_args is None:
-        # for multi-tokenizer
+        # Initialize multi-tokenizer support for worker processes
         fast_api_app.server_args = await init_multi_tokenizer()
         setup_middlewares(
             fast_api_app.server_args.api_key, fast_api_app.server_args.enable_metrics
