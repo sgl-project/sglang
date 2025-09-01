@@ -432,7 +432,12 @@ class DeepEPMoE(EPMoE):
         hidden_states = self.moe_impl(dispatch_output)
 
         if ENABLE_DEEPEP_COMBINE_OVERLAP:
-            overlap_args = TODO
+            overlap_args = dict(
+                signal=TODO,
+                block_m=TODO,
+                threshold=TODO,
+                num_sms=TODO,
+            )
         else:
             overlap_args = None
 
