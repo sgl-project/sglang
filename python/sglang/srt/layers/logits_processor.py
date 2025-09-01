@@ -46,7 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import dump_to_file, use_intel_amx_backend, is_npu
+from sglang.srt.utils import dump_to_file, is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -522,7 +522,9 @@ class LogitsProcessor(nn.Module):
             if not _is_npu:
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
-                logits = self.final_logit_softcapping * torch.tanh(logits / self.final_logit_softcapping)
+                logits = self.final_logit_softcapping * torch.tanh(
+                    logits / self.final_logit_softcapping
+                )
 
         return logits
 
