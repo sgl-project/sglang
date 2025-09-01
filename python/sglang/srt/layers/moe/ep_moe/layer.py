@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
+from sglang.srt.layers.moe.token_dispatcher.deepep import ENABLE_DEEPEP_COMBINE_OVERLAP
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -429,13 +430,20 @@ class DeepEPMoE(EPMoE):
             hidden_states, topk_idx, topk_weights, forward_batch
         )
         hidden_states = self.moe_impl(dispatch_output)
+
+        if ENABLE_DEEPEP_COMBINE_OVERLAP:
+            overlap_args = TODO
+        else:
+            overlap_args = None
+
         hidden_states = self.combine(
             hidden_states,
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
             forward_batch,
-            overlap_args=TODO,
+            overlap_args=overlap_args,
         )
+
         return hidden_states
 
     def dispatch(
