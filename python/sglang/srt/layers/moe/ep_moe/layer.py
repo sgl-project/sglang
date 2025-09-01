@@ -475,7 +475,10 @@ class DeepEPMoE(EPMoE):
 
         # TODO use zero_allocator
         combine_signal = torch.zeros(
-            (num_local_experts, ceil_div(num_tokens_static, block_m)),
+            # TODO their deepep requires the size to be this large, temp use theirs to avoid changing their code
+            # but should optimize later
+            # (num_local_experts, ceil_div(num_tokens_static, block_m)),
+            num_local_experts * ceil_div(num_tokens_static, 64),
             dtype=torch.int32,
             device=hidden_states.device,
         )
