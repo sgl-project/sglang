@@ -2191,16 +2191,18 @@ class ServerArgs:
 
         # Check multi tokenizer
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
-        
+
         # check pd disaggregation args
         assert (
-            self.enable_pd_convert and self.disaggregation_mode != "null"
-        ) or self.disaggregation_mode == "null", (
-            "enable_pd_convert should be set only when disaggregation_mode is not null"
-        )
+            not self.enable_pd_convert or self.disaggregation_mode != "null"
+        ), "Only disaggregation mode is supported when enable_pd_convert is set"
         assert (
-            self.enable_pd_convert and self.pp_size == 1
-        ), "Pipeline parallelism is not supported in enable_pd_convert mode"
+            not self.enable_pd_convert or self.pp_size == 1
+        ), "Pipeline parallelism is not supported when enable_pd_convert is set"
+        assert (
+            not self.enable_pd_convert
+            or self.disaggregation_transfer_backend == "mooncake"
+        ), "Only mooncake backend is supported currently when enable_pd_convert is set"
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
