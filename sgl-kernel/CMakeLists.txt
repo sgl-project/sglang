@@ -87,8 +87,8 @@ FetchContent_Populate(repo-flashinfer)
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        sgl-kernel
+    GIT_REPOSITORY https://github.com/cicirori/sgl-flash-attn
+    GIT_TAG        sgl-kernel-cute
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
@@ -497,5 +497,11 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
 # triton_kernels
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
         DESTINATION "triton_kernels"
+        PATTERN ".git*" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE)
+
+# flash_attn/cute
+install(DIRECTORY "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute/"
+        DESTINATION "flash_attn/cute/"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)

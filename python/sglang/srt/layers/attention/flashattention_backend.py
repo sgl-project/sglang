@@ -22,6 +22,13 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+try:
+    from sgl_kernel.flash_attn_4 import (
+        flash_attn_varlen_func as flash_attn_4_varlen_func,
+    )
+except ImportError:
+    flash_attn_varlen_func_fa4 = None
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -305,6 +312,7 @@ class FlashAttentionBackend(AttentionBackend):
         speculative_step_id=0,
         topk=0,
         speculative_num_steps=0,
+        fa_impl_ver=3,
     ):
         super().__init__()
 
@@ -337,6 +345,15 @@ class FlashAttentionBackend(AttentionBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+
+        self.fa_impl_ver = fa_impl_ver
+
+        if self.fa_impl_ver == 4:
+            self.flash_attn_varlen_func = flash_attn_4_varlen_func
+            self.flash_attn_with_kvcache = None
+        else:
+            self.flash_attn_varlen_func = flash_attn_varlen_func
+            self.flash_attn_with_kvcache = flash_attn_with_kvcache
 
         # Local attention settings
         self.attention_chunk_size = (
@@ -819,7 +836,7 @@ class FlashAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
-                    output = flash_attn_varlen_func(
+                    output = self.flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -833,7 +850,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
-                    output = flash_attn_varlen_func(
+                    output = self.flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
