@@ -194,7 +194,7 @@ def mxfp4_weight_only_gemm(
                 w_packed[ks_packed:ke_packed],
                 w_scale[ks // group_size : (ke-1) // group_size + 1],
                 dtype=torch.bfloat16, axis=-1
-            )
+            ).contiguous()
             # Ensure the unpacked weight has correct shape
             if wk.shape[0] != (ke - ks):
                 wk = wk[:ke-ks]  # Trim if needed
@@ -204,7 +204,8 @@ def mxfp4_weight_only_gemm(
                 ne = min(ns + tile_n, N)
                 output[:, ns:ne].add_(xk @ wk[:, ns:ne])
             del wk
-            torch.cuda.empty_cache()
+            if os.getenv("SGLANG_DEBUG_EMPTY_CACHE", "0") == "1":
+                torch.cuda.empty_cache()
     
     return output
 

@@ -117,9 +117,11 @@ def _extract_routing(topk_output, device):
             T, K = getattr(topk_output, ix).shape
             tok = torch.arange(T, device=device, dtype=torch.int64).repeat_interleave(K)
             
-            # Assert shapes match
-            assert tok.numel() == idx.numel() == gate.numel(), \
-                f"Routing tensors mismatch: tok={tok.numel()}, idx={idx.numel()}, gate={gate.numel()}"
+            # Check shapes match
+            if not (tok.numel() == idx.numel() == gate.numel()):
+                raise RuntimeError(
+                    f"MoE routing mismatch: tok={tok.numel()}, idx={idx.numel()}, gate={gate.numel()}"
+                )
             return tok, idx, gate
 
     # Alternative format with explicit fields
@@ -128,9 +130,11 @@ def _extract_routing(topk_output, device):
         idx = topk_output.expert_ids.to(device, dtype=torch.int64)
         gate = topk_output.scores.to(device)
         
-        # Assert shapes match
-        assert tok.numel() == idx.numel() == gate.numel(), \
-            f"Routing tensors mismatch: tok={tok.numel()}, idx={idx.numel()}, gate={gate.numel()}"
+        # Check shapes match
+        if not (tok.numel() == idx.numel() == gate.numel()):
+            raise RuntimeError(
+                f"MoE routing mismatch: tok={tok.numel()}, idx={idx.numel()}, gate={gate.numel()}"
+            )
         return tok, idx, gate
 
     raise RuntimeError(

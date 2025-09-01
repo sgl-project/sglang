@@ -60,6 +60,10 @@ std::vector<at::Tensor> grouped_forward(
 
     // Expect Wq packed row-major by output rows; N derived from metadata or shape.
     TORCH_CHECK(Wq.dim() >= 2, "Wq must be at least 2D packed tensor");
+    TORCH_CHECK(Wq.dtype() == at::kByte || Wq.dtype() == at::kUInt8, "Wq must be uint8 packed FP4");
+    TORCH_CHECK(Wq.is_contiguous(), "Wq must be contiguous [K_packed, N]");
+    TORCH_CHECK(S.dim() >= 1, "Scales must be 1D+ per-group");
+    TORCH_CHECK(S.is_contiguous(), "Scales must be contiguous");
     // For MXFP4, Wq is [K_packed, N] where K_packed = K // 2
     const bool wq_is_kpacked_by_n = (Wq.dim() >= 2); // true in your pack
     const auto Kp = Wq.size(0);               // K_packed
