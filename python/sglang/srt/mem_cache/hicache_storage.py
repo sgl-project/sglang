@@ -158,13 +158,11 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
-            # Load directly into target_location's memory buffer
-            with open(tensor_path, "rb") as f:
-                target_location.set_(
-                    torch.frombuffer(f.read(), dtype=target_location.dtype)
-                    .reshape(target_location.shape)
-                    .untyped_storage()
-                )
+            expected = target_location.numel() * target_location.element_size()
+            with open(tensor_path, "rb", buffering=0) as f:
+                buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
+                if f.readinto(buf) != expected:
+                    raise IOError(f"Short read for {key}")
             return target_location
         except FileNotFoundError:
             logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
