@@ -153,6 +153,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     # Supress warnings
     "-Xcompiler=-Wno-conversion"
     "-Xcompiler=-Wno-deprecated-declarations"
+    "-Xcompiler=-Wno-clang-format-violations"
     "-Xcompiler=-Wfatal-errors"
     "-Xcompiler=-ftemplate-backtrace-limit=1"
     "-Xcudafe=--diag_suppress=177"  # variable was declared but never referenced
