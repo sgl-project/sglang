@@ -2162,6 +2162,30 @@ class ServerArgs:
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
+        if self.enable_pdmux:
+            assert (
+                self.pp_size == 1
+            ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
+            assert (
+                self.chunked_prefill_size == -1
+            ), "PD-Multiplexing is not compatible with chunked prefill."
+            assert (
+                self.disaggregation_mode == "null"
+            ), "PD-Multiplexing is not compatible with disaggregation mode."
+            assert (
+                self.disable_overlap_schedule
+            ), "PD-Multiplexing is not compatible with overlap schedule."
+
+        if isinstance(self.lora_paths, list):
+            lora_paths = self.lora_paths
+            self.lora_paths = {}
+            for lora_path in lora_paths:
+                if "=" in lora_path:
+                    name, path = lora_path.split("=", 1)
+                    self.lora_paths[name] = path
+                else:
+                    self.lora_paths[lora_path] = lora_path
+
         assert self.moe_dense_tp_size in {
             1,
             None,
@@ -2388,6 +2412,7 @@ class ServerArgs:
         self.mem_fraction_static = (
             original_server_arg_mem_fraction * final_overall_factor
         )
+
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:

@@ -1457,8 +1457,9 @@ def initialize_model_parallel(
             ),
             group_name="pdmux_prefill_tp",
         )
-        _TP.pynccl_comm.disabled = False
-        _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
+        if _TP.pynccl_comm:
+            _TP.pynccl_comm.disabled = False
+            _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
     moe_ep_size = expert_model_parallel_size
 
