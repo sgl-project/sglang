@@ -440,7 +440,8 @@ class DeepEPMoE(EPMoE):
         hidden_states = self.moe_impl(dispatch_output, down_overlap_args=down_overlap_args)
 
         if hook_overlap_on_combine is not None:
-            hook_overlap_on_combine()
+            with deep_gemm_wrapper.configure_deep_gemm_num_sms(TODO):
+                hook_overlap_on_combine()
 
         combine_context = nullcontext()
         if ENABLE_DEEPEP_COMBINE_OVERLAP:
