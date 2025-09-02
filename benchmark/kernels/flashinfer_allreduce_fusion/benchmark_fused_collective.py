@@ -20,6 +20,7 @@ Usage with torchrun:
 import argparse
 import contextlib
 import itertools
+import logging
 import os
 import time
 from typing import Optional
@@ -27,28 +28,21 @@ from typing import Optional
 import torch  # type: ignore
 import torch.distributed as dist  # type: ignore
 
-import logging
-from sglang.srt.distributed import (
-    get_tp_group,
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
     graph_capture,
     init_distributed_environment,
     initialize_model_parallel,
-    cleanup_dist_env_and_memory,
 )
 from sglang.srt.layers.layernorm import RMSNorm  # noqa
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype as SGLANG_FP8_DTYPE,
-    static_quant_fp8,
-)
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as SGLANG_FP8_DTYPE
+from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
+
 try:
-    from sgl_kernel import (
-        fused_add_rmsnorm as SGL_FUSED_ADD_RMS_NORM,
-        rmsnorm as SGL_RMS_NORM,
-        scaled_fp4_quant as SGL_SCALED_FP4_QUANT,
-    )
+    from sgl_kernel import fused_add_rmsnorm as SGL_FUSED_ADD_RMS_NORM
+    from sgl_kernel import rmsnorm as SGL_RMS_NORM
+    from sgl_kernel import scaled_fp4_quant as SGL_SCALED_FP4_QUANT
 except Exception:  # pragma: no cover - fallback on non-supported platforms
     SGL_FUSED_ADD_RMS_NORM = None
     SGL_RMS_NORM = None
@@ -335,7 +329,9 @@ def standard_allreduce_rmsnorm_fp8_quant(
     if residual is not None:
         if SGL_FUSED_ADD_RMS_NORM is not None:
             SGL_FUSED_ADD_RMS_NORM(allreduce_out, residual, rms_gamma, rms_eps)
-            quant_out, _ = static_quant_fp8(allreduce_out, scale_factor, repeat_scale=False)
+            quant_out, _ = static_quant_fp8(
+                allreduce_out, scale_factor, repeat_scale=False
+            )
         else:
             rms = RMSNorm(allreduce_out.shape[-1], eps=rms_eps)
             rms.weight.data = rms_gamma
@@ -1025,11 +1021,11 @@ def format_results_markdown(
     """Format all benchmark results as markdown."""
     markdown = f"""# FlashInfer Fused Collective Operations Benchmark Results
 
-**World Size:** {world_size}  
-**Hidden Dimension:** {args.hidden_dim}  
-**Warmup Iterations:** {args.warmup}  
-**Benchmark Trials:** {args.trials}  
-**Quantization Mode:** {all_results[0]["quant_mode"] if all_results else "N/A"}  
+**World Size:** {world_size}
+**Hidden Dimension:** {args.hidden_dim}
+**Warmup Iterations:** {args.warmup}
+**Benchmark Trials:** {args.trials}
+**Quantization Mode:** {all_results[0]["quant_mode"] if all_results else "N/A"}
 
 ---
 
@@ -1146,7 +1142,7 @@ def main():
     parser.add_argument(
         "--output-file",
         type=str,
-        help="""Output file path for markdown results 
+        help="""Output file path for markdown results
                 (default: benchmark_results_<timestamp>.md)
         """,
     )
