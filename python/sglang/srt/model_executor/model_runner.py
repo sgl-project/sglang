@@ -1395,12 +1395,14 @@ class ModelRunner:
                 else TokenToKVPoolAllocator
             )
             if self.is_hybrid:
-                return SWATokenToKVPoolAllocator(
-                    size=self.full_max_total_num_tokens,
-                    size_swa=self.swa_max_total_num_tokens,
-                    allocator_class=allocator_cls,
-                    **self._build_allocator_args(),
-                )
+                allocator_args = self._build_allocator_args()
+                args_to_update = {
+                    "size": self.full_max_total_num_tokens,
+                    "size_swa": self.swa_max_total_num_tokens,
+                    "allocator_class": allocator_cls,
+                }
+                allocator_args.update(args_to_update)
+                return SWATokenToKVPoolAllocator(**allocator_args)
             else:
                 return allocator_cls(
                     **self._build_allocator_args(),
