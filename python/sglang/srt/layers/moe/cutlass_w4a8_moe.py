@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cutlass W4A8 MoE kernel."""
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from sgl_kernel import (
@@ -11,9 +11,12 @@ from sgl_kernel import (
 )
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    deepep_fp8_quant_to_static_per_tensor_quant,
+    deepep_ll_get_cutlass_w4a8_moe_mm_data,
     post_reorder_triton_kernel_for_cutlass_moe,
     pre_reorder_triton_kernel_for_cutlass_moe,
     run_moe_ep_preproess,
+    silu_mul_and_per_tensor_static_quant_fwd,
 )
 
 
@@ -146,7 +149,7 @@ def cutlass_w4a8_moe(
     )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
-    c2 = torch.zeros((m * topk, k), device=device, dtype=torch.bfloat16)
+    c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
 
     cutlass_w4a8_moe_mm(
         c1,
@@ -199,5 +202,116 @@ def cutlass_w4a8_moe(
         num_local_experts,
         k,
         BLOCK_SIZE=512,
+    )
+    return output
+
+
+def cutlass_w4a8_moe_deepep_ll(
+    a_fp8: Tuple[torch.Tensor, torch.Tensor],
+    w1_q: torch.Tensor,
+    w2_q: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    masked_m: torch.Tensor,
+    a_strides1: torch.Tensor,
+    b_strides1: torch.Tensor,
+    c_strides1: torch.Tensor,
+    a_strides2: torch.Tensor,
+    b_strides2: torch.Tensor,
+    c_strides2: torch.Tensor,
+    s_strides13: torch.Tensor,
+    s_strides2: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    a1_scale: torch.Tensor,
+    a2_scale: torch.Tensor,
+):
+    a, a_scale = a_fp8
+    assert a.shape[2] // 2 == w1_q.shape[2], "Hidden size mismatch w1"
+    assert w1_q.dtype == torch.int8
+    assert w2_q.dtype == torch.int8
+    assert w1_q.shape[2] * 2 == w2_q.shape[1], "Hidden size mismatch w2"
+    assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
+    assert w1_q.shape[0] == masked_m.shape[0], "Masked m expert number mismatch"
+    assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
+    assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
+
+    assert a_strides1.shape[0] == w1_q.shape[0], "A Strides 1 expert number mismatch"
+    assert b_strides1.shape[0] == w1_q.shape[0], "B Strides 1 expert number mismatch"
+    assert a_strides2.shape[0] == w2_q.shape[0], "A Strides 2 expert number mismatch"
+    assert b_strides2.shape[0] == w2_q.shape[0], "B Strides 2 expert number mismatch"
+
+    assert problem_sizes1.dtype == torch.int32
+    assert problem_sizes2.dtype == torch.int32
+
+    num_experts = w1_q.size(0)
+    m = a.size(1)
+    k = w1_q.size(2) * 2  # w1_q is transposed and packed
+    n = w2_q.size(2) * 2  # w2_q is transposed and packed
+    topk = topk_ids.size(1)
+
+    deepep_ll_get_cutlass_w4a8_moe_mm_data(
+        masked_m=masked_m,
+        problem_sizes1=problem_sizes1,
+        problem_sizes2=problem_sizes2,
+        expert_offsets=expert_offsets,
+        num_experts=num_experts,
+        m=m,
+        n=n,
+        k=k,
+    )
+
+    gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=a.device)
+    deepep_fp8_quant_to_static_per_tensor_quant(
+        x=a,
+        x_scale=a_scale,
+        masked_m=masked_m,
+        output_scale=a1_scale,
+        output=gateup_input,
+    )
+
+    gate_up_o = torch.empty(
+        (num_experts, m, 2 * n), device=a.device, dtype=torch.bfloat16
+    )
+    cutlass_w4a8_moe_mm(
+        gate_up_o.view(-1, gate_up_o.size(-1)),
+        gateup_input.view(-1, gateup_input.size(-1)),
+        w1_q,
+        a1_scale.float(),
+        w1_scale,
+        expert_offsets[:-1],
+        problem_sizes1,
+        a_strides1,
+        b_strides1,
+        c_strides1,
+        s_strides13,
+        128,
+        topk,
+    )
+
+    intermediate_q = torch.empty(
+        (num_experts, m, n), device=a.device, dtype=torch.float8_e4m3fn
+    )
+    silu_mul_and_per_tensor_static_quant_fwd(
+        input=gate_up_o, output=intermediate_q, masked_m=masked_m, output_scale=a2_scale
+    )
+
+    output = torch.empty((num_experts, m, k), device=a.device, dtype=torch.bfloat16)
+    cutlass_w4a8_moe_mm(
+        output.view(-1, output.size(-1)),
+        intermediate_q.view(-1, intermediate_q.size(-1)),
+        w2_q,
+        a2_scale.float(),
+        w2_scale,
+        expert_offsets[:-1],
+        problem_sizes2,
+        a_strides2,
+        b_strides2,
+        c_strides2,
+        s_strides2,
+        128,
+        topk,
     )
     return output

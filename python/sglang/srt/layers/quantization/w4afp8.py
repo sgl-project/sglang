@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.nn import Module
@@ -21,10 +21,12 @@ from sglang.srt.utils import is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
+    from sglang.srt.layers.moe.ep_moe.layer import EPMoE, DeepEPMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
     )
+
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -326,3 +328,35 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         if self.moe_runner_config.routed_scaling_factor is not None:
             output *= self.moe_runner_config.routed_scaling_factor
         return StandardCombineInput(hidden_states=output)
+
+    def apply_deepep_ll(
+        self,
+        layer: DeepEPMoE,
+        x: Tuple[torch.Tensor, torch.Tensor],
+        topk_ids: torch.Tensor,
+        masked_m: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
+
+        return cutlass_w4a8_moe_deepep_ll(
+            a_fp8=x,
+            w1_q=layer.w13_weight,
+            w2_q=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            topk_ids=topk_ids,
+            masked_m=masked_m,
+            a_strides1=self.a_strides1,
+            b_strides1=self.b_strides1,
+            c_strides1=self.c_strides1,
+            a_strides2=self.a_strides2,
+            b_strides2=self.b_strides2,
+            c_strides2=self.c_strides2,
+            s_strides13=self.s_strides13,
+            s_strides2=self.s_strides2,
+            expert_offsets=self.expert_offsets,
+            problem_sizes1=self.problem_sizes1,
+            problem_sizes2=self.problem_sizes2,
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+        )
