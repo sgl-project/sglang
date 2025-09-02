@@ -1372,6 +1372,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                enable_alltoall=get_moe_a2a_backend().is_flashinfer_alltoallv(),
             )[0]
             # Scale by routed_scaling_factor is fused into select_experts.
             if get_moe_a2a_backend().is_fp4_allgather():

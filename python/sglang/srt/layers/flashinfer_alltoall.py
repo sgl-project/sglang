@@ -15,6 +15,44 @@ logger = logging.getLogger(__name__)
 
 if is_flashinfer_available():
     from flashinfer.comm.mnnvl import CommBackend
+
+    class TorchDistributedCommBackend(CommBackend):
+        """
+        Use torch distributed instead of MPI to set up flashinfer MNNVL workspaces during initialization
+        """
+
+        def __init__(self, group: ProcessGroup):
+            self._group = group
+
+        def Get_rank(self) -> int:
+            return self._group.rank()
+
+        def Get_size(self) -> int:
+            return self._group.size()
+
+        def allgather(self, data: int):
+            gathered = [None] * self.Get_size()
+            dist.all_gather_object(gathered, data, group=self._group)
+            return gathered
+
+        def Split(self, color: int, key: int):
+            # No need to split, we already use the proper group
+            return self
+
+
+def is_flashinfer_alltoallv_supported() -> bool:
+    if not is_flashinfer_available():
+        return False
+    from flashinfer.comm.trtllm_alltoall import MnnvlMemory
+
+    MnnvlMemory.initialize()
+    return MnnvlMemory.supports_mnnvl()
+
+
+_alltoall_workspaces = None
+
+
+def initialize_flashinfer_alltoall_workspaces():
     from flashinfer.comm.trtllm_alltoall import (
         Mapping,
         MnnvlConfig,
@@ -22,35 +60,6 @@ if is_flashinfer_available():
         MnnvlMoe,
     )
 
-
-class TorchDistributedCommBackend(CommBackend):
-    """
-    Use torch distributed instead of MPI to set up flashinfer MNNVL workspaces during initialization
-    """
-
-    def __init__(self, group: ProcessGroup):
-        self._group = group
-
-    def Get_rank(self) -> int:
-        return self._group.rank()
-
-    def Get_size(self) -> int:
-        return self._group.size()
-
-    def allgather(self, data: int):
-        gathered = [None] * self.Get_size()
-        dist.all_gather_object(gathered, data, group=self._group)
-        return gathered
-
-    def Split(self, color: int, key: int):
-        # No need to split, we already use the proper group
-        return self
-
-
-_alltoall_workspaces = None
-
-
-def initialize_flashinfer_alltoall_workspaces():
     global _alltoall_workspaces
     if _alltoall_workspaces is not None:
         return _alltoall_workspaces
