@@ -2902,6 +2902,10 @@ def parse_module_path(module_path, function_name, create_dummy):
     return final_module, None
 
 
+def alloc_len_per_eagle_decode(worker: "EagleWorker") -> int:
+    return max(worker.num_steps * worker.topk, worker.num_draft_tokens)
+
+
 def mxfp_supported():
     """
     Returns whether the current platform supports MX types.

@@ -769,11 +769,6 @@ class ServerArgs:
                 ), "Currently standalone speculative decoding does not support dp attention."
             if self.max_running_requests is None:
                 self.max_running_requests = 48
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using "
-                "eagle speculative decoding."
-            )
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(
