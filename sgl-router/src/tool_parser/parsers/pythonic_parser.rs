@@ -23,6 +23,8 @@ use crate::tool_parser::{
 pub struct PythonicParser {
     /// Regex to detect tool calls in Pythonic format
     tool_call_regex: Regex,
+    /// Regex to parse function calls - cached for reuse
+    call_regex: Regex,
 }
 
 impl PythonicParser {
@@ -33,7 +35,13 @@ impl PythonicParser {
         let pattern = r"\[[a-zA-Z_]\w*\(";
         let tool_call_regex = Regex::new(pattern).expect("Valid regex pattern");
 
-        Self { tool_call_regex }
+        // Compile the function call regex once
+        let call_regex = Regex::new(r"(?s)^([a-zA-Z_]\w*)\((.*)\)$").expect("Valid regex pattern");
+
+        Self {
+            tool_call_regex,
+            call_regex,
+        }
     }
 
     /// Extract tool calls using bracket counting (similar to MistralParser)
@@ -120,10 +128,8 @@ impl PythonicParser {
 
     /// Parse a single function call from Python syntax
     fn parse_function_call(&self, call_str: &str) -> ToolParserResult<Option<ToolCall>> {
-        // Match function_name(args) - use (?s) to make . match newlines
-        let call_regex = Regex::new(r"(?s)^([a-zA-Z_]\w*)\((.*)\)$").unwrap();
-
-        if let Some(captures) = call_regex.captures(call_str.trim()) {
+        // Use cached regex instead of creating new one
+        if let Some(captures) = self.call_regex.captures(call_str.trim()) {
             let function_name = captures.get(1).unwrap().as_str();
             let args_str = captures.get(2).unwrap().as_str();
 
