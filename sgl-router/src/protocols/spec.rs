@@ -1821,25 +1821,25 @@ pub const DEFAULT_MODEL_NAME: &str = "default";
 pub struct RerankRequest {
     /// The query text to rank documents against
     pub query: String,
-    
+
     /// List of documents to be ranked
     pub documents: Vec<String>,
-    
+
     /// Model to use for reranking
     #[serde(default = "default_model_name")]
     pub model: String,
-    
+
     /// Maximum number of documents to return (optional)
     pub top_k: Option<usize>,
-    
+
     /// Whether to return documents in addition to scores
     #[serde(default = "default_return_documents")]
     pub return_documents: bool,
-    
+
     // SGLang specific extensions
     /// Request ID for tracking
     pub rid: Option<StringOrArray>,
-    
+
     /// User identifier
     pub user: Option<String>,
 }
@@ -1857,14 +1857,14 @@ fn default_return_documents() -> bool {
 pub struct RerankResult {
     /// Relevance score for the document
     pub score: f32,
-    
+
     /// The document text (if return_documents was true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document: Option<String>,
-    
+
     /// Original index of the document in the request
     pub index: usize,
-    
+
     /// Additional metadata about the ranking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta_info: Option<HashMap<String, Value>>,
@@ -1875,20 +1875,20 @@ pub struct RerankResult {
 pub struct RerankResponse {
     /// Ranked results sorted by score (highest first)
     pub results: Vec<RerankResult>,
-    
+
     /// Model used for reranking
     pub model: String,
-    
+
     /// Usage information
     pub usage: Option<UsageInfo>,
-    
+
     /// Response object type
     #[serde(default = "default_rerank_object")]
     pub object: String,
-    
+
     /// Response ID
     pub id: String,
-    
+
     /// Creation timestamp
     pub created: i64,
 }
@@ -1925,7 +1925,7 @@ impl GenerationRequest for RerankRequest {
     fn get_model(&self) -> Option<&str> {
         Some(&self.model)
     }
-    
+
     fn is_stream(&self) -> bool {
         false // Reranking doesn't support streaming
     }
@@ -1941,12 +1941,12 @@ impl RerankRequest {
         if self.query.trim().is_empty() {
             return Err("Query cannot be empty".to_string());
         }
-        
+
         // Validate documents list
         if self.documents.is_empty() {
             return Err("Documents list cannot be empty".to_string());
         }
-        
+
         // Validate top_k if specified
         if let Some(k) = self.top_k {
             if k == 0 {
@@ -1955,16 +1955,16 @@ impl RerankRequest {
             if k > self.documents.len() {
                 // This is allowed but we log a warning
                 tracing::warn!(
-                    "top_k ({}) is greater than number of documents ({})", 
-                    k, 
+                    "top_k ({}) is greater than number of documents ({})",
+                    k,
                     self.documents.len()
                 );
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Get the effective top_k value
     pub fn effective_top_k(&self) -> usize {
         self.top_k.unwrap_or(self.documents.len())
@@ -1978,12 +1978,12 @@ impl RerankResponse {
         request_id: String,
     ) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
-        
+
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        
+
         RerankResponse {
             results,
             model,
@@ -1993,14 +1993,14 @@ impl RerankResponse {
             created,
         }
     }
-    
+
     /// Sort results by score in descending order
     pub fn sort_by_score(&mut self) {
         self.results.sort_by(|a, b| {
             b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
         });
     }
-    
+
     /// Apply top_k limit to results
     pub fn apply_top_k(&mut self, k: usize) {
         self.results.truncate(k);
@@ -2698,9 +2698,9 @@ mod tests {
             query: "test query".to_string(),
             documents: vec!["test document".to_string()],
         };
-        
+
         let request: RerankRequest = v1_input.into();
-        
+
         assert!(request.validate().is_ok());
     }
 }
