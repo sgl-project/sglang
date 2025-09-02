@@ -313,7 +313,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     torch.cumsum(seq_lens, dim=0),
                 )
             ).int()
-            max_seq_len = int(seq_lens.max().item())
+            max_seq_len = max(forward_batch.extend_seq_lens_cpu)
             self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
                 max_seq_len,
                 cum_seq_lens_q,
