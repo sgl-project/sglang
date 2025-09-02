@@ -113,6 +113,8 @@ def synchronized():
 
 
 class HiCacheHF3FS(HiCacheStorage):
+    """HiCache backend that stores KV cache pages in HF3FS files."""
+
     default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
 
     def __init__(
@@ -125,6 +127,7 @@ class HiCacheHF3FS(HiCacheStorage):
         entries: int,
         dtype: torch.dtype,
         metadata_client: Hf3fsMetadataInterface,
+        is_mla_model: bool = False,
     ):
         self.rank = rank
         self.file_path = file_path
@@ -134,9 +137,13 @@ class HiCacheHF3FS(HiCacheStorage):
         self.entries = entries
         self.dtype = dtype
         self.metadata_client = metadata_client
-
+        self.is_mla_model = is_mla_model
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
+        self.skip_backup = False
+        if self.is_mla_model and self.rank != 0:
+            self.skip_backup = True
+            self.rank = 0
 
         logger.info(
             f"[Rank {self.rank}] HiCacheHF3FS Client Initializing: "
@@ -171,15 +178,32 @@ class HiCacheHF3FS(HiCacheStorage):
         dtype: torch.dtype,
         storage_config: HiCacheStorageConfig = None,
     ) -> "HiCacheHF3FS":
+        """Create a HiCacheHF3FS instance from environment configuration.
+
+        Environment:
+            - Uses env var stored in `HiCacheHF3FS.default_env_var` to locate a JSON config.
+            - Falls back to a local single-machine config when the env var is not set.
+
+        Raises:
+            ValueError: If MLA Model is requested without global metadata server or required keys are missing.
+        """
         from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
             Hf3fsGlobalMetadataClient,
             Hf3fsLocalMetadataClient,
         )
 
-        rank = storage_config.tp_rank if storage_config is not None else 0
+        if storage_config is not None:
+            rank, is_mla_model = storage_config.tp_rank, storage_config.is_mla_model
+        else:
+            rank, is_mla_model = 0, False
+
+        mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
 
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
+            if is_mla_model:
+                raise ValueError(mla_unsupported_msg)
+
             return HiCacheHF3FS(
                 rank=rank,
                 file_path=f"/data/hicache.{rank}.bin",
@@ -209,26 +233,34 @@ class HiCacheHF3FS(HiCacheStorage):
             raise ValueError(f"Missing required keys in config: {missing_keys}")
 
         # Choose metadata client based on configuration
-        if "metadata_server_url" in config and config["metadata_server_url"]:
+        if config.get("metadata_server_url"):
             # Use global metadata client to connect to metadata server
             metadata_server_url = config["metadata_server_url"]
             metadata_client = Hf3fsGlobalMetadataClient(metadata_server_url)
+
             logger.info(
                 f"Using global metadata client with server url: {metadata_server_url}"
             )
         else:
+            # Enable MLA optimization only when using the global metadata client
+            if is_mla_model:
+                raise ValueError(mla_unsupported_msg)
+
             # Use local metadata client for single-machine deployment
             metadata_client = Hf3fsLocalMetadataClient()
 
+        rank_for_path = 0 if is_mla_model else rank
         return HiCacheHF3FS(
             rank=rank,
-            file_path=f"{config['file_path_prefix']}.{rank}.bin",
+            # Let all ranks use the same file path for MLA model
+            file_path=f"{config['file_path_prefix']}.{rank_for_path}.bin",
             file_size=int(config["file_size"]),
             numjobs=int(config["numjobs"]),
             bytes_per_page=bytes_per_page,
             entries=int(config["entries"]),
             dtype=dtype,
             metadata_client=metadata_client,
+            is_mla_model=is_mla_model,
         )
 
     def get(
@@ -312,6 +344,10 @@ class HiCacheHF3FS(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        # In MLA backend, only one rank needs to backup the KV cache
+        if self.skip_backup:
+            return True
+
         # Todo: Add prefix block's hash key
         key_with_prefix = [(key, "") for key in keys]
         indices = self.metadata_client.reserve_and_allocate_page_indices(
@@ -363,18 +399,29 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return all(results)
 
-    @synchronized()
     def delete(self, key: str) -> None:
         self.metadata_client.delete_keys(self.rank, [key])
 
-    @synchronized()
     def exists(self, key: str) -> bool:
         result = self.metadata_client.exists(self.rank, [key])
         return result[0] if result else False
 
-    @synchronized()
-    def clear(self) -> None:
-        self.metadata_client.clear(self.rank)
+    def batch_exists(self, keys: List[str]) -> int:
+        results = self.metadata_client.exists(self.rank, keys)
+        for i in range(len(keys)):
+            if not results[i]:
+                return i
+
+        return len(keys)
+
+    def clear(self) -> bool:
+        try:
+            self.metadata_client.clear(self.rank)
+            logger.info(f"Cleared HiCacheHF3FS for rank {self.rank}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear HiCacheHF3FS: {e}")
+            return False
 
     def close(self) -> None:
         try:

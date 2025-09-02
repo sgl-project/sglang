@@ -1,4 +1,3 @@
-use super::header_utils;
 use crate::config::types::{
     CircuitBreakerConfig as ConfigCircuitBreakerConfig,
     HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
@@ -12,6 +11,7 @@ use crate::policies::LoadBalancingPolicy;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, GenerateRequest, GenerationRequest,
 };
+use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
 use axum::{
     body::Body,
@@ -34,8 +34,8 @@ pub struct Router {
     workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
     policy: Arc<dyn LoadBalancingPolicy>,
     client: Client,
-    timeout_secs: u64,
-    interval_secs: u64,
+    worker_startup_timeout_secs: u64,
+    worker_startup_check_interval_secs: u64,
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
@@ -52,8 +52,8 @@ impl Router {
         worker_urls: Vec<String>,
         policy: Arc<dyn LoadBalancingPolicy>,
         client: Client,
-        timeout_secs: u64,
-        interval_secs: u64,
+        worker_startup_timeout_secs: u64,
+        worker_startup_check_interval_secs: u64,
         dp_aware: bool,
         api_key: Option<String>,
         retry_config: RetryConfig,
@@ -65,7 +65,12 @@ impl Router {
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
-            Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs).await?;
+            Self::wait_for_healthy_workers(
+                &worker_urls,
+                worker_startup_timeout_secs,
+                worker_startup_check_interval_secs,
+            )
+            .await?;
         }
 
         let worker_urls = if dp_aware {
@@ -110,7 +115,10 @@ impl Router {
         }
 
         let workers = Arc::new(RwLock::new(workers));
-        let health_checker = crate::core::start_health_checker(Arc::clone(&workers), interval_secs);
+        let health_checker = crate::core::start_health_checker(
+            Arc::clone(&workers),
+            worker_startup_check_interval_secs,
+        );
 
         // Setup load monitoring for PowerOfTwo policy
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
@@ -118,7 +126,7 @@ impl Router {
 
         let load_monitor_handle = if policy.name() == "power_of_two" {
             let monitor_urls = worker_urls.clone();
-            let monitor_interval = interval_secs;
+            let monitor_interval = worker_startup_check_interval_secs;
             let policy_clone = Arc::clone(&policy);
             let client_clone = client.clone();
 
@@ -140,8 +148,8 @@ impl Router {
             workers,
             policy,
             client,
-            timeout_secs,
-            interval_secs,
+            worker_startup_timeout_secs,
+            worker_startup_check_interval_secs,
             dp_aware,
             api_key,
             retry_config,
@@ -164,8 +172,8 @@ impl Router {
 
     pub async fn wait_for_healthy_workers(
         worker_urls: &[String],
-        timeout_secs: u64,
-        interval_secs: u64,
+        worker_startup_timeout_secs: u64,
+        worker_startup_check_interval_secs: u64,
     ) -> Result<(), String> {
         if worker_urls.is_empty() {
             return Err(
@@ -174,18 +182,23 @@ impl Router {
         }
 
         // Perform health check asynchronously
-        Self::wait_for_healthy_workers_async(worker_urls, timeout_secs, interval_secs).await
+        Self::wait_for_healthy_workers_async(
+            worker_urls,
+            worker_startup_timeout_secs,
+            worker_startup_check_interval_secs,
+        )
+        .await
     }
 
     async fn wait_for_healthy_workers_async(
         worker_urls: &[String],
-        timeout_secs: u64,
-        interval_secs: u64,
+        worker_startup_timeout_secs: u64,
+        worker_startup_check_interval_secs: u64,
     ) -> Result<(), String> {
         info!(
             "Waiting for {} workers to become healthy (timeout: {}s)",
             worker_urls.len(),
-            timeout_secs
+            worker_startup_timeout_secs
         );
 
         let start_time = std::time::Instant::now();
@@ -195,14 +208,14 @@ impl Router {
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
         loop {
-            if start_time.elapsed() > Duration::from_secs(timeout_secs) {
+            if start_time.elapsed() > Duration::from_secs(worker_startup_timeout_secs) {
                 error!(
                     "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
-                    timeout_secs, worker_urls
+                    worker_startup_timeout_secs, worker_urls
                 );
                 return Err(format!(
                     "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
-                    timeout_secs, worker_urls
+                    worker_startup_timeout_secs, worker_urls
                 ));
             }
 
@@ -262,7 +275,7 @@ impl Router {
                     unhealthy_workers.len(),
                     unhealthy_workers
                 );
-                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                tokio::time::sleep(Duration::from_secs(worker_startup_check_interval_secs)).await;
             }
         }
     }
@@ -393,7 +406,7 @@ impl Router {
 
     // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
-        let headers = super::header_utils::copy_request_headers(&req);
+        let headers = header_utils::copy_request_headers(&req);
 
         match self.select_first_worker() {
             Ok(worker_url) => {
@@ -667,7 +680,7 @@ impl Router {
 
         if !is_stream {
             // For non-streaming requests, preserve headers
-            let response_headers = super::header_utils::preserve_response_headers(res.headers());
+            let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let response = match res.bytes().await {
                 Ok(body) => {
@@ -812,19 +825,19 @@ impl Router {
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
         let start_time = std::time::Instant::now();
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
+            .timeout(Duration::from_secs(self.worker_startup_timeout_secs))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
         loop {
-            if start_time.elapsed() > Duration::from_secs(self.timeout_secs) {
+            if start_time.elapsed() > Duration::from_secs(self.worker_startup_timeout_secs) {
                 error!(
                     "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
-                    self.timeout_secs, worker_url
+                    self.worker_startup_timeout_secs, worker_url
                 );
                 return Err(format!(
                     "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
-                    self.timeout_secs, worker_url
+                    self.worker_startup_timeout_secs, worker_url
                 ));
             }
 
@@ -894,7 +907,10 @@ impl Router {
                             warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
                         }
 
-                        tokio::time::sleep(Duration::from_secs(self.interval_secs)).await;
+                        tokio::time::sleep(Duration::from_secs(
+                            self.worker_startup_check_interval_secs,
+                        ))
+                        .await;
                         continue;
                     }
                 }
@@ -906,7 +922,10 @@ impl Router {
                         warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
                     }
 
-                    tokio::time::sleep(Duration::from_secs(self.interval_secs)).await;
+                    tokio::time::sleep(Duration::from_secs(
+                        self.worker_startup_check_interval_secs,
+                    ))
+                    .await;
                     continue;
                 }
             }
@@ -1198,6 +1217,14 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        todo!()
+    }
+
+    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        todo!()
+    }
+
     async fn flush_cache(&self) -> Response {
         // Get all worker URLs
         let worker_urls = self.get_worker_urls();
@@ -1316,8 +1343,8 @@ mod tests {
         Router {
             workers: Arc::new(RwLock::new(workers)),
             policy: Arc::new(RandomPolicy::new()),
-            timeout_secs: 5,
-            interval_secs: 1,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
             dp_aware: false,
             api_key: None,
             client: Client::new(),

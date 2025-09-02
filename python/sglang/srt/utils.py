@@ -172,6 +172,20 @@ def is_blackwell():
     return torch.cuda.get_device_capability()[0] == 10
 
 
+@lru_cache(maxsize=1)
+def is_sm100_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 10) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
+@lru_cache(maxsize=1)
+def is_sm90_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 9) and (
+        torch.version.cuda >= "12.3"
+    )
+
+
 _warned_bool_env_var_keys = set()
 
 
@@ -1950,6 +1964,15 @@ def get_ip() -> str:
     except Exception:
         pass
 
+    # try  using hostname
+    hostname = socket.gethostname()
+    try:
+        ip_addr = socket.gethostbyname(hostname)
+        warnings.warn("using local ip address: {}".format(ip_addr))
+        return ip_addr
+    except Exception:
+        pass
+
     warnings.warn(
         "Failed to get the IP address, using 0.0.0.0 by default."
         "The value can be set by the environment variable"
@@ -2762,6 +2785,10 @@ def lru_cache_frozenset(maxsize=128):
         return wrapper
 
     return decorator
+
+
+def get_origin_rid(rid):
+    return rid.split("_", 1)[1] if "_" in rid else rid
 
 
 def apply_module_patch(target_module, target_function, wrappers):
