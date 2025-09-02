@@ -69,6 +69,20 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
+        # Validate named tool choice
+        if (
+            hasattr(request.tool_choice, "function")
+            and request.tool_choice.function
+            and request.tools
+        ):
+            tool_name = request.tool_choice.function.name
+            available_tools = [tool.function.name for tool in request.tools]
+            if tool_name not in available_tools:
+                return (
+                    f"Function '{tool_name}' not found in available tools. "
+                    f"Available functions: {available_tools}"
+                )
+
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
         if (
