@@ -611,6 +611,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         if overlap_args is not None:
+            # TODO refactor and improve the whole logic, e.g. move to save level
             overlap_args["stream"].wait_event(overlap_args["wait_event"])
             with torch.cuda.stream(overlap_args["stream"]):
                 # TODO let ant change DeepEP to unify the two APIs?
