@@ -337,11 +337,10 @@ class JSONDetector:
             trigger="",
         )
 
-    def build_json_schema(self, tools: List[Tool]):
+    def build_json_schema(self, tools: List[Tool], tool_choice: str = "auto"):
         return JSONSchemaComposer.build_json_schema(
             tools,
-            tool_choice="required",
-            tool_call_separator=self.tool_call_separator,
+            tool_choice=tool_choice,
         )
     
     def build_ebnf(self, tools: List[Tool]):

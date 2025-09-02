@@ -136,15 +136,18 @@ class FunctionCallParser:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
-        # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
-        # It cannot parse or validate function call Pythonic or XML-ish syntax.
-        if (
-            self.detector.supports_structural_tag()
-            and tool_choice == "auto"
-            and any(tool.function.strict for tool in self.tools)
-        ):
-            strict_tag = self.get_structure_tag()
-            return ("structural_tag", strict_tag)
+        # For auto mode, always generate a schema to ensure proper JSON format
+        # This prevents models from generating raw training data formats like <|python_tag|>
+        if tool_choice == "auto":
+            # Try JSON schema first, fall back to structural tag
+            json_schema = self.get_json_schema(tool_choice)
+            if json_schema is not None:
+                return ("json_schema", json.dumps(json_schema))
+            
+            # Fall back to structural tag if JSON schema fails
+            if self.detector.supports_structural_tag():
+                strict_tag = self.get_structure_tag()
+                return ("structural_tag", strict_tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
             # Try JSON schema first, fall back to EBNF for backward compatibility
             json_schema = self.get_json_schema(tool_choice)
@@ -193,7 +196,7 @@ class FunctionCallParser:
         return self.detector.build_ebnf(filtered_tools)
 
     def get_json_schema(
-        self, tool_choice: Union[ToolChoice, Literal["required"]]
+        self, tool_choice: Union[ToolChoice, Literal["required", "auto"]]
     ) -> Optional[Dict[str, Any]]:
         """
         Get the JSON schema for the specified tool choice.
@@ -226,7 +229,7 @@ class FunctionCallParser:
             filtered_tools = self.tools
 
         try:
-            return self.detector.build_json_schema(filtered_tools)
+            return self.detector.build_json_schema(filtered_tools, tool_choice)
         except Exception as e:
             logger.warning(f"Failed to generate JSON schema: {e}. Falling back to EBNF.")
             return None
