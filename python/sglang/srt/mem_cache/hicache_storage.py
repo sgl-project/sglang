@@ -27,6 +27,7 @@ class HiCacheStorageConfig:
     tp_rank: int
     tp_size: int
     is_mla_model: bool
+    is_page_first_layout: bool
     model_name: Optional[str]
     extra_config: Optional[dict] = None
 
