@@ -24,6 +24,9 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the worker's type (Regular, Prefill, or Decode)
     fn worker_type(&self) -> WorkerType;
 
+    /// Get the worker's connection mode (HTTP or gRPC)
+    fn connection_mode(&self) -> ConnectionMode;
+
     /// Check if the worker is currently healthy
     fn is_healthy(&self) -> bool;
 
@@ -152,6 +155,30 @@ pub trait Worker: Send + Sync + fmt::Debug {
     }
 }
 
+/// Connection mode for worker communication
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConnectionMode {
+    /// HTTP/REST connection
+    Http,
+    /// gRPC connection
+    Grpc {
+        /// Optional port for gRPC endpoint (if different from URL)
+        port: Option<u16>,
+    },
+}
+
+impl fmt::Display for ConnectionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectionMode::Http => write!(f, "HTTP"),
+            ConnectionMode::Grpc { port } => match port {
+                Some(p) => write!(f, "gRPC(port:{})", p),
+                None => write!(f, "gRPC"),
+            },
+        }
+    }
+}
+
 /// Worker type classification
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkerType {
@@ -213,6 +240,8 @@ pub struct WorkerMetadata {
     pub url: String,
     /// Worker type
     pub worker_type: WorkerType,
+    /// Connection mode
+    pub connection_mode: ConnectionMode,
     /// Additional labels/tags
     pub labels: std::collections::HashMap<String, String>,
     /// Health check configuration
@@ -233,9 +262,18 @@ pub struct BasicWorker {
 
 impl BasicWorker {
     pub fn new(url: String, worker_type: WorkerType) -> Self {
+        Self::with_connection_mode(url, worker_type, ConnectionMode::Http)
+    }
+
+    pub fn with_connection_mode(
+        url: String,
+        worker_type: WorkerType,
+        connection_mode: ConnectionMode,
+    ) -> Self {
         let metadata = WorkerMetadata {
             url: url.clone(),
             worker_type,
+            connection_mode,
             labels: std::collections::HashMap::new(),
             health_config: HealthConfig::default(),
         };
@@ -296,6 +334,10 @@ impl Worker for BasicWorker {
 
     fn worker_type(&self) -> WorkerType {
         self.metadata.worker_type.clone()
+    }
+
+    fn connection_mode(&self) -> ConnectionMode {
+        self.metadata.connection_mode.clone()
     }
 
     fn is_healthy(&self) -> bool {
@@ -432,6 +474,10 @@ impl Worker for DPAwareWorker {
 
     fn worker_type(&self) -> WorkerType {
         self.base_worker.worker_type()
+    }
+
+    fn connection_mode(&self) -> ConnectionMode {
+        self.base_worker.connection_mode()
     }
 
     fn is_healthy(&self) -> bool {
@@ -601,6 +647,28 @@ impl WorkerFactory {
             decode_urls.into_iter().map(Self::create_decode).collect();
 
         (regular_workers, prefill_workers, decode_workers)
+    }
+
+    /// Create a gRPC worker
+    pub fn create_grpc(url: String, worker_type: WorkerType, port: Option<u16>) -> Box<dyn Worker> {
+        Box::new(BasicWorker::with_connection_mode(
+            url,
+            worker_type,
+            ConnectionMode::Grpc { port },
+        ))
+    }
+
+    /// Create a gRPC worker with custom circuit breaker configuration
+    pub fn create_grpc_with_config(
+        url: String,
+        worker_type: WorkerType,
+        port: Option<u16>,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Box<dyn Worker> {
+        Box::new(
+            BasicWorker::with_connection_mode(url, worker_type, ConnectionMode::Grpc { port })
+                .with_circuit_breaker_config(circuit_breaker_config),
+        )
     }
 
     /// Create a DP-aware worker of specified type
