@@ -599,6 +599,13 @@ class ModelOptFp4Config(QuantizationConfig):
             regex_str = pattern.replace(".", r"\.").replace("*", r".*")
             if re.fullmatch(regex_str, prefix):
                 return True
+
+            # Check if the last part of the excluded pattern is contained in the last part of the prefix
+            # This handles fused modules like fused_qkv_a_proj_with_mqa that contain q_a_proj and kv_a_proj_with_mqa
+            pattern_last_part = pattern.split(".")[-1]
+            prefix_last_part = prefix.split(".")[-1]
+            if pattern_last_part in prefix_last_part:
+                return True
         return False
 
     def get_quant_method(
@@ -876,7 +883,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             data=torch.empty(
                 layer.num_local_experts,
                 2 * intermediate_size_per_partition,
-                # 2 fp4 items are packed in the input dimension
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
             ),
@@ -895,7 +901,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             data=torch.empty(
                 layer.num_local_experts,
                 hidden_size,
-                # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
             ),
@@ -1212,11 +1217,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w13 weights
             w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
+            del layer.w13_weight_scale
             layer.w13_blockscale_swizzled.data.copy_(w13_blockscale_swizzled)
             layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
 
             # Process w2 weights
             w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
+            del layer.w2_weight_scale
             layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
             layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
