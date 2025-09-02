@@ -618,6 +618,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device
             )
 
+        # TODO shared can be overlapped in dispatch/combine/dispatch-and-combine
         hook_overlap_on_combine = None
         if ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP:
             def hook_overlap_on_combine():
