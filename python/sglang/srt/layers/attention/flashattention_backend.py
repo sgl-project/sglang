@@ -741,6 +741,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use Flash Attention for prefill
         if not self.use_mla:
+            assert self.fa_impl_ver in [3], "Only FA3 support here"
             # Do multi-head attention
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
@@ -856,6 +857,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
+                assert self.fa_impl_ver in [3], "Only FA3 support here"
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
@@ -944,6 +946,7 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        assert self.fa_impl_ver in [3], "Only FA3 support decoding"
         if k is not None:
             assert v is not None
             if save_kv_cache:

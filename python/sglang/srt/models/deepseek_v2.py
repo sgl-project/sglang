@@ -1039,7 +1039,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return _dispatch_mla_subtype()
         elif attention_backend == "fa4":
-            # TODO: FA4 support is on early stage, this is a hacky way to support MLA models.
+            # TODO: FA4 support is at an early stage, this is a hacky way to support MLA models.
             return AttnForwardMethod.MHA_CHUNKED_KV
         elif attention_backend == "aiter":
             if (

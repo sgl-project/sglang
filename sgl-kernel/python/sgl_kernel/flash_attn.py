@@ -249,6 +249,9 @@ def flash_attn_varlen_func(
     ver=3,
 ):
     if ver == 4 and flash_attn_varlen_func_v4:
+        # Using `(-1, -1)` as no sliding window causes correctness issues for FA4.
+        if window_size == (-1, -1):
+            window_size = (None, None)
         return flash_attn_varlen_func_v4(
             q,
             k,
