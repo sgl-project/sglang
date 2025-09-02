@@ -49,39 +49,6 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
     )
 
 
-def generate_random_padding_mask(
-    max_seqlen, batch_size, device, mode="random", zero_lengths=False
-):
-    assert mode in ["full", "random", "third"]
-    if mode == "full":
-        lengths = torch.full(
-            (batch_size, 1), max_seqlen, device=device, dtype=torch.int32
-        )
-    elif mode == "random":
-        lengths = torch.randint(
-            max(0 if zero_lengths else 1, max_seqlen - 20),
-            max_seqlen + 1,
-            (batch_size, 1),
-            device=device,
-        )
-    elif mode == "third":
-        lengths = torch.randint(
-            max_seqlen // 3, max_seqlen + 1, (batch_size, 1), device=device
-        )
-
-    if zero_lengths:
-        # Generate zero-lengths every 5 batches and the last batch.
-        for i in range(batch_size):
-            if i % 5 == 0:
-                lengths[i] = 0
-        lengths[-1] = 0
-    padding_mask = (
-        repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size)
-        < lengths
-    )
-    return padding_mask
-
-
 def pad_input(hidden_states, indices, batch, seqlen):
     """
     Arguments:
