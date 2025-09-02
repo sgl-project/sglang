@@ -43,12 +43,12 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_int_env_var,
+    is_cpu,
     is_cuda_alike,
     is_hip,
     is_npu,
     is_shm_available,
     supports_custom_op,
-    is_cpu,
 )
 
 _is_npu = is_npu()
