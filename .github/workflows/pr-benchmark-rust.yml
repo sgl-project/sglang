@@ -9,6 +9,7 @@ on:
     branches: [ main ]
     paths:
       - "sgl-router/**"
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -19,9 +20,52 @@ permissions:
   pull-requests: write
   issues: write
 jobs:
+  # Quick check job that always runs on PRs
+  benchmark-compile-check:
+    name: Benchmark Compilation Check
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_rust.sh
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            sgl-router/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check benchmarks compile
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          cargo check --benches
+
+  # Full benchmark jobs that only run with label or on main branch
   benchmark-request-processing:
     name: Request Processing Benchmark
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: |
+      github.repository == 'sgl-project/sglang' && 
+      (github.event_name == 'push' || 
+       github.event_name == 'workflow_dispatch' || 
+       contains(github.event.pull_request.labels.*.name, 'benchmark'))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -33,6 +77,9 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_rust.sh
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
 
       - name: Cache Rust dependencies
         uses: actions/cache@v4
@@ -49,6 +96,9 @@ jobs:
 
       - name: Run request processing benchmark
         timeout-minutes: 30
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
@@ -66,7 +116,11 @@ jobs:
 
   benchmark-tokenizer:
     name: Tokenizer Benchmark
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: |
+      github.repository == 'sgl-project/sglang' && 
+      (github.event_name == 'push' || 
+       github.event_name == 'workflow_dispatch' || 
+       contains(github.event.pull_request.labels.*.name, 'benchmark'))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -77,6 +131,9 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_rust.sh
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
 
       - name: Cache Rust dependencies
         uses: actions/cache@v4
@@ -93,6 +150,9 @@ jobs:
 
       - name: Run tokenizer benchmark
         timeout-minutes: 30
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
@@ -109,7 +169,11 @@ jobs:
 
   benchmark-tool-parser:
     name: Tool Parser Benchmark
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: |
+      github.repository == 'sgl-project/sglang' && 
+      (github.event_name == 'push' || 
+       github.event_name == 'workflow_dispatch' || 
+       contains(github.event.pull_request.labels.*.name, 'benchmark'))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -120,6 +184,9 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_rust.sh
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
 
       - name: Cache Rust dependencies
         uses: actions/cache@v4
@@ -136,6 +203,9 @@ jobs:
 
       - name: Run tool parser benchmark
         timeout-minutes: 30
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
