@@ -8,7 +8,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     ToolChoice,
 )
-
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.json_detector import JSONDetector
 
@@ -143,7 +142,7 @@ class FunctionCallParser:
             json_schema = self.get_json_schema(tool_choice)
             if json_schema is not None:
                 return ("json_schema", json.dumps(json_schema))
-            
+
             # Fall back to structural tag if JSON schema fails
             if self.detector.supports_structural_tag():
                 strict_tag = self.get_structure_tag()
@@ -153,7 +152,7 @@ class FunctionCallParser:
             json_schema = self.get_json_schema(tool_choice)
             if json_schema is not None:
                 return ("json_schema", json.dumps(json_schema))
-            
+
             ebnf = self.get_ebnf(tool_choice)
             return ("ebnf", ebnf) if ebnf is not None else None
 
@@ -231,5 +230,7 @@ class FunctionCallParser:
         try:
             return self.detector.build_json_schema(filtered_tools, tool_choice)
         except Exception as e:
-            logger.warning(f"Failed to generate JSON schema: {e}. Falling back to EBNF.")
+            logger.warning(
+                f"Failed to generate JSON schema: {e}. Falling back to EBNF."
+            )
             return None

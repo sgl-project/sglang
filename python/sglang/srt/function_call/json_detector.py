@@ -8,8 +8,8 @@ from partial_json_parser.core.options import Allow
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
-    ToolCallItem,
     StructureInfo,
+    ToolCallItem,
     _GetInfoFunc,
 )
 from sglang.srt.function_call.json_schema_composer import JSONSchemaComposer
@@ -25,11 +25,11 @@ logger = logging.getLogger(__name__)
 class JSONDetector:
     """
     Universal detector for JSON Schema constrained tool calls.
-    
+
     This detector handles the standardized JSON format that all models output
     when using JSON Schema constraints, eliminating the need for model-specific
     JSON parsing logic.
-    
+
     Format Structure:
     ```
     [
@@ -116,7 +116,7 @@ class JSONDetector:
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse function calls from text, handling JSON arrays and objects."""
         stripped_text = text.strip()
-        
+
         # Handle both array and single object formats
         if not (stripped_text.startswith("[") or stripped_text.startswith("{")):
             return StreamingParseResult(normal_text=text, calls=[])
@@ -124,19 +124,19 @@ class JSONDetector:
         try:
             # Try to parse as complete JSON first
             parsed_content = json.loads(stripped_text)
-            
+
             if isinstance(parsed_content, list):
                 # Array format: [{"name": "tool", "parameters": {...}}]
                 all_actions = parsed_content
             else:
                 # Single object format: {"name": "tool", "parameters": {...}}
                 all_actions = [parsed_content]
-            
+
             # Parse the actions into tool calls
             calls = self.parse_base_json(all_actions, tools) if all_actions else []
-            
+
             return StreamingParseResult(normal_text="", calls=calls)
-            
+
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse JSON: {stripped_text}, error: {str(e)}")
             # If JSON parsing fails, return the text as normal text
@@ -157,7 +157,7 @@ class JSONDetector:
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing with tool validation for JSON format.
-        
+
         This implementation handles JSON Schema constrained tool calls where:
         1. Tool calls are in JSON array format
         2. JSON can be parsed incrementally using partial_json_loads
@@ -342,10 +342,11 @@ class JSONDetector:
             tools,
             tool_choice=tool_choice,
         )
-    
+
     def build_ebnf(self, tools: List[Tool]):
         # Keep for backward compatibility, but JSON Schema is preferred
         from sglang.srt.function_call.ebnf_composer import EBNFComposer
+
         return EBNFComposer.build_ebnf(
             tools,
             function_format="json",
