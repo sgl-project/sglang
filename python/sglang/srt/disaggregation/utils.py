@@ -8,7 +8,7 @@ import warnings
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 import numpy as np
 import requests
@@ -217,7 +217,9 @@ class KVClassType(Enum):
     BOOTSTRAP_SERVER = "bootstrap_server"
 
 
-def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: KVClassType
+) -> Optional[Type]:
     from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
 
     if transfer_backend == TransferBackend.MOONCAKE:

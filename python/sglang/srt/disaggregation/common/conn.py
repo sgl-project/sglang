@@ -308,7 +308,8 @@ class CommonKVReceiver(BaseKVReceiver):
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
-    def __init__(self, port: int):
+    def __init__(self, host: str, port: int):
+        self.host = host
         self.port = port
         self.app = web.Application()
         self.store = dict()
@@ -412,7 +413,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self._runner = web.AppRunner(self.app)
             self._loop.run_until_complete(self._runner.setup())
 
-            site = web.TCPSite(self._runner, port=self.port)
+            site = web.TCPSite(self._runner, host=self.host, port=self.port)
             self._loop.run_until_complete(site.start())
             self._loop.run_forever()
         except Exception as e:
