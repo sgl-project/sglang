@@ -468,16 +468,18 @@ class HiRadixCache(RadixCache):
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch.pop(
-            req_id
-        )
+        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[req_id]
 
         if operation.host_indices is None:
             # prefetch has not been issued due to insufficient host memory
+            self.ongoing_prefetch.pop(req_id)
             return True
 
         if not self.can_terminate_prefetch(operation):
             return False
+        
+        # Only pop when we're ready to process
+        self.ongoing_prefetch.pop(req_id)
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
