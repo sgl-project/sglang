@@ -108,7 +108,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         softplus_x = tl.where(
             beta_x <= softplus_threshold,
             (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x
+            x,
         )
         b_g = -tl.exp(b_A_log) * softplus_x
 
@@ -151,7 +151,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         idx = tl.load(h0_indices + i_n)
         if idx >= 0:
             p_h0 = (
-                h0_source + idx * HV * K * V + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+                h0_source
+                + idx * HV * K * V
+                + i_hv * K * V
+                + o_k[:, None] * V
+                + o_v[None, :]
             )
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
