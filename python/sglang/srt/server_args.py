@@ -331,6 +331,7 @@ class ServerArgs:
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
+    dense_tbo_min_token_num: int = 2048
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
@@ -1871,6 +1872,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.tbo_token_distribution_threshold,
             help="The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
+        )
+        parser.add_argument(
+            "--dense-tbo-min-token-num",
+            type=int,
+            default=ServerArgs.dense_tbo_min_token_num,
+            help="The minimum number of tokens required to enable two-batch overlap on dense model. Default is 2048.",
         )
         parser.add_argument(
             "--enable-torch-compile",

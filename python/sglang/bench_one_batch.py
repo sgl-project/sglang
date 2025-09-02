@@ -61,7 +61,11 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe.utils import (
+    initialize_dense_config,
+    initialize_moe_config,
+    is_tbo_enabled,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -153,6 +157,10 @@ def load_model(server_args, port_args, tp_rank):
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
+    if hasattr(model_config.hf_config, "num_experts_per_tok"):
+        initialize_moe_config(server_args)
+    else:
+        initialize_dense_config(server_args)
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
@@ -303,6 +311,10 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
         )
+    if is_tbo_enabled() and not hasattr(
+        batch.model_config.hf_config, "num_experts_per_tok"
+    ):
+        Scheduler.prepare_dense_tbo_batch(batch)
 
 
 def _read_prompts_from_file(prompt_file, rank_print):
@@ -510,8 +522,6 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
-    initialize_moe_config(server_args)
-
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)

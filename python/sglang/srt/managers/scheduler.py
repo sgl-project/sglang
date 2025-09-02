@@ -64,7 +64,8 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe import initialize_dense_config, initialize_moe_config
+from sglang.srt.layers.moe.utils import is_tbo_enabled
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
@@ -145,7 +146,7 @@ from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.two_batch_overlap import TboDPAttentionPreparer, TboStreamPreparer
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -302,8 +303,8 @@ class Scheduler(
         # Init tokenizer
         self.init_tokenizer()
 
-        # Init moe config
-        self.init_moe_config()
+        # Init global config
+        self.initialize_global_config()
 
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
@@ -779,9 +780,11 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
-    def init_moe_config(self):
+    def initialize_global_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
+        else:
+            initialize_dense_config(self.server_args)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1575,6 +1578,12 @@ class Scheduler(
                 self.handle_dp_balance_data(ret)
             ret = self.prepare_mlp_sync_batch(ret)
 
+        # Handle Dense TBO
+        if is_tbo_enabled() and not hasattr(
+            self.model_config.hf_config, "num_experts_per_tok"
+        ):
+            ret = self.prepare_dense_tbo_batch(ret)
+
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -1976,6 +1985,19 @@ class Scheduler(
             write_shared_dp_balance_info(
                 new_recv_dp_balance_id_list, holding_token_list
             )
+
+    @staticmethod
+    def prepare_dense_tbo_batch(batch: ScheduleBatch):
+        is_extend_in_batch = batch.forward_mode.is_extend() if batch else False
+        tbo_preparer = TboStreamPreparer()
+        tbo_split_seq_index, global_forward_mode = tbo_preparer.prepare_split_index(
+            batch
+        )
+        if batch is not None:
+            batch.is_extend_in_batch = is_extend_in_batch
+            batch.tbo_split_seq_index = tbo_split_seq_index
+            batch.global_forward_mode = global_forward_mode
+        return batch
 
     @staticmethod
     def prepare_mlp_sync_batch_raw(

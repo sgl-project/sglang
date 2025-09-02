@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 import os
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Sequence, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Optional,
+    Sequence,
+    Union,
+)
 
 import torch
 
@@ -16,6 +27,127 @@ _ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_OPERATIONS_ENABLE_PROFILE", "0
 
 if _ENABLE_PROFILE:
     import nvtx
+
+
+class FunctionAdapter:
+    @staticmethod
+    def attention_forward_wrapper(attention_module):
+        def wrapper(state):
+            positions = state.positions
+            hidden_states = state.hidden_states
+            forward_batch = state.forward_batch
+            output = attention_module.forward(
+                positions, hidden_states, forward_batch, skip_all_reduce=True
+            )
+            state.hidden_states = output
+
+        return wrapper
+
+    @staticmethod
+    def mlp_forward_wrapper(mlp_module):
+        def wrapper(state):
+            hidden_states = state.hidden_states
+            forward_batch = state.forward_batch
+            output = mlp_module.forward(
+                hidden_states, forward_batch, use_reduce_scatter=True
+            )
+            state.hidden_states = output
+
+        return wrapper
+
+    @staticmethod
+    def layernorm_forward_wrapper(layernorm_module):
+        def wrapper(state):
+            hidden_states = state.hidden_states
+            residual = state.residual
+            if residual is None:
+                residual = hidden_states
+                output = layernorm_module.forward(hidden_states)
+                state.hidden_states = output
+                state.residual = residual
+            else:
+                output, new_residual = layernorm_module.forward(hidden_states, residual)
+                state.hidden_states = output
+                state.residual = new_residual
+
+        return wrapper
+
+    @staticmethod
+    def allreduce_forward_wrapper():
+        def wrapper(state):
+            from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
+            hidden_states = state.hidden_states
+            output = tensor_model_parallel_all_reduce(hidden_states)
+            state.hidden_states = output
+            return dict(hidden_states=state.hidden_states, residual=state.residual)
+
+        return wrapper
+
+
+class Qwen3FunctionAdapter:
+    @staticmethod
+    def mlp_forward_wrapper(mlp_module):
+        def wrapper(state):
+            hidden_states = state.hidden_states
+            output = mlp_module.forward(hidden_states, use_reduce_scatter=True)
+            state.hidden_states = output
+
+        return wrapper
+
+
+@dataclass
+class StreamOperation:
+    funcs: List[callable]
+    stream_name: str = "compute"
+    wait_for: Optional[List[str]] = None
+    wait_timing: str = "before"
+    batch_id: Optional[int] = None
+
+
+def execute_stream_operations(inputs_arr, operations):
+    executor = StreamStageExecutor(operations=operations, inputs_arr=inputs_arr)
+    for _, op in enumerate(operations):
+        executor.execute_operation(op)
+    return executor.get_final_output()
+
+
+class StreamStageExecutor:
+    def __init__(self, operations, inputs_arr):
+        self.operations = operations
+        self.batch_states = []
+        self.batch_outputs = []
+        for inputs in inputs_arr:
+            state = _StateDict()
+            state.update(inputs)
+            self.batch_states.append(state)
+            self.batch_outputs.append(inputs)
+        self.streams = {}
+        self.streams["compute"] = torch.cuda.current_stream()
+        self.streams["copy"] = torch.cuda.Stream(priority=-1)
+
+    def execute_operation(self, op):
+        stream = self.streams[op.stream_name]
+        with torch.cuda.stream(stream):
+            if op.wait_for and op.wait_timing == "before":
+                for wait_stream_name in op.wait_for:
+                    wait_stream = self.streams[wait_stream_name]
+                    stream.wait_stream(wait_stream)
+
+            for _, func in enumerate(op.funcs):
+                if op.batch_id is not None:
+                    state = self.batch_states[op.batch_id]
+                    result = func(state=state)
+                    if result is not None:
+                        self.batch_outputs[op.batch_id] = result
+
+            if op.wait_for and op.wait_timing == "after":
+                for wait_stream_name in op.wait_for:
+                    wait_stream = self.streams[wait_stream_name]
+                    stream.wait_stream(wait_stream)
+
+    def get_final_output(self):
+        return self.batch_outputs
 
 
 def execute_operations(inputs, operations):
@@ -142,9 +274,7 @@ class _StateDict:
         if key == "_data":
             super().__setattr__(key, value)
             return
-        assert (
-            key not in self._data
-        ), f"`{key}` already exist, are you sure you want to override it?"
+
         self._data[key] = value
 
     def __getattr__(self, item):

@@ -35,6 +35,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_tbo_token_distribution_threshold
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -49,6 +50,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, make_layers
 
 Qwen2Config = None
@@ -88,10 +90,14 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        use_reduce_scatter: bool = False,
+    ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, skip_all_reduce=use_reduce_scatter)
         return x
 
 
@@ -331,18 +337,37 @@ class Qwen2Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
+        dense_tbo_min_token_num = get_tbo_token_distribution_threshold()
+        if (
+            forward_batch.can_run_tbo
+            and forward_batch.forward_mode.is_extend()
+            and input_ids.shape[0] >= dense_tbo_min_token_num
+        ):
+            hidden_states, residual = model_forward_maybe_tbo(
+                layers=self.layers,
+                enable_tbo=True,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+                stream_operate=True,
             )
+        else:
+            for i in range(self.start_layer, self.end_layer):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
