@@ -433,14 +433,17 @@ class DeepEPMoE(EPMoE):
             hidden_states, topk_idx, topk_weights, forward_batch
         )
 
-        combine_overlap_args, down_overlap_args, compute_num_sms = (
+        combine_overlap_args, down_overlap_args, meta_overlap_args = (
             self._compute_overlap_args(dispatch_output, alt_stream)
         )
 
         hidden_states = self.moe_impl(dispatch_output, down_overlap_args=down_overlap_args)
 
+        if (e := meta_overlap_args["record_event_after_down"]) is not None:
+            e.record()
+
         if hook_overlap_on_combine is not None:
-            with deep_gemm_wrapper.configure_deep_gemm_num_sms(TODO):
+            with deep_gemm_wrapper.configure_deep_gemm_num_sms(meta_overlap_args["compute_num_sms"]):
                 hook_overlap_on_combine()
 
         hidden_states = self.combine(
@@ -480,6 +483,9 @@ class DeepEPMoE(EPMoE):
             stream=alt_stream,
             wait_event=combine_wait_event,
         )
+        meta_overlap_args = dict(
+            compute_num_sms=compute_num_sms,
+        )
         down_overlap_args = None
 
         if ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP:
@@ -506,9 +512,11 @@ class DeepEPMoE(EPMoE):
                 threshold=ceil_div(hidden_dim, block_n),
             )
         else:
-            TODO(combine_wait_event)
+            meta_overlap_args |= dict(
+                record_event_after_down=combine_wait_event,
+            )
 
-        return combine_overlap_args, down_overlap_args, compute_num_sms
+        return combine_overlap_args, down_overlap_args, meta_overlap_args
 
     def dispatch(
         self,
