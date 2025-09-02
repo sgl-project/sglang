@@ -6,7 +6,7 @@ use std::fmt::Display;
 
 // Import types from spec module
 use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, ResponseFormat, StringOrArray, UserMessageContent,
+    ChatCompletionRequest, ChatMessage, MessageContent, ResponseFormat, StringOrArray,
 };
 
 /// Validation constants for OpenAI API parameters
@@ -618,14 +618,14 @@ impl ChatCompletionRequest {
         for (i, msg) in self.messages.iter().enumerate() {
             if let ChatMessage::User { content, .. } = msg {
                 match content {
-                    UserMessageContent::Text(text) if text.is_empty() => {
+                    MessageContent::Text(text) if text.is_empty() => {
                         return Err(ValidationError::InvalidValue {
                             parameter: format!("messages[{}].content", i),
                             value: "empty".to_string(),
                             reason: "message content cannot be empty".to_string(),
                         });
                     }
-                    UserMessageContent::Parts(parts) if parts.is_empty() => {
+                    MessageContent::Parts(parts) if parts.is_empty() => {
                         return Err(ValidationError::InvalidValue {
                             parameter: format!("messages[{}].content", i),
                             value: "empty array".to_string(),
@@ -875,9 +875,9 @@ mod tests {
             ChatCompletionRequest {
                 model: "gpt-4".to_string(),
                 messages: vec![ChatMessage::User {
-                    role: "user".to_string(),
-                    content: UserMessageContent::Text("Hello".to_string()),
+                    content: MessageContent::Text("Hello".to_string()),
                     name: None,
+                    extra: Default::default(),
                 }],
                 temperature: Some(1.0),
                 top_p: Some(0.9),

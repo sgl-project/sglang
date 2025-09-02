@@ -50,24 +50,29 @@ use std::collections::HashMap;
 // ============= Message Types =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(tag = "role")]
 pub enum ChatMessage {
+    #[serde(rename = "system")]
     System {
-        role: String,
-        content: String,
+        content: MessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        #[serde(flatten)]
+        #[serde(default)]
+        extra: HashMap<Value, Value>,
     },
+    #[serde(rename = "user")]
     User {
-        role: String, // "user"
-        content: UserMessageContent,
+        content: MessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        #[serde(flatten)]
+        #[serde(default)]
+        extra: HashMap<Value, Value>,
     },
+    #[serde(rename = "assistant")]
     Assistant {
-        role: String, // "assistant"
-        #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: MessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,22 +82,40 @@ pub enum ChatMessage {
         /// Reasoning content for O1-style models (SGLang extension)
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
+        #[serde(flatten)]
+        #[serde(default)]
+        extra: HashMap<Value, Value>,
     },
+    #[serde(rename = "tool")]
     Tool {
-        role: String, // "tool"
-        content: String,
+        content: MessageContent,
         tool_call_id: String,
+        #[serde(flatten)]
+        #[serde(default)]
+        extra: HashMap<Value, Value>,
     },
+    #[serde(rename = "function")]
     Function {
-        role: String, // "function"
         content: String,
         name: String,
+        #[serde(flatten)]
+        #[serde(default)]
+        extra: HashMap<Value, Value>,
+    },
+    #[serde(rename = "developer")]
+    Developer {
+        content: MessageContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(flatten)]
+        #[serde(default)]
+        extra: HashMap<Value, Value>,
     },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum UserMessageContent {
+pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
 }
@@ -342,43 +365,47 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Extract text from messages for routing decisions
         self.messages
             .iter()
             .filter_map(|msg| match msg {
-                ChatMessage::System { content, .. } => Some(content.clone()),
-                ChatMessage::User { content, .. } => match content {
-                    UserMessageContent::Text(text) => Some(text.clone()),
-                    UserMessageContent::Parts(parts) => {
-                        let texts: Vec<String> = parts
-                            .iter()
-                            .filter_map(|part| match part {
-                                ContentPart::Text { text } => Some(text.clone()),
-                                _ => None,
-                            })
-                            .collect();
-                        Some(texts.join(" "))
-                    }
-                },
+                ChatMessage::System { content, .. }
+                | ChatMessage::User { content, .. }
+                | ChatMessage::Developer { content, .. }
+                | ChatMessage::Tool { content, .. } => extract_user_content(content),
                 ChatMessage::Assistant {
                     content,
                     reasoning_content,
                     ..
                 } => {
                     // Combine content and reasoning content for routing decisions
-                    let main_content = content.clone().unwrap_or_default();
+                    let user_content = extract_user_content(content).unwrap_or_default();
                     let reasoning = reasoning_content.clone().unwrap_or_default();
-                    if main_content.is_empty() && reasoning.is_empty() {
+                    if user_content.is_empty() && reasoning.is_empty() {
                         None
                     } else {
-                        Some(format!("{} {}", main_content, reasoning).trim().to_string())
+                        Some(format!("{} {}", user_content, reasoning).trim().to_string())
                     }
                 }
-                ChatMessage::Tool { content, .. } => Some(content.clone()),
                 ChatMessage::Function { content, .. } => Some(content.clone()),
             })
             .collect::<Vec<String>>()
             .join(" ")
+    }
+}
+
+pub fn extract_user_content(content: &MessageContent) -> Option<String> {
+    match content {
+        MessageContent::Text(text) => Some(text.clone()),
+        MessageContent::Parts(parts) => {
+            let texts: Vec<String> = parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            Some(texts.join(" "))
+        }
     }
 }
 
