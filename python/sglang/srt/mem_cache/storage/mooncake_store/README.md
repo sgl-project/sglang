@@ -1,7 +1,12 @@
 # Mooncake as L3 KV Cache
 
 This document describes how to use Mooncake as the L3 KV cache for SGLang.
-For more details about Mooncake, please refer to: https://kvcache-ai.github.io/
+
+## About Mooncake
+
+Mooncake aims to enhance the inference efficiency of large language models (LLMs), especially in slow object storage environments, by constructing a multi-level caching pool on high-speed interconnected DRAM/SSD resources. Compared to traditional caching, Mooncake utilizes (GPUDirect) RDMA technology to transfer data directly from the initiator’s DRAM/VRAM to the target’s DRAM/SSD in a zero-copy manner, while maximizing the use of multi-NIC resources on a single machine.
+
+For more details about Mooncake, please refer to [Mooncake project](https://github.com/kvcache-ai/Mooncake) and [Mooncake documents](https://kvcache-ai.github.io/).
 
 ## Install Mooncake
 
@@ -41,7 +46,11 @@ Install Mooncake:
 sudo make install
 ```
 
-## Use Mooncake
+## Deploy Mooncake
+
+**Mooncake** is a distributed system that efficiently aggregates memory resources across multiple servers. It can also be deployed on a single server for simpler setups.
+
+When integrated with **SGLang**, the system conceptually consists of four key components: `the master service`, `metadata service`, `store service`, and the `SGLang server`. Among them, the `master service` and `metadata service` are responsible for object and metadata maintenance. The `store service` manages a contiguous memory segment that contributes to the distributed KV cache, making its memory accessible to both local and remote `SGLang servers`. Data transfer occurs directly between the `store service` and `SGLang servers`, bypassing the master service.
 
 Launch Mooncake master server:
 
