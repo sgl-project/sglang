@@ -896,17 +896,21 @@ def sample_mmmu_requests(
                 prompt = f"Question: {question}\n\nAnswer: "
                 if apply_chat_template:
                     try:
+                        if "phi-4-multimodal" in tokenizer.name_or_path.lower():
+                            content = prompt.replace("image 1", "<|endoftext10|>")
+                        else:
+                            content = [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": image_data},
+                                },
+                                {"type": "text", "text": prompt},
+                            ]
                         prompt = tokenizer.apply_chat_template(
                             [
                                 {
                                     "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "image_url",
-                                            "image_url": {"url": image_data},
-                                        },
-                                        {"type": "text", "text": prompt},
-                                    ],
+                                    "content": content,
                                 }
                             ],
                             add_generation_prompt=True,
