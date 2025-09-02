@@ -1,3 +1,4 @@
+# Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/l2norm.py
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
