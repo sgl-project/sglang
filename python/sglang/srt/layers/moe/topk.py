@@ -330,6 +330,14 @@ class TopK(CustomOp):
                 )
                 topk_weights = topk_weights / topk_weights_sum
 
+            if expert_location_dispatch_info is not None:
+                topk_ids = topk_ids_logical_to_physical(
+                    topk_ids, expert_location_dispatch_info
+                )
+            get_global_expert_distribution_recorder().on_select_experts(
+                topk_ids=topk_ids
+            )
+
             return StandardTopKOutput(topk_weights, topk_ids, _)
         else:
             self.topk_config.torch_native = True
