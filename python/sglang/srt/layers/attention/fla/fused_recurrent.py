@@ -11,12 +11,14 @@ from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
-@triton.heuristics({
-    'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
-    'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
-})
-@triton.jit(do_not_specialize=['T'])
+@triton.heuristics(
+    {
+        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T"])
 def fused_recurrent_gated_delta_rule_fwd_kernel(
     q,
     k,
@@ -40,13 +42,15 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     STORE_FINAL_STATE: tl.constexpr,  # whether to store final state
     IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int64)
         all = T
         T = eos - bos
     else:
@@ -71,7 +75,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        p_h0 = h0 + i_nh * K*V + o_k[:, None] * V + o_v[None, :]
+        p_h0 = h0 + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for _ in range(0, T):
@@ -99,15 +103,15 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-        p_q += H*K
-        p_k += H*K
-        p_o += HV*V
-        p_v += HV*V
+        p_q += H * K
+        p_k += H * K
+        p_o += HV * V
+        p_v += HV * V
         p_g += HV
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
     if STORE_FINAL_STATE:
-        p_ht = ht + i_nh * K*V + o_k[:, None] * V + o_v[None, :]
+        p_ht = ht + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
@@ -182,7 +186,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         initial_state: torch.Tensor,
         output_final_state: bool,
         cu_seqlens: Optional[torch.LongTensor] = None,
-        use_qk_l2norm_in_kernel: bool = False
+        use_qk_l2norm_in_kernel: bool = False,
     ):
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q,
@@ -194,7 +198,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             initial_state=initial_state,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            cu_seqlens=cu_seqlens
+            cu_seqlens=cu_seqlens,
         )
 
         return o, final_state
@@ -309,15 +313,18 @@ def fused_recurrent_gated_delta_rule(
         initial_state,
         output_final_state,
         cu_seqlens,
-        use_qk_l2norm_in_kernel
+        use_qk_l2norm_in_kernel,
     )
     return o, final_state
 
-@triton.heuristics({
-    'USE_INITIAL_STATE': lambda args: args['h0_source'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
-})
-@triton.jit(do_not_specialize=['T'])
+
+@triton.heuristics(
+    {
+        "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T"])
 def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     q,
     k,
@@ -340,13 +347,15 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int64)
         all = T
         T = eos - bos
     else:
@@ -374,9 +383,15 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         idx = tl.load(h0_indices + i_n)
         # Add bounds checking for idx
         if idx >= 0:  # Assuming negative indices are invalid
-            p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+            p_h0 = (
+                h0_source
+                + idx * HV * K * V
+                + i_hv * K * V
+                + o_k[:, None] * V
+                + o_v[None, :]
+            )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
-    
+
     for _ in range(0, T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
@@ -401,19 +416,26 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         # [BV]
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-        
-        p_q += H*K
-        p_k += H*K
-        p_o += HV*V
-        p_v += HV*V
+
+        p_q += H * K
+        p_k += H * K
+        p_o += HV * V
+        p_v += HV * V
         p_g += HV
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
     # Store final state back to h0_source with bounds checking
     idx = tl.load(h0_indices + i_n)
     if idx >= 0:  # Add bounds checking
-        p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+        p_h0 = (
+            h0_source
+            + idx * HV * K * V
+            + i_hv * K * V
+            + o_k[:, None] * V
+            + o_v[None, :]
+        )
         tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
+
 
 def fused_recurrent_gated_delta_rule_update_fwd(
     q: torch.Tensor,
@@ -467,6 +489,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     o = o.squeeze(0)
     return o
 
+
 class FusedRecurrentUpdateFunction(torch.autograd.Function):
 
     @staticmethod
@@ -482,7 +505,7 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         initial_state_source: torch.Tensor,
         initial_state_indices: torch.Tensor,
         cu_seqlens: Optional[torch.LongTensor] = None,
-        use_qk_l2norm_in_kernel: bool = False
+        use_qk_l2norm_in_kernel: bool = False,
     ):
         o = fused_recurrent_gated_delta_rule_update_fwd(
             q=q,
@@ -494,11 +517,11 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             initial_state_source=initial_state_source,
             initial_state_indices=initial_state_indices,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            cu_seqlens=cu_seqlens
+            cu_seqlens=cu_seqlens,
         )
 
         return o
-    
+
     @staticmethod
     @input_guard
     def backward(ctx, do, dht):
@@ -507,6 +530,7 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             "because we haven't figured out how to compute dg without materializing the full "
             "hidden states for all time steps."
         )
+
 
 def fused_recurrent_gated_delta_rule_update(
     q: torch.Tensor,
@@ -526,7 +550,10 @@ def fused_recurrent_gated_delta_rule_update(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
-        if initial_state_source is not None and initial_state_indices.shape[0] != len(cu_seqlens) - 1:
+        if (
+            initial_state_source is not None
+            and initial_state_indices.shape[0] != len(cu_seqlens) - 1
+        ):
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."
@@ -547,6 +574,6 @@ def fused_recurrent_gated_delta_rule_update(
         initial_state_source,
         initial_state_indices,
         cu_seqlens,
-        use_qk_l2norm_in_kernel
+        use_qk_l2norm_in_kernel,
     )
     return o

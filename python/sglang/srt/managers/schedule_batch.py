@@ -1906,7 +1906,6 @@ class ModelWorkerBatch:
     launch_done: Optional[threading.Event] = None
 
 
-
 @triton.jit
 def write_req_to_token_pool_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
@@ -2016,4 +2015,3 @@ def get_last_loc_triton(
         BLOCK_SIZE,
     )
     return result
-

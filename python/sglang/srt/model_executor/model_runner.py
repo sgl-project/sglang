@@ -75,20 +75,18 @@ from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
 )
-from sglang.srt.mem_cache.allocator import (
+from sglang.srt.mem_cache.allocator import (  # MambaTokenToKVPoolAllocator,
     BaseTokenToKVPoolAllocator,
-    # MambaTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import (
+from sglang.srt.mem_cache.memory_pool import (  # MambaHybridPool,
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
     HybridReqToTokenPool,
-    # MambaHybridPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -1115,7 +1113,10 @@ class ModelRunner:
 
     @property
     def is_hybrid_gdn(self):
-        return self.model_config.hf_config.architectures[0] in ["Qwen3HybridMoEForCausalLM", "Qwen3HybridMoEForCausalLMMTP"]
+        return self.model_config.hf_config.architectures[0] in [
+            "Qwen3HybridMoEForCausalLM",
+            "Qwen3HybridMoEForCausalLMMTP",
+        ]
 
     def set_num_token_hybrid(self):
         if (
@@ -1662,17 +1663,23 @@ class ModelRunner:
 
             return DualChunkFlashAttentionBackend(self)
         elif backend_str == "hybrid_linear_attn":
-            assert self.is_hybrid_gdn, "hybrid_linear_attn backend can only be used with hybrid GDN models."
-            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-                HybridLinearAttnBackend, MambaAttnBackend
-            )
+            assert (
+                self.is_hybrid_gdn
+            ), "hybrid_linear_attn backend can only be used with hybrid GDN models."
             from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend
+                FlashAttentionBackend,
             )
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
+                MambaAttnBackend,
+            )
+
             full_attn_backend = FlashAttentionBackend(self)
             linear_attn_backend = MambaAttnBackend(self)
             full_attn_layers = self.model_config.hf_config.full_attention_layer_ids
-            return HybridLinearAttnBackend(full_attn_backend, linear_attn_backend, full_attn_layers)
+            return HybridLinearAttnBackend(
+                full_attn_backend, linear_attn_backend, full_attn_layers
+            )
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
 

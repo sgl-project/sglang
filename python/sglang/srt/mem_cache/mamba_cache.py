@@ -4,9 +4,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    global_server_args_dict,
-)
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 

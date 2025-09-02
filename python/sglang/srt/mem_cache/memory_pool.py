@@ -101,6 +101,7 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size))
 
+
 class MambaPool:
     def __init__(
         self,
@@ -125,40 +126,89 @@ class MambaPool:
         )
         if speculative_num_draft_tokens is not None:
             mixed_qkv_cache = torch.empty(
-                size=(num_mamba_layers, size + 1, speculative_num_draft_tokens, conv_state_shape[0]),
+                size=(
+                    num_mamba_layers,
+                    size + 1,
+                    speculative_num_draft_tokens,
+                    conv_state_shape[0],
+                ),
                 dtype=conv_dtype,
                 device="cuda",
             )
             linear_num_value_heads_per_tp_rank = temporal_state_shape[0]
             key_head_dim = temporal_state_shape[1]
             value_head_dim = temporal_state_shape[2]
-            linear_num_key_heads_per_tp_rank = int((conv_state_shape[0] - value_head_dim * linear_num_value_heads_per_tp_rank) / 2 / key_head_dim)
+            linear_num_key_heads_per_tp_rank = int(
+                (
+                    conv_state_shape[0]
+                    - value_head_dim * linear_num_value_heads_per_tp_rank
+                )
+                / 2
+                / key_head_dim
+            )
             query_cache = torch.empty(
-                size=(num_mamba_layers, size + 1,  speculative_num_draft_tokens, linear_num_key_heads_per_tp_rank, key_head_dim),
+                size=(
+                    num_mamba_layers,
+                    size + 1,
+                    speculative_num_draft_tokens,
+                    linear_num_key_heads_per_tp_rank,
+                    key_head_dim,
+                ),
                 dtype=conv_dtype,
                 device="cuda",
-            ) 
+            )
             key_cache = torch.empty(
-                size=(num_mamba_layers, size + 1, speculative_num_draft_tokens, linear_num_key_heads_per_tp_rank, key_head_dim),
+                size=(
+                    num_mamba_layers,
+                    size + 1,
+                    speculative_num_draft_tokens,
+                    linear_num_key_heads_per_tp_rank,
+                    key_head_dim,
+                ),
                 dtype=conv_dtype,
                 device="cuda",
-            ) 
+            )
             value_cache = torch.empty(
-                size=(num_mamba_layers, size + 1, speculative_num_draft_tokens, linear_num_value_heads_per_tp_rank, value_head_dim),
+                size=(
+                    num_mamba_layers,
+                    size + 1,
+                    speculative_num_draft_tokens,
+                    linear_num_value_heads_per_tp_rank,
+                    value_head_dim,
+                ),
                 dtype=conv_dtype,
                 device="cuda",
-            ) 
+            )
             g_cache = torch.empty(
-                size=(num_mamba_layers, size + 1, speculative_num_draft_tokens, linear_num_value_heads_per_tp_rank),
+                size=(
+                    num_mamba_layers,
+                    size + 1,
+                    speculative_num_draft_tokens,
+                    linear_num_value_heads_per_tp_rank,
+                ),
                 dtype=ssm_dtype,  # QQ: only g has same dtype as ssm state, need to double check later to see if g always need fp32
                 device="cuda",
             )
             beta_cache = torch.empty(
-                size=(num_mamba_layers, size + 1, speculative_num_draft_tokens, linear_num_value_heads_per_tp_rank),
+                size=(
+                    num_mamba_layers,
+                    size + 1,
+                    speculative_num_draft_tokens,
+                    linear_num_value_heads_per_tp_rank,
+                ),
                 dtype=conv_dtype,
                 device="cuda",
             )
-            self.mamba_cache = (conv_state, temporal_state, mixed_qkv_cache, query_cache, key_cache, value_cache, g_cache, beta_cache)
+            self.mamba_cache = (
+                conv_state,
+                temporal_state,
+                mixed_qkv_cache,
+                query_cache,
+                key_cache,
+                value_cache,
+                g_cache,
+                beta_cache,
+            )
         else:
             self.mamba_cache = (conv_state, temporal_state)
         self.size = size
@@ -169,8 +219,10 @@ class MambaPool:
         return [self.mamba_cache[i][layer_id] for i in range(len(self.mamba_cache))]
 
     def get_mamba_size(self):
-        return np.prod(self.mamba_cache[0].shape) * self.mamba_cache[0].dtype.itemsize + \
-            np.prod(self.mamba_cache[1].shape) * self.mamba_cache[1].dtype.itemsize
+        return (
+            np.prod(self.mamba_cache[0].shape) * self.mamba_cache[0].dtype.itemsize
+            + np.prod(self.mamba_cache[1].shape) * self.mamba_cache[1].dtype.itemsize
+        )
 
     def available_size(self):
         return len(self.free_slots)
@@ -194,6 +246,7 @@ class MambaPool:
     def clear(self):
         self.free_slots = list(range(self.size))
 
+
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
@@ -216,10 +269,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        
+
         self.mamba_pool = MambaPool(
             # size,
-            128, # TODO: fixme
+            128,  # TODO: fixme
             conv_dtype,
             ssm_dtype,
             len(mamba_layers),
@@ -229,9 +282,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
             speculative_num_draft_tokens,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layers)}
-        
+
         self.device = device
-        self.full_to_mamba_index_mapping: torch.Tensor = torch.empty(size, dtype=torch.int32, device=self.device)
+        self.full_to_mamba_index_mapping: torch.Tensor = torch.empty(
+            size, dtype=torch.int32, device=self.device
+        )
 
     def alloc(self, need_size: int) -> Optional[List[int]]:
         select_index = super().alloc(need_size)
@@ -239,7 +294,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             return None
         mamba_index = self.mamba_pool.alloc(need_size)
         assert len(select_index) == len(mamba_index)
-        self.full_to_mamba_index_mapping[select_index] = torch.tensor(mamba_index, dtype=torch.int32, device=self.device)
+        self.full_to_mamba_index_mapping[select_index] = torch.tensor(
+            mamba_index, dtype=torch.int32, device=self.device
+        )
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
@@ -258,6 +315,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def clear(self):
         super().clear()
         self.mamba_pool.clear()
+
 
 class KVCache(abc.ABC):
     @abc.abstractmethod

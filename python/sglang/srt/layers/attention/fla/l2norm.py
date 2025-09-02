@@ -15,10 +15,9 @@ BT_LIST = [8, 16, 32, 64, 128]
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16, 32]
+        triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]
     ],
-    key=['D']
+    key=["D"],
 )
 @triton.jit
 def l2norm_fwd_kernel1(
@@ -45,10 +44,9 @@ def l2norm_fwd_kernel1(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16, 32]
+        triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]
     ],
-    key=['D']
+    key=["D"],
 )
 @triton.jit
 def l2norm_bwd_kernel1(
@@ -71,17 +69,17 @@ def l2norm_bwd_kernel1(
     b_var = tl.sum(b_x * b_x)
     b_rstd = 1 / tl.sqrt(b_var + eps)
     b_dy = tl.load(dy + cols, mask=mask, other=0.0).to(tl.float32)
-    b_dx = b_dy * b_rstd - tl.sum(b_dy * b_x) * (1 / (b_var+eps)) * b_rstd * b_x
+    b_dx = b_dy * b_rstd - tl.sum(b_dy * b_x) * (1 / (b_var + eps)) * b_rstd * b_x
     tl.store(dx + cols, b_dx, mask=mask)
 
 
 @triton.autotune(
     configs=[
-        triton.Config({'BT': BT}, num_warps=num_warps)
+        triton.Config({"BT": BT}, num_warps=num_warps)
         for num_warps in [1, 2, 4, 8, 16]
         for BT in BT_LIST
     ],
-    key=['D', 'NB']
+    key=["D", "NB"],
 )
 @triton.jit
 def l2norm_fwd_kernel(
@@ -105,11 +103,11 @@ def l2norm_fwd_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({'BT': BT}, num_warps=num_warps)
+        triton.Config({"BT": BT}, num_warps=num_warps)
         for num_warps in [1, 2, 4, 8, 16]
         for BT in BT_LIST
     ],
-    key=['D', 'NB']
+    key=["D", "NB"],
 )
 @triton.jit
 def l2norm_bwd_kernel(
@@ -131,14 +129,15 @@ def l2norm_bwd_kernel(
     b_dy = tl.load(p_dy, boundary_check=(0, 1)).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)[:, None]
     b_rstd = 1 / tl.sqrt(b_var + eps)
-    b_dx = b_dy * b_rstd - tl.sum(b_dy * b_x, axis=1)[:, None] / (b_var+eps) * b_rstd * b_x
+    b_dx = (
+        b_dy * b_rstd
+        - tl.sum(b_dy * b_x, axis=1)[:, None] / (b_var + eps) * b_rstd * b_x
+    )
     tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), boundary_check=(0, 1))
 
 
 def l2norm_fwd(
-    x: torch.Tensor,
-    eps: float = 1e-6,
-    output_dtype: Optional[torch.dtype] = None
+    x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
 ):
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
@@ -158,7 +157,10 @@ def l2norm_fwd(
 
     if D <= 512:
         NB = triton.cdiv(T, 2048)
-        def grid(meta): return (triton.cdiv(T, meta['BT']), )
+
+        def grid(meta):
+            return (triton.cdiv(T, meta["BT"]),)
+
         l2norm_fwd_kernel[grid](
             x,
             y,
@@ -180,11 +182,7 @@ def l2norm_fwd(
     return y.view(x_shape_og)
 
 
-def l2norm_bwd(
-    x: torch.Tensor,
-    dy: torch.Tensor,
-    eps: float = 1e-5
-):
+def l2norm_bwd(x: torch.Tensor, dy: torch.Tensor, eps: float = 1e-5):
     x_shape_og = x.shape
     x = x.view(-1, dy.shape[-1])
     dy = dy.view(-1, dy.shape[-1])
@@ -202,7 +200,10 @@ def l2norm_bwd(
 
     if D <= 512:
         NB = triton.cdiv(T, 2048)
-        def grid(meta): return (triton.cdiv(T, meta['BT']), )
+
+        def grid(meta):
+            return (triton.cdiv(T, meta["BT"]),)
+
         l2norm_bwd_kernel[grid](
             x,
             dy,
@@ -230,12 +231,7 @@ class L2NormFunction(torch.autograd.Function):
 
     @staticmethod
     @input_guard
-    def forward(
-        ctx,
-        x,
-        eps=1e-6,
-        output_dtype=None
-    ):
+    def forward(ctx, x, eps=1e-6, output_dtype=None):
         y = l2norm_fwd(x, eps, output_dtype)
         ctx.eps = eps
         ctx.x_dtype = x.dtype
@@ -245,15 +241,13 @@ class L2NormFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
     def backward(ctx, dy):
-        x, = ctx.saved_tensors
+        (x,) = ctx.saved_tensors
         dx = l2norm_bwd(x, dy, ctx.eps)
         return dx, None, None
 
 
 def l2norm(
-    x: torch.Tensor,
-    eps: float = 1e-6,
-    output_dtype: Optional[torch.dtype] = None
+    x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
     return L2NormFunction.apply(x, eps, output_dtype)
 
@@ -263,11 +257,7 @@ l2_norm = l2norm
 
 class L2Norm(nn.Module):
 
-    def __init__(
-        self,
-        eps: float = 1e-6,
-        output_dtype: Optional[torch.dtype] = None
-    ):
+    def __init__(self, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None):
         super().__init__()
         self.eps = eps
         self.output_dtype = output_dtype

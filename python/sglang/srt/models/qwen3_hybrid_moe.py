@@ -465,14 +465,14 @@ class Qwen3GatedDeltaNet(nn.Module):
         }
 
         core_attn_out = forward_batch.attn_backend.forward(
-            q = None,
-            k = None,
-            v = None,
-            layer = None,
+            q=None,
+            k=None,
+            v=None,
+            layer=None,
             forward_batch=forward_batch,
             **kwargs,
         )
-        
+
         if self.share_norm:
             z_shape_og = z.shape
             # reshape input data into 2D tensor
@@ -964,9 +964,7 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        hidden_states = self.model(
-            input_ids, positions, forward_batch, inputs_embeds
-        )
+        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
@@ -983,7 +981,9 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False) -> Set[str]:
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ) -> Set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1006,9 +1006,13 @@ class Qwen3HybridMoEForCausalLM(nn.Module):
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
 
-            if is_mtp and name not in ['fc.weight', 'pre_fc_norm_embedding.weight', 'pre_fc_norm_hidden.weight']:
+            if is_mtp and name not in [
+                "fc.weight",
+                "pre_fc_norm_embedding.weight",
+                "pre_fc_norm_hidden.weight",
+            ]:
                 name = f"model.{name}"
-                
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
