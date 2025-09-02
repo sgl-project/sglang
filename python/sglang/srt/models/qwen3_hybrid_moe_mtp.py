@@ -89,15 +89,16 @@ class Qwen3HybridMoEForCausalLMMTP(Qwen3HybridMoEForCausalLM):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-
-        inputs_embeds = self.model.embed_tokens(input_ids)
+        if input_embeds is None:
+            hidden_states = self.model.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
         inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
 
-        hidden_states = inputs_embeds  # QQ: hidden_states should be something else?
-        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = self.pre_fc_norm_hidden(forward_batch.spec_info.hidden_states)
         hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
 
         hidden_states = self.model(
