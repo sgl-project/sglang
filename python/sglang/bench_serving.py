@@ -1299,7 +1299,11 @@ def sample_image_requests(
         total_image_bytes += sum(list(images_bytes))
 
         data_row = create_mm_data_row(
-            text_prompt, images, images_base64, int(output_lens[i]), processor
+            text_prompt,
+            list(images),
+            list(images_base64),
+            int(output_lens[i]),
+            processor,
         )
 
         dataset.append(data_row)
