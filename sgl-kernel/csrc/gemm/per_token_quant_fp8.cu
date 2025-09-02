@@ -136,20 +136,20 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
 
   max_value = blockReduceMax(max_value);
 
-  __shared__ float token_scale;
+  __shared__ float scale;
   if (tid == 0) {
     if (scale_ub) {
-      token_scale = min(max_value, *scale_ub);
+      scale = min(max_value, *scale_ub);
     } else {
-      token_scale = max_value;
+      scale = max_value;
     }
     // token scale computation
-    token_scale = max(token_scale / FP8_E4M3_MAX, min_scaling_factor);
-    output_s[token_idx] = token_scale;
+    scale = max(scale / FP8_E4M3_MAX, min_scaling_factor);
+    output_s[token_idx] = scale;
   }
   __syncthreads();
 
-  const float scale_inv = 1.0f / token_scale;
+  const float scale_inv = 1.0f / scale;
 
   // Quantize using vectorized loads
   for (int32_t i = tid; i < num_vec_elems; i += block_dim) {
