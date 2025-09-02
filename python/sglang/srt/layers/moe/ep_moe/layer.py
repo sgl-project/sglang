@@ -539,6 +539,23 @@ class DeepEPMoE(EPMoE):
         N = self.w13_weight.size(1)
         scale_block_size = 128
 
+        w13_weight_fp8 = (
+            self.w13_weight,
+            (
+                self.w13_weight_scale_inv
+                if self.use_block_quant
+                else self.w13_weight_scale
+            ),
+        )
+        w2_weight_fp8 = (
+            self.w2_weight,
+            (
+                self.w2_weight_scale_inv
+                if self.use_block_quant
+                else self.w2_weight_scale
+            ),
+        )
+
         hidden_states_fp8_shape = hidden_states_fp8.shape
         hidden_states_fp8_device = hidden_states_fp8.device
         hidden_states_fp8_dtype = hidden_states_fp8.dtype
@@ -599,7 +616,7 @@ class DeepEPMoE(EPMoE):
         if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             input_tensor[1] = tma_align_input_scale(input_tensor[1])
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            input_tensor, self.w13_weight_fp8, gateup_output, m_indices
+            input_tensor, w13_weight_fp8, gateup_output, m_indices
         )
         del input_tensor
         down_input = torch.empty(
@@ -629,7 +646,7 @@ class DeepEPMoE(EPMoE):
             down_input_scale = tma_align_input_scale(down_input_scale)
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
-            self.w2_weight_fp8,
+            w2_weight_fp8,
             down_output,
             m_indices,
         )
