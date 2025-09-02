@@ -63,6 +63,11 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+# --- Modification (0) Start --- #
+import logging
+logger = logging.getLogger(__name__)
+# --- Modification (0) End --- #
+
 _is_npu = is_npu()
 
 
@@ -618,6 +623,24 @@ class ForwardBatch:
 
         from sglang.srt.speculative.eagle_utils import EagleDraftInput
 
+        # -- Modification (1) Start -- #
+        import torch.distributed as dist
+        from sglang.srt.distributed import (
+            get_tp_group,
+            get_world_group
+        )
+        from sglang.srt.layers.dp_attention import (
+            get_attention_tp_group,
+            get_attention_tp_rank,
+            get_attention_tp_size,
+            get_attention_dp_rank,
+            get_attention_dp_size,
+            get_local_attention_dp_rank,
+            get_local_attention_dp_size,
+            attn_tp_all_gather
+        )
+        # -- Modification (1) End -- #
+
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -631,6 +654,21 @@ class ForwardBatch:
             global_num_tokens[i] = (
                 (global_num_tokens[i] - 1) // attn_tp_size + 1
             ) * attn_tp_size
+
+        # -- Modification (2) Start -- #
+        # attention_tp_group
+        my_rank = dist.get_rank()
+        cur_device = f"cuda:{my_rank}"
+        local_bs_tensor = torch.tensor([self.batch_size], device=cur_device)
+        global_bs_list = [torch.zeros_like(local_bs_tensor) for _ in range(sync_group_size)]
+        #attn_tp_all_gather(global_bs_list, local_bs_tensor)
+        get_tp_group().all_gather(local_bs_tensor, output_tensor_list=global_bs_list)
+        global_batch_sizes = [t.item() for t in global_bs_list]
+        global_max_bs = max(global_batch_sizes)
+        #logger.info(f"[GW DEBUG] After allgather : {self.batch_size=}, {global_max_bs=}, {global_bs_list=}")
+
+        # -- Modification (2) End -- #
+
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(global_num_tokens)
         self.dp_padding_mode = dp_padding_mode
@@ -654,7 +692,17 @@ class ForwardBatch:
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
 
+        # -- Modification (3) Start -- #
+        if not self.forward_mode.is_decode():
+            setattr(self, "_original_batch_size", self.batch_size)
+            #bs_diff = global_max_bs - self.batch_size
+            #if bs_diff != 0:
+            #    logger.info(f"[GW DEBUG] bs gap alleviated! {self.batch_size=}, {global_max_bs=}")
+            self.batch_size = global_max_bs
+        # -- Modification (3) End -- #
+
         bs = self.batch_size
+
 
         if self.forward_mode.is_decode():
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
@@ -709,8 +757,17 @@ class ForwardBatch:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
 
         # TODO: check if we need to pad other tensors
+        # --- Modification (4) Start --- #
         if self.extend_seq_lens is not None:
-            self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+            extend_seq_lens_fill_value = self.input_ids.shape[0] - sum(self.extend_seq_lens_cpu)
+            self.extend_seq_lens = self._pad_tensor_to_size(
+                                    self.extend_seq_lens, bs, value=extend_seq_lens_fill_value)
+            self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+        if self.extend_prefix_lens is not None:
+            self.extend_prefix_lens = self._pad_tensor_to_size(self.extend_prefix_lens, bs)
+            self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
+            self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
+        # --- Modification (4) End --- #
 
         if self.spec_info is not None and isinstance(self.spec_info, EagleDraftInput):
             spec_info = self.spec_info
@@ -778,6 +835,15 @@ class ForwardBatch:
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+
+        # -- Modification (6) Start -- #
+        if self.forward_mode.is_extend():
+            self.seq_lens = self.seq_lens[:bs]
+            logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+            if logits_output.hidden_states is not None:
+                logits_output.hidden_states = logits_output.hidden_states[:bs]
+        # -- Modification (6) End -- #
+
 
     # Here we suppose the length of each chunk is equal
     # For example, if we have 4 sequences with prefix length [256, 512, 768, 1024], prefix_chunk_len = 256
