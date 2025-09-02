@@ -590,11 +590,8 @@ class DeepEPMoE(EPMoE):
             num_recv_tokens_per_expert,
             dtype=torch.int32,
             pin_memory=True,
-            # NOTE MODFIED
-            device="cuda",
-        )
-        #     device="cpu",
-        # ).cuda(non_blocking=True)
+            device="cpu",
+        ).cuda(non_blocking=True)
         expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
 
         ep_scatter(
