@@ -1865,8 +1865,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        if torch.distributed.get_rank() == 0:
-            print(f"Layer {self.layer_id=} forward START", flush=True)
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch

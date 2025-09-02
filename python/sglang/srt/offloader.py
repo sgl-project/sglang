@@ -209,7 +209,6 @@ class OffloaderV2(BaseOffloader):
                 offload_submodules.append(submodule)
                 self.offloaders.append(
                     _ModuleOffloader(
-                        debug_name=f"offloader{len(self.offloaders)}_module{module_index}",
                         mode=self.mode,
                         module=submodule,
                         alt_stream=alt_stream,
@@ -267,13 +266,11 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
 class _ModuleOffloader(ABC):
     def __init__(
         self,
-        debug_name: str,
         mode: str,
         module: torch.nn.Module,
         alt_stream: torch.cuda.Stream,
         whitelist_param_names: List[str],
     ):
-        self.debug_name = debug_name
         self.mode = mode
         self.module = module
         self.device = next(module.parameters()).device
