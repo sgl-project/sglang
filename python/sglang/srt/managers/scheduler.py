@@ -488,7 +488,7 @@ class Scheduler(
             enable=server_args.enable_memory_saver
         )
         self.offload_tags = set()
-        self.init_profier()
+        self.init_profiler()
 
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
