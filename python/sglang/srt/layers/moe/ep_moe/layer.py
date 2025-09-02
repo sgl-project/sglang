@@ -22,8 +22,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.moe.token_dispatcher.deepep import ENABLE_DEEPEP_COMBINE_OVERLAP, DEEPEP_LL_COMBINE_SEND_NUM_SMS, \
-    ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP
+from sglang.srt.layers.moe.token_dispatcher.deepep import ENABLE_DEEPEP_COMBINE_OVERLAP, ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -34,7 +33,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -475,15 +474,14 @@ class DeepEPMoE(EPMoE):
         # TODO do not hardcode
         block_m, block_n = 128, 128
 
-        from sglang.srt.layers.moe.token_dispatcher.deepep import DEEPEP_LL_COMBINE_SEND_NUM_SMS
-        device_properties = torch.cuda.get_device_properties(device="cuda")
-        total_num_sms = device_properties.multi_processor_count
-        compute_num_sms = total_num_sms - DEEPEP_LL_COMBINE_SEND_NUM_SMS
+        total_num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+        communicate_num_sms = get_int_env_var("SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32)
+        compute_num_sms = total_num_sms - communicate_num_sms
 
         combine_overlap_args = dict(
             # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
             overlap=False,
-            num_sms=DEEPEP_LL_COMBINE_SEND_NUM_SMS,
+            num_sms=communicate_num_sms,
         )
         down_overlap_args = None
 
