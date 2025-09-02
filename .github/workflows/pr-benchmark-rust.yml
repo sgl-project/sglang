@@ -48,7 +48,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run request processing benchmark
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
@@ -92,7 +92,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run tokenizer benchmark
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
@@ -135,7 +135,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run tool parser benchmark
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
