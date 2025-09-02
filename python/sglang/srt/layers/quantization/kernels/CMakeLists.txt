@@ -30,8 +30,19 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-# Use the same ABI as PyTorch
-add_definitions(-D_GLIBCXX_USE_CXX11_ABI=1)
+# Derive ABI flag from PyTorch to match the installed wheel
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
+  OUTPUT_VARIABLE TORCH_CXX11_ABI
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE TORCH_ABI_RESULT
+)
+if(NOT TORCH_ABI_RESULT EQUAL 0)
+  # Fallback if PyTorch query fails
+  set(TORCH_CXX11_ABI 1)
+  message(WARNING "Could not detect PyTorch ABI, defaulting to _GLIBCXX_USE_CXX11_ABI=1")
+endif()
+add_definitions(-D_GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI})
 
 # Select source files based on backend
 set(SOURCES mxfp4_grouped.cpp)
@@ -41,15 +52,15 @@ if(USE_CUTLASS_ADVANCED)
   add_definitions(-DUSE_CUTLASS_FP4)
   message(STATUS "Using advanced CUTLASS FP4 implementation")
 elseif(USE_CUTLASS_FP4)
-  list(APPEND SOURCES mxfp4_grouped.cu)
+  list(APPEND SOURCES mxfp4_grouped_impl.cu)
   add_definitions(-DUSE_CUTLASS_FP4)
   message(STATUS "Using CUTLASS FP4 backend")
 elseif(USE_FLASHINFER_BACKEND)
-  list(APPEND SOURCES mxfp4_grouped.cu)
+  list(APPEND SOURCES mxfp4_grouped_impl.cu)
   add_definitions(-DUSE_FLASHINFER_BACKEND)
   message(STATUS "Using FlashInfer backend")
 else()
-  list(APPEND SOURCES mxfp4_grouped.cu)
+  list(APPEND SOURCES mxfp4_grouped_impl.cu)
   message(STATUS "Using stub implementation (build sanity only)")
 endif()
 
@@ -67,9 +78,22 @@ if(CUTLASS_INCLUDE_DIR)
   target_include_directories(_mxfp4_kernels PRIVATE ${CUTLASS_INCLUDE_DIR})
 endif()
 
-# Set CUDA architectures (allow override via CMAKE_CUDA_ARCHITECTURES)
+# Set CUDA architectures - honor TORCH_CUDA_ARCH_LIST if set
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES "120")  # Default to SM120 for RTX 5090
+  # Check for TORCH_CUDA_ARCH_LIST environment variable
+  if(DEFINED ENV{TORCH_CUDA_ARCH_LIST})
+    string(REPLACE " " ";" ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
+    set(CMAKE_CUDA_ARCHITECTURES "")
+    foreach(ARCH IN LISTS ARCH_LIST)
+      # Convert format like "12.0" to "120"
+      string(REPLACE "." "" ARCH_CLEAN "${ARCH}")
+      list(APPEND CMAKE_CUDA_ARCHITECTURES "${ARCH_CLEAN}")
+    endforeach()
+    message(STATUS "Using CUDA architectures from TORCH_CUDA_ARCH_LIST: ${CMAKE_CUDA_ARCHITECTURES}")
+  else()
+    set(CMAKE_CUDA_ARCHITECTURES "120")  # Default to SM120 for RTX 5090
+    message(STATUS "Using default CUDA architecture: ${CMAKE_CUDA_ARCHITECTURES}")
+  endif()
 endif()
 set_target_properties(_mxfp4_kernels PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
@@ -106,13 +130,26 @@ target_link_libraries(_mxfp4_kernels PRIVATE
 
 # Link FlashInfer if using that backend
 if(USE_FLASHINFER_BACKEND)
-  find_library(FLASHINFER_LIB flashinfer PATHS /usr/local/lib)
+  # Check for custom FlashInfer location via environment
+  if(DEFINED ENV{FLASHINFER_DIR})
+    find_library(FLASHINFER_LIB flashinfer 
+      PATHS $ENV{FLASHINFER_DIR}/lib $ENV{FLASHINFER_DIR}
+      NO_DEFAULT_PATH)
+  else()
+    find_library(FLASHINFER_LIB flashinfer PATHS /usr/local/lib)
+  endif()
   if(FLASHINFER_LIB)
     target_link_libraries(_mxfp4_kernels PRIVATE ${FLASHINFER_LIB})
+    message(STATUS "Found FlashInfer library: ${FLASHINFER_LIB}")
+  else()
+    message(WARNING "FlashInfer library not found, backend may not work")
   endif()
 endif()
 
-# Installation
+# Installation - use proper subdirectory
+if(NOT DEFINED CMAKE_INSTALL_LIBDIR)
+  set(CMAKE_INSTALL_LIBDIR "lib")
+endif()
 install(TARGETS _mxfp4_kernels
-  LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}
 )

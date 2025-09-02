@@ -11,8 +11,25 @@ import torch
 def get_cuda_arch_list():
     """Get CUDA architectures to compile for, respecting TORCH_CUDA_ARCH_LIST."""
     # Check environment variable first
-    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "12.0")
-    return arch_list.split(";")
+    arch_list_env = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+    if arch_list_env:
+        # Parse various formats: "12.0", "12.0;11.0", "12.0 11.0", "120+PTX"
+        arch_list_env = arch_list_env.replace(";", " ").replace(",", " ")
+        archs = []
+        for arch in arch_list_env.split():
+            # Remove +PTX suffix if present
+            arch = arch.split("+")[0]
+            # Normalize format (12.0 -> 12.0, 120 -> 12.0)
+            if "." not in arch:
+                if len(arch) == 3:
+                    arch = f"{arch[0:2]}.{arch[2]}"
+                elif len(arch) == 2:
+                    arch = f"{arch}.0"
+            archs.append(arch)
+        return archs if archs else ["12.0"]  # Default to SM120
+    else:
+        # Default to SM120 for RTX 5090
+        return ["12.0"]
 
 setup(
     name='mxfp4_kernels',
@@ -21,7 +38,7 @@ setup(
             name='_mxfp4_kernels',
             sources=[
                 'mxfp4_grouped.cpp',
-                'mxfp4_grouped.cu',
+                'mxfp4_grouped_impl.cu',
             ],
             extra_compile_args={
                 'cxx': [
