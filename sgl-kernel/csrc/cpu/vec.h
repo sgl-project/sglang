@@ -121,6 +121,49 @@ inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
 #endif
 }
 
+// remove warning: ignoring attributes on template argument ‘__m512bh’ [-Wignored-attributes]
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-attributes"
+
+#define MXFP4_VALUES \
+  -6.0f, -4.0f, -3.0f, -2.0f, -1.5f, -1.0f, -0.5f, -0.0f, 6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f, 0.0f
+
+// convert 64 mxfp4 to 2x bf16 vectors, expect input 32-way packing
+inline std::tuple<__m512bh, __m512bh> cvt_mxfp4_e2m1_bf16_intrinsic_lut(__m256i a, __m512i s0, __m512i s1) {
+  // LUT
+  static const __m512 values = _mm512_set_ps(MXFP4_VALUES);
+  static const __m512i lut = (__m512i)(_mm512_cvtne2ps_pbh(values, values));
+
+  const __m512i abs_mask = _mm512_set1_epi16(0x7FFF);
+  const __m512i zero = _mm512_setzero_si512();
+
+  // expand values to 16-bit integers
+  __m512i x0 = _mm512_cvtepu8_epi16(a);
+  __m512i x1 = _mm512_srli_epi32(x0, 4);
+
+  // LUT to convert mxfp4 values to bf16
+  x0 = _mm512_permutexvar_epi16(x0, lut);
+  x1 = _mm512_permutexvar_epi16(x1, lut);
+
+  // check for zeros
+  __mmask32 mask0 = _mm512_cmp_epi16_mask(_mm512_and_si512(x0, abs_mask), zero, _MM_CMPINT_EQ);
+  __mmask32 mask1 = _mm512_cmp_epi16_mask(_mm512_and_si512(x1, abs_mask), zero, _MM_CMPINT_EQ);
+
+  // emulate bf16 mul with scale factor
+  x0 = _mm512_add_epi16(x0, s0);
+  x1 = _mm512_add_epi16(x1, s1);
+
+  // blend with zero
+  x0 = _mm512_mask_blend_epi16(mask0, x0, zero);
+  x1 = _mm512_mask_blend_epi16(mask1, x1, zero);
+
+  return std::make_tuple(__m512bh(x0), __m512bh(x1));
+}
+
+#define CVT_MXFP4_TO_BF16(a, s0, s1) cvt_mxfp4_e2m1_bf16_intrinsic_lut(a, s0, s1)
+
+#pragma GCC diagnostic pop
+
 #endif
 
 // vector to scalar reduction

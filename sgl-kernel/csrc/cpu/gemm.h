@@ -34,6 +34,11 @@ inline bool can_use_brgemm<int8_t>(int M) {
 }
 
 template <>
+inline bool can_use_brgemm<uint8_t>(int M) {
+  return false;
+}
+
+template <>
 inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
   return M > 4;
 }
@@ -50,6 +55,12 @@ inline int64_t get_row_size(int64_t K) {
 template <>
 inline int64_t get_row_size<int8_t>(int64_t K) {
   return K + sizeof(int32_t);
+}
+
+// uint8: mxfp4 or int4
+template <>
+inline int64_t get_row_size<uint8_t>(int64_t K) {
+  return K >> 1;
 }
 
 inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {

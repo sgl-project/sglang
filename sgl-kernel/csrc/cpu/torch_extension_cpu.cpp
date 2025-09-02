@@ -117,6 +117,9 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
+// scale prepack for mxfp4
+at::Tensor convert_scale_packed(at::Tensor& scale);
+
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
 
@@ -143,6 +146,10 @@ at::Tensor fp8_scaled_mm_cpu(
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni);
+
+// mxfp4 gemm
+at::Tensor mxfp4_scaled_mm_cpu(
+    at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2, const std::optional<at::Tensor>& bias, bool is_vnni);
 
 // quant + igemm
 at::Tensor int8_scaled_mm_with_quant(
@@ -321,6 +328,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
   m.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed);
 
+  // scale prepack for mxfp4
+  m.def("convert_scale_packed(Tensor scale) -> Tensor");
+  m.impl("convert_scale_packed", torch::kCPU, &convert_scale_packed);
+
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
@@ -340,6 +351,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, int[] block_size, Tensor? bias, ScalarType "
       "out_dtype, bool is_vnni) -> Tensor");
   m.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
+
+  // mxfp4 gemm
+  m.def("mxfp4_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, bool is_vnni) -> Tensor");
+  m.impl("mxfp4_scaled_mm_cpu", torch::kCPU, &mxfp4_scaled_mm_cpu);
 
   // quant + igemm
   m.def(
