@@ -591,13 +591,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_weights,
             overlap_args=overlap_args,
         )
-        return hidden_states, event, hook
+        return hidden_states, event, hook, overlap_args
 
-    def combine_b(self, hidden_states, event, hook):
+    def combine_b(self, hidden_states, event, hook, overlap_args):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
-        if ENABLE_DEEPEP_COMBINE_OVERLAP:
-            self.device_module.current_stream().wait_stream(overlap_args["communicate_stream"])
+        # TODO refactor and improve the whole logic
+        if overlap_args is not None:
+            self.device_module.current_stream().wait_stream(overlap_args["stream"])
 
         return hidden_states
 
@@ -609,7 +610,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         overlap_args: Optional[Dict[str, Any]],
     ):
         buffer = self._get_buffer()
-        if ENABLE_DEEPEP_COMBINE_OVERLAP:
+        if overlap_args is not None:
             overlap_args["stream"].wait_event(overlap_args["wait_event"])
             with torch.cuda.stream(overlap_args["stream"]):
                 # TODO let ant change DeepEP to unify the two APIs?

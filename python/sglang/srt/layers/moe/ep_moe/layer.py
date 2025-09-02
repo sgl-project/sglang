@@ -453,6 +453,7 @@ class DeepEPMoE(EPMoE):
 
         return hidden_states
 
+    # TODO refactor and improve the whole logic
     @staticmethod
     def _compute_overlap_args(dispatch_output, alt_stream):
         if not ENABLE_DEEPEP_COMBINE_OVERLAP:
