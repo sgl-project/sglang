@@ -1,13 +1,10 @@
 use super::traits::{
     Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
 };
-use crate::metrics::TokenizerMetrics;
 use anyhow::{Error, Result};
 use std::collections::HashMap;
-use std::time::Instant;
 use tokenizers::tokenizer::Tokenizer as HfTokenizer;
 
-#[cfg(feature = "minijinja")]
 use super::chat_template::{ChatMessage, ChatTemplateProcessor};
 
 /// HuggingFace tokenizer wrapper
@@ -16,7 +13,6 @@ pub struct HuggingFaceTokenizer {
     special_tokens: SpecialTokens,
     vocab: HashMap<String, TokenIdType>,
     reverse_vocab: HashMap<TokenIdType, String>,
-    #[cfg(feature = "minijinja")]
     chat_template: Option<String>,
 }
 
@@ -45,7 +41,6 @@ impl HuggingFaceTokenizer {
             .collect();
 
         // Load chat template
-        #[cfg(feature = "minijinja")]
         let chat_template = if let Some(template_path) = chat_template_path {
             // Load from specified .jinja file
             Self::load_chat_template_from_file(template_path)?
@@ -59,7 +54,6 @@ impl HuggingFaceTokenizer {
             special_tokens,
             vocab,
             reverse_vocab,
-            #[cfg(feature = "minijinja")]
             chat_template,
         })
     }
@@ -78,7 +72,6 @@ impl HuggingFaceTokenizer {
             special_tokens,
             vocab,
             reverse_vocab,
-            #[cfg(feature = "minijinja")]
             chat_template: None,
         }
     }
@@ -111,7 +104,6 @@ impl HuggingFaceTokenizer {
     }
 
     /// Try to load chat template from tokenizer_config.json
-    #[cfg(feature = "minijinja")]
     fn load_chat_template(tokenizer_path: &str) -> Option<String> {
         // Try to find tokenizer_config.json in the same directory
         let path = std::path::Path::new(tokenizer_path);
@@ -129,7 +121,6 @@ impl HuggingFaceTokenizer {
     }
 
     /// Load chat template from a .jinja file
-    #[cfg(feature = "minijinja")]
     fn load_chat_template_from_file(template_path: &str) -> Result<Option<String>> {
         use std::fs;
 
@@ -143,13 +134,11 @@ impl HuggingFaceTokenizer {
     }
 
     /// Set or override the chat template
-    #[cfg(feature = "minijinja")]
     pub fn set_chat_template(&mut self, template: String) {
         self.chat_template = Some(template);
     }
 
     /// Apply chat template if available
-    #[cfg(feature = "minijinja")]
     pub fn apply_chat_template(
         &self,
         messages: &[ChatMessage],
@@ -174,58 +163,21 @@ impl HuggingFaceTokenizer {
             Ok(result)
         }
     }
-
-    /// Apply chat template if available (without minijinja feature)
-    #[cfg(not(feature = "minijinja"))]
-    pub fn apply_chat_template(
-        &self,
-        messages: &[ChatMessage],
-        add_generation_prompt: bool,
-    ) -> Result<String> {
-        // Fallback to simple formatting
-        let mut result = String::new();
-        for msg in messages {
-            result.push_str(&format!("{}: {}\n", msg.role, msg.content));
-        }
-        if add_generation_prompt {
-            result.push_str("assistant: ");
-        }
-        Ok(result)
-    }
 }
 
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str) -> Result<Encoding> {
-        let start = Instant::now();
-
-        TokenizerMetrics::record_encode_request("huggingface");
-        TokenizerMetrics::record_chars_per_encode(input.len());
-
         self.tokenizer
             .encode(input, false)
-            .map_err(|e| {
-                TokenizerMetrics::record_encode_error("encoding_failed");
-                Error::msg(format!("Encoding failed: {}", e))
-            })
-            .map(|encoding| {
-                TokenizerMetrics::record_tokens_per_encode(encoding.get_ids().len());
-                TokenizerMetrics::record_encode_duration(start.elapsed());
-                Encoding::Hf(Box::new(encoding))
-            })
+            .map_err(|e| Error::msg(format!("Encoding failed: {}", e)))
+            .map(|encoding| Encoding::Hf(Box::new(encoding)))
     }
 
     fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
-        let start = Instant::now();
-
         let encodings = self
             .tokenizer
             .encode_batch(inputs.to_vec(), false)
-            .map_err(|e| {
-                TokenizerMetrics::record_encode_error("batch_encoding_failed");
-                Error::msg(format!("Batch encoding failed: {}", e))
-            })?;
-
-        TokenizerMetrics::record_encode_batch_duration(start.elapsed(), inputs.len());
+            .map_err(|e| Error::msg(format!("Batch encoding failed: {}", e)))?;
 
         Ok(encodings
             .into_iter()
@@ -236,20 +188,9 @@ impl Encoder for HuggingFaceTokenizer {
 
 impl Decoder for HuggingFaceTokenizer {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
-        let start = Instant::now();
-
-        TokenizerMetrics::record_decode_request("huggingface");
-        TokenizerMetrics::record_tokens_per_decode(token_ids.len());
-
         self.tokenizer
             .decode(token_ids, skip_special_tokens)
-            .map_err(|e| {
-                TokenizerMetrics::record_decode_error("decoding_failed");
-                Error::msg(format!("Decoding failed: {}", e))
-            })
-            .inspect(|_| {
-                TokenizerMetrics::record_decode_duration(start.elapsed());
-            })
+            .map_err(|e| Error::msg(format!("Decoding failed: {}", e)))
     }
 }
 
@@ -273,10 +214,8 @@ impl TokenizerTrait for HuggingFaceTokenizer {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "minijinja")]
     use super::ChatMessage;
 
-    #[cfg(feature = "minijinja")]
     #[test]
     fn test_chat_message_creation() {
         let msg = ChatMessage::system("You are a helpful assistant");

@@ -5,7 +5,7 @@ import torch
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported
 
 try:
     from vllm import _custom_ops as ops
@@ -459,7 +459,7 @@ def _requant_weight_ue8m0(
         import deep_gemm.utils.layout
 
         sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
-        sf = deep_gemm.utils.layout.get_col_major_tma_aligned_packed_tensor(sf)
+        sf = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
         return sf
 
     out_s = _transform_scale(out_s, mn=out_w.shape[-2])
@@ -557,7 +557,10 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+        pad_output = (
+            not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+            and not cutlass_fp8_supported
+        )
     output_padding = 17 if pad_output else None
 
     # View input as 2D matrix for fp8 methods

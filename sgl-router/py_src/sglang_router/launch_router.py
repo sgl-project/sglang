@@ -72,6 +72,12 @@ class RouterArgs:
     request_timeout_secs: int = 1800
     # Max concurrent requests for rate limiting
     max_concurrent_requests: int = 256
+    # Queue size for pending requests when max concurrent limit reached
+    queue_size: int = 100
+    # Maximum time (in seconds) a request can wait in queue before timing out
+    queue_timeout_secs: int = 60
+    # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    rate_limit_tokens_per_second: Optional[int] = None
     # CORS allowed origins
     cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
     # Retry configuration
@@ -93,6 +99,9 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Tokenizer configuration
+    model_path: Optional[str] = None
+    tokenizer_path: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -403,11 +412,42 @@ class RouterArgs:
             help="Maximum number of concurrent requests allowed (for rate limiting)",
         )
         parser.add_argument(
+            f"--{prefix}queue-size",
+            type=int,
+            default=RouterArgs.queue_size,
+            help="Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)",
+        )
+        parser.add_argument(
+            f"--{prefix}queue-timeout-secs",
+            type=int,
+            default=RouterArgs.queue_timeout_secs,
+            help="Maximum time (in seconds) a request can wait in queue before timing out",
+        )
+        parser.add_argument(
+            f"--{prefix}rate-limit-tokens-per-second",
+            type=int,
+            default=RouterArgs.rate_limit_tokens_per_second,
+            help="Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests",
+        )
+        parser.add_argument(
             f"--{prefix}cors-allowed-origins",
             type=str,
             nargs="*",
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+        )
+        # Tokenizer configuration
+        parser.add_argument(
+            f"--{prefix}model-path",
+            type=str,
+            default=None,
+            help="Model path for loading tokenizer (HuggingFace model ID or local path)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-path",
+            type=str,
+            default=None,
+            help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
         )
 
     @classmethod
@@ -478,6 +518,21 @@ class RouterArgs:
                 f"{prefix}max_concurrent_requests",
                 RouterArgs.max_concurrent_requests,
             ),
+            queue_size=getattr(
+                args,
+                f"{prefix}queue_size",
+                RouterArgs.queue_size,
+            ),
+            queue_timeout_secs=getattr(
+                args,
+                f"{prefix}queue_timeout_secs",
+                RouterArgs.queue_timeout_secs,
+            ),
+            rate_limit_tokens_per_second=getattr(
+                args,
+                f"{prefix}rate_limit_tokens_per_second",
+                RouterArgs.rate_limit_tokens_per_second,
+            ),
             cors_allowed_origins=getattr(args, f"{prefix}cors_allowed_origins", []),
             retry_max_retries=getattr(args, f"{prefix}retry_max_retries"),
             retry_initial_backoff_ms=getattr(args, f"{prefix}retry_initial_backoff_ms"),
@@ -515,6 +570,8 @@ class RouterArgs:
             health_check_endpoint=getattr(
                 args, f"{prefix}health_check_endpoint", RouterArgs.health_check_endpoint
             ),
+            model_path=getattr(args, f"{prefix}model_path", None),
+            tokenizer_path=getattr(args, f"{prefix}tokenizer_path", None),
         )
 
     @staticmethod
@@ -700,6 +757,9 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             ),
             request_id_headers=router_args.request_id_headers,
             max_concurrent_requests=router_args.max_concurrent_requests,
+            queue_size=router_args.queue_size,
+            queue_timeout_secs=router_args.queue_timeout_secs,
+            rate_limit_tokens_per_second=router_args.rate_limit_tokens_per_second,
             cors_allowed_origins=router_args.cors_allowed_origins,
             retry_max_retries=router_args.retry_max_retries,
             retry_initial_backoff_ms=router_args.retry_initial_backoff_ms,
@@ -717,6 +777,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             health_check_timeout_secs=router_args.health_check_timeout_secs,
             health_check_interval_secs=router_args.health_check_interval_secs,
             health_check_endpoint=router_args.health_check_endpoint,
+            model_path=router_args.model_path,
+            tokenizer_path=router_args.tokenizer_path,
         )
 
         router.start()
