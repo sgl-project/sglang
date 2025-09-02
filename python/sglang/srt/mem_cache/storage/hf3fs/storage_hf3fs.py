@@ -113,6 +113,8 @@ def synchronized():
 
 
 class HiCacheHF3FS(HiCacheStorage):
+    """HiCache backend that stores KV cache pages in HF3FS files."""
+
     default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
 
     def __init__(
@@ -176,15 +178,32 @@ class HiCacheHF3FS(HiCacheStorage):
         dtype: torch.dtype,
         storage_config: HiCacheStorageConfig = None,
     ) -> "HiCacheHF3FS":
+        """Create a HiCacheHF3FS instance from environment configuration.
+
+        Environment:
+            - Uses env var stored in `HiCacheHF3FS.default_env_var` to locate a JSON config.
+            - Falls back to a local single-machine config when the env var is not set.
+
+        Raises:
+            ValueError: If MLA Model is requested without global metadata server or required keys are missing.
+        """
         from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
             Hf3fsGlobalMetadataClient,
             Hf3fsLocalMetadataClient,
         )
 
-        rank = storage_config.tp_rank if storage_config is not None else 0
+        if storage_config is not None:
+            rank, is_mla_model = storage_config.tp_rank, storage_config.is_mla_model
+        else:
+            rank, is_mla_model = 0, False
+
+        mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
 
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
+            if is_mla_model:
+                raise ValueError(mla_unsupported_msg)
+
             return HiCacheHF3FS(
                 rank=rank,
                 file_path=f"/data/hicache.{rank}.bin",
@@ -214,25 +233,27 @@ class HiCacheHF3FS(HiCacheStorage):
             raise ValueError(f"Missing required keys in config: {missing_keys}")
 
         # Choose metadata client based on configuration
-        is_mla_model = False
-        if "metadata_server_url" in config and config["metadata_server_url"]:
+        if config.get("metadata_server_url"):
             # Use global metadata client to connect to metadata server
             metadata_server_url = config["metadata_server_url"]
             metadata_client = Hf3fsGlobalMetadataClient(metadata_server_url)
 
-            # Enable MLA optimization only when using the global metadata client
-            is_mla_model = storage_config.is_mla_model if storage_config else False
             logger.info(
                 f"Using global metadata client with server url: {metadata_server_url}"
             )
         else:
+            # Enable MLA optimization only when using the global metadata client
+            if is_mla_model:
+                raise ValueError(mla_unsupported_msg)
+
             # Use local metadata client for single-machine deployment
             metadata_client = Hf3fsLocalMetadataClient()
 
+        rank_for_path = 0 if is_mla_model else rank
         return HiCacheHF3FS(
             rank=rank,
             # Let all ranks use the same file path for MLA model
-            file_path=f"{config['file_path_prefix']}.{rank if not is_mla_model else 0}.bin",
+            file_path=f"{config['file_path_prefix']}.{rank_for_path}.bin",
             file_size=int(config["file_size"]),
             numjobs=int(config["numjobs"]),
             bytes_per_page=bytes_per_page,
