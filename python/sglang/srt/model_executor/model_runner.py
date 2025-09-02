@@ -75,18 +75,17 @@ from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
 )
-from sglang.srt.mem_cache.allocator import (
+from sglang.srt.mem_cache.allocator import (  # MambaTokenToKVPoolAllocator,
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import (
+from sglang.srt.mem_cache.memory_pool import (  # MambaHybridPool,
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
-    HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -1090,8 +1089,6 @@ class ModelRunner:
                 "num_nextn_predict_layers",
                 self.num_effective_layers,
             )
-        elif self.is_hybrid_gdn:
-            num_layers = len(self.model_config.hf_config.full_attention_layer_ids)
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
@@ -1429,18 +1426,6 @@ class ModelRunner:
                     head_dim=self.model_config.head_dim,
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
-                    enable_kvcache_transpose=False,
-                    device=self.device,
-                )
-            elif self.is_hybrid_gdn:
-                self.token_to_kv_pool = HybridLinearKVPool(
-                    size=self.max_total_num_tokens,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    full_attention_layer_ids=self.model_config.hf_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
                 )
