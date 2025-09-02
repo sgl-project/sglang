@@ -541,6 +541,18 @@ void quant_impl(
   }
 }
 
+// Avoid redefinition warnings
+#undef CHECK_CONTIGUOUS
+#undef CHECK_TH_CUDA
+#undef CHECK_INPUT
+
+/*Quantization entry for fp4 experts quantization*/
+#define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, "must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x, m) TORCH_CHECK(x.is_contiguous(), m, "must be contiguous")
+#define CHECK_INPUT(x, m) \
+  CHECK_TH_CUDA(x, m);    \
+  CHECK_CONTIGUOUS(x, m);
+
 // constexpr auto FP8 = at::ScalarType::Float8_e4m3fn;
 constexpr auto HALF = at::ScalarType::Half;
 constexpr auto BF16 = at::ScalarType::BFloat16;
