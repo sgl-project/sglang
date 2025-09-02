@@ -438,7 +438,6 @@ class DeepEPMoE(EPMoE):
         )
 
         hidden_states = self.moe_impl(dispatch_output, down_overlap_args=down_overlap_args)
-
         if (e := meta_overlap_args["record_event_after_down"]) is not None:
             e.record()
 
