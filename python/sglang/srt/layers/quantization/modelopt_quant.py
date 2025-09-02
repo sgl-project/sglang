@@ -597,14 +597,17 @@ class ModelOptFp4Config(QuantizationConfig):
 
         for pattern in exclude_modules:
             regex_str = pattern.replace(".", r"\.").replace("*", r".*")
+            prefix_split = prefix.split(".")
+            pattern_split = pattern.split(".")
+            fused_patterns = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]
             if re.fullmatch(regex_str, prefix):
                 return True
-
             # Check if the last part of the excluded pattern is contained in the last part of the prefix
             # This handles fused modules like fused_qkv_a_proj_with_mqa that contain q_a_proj and kv_a_proj_with_mqa
-            pattern_last_part = pattern.split(".")[-1]
-            prefix_last_part = prefix.split(".")[-1]
-            if pattern_last_part in prefix_last_part:
+            elif len(prefix_split) == 5 and (
+                pattern_split[-1] in fused_patterns
+                and pattern_split[-1] in prefix_split[-1]
+            ):
                 return True
         return False
 
