@@ -671,6 +671,8 @@ class MooncakeKVManager(BaseKVManager):
     ):
         while True:
             try:
+                if self.tree_cache.is_hiradix_cache:
+                    self.tree_cache.check_hicache_events()
                 kv_chunk: TransferKVChunk = queue.get()
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
@@ -699,7 +701,6 @@ class MooncakeKVManager(BaseKVManager):
                                 )
                                 break
 
-                        self.tree_cache.check_hicache_events()
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
                         # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices

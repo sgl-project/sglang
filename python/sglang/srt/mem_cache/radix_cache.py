@@ -124,6 +124,7 @@ class RadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
         enable_kv_cache_events: bool = False,
+        is_hiradix_cache: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -131,6 +132,7 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        self.is_hiradix_cache = is_hiradix_cache
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
