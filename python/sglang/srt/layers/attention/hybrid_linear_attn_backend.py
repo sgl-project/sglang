@@ -56,7 +56,7 @@ class MambaAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = self._get_cached_arange(bs, str(self.device))
-        elif forward_batch.forward_mode.is_prefill():
+        elif forward_batch.forward_mode.is_extend():
             if forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
                     0,
@@ -75,7 +75,7 @@ class MambaAttnBackend(AttentionBackend):
                     + forward_batch.extend_seq_lens[-1]
                 )
         else:
-            raise NotImplementedError("Only prefill/decode/idle modes are supported.")
+            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
