@@ -67,9 +67,12 @@ if(CUTLASS_INCLUDE_DIR)
   target_include_directories(_mxfp4_kernels PRIVATE ${CUTLASS_INCLUDE_DIR})
 endif()
 
-# Set CUDA architectures (SM120 for RTX 5090)
+# Set CUDA architectures (allow override via CMAKE_CUDA_ARCHITECTURES)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES "120")  # Default to SM120 for RTX 5090
+endif()
 set_target_properties(_mxfp4_kernels PROPERTIES
-  CUDA_ARCHITECTURES "120"
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   PREFIX ""  # Remove lib prefix for Python module
   POSITION_INDEPENDENT_CODE ON
 )
