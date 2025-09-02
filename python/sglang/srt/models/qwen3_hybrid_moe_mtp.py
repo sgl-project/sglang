@@ -93,13 +93,11 @@ class Qwen3HybridMoEForCausalLMMTP(Qwen3HybridMoEForCausalLM):
         **kwargs,
     ):
         if input_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
-        else:
-            inputs_embeds = input_embeds
-        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+            input_embeds = self.model.embed_tokens(input_ids)
 
+        input_embeds = self.pre_fc_norm_embedding(input_embeds)
         hidden_states = self.pre_fc_norm_hidden(forward_batch.spec_info.hidden_states)
-        hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
+        hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
 
         hidden_states = self.model(
             input_ids,
