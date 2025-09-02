@@ -21,7 +21,6 @@ submodule: ## Initialize and update git submodules
 ln: submodule ## Create compilation database
 	@rm -rf build && mkdir build && cd build && cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=YES -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
-
 install: submodule ## Install package in development mode
 	@pip install -e . --no-build-isolation
 
