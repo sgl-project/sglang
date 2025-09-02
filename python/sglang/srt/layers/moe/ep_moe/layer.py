@@ -442,9 +442,11 @@ class DeepEPMoE(EPMoE):
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(compute_num_sms):
                 hook_overlap_on_combine()
 
+        if ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP:
+            alt_stream.wait_event(down_overlap_args["down_start_event"])
+
         combine_context = nullcontext()
         if ENABLE_DEEPEP_COMBINE_OVERLAP:
-            alt_stream.wait_event(down_overlap_args["down_start_event"])
             combine_context = torch.cuda.stream(alt_stream)
 
         with combine_context:
