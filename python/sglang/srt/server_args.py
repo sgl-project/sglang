@@ -351,7 +351,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
-    disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
+    disable_flashinfer_cutlass_moe_comm_opt: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
@@ -697,15 +697,21 @@ class ServerArgs:
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
             if (
                 self.moe_a2a_backend == "none"
-                and not self.disable_flashinfer_cutlass_moe_fp4_allgather
+                and not self.disable_flashinfer_cutlass_moe_comm_opt
                 and self.enable_dp_attention
                 and self.dp_size == self.tp_size
             ):
-                logger.info(
-                    "FP4 allgather is automatically enabled for Flashinfer Cutlass MOE"
+                from sglang.srt.layers.flashinfer_alltoall import (
+                    is_flashinfer_alltoallv_supported,
                 )
-                self.moe_a2a_backend = "fp4_allgather"
-            # TODO(tmorris): auto enable alltoallv option
+
+                if is_flashinfer_alltoallv_supported():
+                    self.moe_a2a_backend = "flashinfer_alltoallv"
+                else:
+                    self.moe_a2a_backend = "fp4_allgather"
+                logger.warning(
+                    f"--moe-a2a-backend={self.moe_a2a_backend} is automatically enabled for Flashinfer Cutlass MOE. Use --disable-flashinfer-cutlass-moe-comm-opt to disable the automatic communication optimization."
+                )
 
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert (
@@ -2056,9 +2062,9 @@ class ServerArgs:
             help="Enable NCCL symmetric memory for fast collectives.",
         )
         parser.add_argument(
-            "--disable-flashinfer-cutlass-moe-fp4-allgather",
+            "--disable-flashinfer-cutlass-moe-comm-opt",
             action="store_true",
-            help="Disables quantize before all-gather for flashinfer cutlass moe.",
+            help="When enabling flashinfer cutlass moe, disable the automatic communication optimization.",
         )
         parser.add_argument(
             "--enable-tokenizer-batch-encode",

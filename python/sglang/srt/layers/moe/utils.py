@@ -24,6 +24,7 @@ class MoeA2ABackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
+    # For moe-runner backend flashinfer_cutlass
     FP4_ALLGATHER = "fp4_allgather"
     FLASHINFER_ALLTOALLV = "flashinfer_alltoallv"
 

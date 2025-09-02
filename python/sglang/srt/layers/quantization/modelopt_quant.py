@@ -13,16 +13,13 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens, get_local_dp_buffer
-<<<<<<< HEAD
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_moe_a2a_backend,
     should_use_flashinfer_trtllm_moe,
 )
-=======
-from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_flashinfer_trtllm_moe
->>>>>>> 40c9a1005 (Add flashinfer alltoallv)
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
@@ -1478,6 +1475,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                enable_alltoall=get_moe_a2a_backend().is_flashinfer_alltoallv(),
             )[0]
             # Scale by routed_scaling_factor is fused into select_experts.
             if get_moe_a2a_backend().is_fp4_allgather():
