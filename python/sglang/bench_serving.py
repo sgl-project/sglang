@@ -896,7 +896,11 @@ def sample_mmmu_requests(
                 prompt = f"Question: {question}\n\nAnswer: "
                 if apply_chat_template:
                     try:
-                        if "phi-4-multimodal" in tokenizer.name_or_path.lower():
+                        is_phi4_multimodal = (
+                            "phi-4-multimodal" in tokenizer.name_or_path.lower()
+                        )
+                        if is_phi4_multimodal:
+                            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
                             content = prompt.replace("image 1", "<|endoftext10|>")
                         else:
                             content = [
