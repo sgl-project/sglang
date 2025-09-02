@@ -586,12 +586,21 @@ class DeepEPMoE(EPMoE):
         )
         output_index = torch.empty_like(topk_idx)
 
-        num_recv_tokens_per_expert_gpu = torch.tensor(
+        # num_recv_tokens_per_expert_gpu = torch.tensor(
+        #     num_recv_tokens_per_expert,
+        #     dtype=torch.int32,
+        #     pin_memory=True,
+        #     device="cpu",
+        # ).cuda(non_blocking=True)
+
+        num_recv_tokens_per_expert_cpu = torch.tensor(
             num_recv_tokens_per_expert,
             dtype=torch.int32,
-            pin_memory=True,
             device="cpu",
-        ).cuda(non_blocking=True)
+        )
+        num_recv_tokens_per_expert_gpu = torch.empty_like(num_recv_tokens_per_expert_cpu, device="cuda")
+        torch.add(num_recv_tokens_per_expert_cpu, 0, out=num_recv_tokens_per_expert_gpu)
+
         expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
 
         ep_scatter(
