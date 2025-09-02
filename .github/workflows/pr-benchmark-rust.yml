@@ -76,9 +76,9 @@ jobs:
   benchmark-request-processing:
     name: Request Processing Benchmark
     if: |
-      github.repository == 'sgl-project/sglang' && 
-      (github.event_name == 'push' || 
-       github.event_name == 'workflow_dispatch' || 
+      github.repository == 'sgl-project/sglang' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
        contains(github.event.pull_request.labels.*.name, 'benchmark'))
     runs-on: ubuntu-latest
     steps:
@@ -145,9 +145,9 @@ jobs:
   benchmark-tokenizer:
     name: Tokenizer Benchmark
     if: |
-      github.repository == 'sgl-project/sglang' && 
-      (github.event_name == 'push' || 
-       github.event_name == 'workflow_dispatch' || 
+      github.repository == 'sgl-project/sglang' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
        contains(github.event.pull_request.labels.*.name, 'benchmark'))
     runs-on: ubuntu-latest
     steps:
@@ -212,9 +212,9 @@ jobs:
   benchmark-tool-parser:
     name: Tool Parser Benchmark
     if: |
-      github.repository == 'sgl-project/sglang' && 
-      (github.event_name == 'push' || 
-       github.event_name == 'workflow_dispatch' || 
+      github.repository == 'sgl-project/sglang' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
        contains(github.event.pull_request.labels.*.name, 'benchmark'))
     runs-on: ubuntu-latest
     steps:
