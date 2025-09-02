@@ -1349,7 +1349,7 @@ class ModelRunner:
         }
 
     def _build_mha_pool_args(self, base_args: dict):
-        # Args for non-hybrid MHA-like pools
+        # Args for MHA-like pools
         args_to_update = {
             "head_num": self.model_config.get_num_kv_heads(get_attention_tp_size()),
             "head_dim": self.model_config.head_dim,
@@ -1368,6 +1368,7 @@ class ModelRunner:
 
     def _build_swa_pool_args(self, base_args: dict, token_to_kv_pool_class):
         # Args for hybrid SWA pool
+        base_args = self._build_mha_pool_args(base_args)
         args_to_update = {
             "size": self.full_max_total_num_tokens,
             "size_swa": self.swa_max_total_num_tokens,
@@ -1377,6 +1378,7 @@ class ModelRunner:
             "token_to_kv_pool_class": token_to_kv_pool_class,
         }
         base_args.update(args_to_update)
+        base_args.pop("layer_num")
         return base_args
 
     def _create_allocator(self):
