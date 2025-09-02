@@ -41,6 +41,9 @@ async def update_weights(
     #   (name0, ipc_tensor0_tp0),
     #   (name1, ipc_tensor1_tp0),
     # ]
+    # for name, tensor in params_batch:
+    #     print(f"1111111111 name {name}")
+    #     print(f"1111111111 tensor {tensor}")
     named_tensors_batch = [
         (
             name,

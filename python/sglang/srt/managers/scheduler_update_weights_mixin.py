@@ -79,7 +79,7 @@ class SchedulerUpdateWeightsMixin:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            if self.server_args.attention_backend == "ascend":
+            if not self.server_args.enable_memory_saver:
                 self.stashed_kv_dynamic_state = []
                 self.k_storage_size = self.tp_worker.worker.model_runner.token_to_kv_pool.k_buffer.untyped_storage().size()
                 self.v_storage_size = self.tp_worker.worker.model_runner.token_to_kv_pool.v_buffer.untyped_storage().size()
@@ -97,7 +97,7 @@ class SchedulerUpdateWeightsMixin:
             )
             torch.distributed.barrier(self.tp_cpu_group)
 
-            if self.server_args.attention_backend == "ascend":
+            if not self.server_args.enable_memory_saver:
                 self.stashed_model_dynamic_state = []
                 for name, param in self.tp_worker.worker.model_runner.model.named_parameters():
                     storage_size = param.untyped_storage().size()
@@ -116,9 +116,9 @@ class SchedulerUpdateWeightsMixin:
 
         if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
-
+        print(f"11111 reuse self.server_args.enable_memory_saver {self.server_args.enable_memory_saver}", flush=True)
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
-            if self.server_args.attention_backend == "ascend":
+            if not self.server_args.enable_memory_saver:
                 for name, param, storage_size in self.stashed_model_dynamic_state:
                     param.untyped_storage().resize_(storage_size)
             else:
@@ -132,7 +132,7 @@ class SchedulerUpdateWeightsMixin:
             del self.stashed_model_static_state
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            if self.server_args.attention_backend == "ascend":
+            if not self.server_args.enable_memory_saver:
                 for param, storage_size in self.stashed_kv_dynamic_state:
                     param.untyped_storage().resize_(storage_size)
             else:

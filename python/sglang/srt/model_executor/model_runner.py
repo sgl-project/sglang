@@ -875,6 +875,11 @@ class ModelRunner:
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
             for name, tensor in named_tensors
         ]
+
+        # for name, tensor in named_tensors:
+        #     print(f"222222222 name {name}")
+        #     print(f"2222222222 tensor {tensor}")
+
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format in self.server_args.custom_weight_loader:

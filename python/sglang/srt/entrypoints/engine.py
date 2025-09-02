@@ -358,10 +358,12 @@ class Engine(EngineBase):
         self.shutdown()
         return False
 
-    def flush_cache(self):
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.flush_cache())
+    # def flush_cache(self):
+    #     loop = asyncio.get_event_loop()
+    #     return loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
+    async def flush_cache(self):
+        return await self.tokenizer_manager.flush_cache()
     def start_profile(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.tokenizer_manager.start_profile())
@@ -746,8 +748,8 @@ def _launch_subprocesses(
                     ),
                 )
 
-                with memory_saver_adapter.configure_subprocess():
-                    proc.start()
+                # with memory_saver_adapter.configure_subprocess():
+                proc.start()
                 pid = q.get()
                 result_pid.append(pid)
                 scheduler_procs.append(proc)
