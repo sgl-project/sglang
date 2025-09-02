@@ -429,11 +429,11 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     assert isinstance(weight_scale_inv, torch.nn.Parameter)
 
     new_weight, new_weight_scale_inv = _requant_weight_ue8m0(
-        weight.to("cuda"), weight_scale_inv.to("cuda"), weight_block_size
+        weight.to("cuda"), weight_scale_inv, weight_block_size
     )
 
     weight.data = new_weight.to(weight.device)
-    weight_scale_inv.data = new_weight_scale_inv.to(weight_scale_inv.device)
+    weight_scale_inv.data = new_weight_scale_inv
 
 
 def _requant_weight_ue8m0(
