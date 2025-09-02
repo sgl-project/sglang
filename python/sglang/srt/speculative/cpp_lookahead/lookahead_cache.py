@@ -19,7 +19,6 @@ lookahead_cache_cpp = load(
         f"{_abs_path}/lookahead.cpp",
     ],
     extra_cflags=["-O3", "-std=c++20"],
-    extra_ldflags=["-lglog"],
 )
 
 

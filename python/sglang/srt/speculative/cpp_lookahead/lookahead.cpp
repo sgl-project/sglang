@@ -155,12 +155,19 @@ Lookahead::match(const std::vector<int32_t>& tokens, size_t batch_size) const {
 }
 
 void Lookahead::squeeze(size_t count) {
-  CHECK(node_pool_.size() >= free_node_count_ + count);
+  if (!(node_pool_.size() >= free_node_count_ + count)) {
+    throw std::runtime_error(
+        "Insufficient node size to release required nodes. "
+        "available to release: " +
+        std::to_string(node_pool_.size() - free_node_count_) + ", required to release: " + std::to_string(count));
+  }
   while (count--) {
     auto last = global_lru_.back();
     global_lru_.pop_back();
 
-    CHECK(last->child.empty());
+    if (!last->child.empty()) {
+      throw std::runtime_error("The node to be released still has child nodes and cannot be released. ");
+    }
 
     last->parent->lru.erase(last->parent_lru_pos);
     last->parent->sorted_children.erase(last);
