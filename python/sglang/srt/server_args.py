@@ -2329,10 +2329,10 @@ class ServerArgs:
             }, "fa3 or aiter is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
-            "Gemma3ForCausalLM",
-            "Gemma3ForConditionalGeneration",
-            "Gemma3nForCausalLM",
-            "Gemma3nForConditionalGeneration",
+            # "Gemma3ForCausalLM",
+            # "Gemma3ForConditionalGeneration",
+            # "Gemma3nForCausalLM",
+            # "Gemma3nForConditionalGeneration",
         ]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
             # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736

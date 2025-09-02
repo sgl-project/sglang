@@ -252,7 +252,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             dtype=torch.int64,
             device=device,
         )
-        self.clear()
+        # self.clear()
 
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
@@ -296,7 +296,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices.to(torch.int64)
         return alloc_full_indices
 
     def free(self, free_index: torch.Tensor):
@@ -325,10 +325,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         raise NotImplementedError
 
     def clear(self):
-        self.swa_attn_allocator.clear()
-        self.full_attn_allocator.clear()
+        # self.swa_attn_allocator.clear()
+        # self.full_attn_allocator.clear()
         self.full_to_swa_index_mapping.fill_(0)
-        self.is_in_free_group = False
+        self.is_not_in_free_group = True
         self.free_group = []
 
 
