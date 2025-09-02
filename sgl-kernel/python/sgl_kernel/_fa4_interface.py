@@ -3,23 +3,6 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.1.0.
 
-# Supported features:
-# - BF16 & FP16 dtype
-# - noncausal & causal attention
-# - MHA, GQA, MQA
-# - hdim 64, 96, 128.
-# - (hdim_qk, hdim_v) = (192, 128) for Blackwell (i.e. DeepSeek shape)
-# - varlen
-# - sliding window
-# - bwd pass for Ampere (will also run on Hopper/Blackwell, but will be slow)
-
-# Features not supported yet:
-# - split (i.e. FlashDecoding)
-# - tuned block sizes
-# - paged KV
-# - append KV to existing KV cache
-# - FP8
-# - bwd pass optimized for Hopper/Blackwell
 
 import math
 from typing import Optional, Tuple
