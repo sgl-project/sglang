@@ -237,6 +237,10 @@ class MambaAttnBackend(AttentionBackend):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
+        if forward_batch.forward_mode.is_target_verify():
+            mixed_qkv_cache[self.forward_metadata.mamba_cache_indices] = (
+                mixed_qkv.view((-1,) + mixed_qkv_cache.shape[1:]).clone()
+            )
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             conv_weights,
@@ -283,9 +287,12 @@ class MambaAttnBackend(AttentionBackend):
         if not forward_batch.forward_mode.is_target_verify():
             ssm_states[self.forward_metadata.mamba_cache_indices] = last_recurrent_state
         else:
-            mixed_qkv_cache[self.forward_metadata.mamba_cache_indices] = (
-                mixed_qkv.view((-1,) + mixed_qkv_cache.shape[1:])
-            )
+            # print("forward_extend", self.forward_metadata.mamba_cache_indices)
+            # if forward_batch.forward_mode.is_target_verify():
+            #     torch.distributed.breakpoint()
+            # mixed_qkv_cache[self.forward_metadata.mamba_cache_indices] = (
+            #     mixed_qkv.transpose(0, 1).view((-1,) + mixed_qkv_cache.shape[1:])
+            # )
             query_cache[self.forward_metadata.mamba_cache_indices] = (
                 query.view((-1,) + query_cache.shape[1:])
             )
@@ -445,7 +452,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
     def update_mamba_state_after_mtp_verify(self, accepted_length, model):
-        num_attn = 0
         request_number = accepted_length.shape[0]
         # QQ: step = spec num_draft token num
         num_draft_tokens = self.attn_backend_list[1].req_to_token_pool.mamba_pool.mamba_cache[2].shape[2]
@@ -467,6 +473,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 ssm_state = mamba_cache[1]
 
                 state_indices_tensor = self.attn_backend_list[1].forward_metadata.mamba_cache_indices
+                # print("update verify", state_indices_tensor)
                 mask = torch.arange(num_draft_tokens, device=accepted_length.device).unsqueeze(0) < accepted_length.unsqueeze(1)
 
                 mixed_qkv = mamba_cache[2][state_indices_tensor][mask]
