@@ -3,6 +3,7 @@ project(sgl-kernel LANGUAGES CXX CUDA)
 
 # CMake
 cmake_policy(SET CMP0169 OLD)
+cmake_policy(SET CMP0177 NEW)
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
