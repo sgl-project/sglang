@@ -1976,7 +1976,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
-        gemm_output_zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
 
         quant_format = (
