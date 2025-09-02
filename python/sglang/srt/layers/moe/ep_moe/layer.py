@@ -464,7 +464,7 @@ class DeepEPMoE(EPMoE):
     @staticmethod
     def _compute_overlap_args(dispatch_output):
         if not ENABLE_DEEPEP_COMBINE_OVERLAP:
-            return None, None
+            return None, None, None
 
         hidden_states = dispatch_output.hidden_states_fp8
         if isinstance(hidden_states, tuple):
