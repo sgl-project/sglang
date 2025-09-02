@@ -1661,6 +1661,7 @@ class TokenizerManager:
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
+                        "prefetched_tokens": recv_obj.prefetched_tokens[i],
                     }
                 )
 

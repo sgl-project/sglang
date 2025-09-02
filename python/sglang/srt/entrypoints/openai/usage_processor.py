@@ -19,6 +19,7 @@ class UsageProcessor:
         responses: List[Dict[str, Any]],
         n_choices: int = 1,
         enable_cache_report: bool = False,
+        enable_prefetch_report: bool = False,
     ) -> UsageInfo:
         completion_tokens = sum(r["meta_info"]["completion_tokens"] for r in responses)
 
@@ -33,6 +34,11 @@ class UsageProcessor:
                 r["meta_info"].get("cached_tokens", 0) for r in responses
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
+            if enable_prefetch_report:
+                prefetched_total = sum(
+                    r["meta_info"].get("prefetched_tokens", 0) for r in responses
+                )
+                cached_details["prefetched_tokens"] = prefetched_total
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -45,8 +51,10 @@ class UsageProcessor:
         prompt_tokens: Mapping[int, int],
         completion_tokens: Mapping[int, int],
         cached_tokens: Mapping[int, int],
+        prefetched_tokens: Mapping[int, int],
         n_choices: int,
         enable_cache_report: bool = False,
+        enable_prefetch_report: bool = False,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
         total_prompt_tokens = sum(
@@ -59,6 +67,8 @@ class UsageProcessor:
             if enable_cache_report
             else None
         )
+        if cached_details is not None and enable_prefetch_report:
+            cached_details["prefetched_tokens"] = sum(prefetched_tokens.values())
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,

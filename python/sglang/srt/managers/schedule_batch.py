@@ -583,6 +583,9 @@ class Req:
         self.cached_tokens = 0
         self.already_computed = 0
 
+        # The number of tokens that were prefetched from storage
+        self.prefetched_tokens = 0
+
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0

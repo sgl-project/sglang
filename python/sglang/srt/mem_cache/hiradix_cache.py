@@ -8,6 +8,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import (
@@ -461,7 +462,8 @@ class HiRadixCache(RadixCache):
 
         return can_terminate
 
-    def check_prefetch_progress(self, req_id: str) -> bool:
+    def check_prefetch_progress(self, req: Req) -> bool:
+        req_id = req.rid
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
             return True
@@ -514,6 +516,8 @@ class HiRadixCache(RadixCache):
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+        req.prefetched_tokens = min_completed_tokens - matched_length
 
         return True
 

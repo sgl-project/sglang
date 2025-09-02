@@ -719,6 +719,7 @@ class BatchTokenIDOut:
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    prefetched_tokens: List[int]
     spec_verify_ct: List[int]
 
     # Logprobs
@@ -766,6 +767,7 @@ class BatchStrOut:
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+    prefetched_tokens: List[int]
     spec_verify_ct: List[int]
 
     # Logprobs

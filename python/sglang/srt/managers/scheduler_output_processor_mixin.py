@@ -494,6 +494,7 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        prefetched_tokens = []
         spec_verify_ct = []
         output_hidden_states = None
 
@@ -583,6 +584,7 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
+                prefetched_tokens.append(req.prefetched_tokens)
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -686,6 +688,7 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
+                    prefetched_tokens,
                     spec_verify_ct,
                     input_token_logprobs_val,
                     input_token_logprobs_idx,

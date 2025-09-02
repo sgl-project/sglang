@@ -132,6 +132,11 @@ class MultiTokenizerMixin:
                 cached_tokens=(
                     [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
                 ),
+                prefetched_tokens=(
+                    [output.prefetched_tokens[i]]
+                    if len(output.prefetched_tokens) > i
+                    else None
+                ),
                 spec_verify_ct=(
                     [output.spec_verify_ct[i]]
                     if len(output.spec_verify_ct) > i
@@ -247,6 +252,11 @@ class MultiTokenizerMixin:
                 ),
                 cached_tokens=(
                     [output.cached_tokens[i]] if len(output.cached_tokens) > i else None
+                ),
+                prefetched_tokens=(
+                    [output.prefetched_tokens[i]]
+                    if len(output.prefetched_tokens) > i
+                    else None
                 ),
                 spec_verify_ct=(
                     [output.spec_verify_ct[i]]

@@ -462,6 +462,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        prefetched_tokens = {}
         hidden_states = {}
 
         try:
@@ -473,6 +474,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                prefetched_tokens[index] = content["meta_info"].get(
+                    "prefetched_tokens", 0
+                )
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
 
                 # Handle logprobs
@@ -634,12 +638,20 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
+                cache_report = self.tokenizer_manager.server_args.enable_cache_report
+                prefetch_report = (
+                    cache_report
+                    and self.tokenizer_manager.server_args.hicache_storage_backend
+                    is not None
+                )
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
+                    prefetched_tokens,
                     n_choices=request.n,
-                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    enable_cache_report=cache_report,
+                    enable_prefetch_report=prefetch_report,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -753,10 +765,16 @@ class OpenAIServingChat(OpenAIServingBase):
             choices.append(choice_data)
 
         # Calculate usage
+        cache_report = self.tokenizer_manager.server_args.enable_cache_report
+        prefetch_report = (
+            cache_report
+            and self.tokenizer_manager.server_args.hicache_storage_backend is not None
+        )
         usage = UsageProcessor.calculate_response_usage(
             ret,
             n_choices=request.n,
-            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+            enable_cache_report=cache_report,
+            enable_prefetch_report=prefetch_report,
         )
 
         return ChatCompletionResponse(
