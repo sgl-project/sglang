@@ -55,6 +55,10 @@ class ChunkCache(BasePrefixCache):
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices
 
+    def evictable_kv_indices(self):
+        # Return a list of all kv indices stored in the tree
+        return []
+
     def evict(self, num_tokens: int):
         pass
 

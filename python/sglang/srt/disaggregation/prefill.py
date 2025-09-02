@@ -330,14 +330,24 @@ class SchedulerDisaggregationPrefillMixin:
                     tmp_batch = ScheduleBatch(
                         reqs=None,
                         forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                        next_batch_sampling_info=(
+                            self.tp_worker.cur_sampling_info
+                            if self.spec_algorithm.is_none()
+                            else self.cur_sampling_info
+                        ),
                     )
                     self.set_next_batch_sampling_info_done(tmp_batch)
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    (
+                        self.tp_worker.cur_sampling_info
+                        if self.spec_algorithm.is_none()
+                        else self.cur_sampling_info
+                    )
+                    if batch
+                    else None
                 )
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
 
@@ -367,16 +377,21 @@ class SchedulerDisaggregationPrefillMixin:
             next_token_ids,
             extend_input_len_per_req,
             extend_logprob_start_len_per_req,
+            copy_done,
         ) = (
             result.logits_output,
             result.next_token_ids,
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
+            result.copy_done,
         )
+
+        if copy_done is not None:
+            copy_done.synchronize()
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        if self.enable_overlap:
+        if self.enable_overlap and self.spec_algorithm.is_none():
             # wait
             logits_output, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(
                 launch_done

@@ -20,7 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.eagle_utils import EagleDraftInput
+from sglang.srt.speculative.eagle_utils_v2 import EagleDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -271,11 +271,11 @@ class EAGLEDraftCudaGraphRunner:
         return graph, out
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
-        score_list, token_list, parents_list = out
-        score_list = [x[:raw_bs] for x in score_list]
-        token_list = [x[:raw_bs] for x in token_list]
-        parents_list = [x[:raw_bs] for x in parents_list]
-        return (score_list, token_list, parents_list)
+        parents_lists, top_scores_indexes, draft_tokens = out
+        score_list = [x[:raw_bs] for x in parents_lists]
+        top_scores_index = [x[:raw_bs] for x in top_scores_indexes]
+        draft_token = draft_tokens[:raw_bs, :]
+        return (score_list, top_scores_index, draft_token)
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
