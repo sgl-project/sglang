@@ -105,9 +105,9 @@ class RouterArgs:
 
     @staticmethod
     def add_cli_args(
-            parser: argparse.ArgumentParser,
-            use_router_prefix: bool = False,
-            exclude_host_port: bool = False,
+        parser: argparse.ArgumentParser,
+        use_router_prefix: bool = False,
+        exclude_host_port: bool = False,
     ):
         """
         Add router-specific arguments to an argument parser.
@@ -176,8 +176,8 @@ class RouterArgs:
             nargs="+",
             action="append",
             help="Prefill server URL and optional bootstrap port. Can be specified multiple times. "
-                 "Format: --prefill URL [BOOTSTRAP_PORT]. "
-                 "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
+            "Format: --prefill URL [BOOTSTRAP_PORT]. "
+            "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
         )
         parser.add_argument(
             f"--{prefix}decode",
@@ -452,7 +452,7 @@ class RouterArgs:
 
     @classmethod
     def from_cli_args(
-            cls, args: argparse.Namespace, use_router_prefix: bool = False
+        cls, args: argparse.Namespace, use_router_prefix: bool = False
     ) -> "RouterArgs":
         """
         Create RouterArgs instance from parsed command line arguments.
@@ -680,27 +680,27 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
 
             # Warn about policy usage in PD mode
             if (
-                    router_args.prefill_policy
-                    and router_args.decode_policy
-                    and router_args.policy
+                router_args.prefill_policy
+                and router_args.decode_policy
+                and router_args.policy
             ):
                 logger.warning(
                     "Both --prefill-policy and --decode-policy are specified. "
                     "The main --policy flag will be ignored for PD mode."
                 )
             elif (
-                    router_args.prefill_policy
-                    and not router_args.decode_policy
-                    and router_args.policy
+                router_args.prefill_policy
+                and not router_args.decode_policy
+                and router_args.policy
             ):
                 logger.info(
                     f"Using --prefill-policy '{router_args.prefill_policy}' for prefill nodes "
                     f"and --policy '{router_args.policy}' for decode nodes."
                 )
             elif (
-                    router_args.decode_policy
-                    and not router_args.prefill_policy
-                    and router_args.policy
+                router_args.decode_policy
+                and not router_args.prefill_policy
+                and router_args.policy
             ):
                 logger.info(
                     f"Using --policy '{router_args.policy}' for prefill nodes "
