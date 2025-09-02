@@ -93,9 +93,9 @@ class Qwen3HybridMoEForCausalLMMTP(Qwen3HybridMoEForCausalLM):
         **kwargs,
     ):
         if input_embeds is None:
-            hidden_states = self.model.embed_tokens(input_ids)
+            inputs_embeds = self.model.embed_tokens(input_ids)
         else:
-            hidden_states = input_embeds
+            inputs_embeds = input_embeds
         inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
 
         hidden_states = self.pre_fc_norm_hidden(forward_batch.spec_info.hidden_states)
