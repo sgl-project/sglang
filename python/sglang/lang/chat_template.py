@@ -15,8 +15,9 @@ class ChatTemplate:
     default_system_prompt: str
     role_prefix_and_suffix: Dict[str, Tuple[str, str]]
     stop_str: List[str] = ()
-    image_token: str = "<image>"
     audio_token: str = "<audio>"
+    image_token: str = "<image>"
+    video_token: str = "<video>"
     style: ChatTemplateStyle = ChatTemplateStyle.PLAIN
 
     def get_prefix_and_suffix(
@@ -161,6 +162,7 @@ register_chat_template(
         style=ChatTemplateStyle.PLAIN,
         stop_str=("<|im_end|>",),
         image_token="<|vision_start|><|image_pad|><|vision_end|>",
+        video_token="<|vision_start|><|video_pad|><|vision_end|>",
     )
 )
 
