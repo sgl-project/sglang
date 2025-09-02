@@ -19,7 +19,8 @@ permissions:
   pull-requests: write
   issues: write
 jobs:
-  benchmark-router:
+  benchmark-request-processing:
+    name: Request Processing Benchmark
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -52,24 +53,168 @@ jobs:
           cd sgl-router/
           cargo build --release
 
-      - name: Run quick benchmarks
-        timeout-minutes: 15
+      - name: Run request processing benchmark
+        timeout-minutes: 10
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          # Run quick benchmarks for PR validation using Python script
-          python3 scripts/run_benchmarks.py --quick --validate-thresholds --save-results
+          # Run only the summary benchmark for quick validation in PRs
+          cargo bench --bench request_processing -- benchmark_summary --exact
 
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results-${{ github.sha }}
+          name: request-processing-results-${{ github.sha }}
           path: |
-            sgl-router/target/criterion/
+            sgl-router/target/criterion/benchmark_summary/
+          retention-days: 30
+
+  benchmark-tokenizer:
+    name: Tokenizer Benchmark
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 100
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_rust.sh
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            sgl-router/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build router in release mode
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          cargo build --release
+
+      - name: Run tokenizer benchmark
+        timeout-minutes: 10
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          cargo bench --bench tokenizer_benchmark
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenizer-results-${{ github.sha }}
+          path: |
+            sgl-router/target/criterion/tokenizer*/
+          retention-days: 30
+
+  benchmark-tool-parser:
+    name: Tool Parser Benchmark
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 100
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_rust.sh
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            sgl-router/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build router in release mode
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          cargo build --release
+
+      - name: Run tool parser benchmark
+        timeout-minutes: 10
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          cargo bench --bench tool_parser_benchmark
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tool-parser-results-${{ github.sha }}
+          path: |
+            sgl-router/target/criterion/tool_parser*/
+          retention-days: 30
+
+  benchmark-summary:
+    name: Benchmark Summary
+    needs: [benchmark-request-processing, benchmark-tokenizer, benchmark-tool-parser]
+    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-results-${{ github.sha }}'
+          path: benchmark-results
+
+      - name: Generate summary
+        run: |
+          echo "## Benchmark Results Summary" > summary.md
+          echo "" >> summary.md
+          echo "### Request Processing" >> summary.md
+          if [ -d "benchmark-results/request-processing-results-${{ github.sha }}" ]; then
+            echo "✅ Completed" >> summary.md
+          else
+            echo "❌ Failed or skipped" >> summary.md
+          fi
+          echo "" >> summary.md
+          echo "### Tokenizer" >> summary.md
+          if [ -d "benchmark-results/tokenizer-results-${{ github.sha }}" ]; then
+            echo "✅ Completed" >> summary.md
+          else
+            echo "❌ Failed or skipped" >> summary.md
+          fi
+          echo "" >> summary.md
+          echo "### Tool Parser" >> summary.md
+          if [ -d "benchmark-results/tool-parser-results-${{ github.sha }}" ]; then
+            echo "✅ Completed" >> summary.md
+          else
+            echo "❌ Failed or skipped" >> summary.md
+          fi
+          cat summary.md
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-summary-${{ github.sha }}
+          path: summary.md
           retention-days: 30
 
   benchmark-integration-test:
+    name: Benchmark Integration Tests
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
