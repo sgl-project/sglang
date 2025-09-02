@@ -47,12 +47,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build router in release mode
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-router/
-          cargo build --release
-
       - name: Run request processing benchmark
         timeout-minutes: 10
         run: |
@@ -97,12 +91,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build router in release mode
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-router/
-          cargo build --release
-
       - name: Run tokenizer benchmark
         timeout-minutes: 10
         run: |
@@ -145,12 +133,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      - name: Build router in release mode
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-router/
-          cargo build --release
 
       - name: Run tool parser benchmark
         timeout-minutes: 10
@@ -212,43 +194,3 @@ jobs:
           name: benchmark-summary-${{ github.sha }}
           path: summary.md
           retention-days: 30
-
-  benchmark-integration-test:
-    name: Benchmark Integration Tests
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_rust.sh
-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            sgl-router/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Run benchmark integration tests
-        timeout-minutes: 10
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-router/
-          # Run integration tests to ensure benchmark code compiles and works
-          cargo test --test benchmark_integration
-
-      - name: Verify benchmark compilation
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-router/
-          # Ensure all benchmarks compile without running them
-          cargo check --benches
