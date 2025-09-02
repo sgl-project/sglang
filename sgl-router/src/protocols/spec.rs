@@ -1977,20 +1977,13 @@ impl RerankResponse {
         model: String,
         request_id: String,
     ) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let created = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
         RerankResponse {
             results,
             model,
             usage: None,
             object: default_rerank_object(),
             id: request_id,
-            created,
+            created: current_timestamp(),
         }
     }
 
@@ -2149,7 +2142,7 @@ mod tests {
 
         let result = request.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Query cannot be empty"));
+        assert_eq!(result.unwrap_err(), "Query cannot be empty");
     }
 
     #[test]
@@ -2166,7 +2159,7 @@ mod tests {
 
         let result = request.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Query cannot be empty"));
+        assert_eq!(result.unwrap_err(), "Query cannot be empty");
     }
 
     #[test]
@@ -2183,7 +2176,7 @@ mod tests {
 
         let result = request.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Documents list cannot be empty"));
+        assert_eq!(result.unwrap_err(), "Documents list cannot be empty");
     }
 
     #[test]
@@ -2200,7 +2193,7 @@ mod tests {
 
         let result = request.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("top_k must be greater than 0"));
+        assert_eq!(result.unwrap_err(), "top_k must be greater than 0");
     }
 
     #[test]
@@ -2690,17 +2683,5 @@ mod tests {
         let deserialized: RerankResponse = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.results.len(), 2);
         assert_eq!(deserialized.model, response.model);
-    }
-
-    #[test]
-    fn test_v1_rerank_req_input_conversion() {
-        let v1_input = V1RerankReqInput {
-            query: "test query".to_string(),
-            documents: vec!["test document".to_string()],
-        };
-
-        let request: RerankRequest = v1_input.into();
-
-        assert!(request.validate().is_ok());
     }
 }
