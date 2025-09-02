@@ -90,7 +90,7 @@ class SchedulerMetricsMixin:
 
         num_new_seq = len(can_run_list)
         f = (
-            f"Prefill batch. iter: {self.forward_ct}, "
+            f"Prefill batch [{self.forward_ct + 1}], "
             f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
@@ -175,7 +175,7 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        msg = f"Decode batch. iter: {self.forward_ct}, #running-req: {num_running_reqs}, {token_msg}"
+        msg = f"Decode batch [{self.forward_ct}], #running-req: {num_running_reqs}, {token_msg}"
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
