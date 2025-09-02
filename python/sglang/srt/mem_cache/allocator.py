@@ -173,8 +173,15 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-    def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
-        super().__init__(size, 1, dtype, device, kvcache)
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+        need_sort: bool,
+    ):
+        super().__init__(size, 1, dtype, device, kvcache, need_sort)
         self.clear()
 
         # sanity check
