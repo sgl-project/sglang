@@ -55,10 +55,10 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
     print(
         f"hi grouped_gemm_nt_f8f8bf16_contig "
-        f"{lhs[0].shape=} {lhs[0].dtype=} {lhs[0].device=} "
-        f"{lhs[1].shape=} {lhs[1].dtype=} {lhs[1].device=} "
-        f"{rhs[0].shape=} {rhs[0].dtype=} {rhs[0].device=} "
-        f"{rhs[1].shape=} {rhs[1].dtype=} {rhs[1].device=} "
+        f"{lhs[0].shape=} {lhs[0].dtype=} {lhs[0].device=} {lhs[0].stride()=} "
+        f"{lhs[1].shape=} {lhs[1].dtype=} {lhs[1].device=} {lhs[1].stride()=} "
+        f"{rhs[0].shape=} {rhs[0].dtype=} {rhs[0].device=} {rhs[0].stride()=} "
+        f"{rhs[1].shape=} {rhs[1].dtype=} {rhs[1].device=} {rhs[1].stride()=} "
     )
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
