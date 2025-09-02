@@ -8,8 +8,8 @@ from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-from sglang.srt.layers.attention.fla.fused_recurrent import (
-    fused_recurrent_gated_delta_rule_update,
+from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.srt.layers.attention.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -190,21 +190,23 @@ class MambaAttnBackend(AttentionBackend):
             (query, key),
         )
         value = rearrange(value, "l (h d) -> 1 l h d", d=head_v_dim)
-        beta = b.sigmoid()
-        g = fused_gdn_gating(A_log, a, dt_bias)
-        g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
-        core_attn_out = fused_recurrent_gated_delta_rule_update(
+
+        core_attn_out = sigmoid_gating_delta_rule_update_triton(
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
             q=query,
             k=key,
             v=value,
-            g=g,
-            beta=beta,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            # head_first=False,
+            a=a,
+            b=b,
+            initial_state_source=cache_params.ssm_state,
+            initial_state_indices=cache_params.state_indices_tensor,
             use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            scale=1.0 / self.head_v_dim ** 0.5,
         )
+
         return core_attn_out
 
     def forward_extend(
