@@ -108,9 +108,11 @@ impl GrpcRouter {
         }
 
         // Create Worker trait objects with gRPC connection mode
-        let workers: Vec<Box<dyn Worker>> = worker_urls
-            .iter()
-            .map(|url| {
+        let mut workers: Vec<Box<dyn Worker>> = Vec::new();
+
+        // Move clients from the HashMap to the workers
+        for url in &worker_urls {
+            if let Some(client) = grpc_clients.remove(url) {
                 let worker = BasicWorker::with_connection_mode(
                     url.clone(),
                     WorkerType::Regular,
@@ -123,10 +125,14 @@ impl GrpcRouter {
                     endpoint: health_check_config.endpoint.clone(),
                     failure_threshold: health_check_config.failure_threshold,
                     success_threshold: health_check_config.success_threshold,
-                });
-                Box::new(worker) as Box<dyn Worker>
-            })
-            .collect();
+                })
+                .with_grpc_client(client);
+
+                workers.push(Box::new(worker) as Box<dyn Worker>);
+            } else {
+                warn!("No gRPC client for worker {}, skipping", url);
+            }
+        }
 
         // Initialize policy with workers if needed
         if let Some(cache_aware) = policy
@@ -252,6 +258,11 @@ impl WorkerManagement for GrpcRouter {
     fn remove_worker(&self, _worker_url: &str) {}
 
     fn get_worker_urls(&self) -> Vec<String> {
-        vec![]
+        self.workers
+            .read()
+            .unwrap()
+            .iter()
+            .map(|w| w.url().to_string())
+            .collect()
     }
 }
