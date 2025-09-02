@@ -1032,7 +1032,7 @@ class GptOssForCausalLM(nn.Module):
                             tp_size = get_tensor_model_parallel_world_size()
                             full_shard_size = param.numel() * tp_size
                             start = tp_rank * param.numel()
-                            if full_shard_size > loaded_weight.size(0) and start >= loaded_weight.size(0):
+                            if full_shard_size > loaded_weight.size(0) and (start >= loaded_weight.size(0) or (start + param.numel()) >= loaded_weight.size(0)):
                                 pad_size = start + param.numel() - loaded_weight.size(0)
                                 pad_tensor = torch.zeros(pad_size).to(loaded_weight.dtype)
                                 loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=0).to(loaded_weight.dtype)
