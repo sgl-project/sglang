@@ -714,7 +714,9 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
-        kwargs = {"ver": self.fa_impl_ver}
+        kwargs = {}
+        if self.fa_impl_ver != 3:
+            kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -992,7 +994,9 @@ class FlashAttentionBackend(AttentionBackend):
         causal = not layer.is_cross_attention
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
-        kwargs = {"ver": self.fa_impl_ver}
+        kwargs = {}
+        if self.fa_impl_ver != 3:
+            kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
 

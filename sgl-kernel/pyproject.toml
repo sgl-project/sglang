@@ -20,6 +20,11 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+blackwell = [
+    "nvidia-cutlass-dsl==4.1.0",
+]
+
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
