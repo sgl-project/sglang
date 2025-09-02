@@ -407,6 +407,7 @@ class HiCacheController:
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             is_mla_model=is_mla_backend,
+            is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             extra_config=extra_config,
         )
