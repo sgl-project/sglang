@@ -1041,26 +1041,6 @@ async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request)
     )
 
 
-@app.post(
-    "/tokenize",
-    response_class=ORJSONResponse,
-    dependencies=[Depends(validate_json_request)],
-    include_in_schema=False,
-)
-async def openai_tokenize(request: TokenizeRequest, raw_request: Request):
-    return await openai_v1_tokenize(request, raw_request)
-
-
-@app.post(
-    "/detokenize",
-    response_class=ORJSONResponse,
-    dependencies=[Depends(validate_json_request)],
-    include_in_schema=False,
-)
-async def openai_detokenize(request: DetokenizeRequest, raw_request: Request):
-    return await openai_v1_detokenize(request, raw_request)
-
-
 @app.get("/v1/models", response_class=ORJSONResponse)
 async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
