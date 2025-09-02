@@ -39,6 +39,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
 )
+from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarBackend
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -305,7 +306,7 @@ class Scheduler(
         # Init moe config
         self.init_moe_config()
 
-        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        # Set think_end_id and is_hybrid if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
@@ -313,6 +314,7 @@ class Scheduler(
             self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
+            self.tokenizer.is_hybrid = reasoning_parser.detector.is_hybrid
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -1261,14 +1263,25 @@ class Scheduler(
             or req.sampling_params.structural_tag is not None
         ):
             assert self.grammar_backend is not None
+
             if req.sampling_params.json_schema is not None:
-                key = ("json", req.sampling_params.json_schema)
+                key_type = "json"
+                key_string = req.sampling_params.json_schema
             elif req.sampling_params.regex is not None:
-                key = ("regex", req.sampling_params.regex)
+                key_type = "regex"
+                key_string = req.sampling_params.regex
             elif req.sampling_params.ebnf is not None:
-                key = ("ebnf", req.sampling_params.ebnf)
-            elif req.sampling_params.structural_tag:
-                key = ("structural_tag", req.sampling_params.structural_tag)
+                key_type = "ebnf"
+                key_string = req.sampling_params.ebnf
+            elif req.sampling_params.structural_tag is not None:
+                key_type = "structural_tag"
+                key_string = req.sampling_params.structural_tag
+
+            if isinstance(self.grammar_backend, ReasonerGrammarBackend):
+                enable_thinking = bool(req.sampling_params.enable_thinking)
+                key = (key_type, key_string, enable_thinking)
+            else:
+                key = (key_type, key_string)
 
             value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
             req.grammar = value
