@@ -398,14 +398,22 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
         return self.shm_cpu_data.to("cuda", non_blocking=True)
 
 
+def update_param(param, new_tensor):
+    param.data = _create_cpu_data(new_tensor, pin_memory=True)
+
+
 def _move_param_to_cpu(param, pin_memory: bool):
+    param.data = _create_cpu_data(param.data, pin_memory=pin_memory)
+
+
+def _create_cpu_data(data, pin_memory: bool):
     cpu_data = _empty_strided_like(
-        param.data,
+        data,
         device="cpu",
         pin_memory=pin_memory,
     )
-    cpu_data.copy_(param.data)
-    param.data = cpu_data
+    cpu_data.copy_(data)
+    return cpu_data
 
 
 def _move_param_to_meta(module, param_name):

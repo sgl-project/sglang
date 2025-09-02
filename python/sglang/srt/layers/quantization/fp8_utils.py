@@ -2,6 +2,7 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt import offloader
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -432,7 +433,7 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
         weight.to("cuda"), weight_scale_inv, weight_block_size
     )
 
-    weight.data = new_weight.to(weight.device)
+    offloader.update_param(weight, new_weight)
     weight_scale_inv.data = new_weight_scale_inv
 
 
