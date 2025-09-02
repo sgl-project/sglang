@@ -2108,7 +2108,7 @@ mod tests {
         assert_eq!(request.documents, vec!["doc1", "doc2"]);
         assert_eq!(request.model, default_model_name());
         assert_eq!(request.top_k, None);
-        assert_eq!(request.return_documents, true);
+        assert!(request.return_documents);
         assert_eq!(request.rid, None);
         assert_eq!(request.user, None);
     }
@@ -2473,7 +2473,7 @@ mod tests {
         assert_eq!(request.documents, vec!["doc1", "doc2"]);
         assert_eq!(request.model, default_model_name());
         assert_eq!(request.top_k, None);
-        assert_eq!(request.return_documents, true);
+        assert!(request.return_documents);
         assert_eq!(request.rid, None);
         assert_eq!(request.user, None);
     }
@@ -2495,7 +2495,7 @@ mod tests {
         };
 
         assert_eq!(request.get_model(), Some("test-model"));
-        assert_eq!(request.is_stream(), false);
+        assert!(!request.is_stream());
         assert_eq!(request.extract_text_for_routing(), "test query");
     }
 
