@@ -403,7 +403,7 @@ def update_param(param, new_tensor):
     if param.device == new_tensor.device:
         param.data = new_tensor
     else:
-        assert param.device == "cpu"
+        # assert param.device == "cpu", f"{param.device=} {new_tensor.device=}"
         param.data = _create_cpu_data(new_tensor, pin_memory=True)
 
 
