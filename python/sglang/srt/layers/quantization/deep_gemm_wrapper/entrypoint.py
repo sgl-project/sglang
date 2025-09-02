@@ -60,7 +60,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
         f"{rhs[0].shape=} {rhs[0].dtype=} {rhs[0].device=} {rhs[0].stride()=} "
         f"{rhs[1].shape=} {rhs[1].dtype=} {rhs[1].device=} {rhs[1].stride()=} "
         f"{m_indices.shape=} {m_indices.dtype=} {m_indices.device=} {m_indices.stride()=} "
-        f"{m_indices.tolist()=} "
+        # f"{m_indices.tolist()=} "
     )
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
