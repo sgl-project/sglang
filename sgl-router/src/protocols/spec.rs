@@ -1972,11 +1972,7 @@ impl RerankRequest {
 }
 
 impl RerankResponse {
-    pub fn new(
-        results: Vec<RerankResult>,
-        model: String,
-        request_id: String,
-    ) -> Self {
+    pub fn new(results: Vec<RerankResult>, model: String, request_id: String) -> Self {
         RerankResponse {
             results,
             model,
@@ -1990,7 +1986,9 @@ impl RerankResponse {
     /// Sort results by score in descending order
     pub fn sort_by_score(&mut self) {
         self.results.sort_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
 
@@ -2278,20 +2276,15 @@ mod tests {
 
     #[test]
     fn test_rerank_response_serialization() {
-        let results = vec![
-            RerankResult {
-                score: 0.8,
-                document: Some("doc1".to_string()),
-                index: 0,
-                meta_info: None,
-            },
-        ];
+        let results = vec![RerankResult {
+            score: 0.8,
+            document: Some("doc1".to_string()),
+            index: 0,
+            meta_info: None,
+        }];
 
-        let response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            "req-123".to_string(),
-        );
+        let response =
+            RerankResponse::new(results, "test-model".to_string(), "req-123".to_string());
 
         let serialized = serde_json::to_string(&response).unwrap();
         let deserialized: RerankResponse = serde_json::from_str(&serialized).unwrap();
@@ -2325,11 +2318,8 @@ mod tests {
             },
         ];
 
-        let mut response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            "req-123".to_string(),
-        );
+        let mut response =
+            RerankResponse::new(results, "test-model".to_string(), "req-123".to_string());
 
         response.sort_by_score();
 
@@ -2364,11 +2354,8 @@ mod tests {
             },
         ];
 
-        let mut response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            "req-123".to_string(),
-        );
+        let mut response =
+            RerankResponse::new(results, "test-model".to_string(), "req-123".to_string());
 
         response.apply_top_k(2);
 
@@ -2379,20 +2366,15 @@ mod tests {
 
     #[test]
     fn test_rerank_response_apply_top_k_larger_than_results() {
-        let results = vec![
-            RerankResult {
-                score: 0.8,
-                document: Some("doc1".to_string()),
-                index: 0,
-                meta_info: None,
-            },
-        ];
+        let results = vec![RerankResult {
+            score: 0.8,
+            document: Some("doc1".to_string()),
+            index: 0,
+            meta_info: None,
+        }];
 
-        let mut response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            "req-123".to_string(),
-        );
+        let mut response =
+            RerankResponse::new(results, "test-model".to_string(), "req-123".to_string());
 
         response.apply_top_k(5);
 
@@ -2411,7 +2393,10 @@ mod tests {
             index: 42,
             meta_info: Some(HashMap::from([
                 ("confidence".to_string(), Value::String("high".to_string())),
-                ("processing_time".to_string(), Value::Number(serde_json::Number::from(150))),
+                (
+                    "processing_time".to_string(),
+                    Value::Number(serde_json::Number::from(150)),
+                ),
             ])),
         };
 
@@ -2540,7 +2525,10 @@ mod tests {
     fn test_rerank_request_special_characters() {
         let request = RerankRequest {
             query: "query with émojis 🚀 and unicode: 测试".to_string(),
-            documents: vec!["doc with émojis 🎉".to_string(), "doc with unicode: 测试".to_string()],
+            documents: vec![
+                "doc with émojis 🎉".to_string(),
+                "doc with unicode: 测试".to_string(),
+            ],
             model: "test-model".to_string(),
             top_k: None,
             return_documents: true,
@@ -2559,7 +2547,10 @@ mod tests {
             model: "test-model".to_string(),
             top_k: None,
             return_documents: true,
-            rid: Some(StringOrArray::Array(vec!["req1".to_string(), "req2".to_string()])),
+            rid: Some(StringOrArray::Array(vec![
+                "req1".to_string(),
+                "req2".to_string(),
+            ])),
             user: None,
         };
 
@@ -2568,20 +2559,15 @@ mod tests {
 
     #[test]
     fn test_rerank_response_with_usage_info() {
-        let results = vec![
-            RerankResult {
-                score: 0.8,
-                document: Some("doc1".to_string()),
-                index: 0,
-                meta_info: None,
-            },
-        ];
+        let results = vec![RerankResult {
+            score: 0.8,
+            document: Some("doc1".to_string()),
+            index: 0,
+            meta_info: None,
+        }];
 
-        let mut response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            "req-123".to_string(),
-        );
+        let mut response =
+            RerankResponse::new(results, "test-model".to_string(), "req-123".to_string());
 
         response.usage = Some(UsageInfo {
             prompt_tokens: 100,
@@ -2658,10 +2644,14 @@ mod tests {
         let mut response = RerankResponse::new(
             results,
             request.model.clone(),
-            request.rid.as_ref().and_then(|r| match r {
-                StringOrArray::String(s) => Some(s.clone()),
-                StringOrArray::Array(arr) => arr.first().cloned(),
-            }).unwrap_or_else(|| "unknown".to_string()),
+            request
+                .rid
+                .as_ref()
+                .and_then(|r| match r {
+                    StringOrArray::String(s) => Some(s.clone()),
+                    StringOrArray::Array(arr) => arr.first().cloned(),
+                })
+                .unwrap_or_else(|| "unknown".to_string()),
         );
 
         // Sort by score
