@@ -4,9 +4,7 @@ version = "0.0.0"
 edition = "2021"
 
 [features]
-default = ["huggingface", "grpc-client"]
-huggingface = ["tokenizers", "minijinja"]
-tiktoken = ["tiktoken-rs"]
+default = ["grpc-client"]
 grpc-client = []
 grpc-server = []
 
@@ -52,10 +50,11 @@ regex = "1.10"
 url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
-tokenizers = { version = "0.21.4", optional = true }
-tiktoken-rs = { version = "0.7.0", optional = true }
-minijinja = { version = "2.0", optional = true }
+tokenizers = { version = "0.22.0" }
+tiktoken-rs = { version = "0.7.0" }
+minijinja = { version = "2.0" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+hf-hub = { version = "0.4.3", features = ["tokio"] }
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.12", features = ["tls", "gzip", "transport"] }
