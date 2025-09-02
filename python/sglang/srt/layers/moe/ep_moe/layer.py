@@ -232,7 +232,9 @@ class EPMoE(FusedMoE):
             (
                 _cast_to_e8m0_with_rounding_up(gateup_input_scale)
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(gateup_input_scale)
+                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                    gateup_input_scale
+                )
             ),
         )
         num_groups, m, k = gateup_input_fp8[0].size()
