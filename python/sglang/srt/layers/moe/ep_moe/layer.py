@@ -475,6 +475,8 @@ class DeepEPMoE(EPMoE):
         block_m, block_n = 128, 128
 
         combine_overlap_args = dict(
+            # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
+            overlap=False,
             num_sms=DEEPEP_LL_COMBINE_SEND_NUM_SMS,
         )
         down_overlap_args = None
@@ -497,7 +499,6 @@ class DeepEPMoE(EPMoE):
                 down_start_event=down_start_event,
             )
             combine_overlap_args |= dict(
-                # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
                 overlap=True,
                 signal=combine_signal,
                 block_m=block_m,
