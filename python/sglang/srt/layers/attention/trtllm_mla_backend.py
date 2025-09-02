@@ -337,8 +337,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens.device,
             )
 
+            max_seq_len_val = int(max_seq)
             self.forward_decode_metadata = TRTLLMMLADecodeMetadata(
-                self.workspace_buffer, block_kv_indices
+                self.workspace_buffer, block_kv_indices, max_seq_len_val
             )
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
