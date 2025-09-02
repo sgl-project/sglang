@@ -191,20 +191,20 @@ class MambaAttnBackend(AttentionBackend):
         )
         value = rearrange(value, "l (h d) -> 1 l h d", d=head_v_dim)
 
-        core_attn_out = sigmoid_gating_delta_rule_update_triton(
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
+        core_attn_out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
             q=query,
             k=key,
             v=value,
             a=a,
             b=b,
-            initial_state_source=cache_params.ssm_state,
-            initial_state_indices=cache_params.state_indices_tensor,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
-            scale=1.0 / self.head_v_dim ** 0.5,
+            scale=1.0 / query.size(-1) ** 0.5,
         )
 
         return core_attn_out
