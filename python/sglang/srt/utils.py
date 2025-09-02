@@ -181,7 +181,8 @@ def is_blackwell():
 def is_sm100_supported(device=None) -> bool:
     # Support both SM100 (compute cap 10.x) and SM120 (compute cap 12.x for RTX 5090/Blackwell)
     compute_cap = torch.cuda.get_device_capability(device)[0]
-    return ((compute_cap == 10) or (compute_cap == 12)) and (
+    # Use safe tuple comparison for CUDA version
+    return (compute_cap in (10, 12)) and (
         _parse_cuda_version(torch.version.cuda) >= (12, 8)
     )
 
