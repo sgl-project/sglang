@@ -298,8 +298,6 @@ class _ModuleOffloader(ABC):
             param_offloader.post_init()
 
     def start_onload(self):
-        if torch.distributed.get_rank() == 0:
-            print(f"[{self.debug_name}] start_onload")
         self.alt_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.alt_stream):
             self._device_tensors = self._create_device_tensors()
@@ -307,14 +305,10 @@ class _ModuleOffloader(ABC):
             self._load_event.record()
 
     def offload(self):
-        if torch.distributed.get_rank() == 0:
-            print(f"[{self.debug_name}] offload")
         self._device_tensors = None
         self._load_event = None
 
     def wait_and_get_device_tensors(self):
-        if torch.distributed.get_rank() == 0:
-            print(f"[{self.debug_name}] wait_and_get_device_tensors")
         assert self._device_tensors is not None
         self._load_event.wait()
         return self._device_tensors
