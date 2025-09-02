@@ -1207,6 +1207,50 @@ def launch_server(
         )
         app.warmup_thread = warmup_thread
 
+    # Launch gRPC server if enabled
+    grpc_task = None
+    if server_args.enable_grpc:
+        try:
+            from sglang.srt.entrypoints.grpc_server import serve_grpc
+            
+            # Get the scheduler from global state
+            scheduler = scheduler_info.scheduler if hasattr(scheduler_info, 'scheduler') else None
+            
+            if scheduler is None:
+                logging.warning("gRPC server requested but scheduler not available - gRPC server will not start")
+            else:
+                logging.info(f"Starting gRPC server on {server_args.grpc_host}:{server_args.grpc_port}")
+                
+                def start_grpc_server():
+                    """Start gRPC server in a separate thread"""
+                    import asyncio
+                    
+                    # Create new event loop for the gRPC server thread
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    try:
+                        loop.run_until_complete(serve_grpc(
+                            scheduler=scheduler,
+                            port=server_args.grpc_port,
+                            host=server_args.grpc_host,
+                            max_workers=server_args.grpc_max_workers,
+                            enable_reflection=server_args.grpc_enable_reflection
+                        ))
+                    finally:
+                        loop.close()
+                
+                grpc_thread = threading.Thread(
+                    target=start_grpc_server,
+                    daemon=True,
+                    name="grpc-server"
+                )
+                grpc_thread.start()
+                
+        except ImportError as e:
+            logging.error(f"Failed to import gRPC server: {e}")
+            logging.error("Please ensure grpcio and grpcio-tools are installed and protobuf files are compiled")
+
     try:
         # Update logging configs
         set_uvicorn_logging_configs()
