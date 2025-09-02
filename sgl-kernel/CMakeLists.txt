@@ -61,7 +61,7 @@ FetchContent_Populate(repo-fmt)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        sgl
+    GIT_TAG        dg-skip-launch
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
