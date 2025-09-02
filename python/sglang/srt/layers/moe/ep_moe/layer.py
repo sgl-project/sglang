@@ -22,7 +22,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.moe.token_dispatcher.deepep import ENABLE_DEEPEP_COMBINE_OVERLAP, DEEPEP_LL_COMBINE_SEND_NUM_SMS
+from sglang.srt.layers.moe.token_dispatcher.deepep import ENABLE_DEEPEP_COMBINE_OVERLAP, DEEPEP_LL_COMBINE_SEND_NUM_SMS, \
+    ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -473,32 +474,35 @@ class DeepEPMoE(EPMoE):
         # TODO do not hardcode
         block_m, block_n = 128, 128
 
-        # TODO use zero_allocator
-        combine_signal = torch.zeros(
-            # TODO their deepep requires the size to be this large, temp use theirs to avoid changing their code
-            #      but should optimize later
-            #      this may be better: (num_local_experts, ceil_div(num_tokens_static, block_m)),
-            num_local_experts * ceil_div(num_tokens_static, 64),
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
-
-        down_start_event = torch.cuda.Event()
-
         combine_overlap_args = dict(
-            overlap=True,
-            signal=combine_signal,
-            block_m=block_m,
-            threshold=ceil_div(hidden_dim, block_n),
             num_sms=DEEPEP_LL_COMBINE_SEND_NUM_SMS,
         )
+        down_overlap_args = None
 
-        down_overlap_args = dict(
-            # TODO after improving DeepEP's `combine_signal`, simplify this
-            down_signals=combine_signal[:num_local_experts * ceil_div(num_tokens_static, block_m)].view(
-                num_local_experts, ceil_div(num_tokens_static, block_m)),
-            down_start_event=down_start_event,
-        )
+        if ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP:
+            # TODO use zero_allocator
+            combine_signal = torch.zeros(
+                # TODO their deepep requires the size to be this large, temp use theirs to avoid changing their code
+                #      but should optimize later
+                #      this may be better: (num_local_experts, ceil_div(num_tokens_static, block_m)),
+                num_local_experts * ceil_div(num_tokens_static, 64),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            down_start_event = torch.cuda.Event()
+            down_overlap_args = dict(
+                # TODO after improving DeepEP's `combine_signal`, simplify this
+                down_signals=combine_signal[:num_local_experts * ceil_div(num_tokens_static, block_m)].view(
+                    num_local_experts, ceil_div(num_tokens_static, block_m)),
+                down_start_event=down_start_event,
+            )
+            combine_overlap_args |= dict(
+                # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
+                overlap=True,
+                signal=combine_signal,
+                block_m=block_m,
+                threshold=ceil_div(hidden_dim, block_n),
+            )
 
         return combine_overlap_args, down_overlap_args
 
