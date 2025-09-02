@@ -1,20 +1,10 @@
 // mxfp4_grouped.cu
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include "mxfp4_grouped_common.h"
 #include <vector>
 #include <stdint.h>
 #include <assert.h>
-
-struct GroupedDesc {
-  const void* X;
-  const void* Wq;
-  const void* Scales;
-  void*       Y;
-  int64_t M, N, K;
-  int group_size;
-  int pack_layout;
-  int64_t lda, ldwq, lds, ldy;
-};
 
 // TODO: Real kernel with tile dequant + Tensor Cores.
 // For now, placeholder that demonstrates the structure.
@@ -34,7 +24,7 @@ static void kernel_fallback(const GroupedDesc& d, cudaStream_t stream) {
   cudaMemsetAsync(y_ptr, 0, size * sizeof(__nv_bfloat16), stream);
 }
 
-extern "C" void launch_grouped_mxfp4_weightonly(
+void launch_grouped_mxfp4_weightonly(
     const std::vector<GroupedDesc>& descs,
     int sm_arch, cudaStream_t stream) {
   

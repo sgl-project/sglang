@@ -2306,23 +2306,21 @@ class ServerArgs:
                 )
             else:
                 if self.moe_runner_backend == "triton_kernel":
-                    import os
                     if os.environ.get("SGLANG_DISABLE_TRITON_MOE", "0") == "1":
                         self.moe_runner_backend = "flashinfer_trtllm"
                         self.enable_triton_kernel_moe = False
                         self.enable_flashinfer_mxfp4_moe = True
                         self.enable_flashinfer_trtllm_moe = True
                         logger.warning(
-                            "SGLANG_DISABLE_TRITON_MOE=1 detected, forcing FlashInfer MOE backend"
+                            "SGLANG_DISABLE_TRITON_MOE=1 → forcing FlashInfer MoE backend"
                         )
-                    # Check for Blackwell (RTX 5090) and force FlashInfer MOE
                     elif is_sm120_supported():
                         self.moe_runner_backend = "flashinfer_trtllm"
                         self.enable_triton_kernel_moe = False
                         self.enable_flashinfer_mxfp4_moe = True
                         self.enable_flashinfer_trtllm_moe = True
                         logger.warning(
-                            "Detected Blackwell GPU (SM120), forcing FlashInfer MOE backend (Triton MOE incompatible with Blackwell)"
+                            "Detected Blackwell (SM120) → forcing FlashInfer MoE backend"
                         )
                     else:
                         assert self.ep_size == 1, "Triton kernel MoE is only supported when ep_size == 1"

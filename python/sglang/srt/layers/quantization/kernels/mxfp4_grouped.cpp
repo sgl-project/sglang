@@ -1,23 +1,9 @@
 // mxfp4_grouped.cpp
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include "mxfp4_grouped_common.h"
 #include <vector>
 #include <stdexcept>
-
-struct GroupedDesc {
-  const void* X;        // BF16 [M,K]
-  const void* Wq;       // packed FP4
-  const void* Scales;   // FP16/BF16 per-group
-  void*       Y;        // BF16 [M,N]
-  int64_t M, N, K;
-  int group_size;       // e.g., 128
-  int pack_layout;      // 0: mxfp4_row, 1: mxfp4_col (define)
-  int64_t lda, ldwq, lds, ldy; // strides (row-major expected: lda=K, ldy=N)
-};
-
-// CUDA launcher (implemented in .cu)
-void launch_grouped_mxfp4_weightonly(
-    const std::vector<GroupedDesc>& descs,
-    int sm_arch, cudaStream_t stream);
 
 static int to_layout(const std::string& s) {
   if (s == "mxfp4_row") return 0;
