@@ -772,14 +772,15 @@ class HiRadixCache(RadixCache):
                         stack.append(cur_child)
         return ret_list
 
-    def check_abort_prefetch(self, rid: str):
-        if rid not in  self.ongoing_prefetch:
+    def release_aborted_request(self, rid: str):
+        if rid not in self.ongoing_prefetch:
             return
 
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
-        self.cache_controller.terminate_prefetch(operation)
-
-        self.cache_controller.mem_pool_host.free(host_indices)
+        completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
+        if self.tp_world_size > 1:
+            torch.distributed.barrier(group=self.tp_group)
         last_host_node.release_host()
         del self.ongoing_prefetch[rid]
+        self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
