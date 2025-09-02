@@ -475,6 +475,11 @@ class DeepEPMoE(EPMoE):
         # TODO do not hardcode
         block_m, block_n = 128, 128
 
+        from sglang.srt.layers.moe.token_dispatcher.deepep import DEEPEP_LL_COMBINE_SEND_NUM_SMS
+        device_properties = torch.cuda.get_device_properties(device="cuda")
+        total_num_sms = device_properties.multi_processor_count
+        compute_num_sms = total_num_sms - DEEPEP_LL_COMBINE_SEND_NUM_SMS
+
         combine_overlap_args = dict(
             # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
             overlap=False,
@@ -498,6 +503,7 @@ class DeepEPMoE(EPMoE):
                 down_signals=combine_signal[:num_local_experts * ceil_div(num_tokens_static, block_m)].view(
                     num_local_experts, ceil_div(num_tokens_static, block_m)),
                 down_start_event=down_start_event,
+                down_sm_count=compute_num_sms,
             )
             combine_overlap_args |= dict(
                 overlap=True,
@@ -506,7 +512,7 @@ class DeepEPMoE(EPMoE):
                 threshold=ceil_div(hidden_dim, block_n),
             )
 
-        return combine_overlap_args, down_overlap_args
+        return combine_overlap_args, down_overlap_args, compute_num_sms
 
     def dispatch(
         self,

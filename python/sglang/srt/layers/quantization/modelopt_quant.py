@@ -819,11 +819,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self.enable_flashinfer_trtllm_moe = should_use_flashinfer_trtllm_moe()
         self._cache_permute_indices = {}
 
-        from sglang.srt.layers.moe.token_dispatcher.deepep import DEEPEP_LL_COMBINE_SEND_NUM_SMS
-        device_properties = torch.cuda.get_device_properties(device="cuda")
-        total_num_sms = device_properties.multi_processor_count
-        self.down_sm_count = total_num_sms - DEEPEP_LL_COMBINE_SEND_NUM_SMS
-
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
         from sglang.srt.layers.moe import get_moe_runner_backend
@@ -1384,7 +1379,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_blockscale=layer.w2_blockscale_swizzled,
             w2_alpha=layer.g2_alphas,
             masked_m=masked_m,
-            down_sm_count=self.down_sm_count,
+            down_sm_count=down_overlap_args["down_sm_count"],
             down_signals=down_overlap_args["down_signals"],
             down_start_event=down_overlap_args["down_start_event"],
         )
