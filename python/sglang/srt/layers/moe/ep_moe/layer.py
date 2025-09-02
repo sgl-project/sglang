@@ -366,7 +366,6 @@ class DeepEPMoE(EPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = get_deepep_mode()
-        self.device_module = torch.get_device_module()
 
         # TODO: move to the beginning of the file
         from sglang.srt.distributed.parallel_state import get_tp_group
@@ -434,7 +433,7 @@ class DeepEPMoE(EPMoE):
             hidden_states, topk_idx, topk_weights, forward_batch
         )
 
-        combine_overlap_args, down_overlap_args, compute_num_sms = self._compute_overlap_args(dispatch_output)
+        combine_overlap_args, down_overlap_args, compute_num_sms = self._compute_overlap_args(dispatch_output, alt_stream)
 
         hidden_states = self.moe_impl(dispatch_output, down_overlap_args=down_overlap_args)
 
@@ -442,27 +441,18 @@ class DeepEPMoE(EPMoE):
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(compute_num_sms):
                 hook_overlap_on_combine()
 
-        combine_context = nullcontext()
-        if ENABLE_DEEPEP_COMBINE_OVERLAP:
-            alt_stream.wait_event(down_overlap_args["down_start_event"])
-            combine_context = torch.cuda.stream(alt_stream)
-
-        with combine_context:
-            hidden_states = self.combine(
-                hidden_states,
-                dispatch_output.topk_idx,
-                dispatch_output.topk_weights,
-                forward_batch,
-                overlap_args=combine_overlap_args,
-            )
-
-        if ENABLE_DEEPEP_COMBINE_OVERLAP:
-            self.device_module.current_stream().wait_stream(alt_stream)
+        hidden_states = self.combine(
+            hidden_states,
+            dispatch_output.topk_idx,
+            dispatch_output.topk_weights,
+            forward_batch,
+            overlap_args=combine_overlap_args,
+        )
 
         return hidden_states
 
     @staticmethod
-    def _compute_overlap_args(dispatch_output):
+    def _compute_overlap_args(dispatch_output, alt_stream):
         if not ENABLE_DEEPEP_COMBINE_OVERLAP:
             return None, None, None
 
@@ -478,10 +468,13 @@ class DeepEPMoE(EPMoE):
         communicate_num_sms = get_int_env_var("SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32)
         compute_num_sms = total_num_sms - communicate_num_sms
 
+        assert alt_stream is not None
         combine_overlap_args = dict(
             # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
             overlap=False,
             num_sms=communicate_num_sms,
+            stream=alt_stream,
+            wait_event=TODO,
         )
         down_overlap_args = None
 
@@ -508,6 +501,7 @@ class DeepEPMoE(EPMoE):
                 signal=combine_signal,
                 block_m=block_m,
                 threshold=ceil_div(hidden_dim, block_n),
+                wait_event=down_start_event,
             )
 
         return combine_overlap_args, down_overlap_args, compute_num_sms
