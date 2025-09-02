@@ -469,12 +469,13 @@ class DeepEPMoE(EPMoE):
         compute_num_sms = total_num_sms - communicate_num_sms
 
         assert alt_stream is not None
+        combine_wait_event = torch.cuda.Event()
         combine_overlap_args = dict(
             # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
             overlap=False,
             num_sms=communicate_num_sms,
             stream=alt_stream,
-            wait_event=TODO,
+            wait_event=combine_wait_event,
         )
         down_overlap_args = None
 
@@ -488,12 +489,11 @@ class DeepEPMoE(EPMoE):
                 dtype=torch.int32,
                 device=hidden_states.device,
             )
-            down_start_event = torch.cuda.Event()
             down_overlap_args = dict(
                 # TODO after improving DeepEP's `combine_signal`, simplify this
                 down_signals=combine_signal[:num_local_experts * ceil_div(num_tokens_static, block_m)].view(
                     num_local_experts, ceil_div(num_tokens_static, block_m)),
-                down_start_event=down_start_event,
+                down_start_event=combine_wait_event,
                 down_sm_count=compute_num_sms,
             )
             combine_overlap_args |= dict(
@@ -501,8 +501,9 @@ class DeepEPMoE(EPMoE):
                 signal=combine_signal,
                 block_m=block_m,
                 threshold=ceil_div(hidden_dim, block_n),
-                wait_event=down_start_event,
             )
+        else:
+            TODO(combine_wait_event)
 
         return combine_overlap_args, down_overlap_args, compute_num_sms
 
