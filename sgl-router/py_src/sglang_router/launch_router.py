@@ -99,12 +99,15 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Tokenizer configuration
+    model_path: Optional[str] = None
+    tokenizer_path: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
-        parser: argparse.ArgumentParser,
-        use_router_prefix: bool = False,
-        exclude_host_port: bool = False,
+            parser: argparse.ArgumentParser,
+            use_router_prefix: bool = False,
+            exclude_host_port: bool = False,
     ):
         """
         Add router-specific arguments to an argument parser.
@@ -173,8 +176,8 @@ class RouterArgs:
             nargs="+",
             action="append",
             help="Prefill server URL and optional bootstrap port. Can be specified multiple times. "
-            "Format: --prefill URL [BOOTSTRAP_PORT]. "
-            "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
+                 "Format: --prefill URL [BOOTSTRAP_PORT]. "
+                 "BOOTSTRAP_PORT can be a port number, 'none', or omitted (defaults to none).",
         )
         parser.add_argument(
             f"--{prefix}decode",
@@ -433,10 +436,23 @@ class RouterArgs:
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
         )
+        # Tokenizer configuration
+        parser.add_argument(
+            f"--{prefix}model-path",
+            type=str,
+            default=None,
+            help="Model path for loading tokenizer (HuggingFace model ID or local path)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-path",
+            type=str,
+            default=None,
+            help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+        )
 
     @classmethod
     def from_cli_args(
-        cls, args: argparse.Namespace, use_router_prefix: bool = False
+            cls, args: argparse.Namespace, use_router_prefix: bool = False
     ) -> "RouterArgs":
         """
         Create RouterArgs instance from parsed command line arguments.
@@ -554,6 +570,8 @@ class RouterArgs:
             health_check_endpoint=getattr(
                 args, f"{prefix}health_check_endpoint", RouterArgs.health_check_endpoint
             ),
+            model_path=getattr(args, f"{prefix}model_path", None),
+            tokenizer_path=getattr(args, f"{prefix}tokenizer_path", None),
         )
 
     @staticmethod
@@ -662,27 +680,27 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
 
             # Warn about policy usage in PD mode
             if (
-                router_args.prefill_policy
-                and router_args.decode_policy
-                and router_args.policy
+                    router_args.prefill_policy
+                    and router_args.decode_policy
+                    and router_args.policy
             ):
                 logger.warning(
                     "Both --prefill-policy and --decode-policy are specified. "
                     "The main --policy flag will be ignored for PD mode."
                 )
             elif (
-                router_args.prefill_policy
-                and not router_args.decode_policy
-                and router_args.policy
+                    router_args.prefill_policy
+                    and not router_args.decode_policy
+                    and router_args.policy
             ):
                 logger.info(
                     f"Using --prefill-policy '{router_args.prefill_policy}' for prefill nodes "
                     f"and --policy '{router_args.policy}' for decode nodes."
                 )
             elif (
-                router_args.decode_policy
-                and not router_args.prefill_policy
-                and router_args.policy
+                    router_args.decode_policy
+                    and not router_args.prefill_policy
+                    and router_args.policy
             ):
                 logger.info(
                     f"Using --policy '{router_args.policy}' for prefill nodes "
@@ -759,6 +777,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             health_check_timeout_secs=router_args.health_check_timeout_secs,
             health_check_interval_secs=router_args.health_check_interval_secs,
             health_check_endpoint=router_args.health_check_endpoint,
+            model_path=router_args.model_path,
+            tokenizer_path=router_args.tokenizer_path,
         )
 
         router.start()
