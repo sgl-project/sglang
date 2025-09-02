@@ -48,9 +48,11 @@ from sglang.srt.utils import (
     is_npu,
     is_shm_available,
     supports_custom_op,
+    is_cpu,
 )
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 IS_ONE_DEVICE_PER_PROCESS = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
 
@@ -1643,7 +1645,7 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
 
         ray.shutdown()
     gc.collect()
-    if not current_platform.is_cpu():
+    if not _is_cpu:
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
             if hasattr(torch._C, "_host_emptyCache"):
