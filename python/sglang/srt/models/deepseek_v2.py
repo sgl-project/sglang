@@ -1039,6 +1039,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return _dispatch_mla_subtype()
         elif attention_backend == "fa4":
+            # TODO: FA4 support is on early stage, this is a hacky way to support MLA models.
             return AttnForwardMethod.MHA_CHUNKED_KV
         elif attention_backend == "aiter":
             if (
@@ -1734,11 +1735,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
-        has_extend_prefix = (
-            False
-            if not forward_batch.extend_prefix_lens_cpu
-            else any(forward_batch.extend_prefix_lens_cpu)
+        has_extend_prefix = forward_batch.extend_prefix_lens_cpu and any(
+            forward_batch.extend_prefix_lens_cpu
         )
+
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.prepare_chunked_prefix_cache_info(q.device)

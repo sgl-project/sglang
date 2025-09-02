@@ -1550,10 +1550,9 @@ class ModelRunner:
 
             return FlashAttentionBackend(self)
         elif backend_str == "fa4":
-            assert self.use_mla_backend, (
-                "FlashAttention v4 Backend requires SM>=80 and SM<=90. "
-                "Please use `--attention-backend flashinfer`."
-            )
+            assert (
+                self.use_mla_backend
+            ), "FlashAttention v4 Support is on early stage, only MLA model supported now"
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
             )

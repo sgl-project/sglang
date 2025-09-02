@@ -87,11 +87,20 @@ FetchContent_Populate(repo-flashinfer)
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    GIT_REPOSITORY https://github.com/cicirori/sgl-flash-attn
-    GIT_TAG        sgl-kernel-cute
+    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
+    GIT_TAG        sgl-kernel
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
+
+# flash-attention origin
+FetchContent_Declare(
+    repo-flash-attention-origin
+    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
+    GIT_TAG        203b9b3dba39d5d08dffb49c09aa622984dff07d
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-flash-attention-origin)
 
 # mscclpp
 FetchContent_Declare(
@@ -500,8 +509,11 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
 
-# flash_attn/cute
-install(DIRECTORY "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute/"
-        DESTINATION "flash_attn/cute/"
-        PATTERN ".git*" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)
+# fa4
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
+    # flash_attn/cute
+    install(DIRECTORY "${repo-flash-attention-origin_SOURCE_DIR}/flash_attn/cute/"
+            DESTINATION "flash_attn/cute"
+            PATTERN ".git*" EXCLUDE
+            PATTERN "__pycache__" EXCLUDE)
+    endif()

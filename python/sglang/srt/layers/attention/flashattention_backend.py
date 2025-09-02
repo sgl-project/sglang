@@ -22,13 +22,6 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
-try:
-    from sgl_kernel.flash_attn_4 import (
-        flash_attn_varlen_func as flash_attn_4_varlen_func,
-    )
-except ImportError:
-    flash_attn_varlen_func_fa4 = None
-
 
 @dataclass
 class FlashAttentionMetadata:
@@ -347,13 +340,6 @@ class FlashAttentionBackend(AttentionBackend):
         self.speculative_step_id = speculative_step_id
 
         self.fa_impl_ver = fa_impl_ver
-
-        if self.fa_impl_ver == 4:
-            self.flash_attn_varlen_func = flash_attn_4_varlen_func
-            self.flash_attn_with_kvcache = None
-        else:
-            self.flash_attn_varlen_func = flash_attn_varlen_func
-            self.flash_attn_with_kvcache = flash_attn_with_kvcache
 
         # Local attention settings
         self.attention_chunk_size = (
@@ -728,7 +714,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
-        kwargs = {}
+        kwargs = {"ver": self.fa_impl_ver}
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -836,7 +822,7 @@ class FlashAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
-                    output = self.flash_attn_varlen_func(
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -847,10 +833,11 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
+                        **kwargs,
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
-                    output = self.flash_attn_varlen_func(
+                    output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -861,6 +848,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
+                        **kwargs,
                     )
                 if forward_batch.mha_return_lse:
                     output, lse, *rest = output
@@ -1001,7 +989,7 @@ class FlashAttentionBackend(AttentionBackend):
         causal = not layer.is_cross_attention
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
-        kwargs = {}
+        kwargs = {"ver": self.fa_impl_ver}
         if sinks is not None:
             kwargs["sinks"] = sinks
 
