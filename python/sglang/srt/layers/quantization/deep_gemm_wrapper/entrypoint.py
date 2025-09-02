@@ -53,19 +53,8 @@ def grouped_gemm_nt_f8f8bf16_contig(
     num_groups, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
 
-    print(
-        f"hi grouped_gemm_nt_f8f8bf16_contig "
-        f"{lhs[0].shape=} {lhs[0].dtype=} {lhs[0].device=} {lhs[0].stride()=} "
-        f"{lhs[1].shape=} {lhs[1].dtype=} {lhs[1].device=} {lhs[1].stride()=} "
-        f"{rhs[0].shape=} {rhs[0].dtype=} {rhs[0].device=} {rhs[0].stride()=} "
-        f"{rhs[1].shape=} {rhs[1].dtype=} {rhs[1].device=} {rhs[1].stride()=} "
-        f"{m_indices.shape=} {m_indices.dtype=} {m_indices.device=} {m_indices.stride()=} "
-        # f"{m_indices.tolist()=} "
-    )
-
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        for _ in range(3):
-            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(lhs, rhs, out, m_indices)
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(lhs, rhs, out, m_indices)
 
 
 def gemm_nt_f8f8bf16(
