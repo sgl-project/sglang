@@ -59,10 +59,12 @@ class TestAscendDeepEP(CustomTestCase):
         ]
 
         cls.envs = os.environ.copy()
-        cls.envs.update({
-            "HCCL_BUFFSIZE": 500,
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": 32,
-        })
+        cls.envs.update(
+            {
+                "HCCL_BUFFSIZE": 500,
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": 32,
+            }
+        )
 
     def test_a_gsm8k(self):
         for model in self.models:
