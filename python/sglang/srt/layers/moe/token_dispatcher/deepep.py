@@ -624,8 +624,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     # TODO overlap_args may use stronger typing
                     overlap=overlap_args["overlap"],
                     comp_signal=overlap_args.get("signal"),
-                    block_m=overlap_args.get("block_m"),
-                    threshold=overlap_args.get("threshold"),
+                    block_m=overlap_args.get("block_m", -1),
+                    threshold=overlap_args.get("threshold", -1),
                     num_sms=overlap_args["num_sms"],
                     async_finish=not self.return_recv_hook,
                     return_recv_hook=self.return_recv_hook,
