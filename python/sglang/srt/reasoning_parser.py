@@ -178,15 +178,15 @@ class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
     Assumes reasoning format:
-      ◁think▷*(.*)◁/think▷
+      <think>*(.*)</think>
     Returns all the text before the ◁/think▷ tag as `reasoning_text`
     and the rest of the text as `normal_text`.
     """
 
     def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
         super().__init__(
-            "◁think▷",
-            "◁/think▷",
+            "<think>",
+            "</think>",
             force_reasoning=False,
             stream_reasoning=stream_reasoning,
         )
