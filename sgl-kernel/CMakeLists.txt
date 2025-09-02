@@ -150,9 +150,13 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-extended-lambda"
     "--threads=32"
 
-    # Suppress warnings
-    "-Xcompiler=-Wconversion"
+    # Supress warnings
+    "-Xcompiler=-Wno-conversion"
     "-Xcompiler=-fno-strict-aliasing"
+    "-Xcompiler=-Wno-return-type"
+    "-Xcompiler=-Wno-attributes"
+    "-Xcompiler=-Wno-terminate"
+    "-Xcompiler=-Wfatal-errors"
 
     # uncomment to debug
     # "--ptxas-options=-v"
