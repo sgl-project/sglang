@@ -34,7 +34,7 @@ class UsageProcessor:
                 r["meta_info"].get("cached_tokens", 0) for r in responses
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
-            if enable_prefetch_report:
+            if enable_prefetch_report and cached_details is not None:
                 prefetched_total = sum(
                     r["meta_info"].get("prefetched_tokens", 0) for r in responses
                 )

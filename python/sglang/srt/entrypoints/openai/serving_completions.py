@@ -184,6 +184,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 text = content["text"]
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 prefetched_tokens[index] = content["meta_info"].get(
                     "prefetched_tokens", 0
                 )
