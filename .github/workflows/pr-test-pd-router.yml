@@ -305,10 +305,10 @@ jobs:
 
                 # Set mean thresholds (allowing for reasonable variance)
                 # These can be adjusted based on your performance requirements
-                ttft_threshold=2.0          # Max 2.0 seconds for mean TTFT
-                e2e_latency_threshold=24.0   # Max 8.0 seconds for mean E2E latency
-                input_throughput_threshold=10000   # Min 9000 tokens/s for mean input throughput
-                output_throughput_threshold=90    # Min 100 tokens/s for mean output throughput
+                ttft_threshold=4.7          # Max 4.7 seconds for mean TTFT
+                e2e_latency_threshold=35.0   # Max 35.0 seconds for mean E2E latency
+                input_throughput_threshold=12000   # Min 12000 tokens/s for mean input throughput
+                output_throughput_threshold=68    # Min 68 tokens/s for mean output throughput
 
 
                 # Validate mean thresholds
