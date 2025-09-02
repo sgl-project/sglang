@@ -486,6 +486,7 @@ class DeepEPMoE(EPMoE):
         down_start_event = torch.cuda.Event()
 
         combine_overlap_args = dict(
+            overlap=True,
             signal=combine_signal,
             block_m=block_m,
             threshold=ceil_div(hidden_dim, block_n),
