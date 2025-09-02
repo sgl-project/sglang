@@ -1,0 +1,3 @@
+# Python dependencies for the demo gRPC server
+grpcio>=1.60.0
+grpcio-tools>=1.60.0
