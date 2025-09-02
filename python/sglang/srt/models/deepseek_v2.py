@@ -2023,8 +2023,8 @@ class DeepseekV2Model(nn.Module):
                     [
                         "w13_weight",
                         "w2_weight",
-                        "w13_blockscale_swizzled",
-                        "w2_blockscale_swizzled",
+                        # "w13_blockscale_swizzled",
+                        # "w2_blockscale_swizzled",
                     ]
                     if isinstance(module, FusedMoE)
                     else []
