@@ -1,9 +1,15 @@
+import logging
 import uuid
 
 import torch
 from mooncake_store import MooncakeStore
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
 def generate_batch_query_keys(kv_num: int, config: HiCacheStorageConfig):
@@ -43,19 +49,21 @@ def test_single_operation():
 
     # Test set operation
     result = store.set(key, target_location=set_location, target_size=value_size)
-    assert result is True, f"set operation failed for key: {key}"
+    assert result is True, f"❌set operation failed for key: {key}"
 
     # Test exists operation
-    assert store.exists(key), f"key {key} should exist after set operation"
+    assert store.exists(key), f"❌key {key} should exist after set operation"
 
     # Test get operation
     result = store.get(key, target_location=get_location, target_size=value_size)
-    assert result is True, f"get operation failed for key: {key}"
+    assert result is True, f"❌get operation failed for key: {key}"
 
     # Compare the data using proper tensor indices
     assert torch.allclose(
         set_slice, get_slice, atol=1e-6
-    ), f"get operation failed for key: {key}"
+    ), f"❌get operation failed for key: {key}"
+
+    logger.info(f"✅ Single operation passed")
 
 
 def test_batch_operation(config: HiCacheStorageConfig):
@@ -83,12 +91,12 @@ def test_batch_operation(config: HiCacheStorageConfig):
     result = store.batch_set(
         set_keys, target_locations=set_locations, target_sizes=target_sizes
     )
-    assert result is True, f"batch set operation failed for keys: {set_keys}"
+    assert result is True, f"❌batch set operation failed"
 
     # Test batch exists operation
     assert store.batch_exists(
         exist_keys
-    ), f"keys {exist_keys} should exist after batch set operation"
+    ), f"❌keys should exist after batch set operation"
 
     # Test batch get operation
     get_slices = [
@@ -103,11 +111,13 @@ def test_batch_operation(config: HiCacheStorageConfig):
     result = store.batch_get(
         get_keys, target_locations=get_locations, target_sizes=target_sizes
     )
-    assert result == kv_num, f"batch get operation failed for keys: {get_keys}"
+    assert result == kv_num, f"❌batch get operation failed"
     for i in range(len(get_keys)):
         assert torch.allclose(
             set_slices[i], get_slices[i], atol=1e-6
-        ), f"batch get operation failed for keys: {get_keys[i]}"
+        ), f"❌batch get operation failed for key: {get_keys[i]}"
+
+    logger.info(f"✅ Batch operation passed")
 
 
 if __name__ == "__main__":
@@ -124,3 +134,4 @@ if __name__ == "__main__":
     test_batch_operation(
         HiCacheStorageConfig(is_mla_model=True, tp_rank=3, tp_size=8, model_name=None)
     )
+    logger.info(f"✅ All tests passed")
