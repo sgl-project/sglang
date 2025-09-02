@@ -534,6 +534,21 @@ class TokenizedGenerateReqInput:
 
 
 @dataclass
+class BatchTokenizedGenerateReqInput:
+    # The batch of tokenized requests
+    batch: List[TokenizedGenerateReqInput]
+
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, i):
+        return self.batch[i]
+
+    def __iter__(self):
+        return iter(self.batch)
+
+
+@dataclass
 class EmbeddingReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
@@ -612,6 +627,8 @@ class EmbeddingReqInput:
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
+            elif isinstance(self.sampling_params, dict):
+                self.sampling_params = [self.sampling_params] * self.batch_size
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
@@ -660,8 +677,25 @@ class TokenizedEmbeddingReqInput:
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
+
+
+@dataclass
+class BatchTokenizedEmbeddingReqInput:
+    # The batch of tokenized embedding requests
+    batch: List[TokenizedEmbeddingReqInput]
+
+    def __len__(self):
+        return len(self.batch)
+
+    def __getitem__(self, i):
+        return self.batch[i]
+
+    def __iter__(self):
+        return iter(self.batch)
 
 
 @dataclass
@@ -778,6 +812,16 @@ class BatchEmbeddingOut:
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
+
+
+@dataclass
+class ClearHiCacheReqInput:
+    pass
+
+
+@dataclass
+class ClearHiCacheReqOutput:
+    success: bool
 
 
 @dataclass
@@ -939,6 +983,11 @@ class AbortReq:
     abort_all: bool = False
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
+    # used in MultiTokenzierManager mode
+    rids: Optional[Union[List[str], str]] = None
+
+    def __post_init__(self):
+        self.rids = self.rid
 
 
 @dataclass
@@ -999,6 +1048,11 @@ class ProfileReq:
 class ProfileReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class FreezeGCReq:
+    pass
 
 
 @dataclass
@@ -1132,6 +1186,18 @@ class LoRAUpdateResult:
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
+
+
+@dataclass
+class MultiTokenizerRegisterReq:
+    rids: Optional[Union[List[str], str]] = None
+    ipc_name: Optional[str] = None
+
+
+@dataclass
+class MultiTokenizerWarpper:
+    worker_id: int
+    obj: Optional[Any] = None
 
 
 class BlockReqType(Enum):

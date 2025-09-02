@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_int_env_var,
+    is_cpu,
     is_cuda_alike,
     is_hip,
     is_npu,
@@ -51,11 +52,14 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+
+IS_ONE_DEVICE_PER_PROCESS = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
 
 
 @dataclass
 class GraphCaptureContext:
-    stream: torch.cuda.Stream
+    stream: torch.cuda.Stream if not _is_npu else torch.npu.Stream
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -223,10 +227,12 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
     ):
+        # Set group info
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
+        # Set rank info
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
         self.device_group = None
@@ -250,11 +256,16 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
+        device_id = 0 if IS_ONE_DEVICE_PER_PROCESS else local_rank
         if is_cuda_alike():
-            self.device = torch.device(f"cuda:{local_rank}")
+            self.device = torch.device(f"cuda:{device_id}")
+        elif _is_npu:
+            self.device = torch.device(f"npu:{device_id}")
         else:
             self.device = torch.device("cpu")
+        self.device_module = torch.get_device_module(self.device)
 
+        # Import communicators
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
@@ -266,6 +277,9 @@ class GroupCoordinator:
         # lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
+        )
+        from sglang.srt.distributed.device_communicators.pymscclpp import (
+            PyMscclppCommunicator,
         )
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
@@ -283,10 +297,6 @@ class GroupCoordinator:
                 group=self.cpu_group,
                 device=self.device,
             )
-
-        from sglang.srt.distributed.device_communicators.pymscclpp import (
-            PyMscclppCommunicator,
-        )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
         if use_pymscclpp and self.world_size > 1:
@@ -322,30 +332,30 @@ class GroupCoordinator:
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
 
+        # Create communicator for other hardware backends
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
+        )
+        from sglang.srt.distributed.device_communicators.npu_communicator import (
+            NpuCommunicator,
+        )
+        from sglang.srt.distributed.device_communicators.xpu_communicator import (
+            XpuCommunicator,
         )
 
         self.hpu_communicator: Optional[HpuCommunicator] = None
         if use_hpu_communicator and self.world_size > 1:
             self.hpu_communicator = HpuCommunicator(group=self.device_group)
 
-        from sglang.srt.distributed.device_communicators.xpu_communicator import (
-            XpuCommunicator,
-        )
-
         self.xpu_communicator: Optional[XpuCommunicator] = None
         if use_xpu_communicator and self.world_size > 1:
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
-
-        from sglang.srt.distributed.device_communicators.npu_communicator import (
-            NpuCommunicator,
-        )
 
         self.npu_communicator: Optional[NpuCommunicator] = None
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
+        # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
             MessageQueue,
         )
@@ -402,7 +412,7 @@ class GroupCoordinator:
         self, graph_capture_context: Optional[GraphCaptureContext] = None
     ):
         if graph_capture_context is None:
-            stream = torch.cuda.Stream()
+            stream = self.device_module.Stream()
             graph_capture_context = GraphCaptureContext(stream)
         else:
             stream = graph_capture_context.stream
@@ -413,11 +423,11 @@ class GroupCoordinator:
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
-        curr_stream = torch.cuda.current_stream()
+        curr_stream = self.device_module.current_stream()
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context:
+        with self.device_module.stream(stream), maybe_ca_context:
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
@@ -583,6 +593,39 @@ class GroupCoordinator:
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
+    def reduce_scatterv(
+        self,
+        input_: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+        sizes: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        world_size = self.world_size
+        pynccl_comm = self.pynccl_comm
+
+        with pynccl_comm.change_state(enable=True, stream=torch.cuda.current_stream()):
+            assert (
+                pynccl_comm is not None and not pynccl_comm.disabled
+            ), "pynccl is required for reduce_scatterv"
+
+            if sizes is not None:
+                assert len(sizes) == world_size
+                assert input_.shape[0] == sum(sizes)
+                chunk_size = sizes[self.rank_in_group]
+            else:
+                assert input_.shape[0] % world_size == 0
+                chunk_size = input_.shape[0] // world_size
+            output_shape = (chunk_size,) + input_.shape[1:]
+
+            if output is None:
+                output = torch.empty(
+                    output_shape, dtype=input_.dtype, device=input_.device
+                )
+            else:
+                assert output.shape == output_shape
+
+            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
+            return output
+
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -672,6 +715,54 @@ class GroupCoordinator:
             input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
         )
         return output_tensor
+
+    def all_gatherv(
+        self,
+        input_: Union[torch.Tensor, List[torch.Tensor]],
+        sizes: Optional[List[int]] = None,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """
+        Supports varying sizes per rank and input tensor list.
+        `sizes`: a list of len(world_size) with the number of items per rank to gather.
+        """
+        world_size = self.world_size
+        pynccl_comm = self.pynccl_comm
+
+        with pynccl_comm.change_state(enable=True, stream=torch.cuda.current_stream()):
+            assert (
+                pynccl_comm is not None and not pynccl_comm.disabled
+            ), "pynccl is required for all_gatherv"
+
+            def _all_gather_single(
+                input_: torch.Tensor, sizes: Optional[List[int]] = None
+            ):
+                input_size = input_.size()
+                if sizes is not None:
+                    assert len(sizes) == world_size
+                    assert input_.shape[0] == sizes[self.rank_in_group]
+                    output_size = (sum(sizes),) + input_size[1:]
+                    # 'sizes' is not needed if all inputs in the same group have the same shape
+                    if all(s == sizes[0] for s in sizes):
+                        sizes = None
+                else:
+                    output_size = (input_size[0] * world_size,) + input_size[1:]
+                # Allocate output tensor.
+                output_tensor = torch.empty(
+                    output_size, dtype=input_.dtype, device=input_.device
+                )
+                pynccl_comm.all_gather(output_tensor, input_, sizes=sizes)
+                return output_tensor
+
+            if isinstance(input_, torch.Tensor):
+                return _all_gather_single(input_, sizes)
+
+            output_list = []
+            pynccl_comm.group_start()
+            for inp in input_:
+                output_list.append(_all_gather_single(inp, sizes=sizes))
+            pynccl_comm.group_end()
+
+            return output_list
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
@@ -763,6 +854,11 @@ class GroupCoordinator:
             obj_list, src=self.ranks[src], group=self.device_group
         )
         return obj_list
+
+    def all_gather_object(self, obj: Any) -> List[Any]:
+        objs = [None] * self.world_size
+        torch.distributed.all_gather_object(objs, obj, group=self.cpu_group)
+        return objs
 
     def send_object(self, obj: Any, dst: int) -> None:
         """Send the input object list to the destination rank."""
@@ -1549,7 +1645,7 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
 
         ray.shutdown()
     gc.collect()
-    if not current_platform.is_cpu():
+    if not _is_cpu:
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
             if hasattr(torch._C, "_host_emptyCache"):
@@ -1560,6 +1656,8 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
                 )
         elif hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.empty_cache()
+        elif hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.empty_cache()
 
 
 def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:

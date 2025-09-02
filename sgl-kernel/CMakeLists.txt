@@ -45,7 +45,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        664c4f7b3ed1959414905025728eef5568209479
+    GIT_TAG        a49a78ffefc86a87160dfe0ccc3a3a2d1622c918
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -57,10 +57,11 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-fmt)
+
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        cabi
+    GIT_TAG        sgl
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -78,7 +79,7 @@ FetchContent_Populate(repo-triton)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        9220fb3443b5a5d274f00ca5552f798e225239b7
+    GIT_TAG        018b551825c8e5579206e6eb9d3229fa679202b3
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -174,11 +175,28 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_101,code=sm_101"
-        "-gencode=arch=compute_101a,code=sm_101a"
         "-gencode=arch=compute_120,code=sm_120"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
+
+    # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
+    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_103,code=sm_103"
+            "-gencode=arch=compute_103a,code=sm_103a"
+            "-gencode=arch=compute_110,code=sm_110"
+            "-gencode=arch=compute_110a,code=sm_110a"
+            "-gencode=arch=compute_121,code=sm_121"
+            "-gencode=arch=compute_121a,code=sm_121a"
+            "--compress-mode=size"
+        )
+    else()
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_101,code=sm_101"
+            "-gencode=arch=compute_101a,code=sm_101a"
+        )
+    endif()
+
 else()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-use_fast_math"
@@ -218,17 +236,19 @@ string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE
 string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 
 set(SOURCES
-    "csrc/allreduce/mscclpp_allreduce.cu"
     "csrc/allreduce/custom_all_reduce.cu"
+    "csrc/allreduce/mscclpp_allreduce.cu"
     "csrc/attention/cascade.cu"
-    "csrc/attention/merge_attn_states.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
-    "csrc/attention/vertical_slash_index.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
+    "csrc/attention/merge_attn_states.cu"
+    "csrc/attention/vertical_slash_index.cu"
     "csrc/elementwise/activation.cu"
+    "csrc/elementwise/cast.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/common_extension.cc"
+
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/dsv3_fused_a_gemm.cu"
@@ -252,17 +272,13 @@ set(SOURCES
     "csrc/gemm/marlin/gptq_marlin_repack.cu"
     "csrc/gemm/marlin/awq_marlin_repack.cu"
     "csrc/gemm/gptq/gptq_kernel.cu"
+
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
+
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
     "csrc/moe/marlin_moe_wna16/ops.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
-    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
@@ -271,14 +287,18 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
     "csrc/moe/ep_moe_reorder_kernel.cu"
     "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
+
+    "csrc/memory/store.cu"
     "csrc/kvcacheio/transfer.cu"
+
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
-    "csrc/memory/store.cu"
+
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
@@ -294,8 +314,6 @@ target_include_directories(common_ops PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
-set_source_files_properties("csrc/gemm/per_token_group_quant_8bit" PROPERTIES COMPILE_OPTIONS "--use_fast_math")
-
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
@@ -317,7 +335,10 @@ endif()
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
-add_subdirectory(${repo-mscclpp_SOURCE_DIR})
+add_subdirectory(
+    ${repo-mscclpp_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
+)
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
 # flash attention

@@ -1,3 +1,6 @@
+// Mock worker for testing - these functions are used by integration tests
+#![allow(dead_code)]
+
 use axum::{
     extract::{Json, State},
     http::StatusCode,
@@ -25,7 +28,6 @@ pub struct MockWorkerConfig {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum WorkerType {
     Regular,
     Prefill,
@@ -33,7 +35,6 @@ pub enum WorkerType {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum HealthStatus {
     Healthy,
     Unhealthy,

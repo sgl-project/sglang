@@ -52,7 +52,6 @@ if not (_is_npu or _is_hip):
 if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
-    from aiter.ops.shuffle import shuffle_weight
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +113,6 @@ class EPMoE(FusedMoE):
             gemm1_clamp_limit=gemm1_clamp_limit,
             with_bias=with_bias,
         )
-
-        self.start_expert_id = self.moe_ep_rank * self.num_local_experts
-        self.end_expert_id = self.start_expert_id + self.num_local_experts - 1
 
         self.intermediate_size = intermediate_size
 
@@ -233,7 +229,7 @@ class EPMoE(FusedMoE):
             (
                 _cast_to_e8m0_with_rounding_up(gateup_input_scale)
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
+                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                     gateup_input_scale
                 )
             ),
@@ -249,7 +245,6 @@ class EPMoE(FusedMoE):
             gateup_output,
             masked_m,
             expected_m,
-            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
         del gateup_input
         del gateup_input_fp8
@@ -291,9 +286,7 @@ class EPMoE(FusedMoE):
             (
                 down_input_scale
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
-                    down_input_scale
-                )
+                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(down_input_scale)
             ),
         )
         down_output = torch.empty(
@@ -305,7 +298,6 @@ class EPMoE(FusedMoE):
             down_output,
             masked_m,
             expected_m,
-            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
         del down_input
         del down_input_fp8
@@ -668,7 +660,6 @@ class DeepEPMoE(EPMoE):
             gateup_output,
             masked_m,
             expected_m,
-            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
         dispose_tensor(hidden_states_fp8[0])
 
@@ -709,9 +700,7 @@ class DeepEPMoE(EPMoE):
             (
                 down_input_scale
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
-                    down_input_scale
-                )
+                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(down_input_scale)
             ),
         )
         down_output = torch.empty(
@@ -723,7 +712,6 @@ class DeepEPMoE(EPMoE):
             down_output,
             masked_m,
             expected_m,
-            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
 
         return down_output
@@ -736,7 +724,7 @@ class DeepEPMoE(EPMoE):
             assert isinstance(dispatch_output, AscendDeepEPLLOutput)
         hidden_states, topk_idx, topk_weights, _, seg_indptr, _ = dispatch_output
         assert self.quant_method is not None
-        assert self.activation == "silu"
+        assert self.moe_runner_config.activation == "silu"
 
         # NOTE: Ascend's Dispatch & Combine does not support FP16
         output_dtype = torch.bfloat16
@@ -753,19 +741,25 @@ class DeepEPMoE(EPMoE):
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[self.w13_weight],
-            scale=[self.w13_weight_scale.to(output_dtype)],
-            per_token_scale=[pertoken_scale],
             split_item=2,
             group_list_type=group_list_type,
             group_type=0,
             group_list=seg_indptr,
-            output_dtype=output_dtype,
+            output_dtype=torch.int32,
         )[0]
 
         # act_fn: swiglu
-        hidden_states = torch_npu.npu_swiglu(hidden_states)
-
-        hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+        hidden_states, swiglu_out_scale = torch_npu.npu_dequant_swiglu_quant(
+            x=hidden_states,
+            weight_scale=self.w13_weight_scale.to(torch.float32),
+            activation_scale=pertoken_scale,
+            bias=None,
+            quant_scale=None,
+            quant_offset=None,
+            group_index=seg_indptr,
+            activate_left=True,
+            quant_mode=1,
+        )
 
         # gmm2: down_proj
         hidden_states = torch_npu.npu_grouped_matmul(
@@ -783,13 +777,17 @@ class DeepEPMoE(EPMoE):
         return hidden_states
 
 
-def get_moe_impl_class():
+def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
     if get_moe_a2a_backend().is_deepep():
         return DeepEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
     # Check for FP4 quantization with TRTLLM flag, regardless of EP
     if get_moe_runner_backend().is_flashinfer_trtllm():
+        # FlashInferFP4MoE must be paired with ModelOptNvFp4FusedMoEMethod.
+        # If UnquantizedFusedMoEMethod is detected, fall back to FusedMoE instead.
+        if quant_config is None:
+            return FusedMoE
         try:
             # Check the quantization argument directly
             quantization = global_server_args_dict.get("quantization")
