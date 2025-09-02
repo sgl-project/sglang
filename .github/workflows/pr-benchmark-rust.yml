@@ -54,13 +54,19 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          # Try with sccache if available, fallback to regular cargo
+          # Try to use sccache, but disable if it fails
           if command -v sccache &> /dev/null; then
-            echo "Using sccache for compilation"
+            echo "Testing sccache availability..."
+            # Try to start sccache and check if it works
             export RUSTC_WRAPPER=sccache
             export SCCACHE_GHA_ENABLED="true"
-            # Start sccache with error handling
-            sccache --start-server || true
+            if sccache --start-server 2>/dev/null && sccache --show-stats 2>/dev/null; then
+              echo "sccache is working, using it for compilation"
+            else
+              echo "sccache failed to start, falling back to regular cargo"
+              unset RUSTC_WRAPPER
+              unset SCCACHE_GHA_ENABLED
+            fi
           else
             echo "sccache not available, using regular cargo"
           fi
@@ -108,13 +114,19 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          # Try with sccache if available, fallback to regular cargo
+          # Try to use sccache, but disable if it fails
           if command -v sccache &> /dev/null; then
-            echo "Using sccache for compilation"
+            echo "Testing sccache availability..."
+            # Try to start sccache and check if it works
             export RUSTC_WRAPPER=sccache
             export SCCACHE_GHA_ENABLED="true"
-            # Start sccache with error handling
-            sccache --start-server || true
+            if sccache --start-server 2>/dev/null && sccache --show-stats 2>/dev/null; then
+              echo "sccache is working, using it for compilation"
+            else
+              echo "sccache failed to start, falling back to regular cargo"
+              unset RUSTC_WRAPPER
+              unset SCCACHE_GHA_ENABLED
+            fi
           else
             echo "sccache not available, using regular cargo"
           fi
@@ -170,13 +182,19 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          # Try with sccache if available, fallback to regular cargo
+          # Try to use sccache, but disable if it fails
           if command -v sccache &> /dev/null; then
-            echo "Using sccache for compilation"
+            echo "Testing sccache availability..."
+            # Try to start sccache and check if it works
             export RUSTC_WRAPPER=sccache
             export SCCACHE_GHA_ENABLED="true"
-            # Start sccache with error handling
-            sccache --start-server || true
+            if sccache --start-server 2>/dev/null && sccache --show-stats 2>/dev/null; then
+              echo "sccache is working, using it for compilation"
+            else
+              echo "sccache failed to start, falling back to regular cargo"
+              unset RUSTC_WRAPPER
+              unset SCCACHE_GHA_ENABLED
+            fi
           else
             echo "sccache not available, using regular cargo"
           fi
@@ -231,13 +249,19 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          # Try with sccache if available, fallback to regular cargo
+          # Try to use sccache, but disable if it fails
           if command -v sccache &> /dev/null; then
-            echo "Using sccache for compilation"
+            echo "Testing sccache availability..."
+            # Try to start sccache and check if it works
             export RUSTC_WRAPPER=sccache
             export SCCACHE_GHA_ENABLED="true"
-            # Start sccache with error handling
-            sccache --start-server || true
+            if sccache --start-server 2>/dev/null && sccache --show-stats 2>/dev/null; then
+              echo "sccache is working, using it for compilation"
+            else
+              echo "sccache failed to start, falling back to regular cargo"
+              unset RUSTC_WRAPPER
+              unset SCCACHE_GHA_ENABLED
+            fi
           else
             echo "sccache not available, using regular cargo"
           fi
