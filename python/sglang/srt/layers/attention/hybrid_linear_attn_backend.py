@@ -465,7 +465,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 conv_state = mamba_cache[0]
                 ssm_state = mamba_cache[1]
 
-                state_indices_tensor = self.attn_backend_list[1].forward_metadata.mamba_cache_indices
+                state_indices_tensor = self.attn_backend_list[1].forward_metadata.mamba_cache_indices[:request_number]
                 mask = torch.arange(num_draft_tokens, device=accepted_length.device).unsqueeze(0) < accepted_length.unsqueeze(1)
 
                 mixed_qkv = mamba_cache[2][state_indices_tensor][mask]

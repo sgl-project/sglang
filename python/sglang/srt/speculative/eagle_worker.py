@@ -838,7 +838,7 @@ class EAGLEWorker(TpModelWorker):
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
                 accepted_length, self.target_worker.model_runner.model
             )
-
+                
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
 
