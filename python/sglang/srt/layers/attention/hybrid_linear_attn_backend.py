@@ -287,12 +287,6 @@ class MambaAttnBackend(AttentionBackend):
         if not forward_batch.forward_mode.is_target_verify():
             ssm_states[self.forward_metadata.mamba_cache_indices] = last_recurrent_state
         else:
-            # print("forward_extend", self.forward_metadata.mamba_cache_indices)
-            # if forward_batch.forward_mode.is_target_verify():
-            #     torch.distributed.breakpoint()
-            # mixed_qkv_cache[self.forward_metadata.mamba_cache_indices] = (
-            #     mixed_qkv.transpose(0, 1).view((-1,) + mixed_qkv_cache.shape[1:])
-            # )
             query_cache[self.forward_metadata.mamba_cache_indices] = (
                 query.view((-1,) + query_cache.shape[1:])
             )
@@ -459,7 +453,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         for i in range(len(model.model.layers)):
             layer = model.model.layers[i]
             if isinstance(layer, Qwen3HybridLinearDecoderLayer):
-                # try:
                 conv_weights = layer.linear_attn.conv1d.weight.view(
                     layer.linear_attn.conv1d.weight.size(0), 
                     layer.linear_attn.conv1d.weight.size(2)
@@ -473,7 +466,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 ssm_state = mamba_cache[1]
 
                 state_indices_tensor = self.attn_backend_list[1].forward_metadata.mamba_cache_indices
-                # print("update verify", state_indices_tensor)
                 mask = torch.arange(num_draft_tokens, device=accepted_length.device).unsqueeze(0) < accepted_length.unsqueeze(1)
 
                 mixed_qkv = mamba_cache[2][state_indices_tensor][mask]
@@ -507,5 +499,3 @@ class HybridLinearAttnBackend(AttentionBackend):
                     use_qk_l2norm_in_kernel=True,
                 )
                 ssm_state[state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype, copy=False)
-                # except:
-                #     torch.distributed.breakpoint()

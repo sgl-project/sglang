@@ -1115,7 +1115,7 @@ class ModelRunner:
 
     @property
     def is_hybrid_gdn(self):
-        return "Qwen3HybridMoEForCausalLM" in self.model_config.hf_config.architectures
+        return self.model_config.hf_config.architectures[0] in ["Qwen3HybridMoEForCausalLM", "Qwen3HybridMoEForCausalLMMTP"]
 
     def set_num_token_hybrid(self):
         if (
@@ -1662,7 +1662,7 @@ class ModelRunner:
 
             return DualChunkFlashAttentionBackend(self)
         elif backend_str == "hybrid_linear_attn":
-            # assert self.is_hybrid_gdn, "hybrid_linear_attn backend can only be used with hybrid GDN models."
+            assert self.is_hybrid_gdn, "hybrid_linear_attn backend can only be used with hybrid GDN models."
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
                 HybridLinearAttnBackend, MambaAttnBackend
             )
