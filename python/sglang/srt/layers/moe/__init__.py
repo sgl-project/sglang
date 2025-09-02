@@ -29,5 +29,6 @@ __all__ = [
     "should_use_flashinfer_cutlass_moe_fp4_allgather",
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",
-    "get_dense_tbo_min_token_num" "get_deepep_config",
+    "get_dense_tbo_min_token_num",
+    "get_deepep_config",
 ]

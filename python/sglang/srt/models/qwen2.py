@@ -35,7 +35,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_tbo_token_distribution_threshold
+from sglang.srt.layers.moe import get_dense_tbo_min_token_num
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -337,7 +337,7 @@ class Qwen2Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        dense_tbo_min_token_num = get_tbo_token_distribution_threshold()
+        dense_tbo_min_token_num = get_dense_tbo_min_token_num()
         if (
             forward_batch.can_run_tbo
             and forward_batch.forward_mode.is_extend()

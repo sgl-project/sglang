@@ -103,7 +103,7 @@ MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
-Dense_TBO_MIN_TOKEN_NUM: Optional[int] = None
+DENSE_TBO_MIN_TOKEN_NUM: Optional[int] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 
@@ -112,10 +112,10 @@ def initialize_dense_config(server_args: ServerArgs):
     # The parameters are temporarily initialized; more will be added if needed in the future.
     global IS_TBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
-    global Dense_TBO_MIN_TOKEN_NUM
+    global DENSE_TBO_MIN_TOKEN_NUM
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
-    Dense_TBO_MIN_TOKEN_NUM = server_args.dense_tbo_min_token_num
+    DENSE_TBO_MIN_TOKEN_NUM = server_args.dense_tbo_min_token_num
 
 
 def initialize_moe_config(server_args: ServerArgs):
