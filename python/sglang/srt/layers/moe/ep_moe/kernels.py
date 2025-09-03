@@ -1334,7 +1334,8 @@ def moe_ep_deepgemm_preprocess(
 
     from deep_gemm.utils import per_token_cast_to_fp8 as deep_gemm_utils_per_token_cast_to_fp8
     assert block_k == 128
-    hidden_states, scale = deep_gemm_utils_per_token_cast_to_fp8(hidden_states, scale_ue8m0=scale_ue8m0)
+    # TODO inefficient, but this code path is already so inefficient...
+    hidden_states, scale = deep_gemm_utils_per_token_cast_to_fp8(hidden_states, use_ue8m0=scale_ue8m0)
     # hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k, scale_ue8m0=scale_ue8m0)
 
     gateup_input_scale = torch.empty(
