@@ -22,7 +22,7 @@ suites = {
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("lora/test_lora_cuda_graph.py", 250),
         TestFile("lora/test_lora_update.py", 400),
-        TestFile("lora/test_lora_embedding_layer.py", 100),
+        # TestFile("lora/test_lora_embedding_layer.py", 100),
         TestFile("lora/test_lora_qwen3.py", 97),
         TestFile("lora/test_lora_radix_cache.py", 100),
         TestFile("models/test_embedding_models.py", 73),

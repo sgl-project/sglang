@@ -182,6 +182,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--lora-paths` | The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool} | None |
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | 8 |
 | `--max-loaded-loras` | If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`. | None |
+| `--lora-extra-vocab-size` | Maximum size of extra vocabulary that can be present in a LoRA adapter (added to the base model vocabulary). | 0 |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | triton |
 
 ## Kernel backend
