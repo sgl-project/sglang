@@ -345,7 +345,8 @@ class FlashAttentionBackend(AttentionBackend):
             page_size=self.page_size,
             retrive_budget_per_seq=1024,
             device=model_runner.device,
-            async_retrive=True,
+            async_retrive=False,
+            req_to_token=model_runner.req_to_token_pool.req_to_token,
         )
         
         self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)
@@ -954,8 +955,6 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
-        if self.sparse_attn:
-            self.sparse_cache_updater.call_begin_forward_attn_decode(q, forward_batch, metadata, layer)
         
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
