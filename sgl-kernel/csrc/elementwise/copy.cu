@@ -1,3 +1,8 @@
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/all.h>
+#include <vector>
+
 template <int N>
 struct InputArray {
     int values[N];
