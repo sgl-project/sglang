@@ -535,11 +535,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-        v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
+
         if not forward_batch.attn_attend_prefix_cache:
+            q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+            v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
             output = flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
@@ -562,7 +572,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             # replace with trtllm ragged attention once accuracy is resolved.
             output = super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
         return output
 
