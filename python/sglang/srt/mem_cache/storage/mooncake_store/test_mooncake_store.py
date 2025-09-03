@@ -123,15 +123,39 @@ def test_batch_operation(config: HiCacheStorageConfig):
 if __name__ == "__main__":
     test_single_operation()
     test_batch_operation(
-        HiCacheStorageConfig(is_mla_model=False, tp_rank=0, tp_size=1, model_name=None)
+        HiCacheStorageConfig(
+            is_mla_model=False,
+            tp_rank=0,
+            tp_size=1,
+            model_name=None,
+            is_page_first_layout=True,
+        )
     )
     test_batch_operation(
-        HiCacheStorageConfig(is_mla_model=True, tp_rank=0, tp_size=1, model_name=None)
+        HiCacheStorageConfig(
+            is_mla_model=True,
+            tp_rank=0,
+            tp_size=1,
+            model_name=None,
+            is_page_first_layout=True,
+        )
     )
     test_batch_operation(
-        HiCacheStorageConfig(is_mla_model=False, tp_rank=1, tp_size=4, model_name=None)
+        HiCacheStorageConfig(
+            is_mla_model=False,
+            tp_rank=1,
+            tp_size=4,
+            model_name=None,
+            is_page_first_layout=True,
+        )
     )
     test_batch_operation(
-        HiCacheStorageConfig(is_mla_model=True, tp_rank=3, tp_size=8, model_name=None)
+        HiCacheStorageConfig(
+            is_mla_model=True,
+            tp_rank=3,
+            tp_size=8,
+            model_name=None,
+            is_page_first_layout=True,
+        )
     )
     logger.info(f"✅ All tests passed")
