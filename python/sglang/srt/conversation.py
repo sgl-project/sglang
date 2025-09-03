@@ -974,12 +974,6 @@ register_conv_template(
     )
 )
 
-@register_conv_template_matching_function
-def match_points_v15_chat(model_path: str):
-    if re.search(r"points", model_path, re.IGNORECASE):
-        return "points-v15-chat"
-
-
 MODEL_TYPE_TO_TEMPLATE = {
     "internvl_chat": "internvl-2-5",
     "deepseek_vl_v2": "deepseek-vl2",
