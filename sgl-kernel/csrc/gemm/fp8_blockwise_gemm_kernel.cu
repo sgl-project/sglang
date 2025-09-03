@@ -209,31 +209,37 @@ void launch_sm120_fp8_blockwise_scaled_mm(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b) {
-
   using ElementBlockScale = float;
 
   // A matrix configuration
-  using         ElementA    = cutlass::float_e4m3_t;                          // Element type for A matrix operand
-  using         LayoutATag  = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
-  constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
+  using ElementA = cutlass::float_e4m3_t;        // Element type for A matrix operand
+  using LayoutATag = cutlass::layout::RowMajor;  // Layout type for A matrix operand
+  constexpr int AlignmentA =
+      128 / cutlass::sizeof_bits<ElementA>::value;  // Memory access granularity/alignment of A matrix in units of
+                                                    // elements (up to 16 bytes)
 
   // B matrix configuration
-  using         ElementB    = cutlass::float_e4m3_t;                          // Element type for B matrix operand
-  using         LayoutBTag  = cutlass::layout::ColumnMajor;                   // Layout type for B matrix operand
-  constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
+  using ElementB = cutlass::float_e4m3_t;           // Element type for B matrix operand
+  using LayoutBTag = cutlass::layout::ColumnMajor;  // Layout type for B matrix operand
+  constexpr int AlignmentB =
+      128 / cutlass::sizeof_bits<ElementB>::value;  // Memory access granularity/alignment of B matrix in units of
+                                                    // elements (up to 16 bytes)
 
   // C/D matrix configuration
-  using         ElementD    = OutType;                                        // Element type for D matrix operand
-  using         ElementC    = void;                                           // Element type for C matrix operand
-  using         LayoutCTag  = cutlass::layout::RowMajor;                      // Layout type for C matrix operand
-  using         LayoutDTag  = cutlass::layout::RowMajor;                      // Layout type for D matrix operand
-  constexpr int AlignmentD  = 128 / cutlass::sizeof_bits<ElementD>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
-  constexpr int AlignmentC  = AlignmentD;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
+  using ElementD = OutType;                      // Element type for D matrix operand
+  using ElementC = void;                         // Element type for C matrix operand
+  using LayoutCTag = cutlass::layout::RowMajor;  // Layout type for C matrix operand
+  using LayoutDTag = cutlass::layout::RowMajor;  // Layout type for D matrix operand
+  constexpr int AlignmentD =
+      128 / cutlass::sizeof_bits<ElementD>::value;  // Memory access granularity/alignment of C matrix in units of
+                                                    // elements (up to 16 bytes)
+  constexpr int AlignmentC =
+      AlignmentD;  // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
 
   // Kernel functional config
-  using ElementAccumulator  = float;                                          // Element type for internal accumulation
-  using ArchTag             = cutlass::arch::Sm120;                           // Tag indicating the minimum SM that supports the intended feature
-  using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag - changed from OpClassBlockScaledTensorOp
+  using ElementAccumulator = float;      // Element type for internal accumulation
+  using ArchTag = cutlass::arch::Sm120;  // Tag indicating the minimum SM that supports the intended feature
+  using OperatorClass = cutlass::arch::OpClassTensorOp;  // Operator class tag - changed from OpClassBlockScaledTensorOp
 
   static constexpr int ScaleMsPerTile = size<0>(ScalesPerTile{});
   static constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;
@@ -245,33 +251,48 @@ void launch_sm120_fp8_blockwise_scaled_mm(
       ScaleGranularityN,
       ScaleGranularityK,
       cute::UMMA::Major::MN,
-      cute::UMMA::Major::K>;  
+      cute::UMMA::Major::K>;
   // FP8 Block-wise scaling configuration
-  using LayoutSFA   = decltype(ScaleConfig::deduce_layoutSFA());              // Layout type for SFA matrix operand
-  using LayoutSFB   = decltype(ScaleConfig::deduce_layoutSFB());              // Layout type for SFB matrix operand
+  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());  // Layout type for SFA matrix operand
+  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());  // Layout type for SFB matrix operand
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, OperatorClass,
-      PerSmTileShape, ClusterShape,
+      ArchTag,
+      OperatorClass,
+      PerSmTileShape,
+      ClusterShape,
       cutlass::epilogue::collective::EpilogueTileAuto,
-      ElementAccumulator, ElementAccumulator,
-      ElementC, LayoutCTag, AlignmentC,
-      ElementD, LayoutDTag, AlignmentD,
-      cutlass::epilogue::collective::EpilogueScheduleAuto                      // Epilogue schedule policy
-    >::CollectiveOp;
+      ElementAccumulator,
+      ElementAccumulator,
+      ElementC,
+      LayoutCTag,
+      AlignmentC,
+      ElementD,
+      LayoutDTag,
+      AlignmentD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto  // Epilogue schedule policy
+      >::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, OperatorClass,
-      ElementA, cute::tuple<LayoutATag, LayoutSFA>, AlignmentA,
-      ElementB, cute::tuple<LayoutBTag, LayoutSFB>, AlignmentB,
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      cute::tuple<LayoutATag, LayoutSFA>,
+      AlignmentA,
+      ElementB,
+      cute::tuple<LayoutBTag, LayoutSFB>,
+      AlignmentB,
       ElementAccumulator,
-      MmaTileShape, ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      cutlass::gemm::collective::KernelScheduleAuto                             // Kernel schedule policy. Auto defaults to cooperative kernel schedule
-    >::CollectiveOp;
+      MmaTileShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::collective::KernelScheduleAuto  // Kernel schedule policy. Auto defaults to cooperative kernel
+                                                     // schedule
+      >::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int,int,int,int>,                                                   // Indicates ProblemShape
+      Shape<int, int, int, int>,  // Indicates ProblemShape
       CollectiveMainloop,
       CollectiveEpilogue,
       void>;
