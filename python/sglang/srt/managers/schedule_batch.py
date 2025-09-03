@@ -1412,35 +1412,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 reverse=True,
             )
 
-        def get_required_tokens(num_reqs: int):
-            headroom_for_spec_decode = 0
-            if server_args.speculative_algorithm:
-                headroom_for_spec_decode += (
-                    num_reqs
-                    * server_args.speculative_eagle_topk
-                    * server_args.speculative_num_steps
-                    + num_reqs * server_args.speculative_num_draft_tokens
-                )
-            return (
-                num_reqs * global_config.retract_decode_steps + headroom_for_spec_decode
-            )
-
-        def _get_available_size():
-            if self.is_hybrid:
-                return min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                return self.token_to_kv_pool_allocator.available_size()
-
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
-        while (
-            _get_available_size() < get_required_tokens(len(sorted_indices))
-            or first_iter
-        ):
+        while first_iter or (not self.check_decode_mem()):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 if self.is_hybrid:
