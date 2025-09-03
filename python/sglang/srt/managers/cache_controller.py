@@ -210,6 +210,7 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
 
         self.start_time = time.monotonic()
+        self.failed = False
 
         super().__init__(host_indices, token_ids, last_hash)
 
@@ -695,6 +696,7 @@ class HiCacheController:
                 operation.completed_tokens
                 != prev_completed_tokens + len(batch_hashes) * self.page_size
             ):
+                operation.failed = True
                 break  # Some operations fail or operation terminated by controller
         # release pre-allocated memory
         self.append_host_mem_release(

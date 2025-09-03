@@ -450,6 +450,7 @@ class HiRadixCache(RadixCache):
             # unknown prefetch stop policy, just return True
             return True
 
+        operation_fail = operation.failed
         if self.tp_world_size > 1:
             can_terminate = torch.tensor(can_terminate, dtype=torch.int)
             torch.distributed.all_reduce(
@@ -457,8 +458,15 @@ class HiRadixCache(RadixCache):
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
+            operation_fail = torch.tensor(operation.failed, dtype=torch.int)
+            torch.distributed.all_reduce(
+                operation_fail,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_group,
+            )
             can_terminate = bool(can_terminate.item())
-
+            operation_fail = bool(operation_fail.item())
+        can_terminate = can_terminate or operation_fail
         return can_terminate
 
     def check_prefetch_progress(self, req_id: str) -> bool:
@@ -485,7 +493,7 @@ class HiRadixCache(RadixCache):
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
-        if self.tp_world_size > 1 and self.prefetch_stop_policy != "wait_complete":
+        if self.tp_world_size > 1:
             # synchrnoize TP workers to make the same update to hiradix cache
             completed_tokens_tensor = torch.tensor(
                 min_completed_tokens, dtype=torch.int
