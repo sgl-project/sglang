@@ -533,6 +533,9 @@ class Scheduler(
 
         self.recv_dp_balance_id_this_term = []
 
+        # self.cnt1 = 0
+        # self.cnt2 = 0
+
     def init_tokenizer(self):
         server_args = self.server_args
 
@@ -772,9 +775,43 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        # ## profiling 采集配置
+        # import torch_npu
+        # print(f"overlap 11111 self.cnt1: {self.cnt1}")
+        # self.cnt1 += 1
+        # torch_profiler_trace_dir = "/home/l00878165/sglang/data/profiling/stage2/generate_512_1024"
+        # logger.info("Profiling enabled. Traces will be saved to: %s",
+        #             torch_profiler_trace_dir)
+        # experimental_config = torch_npu.profiler._ExperimentalConfig(
+        #         export_type=torch_npu.profiler.ExportType.Text,
+        #         profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        #         msprof_tx=False,
+        #         aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        #         l2_cache=False,
+        #         op_attr=False,
+        #         data_simplification=False,
+        #         record_op_args=False,
+        #         gc_detect_threshold=None,
+        # )
+        # self_profiler = torch_npu.profiler.profile(
+        #         activities=[
+        #             torch_npu.profiler.ProfilerActivity.CPU,
+        #             torch_npu.profiler.ProfilerActivity.NPU,
+        #         ],
+        #         with_stack=False,
+        #         record_shapes=False,
+        #         profile_memory=False,
+        #         with_modules=False,
+        #         schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=18, repeat=1, skip_first=0),
+        #         experimental_config=experimental_config,
+        #         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_profiler_trace_dir))
+        # ## profiling 采集配置
+        # self_profiler.start() ## 采集新增代码
         self.result_queue = deque()
 
         while True:
+            # print(f"overlap 22222222 self.cnt2: {self.cnt2}")
+            # self.cnt2 += 1
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
@@ -811,6 +848,7 @@ class Scheduler(
                 self.self_check_during_idle()
 
             self.last_batch = batch
+            # self_profiler.step() ## 采集新增代码
 
     @DynamicGradMode()
     def event_loop_pp(self):
