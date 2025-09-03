@@ -4,6 +4,7 @@ import sys
 from typing import List, Optional
 
 from sglang_router import Router
+from sglang_router.mini_lb import MiniLoadBalancer
 from sglang_router.router_args import RouterArgs
 
 logger = logging.getLogger("router")
@@ -27,12 +28,14 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         else:
             router_args = args
 
-        router_args._validate_router_args()
-        router_args_dict = vars(router_args)
-        router = Router.from_args_dict(router_args_dict)
-
-        router.start()
-        return router
+        if router_args.mini_lb:
+            mini_lb = MiniLoadBalancer(router_args)
+            mini_lb.start()
+        else:
+            router_args._validate_router_args()
+            router_args_dict = vars(router_args)
+            router = Router.from_args_dict(router_args_dict)
+            router.start()
 
     except Exception as e:
         logger.error(f"Error starting router: {e}")

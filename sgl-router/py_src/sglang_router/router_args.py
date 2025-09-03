@@ -14,6 +14,7 @@ class RouterArgs:
     port: int = 30000
 
     # PD-specific configuration
+    mini_lb: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -148,6 +149,11 @@ class RouterArgs:
         )
 
         # PD-specific arguments
+        parser.add_argument(
+            f"--{prefix}mini-lb",
+            action="store_true",
+            help="Enable MiniLB",
+        )
         parser.add_argument(
             f"--{prefix}pd-disaggregation",
             action="store_true",

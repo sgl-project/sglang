@@ -113,6 +113,9 @@ class Router:
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
 
+        # remoge mini_lb parameter
+        args_dict.pop("mini_lb")
+
         return Router(_Router(**args_dict))
 
     def start(self) -> None:
