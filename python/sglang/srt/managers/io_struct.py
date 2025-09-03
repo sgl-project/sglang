@@ -1081,6 +1081,26 @@ class OpenSessionReqOutput:
 
 
 @dataclass
+class CreateGrammarReqInput:
+    json_schema: Optional[str] = None
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
+    structural_tag: Optional[str] = None
+    grammar_id: Optional[str] = None
+
+
+@dataclass
+class CreateGrammarReqOutput:
+    grammar_id: str
+    success: bool
+
+
+@dataclass
+class DeleteGrammarReqInput:
+    grammar_id: str
+
+
+@dataclass
 class HealthCheckOutput:
     pass
 

@@ -77,6 +77,9 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    CreateGrammarReqInput,
+    CreateGrammarReqOutput,
+    DeleteGrammarReqInput,
     EmbeddingReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -299,6 +302,9 @@ class TokenizerManager:
         # Session
         self.session_futures = {}  # session_id -> asyncio event
 
+        # Grammar
+        self.grammar_futures = {}  # grammar_id -> asyncio event
+
         # Weight updates
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
@@ -400,6 +406,7 @@ class TokenizerManager:
                 ),
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (CreateGrammarReqOutput, self._handle_create_grammar_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -1351,6 +1358,30 @@ class TokenizerManager:
     ):
         await self.send_to_scheduler.send_pyobj(obj)
 
+    async def create_grammar(self, obj: CreateGrammarReqInput, request: Optional[fastapi.Request] = None):
+        self.auto_create_handle_loop()
+
+        if obj.grammar_id is None:
+            obj.grammar_id = uuid.uuid4().hex
+
+        if obj.json_schema is None and obj.regex is None and obj.ebnf is None and obj.structural_tag is None:
+            return None
+
+        if obj.grammar_id in self.grammar_futures:
+            return None
+
+        self.send_to_scheduler.send_pyobj(obj)
+
+        self.grammar_futures[obj.grammar_id] = asyncio.Future()
+        grammar_id = await self.grammar_futures[obj.grammar_id]
+        del self.grammar_futures[obj.grammar_id]
+        return grammar_id
+
+    async def delete_grammar(
+        self, obj: DeleteGrammarReqInput, request: Optional[fastapi.Request] = None
+    ):
+        await self.send_to_scheduler.send_pyobj(obj)
+
     async def get_internal_state(self) -> List[Dict[Any, Any]]:
         req = GetInternalStateReq()
         responses: List[GetInternalStateReqOutput] = (
@@ -1974,6 +2005,11 @@ class TokenizerManager:
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
             recv_obj.session_id if recv_obj.success else None
+        )
+
+    def _handle_create_grammar_req_output(self, recv_obj):
+        self.grammar_futures[recv_obj.grammar_id].set_result(
+            recv_obj.grammar_id if recv_obj.success else None
         )
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
