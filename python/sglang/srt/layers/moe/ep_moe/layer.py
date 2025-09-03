@@ -549,6 +549,7 @@ class DeepEPMoE(EPMoE):
         N = self.w13_weight.size(1)
         scale_block_size = 128
 
+        # TODO also unify other branches (e.g. `EPMoE.forward_deepgemm` sets the field on forward pass)
         w13_weight_fp8 = (
             self.w13_weight,
             (
