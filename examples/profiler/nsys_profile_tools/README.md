@@ -101,22 +101,15 @@ Substages or categories, which consist of attention kernels as the biggest
 category, at 63 seconds, followed by "gemm" kernels. This lets the user
 prioritize the kernels to focus on for performance optimizations.
 
-![Example GPU Trace Visualization](images/html.png)
-
 There's also an appended data table underneath the bar chart for copying out to
  other post-processing tools.
-
-![Example GPU Trace Visualization Table](images/html_tbl.png)
 
 ### Kernel to category mapping with result.csv
 
 Suppose the user would like to focus on improving triton kernels. It's not the
 biggest consumer of cycles at .01 sec but perhaps it hasn't been optimized.
 The next step is to use the result.csv to dive into what the kernels are which
-compose the triton kernel GPU cycles. The following image shows that
-triton_poi_fused_index_lt.. kernel to be the biggest contributor to GPU cycles.
-
-![Example GPU Trace csv](images/csv.png)
+compose the triton kernel GPU cycles. 
 
 ## Example 2: analyze multiple profiles
 
