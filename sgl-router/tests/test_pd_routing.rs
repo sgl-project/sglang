@@ -2,11 +2,11 @@
 mod test_pd_routing {
     use serde_json::json;
     use sglang_router_rs::config::{
-        CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
     };
     use sglang_router_rs::core::{WorkerFactory, WorkerType};
-    use sglang_router_rs::routers::pd_types::get_hostname;
-    use sglang_router_rs::routers::pd_types::PDSelectionPolicy;
+    use sglang_router_rs::routers::http::pd_types::get_hostname;
+    use sglang_router_rs::routers::http::pd_types::PDSelectionPolicy;
     use sglang_router_rs::routers::RouterFactory;
 
     // Test-only struct to help validate PD request parsing
@@ -188,6 +188,9 @@ mod test_pd_routing {
                 health_check: sglang_router_rs::config::HealthCheckConfig::default(),
                 enable_igw: false,
                 rate_limit_tokens_per_second: None,
+                connection_mode: ConnectionMode::Http,
+                model_path: None,
+                tokenizer_path: None,
             };
 
             // Router creation will fail due to health checks, but config should be valid
