@@ -349,6 +349,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    DISABLE_STATE_UPDATE: tl.constexpr,  # whether to disable final state update
+    DISABLE_OUTPUT_CALCULATION: tl.constexpr,  # whether to disable output calculation
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -415,8 +417,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         # [BK, BV]
         b_h += b_k[:, None] * b_v[None, :]
         # [BV]
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+        if not DISABLE_OUTPUT_CALCULATION:
+            b_o = tl.sum(b_h * b_q[:, None], 0)
+            # core attn output
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         p_q += H * K
         p_k += H * K
@@ -426,16 +430,18 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
     # Store final state back to h0_source with bounds checking
-    idx = tl.load(h0_indices + i_n)
-    if idx >= 0:  # Add bounds checking
-        p_h0 = (
-            h0_source
-            + idx * HV * K * V
-            + i_hv * K * V
-            + o_k[:, None] * V
-            + o_v[None, :]
-        )
-        tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
+    # ssm states
+    if not DISABLE_STATE_UPDATE:
+        idx = tl.load(h0_indices + i_n)
+        if idx >= 0:  # Add bounds checking
+            p_h0 = (
+                h0_source
+                + idx * HV * K * V
+                + i_hv * K * V
+                + o_k[:, None] * V
+                + o_v[None, :]
+            )
+            tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
 def fused_recurrent_gated_delta_rule_update_fwd(
@@ -449,6 +455,8 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     initial_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    disable_state_update: bool = False,
+    disable_output_calculation: bool = False,
 ) -> torch.Tensor:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -459,7 +467,11 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     num_stages = 3
     num_warps = 1
 
-    o = q.new_empty(NK, *v.shape)
+    if disable_output_calculation:
+        # When output calculation is disabled, allocate minimal tensor
+        o = q.new_empty(NK, 1, 1, 1, 1)  # minimal allocation
+    else:
+        o = q.new_empty(NK, *v.shape)
 
     grid = (NK, NV, N * HV)
 
@@ -484,6 +496,8 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         BV=BV,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        DISABLE_STATE_UPDATE=disable_state_update,
+        DISABLE_OUTPUT_CALCULATION=disable_output_calculation,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -507,6 +521,8 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         initial_state_indices: torch.Tensor,
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
+        disable_state_update: bool = False,
+        disable_output_calculation: bool = False,
     ):
         o = fused_recurrent_gated_delta_rule_update_fwd(
             q=q,
@@ -519,6 +535,8 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             initial_state_indices=initial_state_indices,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
+            disable_state_update=disable_state_update,
+            disable_output_calculation=disable_output_calculation,
         )
 
         return o
@@ -544,6 +562,8 @@ def fused_recurrent_gated_delta_rule_update(
     initial_state_indices: torch.Tensor = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
+    disable_state_update: bool = False,
+    disable_output_calculation: bool = False,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -576,5 +596,7 @@ def fused_recurrent_gated_delta_rule_update(
         initial_state_indices,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        disable_state_update,
+        disable_output_calculation,
     )
     return o

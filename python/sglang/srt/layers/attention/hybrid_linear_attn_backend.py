@@ -296,7 +296,7 @@ class MambaAttnBackend(AttentionBackend):
         g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
 
         if forward_batch.forward_mode.is_target_verify():
-            last_recurrent_state = ssm_states[cache_indices].clone()  # keep a copy
+            # last_recurrent_state = ssm_states[cache_indices].clone()  # keep a copy
             # since target verify usually use small seq lens (num_draft_tokens)
             # it's faster to use fused_recurrent_gated_delta_rule_update
             core_attn_out = fused_recurrent_gated_delta_rule_update(
@@ -309,6 +309,7 @@ class MambaAttnBackend(AttentionBackend):
                 initial_state_indices=cache_indices,
                 cu_seqlens=query_start_loc,
                 use_qk_l2norm_in_kernel=True,
+                disable_state_update=True,
             )
             query_cache[cache_indices] = query.view((-1,) + query_cache.shape[1:])
             key_cache[cache_indices] = key.view((-1,) + key_cache.shape[1:])
@@ -330,8 +331,7 @@ class MambaAttnBackend(AttentionBackend):
                 use_qk_l2norm_in_kernel=True,
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-
-        ssm_states[cache_indices] = last_recurrent_state
+            ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 
@@ -564,4 +564,5 @@ class HybridLinearAttnBackend(AttentionBackend):
                     initial_state_indices=state_indices_tensor,
                     cu_seqlens=query_start_loc,
                     use_qk_l2norm_in_kernel=True,
+                    disable_output_calculation=True,  # 优化2: 只需要更新状态，不需要计算输出
                 )
