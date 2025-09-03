@@ -6,7 +6,6 @@ from sglang.srt.disaggregation.mini_lb import PrefillConfig, run
 
 @dataclasses.dataclass
 class LBArgs:
-    rust_lb: bool = False
     host: str = "0.0.0.0"
     port: int = 8000
     policy: str = "random"
@@ -17,11 +16,6 @@ class LBArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        parser.add_argument(
-            "--rust-lb",
-            action="store_true",
-            help="Deprecated, please use SGLang Router instead, this argument will have no effect.",
-        )
         parser.add_argument(
             "--host",
             type=str,
@@ -92,7 +86,6 @@ class LBArgs:
         ]
 
         return cls(
-            rust_lb=args.rust_lb,
             host=args.host,
             port=args.port,
             policy=args.policy,
@@ -101,12 +94,6 @@ class LBArgs:
             log_interval=args.log_interval,
             timeout=args.timeout,
         )
-
-    def __post_init__(self):
-        if not self.rust_lb:
-            assert (
-                self.policy == "random"
-            ), "Only random policy is supported for Python load balancer"
 
 
 def main():

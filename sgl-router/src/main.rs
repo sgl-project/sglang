@@ -1,7 +1,7 @@
 use clap::{ArgAction, Parser};
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
+    HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
@@ -70,6 +70,7 @@ Examples:
     --decode http://127.0.0.3:30003 \
     --decode http://127.0.0.4:30004 \
     --prefill-policy cache_aware --decode-policy power_of_two
+
 "#)]
 struct CliArgs {
     /// Host address to bind the router server
@@ -266,9 +267,47 @@ struct CliArgs {
     /// Health check endpoint path
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
+
+    // IGW (Inference Gateway) configuration
+    /// Enable Inference Gateway mode
+    #[arg(long, default_value_t = false)]
+    enable_igw: bool,
+
+    // Tokenizer configuration
+    /// Model path for loading tokenizer (HuggingFace model ID or local path)
+    #[arg(long)]
+    model_path: Option<String>,
+
+    /// Explicit tokenizer path (overrides model_path tokenizer if provided)
+    #[arg(long)]
+    tokenizer_path: Option<String>,
 }
 
 impl CliArgs {
+    /// Determine connection mode from worker URLs
+    fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
+        // Check if any URL is a gRPC endpoint (starts with grpc:// or has port that commonly indicates gRPC)
+        for url in worker_urls {
+            if url.starts_with("grpc://") || url.starts_with("grpcs://") {
+                return ConnectionMode::Grpc;
+            }
+            // Also check for common gRPC ports if the scheme isn't specified
+            if let Ok(parsed_url) = url::Url::parse(url) {
+                if let Some(port) = parsed_url.port() {
+                    // Common gRPC ports
+                    if port == 50051 || port == 9090 || ((50000..=50100).contains(&port)) {
+                        return ConnectionMode::Grpc;
+                    }
+                }
+            } else if url.contains(":50051") || url.contains(":9090") || url.contains(":5000") {
+                // Fallback check for URLs that might not parse correctly
+                return ConnectionMode::Grpc;
+            }
+        }
+        // Default to HTTP
+        ConnectionMode::Http
+    }
+
     /// Parse selector strings into HashMap
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
         let mut map = HashMap::new();
@@ -307,7 +346,12 @@ impl CliArgs {
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         // Determine routing mode
-        let mode = if self.pd_disaggregation {
+        let mode = if self.enable_igw {
+            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            }
+        } else if self.pd_disaggregation {
             let decode_urls = self.decode.clone();
 
             // Validate PD configuration if not using service discovery
@@ -361,10 +405,30 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
+        // Determine connection mode from all worker URLs
+        let mut all_urls = Vec::new();
+        match &mode {
+            RoutingMode::Regular { worker_urls } => {
+                all_urls.extend(worker_urls.clone());
+            }
+            RoutingMode::PrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } => {
+                for (url, _) in prefill_urls {
+                    all_urls.push(url.clone());
+                }
+                all_urls.extend(decode_urls.clone());
+            }
+        }
+        let connection_mode = Self::determine_connection_mode(&all_urls);
+
         // Build RouterConfig
         Ok(RouterConfig {
             mode,
             policy,
+            connection_mode,
             host: self.host.clone(),
             port: self.port,
             max_payload_size: self.max_payload_size,
@@ -383,6 +447,8 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             max_concurrent_requests: self.max_concurrent_requests,
+            queue_size: 100,        // Default queue size
+            queue_timeout_secs: 60, // Default timeout
             cors_allowed_origins: self.cors_allowed_origins.clone(),
             retry: RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -406,6 +472,10 @@ impl CliArgs {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
             },
+            enable_igw: self.enable_igw,
+            rate_limit_tokens_per_second: None,
+            model_path: self.model_path.clone(),
+            tokenizer_path: self.tokenizer_path.clone(),
         })
     }
 
@@ -487,17 +557,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Host: {}:{}", cli_args.host, cli_args.port);
     println!(
         "Mode: {}",
-        if cli_args.pd_disaggregation {
+        if cli_args.enable_igw {
+            "IGW (Inference Gateway)"
+        } else if cli_args.pd_disaggregation {
             "PD Disaggregated"
         } else {
             "Regular"
         }
     );
-    println!("Policy: {}", cli_args.policy);
 
-    if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
-        println!("Prefill nodes: {:?}", prefill_urls);
-        println!("Decode nodes: {:?}", cli_args.decode);
+    if !cli_args.enable_igw {
+        println!("Policy: {}", cli_args.policy);
+
+        if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
+            println!("Prefill nodes: {:?}", prefill_urls);
+            println!("Decode nodes: {:?}", cli_args.decode);
+        }
     }
 
     // Convert to RouterConfig

@@ -23,8 +23,10 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import random
 import signal
 import threading
+import time
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
@@ -58,6 +60,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -536,6 +539,22 @@ class Engine(EngineBase):
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
 
+    def freeze_gc(self):
+        """
+        To maintain a high performance server with low latency, we want to reduce the
+        stalls caused by the garbage collector scanning through a large number of objects.
+
+        It is usually helpful to start the server and warm it up with real requests to
+        initialize many of the long-lived objects that do not need to be garbage collected.
+
+        After sufficient warmup, we can call this function to freeze the garbage collector
+        so that all objects created before this point are considered out of scope for garbage
+        collection.
+        """
+
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.freeze_gc())
+
     """
     Execute an RPC call on all scheduler processes.
     """
@@ -638,6 +657,11 @@ def _set_envs_and_config(server_args: ServerArgs):
     # flashinfer uses this environment variable for various kernels from MoE to quant kernels
     os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
+    # Can also be passed as argument
+    os.environ["SGLANG_RUN_ID"] = (
+        f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
+    )
+
     # Set prometheus env vars
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()
@@ -649,7 +673,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.11.post3",
+            "0.3.0",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -657,7 +681,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.5",
+            "0.3.8",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -791,18 +815,24 @@ def _launch_subprocesses(
         ),
     )
     detoken_proc.start()
+    if server_args.tokenizer_worker_num > 1:
+        # Launch multi-tokenizer router
+        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
 
-    # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+        # Initialize templates
+        template_manager = None
+    else:
+        # Launch tokenizer process
+        tokenizer_manager = TokenizerManager(server_args, port_args)
 
-    # Initialize templates
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
-    )
+        # Initialize templates
+        template_manager = TemplateManager()
+        template_manager.initialize_templates(
+            tokenizer_manager=tokenizer_manager,
+            model_path=server_args.model_path,
+            chat_template=server_args.chat_template,
+            completion_template=server_args.completion_template,
+        )
 
     # Wait for the model to finish loading
     scheduler_infos = []

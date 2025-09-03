@@ -517,6 +517,39 @@ class ModelOptFp4Config(QuantizationConfig):
     def get_config_filenames(cls) -> List[str]:
         return ["hf_quant_config.json"]
 
+    @staticmethod
+    def common_group_size(cfg: dict) -> int:
+        """Return the unique group_size across the config; raise if missing/mismatched."""
+        sizes = set()
+
+        # Top-level and 'quantization' block
+        v = cfg.get("group_size")
+        if isinstance(v, int):
+            sizes.add(v)
+        q = cfg.get("quantization")
+        if isinstance(q, dict):
+            v = q.get("group_size")
+            if isinstance(v, int):
+                sizes.add(v)
+
+        # config_groups: accept group-level or nested dicts (e.g., weights/input_activations)
+        for g in (cfg.get("config_groups") or {}).values():
+            if isinstance(g, dict):
+                v = g.get("group_size")
+                if isinstance(v, int):
+                    sizes.add(v)
+                for sub in g.values():
+                    if isinstance(sub, dict):
+                        v = sub.get("group_size")
+                        if isinstance(v, int):
+                            sizes.add(v)
+
+        if not sizes:
+            raise ValueError("No group_size found in config.")
+        if len(sizes) > 1:
+            raise ValueError(f"Inconsistent group_size values: {sorted(sizes)}")
+        return next(iter(sizes))
+
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> ModelOptFp4Config:
         # Handle two different config formats:
@@ -549,7 +582,7 @@ class ModelOptFp4Config(QuantizationConfig):
                 else:
                     kv_cache_quant_algo = "auto"
 
-            group_size = config.get("group_size")
+            group_size = ModelOptFp4Config.common_group_size(config)
             exclude_modules = config.get("ignore", [])
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
@@ -559,7 +592,7 @@ class ModelOptFp4Config(QuantizationConfig):
                 kv_cache_quant_algo = quant_config.get("kv_cache_quant_algo")
                 if not kv_cache_quant_algo:
                     kv_cache_quant_algo = "auto"
-                group_size = quant_config.get("group_size")
+                group_size = ModelOptFp4Config.common_group_size(config)
                 exclude_modules = quant_config.get("exclude_modules", [])
             except (ValueError, KeyError):
                 raise ValueError(
@@ -598,6 +631,13 @@ class ModelOptFp4Config(QuantizationConfig):
         for pattern in exclude_modules:
             regex_str = pattern.replace(".", r"\.").replace("*", r".*")
             if re.fullmatch(regex_str, prefix):
+                return True
+
+            # Check if the last part of the excluded pattern is contained in the last part of the prefix
+            # This handles fused modules like fused_qkv_a_proj_with_mqa that contain q_a_proj and kv_a_proj_with_mqa
+            pattern_last_part = pattern.split(".")[-1]
+            prefix_last_part = prefix.split(".")[-1]
+            if pattern_last_part in prefix_last_part:
                 return True
         return False
 
@@ -876,7 +916,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             data=torch.empty(
                 layer.num_local_experts,
                 2 * intermediate_size_per_partition,
-                # 2 fp4 items are packed in the input dimension
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
             ),
@@ -895,7 +934,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             data=torch.empty(
                 layer.num_local_experts,
                 hidden_size,
-                # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
             ),
@@ -1212,11 +1250,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w13 weights
             w13_blockscale_swizzled = self.swizzle_blockscale(layer.w13_weight_scale)
+            del layer.w13_weight_scale
             layer.w13_blockscale_swizzled.data.copy_(w13_blockscale_swizzled)
             layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
 
             # Process w2 weights
             w2_blockscale_swizzled = self.swizzle_blockscale(layer.w2_weight_scale)
+            del layer.w2_weight_scale
             layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
             layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
@@ -1305,8 +1345,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
-            if moe_runner_config.routed_scaling_factor is not None:
-                output *= moe_runner_config.routed_scaling_factor
+            # Scale by routed_scaling_factor is fused into select_experts.
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 output, global_output = get_local_dp_buffer(), output
                 get_tp_group().reduce_scatterv(
@@ -1332,6 +1371,5 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             params=layer.cutlass_moe_params,
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
         ).to(x.dtype)
-        if moe_runner_config.routed_scaling_factor is not None:
-            output *= moe_runner_config.routed_scaling_factor
+        # Scale by routed_scaling_factor is fused into select_experts.
         return output

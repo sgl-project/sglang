@@ -7,11 +7,11 @@ import signal
 import threading
 from abc import ABC, abstractmethod
 from functools import wraps
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
 
 logger = logging.getLogger(__name__)
@@ -113,6 +113,8 @@ def synchronized():
 
 
 class HiCacheHF3FS(HiCacheStorage):
+    """HiCache backend that stores KV cache pages in HF3FS files."""
+
     default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
 
     def __init__(
@@ -125,6 +127,8 @@ class HiCacheHF3FS(HiCacheStorage):
         entries: int,
         dtype: torch.dtype,
         metadata_client: Hf3fsMetadataInterface,
+        is_mla_model: bool = False,
+        is_page_first_layout: bool = False,
     ):
         self.rank = rank
         self.file_path = file_path
@@ -134,9 +138,14 @@ class HiCacheHF3FS(HiCacheStorage):
         self.entries = entries
         self.dtype = dtype
         self.metadata_client = metadata_client
-
+        self.is_mla_model = is_mla_model
+        self.is_page_first_layout = is_page_first_layout
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
+        self.skip_backup = False
+        if self.is_mla_model and self.rank != 0:
+            self.skip_backup = True
+            self.rank = 0
 
         logger.info(
             f"[Rank {self.rank}] HiCacheHF3FS Client Initializing: "
@@ -167,15 +176,40 @@ class HiCacheHF3FS(HiCacheStorage):
 
     @staticmethod
     def from_env_config(
-        rank: int, bytes_per_page: int, dtype: torch.dtype
+        bytes_per_page: int,
+        dtype: torch.dtype,
+        storage_config: HiCacheStorageConfig = None,
     ) -> "HiCacheHF3FS":
+        """Create a HiCacheHF3FS instance from environment configuration.
+
+        Environment:
+            - Uses env var stored in `HiCacheHF3FS.default_env_var` to locate a JSON config.
+            - Falls back to a local single-machine config when the env var is not set.
+
+        Raises:
+            ValueError: If MLA Model is requested without global metadata server or required keys are missing.
+        """
         from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
             Hf3fsGlobalMetadataClient,
             Hf3fsLocalMetadataClient,
         )
 
+        if storage_config is not None:
+            rank, is_mla_model, is_page_first_layout = (
+                storage_config.tp_rank,
+                storage_config.is_mla_model,
+                storage_config.is_page_first_layout,
+            )
+        else:
+            rank, is_mla_model, is_page_first_layout = 0, False, False
+
+        mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
+
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
+            if is_mla_model:
+                raise ValueError(mla_unsupported_msg)
+
             return HiCacheHF3FS(
                 rank=rank,
                 file_path=f"/data/hicache.{rank}.bin",
@@ -185,6 +219,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 entries=8,
                 dtype=dtype,
                 metadata_client=Hf3fsLocalMetadataClient(),
+                is_page_first_layout=is_page_first_layout,
             )
 
         try:
@@ -205,38 +240,55 @@ class HiCacheHF3FS(HiCacheStorage):
             raise ValueError(f"Missing required keys in config: {missing_keys}")
 
         # Choose metadata client based on configuration
-        if "metadata_server_url" in config and config["metadata_server_url"]:
+        if config.get("metadata_server_url"):
             # Use global metadata client to connect to metadata server
             metadata_server_url = config["metadata_server_url"]
             metadata_client = Hf3fsGlobalMetadataClient(metadata_server_url)
+
             logger.info(
                 f"Using global metadata client with server url: {metadata_server_url}"
             )
         else:
+            # Enable MLA optimization only when using the global metadata client
+            if is_mla_model:
+                raise ValueError(mla_unsupported_msg)
+
             # Use local metadata client for single-machine deployment
             metadata_client = Hf3fsLocalMetadataClient()
 
+        rank_for_path = 0 if is_mla_model else rank
         return HiCacheHF3FS(
             rank=rank,
-            file_path=f"{config['file_path_prefix']}.{rank}.bin",
+            # Let all ranks use the same file path for MLA model
+            file_path=f"{config['file_path_prefix']}.{rank_for_path}.bin",
             file_size=int(config["file_size"]),
             numjobs=int(config["numjobs"]),
             bytes_per_page=bytes_per_page,
             entries=int(config["entries"]),
             dtype=dtype,
             metadata_client=metadata_client,
+            is_mla_model=is_mla_model,
+            is_page_first_layout=is_page_first_layout,
         )
 
     def get(
-        self, key: str, target_location: Optional[torch.Tensor] = None
+        self,
+        key: str,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
-        return self.batch_get([key], [target_location] if target_location else None)[0]
+        return self.batch_get(
+            [key],
+            [target_location] if target_location is not None else None,
+            [target_sizes] if target_sizes is not None else None,
+        )[0]
 
     @synchronized()
     def batch_get(
         self,
         keys: List[str],
-        target_locations: Optional[List[torch.Tensor]] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
         page_indices = self.metadata_client.get_page_indices(self.rank, keys)
 
@@ -246,9 +298,15 @@ class HiCacheHF3FS(HiCacheStorage):
                 batch_indices.append(i)
                 file_offsets.append(page_index * self.bytes_per_page)
 
-        file_results = [
-            torch.empty(self.numel, dtype=self.dtype) for _ in range(len(batch_indices))
-        ]
+        if target_locations is not None:
+            for target_location in target_locations:
+                assert target_location.is_contiguous()
+            file_results = target_locations
+        else:
+            file_results = [
+                torch.empty(self.numel, dtype=self.dtype)
+                for _ in range(len(batch_indices))
+            ]
 
         futures = [
             self.executor.submit(
@@ -273,10 +331,31 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return results
 
-    def set(self, key: str, value: torch.Tensor) -> bool:
-        return self.batch_set([key], [value])
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        return self.batch_set(
+            [key],
+            [value] if value is not None else None,
+            [target_location] if target_location is not None else None,
+            [target_sizes] if target_sizes is not None else None,
+        )
 
-    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        # In MLA backend, only one rank needs to backup the KV cache
+        if self.skip_backup:
+            return True
+
         # Todo: Add prefix block's hash key
         key_with_prefix = [(key, "") for key in keys]
         indices = self.metadata_client.reserve_and_allocate_page_indices(
@@ -292,7 +371,8 @@ class HiCacheHF3FS(HiCacheStorage):
 
             batch_indices.append(i)
             file_offsets.append(page_index * self.bytes_per_page)
-            file_values.append(value.contiguous())
+            assert value.is_contiguous()
+            file_values.append(value)
 
         futures = [
             self.executor.submit(
@@ -327,18 +407,39 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return all(results)
 
-    @synchronized()
     def delete(self, key: str) -> None:
         self.metadata_client.delete_keys(self.rank, [key])
 
-    @synchronized()
     def exists(self, key: str) -> bool:
         result = self.metadata_client.exists(self.rank, [key])
         return result[0] if result else False
 
-    @synchronized()
-    def clear(self) -> None:
-        self.metadata_client.clear(self.rank)
+    def batch_exists(self, keys: List[str]) -> int:
+        if self.is_page_first_layout and not self.is_mla_model:
+            query_keys = []
+            # Compatible with page_first layout's key format, Refer to memory_pool_host.py#get_buffer_with_hash
+            for key in keys:
+                query_keys.append(f"{key}-k")
+                query_keys.append(f"{key}-v")
+            key_multiplier = 2
+        else:
+            query_keys = keys
+            key_multiplier = 1
+
+        exist_result = self.metadata_client.exists(self.rank, query_keys)
+        for i in range(len(query_keys)):
+            if not exist_result[i]:
+                return i // key_multiplier
+        return len(query_keys) // key_multiplier
+
+    def clear(self) -> bool:
+        try:
+            self.metadata_client.clear(self.rank)
+            logger.info(f"Cleared HiCacheHF3FS for rank {self.rank}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear HiCacheHF3FS: {e}")
+            return False
 
     def close(self) -> None:
         try:

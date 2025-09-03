@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::reasoning_parser::parsers::{
-    BaseReasoningParser, DeepSeekR1Parser, KimiParser, Qwen3Parser, QwenThinkingParser,
+    BaseReasoningParser, DeepSeekR1Parser, Glm45Parser, KimiParser, Qwen3Parser,
+    QwenThinkingParser, Step3Parser,
 };
 use crate::reasoning_parser::traits::{ParseError, ParserConfig, ReasoningParser};
 
@@ -153,15 +154,21 @@ impl ParserFactory {
         // Register Kimi parser with Unicode tokens (starts with in_reasoning=false)
         registry.register_parser("kimi", || Box::new(KimiParser::new()));
 
+        // Register GLM45 parser (same format as Qwen3 but separate for debugging)
+        registry.register_parser("glm45", || Box::new(Glm45Parser::new()));
+
+        // Register Step3 parser (same format as DeepSeek-R1 but separate for debugging)
+        registry.register_parser("step3", || Box::new(Step3Parser::new()));
+
         // Register model patterns
         registry.register_pattern("deepseek-r1", "deepseek_r1");
         registry.register_pattern("qwen3-thinking", "qwen3_thinking");
         registry.register_pattern("qwen-thinking", "qwen3_thinking");
         registry.register_pattern("qwen3", "qwen3");
         registry.register_pattern("qwen", "qwen3");
-        registry.register_pattern("glm45", "qwen3"); // GLM45 uses same format as Qwen3
+        registry.register_pattern("glm45", "glm45");
         registry.register_pattern("kimi", "kimi");
-        registry.register_pattern("step3", "deepseek_r1"); // Step3 alias for DeepSeek-R1
+        registry.register_pattern("step3", "step3");
 
         Self { registry }
     }
@@ -281,13 +288,17 @@ mod tests {
     }
 
     #[test]
-    fn test_alias_models() {
+    fn test_step3_model() {
         let factory = ParserFactory::new();
         let step3 = factory.create("step3-model").unwrap();
-        let glm45 = factory.create("glm45-v2").unwrap();
+        assert_eq!(step3.model_type(), "step3");
+    }
 
-        assert_eq!(step3.model_type(), "deepseek_r1");
-        assert_eq!(glm45.model_type(), "qwen3");
+    #[test]
+    fn test_glm45_model() {
+        let factory = ParserFactory::new();
+        let glm45 = factory.create("glm45-v2").unwrap();
+        assert_eq!(glm45.model_type(), "glm45");
     }
 
     #[test]
