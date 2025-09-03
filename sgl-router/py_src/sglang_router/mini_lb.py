@@ -4,6 +4,7 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 
 import asyncio
 import dataclasses
+import ipaddress
 import logging
 import random
 import urllib
@@ -17,12 +18,17 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.srt.disaggregation.utils import PDRegistryRequest
-from sglang.srt.utils import maybe_wrap_ipv6_address
-
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
 )  # 64KB, to prevent aiohttp's "Chunk too big" error
+
+
+def maybe_wrap_ipv6_address(address: str) -> str:
+    try:
+        ipaddress.IPv6Address(address)
+        return f"[{address}]"
+    except ValueError:
+        return address
 
 
 def setup_logger():
@@ -404,32 +410,6 @@ async def get_models():
             return ORJSONResponse(content=await response.json())
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/register")
-async def register(obj: PDRegistryRequest):
-    if obj.mode == "prefill":
-        load_balancer.add_prefill_server(
-            PrefillConfig(obj.registry_url, obj.bootstrap_port)
-        )
-        logger.info(
-            f"Registered prefill server: {obj.registry_url} with bootstrap port: {obj.bootstrap_port}"
-        )
-    elif obj.mode == "decode":
-        load_balancer.add_decode_server(obj.registry_url)
-        logger.info(f"Registered decode server: {obj.registry_url}")
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid mode. Must be either PREFILL or DECODE.",
-        )
-
-    logger.info(
-        f"#Prefill servers: {len(load_balancer.prefill_configs)}, "
-        f"#Decode servers: {len(load_balancer.decode_servers)}"
-    )
-
-    return Response(status_code=200)
 
 
 def run(prefill_configs, decode_addrs, host, port, timeout):
