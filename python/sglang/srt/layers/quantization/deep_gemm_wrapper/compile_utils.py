@@ -44,6 +44,13 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
 
+    # Update UE8M0 scaling configuration based on server args
+    from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
+        update_deepgemm_scale_ue8m0,
+    )
+
+    update_deepgemm_scale_ue8m0(server_args.disable_deepgemm_ue8m0)
+
     # Generate m_max
     m_max = 1024 * 16
     if server_args.chunked_prefill_size < 1:
