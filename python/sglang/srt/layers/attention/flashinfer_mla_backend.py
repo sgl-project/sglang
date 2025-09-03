@@ -954,7 +954,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] use_ragged is False", flush=True)
             page_size = self.page_size
             if spec_info is not None:
-                kv_lens = kv_indptr[1:] - kv_indptr[:-1]
+                kv_lens = ((kv_indptr[1:] - kv_indptr[:-1]) * self.page_size).to(torch.int32)
             else:
                 kv_lens = paged_kernel_lens.to(torch.int32)
             if print_cond:
