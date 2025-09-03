@@ -3,20 +3,20 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
-import dataclasses
 import ipaddress
 import logging
 import random
 import urllib
 from http import HTTPStatus
 from itertools import chain
-from typing import List, Optional
+from typing import Optional
 
 import aiohttp
 import orjson
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from sglang_router.router_args import RouterArgs
 
 logger = logging.getLogger(__name__)
 
@@ -33,32 +33,27 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return address
 
 
-@dataclasses.dataclass
-class PrefillConfig:
-    url: str
-    bootstrap_port: Optional[int] = None
-
-
 class MiniLoadBalancer:
     def __init__(
         self,
-        prefill_configs: List[PrefillConfig],
-        decode_servers: List[str],
-        timeout: int,
+        router_args: RouterArgs,
     ):
-        self.prefill_configs = prefill_configs
-        self.prefill_servers = [p.url for p in prefill_configs]
-        self.decode_servers = decode_servers
-        self.timeout = timeout
+        self.host = router_args.host
+        self.port = router_args.port
+        self.timeout = router_args.request_timeout_secs
+        self.prefill_urls = router_args.prefill_urls  # (url, bootstrap_port)
+        self.decode_urls = router_args.decode_urls  # urls
+
+    def start(self):
+        uvicorn.run(app, host=self.host, port=self.port)
 
     def select_pair(self):
-        # TODO: return some message instead of panic
-        assert len(self.prefill_configs) > 0, "No prefill servers available"
-        assert len(self.decode_servers) > 0, "No decode servers available"
+        assert len(self.prefill_urls) > 0, "No prefill servers available"
+        assert len(self.decode_urls) > 0, "No decode servers available"
 
-        prefill_config = random.choice(self.prefill_configs)
-        decode_server = random.choice(self.decode_servers)
-        return prefill_config.url, prefill_config.bootstrap_port, decode_server
+        prefill = random.choice(self.prefill_urls)
+        decode = random.choice(self.decode_urls)
+        return prefill[0], prefill[1], decode
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
@@ -386,16 +381,3 @@ async def get_models():
             return ORJSONResponse(content=await response.json())
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-
-
-def run(prefill_configs, decode_addrs, host, port, timeout):
-    global load_balancer
-    load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs, timeout=timeout)
-    uvicorn.run(app, host=host, port=port)
-
-
-if __name__ == "__main__":
-    # FIXME: remove this, use the unified entry point: sglang.srt.disaggregation.launch_lb
-    from sglang.srt.disaggregation.launch_lb import main
-
-    main()
