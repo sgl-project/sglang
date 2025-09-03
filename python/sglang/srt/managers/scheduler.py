@@ -2615,9 +2615,8 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
-    node = {0: 0, 1: 0, 2: 1, 3: 1}[gpu_id]
-    print(f"hack: bind_to_node {gpu_id=} {node=}")
-    numa_bind_to_node(node)
+    if (numa_node := server_args.numa_node) is not None:
+        numa_bind_to_node(numa_node[gpu_id])
 
     # Generate the prefix
     prefix = ""
