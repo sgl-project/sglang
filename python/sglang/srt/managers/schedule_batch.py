@@ -1372,21 +1372,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
-    def new_page_count_next_decode(self):
+    def new_page_count_next_decode(self, selected_reqs: Optional[List[int]] = None):
         page_size = self.token_to_kv_pool_allocator.page_size
+        requests = self.reqs if selected_reqs is None else selected_reqs
         if page_size == 1:
-            return len(self.reqs)
+            return len(requests)
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
         return (
-            sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+            sum(1 for req in requests if req.seqlen % page_size == 0)
             if self.enable_overlap
-            else sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+            else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
         )
 
-    def check_decode_mem(self, buf_multiplier=1):
+    def check_decode_mem(
+        self, buf_multiplier=1, selected_reqs: Optional[List[int]] = None
+    ):
         num_tokens = (
-            self.new_page_count_next_decode()
+            self.new_page_count_next_decode(selected_reqs)
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
@@ -1415,7 +1418,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
-        while first_iter or (not self.check_decode_mem()):
+        while first_iter or (not self.check_decode_mem(sorted_indices)):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 if self.is_hybrid:
