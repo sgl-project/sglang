@@ -186,7 +186,7 @@ class HybridAttnBackend(AttentionBackend):
         # Check if this is a speculative decoding operation that should use decode backend
         if (forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend()) and \
            self.model_runner.server_args.speculative_attention_backend == "decode":
-            return self.decode_backend.forward_decode(
+            return self.decode_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
         else:
