@@ -1293,6 +1293,7 @@ def moe_ep_deepgemm_preprocess(
     start_expert_id,
     end_expert_id,
     block_shape,
+    scale_ue8m0: bool,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
 ):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
@@ -1330,7 +1331,7 @@ def moe_ep_deepgemm_preprocess(
         block_shape = [128, 128]
     assert len(block_shape) == 2
     block_n, block_k = block_shape[0], block_shape[1]
-    hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+    hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k, scale_ue8m0=scale_ue8m0)
 
     gateup_input_scale = torch.empty(
         (gateup_input.size(0), gateup_input.size(1), scale.size(1)),

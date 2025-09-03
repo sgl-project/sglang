@@ -212,6 +212,7 @@ class EPMoE(FusedMoE):
                 self.start_expert_id,
                 self.end_expert_id,
                 self.block_shape,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
         )
 
