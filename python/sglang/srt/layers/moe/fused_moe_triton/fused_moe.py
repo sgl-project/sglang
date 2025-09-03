@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
+import triton
 import triton.language as tl
 from sgl_kernel import machete_mm
 from sgl_kernel.scalar_type import ScalarType, scalar_types
