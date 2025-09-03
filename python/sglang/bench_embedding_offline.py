@@ -164,7 +164,7 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def truncate_prompts(prompts, model_path):
+def truncate_prompts(prompts: List[str], model_path: str):
     config = AutoConfig.from_pretrained(model_path)
     max_length = getattr(config, "max_position_embeddings", 2048)
 
@@ -184,6 +184,7 @@ def truncate_prompts(prompts, model_path):
 def throughput_test_once(
     backend: Engine,
     reqs: List[DatasetRow],
+    model_path: str,
     profile: bool,
 ):
     measurement_results = {
@@ -191,15 +192,14 @@ def throughput_test_once(
         "successful_requests": len(reqs),
         "total_latency": -1,
         "total_input_tokens": sum(r.prompt_len for r in reqs),
-        "total_output_tokens": -1,
+        "average_e2e_latency": -1,
         "request_throughput": -1,
         "input_throughput": -1,
-        "output_throughput": -1,
-        "total_throughput": -1,
     }
 
-    prompt = [truncate_prompts(r.prompt) for r in reqs]
-    image_data = [r.image_data for r in reqs]
+    prompts = [r.prompt for r in reqs]
+    prompts = truncate_prompts(prompts, model_path)
+    image_data = [r.image_data for r in reqs] if reqs[0].image_data is not None else None
 
     if profile:
         assert "SGLANG_TORCH_PROFILER_DIR" in os.environ, "Please set SGLANG_TORCH_PROFILER_DIR."
@@ -207,7 +207,7 @@ def throughput_test_once(
         backend.start_profile()
 
     st = time.perf_counter()
-    gen_out = backend.encode(prompt=prompt, image_data=image_data)
+    gen_out = backend.encode(prompt=prompts, image_data=image_data)
     latency = time.perf_counter() - st
 
     if profile:
@@ -219,13 +219,9 @@ def throughput_test_once(
     server_info = backend.get_server_info()
 
     measurement_results["total_latency"] = latency
-    measurement_results["total_output_tokens"] = sum(o["meta_info"]["completion_tokens"] for o in gen_out)
+    measurement_results["average_e2e_latency"] = sum(o["meta_info"]["e2e_latency"] for o in gen_out) / len(gen_out)
     measurement_results["request_throughput"] = measurement_results["successful_requests"] / latency
     measurement_results["input_throughput"] = measurement_results["total_input_tokens"] / latency
-    measurement_results["output_throughput"] = measurement_results["total_output_tokens"] / latency
-    measurement_results["total_throughput"] = (
-        measurement_results["total_input_tokens"] + measurement_results["total_output_tokens"]
-    ) / latency
 
     if inspect.isawaitable(server_info):
         server_info = asyncio.run(server_info)
@@ -301,6 +297,7 @@ def throughput_test(
         throughput_test_once(
             backend=backend,
             reqs=warmup_requests,
+            model_path=server_args.model_path,
             profile=False,
         )
         time.sleep(0.5)
@@ -309,6 +306,7 @@ def throughput_test(
     result = throughput_test_once(
         backend=backend,
         reqs=input_requests,
+        model_path=server_args.model_path,
         profile=bench_args.profile,
     )
     backend.shutdown()
@@ -322,12 +320,10 @@ def throughput_test(
     print("{:<40} {:<10}".format("Successful requests:", result["successful_requests"]))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", result["total_latency"]))
     print("{:<40} {:<10}".format("Total input tokens:", result["total_input_tokens"]))
-    print("{:<40} {:<10}".format("Total generated tokens:", result["total_output_tokens"]))
+    print("{:<40} {:<10.2f}".format("Average e2e latency (s):", result["average_e2e_latency"]))
     print("{:<40} {:<10.2f}".format("Last generation throughput (tok/s):", result["last_gen_throughput"]))
     print("{:<40} {:<10.2f}".format("Request throughput (req/s):", result["request_throughput"]))
     print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", result["input_throughput"]))
-    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", result["output_throughput"]))
-    print("{:<40} {:<10.2f}".format("Total token throughput (tok/s):", result["total_throughput"]))
     print("=" * 50)
 
     return result
