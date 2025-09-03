@@ -324,24 +324,18 @@ class HiCacheController:
                     group_ranks, backend="gloo"
                 )
 
-            # Select the get function
+            # Select the get and set functions
             self.get_func = self._generic_page_get
+            self.backup_set_func = self._generic_page_set
+            self.is_3fs_zerocopy = (
+                self.storage_backend_type == "hf3fs"
+                and self.mem_pool_host.layout == "page_first"
+            )
             if self.storage_backend_type == "mooncake":
                 self.get_func = self._mooncake_page_get
-            elif (
-                self.storage_backend_type == "hf3fs"
-                and self.mem_pool_host.layout == "page_first"
-            ):
-                self.get_func = self._3fs_zero_copy_page_get
-
-            # Select the set function and batch size
-            self.backup_set_func = self._generic_page_set
-            if self.storage_backend_type == "mooncake":
                 self.backup_set_func = self._mooncake_page_set
-            elif (
-                self.storage_backend_type == "hf3fs"
-                and self.mem_pool_host.layout == "page_first"
-            ):
+            elif self.is_3fs_zerocopy:
+                self.get_func = self._3fs_zero_copy_page_get
                 self.backup_set_func = self._3fs_zero_copy_page_set
 
         self.load_cache_event = load_cache_event
@@ -756,10 +750,7 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            if (
-                self.storage_backend_type == "hf3fs"
-                and self.mem_pool_host.layout == "page_first"
-            ):
+            if self.is_3fs_zerocopy:
                 _batch_hashes, _, factor = self.mem_pool_host.get_buffer_with_hash(
                     batch_hashes
                 )

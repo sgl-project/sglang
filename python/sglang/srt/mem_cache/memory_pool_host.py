@@ -512,7 +512,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             key_list.append(f"{key}-k")
             key_list.append(f"{key}-v")
             if indices is not None:
-                index = i * self.page_size
+                index = indices[i * self.page_size]
                 buf_list.append(self.k_buffer[index : index + self.page_size])
                 buf_list.append(self.v_buffer[index : index + self.page_size])
 
@@ -739,7 +739,7 @@ class MLATokenToKVPoolHost(HostKVCache):
 
         if indices is not None:
             for i in range(len(keys)):
-                index = i * self.page_size
+                index = indices[i * self.page_size]
                 buf_list.append(self.kv_buffer[index : index + self.page_size])
 
         return keys, buf_list, 1
