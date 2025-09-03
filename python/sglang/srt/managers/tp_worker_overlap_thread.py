@@ -25,6 +25,7 @@ import psutil
 import torch
 
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
@@ -265,6 +266,10 @@ class TpModelWorkerClient:
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         success, message = self.worker.init_weights_update_group(recv_req)
+        return success, message
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        success, message = self.worker.destroy_weights_update_group(recv_req)
         return success, message
 
     def update_weights_from_distributed(
