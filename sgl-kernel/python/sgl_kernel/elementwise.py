@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import List, Optional
 
 import torch
 from sgl_kernel.utils import get_cuda_stream, is_arch_support_pdl

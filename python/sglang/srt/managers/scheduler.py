@@ -158,13 +158,14 @@ from sglang.srt.utils import (
     get_zmq_socket,
     is_cpu,
     kill_itself_when_parent_died,
+    numa_bind_to_node,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
     set_random_seed,
-    suppress_other_loggers, numa_bind_to_node,
+    suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 

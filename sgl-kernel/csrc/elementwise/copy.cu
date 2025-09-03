@@ -1,19 +1,20 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
+
 #include <vector>
 
 template <int N>
 struct InputArray {
-    int values[N];
+  int values[N];
 };
 
 template <int N>
 __global__ void copy_to_gpu_no_ce_kernel(const InputArray<N> input_array, int* output) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < N) {
-        output[idx] = input_array.values[idx];
-    }
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if (idx < N) {
+    output[idx] = input_array.values[idx];
+  }
 }
 
 template <int N>
@@ -34,7 +35,8 @@ void copy_to_gpu_no_ce_impl(const at::Tensor& input, at::Tensor& output) {
   // Copy input tensor values into the small stack struct which will be passed as kernel argument.
   InputArray<N> input_array;
   const int* input_ptr = input.data_ptr<int>();
-  for (int i = 0; i < N; ++i) input_array.values[i] = input_ptr[i];
+  for (int i = 0; i < N; ++i)
+    input_array.values[i] = input_ptr[i];
 
   // TODO may use multi thread blocks?
   dim3 grid(1);
@@ -45,12 +47,12 @@ void copy_to_gpu_no_ce_impl(const at::Tensor& input, at::Tensor& output) {
 }
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output) {
-    int N = static_cast<int>(input.numel());
-    if (N == 72) {
-        copy_to_gpu_no_ce_impl<72>(input, output);
-    } else if (N == 64) {
-        copy_to_gpu_no_ce_impl<64>(input, output);
-    } else {
-        TORCH_CHECK(false, "unexpected N");
-    }
+  int N = static_cast<int>(input.numel());
+  if (N == 72) {
+    copy_to_gpu_no_ce_impl<72>(input, output);
+  } else if (N == 64) {
+    copy_to_gpu_no_ce_impl<64>(input, output);
+  } else {
+    TORCH_CHECK(false, "unexpected N");
+  }
 }

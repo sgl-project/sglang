@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from sgl_kernel.elementwise import copy_to_gpu_no_ce
 import logging
-from typing import TYPE_CHECKING, Optional, Union, List
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
+from sgl_kernel.elementwise import copy_to_gpu_no_ce
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe import (
@@ -32,10 +34,14 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
-import triton
-import triton.language as tl
-from sglang.srt.utils import next_power_of_2
+from sglang.srt.utils import (
+    ceil_div,
+    dispose_tensor,
+    get_bool_env_var,
+    is_hip,
+    is_npu,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -591,7 +597,9 @@ class DeepEPMoE(EPMoE):
         output_index = torch.empty_like(topk_idx)
 
         if len(num_recv_tokens_per_expert) in {64, 72}:
-            num_recv_tokens_per_expert_gpu = copy_to_gpu_no_ce_wrapped(num_recv_tokens_per_expert)
+            num_recv_tokens_per_expert_gpu = copy_to_gpu_no_ce_wrapped(
+                num_recv_tokens_per_expert
+            )
         else:
             num_recv_tokens_per_expert_gpu = torch.tensor(
                 num_recv_tokens_per_expert,
