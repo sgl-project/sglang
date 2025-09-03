@@ -351,7 +351,9 @@ class TestJSONDetector(unittest.TestCase):
         schema = self.detector.build_json_schema(self.tools)
         self.assertIsNotNone(schema)
         self.assertIn("type", schema)
-        self.assertIn("properties", schema)
+        self.assertEqual(schema["type"], "array")
+        self.assertIn("items", schema)
+        self.assertIn("minItems", schema)
 
     def test_build_ebnf(self):
         """Test EBNF generation (for backward compatibility)."""

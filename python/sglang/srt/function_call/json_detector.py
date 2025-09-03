@@ -110,41 +110,143 @@ class JSONDetector:
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains JSON format tool calls."""
+        # Check if the entire text is a tool call (backward compatibility)
         stripped_text = text.strip()
-        return stripped_text.startswith("[") or stripped_text.startswith("{")
+        if stripped_text.startswith("[") or stripped_text.startswith("{"):
+            return True
+        
+        # For embedded tool calls, we need to be more careful to avoid false positives
+        # with partial/incomplete JSON. Only detect complete, valid JSON tool calls.
+        
+        # Look for complete JSON tool call patterns anywhere in the text
+        # Look for array pattern: [{"name": "...", "parameters": {...}}]
+        if '[' in text and ']' in text:
+            # Find potential JSON arrays
+            start = text.find('[')
+            while start != -1:
+                # Try to find matching closing bracket
+                bracket_count = 0
+                for i in range(start, len(text)):
+                    if text[i] == '[':
+                        bracket_count += 1
+                    elif text[i] == ']':
+                        bracket_count -= 1
+                        if bracket_count == 0:
+                            # Found potential JSON array
+                            json_str = text[start:i+1]
+                            try:
+                                parsed = json.loads(json_str)
+                                if isinstance(parsed, list) and any(
+                                    isinstance(item, dict) and "name" in item 
+                                    for item in parsed
+                                ):
+                                    return True
+                            except json.JSONDecodeError:
+                                pass
+                            break
+                start = text.find('[', start + 1)
+        
+        # Look for single object pattern: {"name": "...", "parameters": {...}}
+        if '{' in text and '}' in text:
+            # Find potential JSON objects
+            start = text.find('{')
+            while start != -1:
+                # Try to find matching closing brace
+                brace_count = 0
+                for i in range(start, len(text)):
+                    if text[i] == '{':
+                        brace_count += 1
+                    elif text[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            # Found potential JSON object
+                            json_str = text[start:i+1]
+                            try:
+                                parsed = json.loads(json_str)
+                                if isinstance(parsed, dict) and "name" in parsed:
+                                    return True
+                            except json.JSONDecodeError:
+                                pass
+                            break
+                start = text.find('{', start + 1)
+        
+        return False
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse function calls from text, handling JSON arrays and objects."""
+        # First try to parse the entire text as JSON (backward compatibility)
         stripped_text = text.strip()
-
-        # Handle both array and single object formats
-        if not (stripped_text.startswith("[") or stripped_text.startswith("{")):
-            return StreamingParseResult(normal_text=text, calls=[])
-
-        try:
-            # Try to parse as complete JSON first
-            parsed_content = json.loads(stripped_text)
-
-            if isinstance(parsed_content, list):
-                # Array format: [{"name": "tool", "parameters": {...}}]
-                all_actions = parsed_content
-            else:
-                # Single object format: {"name": "tool", "parameters": {...}}
-                all_actions = [parsed_content]
-
-            # Parse the actions into tool calls
-            calls = self.parse_base_json(all_actions, tools) if all_actions else []
-
-            # If no valid tool calls were found, return the original text as normal text
-            if not calls:
-                return StreamingParseResult(normal_text=text, calls=[])
-
-            return StreamingParseResult(normal_text="", calls=calls)
-
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON: {stripped_text}, error: {str(e)}")
-            # If JSON parsing fails, return the text as normal text
-            return StreamingParseResult(normal_text=text, calls=[])
+        if stripped_text.startswith("[") or stripped_text.startswith("{"):
+            try:
+                parsed_content = json.loads(stripped_text)
+                if isinstance(parsed_content, list):
+                    all_actions = parsed_content
+                else:
+                    all_actions = [parsed_content]
+                
+                calls = self.parse_base_json(all_actions, tools) if all_actions else []
+                if calls:
+                    return StreamingParseResult(normal_text="", calls=calls)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse JSON: {stripped_text}, error: {str(e)}")
+        
+        # Look for embedded JSON tool calls
+        # Try array format first: [{"name": "...", "parameters": {...}}]
+        if '[' in text and ']' in text:
+            start = text.find('[')
+            while start != -1:
+                # Find matching closing bracket
+                bracket_count = 0
+                for i in range(start, len(text)):
+                    if text[i] == '[':
+                        bracket_count += 1
+                    elif text[i] == ']':
+                        bracket_count -= 1
+                        if bracket_count == 0:
+                            # Found potential JSON array
+                            json_str = text[start:i+1]
+                            try:
+                                parsed = json.loads(json_str)
+                                if isinstance(parsed, list):
+                                    calls = self.parse_base_json(parsed, tools)
+                                    if calls:
+                                        # Extract normal text (only the text before the tool call)
+                                        normal_text = text[:start].rstrip()
+                                        return StreamingParseResult(normal_text=normal_text, calls=calls)
+                            except json.JSONDecodeError:
+                                pass
+                            break
+                start = text.find('[', start + 1)
+        
+        # Try single object format: {"name": "...", "parameters": {...}}
+        if '{' in text and '}' in text:
+            start = text.find('{')
+            while start != -1:
+                # Find matching closing brace
+                brace_count = 0
+                for i in range(start, len(text)):
+                    if text[i] == '{':
+                        brace_count += 1
+                    elif text[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            # Found potential JSON object
+                            json_str = text[start:i+1]
+                            try:
+                                parsed = json.loads(json_str)
+                                if isinstance(parsed, dict) and "name" in parsed:
+                                    calls = self.parse_base_json([parsed], tools)
+                                    if calls:
+                                        # Extract normal text (only the text before the tool call)
+                                        normal_text = text[:start].rstrip()
+                                        return StreamingParseResult(normal_text=normal_text, calls=calls)
+                            except json.JSONDecodeError:
+                                pass
+                            break
+                start = text.find('{', start + 1)
+        
+        # No tool calls found
+        return StreamingParseResult(normal_text=text, calls=[])
 
     def _ends_with_partial_token(self, buffer: str, bot_token: str) -> int:
         """
@@ -172,15 +274,160 @@ class JSONDetector:
         current_text = self._buffer
 
         # Check if we have a tool call (JSON array or object)
-        if not self.has_tool_call(current_text):
-            # Only clear buffer if we're sure no tool call is starting
-            if not self._ends_with_partial_token(self._buffer, "["):
+        if current_text.strip().startswith("[") or current_text.strip().startswith("{"):
+            # Text starts with JSON - first check if we have a complete tool call
+            # Look for complete JSON tool calls at the beginning
+            if current_text.strip().startswith("["):
+                # Try to find complete array
+                bracket_count = 0
+                for i in range(len(current_text)):
+                    if current_text[i] == '[':
+                        bracket_count += 1
+                    elif current_text[i] == ']':
+                        bracket_count -= 1
+                        if bracket_count == 0:
+                            # Found potential complete array
+                            json_str = current_text[:i+1]
+                            try:
+                                parsed = json.loads(json_str)
+                                if isinstance(parsed, list) and any(
+                                    isinstance(item, dict) and "name" in item 
+                                    for item in parsed
+                                ):
+                                    # Found complete tool call, extract it
+                                    calls = self.parse_base_json(parsed, tools)
+                                    if calls:
+                                        # Buffer any remaining text after the tool call
+                                        remaining_text = current_text[i+1:]
+                                        self._buffer = remaining_text
+                                        return StreamingParseResult(normal_text="", calls=calls)
+                            except json.JSONDecodeError:
+                                pass
+                            break
+            elif current_text.strip().startswith("{"):
+                # Try to find complete object
+                brace_count = 0
+                for i in range(len(current_text)):
+                    if current_text[i] == '{':
+                        brace_count += 1
+                    elif current_text[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            # Found potential complete object
+                            json_str = current_text[:i+1]
+                            try:
+                                parsed = json.loads(json_str)
+                                if isinstance(parsed, dict) and "name" in parsed:
+                                    # Found complete tool call, extract it
+                                    calls = self.parse_base_json([parsed], tools)
+                                    if calls:
+                                        # Buffer any remaining text after the tool call
+                                        remaining_text = current_text[i+1:]
+                                        self._buffer = remaining_text
+                                        return StreamingParseResult(normal_text="", calls=calls)
+                            except json.JSONDecodeError:
+                                pass
+                            break
+            
+            # No complete tool call found at the beginning, use existing streaming logic
+            pass
+        else:
+            # Text doesn't start with JSON - check if it contains embedded tool calls
+            # Try to find complete JSON tool calls in the text
+            found_tool_call = False
+            
+            # Look for array format: [{"name": "...", "parameters": {...}}]
+            if '[' in current_text and ']' in current_text:
+                start = current_text.find('[')
+                while start != -1:
+                    # Find matching closing bracket
+                    bracket_count = 0
+                    for i in range(start, len(current_text)):
+                        if current_text[i] == '[':
+                            bracket_count += 1
+                        elif current_text[i] == ']':
+                            bracket_count -= 1
+                            if bracket_count == 0:
+                                # Found potential JSON array
+                                json_str = current_text[start:i+1]
+                                try:
+                                    parsed = json.loads(json_str)
+                                    if isinstance(parsed, list) and any(
+                                        isinstance(item, dict) and "name" in item 
+                                        for item in parsed
+                                    ):
+                                        # Found complete tool call, extract it
+                                        normal_text = current_text[:start]
+                                        tool_call_text = current_text[start:i+1]
+                                        self._buffer = ""
+                                        
+                                        # Parse the tool call
+                                        calls = self.parse_base_json(parsed, tools)
+                                        return StreamingParseResult(normal_text=normal_text, calls=calls)
+                                except json.JSONDecodeError:
+                                    pass
+                                break
+                    start = current_text.find('[', start + 1)
+            
+            # Look for single object format: {"name": "...", "parameters": {...}}
+            if '{' in current_text and '}' in current_text:
+                start = current_text.find('{')
+                while start != -1:
+                    # Find matching closing brace
+                    brace_count = 0
+                    for i in range(start, len(current_text)):
+                        if current_text[i] == '{':
+                            brace_count += 1
+                        elif current_text[i] == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                # Found potential JSON object
+                                json_str = current_text[start:i+1]
+                                try:
+                                    parsed = json.loads(json_str)
+                                    if isinstance(parsed, dict) and "name" in parsed:
+                                        # Found complete tool call, extract it
+                                        normal_text = current_text[:start]
+                                        self._buffer = ""
+                                        
+                                        # Parse the tool call
+                                        calls = self.parse_base_json([parsed], tools)
+                                        return StreamingParseResult(normal_text=normal_text, calls=calls)
+                                except json.JSONDecodeError:
+                                    pass
+                                break
+                    start = current_text.find('{', start + 1)
+            
+            # No complete tool call found, check if we should buffer or return normal text
+            # Look for incomplete JSON structures and extract normal text before them
+            has_open_bracket = '[' in self._buffer
+            has_close_bracket = ']' in self._buffer
+            has_open_brace = '{' in self._buffer
+            has_close_brace = '}' in self._buffer
+            
+            # If we have opening brackets/braces but no closing ones, we have incomplete JSON
+            if (has_open_bracket and not has_close_bracket) or (has_open_brace and not has_close_brace):
+                # Find where the incomplete JSON starts
+                json_start = -1
+                if has_open_bracket and not has_close_bracket:
+                    json_start = self._buffer.find('[')
+                elif has_open_brace and not has_close_brace:
+                    json_start = self._buffer.find('{')
+                
+                if json_start > 0:
+                    # Extract normal text before the incomplete JSON
+                    normal_text = self._buffer[:json_start]
+                    # Keep only the incomplete JSON in buffer
+                    self._buffer = self._buffer[json_start:]
+                    return StreamingParseResult(normal_text=normal_text)
+                else:
+                    # JSON starts at the beginning, buffer everything
+                    return StreamingParseResult()
+            else:
+                # No incomplete JSON, return as normal text
                 normal_text = self._buffer
                 self._buffer = ""
                 return StreamingParseResult(normal_text=normal_text)
-            else:
-                # Might be partial JSON start, keep buffering
-                return StreamingParseResult()
 
         # Build tool indices if not already built
         if not hasattr(self, "_tool_indices"):
