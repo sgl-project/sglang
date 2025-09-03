@@ -1468,10 +1468,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else:
                     self.tree_cache.dec_lock_ref(req.last_node)
 
-                # NOTE(lsyin): we should use the newly evictable memory instantly.
-                num_tokens = len(sorted_indices) * global_config.retract_decode_steps
-                self._evict_tree_cache_if_needed(num_tokens)
-
             req.reset_for_retract()
 
             if len(retracted_reqs) == 0:
