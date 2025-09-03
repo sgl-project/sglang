@@ -128,6 +128,7 @@ class HiCacheHF3FS(HiCacheStorage):
         dtype: torch.dtype,
         metadata_client: Hf3fsMetadataInterface,
         is_mla_model: bool = False,
+        is_page_first_layout: bool = False,
     ):
         self.rank = rank
         self.file_path = file_path
@@ -138,6 +139,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.dtype = dtype
         self.metadata_client = metadata_client
         self.is_mla_model = is_mla_model
+        self.is_page_first_layout = is_page_first_layout
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
         self.skip_backup = False
@@ -193,9 +195,13 @@ class HiCacheHF3FS(HiCacheStorage):
         )
 
         if storage_config is not None:
-            rank, is_mla_model = storage_config.tp_rank, storage_config.is_mla_model
+            rank, is_mla_model, is_page_first_layout = (
+                storage_config.tp_rank,
+                storage_config.is_mla_model,
+                storage_config.is_page_first_layout,
+            )
         else:
-            rank, is_mla_model = 0, False
+            rank, is_mla_model, is_page_first_layout = 0, False, False
 
         mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
 
@@ -213,6 +219,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 entries=8,
                 dtype=dtype,
                 metadata_client=Hf3fsLocalMetadataClient(),
+                is_page_first_layout=is_page_first_layout,
             )
 
         try:
@@ -261,6 +268,7 @@ class HiCacheHF3FS(HiCacheStorage):
             dtype=dtype,
             metadata_client=metadata_client,
             is_mla_model=is_mla_model,
+            is_page_first_layout=is_page_first_layout,
         )
 
     def get(
@@ -407,12 +415,22 @@ class HiCacheHF3FS(HiCacheStorage):
         return result[0] if result else False
 
     def batch_exists(self, keys: List[str]) -> int:
-        results = self.metadata_client.exists(self.rank, keys)
-        for i in range(len(keys)):
-            if not results[i]:
-                return i
+        if self.is_page_first_layout and not self.is_mla_model:
+            query_keys = []
+            # Compatible with page_first layout's key format, Refer to memory_pool_host.py#get_buffer_with_hash
+            for key in keys:
+                query_keys.append(f"{key}-k")
+                query_keys.append(f"{key}-v")
+            key_multiplier = 2
+        else:
+            query_keys = keys
+            key_multiplier = 1
 
-        return len(keys)
+        exist_result = self.metadata_client.exists(self.rank, query_keys)
+        for i in range(len(query_keys)):
+            if not exist_result[i]:
+                return i // key_multiplier
+        return len(query_keys) // key_multiplier
 
     def clear(self) -> bool:
         try:
