@@ -594,6 +594,7 @@ class ModelOptFp4Config(QuantizationConfig):
 
     def is_layer_excluded(self, prefix: str, exclude_modules: list):
         import regex as re
+
         fused_patterns = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]
         prefix_split = prefix.split(".")
         for pattern in exclude_modules:
