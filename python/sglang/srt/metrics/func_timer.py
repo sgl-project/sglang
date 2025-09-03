@@ -20,6 +20,8 @@ import time
 from functools import wraps
 from typing import Any, Callable, List, Optional
 
+from sglang.srt.metrics.utils import exponential_buckets
+
 enable_metrics = False
 
 
@@ -40,13 +42,6 @@ def enable_func_timer():
 
 
 FUNC_LATENCY = None
-
-
-def exponential_buckets(start: float, width: float, length: int) -> List[float]:
-    buckets = []
-    for i in range(length):
-        buckets.append(start * (width**i))
-    return buckets
 
 
 def time_func_latency(
