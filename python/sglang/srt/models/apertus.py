@@ -579,6 +579,10 @@ class ApertusForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
+        for name, buffer in self.named_buffers():
+            if name.endswith(".beta") or name.endswith(".eps"):
+                params_dict[name] = buffer
+
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (

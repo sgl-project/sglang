@@ -219,7 +219,9 @@ class XIELU(CustomOp):
         if original_shape != x.shape:
             logger.warning_once(
                 "Warning: xIELU input tensor expects 3 dimensions"
-                " but got (shape: %s). Reshaping to (shape: %s).",
+                " but got (shape: %s). Reshaping to (shape: %s).\n"
+                "Note: For SGLang this may be expected if sending"
+                "[B*S,D] instead of [B,S,D].",
                 original_shape,
                 x.shape,
             )
