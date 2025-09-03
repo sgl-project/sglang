@@ -294,9 +294,9 @@ class MambaAttnBackend(AttentionBackend):
         beta = b.sigmoid()
         g = fused_gdn_gating(A_log, a, dt_bias)
         g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
-        recurrent_state = ssm_states[self.forward_metadata.mamba_cache_indices]
 
         if forward_batch.forward_mode.is_target_verify():
+            last_recurrent_state = ssm_states[self.forward_metadata.mamba_cache_indices].clone() # keep a copy
             # since target verify usually use small seq lens (num_draft_tokens)
             # it's faster to use fused_recurrent_gated_delta_rule_update
             core_attn_out = fused_recurrent_gated_delta_rule_update(
@@ -326,6 +326,7 @@ class MambaAttnBackend(AttentionBackend):
                 (-1,) + beta_cache.shape[1:]
             )
         else:
+            recurrent_state = ssm_states[self.forward_metadata.mamba_cache_indices]
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -339,7 +340,8 @@ class MambaAttnBackend(AttentionBackend):
                 use_qk_l2norm_in_kernel=True,
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            ssm_states[self.forward_metadata.mamba_cache_indices] = last_recurrent_state
+
+        ssm_states[self.forward_metadata.mamba_cache_indices] = last_recurrent_state
 
         return core_attn_out
 
