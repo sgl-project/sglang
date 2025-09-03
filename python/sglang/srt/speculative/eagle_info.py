@@ -587,7 +587,7 @@ class EagleVerifyInput:
         cum_kv_seq_len[1:] = torch.cumsum(seq_lens_with_draft_tokens, dim=0)
 
         kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device=device)
-        num_pages_per_req = (paged_kernel_lens + page_size - 1) // page_size
+        num_pages_per_req = (seq_lens_with_draft_tokens + page_size - 1) // page_size
         kv_indptr[1 : batch_size + 1] = torch.cumsum(num_pages_per_req, dim=0)
 
         kv_indices = torch.empty(
@@ -610,7 +610,7 @@ class EagleVerifyInput:
         create_flashinfer_kv_indices_triton[(batch_size,)](
             req_to_token,
             req_pool_indices,
-            paged_kernel_lens,
+            seq_lens_with_draft_tokens,
             kv_indptr,
             None,
             kv_indices,
