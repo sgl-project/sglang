@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, List
 
 import torch
 
@@ -32,6 +32,9 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+import triton
+import triton.language as tl
+from sglang.srt.utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -829,3 +832,39 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
     if get_moe_expert_parallel_world_size() > 1:
         return EPMoE
     return FusedMoE
+
+
+@triton.jit
+def to_cuda_without_ce_kernel(
+    out_ptr, N,
+    v0: tl.int32, v1: tl.int32, v2: tl.int32,
+    v3: tl.int32, v4: tl.int32, v5: tl.int32,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    idx = pid * BLOCK + offs
+    mask = idx < N
+    val = v0
+    val = tl.where(offs == 1, v1, val)
+    val = tl.where(offs == 2, v2, val)
+    val = tl.where(offs == 3, v3, val)
+    val = tl.where(offs == 4, v4, val)
+    val = tl.where(offs == 5, v5, val)
+    ptr = out_ptr + idx
+    tl.store(ptr, val, mask=mask)
+
+
+# TODO move or improve
+def to_cuda_without_ce(arr: List[int]) -> torch.Tensor:
+    # we may use managed memory etc for more general case if needed
+
+    N = len(arr)
+    assert N == 6, "other shapes to be supported"
+
+    out = torch.empty(N, dtype=torch.int32, device='cuda')
+
+    BLOCK = next_power_of_2(N)
+    to_cuda_without_ce_kernel[(1,)](out, N, *arr, BLOCK=BLOCK)
+
+    return out
