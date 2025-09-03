@@ -259,7 +259,7 @@ class MambaAttnBackend(AttentionBackend):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         if forward_batch.forward_mode.is_target_verify():
-            mixed_qkv_cache[self.forward_metadata.mamba_cache_indices] = mixed_qkv.view(
+            mixed_qkv_cache[cache_indices] = mixed_qkv.view(
                 (-1,) + mixed_qkv_cache.shape[1:]
             ).clone()
         mixed_qkv = causal_conv1d_fn(
@@ -296,9 +296,7 @@ class MambaAttnBackend(AttentionBackend):
         g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
 
         if forward_batch.forward_mode.is_target_verify():
-            last_recurrent_state = ssm_states[
-                self.forward_metadata.mamba_cache_indices
-            ].clone()  # keep a copy
+            last_recurrent_state = ssm_states[cache_indices].clone()  # keep a copy
             # since target verify usually use small seq lens (num_draft_tokens)
             # it's faster to use fused_recurrent_gated_delta_rule_update
             core_attn_out = fused_recurrent_gated_delta_rule_update(
@@ -312,23 +310,13 @@ class MambaAttnBackend(AttentionBackend):
                 cu_seqlens=query_start_loc,
                 use_qk_l2norm_in_kernel=True,
             )
-            query_cache[self.forward_metadata.mamba_cache_indices] = query.view(
-                (-1,) + query_cache.shape[1:]
-            )
-            key_cache[self.forward_metadata.mamba_cache_indices] = key.view(
-                (-1,) + key_cache.shape[1:]
-            )
-            value_cache[self.forward_metadata.mamba_cache_indices] = value.view(
-                (-1,) + value_cache.shape[1:]
-            )
-            g_cache[self.forward_metadata.mamba_cache_indices] = g.view(
-                (-1,) + g_cache.shape[1:]
-            )
-            beta_cache[self.forward_metadata.mamba_cache_indices] = beta.view(
-                (-1,) + beta_cache.shape[1:]
-            )
+            query_cache[cache_indices] = query.view((-1,) + query_cache.shape[1:])
+            key_cache[cache_indices] = key.view((-1,) + key_cache.shape[1:])
+            value_cache[cache_indices] = value.view((-1,) + value_cache.shape[1:])
+            g_cache[cache_indices] = g.view((-1,) + g_cache.shape[1:])
+            beta_cache[cache_indices] = beta.view((-1,) + beta_cache.shape[1:])
         else:
-            recurrent_state = ssm_states[self.forward_metadata.mamba_cache_indices]
+            recurrent_state = ssm_states[cache_indices]
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -343,7 +331,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
 
-        ssm_states[self.forward_metadata.mamba_cache_indices] = last_recurrent_state
+        ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 
