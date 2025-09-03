@@ -1236,19 +1236,25 @@ class ServerArgs:
             default=ServerArgs.collect_tokens_histogram,
             help="Collect prompt/generation tokens histogram.",
         )
+        bucket_rule = (
+            "Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' "
+            "generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets "
+            "[984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'customer <value1> "
+            "<value2> ...' uses custom bucket values (e.g., 'customer 10 50 100 500')."
+        )
         parser.add_argument(
             "--prompt-tokens-buckets",
             type=str,
             nargs="+",
             default=ServerArgs.prompt_tokens_buckets,
-            help="The buckets rule of prompt tokens.",
+            help=f"The buckets rule of prompt tokens. {bucket_rule}",
         )
         parser.add_argument(
             "--generation-tokens-buckets",
             type=str,
             nargs="+",
             default=ServerArgs.generation_tokens_buckets,
-            help="The buckets rule of generation tokens.",
+            help=f"The buckets rule for generation tokens histogram. {bucket_rule}",
         )
         parser.add_argument(
             "--gc-warning-threshold-secs",

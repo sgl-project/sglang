@@ -45,3 +45,6 @@ def generate_buckets(
         return sorted(set(default_buckets))
     assert rule == "customer"
     return [float(x) for x in buckets_rule[1:]]
+
+
+print(generate_buckets(["tse", "1000", "2", "8"], []))
