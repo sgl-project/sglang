@@ -82,7 +82,7 @@ class Sampler(nn.Module):
         else:
             # Post process original logits. if temperatures are all 1.0, no need to rescale
             if return_logprob and RETURN_ORIGINAL_LOGPROB:
-                logprobs = torch.softmax(logits, dim=-1)
+                probs_without_temp_scaling = torch.softmax(logits, dim=-1)
 
             # Post process logits
             logits.div_(sampling_info.temperatures)
@@ -123,8 +123,8 @@ class Sampler(nn.Module):
             if return_logprob:
                 # clamp to avoid -inf
                 if RETURN_ORIGINAL_LOGPROB:
-                    logprobs = torch.log(logprobs).clamp(
-                        min=torch.finfo(logprobs.dtype).min
+                    logprobs = torch.log(probs_without_temp_scaling).clamp(
+                        min=torch.finfo(probs_without_temp_scaling.dtype).min
                     )
                 else:
                     logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
