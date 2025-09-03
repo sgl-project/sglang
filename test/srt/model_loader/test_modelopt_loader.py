@@ -391,6 +391,46 @@ class TestModelOptLoaderIntegration(CustomTestCase):
                 len(cfg_name) > 0, f"Config name for '{choice}' should not be empty"
             )
 
+    @patch("sglang.srt.model_loader.loader.get_model_loader")
+    @patch("sglang.srt.entrypoints.engine.Engine.__init__")
+    def test_engine_with_modelopt_quant_cli_argument(
+        self, mock_engine_init, mock_get_model_loader
+    ):
+        """Test that CLI argument --modelopt-quant is properly parsed."""
+
+        # Mock the Engine.__init__ to avoid actual initialization
+        mock_engine_init.return_value = None
+
+        # Mock get_model_loader to return our ModelOptModelLoader
+        mock_loader = MagicMock(spec=ModelOptModelLoader)
+        mock_get_model_loader.return_value = mock_loader
+
+        # Test CLI argument parsing
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        # Create parser and add arguments
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        # Test parsing with modelopt_quant argument
+        args = parser.parse_args(
+            [
+                "--model-path",
+                "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                "--modelopt-quant",
+                "fp8",
+            ]
+        )
+
+        # Convert to ServerArgs using the proper from_cli_args method
+        server_args = ServerArgs.from_cli_args(args)
+
+        # Verify that modelopt_quant was properly parsed
+        self.assertEqual(server_args.modelopt_quant, "fp8")
+        self.assertEqual(server_args.model_path, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
 
 if __name__ == "__main__":
     unittest.main()
