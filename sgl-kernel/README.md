@@ -49,6 +49,14 @@ python -m uv build --wheel -Cbuild-dir=build -Ccmake.define.SGL_KERNEL_ENABLE_FP
 ```
 See CMakeLists.txt for more options.
 
+### Using Custom Dependency Versions
+
+#### DeepGEMM Commit Override
+
+By default, the build system automatically selects the appropriate DeepGEMM repository and commit based on your CUDA version:
+- CUDA 12.8/12.9: Uses `sgl-project/DeepGEMM` with `blackwell` tag
+- Other versions: Uses `deepseek-ai/DeepGEMM` with commit `391755ada0ffefa9a6a52b6f14dcaf22d1a463e0`
+
 ### Parallel Build
 
 We highly recommend you build sgl-kernel with Ninja. Ninja can automatically build sgl-kernel in parallel.
