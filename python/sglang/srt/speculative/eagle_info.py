@@ -94,50 +94,8 @@ class EagleVerifyInput(SpecInput):
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-        # Debug prints for prepare_for_verify
-        if hasattr(batch, "req_pool_indices") and batch.req_pool_indices is not None:
-            device_index = batch.req_pool_indices.device.index
-        else:
-            device_index = 0
-
-        if device_index == 0:
-            print(f"DEBUG: [EagleVerifyInput] prepare_for_verify called", flush=True)
-            print(
-                f"DEBUG: [EagleVerifyInput] batch.forward_mode = {batch.forward_mode.name}",
-                flush=True,
-            )
-            print(f"DEBUG: [EagleVerifyInput] page_size = {page_size}", flush=True)
-            print(
-                f"DEBUG: [EagleVerifyInput] Before - batch.input_ids.shape = {batch.input_ids.shape}",
-                flush=True,
-            )
-            print(
-                f"DEBUG: [EagleVerifyInput] Before - batch.input_ids = {batch.input_ids}",
-                flush=True,
-            )
-            print(
-                f"DEBUG: [EagleVerifyInput] Before - batch.seq_lens = {batch.seq_lens}",
-                flush=True,
-            )
-            print(
-                f"DEBUG: [EagleVerifyInput] Before - batch.req_pool_indices = {batch.req_pool_indices}",
-                flush=True,
-            )
-            print(
-                f"DEBUG: [EagleVerifyInput] Before - self.draft_token = {self.draft_token}",
-                flush=True,
-            )
-            print(
-                f"DEBUG: [EagleVerifyInput] Before - self.draft_token_num = {self.draft_token_num}",
-                flush=True,
-            )
 
         if batch.forward_mode.is_idle():
-            if device_index == 0:
-                print(
-                    f"DEBUG: [EagleVerifyInput] prepare_for_verify returning early (idle)",
-                    flush=True,
-                )
             return
 
         batch.input_ids = self.draft_token
@@ -180,30 +138,6 @@ class EagleVerifyInput(SpecInput):
             next_power_of_2(bs),
         )
 
-        if device_index == 0:
-            print(
-                f"DEBUG: [EagleVerifyInput] After - batch.input_ids.shape = {batch.input_ids.shape}",
-                flush=True,
-            )
-            print(
-                f"DEBUG: [EagleVerifyInput] After - batch.input_ids = {batch.input_ids}",
-                flush=True,
-            )
-            print(
-                f"DEBUG: [EagleVerifyInput] After - batch.out_cache_loc = {batch.out_cache_loc}",
-                flush=True,
-            )
-            print(
-                f"DEBUG: [EagleVerifyInput] After - end_offset = {end_offset}",
-                flush=True,
-            )
-            if page_size != 1:
-                print(
-                    f"DEBUG: [EagleVerifyInput] After - self.last_loc = {self.last_loc}",
-                    flush=True,
-                )
-            print(f"DEBUG: [EagleVerifyInput] prepare_for_verify completed", flush=True)
-
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
@@ -212,14 +146,6 @@ class EagleVerifyInput(SpecInput):
         req_to_token: torch.Tensor,
         page_size: int,
     ):
-        if req_pool_indices.device.index == 0:
-            print("=" * 80)
-            print(
-                f"DEBUG: [EagleVerifyInput] generate_attn_arg_prefill called!",
-                flush=True,
-            )
-            print(f"paged_kernel_lens: {paged_kernel_lens}", flush=True)
-            print(f"req_pool_indices: {req_pool_indices}", flush=True)
 
         device = req_to_token.device
         batch_size = len(req_pool_indices)
@@ -247,17 +173,6 @@ class EagleVerifyInput(SpecInput):
             dtype=torch.int32,
             device=device,
         )
-        if req_pool_indices.device.index == 0:
-            print(f"DEBUG: [EagleVerifyInput] req_pool_indices: {req_pool_indices}")
-            print(
-                f"DEBUG: [EagleVerifyInput] seq_lens_with_draft_tokens: {seq_lens_with_draft_tokens}"
-            )
-            print(f"DEBUG: [EagleVerifyInput] num_pages_per_req: {num_pages_per_req}")
-            print(f"DEBUG: [EagleVerifyInput] cum_kv_seq_len: {cum_kv_seq_len}")
-            for i in range(batch_size):
-                print(
-                    f"DEBUG: [EagleVerifyInput] req_to_token[{i}]: {req_to_token[i][:seq_lens_with_draft_tokens[i]]}"
-                )
 
         create_flashinfer_kv_indices_triton[(batch_size,)](
             req_to_token,
@@ -269,13 +184,6 @@ class EagleVerifyInput(SpecInput):
             req_to_token.size(1),
             page_size,
         )
-        if req_pool_indices.device.index == 0:
-            print(f"DEBUG: [EagleVerifyInput] kv_indptr: {kv_indptr}", flush=True)
-            print(f"DEBUG: [EagleVerifyInput] kv_indices: {kv_indices}", flush=True)
-            print(
-                f"DEBUG: [EagleVerifyInput] generate_attn_arg_prefill completed!",
-                flush=True,
-            )
         return kv_indices, kv_indptr, qo_indptr, self.custom_mask
 
     def verify(

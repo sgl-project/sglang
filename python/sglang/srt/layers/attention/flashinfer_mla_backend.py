@@ -279,9 +279,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if forward_batch.req_pool_indices.device.index == 0:
-            print(f"DEBUG: [FlashInferMLAAttnBackend] init_forward_metadata", flush=True)
-            print(f"DEBUG: [FlashInferMLAAttnBackend] forward_batch.forward_mode = {forward_batch.forward_mode.name} ({forward_batch.forward_mode.value})", flush=True)
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -515,10 +512,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        print_cond = forward_batch.req_pool_indices.device.index == 0 and (layer.layer_id in [0, 1, 61])
-        if print_cond:
-            print(f"DEBUG: [FlashInferMLAAttnBackend [layer_id={layer.layer_id}]] Forward extend called.", flush=True)
-            
         if (
             forward_batch.attn_attend_prefix_cache is not None
             and forward_batch.mha_return_lse
@@ -548,8 +541,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-        if print_cond:
-            print(f"DEBUG[layer_id={layer.layer_id}]: forward extend: use_ragged = {self.forward_metadata.use_ragged}", flush=True)
         if self.forward_metadata.use_ragged:
             # ragged prefill
             if q_rope is not None:
@@ -557,10 +548,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             if k_rope is not None:
                 k = torch.cat([k, k_rope], dim=-1)
-            if print_cond:
-                print(f"DEBUG[layer_id={layer.layer_id}]: forward extend: qall.shape = {qall.shape}", flush=True)
-                print(f"DEBUG[layer_id={layer.layer_id}]: forward extend: k.shape = {k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype).shape}", flush=True)
-                print(f"DEBUG[layer_id={layer.layer_id}]: forward extend: v.shape = {v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype).shape}", flush=True)
             o = self.prefill_wrapper_ragged.forward(
                 qall,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
@@ -582,13 +569,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     qall[:, :, layer.v_head_dim :],
                 )
             o = q.new_empty(q.shape)
-            if print_cond:
-                print(f"DEBUG[layer_id={layer.layer_id}]: forward extend: k_buf.shape = {k_buf.shape}", flush=True)
-                print(f"DEBUG[layer_id={layer.layer_id}]: forward extend: q.shape = {q.shape}", flush=True)
-                print(f"DEBUG[layer_id={layer.layer_id}]: forward extend: q_rope.shape = {q_rope.shape}", flush=True)
-                print(f"DEBUG[layer_id={layer.layer_id}]: forward extend: k_buf[:, :, : layer.v_head_dim].shape = {k_buf[:, :, : layer.v_head_dim].shape}", flush=True)
-                print(f"DEBUG[layer_id={layer.layer_id}]: forward extend: k_buf[:, :, layer.v_head_dim :].shape = {k_buf[:, :, layer.v_head_dim :].shape}", flush=True)
-                print(f"DEBUG[layer_id={layer.layer_id}]: forward extend: o.shape = {o.shape}", flush=True)
             o = prefill_wrapper_paged.run(
                 q,
                 q_rope,
@@ -613,12 +593,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     ):
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
-        print_cond = forward_batch.req_pool_indices.device.index == 0 and (layer.layer_id in [0, 1, 61])
-        if print_cond:
-            print(f"DEBUG[layer_id={layer.layer_id}]: forward decode called.", flush=True)
-            print(f"DEBUG[layer_id={layer.layer_id}]: forward decode: save_kv_cache = {save_kv_cache}", flush=True)
-            print(f"DEBUG[layer_id={layer.layer_id}]: forward decode: q_rope.shape = {q_rope.shape}", flush=True)
-            print(f"DEBUG[layer_id={layer.layer_id}]: forward decode: k_rope.shape = {k_rope.shape}", flush=True)
 
         if k is not None:
             assert v is not None
@@ -660,12 +634,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         o = q_nope.new_empty(q_nope.shape)
         # Direct call to run without the wrapper
-        if print_cond:
-            print(f"DEBUG[layer_id={layer.layer_id}]: forward decode: q_nope.shape = {q_nope.shape}", flush=True)
-            print(f"DEBUG[layer_id={layer.layer_id}]: forward decode: q_rope.shape = {q_rope.shape}", flush=True)
-            print(f"DEBUG[layer_id={layer.layer_id}]: forward decode: k_buf[:, :, : layer.v_head_dim].shape = {k_buf[:, :, : layer.v_head_dim].shape}", flush=True)
-            print(f"DEBUG[layer_id={layer.layer_id}]: forward decode: k_buf[:, :, layer.v_head_dim :].shape = {k_buf[:, :, layer.v_head_dim :].shape}", flush=True)
-            print(f"DEBUG[layer_id={layer.layer_id}]: forward decode: o.shape = {o.shape}", flush=True) 
         o = decode_wrapper.run(
             q_nope,
             q_rope,
@@ -732,20 +700,11 @@ class FlashInferMLAIndicesUpdaterDecode:
         spec_info: Optional[SpecInput] = None,
         **fast_decode_kwargs,
     ):
-        print_cond = req_pool_indices.device.index == 0
         bs = len(req_pool_indices)
         q_indptr = q_indptr[: bs + 1]
         kv_lens = paged_kernel_lens.to(torch.int32)
         sm_scale = self.scaling
-        if print_cond:
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] call_begin_forward called!", flush=True)
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] req_pool_indices: {req_pool_indices}", flush=True)
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] paged_kernel_lens: {paged_kernel_lens}", flush=True)
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] paged_kernel_lens_sum: {paged_kernel_lens_sum}", flush=True)
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] q_indptr: {q_indptr}", flush=True)
         if spec_info is None:
-            if print_cond:
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] spec_info is None", flush=True)
             num_pages_per_req = (
                 paged_kernel_lens + self.page_size - 1
             ) // self.page_size
@@ -767,19 +726,8 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.page_size,
             )
         else:
-            if req_pool_indices.device.index == 0:
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] spec_info is not None", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] spec_info.qo_indptr: {spec_info.qo_indptr}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] spec_info.kv_indptr: {spec_info.kv_indptr}", flush=True)
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
         if not init_metadata_replay:
-            if req_pool_indices.device.index == 0:
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] wrapper.plan called!", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] q_indptr: {q_indptr}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] kv_indptr: {kv_indptr}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] kv_indices: {kv_indices}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] kv_lens: {kv_lens[:kv_indptr[-1]]}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] self.page_size: {self.page_size}", flush=True)
             wrapper.plan(
                 qo_indptr=q_indptr,
                 kv_indptr=kv_indptr,
@@ -795,14 +743,6 @@ class FlashInferMLAIndicesUpdaterDecode:
                 kv_data_type=self.data_type,
             )
         else:
-            if req_pool_indices.device.index == 0:
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] wrapper.plan called!", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] q_indptr: {fast_decode_kwargs['qo_indptr_cpu']}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] kv_indptr: {fast_decode_kwargs['kv_indptr_cpu']}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] kv_indices: {kv_indices}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] kv_lens: {fast_decode_kwargs['kv_len_arr_cpu']}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterDecode] self.page_size: {self.page_size}", flush=True)
-
             wrapper.plan(
                 qo_indptr_cpu=fast_decode_kwargs["qo_indptr_cpu"],
                 kv_indptr_cpu=fast_decode_kwargs["kv_indptr_cpu"],
@@ -889,17 +829,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
-        print_cond = req_pool_indices.device.index == 0
-        if print_cond:
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] call_begin_forward called!", flush=True)
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] req_pool_indices: {req_pool_indices}", flush=True)
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] paged_kernel_lens: {paged_kernel_lens}", flush=True)
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] paged_kernel_lens_sum: {paged_kernel_lens_sum}", flush=True)
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] seq_lens: {seq_lens}", flush=True)
-            print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] prefix_lens: {prefix_lens}", flush=True)
         if spec_info is None:
-            if print_cond:
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] spec_info is None", flush=True)
             assert len(seq_lens) == len(req_pool_indices)
             num_pages_per_req = (
                 paged_kernel_lens + self.page_size - 1
@@ -935,9 +865,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
 
         if use_ragged:
             # ragged prefill
-            if print_cond:
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] use_ragged is True", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] qo_indptr: {qo_indptr}", flush=True)
             wrapper_ragged.begin_forward(
                 qo_indptr=qo_indptr,
                 kv_indptr=qo_indptr,
@@ -950,19 +877,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
         else:
             # mla paged prefill
-            if print_cond:
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] use_ragged is False", flush=True)
             page_size = self.page_size
             if spec_info is not None:
                 kv_lens = ((kv_indptr[1:] - kv_indptr[:-1]) * self.page_size).to(torch.int32)
             else:
                 kv_lens = paged_kernel_lens.to(torch.int32)
-            if print_cond:
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] kv_lens: {kv_lens}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] page_size: {page_size}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] qo_indptr: {qo_indptr}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] kv_indptr: {kv_indptr}", flush=True)
-                print(f"DEBUG: [FlashInferMLAIndicesUpdaterPrefill] kv_indices: {kv_indices}", flush=True)
             wrapper_paged.plan(
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
@@ -1001,11 +920,6 @@ class FlashInferMLAMultiStepDraftBackend:
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         
-        # Debug print for initialization
-        device_index = model_runner.device.index if hasattr(model_runner.device, 'index') else 0
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] Initializing with topk={topk}, speculative_num_steps={speculative_num_steps}", flush=True)
-
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (
@@ -1037,31 +951,17 @@ class FlashInferMLAMultiStepDraftBackend:
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
         
-        # Debug print for initialization completion
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] Initialization complete. max_bs={max_bs}, pool_len={self.pool_len}, page_size={self.page_size}", flush=True)
-
     def common_template(
         self,
         forward_batch: ForwardBatch,
         kv_indices_buffer: torch.Tensor,
         call_fn: Callable,
     ):
-        # Debug prints for common_template
-        device_index = forward_batch.req_pool_indices.device.index if hasattr(forward_batch, 'req_pool_indices') and forward_batch.req_pool_indices is not None else 0
         
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
         
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] common_template called with num_seqs={num_seqs}, bs={bs}, seq_lens_sum={seq_lens_sum}", flush=True)
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] num_seqs = {num_seqs}", flush=True)
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] bs = {bs}", flush=True)
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] seq_lens_sum = {seq_lens_sum}", flush=True)
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] req_pool_indices.shape = {forward_batch.req_pool_indices.shape}", flush=True)
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] Calling generate_draft_decode_kv_indices with kv_indices_buffer.shape={kv_indices_buffer.shape}, kv_indptr.shape={self.kv_indptr.shape}", flush=True)
-            
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
@@ -1083,27 +983,15 @@ class FlashInferMLAMultiStepDraftBackend:
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] Starting loop for {self.speculative_num_steps - 1} steps", flush=True)
-
         for i in range(self.speculative_num_steps - 1):
-            if device_index == 0:
-                print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] Step {i}: Setting kv_indptr and kv_indices", flush=True)
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
                 : seq_lens_sum * self.topk + bs * (i + 1)
             ]
-            if device_index == 0:
-                print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] Step {i}: kv_indptr={forward_batch.spec_info.kv_indptr}, kv_indices={forward_batch.spec_info.kv_indices}", flush=True)
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # Debug prints for init_forward_metadata
-        device_index = forward_batch.req_pool_indices.device.index if hasattr(forward_batch, 'req_pool_indices') and forward_batch.req_pool_indices is not None else 0
         
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] init_forward_metadata called with batch_size={forward_batch.batch_size}, max_context_len={self.max_context_len}", flush=True)
-            
         kv_indices = torch.zeros(
             (
                 self.speculative_num_steps,
@@ -1124,16 +1012,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, kv_indices, call_fn)
         
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] init_forward_metadata completed", flush=True)
-
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        # Debug prints for init_cuda_graph_state
-        device_index = 0  # Default for this method since no batch context
-        
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] init_cuda_graph_state called with max_bs={max_bs}, max_num_tokens={max_num_tokens}", flush=True)
-            
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, max_bs * self.max_context_len),
             dtype=torch.int32,
@@ -1141,25 +1020,14 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         for i in range(self.speculative_num_steps):
-            if device_index == 0:
-                print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] Initializing CUDA graph state for step {i}", flush=True)
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
             
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] init_cuda_graph_state completed", flush=True)
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        # Debug prints for init_forward_metadata_capture_cuda_graph
-        device_index = forward_batch.req_pool_indices.device.index if hasattr(forward_batch, 'req_pool_indices') and forward_batch.req_pool_indices is not None else 0
-        
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] init_forward_metadata_capture_cuda_graph called", flush=True)
             
         def call_fn(i, forward_batch):
-            if device_index == 0:
-                print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] Capturing CUDA graph for step {i}", flush=True)
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,
                 forward_batch.batch_size * self.topk,
@@ -1172,21 +1040,13 @@ class FlashInferMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
         
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] init_forward_metadata_capture_cuda_graph completed", flush=True)
 
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        # Debug prints for init_forward_metadata_replay_cuda_graph
-        device_index = forward_batch.req_pool_indices.device.index if hasattr(forward_batch, 'req_pool_indices') and forward_batch.req_pool_indices is not None else 0
-        
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] init_forward_metadata_replay_cuda_graph called with bs={bs}", flush=True)
+            
             
         def call_fn(i, forward_batch):
-            if device_index == 0:
-                print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] Replaying CUDA graph for step {i}", flush=True)
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
                 bs,
                 forward_batch.req_pool_indices,
@@ -1200,9 +1060,6 @@ class FlashInferMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
         
-        if device_index == 0:
-            print(f"DEBUG: [FlashInferMLAMultiStepDraftBackend] init_forward_metadata_replay_cuda_graph completed", flush=True)
-
 
 def fast_mla_decode_plan(
     self,
