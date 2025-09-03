@@ -554,12 +554,12 @@ class MllamaTextCrossAttention(nn.Module):
             _, k, v = qkv_enc.split(
                 [self.q_local_size, self.kv_local_size, self.kv_local_size], dim=-1
             )
-            k = k.reshape(-1, self.num_local_key_value_heads, self.head_dim)
+            k = k.view(-1, self.num_local_key_value_heads, self.head_dim)
             v = v.view(-1, self.num_local_key_value_heads, self.head_dim)
             k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(
                 -1, self.num_local_key_value_heads, self.head_dim
             )
-        q = q.reshape(-1, self.num_local_heads, self.head_dim)
+        q = q.view(-1, self.num_local_heads, self.head_dim)
         q = self.q_norm(q.reshape(-1, self.head_dim)).reshape(
             -1, self.num_local_heads, self.head_dim
         )
