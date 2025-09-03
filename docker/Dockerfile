@@ -1,5 +1,5 @@
 ARG CUDA_VERSION=12.6.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 as base
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
 
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
@@ -82,15 +82,16 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       12.9.1) CUINDEX=129 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
- && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
- && python3 -m flashinfer --download-cubin \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${${SGL_KERNEL_VERSION}}/sgl_kernel-${${SGL_KERNEL_VERSION}}+cu128-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu128-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
     fi \
  && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${${SGL_KERNEL_VERSION}}/sgl_kernel-${${SGL_KERNEL_VERSION}}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
     fi \
-  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
+ && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+ && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
+ && python3 -m flashinfer --download-cubin
+
 
 # Download source files
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
@@ -196,7 +197,7 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     black \
     isort \
     icdiff \
-    scikit_build_core \
+    scikit-build-core \
     uv \
     pre-commit \
     pandas \
@@ -394,7 +395,7 @@ setopt HIST_FIND_NO_DUPS
 setopt INC_APPEND_HISTORY
 EOF
 
-RUN set -euxo ; \
+RUN set -euxo pipefail ; \
     curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
 
 # Set workspace directory
