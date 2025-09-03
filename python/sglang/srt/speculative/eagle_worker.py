@@ -190,7 +190,7 @@ class EAGLEWorker(TpModelWorker):
         # Initialize decode attention backend
         self.draft_attn_backend = self._create_decode_backend()
 
-        # Initialize prefill attention backend
+        # Initialize draft extend attention backend (respects speculative_attention_backend setting)
         self.draft_extend_attn_backend = self._create_draft_extend_backend()
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
@@ -225,20 +225,32 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _create_draft_extend_backend(self):
-        backend_map = {
-            "flashinfer": self._create_flashinfer_prefill_backend,
-            "triton": self._create_triton_prefill_backend,
-            "aiter": self._create_aiter_prefill_backend,
-            "fa3": self._create_fa3_prefill_backend,
-            "trtllm_mha": self._create_trtllm_mha_prefill_backend,
-            "trtllm_mla": self._create_trtllm_mla_prefill_backend,
-        }
+        # Use the specified backend for speculative operations (both verify and draft extend)
+        if self.server_args.speculative_attention_backend == "decode":
+            # Use decode backend methods for speculative operations
+            backend_map = {
+                "flashinfer": self._create_flashinfer_decode_backend,
+                "triton": self._create_triton_decode_backend,
+                "aiter": self._create_aiter_decode_backend,
+                "fa3": self._create_fa3_decode_backend,
+                "trtllm_mha": self._create_trtllm_mha_decode_backend,
+                "trtllm_mla": self._create_trtllm_mla_decode_backend,
+            }
+            backend_name = "decode_attention_backend"
+            error_msg = "EAGLE is not supported in decode attention backend {backend_type}"
+        else:  # default to prefill
+            backend_map = {
+                "flashinfer": self._create_flashinfer_prefill_backend,
+                "triton": self._create_triton_prefill_backend,
+                "aiter": self._create_aiter_prefill_backend,
+                "fa3": self._create_fa3_prefill_backend,
+                "trtllm_mha": self._create_trtllm_mha_prefill_backend,
+                "trtllm_mla": self._create_trtllm_mla_prefill_backend,
+            }
+            backend_name = "prefill_attention_backend"
+            error_msg = "EAGLE is not supported in prefill attention backend {backend_type}"
 
-        return self._create_backend(
-            "prefill_attention_backend",
-            backend_map,
-            "EAGLE is not supported in prefill attention backend {backend_type}",
-        )
+        return self._create_backend(backend_name, backend_map, error_msg)
 
     def _create_flashinfer_decode_backend(self):
         if not global_server_args_dict["use_mla_backend"]:
