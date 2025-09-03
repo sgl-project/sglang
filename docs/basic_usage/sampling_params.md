@@ -303,3 +303,5 @@ response = requests.post(
 )
 print(response.json())
 ```
+
+Note, request `output_token_ids` are updated in a race with custom logit processor application unless `--disable-overlap-schedule` is set. See https://github.com/sgl-project/sglang/issues/8056.
