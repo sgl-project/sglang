@@ -1546,7 +1546,7 @@ def deepep_fp8_quant_to_static_per_tensor_quant(
     assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
     assert output_scale.numel() == 1
 
-    K_BLOCK_SIZE = 512
+    K_BLOCK_SIZE = 1024
     assert x.size(2) % K_BLOCK_SIZE == 0
     grid = (x.size(2) // K_BLOCK_SIZE, 32, x.size(0))
     _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
