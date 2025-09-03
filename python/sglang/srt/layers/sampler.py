@@ -111,7 +111,7 @@ class Sampler(nn.Module):
                             top_p_normalize_probs_torch(probs, sampling_info.top_ps)
                         ).clamp(min=torch.finfo(probs.dtype).min)
 
-                    max_top_k_round, batch_size = 32, probs.shape[0]
+                    # max_top_k_round, batch_size = 32, probs.shape[0]
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
