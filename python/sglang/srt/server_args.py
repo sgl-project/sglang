@@ -86,6 +86,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
     "torch_native",
+    "flex_attention",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -522,6 +523,12 @@ class ServerArgs:
         if self.attention_backend == "torch_native":
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
+            )
+            self.disable_cuda_graph = True
+        
+        if self.attention_backend == "flex_attention":
+            logger.warning(
+                "Cuda graph is disabled because of using torch Flex Attention backend"
             )
             self.disable_cuda_graph = True
 

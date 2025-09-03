@@ -1532,6 +1532,12 @@ class ModelRunner:
             )
 
             return TorchNativeAttnBackend(self)
+        elif backend_str == "flex_attention":
+            from sglang.srt.layers.attention.torch_flex_backend import (
+                TorchFlexAttnBackend,
+            )
+
+            return TorchFlexAttnBackend(self)
         elif backend_str == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
