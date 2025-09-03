@@ -4,7 +4,7 @@ struct InputArray {
 };
 
 template <int N>
-__global__ void copy_to_gpu_no_ce_kernel(InputArray<T> input_array, const int* output) {
+__global__ void copy_to_gpu_no_ce_kernel(InputArray<N> input_array, const int* output) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < N) {
         output[idx] = input_array.values[idx];
@@ -23,7 +23,7 @@ void copy_to_gpu_no_ce_impl(const std::vector<int>& input, at::Tensor& output) {
   dim3 grid(1);
   dim3 block(input.size());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  copy_to_gpu_no_ce_kernel<<<grid, block, 0, stream>>>(input_array, output.data_ptr();
+  copy_to_gpu_no_ce_kernel<<<grid, block, 0, stream>>>(input_array, output.data_ptr());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
