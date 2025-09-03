@@ -22,7 +22,7 @@ class TestHiCacheStorageBenchmark(HiCacheStorageBaseTest):
     @classmethod
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--tp-size": 2}
+        server_args = {"--tp-size": 2, "--hicache-ratio": 1.5}
         return server_args, {}
 
     def flush_cache(self) -> bool:
@@ -43,7 +43,7 @@ class TestHiCacheStorageBenchmark(HiCacheStorageBaseTest):
         args_initial = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=400,
             max_new_tokens=512,
             parallel=32,
             host=f"http://{self.base_host}",
@@ -121,7 +121,7 @@ class TestHiCacheStorageBenchmark(HiCacheStorageBaseTest):
         # Second benchmark, should use remote cache
         res2 = self._run_throughput_benchmark(
             test_name="hicache_online_throughput",
-            num_prompts=200,
+            num_prompts=400,
             request_rate=10,
             additional_args=[],
         )
