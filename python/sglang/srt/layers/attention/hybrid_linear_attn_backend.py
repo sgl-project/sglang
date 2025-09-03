@@ -295,23 +295,21 @@ class MambaAttnBackend(AttentionBackend):
         g = fused_gdn_gating(A_log, a, dt_bias)
         g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
         recurrent_state = ssm_states[self.forward_metadata.mamba_cache_indices]
-        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            initial_state=recurrent_state,  # unified use existing state (zeros for new sequences)
-            output_final_state=True,
-            cu_seqlens=query_start_loc,
-            head_first=False,
-            use_qk_l2norm_in_kernel=True,
-        )
 
-        last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-        if not forward_batch.forward_mode.is_target_verify():
-            ssm_states[self.forward_metadata.mamba_cache_indices] = last_recurrent_state
-        else:
+        if forward_batch.forward_mode.is_target_verify():
+            # since target verify usually use small seq lens (num_draft_tokens)
+            # it's faster to use fused_recurrent_gated_delta_rule_update
+            core_attn_out = fused_recurrent_gated_delta_rule_update(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+            )
             query_cache[self.forward_metadata.mamba_cache_indices] = query.view(
                 (-1,) + query_cache.shape[1:]
             )
@@ -327,6 +325,22 @@ class MambaAttnBackend(AttentionBackend):
             beta_cache[self.forward_metadata.mamba_cache_indices] = beta.view(
                 (-1,) + beta_cache.shape[1:]
             )
+        else:
+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,  # unified use existing state (zeros for new sequences)
+                output_final_state=True,
+                cu_seqlens=query_start_loc,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+            ssm_states[self.forward_metadata.mamba_cache_indices] = last_recurrent_state
+
         return core_attn_out
 
 
@@ -535,18 +549,17 @@ class HybridLinearAttnBackend(AttentionBackend):
                     cache_indices=state_indices_tensor,
                     query_start_loc=query_start_loc,
                 )
-                _, last_recurrent_state = chunk_gated_delta_rule(
-                    q=query,
-                    k=key,
-                    v=value,
+
+                # we do in-place update for ssm_state
+                _ = fused_recurrent_gated_delta_rule_update(
+                    query=query,
+                    key=key,
+                    value=value,
                     g=g,
                     beta=beta,
-                    initial_state=ssm_state[state_indices_tensor],
-                    output_final_state=True,
+                    initial_state_source=ssm_state,
+                    initial_state_indices=state_indices_tensor,
                     cu_seqlens=query_start_loc,
-                    head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )
-                ssm_state[state_indices_tensor] = last_recurrent_state.to(
-                    ssm_state.dtype, copy=False
-                )
+q
