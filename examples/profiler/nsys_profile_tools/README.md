@@ -109,7 +109,7 @@ There's also an appended data table underneath the bar chart for copying out to
 Suppose the user would like to focus on improving triton kernels. It's not the
 biggest consumer of cycles at .01 sec but perhaps it hasn't been optimized.
 The next step is to use the result.csv to dive into what the kernels are which
-compose the triton kernel GPU cycles. 
+compose the triton kernel GPU cycles.
 
 ## Example 2: analyze multiple profiles
 
