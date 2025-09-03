@@ -114,9 +114,6 @@ class EPMoE(FusedMoE):
             with_bias=with_bias,
         )
 
-        self.start_expert_id = self.moe_ep_rank * self.num_local_experts
-        self.end_expert_id = self.start_expert_id + self.num_local_experts - 1
-
         self.intermediate_size = intermediate_size
 
         if isinstance(quant_config, Fp8Config):
@@ -232,7 +229,7 @@ class EPMoE(FusedMoE):
             (
                 _cast_to_e8m0_with_rounding_up(gateup_input_scale)
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
+                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                     gateup_input_scale
                 )
             ),
@@ -289,9 +286,7 @@ class EPMoE(FusedMoE):
             (
                 down_input_scale
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
-                    down_input_scale
-                )
+                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(down_input_scale)
             ),
         )
         down_output = torch.empty(
@@ -746,19 +741,25 @@ class DeepEPMoE(EPMoE):
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[self.w13_weight],
-            scale=[self.w13_weight_scale.to(output_dtype)],
-            per_token_scale=[pertoken_scale],
             split_item=2,
             group_list_type=group_list_type,
             group_type=0,
             group_list=seg_indptr,
-            output_dtype=output_dtype,
+            output_dtype=torch.int32,
         )[0]
 
         # act_fn: swiglu
-        hidden_states = torch_npu.npu_swiglu(hidden_states)
-
-        hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+        hidden_states, swiglu_out_scale = torch_npu.npu_dequant_swiglu_quant(
+            x=hidden_states,
+            weight_scale=self.w13_weight_scale.to(torch.float32),
+            activation_scale=pertoken_scale,
+            bias=None,
+            quant_scale=None,
+            quant_offset=None,
+            group_index=seg_indptr,
+            activate_left=True,
+            quant_mode=1,
+        )
 
         # gmm2: down_proj
         hidden_states = torch_npu.npu_grouped_matmul(

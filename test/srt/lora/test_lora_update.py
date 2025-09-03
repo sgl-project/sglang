@@ -870,6 +870,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             disable_cuda_graph=self.disable_cuda_graph,
             cuda_graph_max_bs=self.cuda_graph_max_bs,
             enable_lora=self.enable_lora,
+            disable_radix_cache=True,
         )
         self.handle.__enter__()
         return self
@@ -1004,6 +1005,7 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             "1",
             "--mem-fraction-static",
             str(MEM_FRACTION_STATIC),
+            "--disable-radix-cache",
         ]
         if self.enable_lora:
             other_args.append("--enable-lora")
