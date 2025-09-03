@@ -89,7 +89,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--url",
         type=str,
-        default="http://localhost:30000",
+        default="http://localhost:33333",
         help="Server or API base url if not using http host and port.",
     )
     parser.add_argument(
