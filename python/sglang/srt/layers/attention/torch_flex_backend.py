@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
@@ -26,13 +26,13 @@ class TorchFlexAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         pass
-    
+
     def _causal_mask(self, b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
-    
+
     def _decode_mask(self, b, h, q_idx, kv_idx):
         return q_idx == q_idx
-    
+
     def _run_sdpa_forward_extend(
         self,
         query: torch.Tensor,
@@ -105,12 +105,14 @@ class TorchFlexAttnBackend(AttentionBackend):
             if causal:
                 seq_len_q = seq_len_kv
                 mask_mod = create_block_mask(
-                    self._causal_mask, 
-                    None, None, 
-                    seq_len_q, seq_len_kv,
+                    self._causal_mask,
+                    None,
+                    None,
+                    seq_len_q,
+                    seq_len_kv,
                     device=query.device,
                     _compile=False,
-                    )
+                )
             else:
                 raise ValueError("We only support causal attention for now.")
 
@@ -185,8 +187,10 @@ class TorchFlexAttnBackend(AttentionBackend):
 
             mask_mod = create_block_mask(
                 self._decode_mask,
-                None, None,
-                seq_len_q, seq_len_kv,
+                None,
+                None,
+                seq_len_q,
+                seq_len_kv,
                 device=query.device,
                 _compile=False,
             )
@@ -235,7 +239,7 @@ class TorchFlexAttnBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
-            
+
         self._run_sdpa_forward_extend(
             q_,
             o_,
