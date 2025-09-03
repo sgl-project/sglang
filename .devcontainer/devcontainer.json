@@ -19,7 +19,8 @@
     "forwardPorts": [],
     "runArgs": [
         "--gpus",
-        "all"
+        "all",
+        "--shm-size=10g"
     ],
     // The two lines below ensures that your local changes in the sglang
     // repo is automatically synced to the sglang pip package installed
