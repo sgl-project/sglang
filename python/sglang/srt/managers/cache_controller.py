@@ -407,6 +407,7 @@ class HiCacheController:
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             is_mla_model=is_mla_backend,
+            is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             extra_config=extra_config,
         )
@@ -647,9 +648,9 @@ class HiCacheController:
             operation.increment(get_result * self.page_size)
 
     def _generic_page_get(self, operation, hash_values, host_indices):
-        dummy_page_dst = [self.mem_pool_host.get_dummy_flat_data_page()] * len(
-            hash_values
-        )
+        dummy_page_dst = [
+            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
+        ]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
             return
