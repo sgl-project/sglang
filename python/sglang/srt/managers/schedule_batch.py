@@ -1372,12 +1372,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
-    def new_page_count_next_decode(self, selected_reqs: Optional[List[int]] = None):
+    def new_page_count_next_decode(self, selected_indices: Optional[List[int]] = None):
         page_size = self.token_to_kv_pool_allocator.page_size
         requests = (
             self.reqs
-            if selected_reqs is None
-            else [self.reqs[i] for i in selected_reqs]
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
         )
         if page_size == 1:
             return len(requests)
@@ -1390,10 +1390,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def check_decode_mem(
-        self, buf_multiplier=1, selected_reqs: Optional[List[int]] = None
+        self, buf_multiplier=1, selected_indices: Optional[List[int]] = None
     ):
         num_tokens = (
-            self.new_page_count_next_decode(selected_reqs)
+            self.new_page_count_next_decode(selected_indices)
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
