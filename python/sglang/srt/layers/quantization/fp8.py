@@ -675,6 +675,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes2 = torch.empty(
                     num_experts, 3, device=w13_weight.device, dtype=torch.int32
                 )
+                self.a_sf_layout = torch.empty(
+                    num_experts, 5, device=w13_weight.device, dtype=torch.int32
+                )
+                self.w_sf_layout = torch.empty(
+                    num_experts, 5, device=w13_weight.device, dtype=torch.int32
+                )
 
         else:
             # Allocate 2 scales for w1 and w3 respectively.
@@ -1035,10 +1041,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             topk_weights, topk_ids, _ = topk_output
             output = cutlass_fused_experts_fp8(
                 x,
-                layer.w13_weight.transpose(1, 2),
-                layer.w2_weight.transpose(1, 2),
-                layer.w13_weight_scale_inv.transpose(1, 2),
-                layer.w2_weight_scale_inv.transpose(1, 2),
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
                 topk_weights,
                 topk_ids,
                 self.ab_strides1,
@@ -1054,6 +1060,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.expert_offsets,
                 self.problem_sizes1,
                 self.problem_sizes2,
+                self.a_sf_layout,
+                self.w_sf_layout,
                 use_fp8_blockscale=True,
             )
             # Scale by routed_scaling_factor is fused into select_experts.
