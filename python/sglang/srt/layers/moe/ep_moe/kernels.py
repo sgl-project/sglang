@@ -1502,7 +1502,6 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     masked_m_ptr,
     output_scale_ptr,
     output_ptr,
-    num_groups,
     m,
     k,
     K_SCALE_BLOCK_SIZE: tl.constexpr,
@@ -1557,7 +1556,6 @@ def deepep_fp8_quant_to_static_per_tensor_quant(
         masked_m,
         output_scale,
         output,
-        x.size(0),
         x.size(1),
         x.size(2),
         K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
@@ -1579,8 +1577,6 @@ def _silu_mul_and_static_tensor_quant_kernel(
     masked_m_ptr,
     scale_ptr,
     size_n,
-    fp8_max,
-    fp8_min,
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
 ):
@@ -1663,10 +1659,6 @@ def silu_mul_and_per_tensor_static_quant_fwd(
         expert_num,
     )
 
-    finfo = torch.finfo(torch.float8_e4m3fn)
-    fp8_max = finfo.max
-    fp8_min = -fp8_max
-
     _silu_mul_and_static_tensor_quant_kernel[grid](
         input,
         *input.stride(),
@@ -1675,8 +1667,6 @@ def silu_mul_and_per_tensor_static_quant_fwd(
         masked_m,
         output_scale,
         size_n,
-        fp8_max,
-        fp8_min,
         BLOCK_N=BLOCK_N,
         NUM_STAGE=NUM_STAGES,
         num_warps=1,

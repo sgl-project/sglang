@@ -215,7 +215,6 @@ def cutlass_w4a8_moe_deepep_ll(
     w2_q: torch.Tensor,
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     masked_m: torch.Tensor,
     a_strides1: torch.Tensor,
@@ -234,7 +233,6 @@ def cutlass_w4a8_moe_deepep_ll(
 ):
     a, a_scale = a_fp8
     assert a.shape[2] // 2 == w1_q.shape[2], "Hidden size mismatch w1"
-    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.int8
     assert w2_q.dtype == torch.int8
     assert w1_q.shape[2] * 2 == w2_q.shape[1], "Hidden size mismatch w2"

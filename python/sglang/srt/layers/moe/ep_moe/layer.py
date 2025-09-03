@@ -657,7 +657,6 @@ class DeepEPMoE(EPMoE):
         return self.quant_method.apply_deepep_ll(
             layer=self,
             x=dispatch_output.hidden_states_fp8,
-            topk_weights=dispatch_output.topk_weights,
             topk_ids=dispatch_output.topk_idx,
             masked_m=dispatch_output.masked_m,
         )

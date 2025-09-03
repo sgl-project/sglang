@@ -336,7 +336,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self,
         layer: DeepEPMoE,
         x: Tuple[torch.Tensor, torch.Tensor],
-        topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         masked_m: torch.Tensor,
     ) -> torch.Tensor:
@@ -348,7 +347,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             w2_q=layer.w2_weight,
             w1_scale=layer.w13_weight_scale_inv,
             w2_scale=layer.w2_weight_scale_inv,
-            topk_weights=topk_weights,
             topk_ids=topk_ids,
             masked_m=masked_m,
             a_strides1=self.a_strides1,
