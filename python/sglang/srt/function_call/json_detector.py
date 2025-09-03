@@ -573,8 +573,14 @@ class JSONDetector:
 
             return res
 
+        except json.JSONDecodeError as e:
+            # JSON parsing errors are expected during streaming when receiving incomplete JSON
+            # This is normal behavior, not an actual error
+            logger.debug(f"JSON parsing failed during streaming (expected): {e}")
+            return StreamingParseResult()
         except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}")
+            # Only log actual unexpected errors
+            logger.error(f"Unexpected error in parse_streaming_increment: {e}")
             return StreamingParseResult()
 
     def supports_structural_tag(self) -> bool:

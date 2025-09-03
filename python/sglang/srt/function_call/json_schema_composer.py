@@ -26,6 +26,96 @@ class JSONSchemaComposer:
     implementation and provides a unified schema that works across different model formats.
     """
 
+    TYPE_ALIASES = {
+        "int": "integer",
+        "long": "integer",
+        "short": "integer",
+        "float": "number",
+        "double": "number",
+        "bool": "boolean",
+        "str": "string",
+        "dict": "object",
+        "map": "object",
+    }
+    
+    SCHEMA_FIELDS = ("anyOf", "oneOf", "allOf")
+    CONDITIONAL_FIELDS = ("not", "if", "then", "else")
+    DEFS_FIELDS = ("$defs", "definitions")
+
+    @staticmethod
+    def _normalize_schema(schema: Any) -> Any:
+        """Normalize schema to valid JSON Schema types with optimized performance."""
+        if not isinstance(schema, dict):
+            return schema
+
+        # Only create a copy if we need to modify the schema
+        normalized = schema.copy()
+
+        # Normalize the 'type' field which can be string or list of strings
+        if "type" in normalized:
+            t = normalized["type"]
+            if isinstance(t, str):
+                alias = JSONSchemaComposer.TYPE_ALIASES.get(t)
+                if alias is not None:
+                    normalized["type"] = alias
+            elif isinstance(t, list):
+                # Only create new list if we need to modify it
+                new_types = []
+                modified = False
+                for x in t:
+                    alias = JSONSchemaComposer.TYPE_ALIASES.get(x)
+                    if alias is not None:
+                        new_types.append(alias)
+                        modified = True
+                    else:
+                        new_types.append(x)
+                if modified:
+                    normalized["type"] = new_types
+
+        # Recurse into known schema-carrying fields - only if they exist
+        properties = normalized.get("properties")
+        if properties and isinstance(properties, dict):
+            normalized["properties"] = {
+                k: JSONSchemaComposer._normalize_schema(v) 
+                for k, v in properties.items()
+            }
+
+        items = normalized.get("items")
+        if items is not None:
+            normalized["items"] = JSONSchemaComposer._normalize_schema(items)
+
+        prefix_items = normalized.get("prefixItems")
+        if prefix_items and isinstance(prefix_items, list):
+            normalized["prefixItems"] = [
+                JSONSchemaComposer._normalize_schema(item) 
+                for item in prefix_items
+            ]
+
+        # Process schema fields (anyOf, oneOf, allOf)
+        for key in JSONSchemaComposer.SCHEMA_FIELDS:
+            field_value = normalized.get(key)
+            if field_value and isinstance(field_value, list):
+                normalized[key] = [
+                    JSONSchemaComposer._normalize_schema(s) for s in field_value
+                ]
+
+        # Process conditional fields (not, if, then, else)
+        for key in JSONSchemaComposer.CONDITIONAL_FIELDS:
+            field_value = normalized.get(key)
+            if field_value and isinstance(field_value, dict):
+                normalized[key] = JSONSchemaComposer._normalize_schema(field_value)
+
+        # Normalize nested definitions if present
+        for defs_key in JSONSchemaComposer.DEFS_FIELDS:
+            defs_value = normalized.get(defs_key)
+            if defs_value and isinstance(defs_value, dict):
+                normalized[defs_key] = {
+                    name: JSONSchemaComposer._normalize_schema(def_schema)
+                    for name, def_schema in defs_value.items()
+                }
+
+        return normalized
+
     @staticmethod
     def build_json_schema(
         tools: List[Tool],
@@ -45,19 +135,16 @@ class JSONSchemaComposer:
             JSON schema dict or None if no tools allowed
         """
         # Handle no tools case
-        if tool_choice == "none" or tools is None or len(tools) == 0:
+        if tool_choice == "none" or not tools:
             return None
 
-        # Handle named tool case
+        # Handle named tool case - optimized with dict lookup
         if isinstance(tool_choice, dict) and "function" in tool_choice:
             tool_name = tool_choice["function"]["name"]
-            # Find the specific tool
-            target_tool = None
-            for tool in tools:
-                if tool.function.name == tool_name:
-                    target_tool = tool
-                    break
-
+            # Create tool name lookup for O(1) access instead of O(n)
+            tool_lookup = {tool.function.name: tool for tool in tools}
+            target_tool = tool_lookup.get(tool_name)
+            
             if target_tool is None:
                 raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
 
@@ -77,11 +164,14 @@ class JSONSchemaComposer:
     @staticmethod
     def _build_tool_schema(tool: Tool) -> Dict[str, Any]:
         """Generate schema for a single tool."""
+        normalized_params = JSONSchemaComposer._normalize_schema(
+            tool.function.parameters or {"type": "object", "properties": {}}
+        )
+
         return {
             "properties": {
                 "name": {"type": "string", "const": tool.function.name},
-                "parameters": tool.function.parameters
-                or {"type": "object", "properties": {}},
+                "parameters": normalized_params,
             },
             "required": ["name", "parameters"],
         }
@@ -94,9 +184,10 @@ class JSONSchemaComposer:
             if tool.function.parameters and "$defs" in tool.function.parameters:
                 tool_defs = tool.function.parameters["$defs"]
                 for def_name, def_schema in tool_defs.items():
+                    normalized_def_schema = JSONSchemaComposer._normalize_schema(def_schema)
                     if def_name not in all_defs:
-                        all_defs[def_name] = def_schema
-                    elif all_defs[def_name] != def_schema:
+                        all_defs[def_name] = normalized_def_schema
+                    elif all_defs[def_name] != normalized_def_schema:
                         raise ValueError(
                             f"Tool definition '{def_name}' has multiple schemas, "
                             "which is not supported."
@@ -109,18 +200,30 @@ class JSONSchemaComposer:
         json_schema = {
             "type": "array",
             "minItems": min_items,
-            "items": {
-                "type": "object",
-                "anyOf": [
-                    JSONSchemaComposer._build_tool_schema(tool) for tool in tools
-                ],
-            },
         }
 
-        # Add $defs if present
-        all_defs = JSONSchemaComposer._extract_defs_from_tools(tools)
-        if all_defs:
-            json_schema["$defs"] = all_defs
+        # Avoid anyOf when there's only one tool to maintain compatibility with xGrammar
+        if len(tools) == 1:
+            json_schema["items"] = {
+                "type": "object",
+                **JSONSchemaComposer._build_tool_schema(tools[0]),
+            }
+        else:
+            # Pre-build tool schemas to avoid repeated computation
+            tool_schemas = [JSONSchemaComposer._build_tool_schema(tool) for tool in tools]
+            json_schema["items"] = {
+                "type": "object",
+                "anyOf": tool_schemas,
+            }
+
+        # Add $defs if present - only extract if we have multiple tools or complex schemas
+        if len(tools) > 1 or any(
+            tool.function.parameters and "$defs" in tool.function.parameters 
+            for tool in tools
+        ):
+            all_defs = JSONSchemaComposer._extract_defs_from_tools(tools)
+            if all_defs:
+                json_schema["$defs"] = all_defs
 
         return json_schema
 
