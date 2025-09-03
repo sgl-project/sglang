@@ -590,7 +590,7 @@ class DeepEPMoE(EPMoE):
         )
         output_index = torch.empty_like(topk_idx)
 
-        if len(num_recv_tokens_per_expert) == 72:
+        if len(num_recv_tokens_per_expert) in {64, 72}:
             num_recv_tokens_per_expert_gpu = copy_to_gpu_no_ce_wrapped(num_recv_tokens_per_expert)
         else:
             num_recv_tokens_per_expert_gpu = torch.tensor(
