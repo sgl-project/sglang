@@ -492,6 +492,59 @@ class DefaultModelLoader(BaseModelLoader):
             model_config.model_path, model_config.revision, fall_back_to_pt=True
         )
 
+    def _load_modelopt_base_model(self, model_config: ModelConfig) -> nn.Module:
+        """Load and prepare the base model for ModelOpt quantization.
+
+        This method handles the common model loading logic shared between
+        DefaultModelLoader (conditional) and ModelOptModelLoader (dedicated).
+        """
+
+        hf_config = AutoConfig.from_pretrained(
+            model_config.model_path, trust_remote_code=True
+        )
+        with init_empty_weights():
+            torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
+            model = AutoModelForCausalLM.from_config(
+                hf_config, torch_dtype=torch_dtype, trust_remote_code=True
+            )
+        max_memory = get_max_memory()
+        inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
+
+        on_cpu = "cpu" in inferred_device_map.values()
+        gpu_mem_percentage = 0.8
+        model_kwargs = {"torch_dtype": "auto"}
+        device_map = "auto"
+
+        if on_cpu:
+            for device in max_memory.keys():
+                if isinstance(device, int):
+                    max_memory[device] *= gpu_mem_percentage
+
+            print(
+                "Model does not fit to the GPU mem. "
+                f"We apply the following memory limit for calibration: \n{max_memory}\n"
+                "If you hit GPU OOM issue, please adjust `gpu_mem_percentage` or "
+                "reduce the calibration `batch_size` manually."
+            )
+            model_kwargs["max_memory"] = max_memory
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_config.model_path,
+            device_map=device_map,
+            **model_kwargs,
+            trust_remote_code=True,
+        )
+        logger.info(f"ModelOpt quantization requested: {model_config.modelopt_quant}")
+
+        quant_choice_str = model_config.modelopt_quant
+        if not isinstance(quant_choice_str, str):
+            raise TypeError(
+                f"modelopt_quant must be a string preset key (e.g., 'fp8'), "
+                f"got {type(quant_choice_str)}"
+            )
+
+        return model
+
     def load_model(
         self,
         *,
@@ -500,65 +553,11 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> nn.Module:
 
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
-
-            from accelerate import infer_auto_device_map, init_empty_weights
-            from accelerate.utils import get_max_memory
-            from transformers import AutoConfig, AutoModelForCausalLM
-
-            hf_config = AutoConfig.from_pretrained(
-                model_config.model_path, trust_remote_code=True
-            )
-            with init_empty_weights():
-                torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
-                model = AutoModelForCausalLM.from_config(
-                    hf_config, torch_dtype=torch_dtype, trust_remote_code=True
-                )
-            max_memory = get_max_memory()
-            inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
-
-            on_cpu = "cpu" in inferred_device_map.values()
-            gpu_mem_percentage = 0.8
-            model_kwargs = {"torch_dtype": "auto"}
-            device_map = "auto"
-
-            if on_cpu:
-                for device in max_memory.keys():
-                    if isinstance(device, int):
-                        max_memory[device] *= gpu_mem_percentage
-
-                print(
-                    "Model does not fit to the GPU mem. "
-                    f"We apply the following memory limit for calibration: \n{max_memory}\n"
-                    "If you hit GPU OOM issue, please adjust `gpu_mem_percentage` or "
-                    "reduce the calibration `batch_size` manually."
-                )
-                model_kwargs["max_memory"] = max_memory
-
-            model = AutoModelForCausalLM.from_pretrained(
-                model_config.model_path,
-                device_map=device_map,
-                **model_kwargs,
-                trust_remote_code=True,
-            )
-            logger.info(
-                f"ModelOpt quantization requested: {model_config.modelopt_quant}"
-            )
-            try:
-                import modelopt.torch.quantization as mtq
-                from modelopt.torch.utils.dataset_utils import create_forward_loop
-            except ImportError:
-                logger.error(
-                    "NVIDIA Model Optimizer (modelopt) library not found. "
-                    "Please install it to use 'modelopt_quant' feature."
-                )
-                raise
-
-            quant_choice_str = model_config.modelopt_quant
-            if not isinstance(quant_choice_str, str):
-                raise TypeError(
-                    f"modelopt_quant must be a string preset key (e.g., 'fp8'), "
-                    f"got {type(quant_choice_str)}"
-                )
+            # Load base model using shared method
+            model = self._load_modelopt_base_model(model_config)
+            # Note: DefaultModelLoader doesn't do additional quantization processing
+            # For full ModelOpt quantization, use ModelOptModelLoader
+            return model.eval()
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
@@ -1763,42 +1762,10 @@ class ModelOptModelLoader(DefaultModelLoader):
 
         logger.info("ModelOptModelLoader: Loading base model...")
 
-        hf_config = AutoConfig.from_pretrained(
-            model_config.model_path, trust_remote_code=True
-        )
-        with init_empty_weights():
-            torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
-            model = AutoModelForCausalLM.from_config(
-                hf_config, torch_dtype=torch_dtype, trust_remote_code=True
-            )
-        max_memory = get_max_memory()
-        inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
+        # Use shared method from parent class to load base model
+        model = self._load_modelopt_base_model(model_config)
 
-        on_cpu = "cpu" in inferred_device_map.values()
-        gpu_mem_percentage = 0.8
-        model_kwargs = {"torch_dtype": "auto"}
-        device_map = "auto"
-
-        if on_cpu:
-            for device in max_memory.keys():
-                if isinstance(device, int):
-                    max_memory[device] *= gpu_mem_percentage
-
-            print(
-                "Model does not fit to the GPU mem. "
-                f"We apply the following memory limit for calibration: \n{max_memory}\n"
-                "If you hit GPU OOM issue, please adjust `gpu_mem_percentage` or "
-                "reduce the calibration `batch_size` manually."
-            )
-            model_kwargs["max_memory"] = max_memory
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_config.model_path,
-            device_map=device_map,
-            **model_kwargs,
-            trust_remote_code=True,
-        )
-        logger.info(f"ModelOpt quantization requested: {model_config.modelopt_quant}")
+        # Import ModelOpt modules (already done in _load_modelopt_base_model, but needed here for quantization)
         try:
             import modelopt.torch.quantization as mtq
             from modelopt.torch.utils.dataset_utils import create_forward_loop
@@ -1810,11 +1777,6 @@ class ModelOptModelLoader(DefaultModelLoader):
             raise
 
         quant_choice_str = model_config.modelopt_quant
-        if not isinstance(quant_choice_str, str):
-            raise TypeError(
-                f"modelopt_quant must be a string preset key (e.g., 'fp8'), "
-                f"got {type(quant_choice_str)}"
-            )
 
         quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
         if not quant_cfg_name:
