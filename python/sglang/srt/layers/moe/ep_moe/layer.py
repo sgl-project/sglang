@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel.elementwise import copy_to_gpu_no_ce
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sgl_kernel.elementwise import copy_to_gpu_no_ce
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe import (
@@ -598,7 +601,7 @@ class DeepEPMoE(EPMoE):
         output_index = torch.empty_like(topk_idx)
 
         if len(num_recv_tokens_per_expert) in {64, 72}:
-            num_recv_tokens_per_expert_gpu = copy_to_gpu_no_ce_wrapped(
+            num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
                 num_recv_tokens_per_expert
             )
         else:
@@ -847,7 +850,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
     return FusedMoE
 
 
-def copy_to_gpu_no_ce_wrapped(arr: List[int]):
+def copy_list_to_gpu_no_ce(arr: List[int]):
     tensor_cpu = torch.tensor(arr, dtype=torch.int32, device="cpu")
     tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
     copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
