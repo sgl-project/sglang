@@ -5,7 +5,6 @@ import sys
 from typing import Dict, List, Optional
 
 from sglang_router import Router
-from sglang_router_rs import PolicyType
 
 logger = logging.getLogger("router")
 
@@ -560,17 +559,6 @@ class RouterArgs:
         return [url[0] for url in decode_list]
 
 
-def policy_from_str(policy_str: str) -> PolicyType:
-    """Convert policy string to PolicyType enum."""
-    policy_map = {
-        "random": PolicyType.Random,
-        "round_robin": PolicyType.RoundRobin,
-        "cache_aware": PolicyType.CacheAware,
-        "power_of_two": PolicyType.PowerOfTwo,
-    }
-    return policy_map[policy_str]
-
-
 def launch_router(args: argparse.Namespace) -> Optional[Router]:
     """
     Launch the SGLang router with the configuration from parsed arguments.
@@ -590,34 +578,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             router_args = args
 
         router_args._validate_router_args()
-
         router_args_dict = vars(router_args)
-
-        router_args_dict["worker_urls"] = (
-            []
-            if router_args.service_discovery or router_args.pd_disaggregation
-            else router_args.worker_urls
-        )
-        router_args_dict["policy"] = policy_from_str(router_args.policy)
-        router_args_dict["prefill_urls"] = (
-            router_args.prefill_urls if router_args.pd_disaggregation else None
-        )
-        router_args_dict["decode_urls"] = (
-            router_args.decode_urls if router_args.pd_disaggregation else None
-        )
-        router_args_dict["prefill_policy"] = (
-            policy_from_str(router_args.prefill_policy)
-            if router_args.prefill_policy
-            else None
-        )
-        router_args_dict["decode_policy"] = (
-            policy_from_str(router_args.decode_policy)
-            if router_args.decode_policy
-            else None
-        )
-
-        # Create router with unified constructor
-        router = Router(**router_args_dict)
+        router = Router.from_args_dict(router_args_dict)
 
         router.start()
         return router
