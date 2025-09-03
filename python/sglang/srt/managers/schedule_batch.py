@@ -1374,7 +1374,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def new_page_count_next_decode(self, selected_reqs: Optional[List[int]] = None):
         page_size = self.token_to_kv_pool_allocator.page_size
-        requests = self.reqs if selected_reqs is None else selected_reqs
+        requests = (
+            self.reqs
+            if selected_reqs is None
+            else [self.reqs[i] for i in selected_reqs]
+        )
         if page_size == 1:
             return len(requests)
         # In the decoding phase, the length of a request's KV cache should be
