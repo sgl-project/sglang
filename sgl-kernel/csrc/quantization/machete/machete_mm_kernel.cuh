@@ -270,7 +270,7 @@ struct MacheteKernelTemplate {
     // {Accum, C, C_layout, D, D}
     EpilogueArguments epilogue_arguments{};
 
-    // 创建尾操作参数：处理 w channel-quant 反量化 + a token-group-wise 反量化
+    //  w channel-wise dequant + a token-group-wise dequant
     if constexpr (with_channel_scales || with_token_scales) {
       epilogue_arguments = EpilogueArguments{
           ChTokScalesEpilogue::prepare_args(*maybe_ch_scales, *maybe_tok_scales), nullptr, {}, D_ptr, stride_Dt};
@@ -278,7 +278,7 @@ struct MacheteKernelTemplate {
       epilogue_arguments = EpilogueArguments{{}, nullptr, {}, D_ptr, stride_Dt};
     }
 
-    // 创建 mainloop 参数
+    // mainloop parameters
     if constexpr (with_group_scales && with_group_zeropoints) {
       auto stride_S_group = permute_layout<1, 0, 2>(*layout_S_group).stride();
       mainloop_arguments = MainloopArguments{
