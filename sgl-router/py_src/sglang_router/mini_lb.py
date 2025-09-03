@@ -53,7 +53,8 @@ class MiniLoadBalancer:
 
         # NOTE: too many arguments unsupported, just validate some important ones
         if router_args.policy != "random":
-            raise ValueError("MiniLB only supports random policy")
+            logger.warning("[MiniLB] Overriding policy to random")
+            router_args.policy = "random"
 
         if len(router_args.prefill_urls) == 0 or len(router_args.decode_urls) == 0:
             raise ValueError(
