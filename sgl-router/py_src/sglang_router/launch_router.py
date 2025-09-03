@@ -253,6 +253,7 @@ class RouterArgs:
             f"--{prefix}selector",
             type=str,
             nargs="+",
+            default=RouterArgs.selector,
             help="Label selector for Kubernetes service discovery (format: key1=value1 key2=value2)",
         )
         parser.add_argument(
@@ -270,12 +271,14 @@ class RouterArgs:
             f"--{prefix}prefill-selector",
             type=str,
             nargs="+",
+            default=RouterArgs.prefill_selector,
             help="Label selector for prefill server pods in PD mode (format: key1=value1 key2=value2)",
         )
         parser.add_argument(
             f"--{prefix}decode-selector",
             type=str,
             nargs="+",
+            default=RouterArgs.decode_selector,
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
         )
         # Prometheus configuration
@@ -448,117 +451,22 @@ class RouterArgs:
             use_router_prefix: If True, look for arguments with 'router-' prefix
         """
         prefix = "router_" if use_router_prefix else ""
-        worker_urls = getattr(args, "worker_urls", [])
+        # auto strip prefix from args
+        args_dict = vars(args)
+        args_dict = {
+            key.lstrip(prefix) if key.startswith(prefix) else key: args_dict[key]
+            for key in args_dict
+        }
 
-        # Parse PD URLs
-        prefill_urls = cls._parse_prefill_urls(getattr(args, f"{prefix}prefill", None))
-        decode_urls = cls._parse_decode_urls(getattr(args, f"{prefix}decode", None))
+        # parse special arguments
+        args_dict["prefill_urls"] = cls._parse_prefill_urls(args_dict["prefill"])
+        args_dict["decode_urls"] = cls._parse_decode_urls(args_dict["decode"])
+        args_dict["selector"] = cls._parse_selector(args_dict["selector"])
 
-        return cls(
-            worker_urls=worker_urls,
-            host=args.host,
-            port=args.port,
-            pd_disaggregation=getattr(args, f"{prefix}pd_disaggregation", False),
-            prefill_urls=prefill_urls,
-            decode_urls=decode_urls,
-            policy=getattr(args, f"{prefix}policy"),
-            prefill_policy=getattr(args, f"{prefix}prefill_policy", None),
-            decode_policy=getattr(args, f"{prefix}decode_policy", None),
-            worker_startup_timeout_secs=getattr(
-                args, f"{prefix}worker_startup_timeout_secs"
-            ),
-            worker_startup_check_interval=getattr(
-                args, f"{prefix}worker_startup_check_interval"
-            ),
-            cache_threshold=getattr(args, f"{prefix}cache_threshold"),
-            balance_abs_threshold=getattr(args, f"{prefix}balance_abs_threshold"),
-            balance_rel_threshold=getattr(args, f"{prefix}balance_rel_threshold"),
-            eviction_interval=getattr(args, f"{prefix}eviction_interval"),
-            max_tree_size=getattr(args, f"{prefix}max_tree_size"),
-            max_payload_size=getattr(args, f"{prefix}max_payload_size"),
-            dp_aware=getattr(args, f"{prefix}dp_aware", False),
-            api_key=getattr(args, f"{prefix}api_key", None),
-            log_dir=getattr(args, f"{prefix}log_dir", None),
-            log_level=getattr(args, f"{prefix}log_level", None),
-            service_discovery=getattr(args, f"{prefix}service_discovery", False),
-            selector=cls._parse_selector(getattr(args, f"{prefix}selector", None)),
-            service_discovery_port=getattr(args, f"{prefix}service_discovery_port"),
-            service_discovery_namespace=getattr(
-                args, f"{prefix}service_discovery_namespace", None
-            ),
-            prefill_selector=cls._parse_selector(
-                getattr(args, f"{prefix}prefill_selector", None)
-            ),
-            decode_selector=cls._parse_selector(
-                getattr(args, f"{prefix}decode_selector", None)
-            ),
-            bootstrap_port_annotation="sglang.ai/bootstrap-port",  # Mooncake-specific annotation
-            prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
-            prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
-            request_id_headers=getattr(args, f"{prefix}request_id_headers", None),
-            request_timeout_secs=getattr(
-                args, f"{prefix}request_timeout_secs", RouterArgs.request_timeout_secs
-            ),
-            max_concurrent_requests=getattr(
-                args,
-                f"{prefix}max_concurrent_requests",
-                RouterArgs.max_concurrent_requests,
-            ),
-            queue_size=getattr(
-                args,
-                f"{prefix}queue_size",
-                RouterArgs.queue_size,
-            ),
-            queue_timeout_secs=getattr(
-                args,
-                f"{prefix}queue_timeout_secs",
-                RouterArgs.queue_timeout_secs,
-            ),
-            rate_limit_tokens_per_second=getattr(
-                args,
-                f"{prefix}rate_limit_tokens_per_second",
-                RouterArgs.rate_limit_tokens_per_second,
-            ),
-            cors_allowed_origins=getattr(args, f"{prefix}cors_allowed_origins", []),
-            retry_max_retries=getattr(args, f"{prefix}retry_max_retries"),
-            retry_initial_backoff_ms=getattr(args, f"{prefix}retry_initial_backoff_ms"),
-            retry_max_backoff_ms=getattr(args, f"{prefix}retry_max_backoff_ms"),
-            retry_backoff_multiplier=getattr(args, f"{prefix}retry_backoff_multiplier"),
-            retry_jitter_factor=getattr(args, f"{prefix}retry_jitter_factor"),
-            cb_failure_threshold=getattr(args, f"{prefix}cb_failure_threshold"),
-            cb_success_threshold=getattr(args, f"{prefix}cb_success_threshold"),
-            cb_timeout_duration_secs=getattr(args, f"{prefix}cb_timeout_duration_secs"),
-            cb_window_duration_secs=getattr(args, f"{prefix}cb_window_duration_secs"),
-            disable_retries=getattr(args, f"{prefix}disable_retries", False),
-            disable_circuit_breaker=getattr(
-                args, f"{prefix}disable_circuit_breaker", False
-            ),
-            health_failure_threshold=getattr(
-                args,
-                f"{prefix}health_failure_threshold",
-                RouterArgs.health_failure_threshold,
-            ),
-            health_success_threshold=getattr(
-                args,
-                f"{prefix}health_success_threshold",
-                RouterArgs.health_success_threshold,
-            ),
-            health_check_timeout_secs=getattr(
-                args,
-                f"{prefix}health_check_timeout_secs",
-                RouterArgs.health_check_timeout_secs,
-            ),
-            health_check_interval_secs=getattr(
-                args,
-                f"{prefix}health_check_interval_secs",
-                RouterArgs.health_check_interval_secs,
-            ),
-            health_check_endpoint=getattr(
-                args, f"{prefix}health_check_endpoint", RouterArgs.health_check_endpoint
-            ),
-            model_path=getattr(args, f"{prefix}model_path", None),
-            tokenizer_path=getattr(args, f"{prefix}tokenizer_path", None),
-        )
+        # Mooncake-specific annotation
+        args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
+
+        return cls(**args_dict)
 
     def _validate_router_args(self):
         # Validate configuration based on mode
