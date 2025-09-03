@@ -136,7 +136,7 @@ class MambaAttnBackend(AttentionBackend):
         )
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return -1  # Mamba attn does not use seq lens to index kv cache
+        return 1  # Mamba attn does not use seq lens to index kv cache
 
     def forward_decode(
         self,
