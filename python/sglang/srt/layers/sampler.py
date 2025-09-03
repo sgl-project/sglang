@@ -80,7 +80,7 @@ class Sampler(nn.Module):
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
 
         else:
-            # Post process original logits. if temperatures are all 1.0, no need to rescale
+            # If requested, cache probabilities from original logits before temperature scaling.
             if return_logprob and RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
 
