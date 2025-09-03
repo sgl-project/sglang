@@ -431,7 +431,6 @@ class Qwen2ForCausalLM(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
-
         else:
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
@@ -452,6 +451,8 @@ class Qwen2ForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -479,6 +480,9 @@ class Qwen2ForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:

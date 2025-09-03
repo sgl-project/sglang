@@ -2185,6 +2185,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
+        elif self.quant_config.get_name() == "w4afp8":
+            disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True
@@ -2414,18 +2416,26 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
 
         num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
+
         for layer_id in range(num_hidden_layers):
             if is_nextn:
                 layer = self.model.decoder
             else:
                 layer = self.model.layers[layer_id]
 
-            for module in [
-                layer.self_attn.fused_qkv_a_proj_with_mqa,
-                layer.self_attn.q_b_proj,
+            module_list = [
                 layer.self_attn.kv_b_proj,
                 layer.self_attn.o_proj,
-            ]:
+            ]
+
+            if self.config.q_lora_rank is not None:
+                module_list.append(layer.self_attn.fused_qkv_a_proj_with_mqa)
+                module_list.append(layer.self_attn.q_b_proj)
+            else:
+                module_list.append(layer.self_attn.kv_a_proj_with_mqa)
+                module_list.append(layer.self_attn.q_proj)
+
+            for module in module_list:
                 requant_weight_ue8m0_inplace(
                     module.weight, module.weight_scale_inv, weight_block_size
                 )
@@ -2488,6 +2498,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
+        # Params for special naming rules in mixed-precision models, for example:
+        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
+        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
         if self.quant_config and self.quant_config.get_name() == "w4afp8":
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts

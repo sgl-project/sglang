@@ -93,7 +93,7 @@ def _maybe_compile_deep_gemm_one_type_all(
         if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
             logger.warning(
                 "Entering DeepGEMM JIT Pre-Compile session. "
-                "It may takes a long time (typically 10-20 mins) "
+                "It may take a long time (typically 10-20 mins) "
                 "if you have not run `sglang.compile_deep_gemm`. "
                 "It is recommended to run `sglang.compile_deep_gemm` with same args as `sglang.launch_server`"
                 " for pre-compilation to reduce the overhead if you have not run it before. "
@@ -132,9 +132,17 @@ def _compile_deep_gemm_one_type_all(
         kernel_type, max_m=max(m_list), n=n, k=k, num_groups=num_groups
     )
 
+    old_compile_mode = deep_gemm.get_compile_mode()
+    deep_gemm.set_compile_mode(1)
     # TODO can use multi thread
     for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
         executor.execute(m=m)
+    deep_gemm.set_compile_mode(old_compile_mode)
+
+    # clean up input buffers
+    torch.cuda.current_stream().synchronize()
+    del executor
+    torch.cuda.empty_cache()
 
 
 class _BaseWarmupExecutor:
