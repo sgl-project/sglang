@@ -1081,6 +1081,17 @@ class InitWeightsUpdateGroupReqOutput:
 
 
 @dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    group_name: str = "weight_update_group"
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
 class UpdateWeightVersionReqInput:
     # The new weight version
     new_version: str

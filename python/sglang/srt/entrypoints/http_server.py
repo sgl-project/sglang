@@ -70,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -711,6 +712,21 @@ async def init_weights_update_group(
     """Initialize the parameter update group."""
     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
         obj, request
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/destroy_weights_update_group")
+async def destroy_weights_update_group(
+    obj: DestroyWeightsUpdateGroupReqInput, request: Request
+):
+    """Initialize the parameter update group."""
+    success, message = (
+        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     )
     content = {"success": success, "message": message}
     if success:
