@@ -209,6 +209,8 @@ class ServerArgs:
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
     gc_warning_threshold_secs: float = 0.0
+    enable_trace: bool = False
+    otel_endpoint: str = "localhost:4317"
 
     # API related
     api_key: Optional[str] = None
@@ -1331,6 +1333,17 @@ class ServerArgs:
             type=str,
             default=None,
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        )
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            "--otel-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
 
         # API related

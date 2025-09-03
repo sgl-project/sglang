@@ -145,6 +145,15 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.tracing.trace import (
+    process_tracing_init,
+    trace_event,
+    trace_set_proc_propagate_context,
+    trace_set_thread_info,
+    trace_slice,
+    trace_slice_end,
+    trace_slice_start,
+)
 from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -815,6 +824,10 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                for req in batch.reqs:
+                    trace_event("schedule", req.rid)
+
+            if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -834,6 +847,10 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+
+            if batch:
+                for req in batch.reqs:
+                    trace_event("schedule", req.rid)
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -1098,6 +1115,12 @@ class Scheduler(
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                trace_set_proc_propagate_context(req.rid, req.trace_context)
+                trace_slice_start("", req.rid, anonymous=True)
+
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -1327,6 +1350,7 @@ class Scheduler(
         else:
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
+            trace_slice_end("process req", req.rid, auto_next_anon=True)
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
@@ -1880,8 +1904,23 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
+            for req in batch.reqs:
+                trace_slice(
+                    "decode loop",
+                    req.rid,
+                    auto_next_anon=not req.finished(),
+                    thread_finish_flag=req.finished(),
+                )
+
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)
+            for req in batch.reqs:
+                trace_slice(
+                    "prefill",
+                    req.rid,
+                    auto_next_anon=not req.finished(),
+                    thread_finish_flag=req.finished(),
+                )
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
@@ -2550,6 +2589,12 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otel_endpoint, "sglang")
+        if server_args.disaggregation_mode == "null":
+            thread_label = "Scheduler"
+            trace_set_thread_info(thread_label, tp_rank, dp_rank)
+
     if (numa_node := server_args.numa_node) is not None:
         numa_bind_to_node(numa_node[gpu_id])
 
