@@ -1309,6 +1309,9 @@ class MiniCPMV4_5(MiniCPMBaseModel):
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
+    def eval(self):
+        super().eval()
+        return self
 
 _SUPPORT_VERSION = {(2, 6): MiniCPMV2_6, (4, 0): MiniCPMV4_0, (4, 5): MiniCPMV4_5}
 
