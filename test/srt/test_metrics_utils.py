@@ -108,7 +108,7 @@ class TestMetricsUtils(unittest.TestCase):
 
     def test_generate_buckets_preserves_order_and_type(self):
         """Test that generate_buckets preserves order and returns floats."""
-        default_buckets = [1, 5, 10, 50, 50, 100]  # integers
+        default_buckets = [1, 5, 10, 50, 100]  # integers
 
         # Test default rule
         result = generate_buckets(["default"], default_buckets)
