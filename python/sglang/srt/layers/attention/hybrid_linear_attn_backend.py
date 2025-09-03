@@ -296,7 +296,9 @@ class MambaAttnBackend(AttentionBackend):
         g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
 
         if forward_batch.forward_mode.is_target_verify():
-            last_recurrent_state = ssm_states[self.forward_metadata.mamba_cache_indices].clone() # keep a copy
+            last_recurrent_state = ssm_states[
+                self.forward_metadata.mamba_cache_indices
+            ].clone()  # keep a copy
             # since target verify usually use small seq lens (num_draft_tokens)
             # it's faster to use fused_recurrent_gated_delta_rule_update
             core_attn_out = fused_recurrent_gated_delta_rule_update(
