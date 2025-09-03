@@ -44,6 +44,13 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
 
+    # Update UE8M0 scaling configuration based on server args
+    from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
+        update_deepgemm_scale_ue8m0,
+    )
+
+    update_deepgemm_scale_ue8m0(server_args.disable_deepgemm_ue8m0)
+
     # Generate m_max
     m_max = 1024 * 16
     if server_args.chunked_prefill_size < 1:
@@ -132,9 +139,17 @@ def _compile_deep_gemm_one_type_all(
         kernel_type, max_m=max(m_list), n=n, k=k, num_groups=num_groups
     )
 
+    old_compile_mode = deep_gemm.get_compile_mode()
+    deep_gemm.set_compile_mode(1)
     # TODO can use multi thread
     for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
         executor.execute(m=m)
+    deep_gemm.set_compile_mode(old_compile_mode)
+
+    # clean up input buffers
+    torch.cuda.current_stream().synchronize()
+    del executor
+    torch.cuda.empty_cache()
 
 
 class _BaseWarmupExecutor:
