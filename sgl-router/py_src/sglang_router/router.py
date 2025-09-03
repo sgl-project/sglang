@@ -97,27 +97,23 @@ class Router:
     @staticmethod
     def from_args_dict(args_dict: dict) -> "Router":
         """Create a router from a RouterArgs instance."""
-        router_args_dict = vars(args_dict)
-
         # Convert RouterArgs to _Router parameters
-        router_args_dict["worker_urls"] = (
+        args_dict["worker_urls"] = (
             []
             if args_dict["service_discovery"] or args_dict["pd_disaggregation"]
             else args_dict["worker_urls"]
         )
-        router_args_dict["policy"] = policy_from_str(args_dict["policy"])
-        router_args_dict["prefill_urls"] = (
+        args_dict["policy"] = policy_from_str(args_dict["policy"])
+        args_dict["prefill_urls"] = (
             args_dict["prefill_urls"] if args_dict["pd_disaggregation"] else None
         )
-        router_args_dict["decode_urls"] = (
+        args_dict["decode_urls"] = (
             args_dict["decode_urls"] if args_dict["pd_disaggregation"] else None
         )
-        router_args_dict["prefill_policy"] = policy_from_str(
-            args_dict["prefill_policy"]
-        )
-        router_args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
+        args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
+        args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
 
-        return Router(_Router(**router_args_dict))
+        return Router(_Router(**args_dict))
 
     def start(self) -> None:
         """Start the router server.

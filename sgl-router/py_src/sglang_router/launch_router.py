@@ -252,7 +252,7 @@ class RouterArgs:
             f"--{prefix}selector",
             type=str,
             nargs="+",
-            default=RouterArgs.selector,
+            default={},
             help="Label selector for Kubernetes service discovery (format: key1=value1 key2=value2)",
         )
         parser.add_argument(
@@ -270,14 +270,14 @@ class RouterArgs:
             f"--{prefix}prefill-selector",
             type=str,
             nargs="+",
-            default=RouterArgs.prefill_selector,
+            default={},
             help="Label selector for prefill server pods in PD mode (format: key1=value1 key2=value2)",
         )
         parser.add_argument(
             f"--{prefix}decode-selector",
             type=str,
             nargs="+",
-            default=RouterArgs.decode_selector,
+            default={},
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
         )
         # Prometheus configuration
@@ -457,9 +457,9 @@ class RouterArgs:
             for key in args_dict
         }
 
-        # parse special arguments
-        args_dict["prefill_urls"] = cls._parse_prefill_urls(args_dict["prefill"])
-        args_dict["decode_urls"] = cls._parse_decode_urls(args_dict["decode"])
+        # parse special arguments and remove "--prefill" and "--decode" from args_dict
+        args_dict["prefill_urls"] = cls._parse_prefill_urls(args_dict.pop("prefill"))
+        args_dict["decode_urls"] = cls._parse_decode_urls(args_dict.pop("decode"))
         args_dict["selector"] = cls._parse_selector(args_dict["selector"])
 
         # Mooncake-specific annotation
