@@ -214,6 +214,11 @@ class MambaPool:
         self.size = size
         self.free_slots = list(range(size))
         self.mem_usage = self.get_mamba_size() / GB
+        logger.info(
+            f"Mamba Cache is allocated. "
+            f"conv_state size: {conv_state.numel() * conv_state.itemsize / GB:.2f}GB, "
+            f"ssm_state size: {temporal_state.numel() * temporal_state.itemsize / GB:.2f}GB "
+        )
 
     def get_mamba_params(self, layer_id: int):
         return [self.mamba_cache[i][layer_id] for i in range(len(self.mamba_cache))]
@@ -271,8 +276,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
 
         self.mamba_pool = MambaPool(
-            # size,
-            128,  # TODO: fixme
+            size,
             conv_dtype,
             ssm_dtype,
             len(mamba_layers),
@@ -293,7 +297,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if select_index == None:
             return None
         mamba_index = self.mamba_pool.alloc(need_size)
-        assert len(select_index) == len(mamba_index)
+        assert len(select_index) == len(
+            mamba_index
+        ), f"Not enough space for mamba cache, try to increase --max-mamba-cache-size."
         self.full_to_mamba_index_mapping[select_index] = torch.tensor(
             mamba_index, dtype=torch.int32, device=self.device
         )
@@ -653,6 +659,88 @@ class MHATokenToKVPool(KVCache):
             src_loc,
             len(tgt_loc),
             next_power_of_2(len(tgt_loc)),
+        )
+
+
+class HybridLinearKVPool(KVCache):
+    """KV cache with separate pools for full and linear attention layers."""
+
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        full_attention_layer_ids: List[int],
+        enable_kvcache_transpose: bool,
+        device: str,
+    ):
+        self.size = size
+        self.dtype = dtype
+        self.device = device
+        self.full_layer_nums = len(full_attention_layer_ids)
+        self.page_size = 1
+        # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
+        assert not enable_kvcache_transpose
+        self.full_kv_pool = MHATokenToKVPool(
+            size=size,
+            page_size=self.page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=self.full_layer_nums,
+            device=device,
+            enable_memory_saver=False,
+        )
+        self.full_attention_layer_id_mapping = {
+            id: i for i, id in enumerate(full_attention_layer_ids)
+        }
+        k_size, v_size = self.get_kv_size_bytes()
+        self.mem_usage = (k_size + v_size) / GB
+
+    def get_kv_size_bytes(self):
+        return self.full_kv_pool.get_kv_size_bytes()
+
+    def get_contiguous_buf_infos(self):
+        return self.full_kv_pool.get_contiguous_buf_infos()
+
+    def _transfer_full_attention_id(self, layer_id: int):
+        if layer_id not in self.full_attention_layer_id_mapping:
+            raise ValueError(
+                f"{layer_id=} not in full attention layers: {self.full_attention_layer_id_mapping.keys()}"
+            )
+        return self.full_attention_layer_id_mapping[layer_id]
+
+    def get_key_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_key_buffer(layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_value_buffer(layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+    ):
+        layer_id = self._transfer_full_attention_id(layer.layer_id)
+        self.full_kv_pool.set_kv_buffer(
+            None,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=layer_id,
         )
 
 

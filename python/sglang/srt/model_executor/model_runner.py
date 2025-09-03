@@ -83,9 +83,11 @@ from sglang.srt.mem_cache.allocator import (  # MambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (  # MambaHybridPool,
+    GB,
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
+    HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -311,6 +313,14 @@ class ModelRunner:
             )
             self.server_args.disable_radix_cache = True
             self.server_args.chunked_prefill_size = -1
+            self.server_args.attention_backend = "hybrid_linear_attn"
+            if self.server_args.max_mamba_cache_size is None:
+                if self.server_args.max_running_requests is not None:
+                    self.server_args.max_mamba_cache_size = (
+                        self.server_args.max_running_requests
+                    )
+                else:
+                    self.server_args.max_mamba_cache_size = 512
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -1089,6 +1099,8 @@ class ModelRunner:
                 "num_nextn_predict_layers",
                 self.num_effective_layers,
             )
+        elif self.is_hybrid_gdn:
+            num_layers = len(self.model_config.hf_config.full_attention_layer_ids)
         else:
             num_layers = self.num_effective_layers
         if self.use_mla_backend:
@@ -1108,6 +1120,12 @@ class ModelRunner:
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
+        if self.is_hybrid_gdn:
+            rest_memory -= (
+                self.server_args.max_mamba_cache_size
+                * self.model_config.hf_config.mamba_cache_per_req
+                / GB
+            )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
@@ -1238,6 +1256,8 @@ class ModelRunner:
                 ),
                 4096,
             )
+        if self.is_hybrid_gdn:
+            max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size)
 
         if not self.spec_algorithm.is_none():
             if self.is_draft_worker:
@@ -1318,22 +1338,13 @@ class ModelRunner:
                 )
             elif self.is_hybrid_gdn:
                 config = self.model_config.hf_config
-                world_size = get_attention_tp_size()
-                conv_dim = (
-                    config.linear_key_head_dim * config.linear_num_key_heads * 2
-                    + config.linear_value_head_dim * config.linear_num_value_heads
-                )
-                conv_state_shape = (
-                    divide(conv_dim, world_size),
-                    config.linear_conv_kernel_dim - 1,
-                )
-
-                temporal_state_shape = (
-                    divide(config.linear_num_value_heads, world_size),
-                    config.linear_key_head_dim,
-                    config.linear_value_head_dim,
-                )
-
+                (
+                    conv_state_shape,
+                    temporal_state_shape,
+                    conv_dtype,
+                    ssm_dtype,
+                    mamba_layers,
+                ) = config.hybrid_gdn_params
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
@@ -1342,9 +1353,9 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     conv_state_shape=conv_state_shape,
                     temporal_state_shape=temporal_state_shape,
-                    conv_dtype=torch.bfloat16,
-                    ssm_dtype=torch.float32,
-                    mamba_layers=config.linear_layer_ids,
+                    conv_dtype=conv_dtype,
+                    ssm_dtype=ssm_dtype,
+                    mamba_layers=mamba_layers,
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
@@ -1426,6 +1437,18 @@ class ModelRunner:
                     head_dim=self.model_config.head_dim,
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                    enable_kvcache_transpose=False,
+                    device=self.device,
+                )
+            elif self.is_hybrid_gdn:
+                self.token_to_kv_pool = HybridLinearKVPool(
+                    size=self.max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    full_attention_layer_ids=self.model_config.hf_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
                 )

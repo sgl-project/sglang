@@ -16,9 +16,14 @@
 
 import enum
 
+import numpy as np
+import torch
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
+
+from sglang.srt.distributed.utils import divide
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 logger = logging.get_logger(__name__)
 
@@ -359,3 +364,43 @@ class Qwen3HybridMoeConfig(PretrainedConfig):
             for i, type_value in enumerate(self.layers_block_type)
             if type_value == HybridLayerType.full_attention.value
         ]
+
+    @property
+    def hybrid_gdn_params(self):
+        world_size = get_attention_tp_size()
+        conv_dim = (
+            self.linear_key_head_dim * self.linear_num_key_heads * 2
+            + self.linear_value_head_dim * self.linear_num_value_heads
+        )
+        conv_state_shape = (
+            divide(conv_dim, world_size),
+            self.linear_conv_kernel_dim - 1,
+        )
+
+        temporal_state_shape = (
+            divide(self.linear_num_value_heads, world_size),
+            self.linear_key_head_dim,
+            self.linear_value_head_dim,
+        )
+        conv_dtype = torch.bfloat16
+        ssm_dtype = torch.float32
+        mamba_layers = self.linear_layer_ids
+        return (
+            conv_state_shape,
+            temporal_state_shape,
+            conv_dtype,
+            ssm_dtype,
+            mamba_layers,
+        )
+
+    @property
+    def mamba_cache_per_req(self):
+        conv_state_shape, temporal_state_shape, conv_dtype, ssm_dtype, mamba_layers = (
+            self.hybrid_gdn_params
+        )
+        mamba_layers_len = len(mamba_layers)
+
+        return (
+            int(np.prod(conv_state_shape)) * conv_dtype.itemsize
+            + int(np.prod(temporal_state_shape)) * ssm_dtype.itemsize
+        ) * mamba_layers_len
