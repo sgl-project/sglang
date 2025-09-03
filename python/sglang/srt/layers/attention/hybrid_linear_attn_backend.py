@@ -512,7 +512,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         ssm_states = mamba_caches[1]
 
         mixed_qkvs = mamba_caches[2][:, state_indices_tensor][:, mask]
-        querys = mamba_caches[3][:, state_indices_tensor][:, mask]
+        queries = mamba_caches[3][:, state_indices_tensor][:, mask]
         keys = mamba_caches[4][:, state_indices_tensor][:, mask]
         values = mamba_caches[5][:, state_indices_tensor][:, mask]
         gs = mamba_caches[6][:, state_indices_tensor][:, mask]
@@ -536,7 +536,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 conv_state = conv_states[layer_id]
                 ssm_state = ssm_states[layer_id]
                 mixed_qkv = mixed_qkvs[layer_id]
-                query = querys[layer_id].unsqueeze(0)
+                query = queries[layer_id].unsqueeze(0)
                 key = keys[layer_id].unsqueeze(0)
                 value = values[layer_id].unsqueeze(0)
                 g = gs[layer_id].unsqueeze(0)
