@@ -25,6 +25,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import tempfile
 import threading
 import time
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
@@ -60,7 +61,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
+from sglang.srt.managers.multi_tokenizer_mixin import (
+    MultiTokenizerRouter,
+    run_multi_detokenizer_router_process,
+)
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -807,14 +811,45 @@ def _launch_subprocesses(
         return None, None, None
 
     # Launch detokenizer process
-    detoken_proc = mp.Process(
-        target=run_detokenizer_process,
-        args=(
-            server_args,
-            port_args,
-        ),
-    )
-    detoken_proc.start()
+    if server_args.enable_multi_detokenizer:
+        detoken_procs = []
+        ports_list = []
+        detokenizer_ipc_name = port_args.detokenizer_ipc_name
+        for i in range(server_args.tokenizer_worker_num):
+            port_args.detokenizer_ipc_name = (
+                f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+            )
+            detoken_proc = mp.Process(
+                target=run_detokenizer_process,
+                args=(
+                    server_args,
+                    port_args,
+                ),
+            )
+            detoken_proc.start()
+            detoken_procs.append(detoken_proc)
+            ports_list.append(port_args.detokenizer_ipc_name)
+        # init Detokenizer router process
+        port_args.detokenizer_ipc_name = detokenizer_ipc_name
+        detoken_router_proc = mp.Process(
+            target=run_multi_detokenizer_router_process,
+            args=(
+                ports_list,
+                server_args,
+                port_args,
+            ),
+        )
+        detoken_router_proc.start()
+    else:
+        detoken_proc = mp.Process(
+            target=run_detokenizer_process,
+            args=(
+                server_args,
+                port_args,
+            ),
+        )
+        detoken_proc.start()
+
     if server_args.tokenizer_worker_num > 1:
         # Launch multi-tokenizer router
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
