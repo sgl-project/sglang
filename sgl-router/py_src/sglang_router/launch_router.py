@@ -560,6 +560,33 @@ class RouterArgs:
             tokenizer_path=getattr(args, f"{prefix}tokenizer_path", None),
         )
 
+    def _validate_router_args(self):
+        # Validate configuration based on mode
+        if self.pd_disaggregation:
+            # Validate PD configuration - skip URL requirements if using service discovery
+            if not self.service_discovery:
+                if not self.prefill_urls:
+                    raise ValueError("PD disaggregation mode requires --prefill")
+                if not self.decode_urls:
+                    raise ValueError("PD disaggregation mode requires --decode")
+
+            # Warn about policy usage in PD mode
+            if self.prefill_policy and self.decode_policy and self.policy:
+                logger.warning(
+                    "Both --prefill-policy and --decode-policy are specified. "
+                    "The main --policy flag will be ignored for PD mode."
+                )
+            elif self.prefill_policy and not self.decode_policy and self.policy:
+                logger.info(
+                    f"Using --prefill-policy '{self.prefill_policy}' for prefill nodes "
+                    f"and --policy '{self.policy}' for decode nodes."
+                )
+            elif self.decode_policy and not self.prefill_policy and self.policy:
+                logger.info(
+                    f"Using --policy '{self.policy}' for prefill nodes "
+                    f"and --decode-policy '{self.decode_policy}' for decode nodes."
+                )
+
     @staticmethod
     def _parse_selector(selector_list):
         if not selector_list:
@@ -636,46 +663,6 @@ def policy_from_str(policy_str: str) -> PolicyType:
     return policy_map[policy_str]
 
 
-def _validate_router_args(router_args: RouterArgs):
-    # Validate configuration based on mode
-    if router_args.pd_disaggregation:
-        # Validate PD configuration - skip URL requirements if using service discovery
-        if not router_args.service_discovery:
-            if not router_args.prefill_urls:
-                raise ValueError("PD disaggregation mode requires --prefill")
-            if not router_args.decode_urls:
-                raise ValueError("PD disaggregation mode requires --decode")
-
-        # Warn about policy usage in PD mode
-        if (
-            router_args.prefill_policy
-            and router_args.decode_policy
-            and router_args.policy
-        ):
-            logger.warning(
-                "Both --prefill-policy and --decode-policy are specified. "
-                "The main --policy flag will be ignored for PD mode."
-            )
-        elif (
-            router_args.prefill_policy
-            and not router_args.decode_policy
-            and router_args.policy
-        ):
-            logger.info(
-                f"Using --prefill-policy '{router_args.prefill_policy}' for prefill nodes "
-                f"and --policy '{router_args.policy}' for decode nodes."
-            )
-        elif (
-            router_args.decode_policy
-            and not router_args.prefill_policy
-            and router_args.policy
-        ):
-            logger.info(
-                f"Using --policy '{router_args.policy}' for prefill nodes "
-                f"and --decode-policy '{router_args.decode_policy}' for decode nodes."
-            )
-
-
 def launch_router(args: argparse.Namespace) -> Optional[Router]:
     """
     Launch the SGLang router with the configuration from parsed arguments.
@@ -694,7 +681,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         else:
             router_args = args
 
-        _validate_router_args(router_args)
+        router_args._validate_router_args()
 
         # Create router with unified constructor
         router = Router(
