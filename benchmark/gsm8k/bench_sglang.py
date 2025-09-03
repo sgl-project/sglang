@@ -34,7 +34,6 @@ def get_few_shot_examples(lines, k):
 
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
-    print(f"answer_str: {answer_str}")
     numbers = re.findall(r"\d+", answer_str)
     if len(numbers) < 1:
         return INVALID
