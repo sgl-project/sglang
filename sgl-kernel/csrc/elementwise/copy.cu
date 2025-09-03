@@ -48,6 +48,7 @@ void copy_to_gpu_no_ce_impl(const at::Tensor& input, at::Tensor& output) {
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output) {
   int N = static_cast<int>(input.numel());
+  // Can use macro if there are more N needed
   if (N == 72) {
     copy_to_gpu_no_ce_impl<72>(input, output);
   } else if (N == 64) {

@@ -42,6 +42,7 @@ class BaseOffloader(ABC):
     def forbid_copy_engine_usage(self):
         return False
 
+
 class NoopOffloader(BaseOffloader):
     pass
 
@@ -239,6 +240,7 @@ class OffloaderV2(BaseOffloader):
     @property
     def forbid_copy_engine_usage(self):
         return self.mode == "cpu"
+
 
 def _hook_module_forward_for_offloader(index, module, offloaders, prefetch_step):
     def _on_forward_end():
