@@ -4,6 +4,7 @@ import os
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -47,9 +48,8 @@ class FunctionAdapter:
     def mlp_forward_wrapper(mlp_module):
         def wrapper(state):
             hidden_states = state.hidden_states
-            forward_batch = state.forward_batch
             output = mlp_module.forward(
-                hidden_states, forward_batch, use_reduce_scatter=True
+                hidden_states, use_reduce_scatter=True
             )
             state.hidden_states = output
 
@@ -85,23 +85,25 @@ class FunctionAdapter:
         return wrapper
 
 
-class Qwen3FunctionAdapter:
-    @staticmethod
-    def mlp_forward_wrapper(mlp_module):
-        def wrapper(state):
-            hidden_states = state.hidden_states
-            output = mlp_module.forward(hidden_states, use_reduce_scatter=True)
-            state.hidden_states = output
+class StreamName(Enum):
+    COMPUTE = "compute"
+    COPY = "copy"
 
-        return wrapper
+class WaitTiming(Enum):
+    BEFORE = "before"
+    AFTER = "after"
 
+COMPUTE = StreamName.COMPUTE
+COPY = StreamName.COPY
+BEFORE = WaitTiming.BEFORE
+AFTER = WaitTiming.AFTER
 
 @dataclass
 class StreamOperation:
     funcs: List[callable]
-    stream_name: str = "compute"
-    wait_for: Optional[List[str]] = None
-    wait_timing: str = "before"
+    stream_name: StreamName = COMPUTE
+    wait_for: Optional[List[StreamName]] = None
+    wait_timing: WaitTiming = BEFORE
     batch_id: Optional[int] = None
 
 
@@ -123,13 +125,13 @@ class StreamStageExecutor:
             self.batch_states.append(state)
             self.batch_outputs.append(inputs)
         self.streams = {}
-        self.streams["compute"] = torch.cuda.current_stream()
-        self.streams["copy"] = torch.cuda.Stream(priority=-1)
+        self.streams[COMPUTE] = torch.cuda.current_stream()
+        self.streams[COPY] = torch.cuda.Stream(priority=-1)
 
     def execute_operation(self, op):
         stream = self.streams[op.stream_name]
         with torch.cuda.stream(stream):
-            if op.wait_for and op.wait_timing == "before":
+            if op.wait_for and op.wait_timing == BEFORE:
                 for wait_stream_name in op.wait_for:
                     wait_stream = self.streams[wait_stream_name]
                     stream.wait_stream(wait_stream)
@@ -141,7 +143,7 @@ class StreamStageExecutor:
                     if result is not None:
                         self.batch_outputs[op.batch_id] = result
 
-            if op.wait_for and op.wait_timing == "after":
+            if op.wait_for and op.wait_timing == AFTER:
                 for wait_stream_name in op.wait_for:
                     wait_stream = self.streams[wait_stream_name]
                     stream.wait_stream(wait_stream)
