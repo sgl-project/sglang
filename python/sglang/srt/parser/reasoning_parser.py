@@ -1,7 +1,7 @@
 import re
 from typing import Dict, Optional, Tuple, Type
 
-from sglang.srt.harmony_parser import HarmonyParser
+from sglang.srt.parser.harmony_parser import HarmonyParser
 
 
 class StreamingParseResult:

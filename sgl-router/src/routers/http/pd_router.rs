@@ -42,8 +42,8 @@ pub struct PDRouter {
     pub decode_workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
     pub prefill_policy: Arc<dyn LoadBalancingPolicy>,
     pub decode_policy: Arc<dyn LoadBalancingPolicy>,
-    pub timeout_secs: u64,
-    pub interval_secs: u64,
+    pub worker_startup_timeout_secs: u64,
+    pub worker_startup_check_interval_secs: u64,
     pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
@@ -74,8 +74,8 @@ impl PDRouter {
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
         crate::routers::http::router::Router::wait_for_healthy_workers(
             &[url.to_string()],
-            self.timeout_secs,
-            self.interval_secs,
+            self.worker_startup_timeout_secs,
+            self.worker_startup_check_interval_secs,
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -376,8 +376,9 @@ impl PDRouter {
         prefill_policy: Arc<dyn LoadBalancingPolicy>,
         decode_policy: Arc<dyn LoadBalancingPolicy>,
         client: Client,
-        timeout_secs: u64,
-        interval_secs: u64,
+        prefill_request_timeout_secs: u64,
+        worker_startup_timeout_secs: u64,
+        worker_startup_check_interval_secs: u64,
         retry_config: RetryConfig,
         circuit_breaker_config: ConfigCircuitBreakerConfig,
         health_check_config: ConfigHealthCheckConfig,
@@ -437,8 +438,8 @@ impl PDRouter {
         if !all_urls.is_empty() {
             crate::routers::http::router::Router::wait_for_healthy_workers(
                 &all_urls,
-                timeout_secs,
-                interval_secs,
+                worker_startup_timeout_secs,
+                worker_startup_check_interval_secs,
             )
             .await?;
         }
@@ -465,7 +466,7 @@ impl PDRouter {
         let load_monitor_handle =
             if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
                 let monitor_urls = all_urls.clone();
-                let monitor_interval = interval_secs;
+                let monitor_interval = worker_startup_check_interval_secs;
                 let monitor_client = client.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
                 let decode_policy_clone = Arc::clone(&decode_policy);
@@ -503,7 +504,7 @@ impl PDRouter {
             .pool_max_idle_per_host(0)
             .http1_only()
             .connect_timeout(Duration::from_millis(300))
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(prefill_request_timeout_secs))
             .build()
             .map_err(|e| format!("Failed to build prefill client: {}", e))?;
 
@@ -581,8 +582,8 @@ impl PDRouter {
             decode_workers,
             prefill_policy,
             decode_policy,
-            timeout_secs,
-            interval_secs,
+            worker_startup_timeout_secs,
+            worker_startup_check_interval_secs,
             worker_loads,
             load_monitor_handle,
             client,
@@ -2104,8 +2105,8 @@ mod tests {
             decode_workers: Arc::new(RwLock::new(vec![])),
             prefill_policy,
             decode_policy,
-            timeout_secs: 5,
-            interval_secs: 1,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
             worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
             load_monitor_handle: None,
             client: Client::new(),

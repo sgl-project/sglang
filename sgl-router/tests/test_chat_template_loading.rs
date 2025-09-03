@@ -4,7 +4,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    #[cfg(feature = "huggingface")]
     fn test_load_chat_template_from_file() {
         use sglang_router_rs::tokenizer::chat_template::ChatMessage;
         use sglang_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;
@@ -73,7 +72,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "huggingface")]
     fn test_override_existing_template() {
         use sglang_router_rs::tokenizer::chat_template::ChatMessage;
         use sglang_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;
@@ -136,7 +134,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "huggingface")]
     fn test_set_chat_template_after_creation() {
         use sglang_router_rs::tokenizer::chat_template::ChatMessage;
         use sglang_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;

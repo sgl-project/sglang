@@ -254,7 +254,7 @@ class MooncakeStore(HiCacheStorage):
         pass
 
     def clear(self) -> None:
-        raise (NotImplementedError)
+        self.store.remove_all()
 
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]

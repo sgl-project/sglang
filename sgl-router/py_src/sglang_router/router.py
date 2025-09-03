@@ -74,6 +74,8 @@ class Router:
         health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
         health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
         health_check_endpoint: Health check endpoint path. Default: '/health'
+        model_path: Model path for loading tokenizer (HuggingFace model ID or local path). Default: None
+        tokenizer_path: Explicit tokenizer path (overrides model_path tokenizer if provided). Default: None
     """
 
     def __init__(
@@ -131,6 +133,8 @@ class Router:
         health_check_timeout_secs: int = 5,
         health_check_interval_secs: int = 60,
         health_check_endpoint: str = "/health",
+        model_path: Optional[str] = None,
+        tokenizer_path: Optional[str] = None,
     ):
         if selector is None:
             selector = {}
@@ -195,6 +199,8 @@ class Router:
             health_check_timeout_secs=health_check_timeout_secs,
             health_check_interval_secs=health_check_interval_secs,
             health_check_endpoint=health_check_endpoint,
+            model_path=model_path,
+            tokenizer_path=tokenizer_path,
         )
 
     def start(self) -> None:

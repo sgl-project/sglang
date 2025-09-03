@@ -91,6 +91,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
         session_params: None,
         separate_reasoning: true,
         stream_reasoning: true,
+        chat_template_kwargs: None,
         return_hidden_states: false,
     }
 }

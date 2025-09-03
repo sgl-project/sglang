@@ -541,6 +541,11 @@ void quant_impl(
   }
 }
 
+// Avoid redefinition warnings
+#undef CHECK_CONTIGUOUS
+#undef CHECK_TH_CUDA
+#undef CHECK_INPUT
+
 /*Quantization entry for fp4 experts quantization*/
 #define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, "must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x, m) TORCH_CHECK(x.is_contiguous(), m, "must be contiguous")
