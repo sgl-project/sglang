@@ -485,6 +485,44 @@ class HybridLinearAttnBackend(AttentionBackend):
             .req_to_token_pool.mamba_pool.mamba_cache[2]
             .shape[2]
         )
+        query_start_loc = accepted_length.cumsum(-1, dtype=accepted_length.dtype)
+        query_start_loc = torch.cat(
+            [
+                torch.zeros(
+                    1,
+                    dtype=query_start_loc.dtype,
+                    device=query_start_loc.device,
+                ),
+                query_start_loc,
+            ]
+        )
+        mask = torch.arange(num_draft_tokens, device=accepted_length.device).unsqueeze(
+            0
+        ) < accepted_length.unsqueeze(1)
+
+        state_indices_tensor = self.attn_backend_list[
+            1
+        ].forward_metadata.mamba_cache_indices[:request_number]
+
+        mamba_caches = self.attn_backend_list[
+            1
+        ].req_to_token_pool.get_mamba_params_all_layers()
+
+        conv_states = mamba_caches[0]
+        ssm_states = mamba_caches[1]
+
+        mixed_qkvs = mamba_caches[2][:, state_indices_tensor][:, mask]
+        querys = mamba_caches[3][:, state_indices_tensor][:, mask]
+        keys = mamba_caches[4][:, state_indices_tensor][:, mask]
+        values = mamba_caches[5][:, state_indices_tensor][:, mask]
+        gs = mamba_caches[6][:, state_indices_tensor][:, mask]
+        betas = mamba_caches[7][:, state_indices_tensor][:, mask]
+
+        mamba_map = self.attn_backend_list[1].req_to_token_pool.mamba_map
+
+        has_initial_states = torch.ones(
+            request_number, dtype=torch.bool, device=accepted_length.device
+        )
         # QQ: can be parallelized
         for i in range(len(model.model.layers)):
             layer = model.model.layers[i]
@@ -493,43 +531,16 @@ class HybridLinearAttnBackend(AttentionBackend):
                     layer.linear_attn.conv1d.weight.size(0),
                     layer.linear_attn.conv1d.weight.size(2),
                 )
-                query_start_loc = accepted_length.cumsum(
-                    -1, dtype=accepted_length.dtype
-                )
-                query_start_loc = torch.cat(
-                    [
-                        torch.zeros(
-                            1,
-                            dtype=query_start_loc.dtype,
-                            device=query_start_loc.device,
-                        ),
-                        query_start_loc,
-                    ]
-                )
 
-                mamba_cache = self.attn_backend_list[
-                    1
-                ].req_to_token_pool.get_mamba_params(i)
-
-                conv_state = mamba_cache[0]
-                ssm_state = mamba_cache[1]
-
-                state_indices_tensor = self.attn_backend_list[
-                    1
-                ].forward_metadata.mamba_cache_indices[:request_number]
-                mask = torch.arange(
-                    num_draft_tokens, device=accepted_length.device
-                ).unsqueeze(0) < accepted_length.unsqueeze(1)
-
-                mixed_qkv = mamba_cache[2][state_indices_tensor][mask]
-                query = mamba_cache[3][state_indices_tensor][mask].unsqueeze(0)
-                key = mamba_cache[4][state_indices_tensor][mask].unsqueeze(0)
-                value = mamba_cache[5][state_indices_tensor][mask].unsqueeze(0)
-                g = mamba_cache[6][state_indices_tensor][mask].unsqueeze(0)
-                beta = mamba_cache[7][state_indices_tensor][mask].unsqueeze(0)
-                has_initial_states = torch.ones(
-                    request_number, dtype=torch.bool, device=accepted_length.device
-                )
+                layer_id = mamba_map[i]
+                conv_state = conv_states[layer_id]
+                ssm_state = ssm_states[layer_id]
+                mixed_qkv = mixed_qkvs[layer_id]
+                query = querys[layer_id].unsqueeze(0)
+                key = keys[layer_id].unsqueeze(0)
+                value = values[layer_id].unsqueeze(0)
+                g = gs[layer_id].unsqueeze(0)
+                beta = betas[layer_id].unsqueeze(0)
 
                 _ = causal_conv1d_fn(
                     mixed_qkv.transpose(0, 1),

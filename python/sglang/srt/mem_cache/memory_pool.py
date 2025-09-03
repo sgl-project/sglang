@@ -220,6 +220,9 @@ class MambaPool:
             f"ssm_state size: {temporal_state.numel() * temporal_state.itemsize / GB:.2f}GB "
         )
 
+    def get_mamba_params_all_layers(self):
+        return [self.mamba_cache[i] for i in range(len(self.mamba_cache))]
+
     def get_mamba_params(self, layer_id: int):
         return [self.mamba_cache[i][layer_id] for i in range(len(self.mamba_cache))]
 
@@ -311,6 +314,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_params(self, layer_id: int):
         assert layer_id in self.mamba_map
         return self.mamba_pool.get_mamba_params(self.mamba_map[layer_id])
+
+    def get_mamba_params_all_layers(self):
+        return self.mamba_pool.get_mamba_params_all_layers()
 
     def free(self, free_index: Union[int, List[int]]):
         mamba_index = self.full_to_mamba_index_mapping[free_index]
