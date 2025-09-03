@@ -330,6 +330,10 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_true")]
     pub stream_reasoning: bool,
 
+    /// Chat template kwargs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<HashMap<String, serde_json::Value>>,
+
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,
