@@ -2504,10 +2504,16 @@ class Scheduler(
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         if recv_req == ExpertDistributionReq.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
+            return ExpertDistributionReqOutput(success=True, message="started")
         elif recv_req == ExpertDistributionReq.STOP_RECORD:
             get_global_expert_distribution_recorder().stop_record()
+            return ExpertDistributionReqOutput(success=True, message="stopped")
         elif recv_req == ExpertDistributionReq.DUMP_RECORD:
             get_global_expert_distribution_recorder().dump_record()
+            return ExpertDistributionReqOutput(success=True, message="dumped_to_files")
+        elif recv_req == ExpertDistributionReq.DUMP_RECORD_OBJECT:
+            obj = get_global_expert_distribution_recorder().dump_record(output_mode="object")
+            return ExpertDistributionReqOutput(success=True, payload=obj)
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
         return ExpertDistributionReqOutput()

@@ -358,7 +358,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
                 server_args.chunked_prefill_size * 8,
                 self._TOP_K_NUM,
             ),
-            dtype=torch.int32,
+            dtype=torch.uint8,
             device=server_args.device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
@@ -367,11 +367,32 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         ), "DetailSinglePassGatherer does not support TBO yet"
         # TODO assert shared experts fusion is disabled, o/w data is wrong
 
+    def _ensure_capacity(self, need_tokens: int):
+        L, cur, K = self._topk_ids_of_layer.shape
+        if need_tokens > cur:
+            new = torch.full((L, need_tokens, K), -1,
+                             dtype=self._topk_ids_of_layer.dtype,
+                             device=self._topk_ids_of_layer.device)
+            new[:, :cur, :] = self._topk_ids_of_layer
+            self._topk_ids_of_layer = new
+
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         assert self._metadata is None
+
+        # shape assertion, tho may be redundant
+        if forward_batch.forward_mode == "decode":
+            assert (
+                len(forward_batch.rids)
+                == forward_batch.input_ids.numel()
+                == forward_batch.positions.numel()
+            ), "Decode: rids/input_ids/positions must align 1:1"
+
+        T_pass = forward_batch.input_ids.numel()  # prefill: sum(extend_seq_lens); decode: batch size
+        self._ensure_capacity(T_pass)
+
         self._metadata = dict(
             # TODO pr-chain
-            # rids=forward_batch.rids,
+            rids=forward_batch.rids, # # record request IDs so we can split tokens by prompt
             input_ids=forward_batch.input_ids.cpu().tolist(),
             positions=forward_batch.positions.cpu().tolist(),
             extend_seq_lens=forward_batch.extend_seq_lens_cpu,
@@ -726,16 +747,35 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._records.clear()
 
+    # def dump(self, output_mode: _OutputMode):
+    #     assert output_mode == "file"
+    #     output = dict(
+    #         records=self._records,
+    #         # NOTE: This may change during recording, so here we say it is the "last" one
+    #         last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+    #     )
+    #     _dump_to_file(
+    #         f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
+    #     )
+    
     def dump(self, output_mode: _OutputMode):
-        assert output_mode == "file"
         output = dict(
-            records=self._records,
-            # NOTE: This may change during recording, so here we say it is the "last" one
+            # copy the list so resetting doesn’t wipe caller’s view
+            records=list(self._records),
+            # Last mapping used during recording
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
-        _dump_to_file(
-            f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
-        )
+        if output_mode == "file":
+            _dump_to_file(
+                f"expert_distribution_recorder_{time.time()}_{self._rank}.pt",
+                output,
+            )
+        elif output_mode == "object":
+            # return the raw object without saving
+            return output
+        else:
+            raise NotImplementedError(f"Unknown output mode: {output_mode}")
+
 
 
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):

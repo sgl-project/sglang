@@ -1780,6 +1780,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            rids=[req.rid for req in self.reqs],
         )
 
     def copy(self):
@@ -1921,6 +1922,8 @@ class ModelWorkerBatch:
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
+
+    rids: list[str] = None
 
 
 @triton.jit
