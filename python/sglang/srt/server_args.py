@@ -2329,7 +2329,7 @@ class ServerArgs:
                 assert (
                     False
                 ), f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
-            assert base > 0, f"{arg_name} TSE base must be positive, got: {base}"
+            assert base > 1, f"{arg_name} TSE base must be larger than 1, got: {base}"
             assert count > 0, f"{arg_name} TSE count must be positive, got: {count}"
             assert middle > 0, f"{arg_name} TSE middle must be positive, got: {middle}"
 

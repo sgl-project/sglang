@@ -48,11 +48,6 @@ class TestMetricsUtils(unittest.TestCase):
         buckets = two_sides_exponential_buckets(middle=10.0, base=2.0, count=1)
         self.assertIn(10.0, buckets)
 
-        # Width = 1.0 (no multiplication effect)
-        buckets = two_sides_exponential_buckets(middle=10.0, base=1.0, count=3)
-        self.assertIn(10.0, buckets)
-        self.assertEqual(1, len(buckets))
-
         # Very small middle value
         buckets = two_sides_exponential_buckets(middle=0.1, base=2.0, count=2)
         self.assertIn(0.1, buckets)

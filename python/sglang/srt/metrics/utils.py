@@ -40,11 +40,9 @@ def generate_buckets(
     rule = buckets_rule[0]
     if rule == "tse":
         middle, base, count = buckets_rule[1:]
+        assert float(base) > 1.0, "Base must be greater than 1.0"
         return two_sides_exponential_buckets(float(middle), float(base), int(count))
     if rule == "default":
         return sorted(set(default_buckets))
     assert rule == "customer"
-    return [float(x) for x in buckets_rule[1:]]
-
-
-print(generate_buckets(["tse", "1000", "2", "8"], []))
+    return sorted(set([float(x) for x in buckets_rule[1:]]))
