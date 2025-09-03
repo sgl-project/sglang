@@ -78,8 +78,8 @@ def _flash_attn_fwd(
             assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
             assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
         else:
-            assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
-            assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
+            assert k.shape == (num_pages, page_size, num_head_kv, head_dim), f"{k.shape=} but {num_pages=} {page_size=} {num_head_kv=} {head_dim=}"
+            assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v), f"{v.shape=} but {num_pages=} {page_size=} {num_head_kv=} {head_dim_v=}"
     else:
         assert k.shape == (seqlen_k, num_head_kv, head_dim)
         assert v.shape == (seqlen_k, num_head_kv, head_dim_v)

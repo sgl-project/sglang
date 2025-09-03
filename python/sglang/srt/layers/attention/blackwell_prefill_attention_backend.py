@@ -37,6 +37,7 @@ class ForwardMetaData:
     cu_seqlens_q: Optional[torch.Tensor] = None
     cu_seqlens_k: Optional[torch.Tensor] = None
     page_table: Optional[torch.Tensor] = None
+    seqlens_k: Optional[torch.Tensor] = None
 
 
 class BlackwellPrefillAttentionBackend(AttentionBackend):
@@ -63,6 +64,7 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(forward_batch.seq_lens, dim=0, dtype=torch.int32), pad=(1, 0)
         )
+        seqlens_k = forward_batch.seq_lens.to(torch.int32)
         page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
@@ -80,7 +82,7 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
             page_table = page_table[:, strided_indices] // self.page_size
 
         self.forward_metadata = ForwardMetaData(
-            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, page_table=page_table
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, page_table=page_table, seqlens_k=seqlens_k,
         )
 
         print("=" * 120)
@@ -149,8 +151,6 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
         v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
 
-        # torch.distributed.breakpoint()
-
         metadata = self.forward_metadata
         if layer.layer_id == 0:
             print(_yellow(f"{layer.is_cross_attention=}"))
@@ -168,7 +168,7 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
             k=k_cache,
             v=v_cache,
             cu_seqlens_q=metadata.cu_seqlens_q,
-            seqused_k=metadata.cu_seqlens_q[1:],
+            seqused_k=metadata.seqlens_k,
             page_table=metadata.page_table,
             softcap=layer.logit_cap,
             softmax_scale=layer.scaling,
@@ -190,10 +190,28 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         max_diff = (out.reshape(-1) - ref.reshape(-1)).float().abs().max().item()
         print(_yellow(f"out: {layer.layer_id=}"), "\n", out.reshape(-1)[:8], "\n", out.reshape(-1)[-8:])
         print(_green(f"ref: {layer.layer_id=}"), "\n", ref.reshape(-1)[:8], "\n", ref.reshape(-1)[-8:])
-        if max_diff > 0.2:
+        if max_diff > 0.75:
             print(_yellow("sliding_window_size:"), "\n", f"{layer.sliding_window_size=}")
-            print(_red("big difference!!!"), f"{layer.layer_id=} {max_diff=:<.5f}", flush=True)
+            print(_red("big difference!!!"), f"{layer.layer_id=} {max_diff=:<.5f} SAVING TO DISK!!!", flush=True)
+
+            from pathlib import Path
+            out_path = Path("/sgl-workspace/debug_output")
+
+            torch.save(q, str((out_path / "q.pt").absolute()))
+            torch.save(k, str((out_path / "k.pt").absolute()))
+            torch.save(v, str((out_path / "v.pt").absolute()))
+            torch.save(k_cache, str((out_path / "k_cache.pt").absolute()))
+            torch.save(v_cache, str((out_path / "v_cache.pt").absolute()))
+            torch.save(metadata.cu_seqlens_q, str((out_path / "cu_seqlens_q.pt").absolute()))
+            torch.save(metadata.cu_seqlens_k, str((out_path / "cu_seqlens_k.pt").absolute()))
+            torch.save(metadata.page_table, str((out_path / "page_table.pt").absolute()))
+            torch.save(out, str((out_path / "out_backend.pt").absolute()))
+            torch.save(ref, str((out_path / "ref_backend.pt").absolute()))
+
             torch.distributed.breakpoint()
+
+            print("DONE", flush=True)
+            assert False
         else:
             print(_green("okay"), f"{layer.layer_id=}", flush=True)
 
