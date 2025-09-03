@@ -18,6 +18,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+logger = logging.getLogger(__name__)
+
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
 )  # 64KB, to prevent aiohttp's "Chunk too big" error
@@ -29,25 +31,6 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return f"[{address}]"
     except ValueError:
         return address
-
-
-def setup_logger():
-    logger = logging.getLogger("pdlb")
-    logger.setLevel(logging.INFO)
-
-    formatter = logging.Formatter(
-        "[PDLB (Python)] %(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    handler = logging.StreamHandler()
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-
-    return logger
-
-
-logger = setup_logger()
 
 
 @dataclasses.dataclass
@@ -67,13 +50,6 @@ class MiniLoadBalancer:
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
         self.timeout = timeout
-
-    def add_prefill_server(self, new_prefill_config: PrefillConfig):
-        self.prefill_configs.append(new_prefill_config)
-        self.prefill_servers.append(new_prefill_config.url)
-
-    def add_decode_server(self, new_decode_server: str):
-        self.decode_servers.append(new_decode_server)
 
     def select_pair(self):
         # TODO: return some message instead of panic
