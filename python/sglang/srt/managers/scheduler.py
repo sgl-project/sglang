@@ -2604,6 +2604,21 @@ def is_work_request(recv_req):
     )
 
 
+def bind_to_node(node):
+    import ctypes
+
+    libnuma = ctypes.CDLL("libnuma.so")
+    if libnuma.numa_available() < 0:
+        raise SystemError("numa not available on this system")
+
+    libnuma.numa_run_on_node(ctypes.c_int(node))
+    try:
+        libnuma.numa_set_localalloc()
+    except Exception:
+        pass
+
+    # TODO set cpu node
+
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -2615,6 +2630,10 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
+    node = {0: 0, 1: 0, 2: 1, 3: 1}[gpu_id]
+    print(f"hack: bind_to_node {gpu_id=} {node=}")
+    bind_to_node(node)
+
     # Generate the prefix
     prefix = ""
     if dp_rank is not None:
