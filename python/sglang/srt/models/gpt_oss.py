@@ -54,6 +54,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -162,9 +163,12 @@ class GptOssSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(hidden_states, should_allreduce_fusion)
+            return self.forward_normal(
+                hidden_states, should_allreduce_fusion, use_reduce_scatter
+            )
         else:
             raise Exception("forward_deepep branch not implemented yet")
 
@@ -179,14 +183,24 @@ class GptOssSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
 
-        router_logits, _ = self.router(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        if hidden_states.shape[0] > 0:
+            router_logits, _ = self.router(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not should_allreduce_fusion:
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
@@ -459,6 +473,7 @@ class GptOssDecoderLayer(nn.Module):
             is_last_layer=(
                 self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
+            allow_reduce_scatter=True,
         )
 
     def forward(
@@ -489,7 +504,13 @@ class GptOssDecoderLayer(nn.Module):
             )
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        hidden_states = self.mlp(
+            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+        )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True

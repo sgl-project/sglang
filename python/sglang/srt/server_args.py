@@ -263,7 +263,6 @@ class ServerArgs:
         "triton_kernel",
         "flashinfer_trtllm",
         "flashinfer_cutlass",
-        "flashinfer_mxfp4",
     ] = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -411,9 +410,14 @@ class ServerArgs:
                 "NOTE: --enable-flashinfer-trtllm-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
             )
         if self.enable_flashinfer_mxfp4_moe:
-            self.moe_runner_backend = "flashinfer_mxfp4"
+            self.moe_runner_backend = "flashinfer_trtllm"
             print_deprecated_warning(
-                "NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead."
+                "NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
+            )
+        if self.moe_runner_backend == "flashinfer_mxfp4":
+            self.moe_runner_backend = "flashinfer_trtllm"
+            print_deprecated_warning(
+                "NOTE: --moe-runner-backend=flashinfer_mxfp4 is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead."
             )
 
         # Set missing default values
@@ -626,8 +630,8 @@ class ServerArgs:
         # MoE kernel
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert (
-                self.quantization == "modelopt_fp4"
-            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+                self.quantization == "modelopt_fp4" or self.quantization == "mxfp4"
+            ), "modelopt_fp4 or mxfp4 quantization is required for Flashinfer MOE"
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -2309,9 +2313,11 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and is_mxfp4_quant_format:
-                self.moe_runner_backend = "flashinfer_mxfp4"
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                self.quantization = "mxfp4"
                 logger.warning(
-                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                    "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer trtllm MOE kernel."
                 )
             else:
                 if self.moe_runner_backend == "triton_kernel":

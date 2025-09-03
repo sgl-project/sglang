@@ -205,14 +205,6 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         self.quant_config = quant_config
-        self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
-        # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
-        if (
-            self.quant_config is not None
-            and self.quant_config.get_name() == "mxfp4"
-            and self.use_flashinfer_mxfp4_moe
-        ):
-            hidden_size = round_up(hidden_size, 256)
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
@@ -479,9 +471,12 @@ class FusedMoE(torch.nn.Module):
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
             else:
+                packing_factor = (
+                    param.data.element_size() // loaded_weight.element_size()
+                )
                 dim1 = loaded_weight.shape[1]
-                dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                dim2 = loaded_weight.shape[2] // packing_factor
+                param.data[:, :dim1, :dim2].copy_(loaded_weight.view(param.data.dtype))
             return
 
         global_expert_location_metadata = get_global_expert_location_metadata()
@@ -733,12 +728,13 @@ class FusedMoE(torch.nn.Module):
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
-            elif "scale" in weight_name:
-                param.data.copy_(loaded_weight)
             else:
                 dim1 = loaded_weight.shape[1]
-                dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                packing_factor = (
+                    param.data.element_size() // loaded_weight.element_size()
+                )
+                dim2 = loaded_weight.shape[2] // packing_factor
+                param.data[:, :dim1, :dim2].copy_(loaded_weight.view(param.data.dtype))
             return
 
         # compressed-tensors checkpoints with packed weights are stored flipped
