@@ -1450,6 +1450,7 @@ def deep_gemm_utils_per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool) -> T
     x_view = x.view(m, -1, 128)
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
     sf = x_amax / 448.0
+    print(f"hi deep_gemm_utils_per_token_cast_to_fp8 {x=} {x_amax=} {sf=}")
     sf = deep_gemm_utils_ceil_to_ue8m0(sf) if use_ue8m0 else sf
     return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), sf
 
