@@ -787,8 +787,10 @@ class LongcatFlashForCausalLM(nn.Module):
                         self.config.hidden_size / self.config.kv_lora_rank
                     ) ** 0.5
 
-        # TODO(linguoyuan) EPMoE not support DEEPGEMM_BLACKWELL, DeepEP needs to be supported in the future
-        deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 = False
+        # Note: Don't unconditionally disable DEEPGEMM_SCALE_UE8M0 here
+        # It should be controlled by server args (--disable-deepgemm-ue8m0)
+        # for addressing DeepSeek EP accuracy issues on B200 GPUs
+        # See GitHub issue #9943: "[Bug] deepseek ep accuracy issue"
 
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM

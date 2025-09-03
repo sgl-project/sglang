@@ -38,8 +38,15 @@ DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL and get_bool_env_var(
 
 
 def update_deepgemm_scale_ue8m0(disable_ue8m0: bool):
-    """Update DEEPGEMM_SCALE_UE8M0 based on server arguments."""
+    """Update DEEPGEMM_SCALE_UE8M0 based on server arguments.
+    
+    This function allows disabling UE8M0 scaling optimizations that can cause
+    accuracy issues with DeepSeek models on B200 GPUs (issue #9943).
+    """
     global DEEPGEMM_SCALE_UE8M0
-    if disable_ue8m0 and DEEPGEMM_SCALE_UE8M0:
+    if disable_ue8m0:
+        if DEEPGEMM_SCALE_UE8M0:
+            logger.info("DeepGEMM UE8M0 scaling disabled via server argument")
         DEEPGEMM_SCALE_UE8M0 = False
-        logger.info("DeepGEMM UE8M0 scaling disabled via server argument")
+    # Note: We don't reset to True here because the initial value depends on 
+    # architecture detection and environment variables
