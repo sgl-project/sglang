@@ -68,6 +68,8 @@ mooncake_master
 
 **Launch Mooncake `store service`:**
 
+`Store service` is optional if MOONCAKE_GLOBAL_SEGMENT_SIZE is set to a non-zero value when starting the `SGLang server`.
+
 First, create and save a configuration file in JSON format. For example:
 
 ```json
