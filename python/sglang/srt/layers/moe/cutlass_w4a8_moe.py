@@ -150,8 +150,8 @@ def cutlass_w4a8_moe(
         k,
     )
 
-    c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
-    c2 = torch.zeros((m * topk, k), device=device, dtype=torch.bfloat16)
+    c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
+    c2 = torch.zeros((m * topk, k), device=device, dtype=torch.half)
 
     cutlass_w4a8_moe_mm(
         c1,
@@ -169,7 +169,7 @@ def cutlass_w4a8_moe(
         topk,
     )
 
-    intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
+    intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
     silu_and_mul(c1, intermediate)
 
     intermediate_q = torch.empty(
