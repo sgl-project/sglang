@@ -407,6 +407,7 @@ class HiCacheController:
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             is_mla_model=is_mla_backend,
+            is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             extra_config=extra_config,
         )
@@ -659,13 +660,14 @@ class HiCacheController:
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
                 break
-            if operation.increment(self.page_size):
-                self.mem_pool_host.set_from_flat_data_page(
-                    host_indices[i * self.page_size],
-                    page_data[i],
-                )
-            else:
-                break
+            # Must set the data before increasing the completed tokens.
+            # Otherwise this page may be read before being set.
+            self.mem_pool_host.set_from_flat_data_page(
+                host_indices[i * self.page_size],
+                page_data[i],
+            )
+            if not operation.increment(self.page_size):
+                break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
         # Select the get function and batch size
