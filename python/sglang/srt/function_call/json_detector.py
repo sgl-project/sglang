@@ -135,6 +135,10 @@ class JSONDetector:
             # Parse the actions into tool calls
             calls = self.parse_base_json(all_actions, tools) if all_actions else []
 
+            # If no valid tool calls were found, return the original text as normal text
+            if not calls:
+                return StreamingParseResult(normal_text=text, calls=[])
+
             return StreamingParseResult(normal_text="", calls=calls)
 
         except json.JSONDecodeError as e:

@@ -44,8 +44,7 @@ class TestToolChoiceLlama32(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
-                "--tool-call-parser",
-                "llama3",  # Default parser for the test model
+                # Tool calling now uses JSON schema by default, no parser needed
             ],
         )
         cls.base_url += "/v1"
@@ -480,8 +479,7 @@ class TestToolChoiceQwen25(TestToolChoiceLlama32):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
-                "--tool-call-parser",
-                "qwen25",
+                # Tool calling now uses JSON schema by default, no parser needed
             ],
         )
         cls.base_url += "/v1"
@@ -509,8 +507,7 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
-                "--tool-call-parser",
-                "mistral",
+                # Tool calling now uses JSON schema by default, no parser needed
             ],
         )
         cls.base_url += "/v1"

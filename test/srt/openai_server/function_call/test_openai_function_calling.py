@@ -44,9 +44,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
-                # If your server needs extra parameters to test function calling, please add them here.
-                "--tool-call-parser",
-                "llama3",
+                # Tool calling now uses JSON schema by default, no parser needed
             ],
         )
         cls.base_url += "/v1"
@@ -847,8 +845,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=[
-                "--tool-call-parser",
-                "pythonic",
+                # Tool calling now uses JSON schema by default, no parser needed
             ],
         )
         cls.base_url += "/v1"
