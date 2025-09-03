@@ -838,27 +838,6 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig] = None):
     return FusedMoE
 
 
-@triton.jit
-def to_cuda_without_ce_kernel(
-    out_ptr, N,
-    v0: tl.int32, v1: tl.int32, v2: tl.int32,
-    v3: tl.int32, v4: tl.int32, v5: tl.int32,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = tl.arange(0, BLOCK)
-    idx = pid * BLOCK + offs
-    mask = idx < N
-    val = v0
-    val = tl.where(offs == 1, v1, val)
-    val = tl.where(offs == 2, v2, val)
-    val = tl.where(offs == 3, v3, val)
-    val = tl.where(offs == 4, v4, val)
-    val = tl.where(offs == 5, v5, val)
-    ptr = out_ptr + idx
-    tl.store(ptr, val, mask=mask)
-
-
 def copy_to_gpu_no_ce_wrapped(arr: List[int]):
     tensor_cpu = torch.tensor(arr, dtype=torch.int32, device="cpu")
     tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
