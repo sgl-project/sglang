@@ -32,7 +32,9 @@ DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and _is_blackwell_arch()
 # Allow disabling UE8M0 scaling for accuracy-critical workloads
 # This can help with DeepSeek EP accuracy issues on B200 GPUs
 # Will be updated by server args in update_deepgemm_scale_ue8m0()
-DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL and get_bool_env_var("SGL_ENABLE_DEEPGEMM_UE8M0", default="true")
+DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL and get_bool_env_var(
+    "SGL_ENABLE_DEEPGEMM_UE8M0", default="true"
+)
 
 
 def update_deepgemm_scale_ue8m0(disable_ue8m0: bool):
@@ -42,4 +44,6 @@ def update_deepgemm_scale_ue8m0(disable_ue8m0: bool):
         DEEPGEMM_SCALE_UE8M0 = False
         logger.info("DeepGEMM UE8M0 scaling disabled via server argument")
     else:
-        DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL and get_bool_env_var("SGL_ENABLE_DEEPGEMM_UE8M0", default="true")
+        DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL and get_bool_env_var(
+            "SGL_ENABLE_DEEPGEMM_UE8M0", default="true"
+        )
