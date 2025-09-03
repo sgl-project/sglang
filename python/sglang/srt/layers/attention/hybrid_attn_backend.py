@@ -25,15 +25,25 @@ class HybridAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.decode_backend.init_forward_metadata(forward_batch)
+        elif forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend():
+            # Use the specified backend for speculative operations (both verify and draft extend)
+            if self.model_runner.server_args.speculative_verify_backend == "decode":
+                self.decode_backend.init_forward_metadata(forward_batch)
+            else:  # default to prefill
+                self.prefill_backend.init_forward_metadata(forward_batch)
         else:
             self.prefill_backend.init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
         if self.model_runner.server_args.speculative_algorithm is not None:
-            # When speculative decoding is enabled, we also need to initialize the
-            # prefill backend's cuda graph state to support target_verify.
-            self.prefill_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+            # When speculative decoding is enabled, we need to initialize the backend
+            # that will be used for target_verify.
+            if self.model_runner.server_args.speculative_verify_backend == "decode":
+                # decode_backend is already initialized above
+                pass  
+            else:  # default to prefill
+                self.prefill_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -55,6 +65,28 @@ class HybridAttnBackend(AttentionBackend):
                 forward_mode,
                 spec_info,
             )
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            # Use the specified backend for speculative operations (both verify and draft extend)
+            if self.model_runner.server_args.speculative_verify_backend == "decode":
+                self.decode_backend.init_forward_metadata_capture_cuda_graph(
+                    bs,
+                    num_tokens,
+                    req_pool_indices,
+                    seq_lens,
+                    encoder_lens,
+                    forward_mode,
+                    spec_info,
+                )
+            else:  # default to prefill
+                self.prefill_backend.init_forward_metadata_capture_cuda_graph(
+                    bs,
+                    num_tokens,
+                    req_pool_indices,
+                    seq_lens,
+                    encoder_lens,
+                    forward_mode,
+                    spec_info,
+                )
         else:
             self.prefill_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -88,6 +120,30 @@ class HybridAttnBackend(AttentionBackend):
                 spec_info,
                 seq_lens_cpu,
             )
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            # Use the specified backend for speculative operations (both verify and draft extend)
+            if self.model_runner.server_args.speculative_verify_backend == "decode":
+                self.decode_backend.init_forward_metadata_replay_cuda_graph(
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_sum,
+                    encoder_lens,
+                    forward_mode,
+                    spec_info,
+                    seq_lens_cpu,
+                )
+            else:  # default to prefill
+                self.prefill_backend.init_forward_metadata_replay_cuda_graph(
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_sum,
+                    encoder_lens,
+                    forward_mode,
+                    spec_info,
+                    seq_lens_cpu,
+                )
         else:
             self.prefill_backend.init_forward_metadata_replay_cuda_graph(
                 bs,
