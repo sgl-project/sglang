@@ -30,7 +30,6 @@ from sglang.srt.hf_transformers_utils import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
-    DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
