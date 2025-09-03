@@ -10,7 +10,7 @@ class TestMetricsUtils(unittest.TestCase):
         """Test basic functionality of two_sides_exponential_buckets."""
         # Test with simple parameters
         count = 5
-        buckets = two_sides_exponential_buckets(middle=10.0, width=2.0, count=count)
+        buckets = two_sides_exponential_buckets(middle=10.0, base=2.0, count=count)
 
         # Should contain the middle value
         self.assertIn(10.0, buckets)
@@ -27,13 +27,13 @@ class TestMetricsUtils(unittest.TestCase):
 
     def test_two_sides_exponential_buckets_specific_values(self):
         """Test specific values for two_sides_exponential_buckets."""
-        buckets = two_sides_exponential_buckets(middle=100.0, width=2.0, count=4)
+        buckets = two_sides_exponential_buckets(middle=100.0, base=2.0, count=4)
         expected_values = [96.0, 98.0, 100.0, 102.0, 104.0]
         self.assertEqual(buckets, expected_values)
 
     def test_two_sides_exponential_buckets_negative_values(self):
         """Test two_sides_exponential_buckets with values that could go negative."""
-        buckets = two_sides_exponential_buckets(middle=5.0, width=3.0, count=4)
+        buckets = two_sides_exponential_buckets(middle=5.0, base=3.0, count=4)
 
         # Should not contain negative values (max(0, middle - distance))
         for bucket in buckets:
@@ -45,16 +45,16 @@ class TestMetricsUtils(unittest.TestCase):
     def test_two_sides_exponential_buckets_edge_cases(self):
         """Test edge cases for two_sides_exponential_buckets."""
         # Count = 1
-        buckets = two_sides_exponential_buckets(middle=10.0, width=2.0, count=1)
+        buckets = two_sides_exponential_buckets(middle=10.0, base=2.0, count=1)
         self.assertIn(10.0, buckets)
 
         # Width = 1.0 (no multiplication effect)
-        buckets = two_sides_exponential_buckets(middle=10.0, width=1.0, count=3)
+        buckets = two_sides_exponential_buckets(middle=10.0, base=1.0, count=3)
         self.assertIn(10.0, buckets)
         self.assertEqual(1, len(buckets))
 
         # Very small middle value
-        buckets = two_sides_exponential_buckets(middle=0.1, width=2.0, count=2)
+        buckets = two_sides_exponential_buckets(middle=0.1, base=2.0, count=2)
         self.assertIn(0.1, buckets)
         for bucket in buckets:
             self.assertGreaterEqual(bucket, 0.0)
