@@ -668,6 +668,7 @@ class Scheduler(
                     model_config=self.model_config,
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
+                    tp_group=self.tp_group,
                 )
             else:
                 self.tree_cache = RadixCache(

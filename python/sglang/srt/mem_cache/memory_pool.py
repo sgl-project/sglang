@@ -155,9 +155,6 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter):
         self.layer_transfer_counter = layer_transfer_counter
 
-    def register_layer_transfer_executor(self, layer_transfer_executor):
-        self.layer_transfer_executor = layer_transfer_executor
-
     def get_cpu_copy(self, indices):
         raise NotImplementedError()
 
@@ -209,7 +206,6 @@ class MHATokenToKVPool(KVCache):
         self._create_buffers()
 
         self.layer_transfer_counter = None
-        self.layer_transfer_executor = None
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
 
@@ -356,8 +352,6 @@ class MHATokenToKVPool(KVCache):
         # same applies to get_value_buffer and get_kv_buffer
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        elif self.layer_transfer_executor is not None:
-            self.layer_transfer_executor.wait_until(layer_id - self.start_layer)
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
