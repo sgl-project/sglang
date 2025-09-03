@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sgl_kernel.elementwise import copy_to_gpu_no_ce
 import logging
 from typing import TYPE_CHECKING, Optional, Union, List
 
@@ -595,7 +596,7 @@ class DeepEPMoE(EPMoE):
         #     pin_memory=True,
         #     device="cpu",
         # ).cuda(non_blocking=True)
-        num_recv_tokens_per_expert_gpu = to_cuda_without_ce(num_recv_tokens_per_expert)
+        num_recv_tokens_per_expert_gpu = copy_to_gpu_no_ce_wrapped(num_recv_tokens_per_expert)
         expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
 
         ep_scatter(
@@ -856,16 +857,8 @@ def to_cuda_without_ce_kernel(
     tl.store(ptr, val, mask=mask)
 
 
-# TODO move or improve
-def to_cuda_without_ce(arr: List[int]) -> torch.Tensor:
-    # we may use managed memory etc for more general case if needed
-
-    N = len(arr)
-    assert N == 6, "other shapes to be supported"
-
-    out = torch.empty(N, dtype=torch.int32, device='cuda')
-
-    BLOCK = next_power_of_2(N)
-    to_cuda_without_ce_kernel[(1,)](out, N, *arr, BLOCK=BLOCK)
-
-    return out
+def copy_to_gpu_no_ce_wrapped(arr: List[int]):
+    tensor_cpu = torch.tensor(arr, dtype=torch.int32, device="cpu")
+    tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
+    copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
+    return tensor_gpu
