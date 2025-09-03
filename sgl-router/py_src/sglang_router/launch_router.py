@@ -7,21 +7,7 @@ from typing import Dict, List, Optional
 from sglang_router import Router
 from sglang_router_rs import PolicyType
 
-
-def setup_logger():
-    logger = logging.getLogger("router")
-    logger.setLevel(logging.INFO)
-
-    formatter = logging.Formatter(
-        "[Router (Python)] %(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    handler = logging.StreamHandler()
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-
-    return logger
+logger = logging.getLogger("router")
 
 
 @dataclasses.dataclass
@@ -650,6 +636,46 @@ def policy_from_str(policy_str: str) -> PolicyType:
     return policy_map[policy_str]
 
 
+def _validate_router_args(router_args: RouterArgs):
+    # Validate configuration based on mode
+    if router_args.pd_disaggregation:
+        # Validate PD configuration - skip URL requirements if using service discovery
+        if not router_args.service_discovery:
+            if not router_args.prefill_urls:
+                raise ValueError("PD disaggregation mode requires --prefill")
+            if not router_args.decode_urls:
+                raise ValueError("PD disaggregation mode requires --decode")
+
+        # Warn about policy usage in PD mode
+        if (
+            router_args.prefill_policy
+            and router_args.decode_policy
+            and router_args.policy
+        ):
+            logger.warning(
+                "Both --prefill-policy and --decode-policy are specified. "
+                "The main --policy flag will be ignored for PD mode."
+            )
+        elif (
+            router_args.prefill_policy
+            and not router_args.decode_policy
+            and router_args.policy
+        ):
+            logger.info(
+                f"Using --prefill-policy '{router_args.prefill_policy}' for prefill nodes "
+                f"and --policy '{router_args.policy}' for decode nodes."
+            )
+        elif (
+            router_args.decode_policy
+            and not router_args.prefill_policy
+            and router_args.policy
+        ):
+            logger.info(
+                f"Using --policy '{router_args.policy}' for prefill nodes "
+                f"and --decode-policy '{router_args.decode_policy}' for decode nodes."
+            )
+
+
 def launch_router(args: argparse.Namespace) -> Optional[Router]:
     """
     Launch the SGLang router with the configuration from parsed arguments.
@@ -661,7 +687,6 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
     Returns:
         Router instance if successful, None if failed
     """
-    logger = logging.getLogger("router")
     try:
         # Convert to RouterArgs if needed
         if not isinstance(args, RouterArgs):
@@ -669,43 +694,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         else:
             router_args = args
 
-        # Validate configuration based on mode
-        if router_args.pd_disaggregation:
-            # Validate PD configuration - skip URL requirements if using service discovery
-            if not router_args.service_discovery:
-                if not router_args.prefill_urls:
-                    raise ValueError("PD disaggregation mode requires --prefill")
-                if not router_args.decode_urls:
-                    raise ValueError("PD disaggregation mode requires --decode")
-
-            # Warn about policy usage in PD mode
-            if (
-                router_args.prefill_policy
-                and router_args.decode_policy
-                and router_args.policy
-            ):
-                logger.warning(
-                    "Both --prefill-policy and --decode-policy are specified. "
-                    "The main --policy flag will be ignored for PD mode."
-                )
-            elif (
-                router_args.prefill_policy
-                and not router_args.decode_policy
-                and router_args.policy
-            ):
-                logger.info(
-                    f"Using --prefill-policy '{router_args.prefill_policy}' for prefill nodes "
-                    f"and --policy '{router_args.policy}' for decode nodes."
-                )
-            elif (
-                router_args.decode_policy
-                and not router_args.prefill_policy
-                and router_args.policy
-            ):
-                logger.info(
-                    f"Using --policy '{router_args.policy}' for prefill nodes "
-                    f"and --decode-policy '{router_args.decode_policy}' for decode nodes."
-                )
+        _validate_router_args(router_args)
 
         # Create router with unified constructor
         router = Router(
