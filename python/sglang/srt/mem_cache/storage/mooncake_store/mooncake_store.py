@@ -149,15 +149,15 @@ class MooncakeStore(HiCacheStorage):
         key,
         value: Optional[Any] = None,
         target_location: Optional[List[int]] = None,
-        target_size: Optional[List[int]] = None,
+        target_sizes: Optional[List[int]] = None,
     ) -> bool:
         # Only support zero copy set for now
-        assert target_location is not None and target_size is not None
+        assert target_location is not None and target_sizes is not None
         exist_result = self._batch_exist([key])
         if exist_result[0] == 1:
             return True
         put_result = self._put_batch_zero_copy_impl(
-            [key], [target_location], [target_size]
+            [key], [target_location], [target_sizes]
         )
         return put_result[0] == 0
 
@@ -214,11 +214,11 @@ class MooncakeStore(HiCacheStorage):
         self,
         key,
         target_location: Optional[Any] = None,
-        target_size: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
     ) -> bool:
-        assert target_location is not None and target_size is not None
+        assert target_location is not None and target_sizes is not None
         get_result = self._get_batch_zero_copy_impl(
-            [key], [target_location], [target_size]
+            [key], [target_location], [target_sizes]
         )
         return get_result[0] >= 0
 

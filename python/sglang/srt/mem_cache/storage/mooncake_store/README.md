@@ -74,7 +74,7 @@ First, create and save a configuration file in JSON format. For example:
 {
     "local_hostname": "localhost",
     "metadata_server": "http://localhost:8080/metadata",
-    "master_server_address": "localhost:50051"
+    "master_server_address": "localhost:50051",
     "protocol": "rdma",
     "device_name": "erdma_0,erdma_1",
     "global_segment_size": 2684354560,

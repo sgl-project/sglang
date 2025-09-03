@@ -48,14 +48,14 @@ def test_single_operation():
     get_location = get_slice.data_ptr()
 
     # Test set operation
-    result = store.set(key, target_location=set_location, target_size=value_size)
+    result = store.set(key, target_location=set_location, target_sizes=value_size)
     assert result is True, f"❌set operation failed for key: {key}"
 
     # Test exists operation
     assert store.exists(key), f"❌key {key} should exist after set operation"
 
     # Test get operation
-    result = store.get(key, target_location=get_location, target_size=value_size)
+    result = store.get(key, target_location=get_location, target_sizes=value_size)
     assert result is True, f"❌get operation failed for key: {key}"
 
     # Compare the data using proper tensor indices
@@ -67,7 +67,7 @@ def test_single_operation():
 
 
 def test_batch_operation(config: HiCacheStorageConfig):
-    """Test the set API with a single key-value pair."""
+    """Test the batch set/get APIs with multiple key-value pairs."""
     print("=" * 100)
     print(f"Testing batch operation with config: {config}")
 
