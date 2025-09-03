@@ -648,9 +648,9 @@ class HiCacheController:
             operation.increment(get_result * self.page_size)
 
     def _generic_page_get(self, operation, hash_values, host_indices):
-        dummy_page_dst = [self.mem_pool_host.get_dummy_flat_data_page()] * len(
-            hash_values
-        )
+        dummy_page_dst = [
+            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
+        ]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
             return
