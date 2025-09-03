@@ -7,12 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.offloader import get_offloader
-
-_is_cuda = is_cuda()
-if _is_cuda:
-    from sgl_kernel.elementwise import copy_to_gpu_no_ce
-
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -39,14 +33,19 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.offloader import get_offloader
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
     get_bool_env_var,
+    is_cuda,
     is_hip,
     is_npu,
-    next_power_of_2,
 )
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sgl_kernel.elementwise import copy_to_gpu_no_ce
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
