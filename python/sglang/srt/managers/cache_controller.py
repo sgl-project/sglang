@@ -325,18 +325,18 @@ class HiCacheController:
                 )
 
             # Select the get and set functions
-            self.get_func = self._generic_page_get
-            self.backup_set_func = self._generic_page_set
+            self.page_get_func = self._generic_page_get
+            self.page_set_func = self._generic_page_set
             self.is_3fs_zerocopy = (
                 self.storage_backend_type == "hf3fs"
                 and self.mem_pool_host.layout == "page_first"
             )
             if self.storage_backend_type == "mooncake":
-                self.get_func = self._mooncake_page_get
-                self.backup_set_func = self._mooncake_page_set
+                self.page_get_func = self._mooncake_page_get
+                self.page_set_func = self._mooncake_page_set
             elif self.is_3fs_zerocopy:
-                self.get_func = self._3fs_zero_copy_page_get
-                self.backup_set_func = self._3fs_zero_copy_page_set
+                self.page_get_func = self._3fs_zero_copy_page_get
+                self.page_set_func = self._3fs_zero_copy_page_set
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
@@ -693,7 +693,7 @@ class HiCacheController:
             ]
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
-            self.get_func(operation, batch_hashes, batch_host_indices)
+            self.page_get_func(operation, batch_hashes, batch_host_indices)
             # Check termination
             if (
                 operation.completed_tokens
@@ -866,7 +866,7 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            success = self.backup_set_func(batch_hashes, batch_host_indices)
+            success = self.page_set_func(batch_hashes, batch_host_indices)
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
