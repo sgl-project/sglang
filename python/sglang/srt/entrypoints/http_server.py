@@ -724,7 +724,7 @@ async def init_weights_update_group(
 async def destroy_weights_update_group(
     obj: DestroyWeightsUpdateGroupReqInput, request: Request
 ):
-    """Initialize the parameter update group."""
+    """Destroy the parameter update group."""
     success, message = (
         await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     )
