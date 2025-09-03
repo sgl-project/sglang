@@ -433,7 +433,6 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
         weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
     )
 
-    # TODO maybe improve logic
     offloader.update_param(weight, new_weight)
     weight_scale_inv.data = new_weight_scale_inv
 

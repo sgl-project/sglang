@@ -399,6 +399,8 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
 
 
 def update_param(param, new_tensor):
+    """Update parameter while keeping properties needed by Offloader (e.g. pinned host memory)."""
+
     if param.device == new_tensor.device:
         param.data = new_tensor
     else:
