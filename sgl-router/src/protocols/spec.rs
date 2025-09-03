@@ -1565,7 +1565,8 @@ pub enum FunctionCall {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionCallResponse {
     pub name: String,
-    pub arguments: String, // JSON string
+    #[serde(default)]
+    pub arguments: Option<String>, // JSON string
 }
 
 // ============= Usage Tracking =============
