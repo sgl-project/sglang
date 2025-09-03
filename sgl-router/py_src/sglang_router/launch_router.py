@@ -591,79 +591,33 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
 
         router_args._validate_router_args()
 
-        # Create router with unified constructor
-        router = Router(
-            worker_urls=(
-                []
-                if router_args.service_discovery or router_args.pd_disaggregation
-                else router_args.worker_urls
-            ),
-            host=router_args.host,
-            port=router_args.port,
-            policy=policy_from_str(router_args.policy),
-            worker_startup_timeout_secs=router_args.worker_startup_timeout_secs,
-            worker_startup_check_interval=router_args.worker_startup_check_interval,
-            cache_threshold=router_args.cache_threshold,
-            balance_abs_threshold=router_args.balance_abs_threshold,
-            balance_rel_threshold=router_args.balance_rel_threshold,
-            eviction_interval_secs=router_args.eviction_interval,
-            max_tree_size=router_args.max_tree_size,
-            max_payload_size=router_args.max_payload_size,
-            dp_aware=router_args.dp_aware,
-            api_key=router_args.api_key,
-            log_dir=router_args.log_dir,
-            log_level=router_args.log_level,
-            service_discovery=router_args.service_discovery,
-            selector=router_args.selector,
-            service_discovery_port=router_args.service_discovery_port,
-            service_discovery_namespace=router_args.service_discovery_namespace,
-            prefill_selector=router_args.prefill_selector,
-            decode_selector=router_args.decode_selector,
-            prometheus_port=router_args.prometheus_port,
-            prometheus_host=router_args.prometheus_host,
-            request_timeout_secs=router_args.request_timeout_secs,
-            pd_disaggregation=router_args.pd_disaggregation,
-            prefill_urls=(
-                router_args.prefill_urls if router_args.pd_disaggregation else None
-            ),
-            decode_urls=(
-                router_args.decode_urls if router_args.pd_disaggregation else None
-            ),
-            prefill_policy=(
-                policy_from_str(router_args.prefill_policy)
-                if router_args.prefill_policy
-                else None
-            ),
-            decode_policy=(
-                policy_from_str(router_args.decode_policy)
-                if router_args.decode_policy
-                else None
-            ),
-            request_id_headers=router_args.request_id_headers,
-            max_concurrent_requests=router_args.max_concurrent_requests,
-            queue_size=router_args.queue_size,
-            queue_timeout_secs=router_args.queue_timeout_secs,
-            rate_limit_tokens_per_second=router_args.rate_limit_tokens_per_second,
-            cors_allowed_origins=router_args.cors_allowed_origins,
-            retry_max_retries=router_args.retry_max_retries,
-            retry_initial_backoff_ms=router_args.retry_initial_backoff_ms,
-            retry_max_backoff_ms=router_args.retry_max_backoff_ms,
-            retry_backoff_multiplier=router_args.retry_backoff_multiplier,
-            retry_jitter_factor=router_args.retry_jitter_factor,
-            cb_failure_threshold=router_args.cb_failure_threshold,
-            cb_success_threshold=router_args.cb_success_threshold,
-            cb_timeout_duration_secs=router_args.cb_timeout_duration_secs,
-            cb_window_duration_secs=router_args.cb_window_duration_secs,
-            disable_retries=router_args.disable_retries,
-            disable_circuit_breaker=router_args.disable_circuit_breaker,
-            health_failure_threshold=router_args.health_failure_threshold,
-            health_success_threshold=router_args.health_success_threshold,
-            health_check_timeout_secs=router_args.health_check_timeout_secs,
-            health_check_interval_secs=router_args.health_check_interval_secs,
-            health_check_endpoint=router_args.health_check_endpoint,
-            model_path=router_args.model_path,
-            tokenizer_path=router_args.tokenizer_path,
+        router_args_dict = vars(router_args)
+
+        router_args_dict["worker_urls"] = (
+            []
+            if router_args.service_discovery or router_args.pd_disaggregation
+            else router_args.worker_urls
         )
+        router_args_dict["policy"] = policy_from_str(router_args.policy)
+        router_args_dict["prefill_urls"] = (
+            router_args.prefill_urls if router_args.pd_disaggregation else None
+        )
+        router_args_dict["decode_urls"] = (
+            router_args.decode_urls if router_args.pd_disaggregation else None
+        )
+        router_args_dict["prefill_policy"] = (
+            policy_from_str(router_args.prefill_policy)
+            if router_args.prefill_policy
+            else None
+        )
+        router_args_dict["decode_policy"] = (
+            policy_from_str(router_args.decode_policy)
+            if router_args.decode_policy
+            else None
+        )
+
+        # Create router with unified constructor
+        router = Router(**router_args_dict)
 
         router.start()
         return router
