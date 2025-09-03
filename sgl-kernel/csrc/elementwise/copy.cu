@@ -15,6 +15,8 @@ template <int N>
 void copy_to_gpu_no_ce_impl(const std::vector<int>& input, at::Tensor& output) {
   TORCH_CHECK(static_cast<int>(input.size()) == N, "input size");
   TORCH_CHECK(output.numel() == N, "output size");
+  TORCH_CHECK(output.is_contiguous(), "output contiguous");
+  TORCH_CHECK(output.dtype() == torch::kInt32, "output dtype");
 
   InputArray<N> input_array;
   for (int i = 0; i < N; ++i) input_array.values[i] = input[i];
