@@ -38,7 +38,7 @@ void copy_to_gpu_no_ce_impl(const at::Tensor& input, at::Tensor& output) {
 
   // TODO may use multi thread blocks?
   dim3 grid(1);
-  dim3 block(input.size());
+  dim3 block(input.numel());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   copy_to_gpu_no_ce_kernel<<<grid, block, 0, stream>>>(input_array, output.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
