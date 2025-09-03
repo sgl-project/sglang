@@ -552,9 +552,9 @@ class HybridLinearAttnBackend(AttentionBackend):
 
                 # we do in-place update for ssm_state
                 _ = fused_recurrent_gated_delta_rule_update(
-                    query=query,
-                    key=key,
-                    value=value,
+                    q=query,
+                    k=key,
+                    v=value,
                     g=g,
                     beta=beta,
                     initial_state_source=ssm_state,
@@ -562,4 +562,3 @@ class HybridLinearAttnBackend(AttentionBackend):
                     cu_seqlens=query_start_loc,
                     use_qk_l2norm_in_kernel=True,
                 )
-q
