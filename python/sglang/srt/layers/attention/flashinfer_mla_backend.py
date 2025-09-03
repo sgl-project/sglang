@@ -845,7 +845,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
-            kv_lens = paged_kernel_lens.to(torch.int32)
+            kv_lens = paged_kernel_lens
         else:
             assert isinstance(spec_info, SpecInput)
             # TODO: Support topk > 1 with custom mask
@@ -879,7 +879,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
-                kv_len_arr=kv_lens,
+                kv_len_arr=kv_lens.to(torch.int32),
                 num_heads=self.num_local_heads,
                 head_dim_ckv=self.kv_lora_rank,
                 head_dim_kpe=self.qk_rope_head_dim,
