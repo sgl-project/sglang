@@ -32,7 +32,7 @@ class RouterArgs:
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
-    eviction_interval: int = 120
+    eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     dp_aware: bool = False
@@ -202,9 +202,9 @@ class RouterArgs:
             help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
         )
         parser.add_argument(
-            f"--{prefix}eviction-interval",
+            f"--{prefix}eviction-interval-secs",
             type=int,
-            default=RouterArgs.eviction_interval,
+            default=RouterArgs.eviction_interval_secs,
             help="Interval in seconds between cache eviction operations",
         )
         parser.add_argument(
