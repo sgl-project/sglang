@@ -3,8 +3,12 @@ use crate::tool_parser::parsers::{
     MistralParser, PythonicParser, QwenParser, Step3Parser,
 };
 use crate::tool_parser::traits::ToolParser;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Global singleton registry instance - created once and reused
+pub static GLOBAL_REGISTRY: Lazy<ParserRegistry> = Lazy::new(ParserRegistry::new_internal);
 
 /// Registry for tool parsers and model mappings
 pub struct ParserRegistry {
@@ -17,8 +21,19 @@ pub struct ParserRegistry {
 }
 
 impl ParserRegistry {
-    /// Create a new parser registry with default mappings
-    pub fn new() -> Self {
+    /// Get the global singleton instance
+    pub fn new() -> &'static Self {
+        &GLOBAL_REGISTRY
+    }
+
+    /// Create a new instance for testing (not the singleton)
+    #[cfg(test)]
+    pub fn new_for_testing() -> Self {
+        Self::new_internal()
+    }
+
+    /// Internal constructor for creating the singleton instance
+    fn new_internal() -> Self {
         let mut registry = Self {
             parsers: HashMap::new(),
             model_mapping: HashMap::new(),
@@ -202,8 +217,8 @@ impl ParserRegistry {
     }
 }
 
-impl Default for ParserRegistry {
+impl Default for &'static ParserRegistry {
     fn default() -> Self {
-        Self::new()
+        ParserRegistry::new()
     }
 }

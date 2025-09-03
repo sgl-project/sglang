@@ -165,6 +165,27 @@ class TestMinicpmvServer(ImageOpenAITestMixin):
         cls.base_url += "/v1"
 
 
+class TestMinicpmv4Server(ImageOpenAITestMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "openbmb/MiniCPM-V-4"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.35",
+                "--cuda-graph-max-bs",
+                "4",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
 class TestInternVL2_5Server(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
@@ -184,7 +205,7 @@ class TestInternVL2_5Server(ImageOpenAITestMixin):
         cls.base_url += "/v1"
 
 
-class TestMinicpmoServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
+class TestMinicpmo2_6Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "openbmb/MiniCPM-o-2_6"

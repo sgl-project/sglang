@@ -1,7 +1,7 @@
 use clap::{ArgAction, Parser};
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
+    HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
@@ -272,9 +272,42 @@ struct CliArgs {
     /// Enable Inference Gateway mode
     #[arg(long, default_value_t = false)]
     enable_igw: bool,
+
+    // Tokenizer configuration
+    /// Model path for loading tokenizer (HuggingFace model ID or local path)
+    #[arg(long)]
+    model_path: Option<String>,
+
+    /// Explicit tokenizer path (overrides model_path tokenizer if provided)
+    #[arg(long)]
+    tokenizer_path: Option<String>,
 }
 
 impl CliArgs {
+    /// Determine connection mode from worker URLs
+    fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
+        // Check if any URL is a gRPC endpoint (starts with grpc:// or has port that commonly indicates gRPC)
+        for url in worker_urls {
+            if url.starts_with("grpc://") || url.starts_with("grpcs://") {
+                return ConnectionMode::Grpc;
+            }
+            // Also check for common gRPC ports if the scheme isn't specified
+            if let Ok(parsed_url) = url::Url::parse(url) {
+                if let Some(port) = parsed_url.port() {
+                    // Common gRPC ports
+                    if port == 50051 || port == 9090 || ((50000..=50100).contains(&port)) {
+                        return ConnectionMode::Grpc;
+                    }
+                }
+            } else if url.contains(":50051") || url.contains(":9090") || url.contains(":5000") {
+                // Fallback check for URLs that might not parse correctly
+                return ConnectionMode::Grpc;
+            }
+        }
+        // Default to HTTP
+        ConnectionMode::Http
+    }
+
     /// Parse selector strings into HashMap
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
         let mut map = HashMap::new();
@@ -372,10 +405,30 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
+        // Determine connection mode from all worker URLs
+        let mut all_urls = Vec::new();
+        match &mode {
+            RoutingMode::Regular { worker_urls } => {
+                all_urls.extend(worker_urls.clone());
+            }
+            RoutingMode::PrefillDecode {
+                prefill_urls,
+                decode_urls,
+                ..
+            } => {
+                for (url, _) in prefill_urls {
+                    all_urls.push(url.clone());
+                }
+                all_urls.extend(decode_urls.clone());
+            }
+        }
+        let connection_mode = Self::determine_connection_mode(&all_urls);
+
         // Build RouterConfig
         Ok(RouterConfig {
             mode,
             policy,
+            connection_mode,
             host: self.host.clone(),
             port: self.port,
             max_payload_size: self.max_payload_size,
@@ -421,6 +474,8 @@ impl CliArgs {
             },
             enable_igw: self.enable_igw,
             rate_limit_tokens_per_second: None,
+            model_path: self.model_path.clone(),
+            tokenizer_path: self.tokenizer_path.clone(),
         })
     }
 

@@ -103,6 +103,15 @@ class GeluAndMul(CustomOp):
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        y_npu, gelu_npu = torch_npu.npu_geglu(
+            x,
+            dim=-1,
+            approximate=1 if self.approximate == "tanh" else 0,
+            activate_left=True,
+        )
+        return y_npu
+
 
 class NewGELU(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -136,6 +145,9 @@ class QuickGELU(CustomOp):
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         gelu_quick(x, out)
         return out
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        return torch_npu.npu_fast_gelu(x)
 
 
 class ScaledActivation(nn.Module):

@@ -36,7 +36,7 @@ jobs:
           filters: |
             src:
               - "python/**"
-              - "scripts/**"
+              - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test.yml"
 
@@ -417,7 +417,7 @@ jobs:
       unit-test-deepep-4-gpu, unit-test-deepep-8-gpu,
       unit-test-backend-8-gpu-b200,
     ]
-    if: needs.check-changes.outputs.src == 'true'
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

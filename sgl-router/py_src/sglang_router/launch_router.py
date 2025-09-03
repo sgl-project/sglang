@@ -99,6 +99,9 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Tokenizer configuration
+    model_path: Optional[str] = None
+    tokenizer_path: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -433,6 +436,19 @@ class RouterArgs:
             default=[],
             help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
         )
+        # Tokenizer configuration
+        parser.add_argument(
+            f"--{prefix}model-path",
+            type=str,
+            default=None,
+            help="Model path for loading tokenizer (HuggingFace model ID or local path)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-path",
+            type=str,
+            default=None,
+            help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+        )
 
     @classmethod
     def from_cli_args(
@@ -554,6 +570,8 @@ class RouterArgs:
             health_check_endpoint=getattr(
                 args, f"{prefix}health_check_endpoint", RouterArgs.health_check_endpoint
             ),
+            model_path=getattr(args, f"{prefix}model_path", None),
+            tokenizer_path=getattr(args, f"{prefix}tokenizer_path", None),
         )
 
     @staticmethod
@@ -759,6 +777,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             health_check_timeout_secs=router_args.health_check_timeout_secs,
             health_check_interval_secs=router_args.health_check_interval_secs,
             health_check_endpoint=router_args.health_check_endpoint,
+            model_path=router_args.model_path,
+            tokenizer_path=router_args.tokenizer_path,
         )
 
         router.start()

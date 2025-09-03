@@ -159,6 +159,7 @@ class MooncakeStore(HiCacheStorage):
     def batch_set(
         self,
         keys: List[str],
+        values: Optional[List[torch.Tensor]] = None,
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
@@ -253,7 +254,7 @@ class MooncakeStore(HiCacheStorage):
         pass
 
     def clear(self) -> None:
-        raise (NotImplementedError)
+        self.store.remove_all()
 
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
