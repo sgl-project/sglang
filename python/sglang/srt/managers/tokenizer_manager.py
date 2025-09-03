@@ -1015,6 +1015,7 @@ class TokenizerManager:
                         pass
 
     async def flush_cache(self) -> FlushCacheReqOutput:
+        self.auto_create_handle_loop()
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
     async def clear_hicache_storage(self) -> ClearHiCacheReqOutput:
