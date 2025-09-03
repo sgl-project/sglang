@@ -23,6 +23,7 @@ import threading
 from multiprocessing import shared_memory
 from typing import Dict
 
+import setproctitle
 import zmq
 import zmq.asyncio
 
@@ -476,6 +477,7 @@ class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        setproctitle.setproctitle("sglang::multi_tokenizer_manager")
         # prevent init prefill bootstrapserver again
         disaggregation_mode = server_args.disaggregation_mode
         server_args.disaggregation_mode = "null"
