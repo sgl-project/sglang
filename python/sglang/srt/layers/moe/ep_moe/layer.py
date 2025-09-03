@@ -7,6 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.offloader import get_offloader
+
 _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel.elementwise import copy_to_gpu_no_ce
@@ -600,7 +602,7 @@ class DeepEPMoE(EPMoE):
         )
         output_index = torch.empty_like(topk_idx)
 
-        if len(num_recv_tokens_per_expert) in {64, 72}:
+        if get_offloader().forbid_copy_engine_usage:
             num_recv_tokens_per_expert_gpu = copy_list_to_gpu_no_ce(
                 num_recv_tokens_per_expert
             )
