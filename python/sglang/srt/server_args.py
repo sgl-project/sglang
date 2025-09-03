@@ -253,7 +253,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
-    speculative_verify_backend: str = "prefill"
+    speculative_attention_backend: str = "prefill"
 
     # Expert parallelism
     ep_size: int = 1
@@ -1514,11 +1514,11 @@ class ServerArgs:
             default=ServerArgs.speculative_token_map,
         )
         parser.add_argument(
-            "--speculative-verify-backend",
+            "--speculative-attention-backend",
             type=str,
             choices=["prefill", "decode"],
-            help="Backend to use for speculative decoding operations (both target verify and draft extend). 'prefill' (default) or 'decode'.",
-            default=ServerArgs.speculative_verify_backend,
+            help="Attention backend to use for speculative decoding operations (both target verify and draft extend). 'prefill' (default) or 'decode'.",
+            default=ServerArgs.speculative_attention_backend,
         )
 
         # Expert parallelism

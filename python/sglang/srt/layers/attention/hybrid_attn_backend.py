@@ -27,7 +27,7 @@ class HybridAttnBackend(AttentionBackend):
             self.decode_backend.init_forward_metadata(forward_batch)
         elif forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend():
             # Use the specified backend for speculative operations (both verify and draft extend)
-            if self.model_runner.server_args.speculative_verify_backend == "decode":
+            if self.model_runner.server_args.speculative_attention_backend == "decode":
                 self.decode_backend.init_forward_metadata(forward_batch)
             else:  # default to prefill
                 self.prefill_backend.init_forward_metadata(forward_batch)
@@ -39,7 +39,7 @@ class HybridAttnBackend(AttentionBackend):
         if self.model_runner.server_args.speculative_algorithm is not None:
             # When speculative decoding is enabled, we need to initialize the backend
             # that will be used for target_verify.
-            if self.model_runner.server_args.speculative_verify_backend == "decode":
+            if self.model_runner.server_args.speculative_attention_backend == "decode":
                 # decode_backend is already initialized above
                 pass  
             else:  # default to prefill
@@ -67,7 +67,7 @@ class HybridAttnBackend(AttentionBackend):
             )
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
             # Use the specified backend for speculative operations (both verify and draft extend)
-            if self.model_runner.server_args.speculative_verify_backend == "decode":
+            if self.model_runner.server_args.speculative_attention_backend == "decode":
                 self.decode_backend.init_forward_metadata_capture_cuda_graph(
                     bs,
                     num_tokens,
@@ -122,7 +122,7 @@ class HybridAttnBackend(AttentionBackend):
             )
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
             # Use the specified backend for speculative operations (both verify and draft extend)
-            if self.model_runner.server_args.speculative_verify_backend == "decode":
+            if self.model_runner.server_args.speculative_attention_backend == "decode":
                 self.decode_backend.init_forward_metadata_replay_cuda_graph(
                     bs,
                     req_pool_indices,
@@ -185,7 +185,7 @@ class HybridAttnBackend(AttentionBackend):
     ):
         # Check if this is a speculative decoding operation that should use decode backend
         if (forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend()) and \
-           self.model_runner.server_args.speculative_verify_backend == "decode":
+           self.model_runner.server_args.speculative_attention_backend == "decode":
             return self.decode_backend.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
