@@ -29,6 +29,8 @@ import time
 from http import HTTPStatus
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
+import setproctitle
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -1165,6 +1167,7 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    setproctitle.setproctitle(f"sglang::http_server/tokenizer_manager")
     if server_args.tokenizer_worker_num > 1:
         port_args = PortArgs.init_new(server_args)
         port_args.tokenizer_worker_ipc_name = (
