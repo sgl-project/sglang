@@ -70,7 +70,7 @@ mooncake_master
 
 First, create and save a configuration file in JSON format. For example:
 
-```bash
+```json
 {
     "local_hostname": "localhost",
     "metadata_server": "http://localhost:8080/metadata",
@@ -78,7 +78,7 @@ First, create and save a configuration file in JSON format. For example:
     "protocol": "rdma",
     "device_name": "erdma_0,erdma_1",
     "global_segment_size": 2684354560,
-    "local_buffer_size": 0,
+    "local_buffer_size": 0
 }
 ```
 
@@ -99,7 +99,7 @@ python -m mooncake.mooncake_store_service --config=[config_path]
 ```
 
 **Start the `SGLang server` with Mooncake enabled:**
-Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` layout.
+Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` layout (which optimizes memory access patterns for KV cache operations).
 
 ```bash
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
@@ -115,23 +115,23 @@ python -m sglang.launch_server \
 
 Parameter Explanation:
 
-* MOONCAKE\_TE\_META\_DATA\_SERVER: The network address of the `metadata service`. The default port is 8080.
-* MOONCAKE\_MASTER: The network address of the `master service`. The default port is 50051.
-* MOONCAKE\_PROTOCOL: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
-* MOONCAKE\_DEVICE: The RDMA devices used by Mooncake. This parameter is required only when the protocol is set to `"rdma"`. Available devices can be listed using the `ibv_devices` command.
-* MOONCAKE\_GLOBAL\_SEGMENT\_SIZE: The amount of memory (in bytes) contributed to the global memory pool. If at least one `store service` is launched, then this value could be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
+* `MOONCAKE_TE_META_DATA_SERVER`: The network address of the `metadata service`. The default port is 8080.
+* `MOONCAKE_MASTER`: The network address of the `master service`. The default port is 50051.
+* `MOONCAKE_PROTOCOL`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
+* `MOONCAKE_DEVICE`: The RDMA devices used by Mooncake. This parameter is required only when the protocol is set to `"rdma"`. Available devices can be listed using the `ibv_devices` command.
+* `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory (in bytes) contributed to the global memory pool. If at least one `store service` is launched, then this value could be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
 
 ### Distributed Deployment
 
 Distributed deployment of Mooncake is straightforward. Similar to the single-node setup, start one `metadata service` and one `master service` for this cluster. Then start a `store service` on each server.
 
-Mooncake also support high availability mode. This mode enhances fault tolerance by running the `master service` as a cluster of multiple master nodes coordinated through an `etcd` cluster. The master nodes use `etcd` to elect a leader, which is responsible for handling client requests. For more details about how to deploy in this mode, please refer to our [documents](https://kvcache-ai.github.io/Mooncake/) .
+Mooncake also supports high availability mode. This mode enhances fault tolerance by running the `master service` as a cluster of multiple master nodes coordinated through an `etcd` cluster. The master nodes use `etcd` to elect a leader, which is responsible for handling client requests. For more details about how to deploy in this mode, please refer to our [documents](https://kvcache-ai.github.io/Mooncake/) .
 
 ## Test Mooncake Store
 
 This test is intended for developers to quickly verify that the MooncakeStore class interfaces are functioning correctly.
 
-First, start the `meta service` and `master service`. Then run the `test_mooncake_store.py`. 16MB global segments size is enough to run this test.
+First, start the `metadata service` and `master service`. Then run the `test_mooncake_store.py`. 16MB global segments size is enough to run this test.
 
 ```bash
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
@@ -140,6 +140,6 @@ MOONCAKE_PROTOCOL="rdma" \
 MOONCAKE_DEVICE="erdma_0,erdma_1" \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=16777216 \
 python3 [path of test_mooncake_store.py]
- ```
+```
 
 If all tests pass, the message "✅ All tests passed" will be printed at the end.
