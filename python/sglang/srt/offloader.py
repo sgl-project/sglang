@@ -398,12 +398,11 @@ class _ShmCpuParamOffloader(_BaseParamOffloader):
         return self.shm_cpu_data.to("cuda", non_blocking=True)
 
 
-# TODO maybe improve logic
 def update_param(param, new_tensor):
     if param.device == new_tensor.device:
         param.data = new_tensor
     else:
-        # assert param.device == "cpu", f"{param.device=} {new_tensor.device=}"
+        assert param.device == "cpu", f"{param.device=} {new_tensor.device=}"
         param.data = _create_cpu_data(new_tensor, pin_memory=True)
 
 
