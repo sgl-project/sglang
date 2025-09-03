@@ -26,7 +26,7 @@ from typing import List, Literal, Optional, Union
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -129,6 +129,7 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
+    tokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -268,6 +269,7 @@ class ServerArgs:
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    disable_deepgemm_ue8m0: bool = False
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -275,6 +277,7 @@ class ServerArgs:
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
+    eplb_min_rebalancing_utilization_threshold: float = 1.0
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_approx", "per_pass", "per_token"]
     ] = None
@@ -826,6 +829,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.tokenizer_path,
             help="The path of the tokenizer.",
+        )
+        parser.add_argument(
+            "--tokenizer-worker-num",
+            type=int,
+            default=ServerArgs.tokenizer_worker_num,
+            help="The worker num of the tokenizer manager.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -1556,6 +1565,11 @@ class ServerArgs:
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
         parser.add_argument(
+            "--disable-deepgemm-ue8m0",
+            action="store_true",
+            help="Disable DeepGEMM UE8M0 scaling optimizations. This can help with accuracy issues on Blackwell GPUs (B200) for certain models like DeepSeek.",
+        )
+        parser.add_argument(
             "--ep-num-redundant-experts",
             type=int,
             default=ServerArgs.ep_num_redundant_experts,
@@ -1595,6 +1609,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.eplb_rebalance_layers_per_chunk,
             help="Number of layers to rebalance per forward pass.",
+        )
+        parser.add_argument(
+            "--eplb-min-rebalancing-utilization-threshold",
+            type=float,
+            default=ServerArgs.eplb_min_rebalancing_utilization_threshold,
+            help="Minimum threshold for GPU average utilization to trigger EPLB rebalancing. Must be in the range [0.0, 1.0].",
         )
         parser.add_argument(
             "--expert-distribution-recorder-mode",
@@ -2170,6 +2190,9 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
+        # Check multi tokenizer
+        assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
@@ -2413,6 +2436,9 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
+    # The ipc filename for Tokenizer and worker tokenizer
+    tokenizer_worker_ipc_name: Optional[str]
+
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
         if server_args.nccl_port is None:
@@ -2436,6 +2462,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                tokenizer_worker_ipc_name=None,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -2469,6 +2496,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
+                tokenizer_worker_ipc_name=None,
             )
 
 
