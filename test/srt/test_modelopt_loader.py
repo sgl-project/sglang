@@ -123,6 +123,205 @@ class TestModelOptModelLoader(CustomTestCase):
             # Verify we get back the expected model
             self.assertEqual(result_model, self.mock_base_model)
 
+    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
+    @patch("sglang.srt.model_loader.loader.logger")
+    def test_invalid_quantization_choice(self, mock_logger):
+        """Test error handling for invalid quantization choices."""
+
+        # Set an invalid quantization choice
+        invalid_config = ModelConfig(
+            model_path=self.model_path, modelopt_quant="invalid_quant"
+        )
+
+        loader = ModelOptModelLoader(self.load_config)
+
+        # Mock the base model loader method
+        with patch.object(
+            loader, "_load_modelopt_base_model", return_value=self.mock_base_model
+        ):
+            with patch("builtins.__import__"):
+
+                # Expect ValueError for invalid quantization choice
+                with self.assertRaises(ValueError) as context:
+                    loader.load_model(
+                        model_config=invalid_config, device_config=self.device_config
+                    )
+
+                # Verify the error message contains expected information
+                error_msg = str(context.exception)
+                self.assertIn(
+                    "Invalid modelopt_quant choice: 'invalid_quant'", error_msg
+                )
+                self.assertIn("Available choices in QUANT_CFG_CHOICES", error_msg)
+
+    @patch("sglang.srt.model_loader.loader.logger")
+    def test_missing_modelopt_import(self, mock_logger):
+        """Test error handling when modelopt library is not available."""
+
+        loader = ModelOptModelLoader(self.load_config)
+
+        # Mock the base model loader method
+        with patch.object(
+            loader, "_load_modelopt_base_model", return_value=self.mock_base_model
+        ):
+            # Simulate missing modelopt by making import fail
+            def mock_import(name, *args, **kwargs):
+                if name.startswith("modelopt"):
+                    raise ImportError("No module named 'modelopt'")
+                # Return default import behavior for other modules
+                return __import__(name, *args, **kwargs)
+
+            with patch("builtins.__import__", side_effect=mock_import):
+                # Expect ImportError to be raised and logged
+                with self.assertRaises(ImportError):
+                    loader.load_model(
+                        model_config=self.model_config, device_config=self.device_config
+                    )
+
+                # Verify error logging
+                mock_logger.error.assert_called_with(
+                    "NVIDIA Model Optimizer (modelopt) library not found. "
+                    "Please install it to use 'modelopt_quant' feature."
+                )
+
+    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
+    @patch("sglang.srt.model_loader.loader.logger")
+    def test_missing_quantization_config_attribute(self, mock_logger):
+        """Test error handling when quantization config attribute doesn't exist in mtq."""
+
+        loader = ModelOptModelLoader(self.load_config)
+
+        # Mock modelopt modules but without the expected config attribute
+        mock_mtq = MagicMock()
+        # Don't set FP8_DEFAULT_CFG attribute to simulate missing config
+        del mock_mtq.FP8_DEFAULT_CFG  # This will cause AttributeError when accessed
+
+        mock_dataset_utils = MagicMock()
+
+        with patch.object(
+            loader, "_load_modelopt_base_model", return_value=self.mock_base_model
+        ):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "modelopt": MagicMock(),
+                    "modelopt.torch": MagicMock(),
+                    "modelopt.torch.quantization": mock_mtq,
+                    "modelopt.torch.utils": MagicMock(),
+                    "modelopt.torch.utils.dataset_utils": mock_dataset_utils,
+                },
+            ):
+
+                # Expect AttributeError to be raised
+                with self.assertRaises(AttributeError) as context:
+                    loader.load_model(
+                        model_config=self.model_config, device_config=self.device_config
+                    )
+
+                # Verify the error message
+                error_msg = str(context.exception)
+                self.assertIn(
+                    "ModelOpt quantization config attribute 'FP8_DEFAULT_CFG'",
+                    error_msg,
+                )
+                self.assertIn(
+                    "not found in modelopt.torch.quantization module", error_msg
+                )
+
+    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
+    @patch("sglang.srt.model_loader.loader.logger")
+    def test_quantization_error_handling(self, mock_logger):
+        """Test error handling when mtq.quantize fails."""
+
+        loader = ModelOptModelLoader(self.load_config)
+
+        # Mock modelopt modules
+        mock_mtq = MagicMock()
+        mock_create_forward_loop = MagicMock()
+
+        # Configure mtq mock to raise exception during quantization
+        mock_fp8_cfg = MagicMock()
+        mock_mtq.FP8_DEFAULT_CFG = mock_fp8_cfg
+        quantization_error = RuntimeError("Quantization failed")
+        mock_mtq.quantize.side_effect = quantization_error
+
+        mock_dataset_utils = MagicMock()
+        mock_dataset_utils.create_forward_loop = mock_create_forward_loop
+
+        with patch.object(
+            loader, "_load_modelopt_base_model", return_value=self.mock_base_model
+        ):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "modelopt": MagicMock(),
+                    "modelopt.torch": MagicMock(),
+                    "modelopt.torch.quantization": mock_mtq,
+                    "modelopt.torch.utils": MagicMock(),
+                    "modelopt.torch.utils.dataset_utils": mock_dataset_utils,
+                },
+            ):
+
+                # Expect RuntimeError to be raised
+                with self.assertRaises(RuntimeError):
+                    loader.load_model(
+                        model_config=self.model_config, device_config=self.device_config
+                    )
+
+                # Verify error logging
+                mock_logger.error.assert_called_with(
+                    f"Error during ModelOpt mtq.quantize call: {quantization_error}"
+                )
+
+    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
+    def test_nvfp4_quantization(self):
+        """Test NVFP4 quantization workflow."""
+
+        # Create model config with nvfp4 quantization
+        nvfp4_config = ModelConfig(model_path=self.model_path, modelopt_quant="nvfp4")
+
+        loader = ModelOptModelLoader(self.load_config)
+
+        # Mock modelopt modules
+        mock_mtq = MagicMock()
+        mock_create_forward_loop = MagicMock()
+
+        # Configure mtq mock with NVFP4_DEFAULT_CFG
+        mock_nvfp4_cfg = MagicMock()
+        mock_mtq.NVFP4_DEFAULT_CFG = mock_nvfp4_cfg
+        mock_mtq.quantize.return_value = self.mock_base_model
+        mock_mtq.print_quant_summary = MagicMock()
+
+        mock_dataset_utils = MagicMock()
+        mock_dataset_utils.create_forward_loop = mock_create_forward_loop
+
+        with patch.object(
+            loader, "_load_modelopt_base_model", return_value=self.mock_base_model
+        ):
+            with patch.dict(
+                "sys.modules",
+                {
+                    "modelopt": MagicMock(),
+                    "modelopt.torch": MagicMock(),
+                    "modelopt.torch.quantization": mock_mtq,
+                    "modelopt.torch.utils": MagicMock(),
+                    "modelopt.torch.utils.dataset_utils": mock_dataset_utils,
+                },
+            ):
+
+                # Execute the load_model method
+                result_model = loader.load_model(
+                    model_config=nvfp4_config, device_config=self.device_config
+                )
+
+                # Verify the quantization process used NVFP4 config
+                mock_mtq.quantize.assert_called_once_with(
+                    self.mock_base_model, mock_nvfp4_cfg, forward_loop=None
+                )
+
+                # Verify we get back the expected model
+                self.assertEqual(result_model, self.mock_base_model)
+
 
 class TestModelOptLoaderIntegration(CustomTestCase):
     """Integration tests for ModelOptModelLoader with Engine API."""
@@ -169,6 +368,28 @@ class TestModelOptLoaderIntegration(CustomTestCase):
                 pass
             else:
                 self.fail(f"modelopt_quant parameter not properly handled: {e}")
+
+    def test_quant_cfg_choices_completeness(self):
+        """Test that QUANT_CFG_CHOICES contains expected quantization options."""
+
+        # Verify expected quantization choices are available
+        expected_choices = ["fp8", "nvfp4", "int4_awq", "w4a8_awq", "nvfp4_awq"]
+
+        for choice in expected_choices:
+            self.assertIn(
+                choice,
+                QUANT_CFG_CHOICES,
+                f"Expected quantization choice '{choice}' not found in QUANT_CFG_CHOICES",
+            )
+
+        # Verify all choices map to non-empty strings
+        for choice, cfg_name in QUANT_CFG_CHOICES.items():
+            self.assertIsInstance(
+                cfg_name, str, f"Config name for '{choice}' should be a string"
+            )
+            self.assertTrue(
+                len(cfg_name) > 0, f"Config name for '{choice}' should not be empty"
+            )
 
     @patch("sglang.srt.model_loader.loader.get_model_loader")
     @patch("sglang.srt.entrypoints.engine.Engine.__init__")
