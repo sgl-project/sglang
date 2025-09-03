@@ -40,10 +40,6 @@ DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL and get_bool_env_var(
 def update_deepgemm_scale_ue8m0(disable_ue8m0: bool):
     """Update DEEPGEMM_SCALE_UE8M0 based on server arguments."""
     global DEEPGEMM_SCALE_UE8M0
-    if disable_ue8m0:
+    if disable_ue8m0 and DEEPGEMM_SCALE_UE8M0:
         DEEPGEMM_SCALE_UE8M0 = False
         logger.info("DeepGEMM UE8M0 scaling disabled via server argument")
-    else:
-        DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL and get_bool_env_var(
-            "SGL_ENABLE_DEEPGEMM_UE8M0", default="true"
-        )
