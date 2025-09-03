@@ -44,7 +44,7 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
-
+from icecream import ic
 logger = logging.getLogger(__name__)
 
 
@@ -252,7 +252,8 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
-    speculative_token_map: Optional[str] = None
+    speculative_draft_vocab_path: Optional[str] = None
+    speculative_draft_vocab_threshold: Optional[float] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -382,6 +383,7 @@ class ServerArgs:
     enable_flashinfer_trtllm_moe: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
+    speculative_token_map: Optional[str] = None
 
     def __post_init__(self):
         # Check deprecated arguments
@@ -414,6 +416,11 @@ class ServerArgs:
             self.moe_runner_backend = "flashinfer_mxfp4"
             print_deprecated_warning(
                 "NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead."
+            )
+        if self.speculative_token_map:
+            self.speculative_draft_vocab_path = self.speculative_token_map
+            print_deprecated_warning(
+                "Note: --speculative-token-map is deprecated. Please set `--speculative-token-map` to `speculative_draft_vocab_path` instead."
             )
 
         # Set missing default values
@@ -1507,10 +1514,16 @@ class ServerArgs:
             default=ServerArgs.speculative_accept_threshold_acc,
         )
         parser.add_argument(
-            "--speculative-token-map",
+            "--speculative-draft-vocab-path",
             type=str,
-            help="The path of the draft model's small vocab table.",
-            default=ServerArgs.speculative_token_map,
+            help="The path to the draft model's vocabulary file. If `None`, uses the full draft model vocabulary. Otherwise expects a file with either token IDs or token frequencies.",
+            default=ServerArgs.speculative_draft_vocab_path,
+        )
+        parser.add_argument(
+            "--speculative-draft-vocab-threshold",
+            type=float,
+            help="The vocabulary pruning threshold for the draft model. If `None` do not prune the vocabulary. If >= 1, prune to top N most frequent tokens. If < 1, prune tokens until cumulative relative frequency mass reaches threshold.",
+            default=ServerArgs.speculative_draft_vocab_threshold,
         )
 
         # Expert parallelism
@@ -2114,6 +2127,12 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action="store_true",
             help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
+        parser.add_argument(
+            '--speculative-token-map',
+            type=str,
+            help="The path of the draft model's small vocab table.",
+            default=ServerArgs.speculative_token_map,
         )
 
     @classmethod
