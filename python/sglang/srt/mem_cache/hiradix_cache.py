@@ -72,6 +72,8 @@ class HiRadixCache(RadixCache):
 
         self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.tp_rank = torch.distributed.get_rank(group=self.tp_group)
+
         self.enable_storage = hicache_storage_backend is not None
         # todo: customizable storage prefetch threshold and timeout
         self.prefetch_threshold = 256
@@ -379,6 +381,11 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+            if self.tp_rank == 0:
+                stats = self.cache_controller.storage_backend.get_stats()
+                if stats is not None:
+                    storage_log = self.cache_controller.storage_backend.log_stats(stats)
+                    logger.info(storage_log)
 
     def drain_storage_control_queues(self):
         """

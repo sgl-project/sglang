@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from abc import ABC, abstractmethod
 from functools import wraps
 from typing import Any, List, Optional, Tuple
@@ -135,6 +136,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.file_size = file_size
         self.numjobs = numjobs
         self.bytes_per_page = bytes_per_page
+        self.gb_per_page = bytes_per_page / (1 << 30)
         self.entries = entries
         self.dtype = dtype
         self.metadata_client = metadata_client
@@ -173,6 +175,9 @@ class HiCacheHF3FS(HiCacheStorage):
         signal.signal(signal.SIGINT, lambda sig, frame: self.close())
         signal.signal(signal.SIGTERM, lambda sig, frame: self.close())
         signal.signal(signal.SIGQUIT, lambda sig, frame: self.close())
+
+        self.read_stats = []
+        self.write_stats = []
 
     @staticmethod
     def from_env_config(
@@ -308,6 +313,8 @@ class HiCacheHF3FS(HiCacheStorage):
                 for _ in range(len(batch_indices))
             ]
 
+        start_time = time.perf_counter()
+
         futures = [
             self.executor.submit(
                 self.clients[self.ac.next()].batch_read,
@@ -317,6 +324,10 @@ class HiCacheHF3FS(HiCacheStorage):
             for i in range(0, len(batch_indices), self.entries)
         ]
         read_results = [result for future in futures for result in future.result()]
+
+        end_time = time.perf_counter()
+        ionum = len(batch_indices)
+        self.read_stats.append((ionum, ionum / (end_time - start_time)))
 
         results = [None] * len(keys)
         for batch_index, file_result, read_result in zip(
@@ -345,6 +356,7 @@ class HiCacheHF3FS(HiCacheStorage):
             [target_sizes] if target_sizes is not None else None,
         )
 
+    @synchronized()
     def batch_set(
         self,
         keys: List[str],
@@ -374,6 +386,8 @@ class HiCacheHF3FS(HiCacheStorage):
             assert value.is_contiguous()
             file_values.append(value)
 
+        start_time = time.perf_counter()
+
         futures = [
             self.executor.submit(
                 self.clients[self.ac.next()].batch_write,
@@ -387,6 +401,10 @@ class HiCacheHF3FS(HiCacheStorage):
             for future in futures
             for result in future.result()
         ]
+
+        end_time = time.perf_counter()
+        ionum = len(batch_indices)
+        self.write_stats.append((ionum, ionum / (end_time - start_time)))
 
         written_keys_to_confirm = []
         results = [index[0] for index in indices]
@@ -449,3 +467,43 @@ class HiCacheHF3FS(HiCacheStorage):
         except Exception as e:
             logger.error(f"close HiCacheHF3FS: {e}")
         logger.info("close HiCacheHF3FS")
+
+    @synchronized()
+    def get_stats(self):
+        if not (len(self.read_stats) or len(self.write_stats)):
+            return None
+
+        iosize_gb = self.gb_per_page
+        read_stats = [(v[0], v[1] * iosize_gb) for v in self.read_stats]
+        write_stats = [(v[0], v[1] * iosize_gb) for v in self.write_stats]
+        self.read_stats.clear()
+        self.write_stats.clear()
+        return (read_stats, write_stats)
+
+    def get_quartile(self, sorted_stats):
+        if not len(sorted_stats):
+            return []
+
+        idx_25 = len(sorted_stats) // 4
+        indices = [0, idx_25, idx_25 * 2, idx_25 * 3, len(sorted_stats) - 1]
+        return [sorted_stats[i] for i in indices]
+
+    def log_stats(self, stats):
+        read_stats, write_stats = stats
+
+        if not (len(read_stats) or len(write_stats)):
+            return None
+
+        read_stats = sorted(read_stats, key=lambda x: x[1])
+        write_stats = sorted(write_stats, key=lambda x: x[1])
+        read_quartile = [
+            f"#io {v[0]}, {v[1]:.3f} GB/s" for v in self.get_quartile(read_stats)
+        ]
+        write_quartile = [
+            f"#io {v[0]}, {v[1]:.3f} GB/s" for v in self.get_quartile(write_stats)
+        ]
+        return (
+            f"Storage quartiles. "
+            f"#batch_get: {len(read_stats)}, quartiles: {read_quartile}; "
+            f"#batch_set: {len(write_stats)}, quartiles: {write_quartile}"
+        )
