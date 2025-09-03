@@ -1331,7 +1331,11 @@ def moe_ep_deepgemm_preprocess(
         block_shape = [128, 128]
     assert len(block_shape) == 2
     block_n, block_k = block_shape[0], block_shape[1]
-    hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k, scale_ue8m0=scale_ue8m0)
+
+    from deep_gemm.utils import per_token_cast_to_fp8 as deep_gemm_utils_per_token_cast_to_fp8
+    assert block_k == 128
+    hidden_states, scale = deep_gemm_utils_per_token_cast_to_fp8(hidden_states, scale_ue8m0=scale_ue8m0)
+    # hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k, scale_ue8m0=scale_ue8m0)
 
     gateup_input_scale = torch.empty(
         (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
