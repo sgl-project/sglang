@@ -22,6 +22,7 @@ from sglang.srt.speculative.build_eagle_tree import (
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
+from sglang.srt.speculative.eagle_draft_npu_graph_runner import EAGLEDraftNpuGraphRunner
 from sglang.srt.speculative.eagle_utils_v2 import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -218,7 +219,11 @@ class EAGLEWorker(TpModelWorker):
         logger.info(
             f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
+        self.cuda_graph_runner = (
+            EAGLEDraftCudaGraphRunner(self)
+            if not is_npu()
+            else EAGLEDraftNpuGraphRunner(self)
+        )
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
