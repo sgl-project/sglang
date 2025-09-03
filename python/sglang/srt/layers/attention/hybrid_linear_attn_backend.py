@@ -564,5 +564,5 @@ class HybridLinearAttnBackend(AttentionBackend):
                     initial_state_indices=state_indices_tensor,
                     cu_seqlens=query_start_loc,
                     use_qk_l2norm_in_kernel=True,
-                    disable_output_calculation=True,  # 优化2: 只需要更新状态，不需要计算输出
+                    disable_output_calculation=True,
                 )
