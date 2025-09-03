@@ -10,12 +10,15 @@ import tempfile
 import time
 import unittest
 from typing import Dict
+from urllib.parse import urlparse
 
 import requests
 
 from sglang.bench_serving import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -23,8 +26,109 @@ from sglang.test.test_utils import (
 )
 
 
-class HiCacheStorageTestMixin:
-    """Mixin class containing core functionality tests that can be reused across different configurations"""
+class HiCacheStorageBaseTest(CustomTestCase):
+    """Base test class with common setup and utilities"""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up test environment and launch server once for all tests"""
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.model = cls._get_model_name()
+        cls.base_url = DEFAULT_URL_FOR_TEST
+
+        parsed_url = urlparse(cls.base_url)
+        cls.base_host = parsed_url.hostname
+        cls.base_port = str(parsed_url.port)
+
+        # Prepare tokenizer for prompt generation
+        cls.tokenizer = get_tokenizer(cls.model)
+
+        # Launch server with HiCache enabled and cache report
+        cls.process = cls._launch_server_with_hicache()
+        cls._wait_for_server_ready()
+
+        print(f"Test server launched successfully at {cls.base_url}")
+        print(f"Cache directory: {cls.temp_dir}")
+
+    @classmethod
+    def tearDownClass(cls):
+        """Clean up test environment"""
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+        import shutil
+
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+
+    @classmethod
+    def _get_model_name(cls):
+        """Get model name for the test configuration - override in subclasses"""
+        return DEFAULT_MODEL_NAME_FOR_TEST
+
+    @classmethod
+    def _get_base_server_args(cls):
+        """Get base server arguments - can be extended in subclasses"""
+        return {
+            "--enable-hierarchical-cache": True,
+            "--mem-fraction-static": 0.8,
+            "--hicache-ratio": 1.2,
+            "--page-size": 64,
+            "--enable-cache-report": True,
+            "--hicache-storage-prefetch-policy": "wait_complete",
+            "--hicache-storage-backend": "file",
+            "--log-level": "debug",
+        }
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        return {}, {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
+
+    @classmethod
+    def _launch_server_with_hicache(cls):
+        """Launch server with HiCache enabled"""
+
+        additional_server_args, env_vars = cls._get_additional_server_args_and_env()
+        server_args = cls._get_base_server_args()
+        if additional_server_args:
+            server_args.update(additional_server_args)
+
+        final_server_args = []
+        for k, v in server_args.items():
+            if isinstance(v, bool):
+                final_server_args.append(str(k))
+            else:
+                final_server_args.append(str(k))
+                final_server_args.append(str(v))
+
+        print(f"final_server_args: {final_server_args}")
+
+        env_vars = {
+            **os.environ,
+            **env_vars,
+        }
+
+        return popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=final_server_args,
+            env=env_vars,
+        )
+
+    @classmethod
+    def _wait_for_server_ready(cls, timeout: int = 60) -> bool:
+        """Wait for server to be ready"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                response = requests.get(f"{cls.base_url}/health", timeout=5)
+                if response.status_code == 200:
+                    return True
+            except requests.RequestException:
+                pass
+            time.sleep(2)
+        raise TimeoutError("Server failed to start within timeout")
 
     def send_request(
         self, prompt: str, max_tokens: int = 100, temperature: float = 0.0
@@ -52,6 +156,7 @@ class HiCacheStorageTestMixin:
 
     def get_cached_tokens(self, response_json: Dict) -> int:
         """Extract cached tokens count from /generate response"""
+        print(f"response_json: {response_json}")
         meta = response_json.get("meta_info", {})
         return int(meta.get("cached_tokens", 0))
 
@@ -82,9 +187,7 @@ class HiCacheStorageTestMixin:
         time.sleep(2)
         self.assertTrue(self.flush_cache(), "Cache flush should succeed")
 
-    # === Core Functionality Tests ===
-
-    def test_01_cache_storage_and_retrieval(self):
+    def test_basic_backup_and_prefetch(self):
         """Test storage and retrieval of large context through remote cache"""
         print("\n=== Testing Large Context Cache Storage & Retrieval ===")
 
@@ -100,7 +203,7 @@ class HiCacheStorageTestMixin:
         self.trigger_offloading_and_flush()
 
         # Second request with extended prompt - should hit remote cache
-        print("Step 3: Testing cache hit from remote storage...")
+        print("Step 2: Testing cache hit from remote storage...")
         extended_prompt = base_prompt + "\n\n" + self.gen_prompt(64)
 
         start_time = time.time()
@@ -117,7 +220,11 @@ class HiCacheStorageTestMixin:
             cached_tokens, 768, "Expected significant cached tokens for remote hit"
         )
 
-    def test_02_share_prefix_caching_with_variations(self):
+
+class HiCacheStorageTestMixin(HiCacheStorageBaseTest):
+    """Mixin class containing core functionality tests that can be reused across different configurations"""
+
+    def test_share_prefix_caching_with_variations(self):
         """Test prefix caching behavior with substantial prompt variations"""
         print("\n=== Testing Prefix Caching with Variations ===")
 
@@ -150,7 +257,7 @@ class HiCacheStorageTestMixin:
             )
             self.assertIsNotNone(response)
 
-    def test_03_multi_turn_conversation_caching(self):
+    def test_multi_turn_conversation_caching(self):
         """Test caching behavior in multi-turn conversations"""
         print("\n=== Testing Multi-Turn Conversation Caching ===")
 
@@ -174,7 +281,7 @@ class HiCacheStorageTestMixin:
             cached_tokens2, 512, "Expected cache hit for conversation continuation"
         )
 
-    def test_04_data_persistence_across_node_restart(self):
+    def test_data_persistence_across_node_restart(self):
         """Test data persistence and sharing capability across node restarts"""
         print("\n=== Testing Data Persistence Across Node Restart ===")
 
@@ -242,114 +349,41 @@ class HiCacheStorageTestMixin:
         kill_process_tree(self.process.pid)
 
 
-class HiCacheStorageBaseTest(CustomTestCase, HiCacheStorageTestMixin):
-    """Base test class with common setup and utilities"""
-
-    @classmethod
-    def setUpClass(cls):
-        """Set up test environment and launch server once for all tests"""
-        cls.temp_dir = tempfile.mkdtemp()
-        cls.model = cls._get_model_name()
-        cls.base_url = DEFAULT_URL_FOR_TEST
-
-        # Prepare tokenizer for prompt generation
-        cls.tokenizer = get_tokenizer(cls.model)
-
-        # Launch server with HiCache enabled and cache report
-        cls.process = cls._launch_server_with_hicache()
-        cls._wait_for_server_ready()
-
-        print(f"Test server launched successfully at {cls.base_url}")
-        print(f"Cache directory: {cls.temp_dir}")
-
-    @classmethod
-    def tearDownClass(cls):
-        """Clean up test environment"""
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-        import shutil
-
-        shutil.rmtree(cls.temp_dir, ignore_errors=True)
-
-    @classmethod
-    def _get_model_name(cls):
-        """Get model name for the test configuration - override in subclasses"""
-        # return DEFAULT_MODEL_NAME_FOR_TEST
-        return "/sgl-workspace/mnt/Qwen-4B"
-
-    @classmethod
-    def _get_base_server_args(cls):
-        """Get base server arguments - can be extended in subclasses"""
-        return [
-            "--enable-hierarchical-cache",
-            "--mem-fraction-static",
-            "0.8",
-            "--hicache-ratio",
-            "1.2",
-            "--page-size",
-            "64",
-            "--enable-cache-report",
-            "--hicache-storage-prefetch-policy",
-            "wait_complete",
-            "--log-level",
-            "debug",
-        ]
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        return ["--hicache-storage-backend", "file"], {
-            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir
-        }
-
-    @classmethod
-    def _launch_server_with_hicache(cls):
-        """Launch server with HiCache enabled"""
-
-        server_args, env_vars = cls._get_additional_server_args_and_env()
-        server_args = cls._get_base_server_args() + server_args
-
-        env_vars = {
-            **os.environ,
-            **env_vars,
-        }
-
-        return popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=server_args,
-            env=env_vars,
-        )
-
-    @classmethod
-    def _wait_for_server_ready(cls, timeout: int = 60) -> bool:
-        """Wait for server to be ready"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"{cls.base_url}/health", timeout=5)
-                if response.status_code == 200:
-                    return True
-            except requests.RequestException:
-                pass
-            time.sleep(2)
-        raise TimeoutError("Server failed to start within timeout")
-
-
-class TestHiCacheStorageTP(HiCacheStorageBaseTest):
+class TestHiCacheStorageTP(HiCacheStorageTestMixin):
     """Multi-TP tests for HiCache Storage functionality"""
 
     @classmethod
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = ["--tp-size", "2", "--hicache-storage-backend", "file"]
-        return server_args, {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
+        server_args = {"--tp-size": 2}
+        return server_args, {}
 
 
-class TestHiCacheStorageMLA(HiCacheStorageBaseTest):
-    """MLA (Multi-head Latent Attention) tests for HiCache Storage functionality"""
+class TestHiCacheStorageLayerFirstDirectIO(HiCacheStorageTestMixin):
+    """Layer first direct tests for HiCache Storage functionality"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args = {
+            "--hicache-mem-layout": "page_first",
+            "--hicache-io-backend": "direct",
+        }
+        return server_args, {}
+
+
+class TestHiCacheStoragePageFirstLayout(HiCacheStorageTestMixin):
+    """Page first layout tests for HiCache Storage functionality"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args = {"--hicache-mem-layout": "page_first"}
+        return server_args, {}
+
+
+class TestHiCacheStorageMLA(HiCacheStorageTestMixin):
+    """MLA Model tests for HiCache Storage functionality"""
 
     @classmethod
     def _get_model_name(cls):
@@ -359,11 +393,11 @@ class TestHiCacheStorageMLA(HiCacheStorageBaseTest):
     @classmethod
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = ["--tp-size", "2", "--hicache-storage-backend", "file"]
-        return server_args, {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
+        server_args = {"--tp-size": 2}
+        return server_args, {}
 
 
-# TODO: Add other backends tests
+# TODO: Add other backends tests（3fs/mooncake）
 # class TestHiCacheStorageMooncakeBackend(HiCacheStorageBaseTest):
 #     """Mooncake backend tests for HiCache Storage functionality"""
 

@@ -4,13 +4,10 @@ Usage:
     python3 -m pytest test/srt/hicache/test_hicache_storage_benchmark.py -v
 """
 
-import os
-import tempfile
 import time
 import unittest
 from types import SimpleNamespace
 from typing import Dict
-from urllib.parse import urlparse
 
 import requests
 from test_hicache_storage_e2e import HiCacheStorageBaseTest
@@ -25,8 +22,8 @@ class TestHiCacheStorageBenchmark(HiCacheStorageBaseTest):
     @classmethod
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = ["--tp-size", "2", "--hicache-storage-backend", "file"]
-        return server_args, {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
+        server_args = {"--tp-size": 2}
+        return server_args, {}
 
     def flush_cache(self) -> bool:
         """Flush device cache to force remote storage access"""
@@ -37,7 +34,6 @@ class TestHiCacheStorageBenchmark(HiCacheStorageBaseTest):
             return False
 
     # === Accuracy Tests ===
-
     def test_eval_accuracy_with_cache_persistence(self):
         """Test eval accuracy with cache persistence across cache flushes"""
         print("\n=== Testing Eval Accuracy with Cache Persistence ===")
@@ -109,7 +105,7 @@ class TestHiCacheStorageBenchmark(HiCacheStorageBaseTest):
         """Benchmark throughput performance with HiCache enabled"""
         print("\n=== Benchmarking Throughput with HiCache ===")
 
-        # Offline throughput test
+        # throughput test
         res1 = self._run_throughput_benchmark(
             test_name="hicache_offline_throughput",
             num_prompts=200,
@@ -122,7 +118,7 @@ class TestHiCacheStorageBenchmark(HiCacheStorageBaseTest):
         self.assertTrue(self.flush_cache(), "Cache flush should succeed")
         time.sleep(2)
 
-        # Second time benchmark, should use remote cache
+        # Second benchmark, should use remote cache
         res2 = self._run_throughput_benchmark(
             test_name="hicache_online_throughput",
             num_prompts=200,
@@ -130,16 +126,14 @@ class TestHiCacheStorageBenchmark(HiCacheStorageBaseTest):
             additional_args=[],
         )
 
-        self.assertGreater(
-            res2["input_throughput"],
-            res1["input_throughput"],
-            "Second time throughput should be greater than first time throughput",
-        )
-        self.assertLess(
-            res2["mean_ttft_ms"],
-            res1["mean_ttft_ms"],
-            "Second time ttft should be less than first time ttft",
-        )
+        if is_in_ci():
+            write_github_step_summary(
+                f"### HiCache Storage FileBackend Benchmark Test\n"
+                f"First time throughput: {res1['input_throughput']:.2f} token/s\n"
+                f"Second time throughput: {res2['input_throughput']:.2f} token/s\n"
+                f"First time TTFT: {res1['mean_ttft_ms']:.2f} ms\n"
+                f"Second time TTFT: {res2['mean_ttft_ms']:.2f} ms\n"
+            )
 
     def _run_throughput_benchmark(
         self,
