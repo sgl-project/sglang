@@ -18,7 +18,10 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
@@ -39,7 +42,6 @@ except ImportError:
     )
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 
 class WrapperDispatch(Enum):
@@ -155,7 +157,7 @@ class AiterAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
 
-            self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
+            self.enable_dp_attention = is_dp_attention_enabled()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -312,11 +314,11 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens_cpu.max().item(),
                     spec_info=None,
                 )
-                
+
                 self.mla_indices_updater_prefill.kv_indptr += (
                     self.mla_indices_updater_prefill.qo_indptr
                 )
-                
+
                 if (
                     sum(forward_batch.extend_prefix_lens_cpu) != 0
                     and self.enable_dp_attention
@@ -678,11 +680,15 @@ class AiterAttnBackend(AttentionBackend):
                         forward_batch.extend_prefix_lens.shape
                         == forward_batch.extend_seq_lens.shape
                     )
-                    k_prefix = torch.split(k_prefix, forward_batch.extend_prefix_lens_cpu)
+                    k_prefix = torch.split(
+                        k_prefix, forward_batch.extend_prefix_lens_cpu
+                    )
                     k_extend = torch.split(k, forward_batch.extend_seq_lens_cpu)
                     assert len(k_prefix) == len(forward_batch.extend_prefix_lens_cpu)
                     k = torch.cat([x for el in zip(k_prefix, k_extend) for x in el])
-                    v_prefix = torch.split(v_prefix, forward_batch.extend_prefix_lens_cpu)
+                    v_prefix = torch.split(
+                        v_prefix, forward_batch.extend_prefix_lens_cpu
+                    )
                     v_extend = torch.split(v, forward_batch.extend_seq_lens_cpu)
                     v = torch.cat([x for el in zip(v_prefix, v_extend) for x in el])
 
@@ -715,8 +721,8 @@ class AiterAttnBackend(AttentionBackend):
                         qo_indptr,
                         kv_indptr,
                         kv_indices,
-                        kv_last_page_lens,
-                        max_extend_len,
+                        self.forward_metadata.kv_last_page_len,
+                        self.forward_metadata.max_q_len,
                         layer.scaling,
                         layer.logit_cap,
                     )
