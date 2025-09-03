@@ -17,15 +17,24 @@ __global__ void copy_to_gpu_no_ce_kernel(const InputArray<N> input_array, int* o
 }
 
 template <int N>
-void copy_to_gpu_no_ce_impl(const std::vector<int>& input, at::Tensor& output) {
-  TORCH_CHECK(static_cast<int>(input.size()) == N, "input size");
+void copy_to_gpu_no_ce_impl(const at::Tensor& input, at::Tensor& output) {
+  TORCH_CHECK(input.dim() == 1, "input must be 1-D");
+  TORCH_CHECK(static_cast<int>(input.numel()) == N, "input numel must equal template N");
+  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(input.dtype() == torch::kInt32, "input dtype must be int32");
+
   TORCH_CHECK(output.dim() == 1, "output dim");
-  TORCH_CHECK(output.numel() == N, "output size");
+  TORCH_CHECK(static_cast<int>(output.numel()) == N, "output size");
   TORCH_CHECK(output.is_contiguous(), "output contiguous");
   TORCH_CHECK(output.dtype() == torch::kInt32, "output dtype");
 
+  TORCH_CHECK(input.device().is_cpu(), "input must be a CPU tensor");
+  TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
+
+  // Copy input tensor values into the small stack struct which will be passed as kernel argument.
   InputArray<N> input_array;
-  for (int i = 0; i < N; ++i) input_array.values[i] = input[i];
+  const int* input_ptr = input.data_ptr<int>();
+  for (int i = 0; i < N; ++i) input_array.values[i] = input_ptr[i];
 
   // TODO may use multi thread blocks?
   dim3 grid(1);
@@ -35,8 +44,8 @@ void copy_to_gpu_no_ce_impl(const std::vector<int>& input, at::Tensor& output) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void copy_to_gpu_no_ce(const std::vector<int>& input, at::Tensor& output) {
-    const int N = input.size();
+void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output) {
+    int N = static_cast<int>(input.numel());
     if (N == 72) {
         copy_to_gpu_no_ce_impl<72>(input, output);
     } else {
