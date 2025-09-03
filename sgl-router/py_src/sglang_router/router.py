@@ -99,6 +99,7 @@ class Router:
         """Create a router from a RouterArgs instance."""
         router_args_dict = vars(args_dict)
 
+        # Convert RouterArgs to _Router parameters
         router_args_dict["worker_urls"] = (
             []
             if args_dict["service_discovery"] or args_dict["pd_disaggregation"]
