@@ -1508,12 +1508,12 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     K_SCALE_BLOCK_SIZE: tl.constexpr,
     K_BLOCK_SIZE: tl.constexpr,
 ):
-    pid_k, pid_m, pid_e = tl.program_id(axis=0), tl.program_id(axis=1), tl.program_id(axis=2)
+    pid_k, pid_m, pid_e = (
+        tl.program_id(axis=0),
+        tl.program_id(axis=1),
+        tl.program_id(axis=2),
+    )
     pid_m_dim = tl.num_programs(1)
-        
-    x_ptr += pid_e * m * k
-    output_ptr += pid_e * m * k
-    x_scale_ptr += pid_e * x_scale_stride0
 
     token_id = pid_m
     last_effective_id = tl.load(masked_m_ptr + pid_e)
@@ -1522,11 +1522,15 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
         k_offsets = pid_k * K_BLOCK_SIZE + tl.arange(0, K_BLOCK_SIZE)
         scale_offsets = (k_offsets // K_SCALE_BLOCK_SIZE) * x_scale_stride2
 
+        x_ptrs = x_ptr + pid_e * m * k + k_offsets
+        output_ptrs = output_ptr + pid_e * m * k + k_offsets
+        x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + scale_offsets
+
         while token_id < last_effective_id:
-            hidden = tl.load(x_ptr + token_id * k + k_offsets).to(tl.float32)
-            scale_fp32 = tl.load(x_scale_ptr + token_id * x_scale_stride1 + scale_offsets)
+            hidden = tl.load(x_ptrs + token_id * k).to(tl.float32)
+            scale_fp32 = tl.load(x_scale_ptrs + token_id * x_scale_stride1)
             hidden = hidden * scale_fp32 * output_scale_val_inv
-            tl.store(output_ptr + token_id * k + k_offsets, hidden.to(output_ptr.dtype.element_ty))
+            tl.store(output_ptrs + token_id * k, hidden.to(output_ptr.dtype.element_ty))
             token_id += pid_m_dim
 
 
@@ -1598,7 +1602,9 @@ def _silu_mul_and_static_tensor_quant_kernel(
     input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
     output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
 
-    for token_index in tl.range(token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE):
+    for token_index in tl.range(
+        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+    ):
         gate = tl.load(
             input_ptr_offs + token_index * stride_input_1,
             mask=offs_in_d < size_n,
@@ -1608,15 +1614,12 @@ def _silu_mul_and_static_tensor_quant_kernel(
             input_ptr_offs + token_index * stride_input_1 + size_n,
             mask=offs_in_d < size_n,
             other=0.0,
-        )
+        ).to(tl.float32)
         gate = gate / (1 + tl.exp(-gate))
-        gate = gate.to(input_ptr.dtype.element_ty)
-        gate_up = up * gate
-
-        output_q = tl.clamp(gate_up * scale_inv, fp8_min, fp8_max).to(output_ptr.dtype.element_ty)
+        gate_up = up * gate * scale_inv
         tl.store(
             output_ptr_offs + token_index * stride_output_1,
-            output_q,
+            gate_up.to(output_ptr.dtype.element_ty),
             mask=offs_in_d < size_n,
         )
 

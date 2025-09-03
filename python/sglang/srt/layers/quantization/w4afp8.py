@@ -21,7 +21,7 @@ from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
-    from sglang.srt.layers.moe.ep_moe.layer import FusedMoE, DeepEPMoE
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, FusedMoE
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]

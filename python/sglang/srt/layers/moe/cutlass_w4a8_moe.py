@@ -11,11 +11,11 @@ from sgl_kernel import (
 )
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    deepep_fp8_quant_to_static_per_tensor_quant,
+    deepep_ll_get_cutlass_w4a8_moe_mm_data,
     post_reorder_triton_kernel_for_cutlass_moe,
     pre_reorder_triton_kernel_for_cutlass_moe,
     run_cutlass_moe_ep_preproess,
-    deepep_ll_get_cutlass_w4a8_moe_mm_data,
-    deepep_fp8_quant_to_static_per_tensor_quant,
     silu_mul_and_per_tensor_static_quant_fwd,
 )
 
@@ -269,9 +269,17 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=a.device)
-    deepep_fp8_quant_to_static_per_tensor_quant(x=a, x_scale=a_scale, masked_m=masked_m, output_scale=a1_scale, output=gateup_input)
+    deepep_fp8_quant_to_static_per_tensor_quant(
+        x=a,
+        x_scale=a_scale,
+        masked_m=masked_m,
+        output_scale=a1_scale,
+        output=gateup_input,
+    )
 
-    gate_up_o = torch.empty((num_experts, m, 2 * n), device=a.device, dtype=torch.bfloat16)
+    gate_up_o = torch.empty(
+        (num_experts, m, 2 * n), device=a.device, dtype=torch.bfloat16
+    )
     cutlass_w4a8_moe_mm(
         gate_up_o.view(-1, gate_up_o.size(-1)),
         gateup_input.view(-1, gateup_input.size(-1)),
@@ -288,8 +296,12 @@ def cutlass_w4a8_moe_deepep_ll(
         topk,
     )
 
-    intermediate_q = torch.empty((num_experts, m, n), device=a.device, dtype=torch.float8_e4m3fn)
-    silu_mul_and_per_tensor_static_quant_fwd(input=gate_up_o, output=intermediate_q, masked_m=masked_m, output_scale=a2_scale)
+    intermediate_q = torch.empty(
+        (num_experts, m, n), device=a.device, dtype=torch.float8_e4m3fn
+    )
+    silu_mul_and_per_tensor_static_quant_fwd(
+        input=gate_up_o, output=intermediate_q, masked_m=masked_m, output_scale=a2_scale
+    )
 
     output = torch.empty((num_experts, m, k), device=a.device, dtype=torch.bfloat16)
     cutlass_w4a8_moe_mm(
