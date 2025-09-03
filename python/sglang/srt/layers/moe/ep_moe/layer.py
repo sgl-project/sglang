@@ -127,6 +127,7 @@ class EPMoE(FusedMoE):
             self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
+            self.use_w4afp8 = False
         elif isinstance(quant_config, W4AFp8Config):
             self.use_w4afp8 = True
             self.use_fp8_w8a8 = False
@@ -134,6 +135,7 @@ class EPMoE(FusedMoE):
             self.block_shape = None
             self.activation_scheme = None
         else:
+            self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
             self.block_shape = None
@@ -467,7 +469,7 @@ class DeepEPMoE(EPMoE):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-            if getattr(self, "use_w4afp8", False):
+            if self.use_w4afp8:
                 return self.forward_w4afp8_masked(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
