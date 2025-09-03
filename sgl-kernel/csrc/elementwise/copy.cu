@@ -48,6 +48,8 @@ void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output) {
     int N = static_cast<int>(input.numel());
     if (N == 72) {
         copy_to_gpu_no_ce_impl<72>(input, output);
+    } else if (N == 64) {
+        copy_to_gpu_no_ce_impl<64>(input, output);
     } else {
         TORCH_CHECK(false, "unexpected N");
     }
