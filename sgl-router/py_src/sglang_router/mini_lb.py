@@ -38,11 +38,27 @@ class MiniLoadBalancer:
         self,
         router_args: RouterArgs,
     ):
+        self._validate_router_args(router_args)
+
         self.host = router_args.host
         self.port = router_args.port
         self.timeout = router_args.request_timeout_secs
         self.prefill_urls = router_args.prefill_urls  # (url, bootstrap_port)
         self.decode_urls = router_args.decode_urls  # urls
+
+    def _validate_router_args(self, router_args: RouterArgs):
+        logger.warning(
+            "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
+        )
+
+        # NOTE: too many arguments unsupported, just validate some important ones
+        if router_args.policy != "random":
+            raise ValueError("MiniLB only supports random policy")
+
+        if len(router_args.prefill_urls) == 0 or len(router_args.decode_urls) == 0:
+            raise ValueError(
+                "MiniLB requires at least one prefill and one decode server"
+            )
 
     def start(self):
         uvicorn.run(app, host=self.host, port=self.port)
