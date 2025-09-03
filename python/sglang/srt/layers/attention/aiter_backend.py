@@ -307,35 +307,15 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla:
                 self.mla_indices_updater_prefill.update(
                     forward_batch.req_pool_indices,
-                    forward_batch.extend_prefix_lens,
-                    sum(forward_batch.extend_prefix_lens_cpu),
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_sum,
                     forward_batch.extend_seq_lens,
-                    max(forward_batch.extend_seq_lens_cpu),
-                    forward_batch.seq_lens_cpu.max().item(),
+                    forward_batch.extend_seq_lens.max().item(),
+                    forward_batch.seq_lens.max().item(),
                     spec_info=None,
                 )
 
-                self.mla_indices_updater_prefill.kv_indptr += (
-                    self.mla_indices_updater_prefill.qo_indptr
-                )
-
-                if (
-                    sum(forward_batch.extend_prefix_lens_cpu) != 0
-                    and self.enable_dp_attention
-                ):
-                    prefix_kv_indices = self.mla_indices_updater_prefill.kv_indices
-                    extend_kv_indices = forward_batch.out_cache_loc
-                    prefix = torch.split(
-                        prefix_kv_indices, forward_batch.extend_prefix_lens_cpu
-                    )
-                    extend = torch.split(
-                        extend_kv_indices, forward_batch.extend_seq_lens_cpu
-                    )
-                    kv_indices = torch.cat(
-                        [x for el in zip(prefix, extend) for x in el]
-                    ).to(torch.int)
-                else:
-                    kv_indices = self.mla_indices_updater_prefill.kv_indices
+                kv_indices = self.mla_indices_updater_prefill.kv_indices
 
                 self.forward_metadata = ForwardMetadata(
                     self.mla_indices_updater_prefill.kv_indptr,
@@ -680,17 +660,9 @@ class AiterAttnBackend(AttentionBackend):
                         forward_batch.extend_prefix_lens.shape
                         == forward_batch.extend_seq_lens.shape
                     )
-                    k_prefix = torch.split(
-                        k_prefix, forward_batch.extend_prefix_lens_cpu
-                    )
-                    k_extend = torch.split(k, forward_batch.extend_seq_lens_cpu)
-                    assert len(k_prefix) == len(forward_batch.extend_prefix_lens_cpu)
-                    k = torch.cat([x for el in zip(k_prefix, k_extend) for x in el])
-                    v_prefix = torch.split(
-                        v_prefix, forward_batch.extend_prefix_lens_cpu
-                    )
-                    v_extend = torch.split(v, forward_batch.extend_seq_lens_cpu)
-                    v = torch.cat([x for el in zip(v_prefix, v_extend) for x in el])
+
+                    k = k_prefix
+                    v = v_prefix
 
                     o = flash_attn_varlen_func(
                         q,
@@ -712,12 +684,11 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     else:
                         o = torch.empty_like(q)
-                    token_num = forward_batch.extend_num_tokens
 
                     mla_prefill_fwd(
-                        q.view(token_num, layer.tp_q_head_num, layer.qk_head_dim),
+                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                         K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
-                        o.view(token_num, layer.tp_q_head_num, layer.v_head_dim),
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         qo_indptr,
                         kv_indptr,
                         kv_indices,
