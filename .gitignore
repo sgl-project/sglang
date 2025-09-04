@@ -48,6 +48,9 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
+
+# Tokenizer cache for tests
+.tokenizer_cache/
 .pytest_cache/
 cover/
 

@@ -135,7 +135,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         return [
             {
                 "role": "user",
-                "content": "Answer the following questions as best you can:\n\nYou will be given a trace of thinking process in the following format.\n\nQuestion: the input question you must answer\nTOOL: think about what to do, and choose a tool to use ONLY IF there are defined tools\nOBSERVATION: the result of the tool call or the observation of the current task, NEVER include this in your response, this information will be provided\n... (this TOOL/OBSERVATION can repeat N times)\nANSWER: If you know the answer to the original question, require for more information, \nif the previous conversation history already contains the answer, \nor you don't know the answer and there are no defined tools or all available tools are not helpful, respond with the answer without mentioning anything else.\nYou may use light Markdown formatting to improve clarity (e.g. lists, **bold**, *italics*), but keep it minimal and unobtrusive.\n\nYour task is to respond with the next step to take, based on the traces, \nor answer the question if you have enough information.\n\nQuestion: what is the weather in top 5 populated cities in the US?\n\nTraces:\n\n\nThese are some additional instructions that you should follow:",
+                "content": "Answer the following questions as best you can:\n\nYou will be given a trace of thinking process in the following format.\n\nQuestion: the input question you must answer\nTOOL: think about what to do, and choose a tool to use ONLY IF there are defined tools\nOBSERVATION: the result of the tool call or the observation of the current task, NEVER include this in your response, this information will be provided\n... (this TOOL/OBSERVATION can repeat N times)\nANSWER: If you know the answer to the original question, require for more information, \nif the previous conversation history already contains the answer, \nor you don't know the answer and there are no defined tools or all available tools are not helpful, respond with the answer without mentioning anything else.\nYou may use light Markdown formatting to improve clarity (e.g. lists, **bold**, *italics*), but keep it minimal and unobtrusive.\n\nYour task is to respond with the next step to take, based on the traces, \nor answer the question if you have enough information.\n\nQuestion: what is the weather in top 5 populated cities in the US in celsius?\n\nTraces:\n\n\nThese are some additional instructions that you should follow:",
             }
         ]
 
@@ -203,7 +203,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=400,
+            max_tokens=2048,
             tools=tools,
             tool_choice="auto",
             stream=False,
@@ -220,7 +220,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=400,
+            max_tokens=2048,
             tools=tools,
             tool_choice="auto",
             stream=True,
@@ -248,7 +248,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=400,
+            max_tokens=2048,
             temperature=0.2,
             tools=tools,
             tool_choice="required",
@@ -268,7 +268,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=400,
+            max_tokens=2048,
             tools=tools,
             tool_choice="required",
             stream=True,
@@ -294,7 +294,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=200,
+            max_tokens=2048,
             tools=tools,
             tool_choice=tool_choice,
             stream=False,
@@ -318,7 +318,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=200,
+            max_tokens=2048,
             tools=tools,
             tool_choice=tool_choice,
             stream=True,
@@ -351,7 +351,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=400,
+            max_tokens=2048,
             temperature=0.2,
             tools=tools,
             tool_choice="auto",
@@ -392,7 +392,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
-            max_tokens=400,
+            max_tokens=2048,
             temperature=0.2,
             tools=tools,
             tool_choice="required",
@@ -450,7 +450,7 @@ class TestToolChoiceLlama32(CustomTestCase):
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
-                max_tokens=200,
+                max_tokens=2048,
                 tools=tools,
                 tool_choice=tool_choice,
                 stream=False,
@@ -515,6 +515,35 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
+
+
+# Skip for ci test
+# class TestToolChoiceGLM45(TestToolChoiceLlama32):
+#     @classmethod
+#     def setUpClass(cls):
+#         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+#         cls.model = "THUDM/GLM-4.5"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-123456"
+
+#         # Start the local OpenAI Server. If necessary, you can add other parameters such as --enable-tools.
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             api_key=cls.api_key,
+#             other_args=[
+#                 # If your server needs extra parameters to test function calling, please add them here.
+#                 "--tool-call-parser",
+#                 "glm45",
+#                 "--reasoning-parser",
+#                 "glm45",
+#                 "--tp-size",
+#                 "8"
+#             ],
+#         )
+#         cls.base_url += "/v1"
+#         cls.tokenizer = get_tokenizer(cls.model)
 
 
 if __name__ == "__main__":

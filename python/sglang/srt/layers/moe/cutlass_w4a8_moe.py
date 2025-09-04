@@ -11,7 +11,7 @@ from sgl_kernel import (
 )
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
-    post_reorder_triton_kernel,
+    post_reorder_triton_kernel_for_cutlass_moe,
     pre_reorder_triton_kernel_for_cutlass_moe,
     run_cutlass_moe_ep_preproess,
 )
@@ -91,18 +91,10 @@ def cutlass_w4a8_moe(
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
     assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
-    assert (
-        w1_scale.shape[1] == w1_q.shape[2] * 2 / 512
-        and w1_scale.shape[2] == w1_q.shape[1] * 4
-    ), "W1 scale shape mismatch"
-    assert (
-        w2_scale.shape[1] == w2_q.shape[2] * 2 / 512
-        and w2_scale.shape[2] == w2_q.shape[1] * 4
-    ), "W2 scale shape mismatch"
 
     assert a_strides1.shape[0] == w1_q.shape[0], "A Strides 1 expert number mismatch"
     assert b_strides1.shape[0] == w1_q.shape[0], "B Strides 1 expert number mismatch"
-    assert a_strides2.shape[0] == w2_q.shape[0], "A Strides 2 expert number  mismatch"
+    assert a_strides2.shape[0] == w2_q.shape[0], "A Strides 2 expert number mismatch"
     assert b_strides2.shape[0] == w2_q.shape[0], "B Strides 2 expert number mismatch"
     num_experts = w1_q.size(0)
     m = a.size(0)
@@ -199,14 +191,13 @@ def cutlass_w4a8_moe(
     )
 
     output = torch.empty_like(a)
-    post_reorder_triton_kernel[(m,)](
+    post_reorder_triton_kernel_for_cutlass_moe[(m,)](
         c2,
         output,
         src2dst,
-        topk_ids_,
+        local_topk_ids,
         topk_weights,
-        start_expert_id,
-        end_expert_id,
+        num_experts,
         topk,
         k,
         0,
