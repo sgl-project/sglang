@@ -109,40 +109,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
         )
-        if SUPPRESS_LEVEL < 2:
-            ctx.save_for_backward(
-                q_orig,
-                k_orig,
-                None,
-                None,
-                v,
-                g,
-                beta,
-                A,
-                initial_state,
-                cu_seqlens,
-                None,
-                None,
-                None,
-            )
-        else:
-            ctx.save_for_backward(
-                q_orig,
-                k_orig,
-                q,
-                k,
-                v,
-                g,
-                beta,
-                A,
-                initial_state,
-                cu_seqlens,
-                w,
-                h,
-                v_new,
-            )
-        ctx.scale = scale
-        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         return o.to(q.dtype), final_state
 
 
