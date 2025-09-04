@@ -23,7 +23,7 @@ TEST_MODEL_MATRIX = {
         "accuracy": 0.90,
         "latency": 180,
         "output_throughput": 20,
-    }
+    },
 }
 
 
