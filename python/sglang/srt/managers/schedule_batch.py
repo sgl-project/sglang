@@ -822,7 +822,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
     is_hybrid: bool = False
-    eos_token_id: int | None = None
 
     # Batch configs
     model_config: ModelConfig = None
@@ -959,13 +958,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             chunked_req=chunked_req,
         )
-
-    @property
-    def eos_id(self) -> int:
-        # TODO: support multiple eos token ids
-        if self.eos_token_id is None and len(self.reqs) > 0:
-            self.eos_token_id = self.reqs[0].tokenizer.eos_token_id
-        return self.eos_token_id
 
     def batch_size(self):
         return len(self.reqs)
@@ -1777,7 +1769,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
-            eos_id=self.eos_id,
             hicache_consumer_index=self.hicache_consumer_index,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -1866,7 +1857,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 class ModelWorkerBatch:
     # The batch id
     bid: int
-    eos_id: int
     # The forward mode
     forward_mode: ForwardMode
     # The input ids
