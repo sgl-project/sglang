@@ -29,13 +29,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     direct_register_custom_op,
-    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_sm100_supported,
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
@@ -66,10 +66,15 @@ _is_hip = is_hip()
 
 if _is_hip:
     # import aiter
-    from aiter import ActivationType, QuantType, dtypes
-    from aiter.fused_moe import fused_moe
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-    from aiter.utility.fp4_utils import e8m0_shuffle
+    try:
+        from aiter import ActivationType, QuantType, dtypes
+        from aiter.fused_moe import fused_moe
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+        from aiter.utility.fp4_utils import e8m0_shuffle
+    except ImportError as err:
+        ActivationType = QuantType = dtypes = fused_moe = dynamic_mxfp4_quant = (
+            e8m0_shuffle
+        ) = err
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -145,27 +150,21 @@ def _quant_dequant_mxfp4_fake(
     return torch.empty_like(x)
 
 
-try:
-    direct_register_custom_op(
-        op_name="dequant_mxfp4",
-        op_func=_dequant_mxfp4,
-        mutates_args=[],
-        fake_impl=_dequant_mxfp4_fake,
-    )
-    dequant_mxfp4 = torch.ops.sglang.dequant_mxfp4
-except AttributeError as error:
-    raise error
+direct_register_custom_op(
+    op_name="dequant_mxfp4",
+    op_func=_dequant_mxfp4,
+    mutates_args=[],
+    fake_impl=_dequant_mxfp4_fake,
+)
+dequant_mxfp4 = torch.ops.sglang.dequant_mxfp4
 
-try:
-    direct_register_custom_op(
-        op_name="quant_dequant_mxfp4",
-        op_func=_quant_dequant_mxfp4,
-        mutates_args=[],
-        fake_impl=_quant_dequant_mxfp4_fake,
-    )
-    quant_dequant_mxfp4 = torch.ops.sglang.quant_dequant_mxfp4
-except AttributeError as error:
-    raise error
+direct_register_custom_op(
+    op_name="quant_dequant_mxfp4",
+    op_func=_quant_dequant_mxfp4,
+    mutates_args=[],
+    fake_impl=_quant_dequant_mxfp4_fake,
+)
+quant_dequant_mxfp4 = torch.ops.sglang.quant_dequant_mxfp4
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -262,6 +261,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        self.flashinfer_mxfp4_moe_precision = global_server_args_dict[
+            "flashinfer_mxfp4_moe_precision"
+        ]
 
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
@@ -305,6 +307,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size, 64
                 )
+        elif has_triton_kernels:
+            # TODO: this is a hack to make
+            # intermediate_size_per_partition_after_pad the same as the
+            # per_rank_intermediate_size during weight loading
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size, mxfp4_block
+            )
 
         self.intermediate_size = intermediate_size_per_partition_after_pad
 
@@ -615,11 +624,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         if self.use_flashinfer:
-            # Based on profiling results, we need to quantize x to mxfp8 here to achieve better performance
-            x_quant, x_scale = mxfp8_quantize(
-                x, False, alignment=self.hidden_size
-            )  # to mxfp8
-            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            # When bf16 mode is enabled, we don't need to quantize the input,
+            # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
+            # which can theoretically improve performance
+            if self.flashinfer_mxfp4_moe_precision == "bf16":
+                assert x.dtype == torch.bfloat16
+                x_quant = x
+                x_scale = None
+
+                # May be fused later if this code branch is frequently needed
+                origin_hidden_states_dim = x_quant.shape[-1]
+                if self.hidden_size != origin_hidden_states_dim:
+                    x_quant = torch.nn.functional.pad(
+                        x_quant,
+                        (0, self.hidden_size - origin_hidden_states_dim),
+                        mode="constant",
+                        value=0.0,
+                    )
+            elif self.flashinfer_mxfp4_moe_precision == "default":
+                x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
+                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            else:
+                raise NotImplementedError
+
             assert x_quant.shape[-1] == self.hidden_size
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
@@ -789,7 +816,10 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         topk_weights, topk_ids, _ = topk_output
-
+        if _is_hip:
+            topk_weights = topk_weights.to(
+                torch.float32
+            )  # aiter's moe_sorting requires topk_weights to be FP32
         return fused_moe(
             x,
             layer.w13_weight,

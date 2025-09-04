@@ -66,7 +66,6 @@ from sglang.srt.layers.quantization import (
 )
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import (
@@ -121,6 +120,7 @@ from sglang.srt.utils import (
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
     is_npu,
+    is_sm100_supported,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cuda_arch,
@@ -172,6 +172,7 @@ class ModelRunner:
         pp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -234,7 +235,7 @@ class ModelRunner:
         min_per_gpu_memory = self.init_torch_distributed()
 
         # CPU offload
-        set_offloader(create_offloader_from_server_args(server_args))
+        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -306,7 +307,10 @@ class ModelRunner:
         model_num_layers = (
             self.model_config.num_nextn_predict_layers
             if self.is_draft_worker and model_has_mtp_layers
-            else self.model_config.num_hidden_layers
+            else max(
+                self.model_config.num_hidden_layers,
+                self.model_config.num_attention_layers,
+            )
         )
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
@@ -1439,14 +1443,12 @@ class ModelRunner:
             else self.server_args.attention_backend
         )
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
-            assert (
-                self.server_args.speculative_algorithm is None
-            ), "Currently HybridAttentionBackend does not support speculative decoding."
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
             )
 
             attn_backend = HybridAttnBackend(
+                self,
                 decode_backend=self._get_attention_backend_from_str(
                     self.decode_attention_backend_str
                 ),
@@ -1653,7 +1655,7 @@ class ModelRunner:
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
-        from sglang.srt.model_parallel import tensor_parallel
+        from sglang.srt.layers.model_parallel import tensor_parallel
 
         device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
         tensor_parallel(self.model, device_mesh)
