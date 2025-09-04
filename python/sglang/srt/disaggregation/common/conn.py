@@ -72,8 +72,19 @@ class CommonKVManager(BaseKVManager):
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
-        host = self.bootstrap_host
-        host = maybe_wrap_ipv6_address(host)
+        if self.dist_init_addr:
+            # multi node: bootstrap server's host is dist_init_addr
+            if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
+                if self.dist_init_addr.endswith("]"):
+                    host = self.dist_init_addr
+                else:
+                    host, _ = self.dist_init_addr.rsplit(":", 1)
+            else:
+                host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
+        else:
+            # single node: bootstrap server's host is same as http server's host
+            host = self.bootstrap_host
+            host = maybe_wrap_ipv6_address(host)
 
         bootstrap_server_url = f"{host}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
