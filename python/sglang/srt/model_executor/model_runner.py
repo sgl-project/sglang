@@ -134,6 +134,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_cuda,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
@@ -173,6 +174,7 @@ def add_mla_attention_backend(backend_name):
         logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
 
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1277,6 +1279,24 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+
+            if (
+                self.kv_cache_dtype == getattr(torch, "float4_e2m1fn_x2", None)
+                and _is_cuda
+            ):
+                # kv_scale_buffer
+                scale_block_size = 16
+                cell_size = (cell_size // 2) + (
+                    (
+                        (
+                            self.model_config.kv_lora_rank
+                            + self.model_config.qk_rope_head_dim
+                        )
+                        // scale_block_size
+                    )
+                    * num_layers
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
