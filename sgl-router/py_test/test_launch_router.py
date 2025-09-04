@@ -176,9 +176,8 @@ class TestLaunchRouter(unittest.TestCase):
         """Test basic PD router functionality without actually starting servers."""
         # This test just verifies the PD router can be created and configured
         # without actually starting it (which would require real prefill/decode servers)
-        from sglang_router import Router
         from sglang_router.launch_router import RouterArgs
-        from sglang_router_rs import PolicyType
+        from sglang_router.router import PolicyType, Router
 
         # Test RouterArgs parsing for PD mode
         # Simulate the parsed args structure from argparse with action="append"

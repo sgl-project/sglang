@@ -3,11 +3,18 @@ import logging
 import sys
 from typing import List, Optional
 
-from sglang_router import Router
 from sglang_router.mini_lb import MiniLoadBalancer
 from sglang_router.router_args import RouterArgs
 
 logger = logging.getLogger("router")
+
+try:
+    from sglang_router.router import Router
+except ImportError:
+    Router = None
+    logger.warning(
+        "Rust Router is not installed, only python MiniLB (debugging only) is available"
+    )
 
 
 def launch_router(args: argparse.Namespace) -> Optional[Router]:
@@ -32,6 +39,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             mini_lb = MiniLoadBalancer(router_args)
             mini_lb.start()
         else:
+            if Router is None:
+                raise RuntimeError("Rust Router is not installed")
             router_args._validate_router_args()
             router = Router.from_args(router_args)
             router.start()
