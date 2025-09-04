@@ -26,7 +26,7 @@ ENV NO_DEPS_FLAG=""
 # ===============================
 # Base image 942 and args
 FROM $BASE_IMAGE_942_ROCM700 AS gfx942-rocm700
-ENV BUILD_VLLM="0"
+ENV BUILD_VLLM="1"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
