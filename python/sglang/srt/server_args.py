@@ -2336,7 +2336,8 @@ class ServerArgs:
             assert self.attention_backend in {
                 "fa3",
                 "aiter",
-            }, "fa3 or aiter is required for Llama4 model"
+                "triton",
+            }, "fa3, aiter, or triton is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
