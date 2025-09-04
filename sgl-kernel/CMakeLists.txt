@@ -247,7 +247,6 @@ set(SOURCES
     "csrc/attention/vertical_slash_index.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/cast.cu"
-    "csrc/elementwise/copy.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/common_extension.cc"

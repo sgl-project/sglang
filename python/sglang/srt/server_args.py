@@ -349,7 +349,6 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
-    numa_node: Optional[List[int]] = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1970,12 +1969,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.scheduler_recv_interval,
             help="The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",
-        )
-        parser.add_argument(
-            "--numa-node",
-            type=int,
-            nargs="+",
-            help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess.",
         )
 
         # Debug tensor dumps
