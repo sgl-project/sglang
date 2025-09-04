@@ -153,7 +153,13 @@ class Glm4MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None, should_allreduce_fusion=False):
+    def forward(
+        self,
+        x,
+        forward_batch=None,
+        should_allreduce_fusion=False,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
