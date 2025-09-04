@@ -1,0 +1,79 @@
+name: PR Test (Blackwell)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/srt/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-blackwell.yml"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/sglang/srt/**"
+      - "sgl-kernel/**"
+      - ".github/workflows/pr-test-blackwell.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-blackwell-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            src:
+              - "python/sglang/srt/**"
+              - "sgl-kernel/**"
+              - ".github/workflows/pr-test-blackwell.yml"
+
+  unit-test-backend-8-gpu-b200-suite:
+    needs: [check-changes]
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.check-changes.outputs.src == 'true'
+    runs-on: b200-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test suite
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
+
+  pr-test-blackwell-finish:
+    if: always()
+    needs: [
+      check-changes,
+      unit-test-backend-8-gpu-b200-suite
+    ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0

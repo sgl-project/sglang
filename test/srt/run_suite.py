@@ -138,8 +138,11 @@ suites = {
         TestFile("test_full_deepseek_v3.py", 333),
     ],
     "per-commit-8-gpu-b200": [
-        # add more here
+        TestFile("test_fp4_moe.py", 120),
         TestFile("test_gpt_oss_4gpu.py", 600),
+        # Currently the below tests do not work on B200 nodes.
+        # TestFile("test_block_fp8_deep_gemm_blackwell.py", 180),
+        # TestFile("test_trtllm_mla_backend.py", 150),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
