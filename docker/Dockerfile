@@ -128,18 +128,6 @@ RUN cd /sgl-workspace/DeepEP && \
     esac && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
 
-# Install Rust toolchain for sgl-router
-ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustc --version && cargo --version
-
-# Build and install sgl-router
-RUN python3 -m pip install --no-cache-dir setuptools-rust \
-    && cd /sgl-workspace/sglang/sgl-router \
-    && cargo build --release \
-    && python3 -m pip install --no-cache-dir . \
-    && rm -rf /root/.cache
-
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
@@ -229,6 +217,19 @@ RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1
     && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
     && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
     && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
+
+# Install Rust toolchain for sgl-router
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && rustc --version && cargo --version
+
+# Build and install sgl-router
+RUN python3 -m pip install --no-cache-dir setuptools-rust \
+    && cd /sgl-workspace/sglang/sgl-router \
+    && cargo build --release \
+    && python3 -m pip install --no-cache-dir . \
+    && rm -rf /root/.cache
+
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
