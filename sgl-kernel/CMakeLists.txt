@@ -22,6 +22,20 @@ enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
+# Detect CUDA version automatically
+if (DEFINED CUDAToolkit_VERSION)
+    set(CUDA_VERSION ${CUDAToolkit_VERSION})
+else()
+    execute_process(
+        COMMAND ${CUDAToolkit_NVCC_EXECUTABLE} --version
+        OUTPUT_VARIABLE NVCC_OUT
+    )
+    string(REGEX MATCH "release ([0-9]+\\.[0-9]+)" _ ${NVCC_OUT})
+    set(CUDA_VERSION ${CMAKE_MATCH_1})
+endif()
+
+message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
+
 message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
     message("CUDA_VERSION ${CUDA_VERSION} >= 13.0")
