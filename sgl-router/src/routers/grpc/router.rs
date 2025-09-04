@@ -12,7 +12,7 @@ use crate::metrics::RouterMetrics;
 use crate::policies::LoadBalancingPolicy;
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::{RouterTrait, WorkerManagement};
-use crate::tokenizer::{factory, traits::Tokenizer};
+use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ParserRegistry;
 use async_trait::async_trait;
 use axum::{
@@ -65,20 +65,12 @@ impl GrpcRouter {
         retry_config: RetryConfig,
         circuit_breaker_config: ConfigCircuitBreakerConfig,
         health_check_config: ConfigHealthCheckConfig,
-        tokenizer_path_or_model: String,
+        tokenizer: Arc<dyn Tokenizer>,
+        reasoning_parser_factory: ParserFactory,
+        tool_parser_registry: &'static ParserRegistry,
     ) -> Result<Self, String> {
         // Update metrics
         RouterMetrics::set_active_workers(worker_urls.len());
-
-        // Initialize tokenizer
-        let tokenizer = factory::create_tokenizer(&tokenizer_path_or_model)
-            .map_err(|e| format!("Failed to create tokenizer: {}", e))?;
-
-        // Initialize reasoning parser factory
-        let reasoning_parser_factory = ParserFactory::new();
-
-        // Get tool parser registry
-        let tool_parser_registry = ParserRegistry::new();
 
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
         let core_cb_config = CircuitBreakerConfig {
