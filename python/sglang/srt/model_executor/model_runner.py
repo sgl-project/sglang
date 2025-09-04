@@ -308,11 +308,8 @@ class ModelRunner:
                 self.is_hybrid = self.model_config.is_hybrid = True
 
         if self.is_hybrid_gdn:
-            logger.warning(
-                "Hybrid GDN model detected, disable radix cache and chunked prefill"
-            )
+            logger.warning("Hybrid GDN model detected, disable radix cache")
             self.server_args.disable_radix_cache = True
-            self.server_args.chunked_prefill_size = -1
             self.server_args.attention_backend = "hybrid_linear_attn"
             if self.server_args.max_mamba_cache_size is None:
                 if self.server_args.max_running_requests is not None:

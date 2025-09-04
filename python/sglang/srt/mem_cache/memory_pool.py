@@ -83,7 +83,7 @@ class ReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> List[int]:
+    def alloc(self, need_size: int, reqs: List["Req"]) -> List[int]:
         if need_size > len(self.free_slots):
             return None
 
@@ -291,38 +291,58 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layers)}
 
         self.device = device
-        self.full_to_mamba_index_mapping: torch.Tensor = torch.empty(
+        self.req_index_to_mamba_index_mapping: torch.Tensor = torch.empty(
             size, dtype=torch.int32, device=self.device
         )
 
-    def alloc(self, need_size: int) -> Optional[List[int]]:
-        select_index = super().alloc(need_size)
+        self.rid_to_mamba_index_mapping: Dict[str, int] = {}
+        self.mamba_index_to_rid_mapping: Dict[int, str] = {}
+
+    # For chunk prefill req, we do not need to allocate mamba cache,
+    # We could use allocated mamba cache instead.
+    def alloc(self, need_size: int, reqs: List["Req"]) -> Optional[List[int]]:
+        select_index = super().alloc(need_size, reqs)
         if select_index == None:
             return None
-        mamba_index = self.mamba_pool.alloc(need_size)
+
+        mamba_index = []
+        for req in reqs:
+            rid = req.rid
+            if rid in self.rid_to_mamba_index_mapping:
+                mid = self.rid_to_mamba_index_mapping[rid]
+            elif (mid := self.mamba_pool.alloc(1)) is not None:
+                mid = mid[0]
+                self.rid_to_mamba_index_mapping[rid] = mid
+                self.mamba_index_to_rid_mapping[mid] = rid
+            mamba_index.append(mid)
         assert len(select_index) == len(
             mamba_index
         ), f"Not enough space for mamba cache, try to increase --max-mamba-cache-size."
-        self.full_to_mamba_index_mapping[select_index] = torch.tensor(
+        self.req_index_to_mamba_index_mapping[select_index] = torch.tensor(
             mamba_index, dtype=torch.int32, device=self.device
         )
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
-        return self.full_to_mamba_index_mapping[req_indices]
+        return self.req_index_to_mamba_index_mapping[req_indices]
 
     def get_mamba_params(self, layer_id: int):
         assert layer_id in self.mamba_map
         return self.mamba_pool.get_mamba_params(self.mamba_map[layer_id])
 
-    def get_mamba_params_all_layers(self):
-        return self.mamba_pool.get_mamba_params_all_layers()
-
-    def free(self, free_index: Union[int, List[int]]):
-        mamba_index = self.full_to_mamba_index_mapping[free_index]
+    # For chunk prefill, we can not free mamba cache, we need use it in the future
+    def free(self, free_index: Union[int, List[int]], free_mamba_cache: bool = True):
         super().free(free_index)
-        self.mamba_pool.free(mamba_index.tolist())
-        self.full_to_mamba_index_mapping[free_index] = -1
+        if free_mamba_cache:
+            mamba_index = self.req_index_to_mamba_index_mapping[free_index]
+            mamba_index_list = mamba_index.tolist()
+            if isinstance(mamba_index_list, int):
+                mamba_index_list = [mamba_index_list]
+            self.mamba_pool.free(mamba_index_list)
+            for mid in mamba_index_list:
+                rid = self.mamba_index_to_rid_mapping[mid]
+                self.mamba_index_to_rid_mapping.pop(mid)
+                self.rid_to_mamba_index_mapping.pop(rid)
 
     def clear(self):
         super().clear()

@@ -965,8 +965,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
-    def alloc_req_slots(self, num_reqs: int):
-        req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
+    def alloc_req_slots(self, num_reqs: int, reqs: List[Req]):
+        req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
         if req_pool_indices is None:
             raise RuntimeError(
                 "alloc_req_slots runs out of memory. "
@@ -1141,7 +1141,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate req slots
         bs = len(self.reqs)
-        req_pool_indices = self.alloc_req_slots(bs)
+        req_pool_indices = self.alloc_req_slots(bs, self.reqs)
 
         # Init tensors
         reqs = self.reqs
