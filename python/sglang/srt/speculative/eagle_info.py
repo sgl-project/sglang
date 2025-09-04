@@ -184,7 +184,13 @@ class EagleVerifyInput(SpecInput):
             req_to_token.size(1),
             page_size,
         )
-        return seq_lens_with_draft_tokens, kv_indices, kv_indptr, qo_indptr, self.custom_mask
+        return (
+            seq_lens_with_draft_tokens,
+            kv_indices,
+            kv_indptr,
+            qo_indptr,
+            self.custom_mask,
+        )
 
     def verify(
         self,

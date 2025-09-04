@@ -849,7 +849,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         else:
             assert isinstance(spec_info, SpecInput)
             # TODO: Support topk > 1 with custom mask
-            kv_lens,kv_indices, kv_indptr, qo_indptr, custom_mask = (
+            kv_lens, kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
                     paged_kernel_lens,
@@ -873,8 +873,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
         else:
             # mla paged prefill
-            page_size = self.page_size
-          
             wrapper_paged.plan(
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
@@ -883,7 +881,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 num_heads=self.num_local_heads,
                 head_dim_ckv=self.kv_lora_rank,
                 head_dim_kpe=self.qk_rope_head_dim,
-                page_size=page_size,
+                page_size=self.page_size,
                 causal=True,
                 sm_scale=sm_scale,
                 q_data_type=self.q_data_type,
@@ -912,7 +910,7 @@ class FlashInferMLAMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
-        
+
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (
@@ -941,18 +939,18 @@ class FlashInferMLAMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
-        
+
     def common_template(
         self,
         forward_batch: ForwardBatch,
         kv_indices_buffer: torch.Tensor,
         call_fn: Callable,
     ):
-        
+
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
-        
+
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
@@ -982,7 +980,7 @@ class FlashInferMLAMultiStepDraftBackend:
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        
+
         kv_indices = torch.zeros(
             (
                 self.speculative_num_steps,
@@ -1002,7 +1000,7 @@ class FlashInferMLAMultiStepDraftBackend:
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
         self.common_template(forward_batch, kv_indices, call_fn)
-        
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, max_bs * self.max_context_len),
@@ -1014,10 +1012,9 @@ class FlashInferMLAMultiStepDraftBackend:
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
-            
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-            
+
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,
@@ -1030,13 +1027,11 @@ class FlashInferMLAMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
-        
 
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-            
-            
+
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
                 bs,
@@ -1050,7 +1045,7 @@ class FlashInferMLAMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
-        
+
 
 def fast_mla_decode_plan(
     self,
