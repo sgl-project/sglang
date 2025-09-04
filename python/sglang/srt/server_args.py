@@ -299,6 +299,7 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
+    hicache_eviction_policy: str = "lru"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
@@ -1720,6 +1721,14 @@ class ServerArgs:
             choices=["write_back", "write_through", "write_through_selective"],
             default=ServerArgs.hicache_write_policy,
             help="The write policy of hierarchical cache.",
+        )
+        parser.add_argument(
+            "--hicache-eviction-policy",
+            type=str,
+            choices=["lru", "lfu"],
+            default=ServerArgs.hicache_eviction_policy,
+            help="The eviction policy of hierarchical cache. 'lru' stands for "
+            "Least Recently Used, 'lfu' stands for Least Frequently Used.",
         )
         parser.add_argument(
             "--hicache-io-backend",
