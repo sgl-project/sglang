@@ -142,25 +142,17 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
     tl.store(seg_indptr + expert_id_minus_1 + 1, target_location + 1)
 
 
-def run_moe_ep_preproess(topk_ids: torch.Tensor, num_local_experts: int):
-    reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
-
-    seg_indptr = torch.zeros(
-        num_local_experts + 1, device=topk_ids.device, dtype=torch.int64
-    )
-    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
-
-    compute_seg_indptr_triton_kernel[(num_local_experts,)](
-        reorder_topk_ids, seg_indptr, topk_ids.numel()
-    )
+def cutlass_w4_run_moe_ep_preproess(topk_ids: torch.Tensor):
+    _, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
 
     BLOCK_SIZE = 512
     grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
+    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
     compute_src2dst_triton_kernel[grid](
         reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE
     )
 
-    return reorder_topk_ids, src2dst, seg_indptr
+    return src2dst
 
 
 @triton.jit

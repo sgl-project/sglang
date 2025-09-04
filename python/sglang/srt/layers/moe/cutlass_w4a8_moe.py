@@ -10,14 +10,15 @@ from sgl_kernel import (
     silu_and_mul,
 )
 
+from sglang.srt.distributed import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
     post_reorder_triton_kernel_for_cutlass_moe,
     pre_reorder_triton_kernel_for_cutlass_moe,
-    run_moe_ep_preproess,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
 )
 
@@ -108,11 +109,11 @@ def cutlass_w4a8_moe(
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
-    topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
+    if get_moe_expert_parallel_world_size() > 1:
+        topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
-    _, src2dst, _ = run_moe_ep_preproess(
+    src2dst = cutlass_w4_run_moe_ep_preproess(
         topk_ids,
-        num_local_experts,
     )
 
     gateup_input = torch.empty(
@@ -151,7 +152,7 @@ def cutlass_w4a8_moe(
     )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
-    c2 = torch.zeros((m * topk, k), device=device, dtype=torch.bfloat16)
+    c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
 
     cutlass_w4a8_moe_mm(
         c1,
