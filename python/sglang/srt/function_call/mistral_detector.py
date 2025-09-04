@@ -42,7 +42,7 @@ class MistralDetector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Mistral format tool call."""
-        return self.bot_token in text
+        return self.bot_token in text or text.startswith("[")
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -52,6 +52,21 @@ class MistralDetector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
+        # Handle JSON array format (from JSON schema constraints)
+        if text.startswith("["):
+            try:
+                obj, end = json.JSONDecoder().raw_decode(text)
+                if isinstance(obj, list):
+                    calls = []
+                    for item in obj:
+                        if isinstance(item, dict) and "name" in item and "parameters" in item:
+                            match_result = {"name": item["name"], "parameters": item["parameters"]}
+                            calls.extend(self.parse_base_json(match_result, tools))
+                    return StreamingParseResult(normal_text="", calls=calls)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse JSON array: {text}, JSON parse error: {str(e)}")
+                return StreamingParseResult(normal_text=text, calls=[])
+
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
 

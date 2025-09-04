@@ -423,6 +423,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 sampling_params[constraint_type] = convert_json_schema_to_str(
                     constraint_value.model_dump(by_alias=True)
                 )
+            elif constraint_type == "json_schema":
+                # Handle vLLM-style modified JSON schema constraint
+                sampling_params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value
+                )
             else:
                 sampling_params[constraint_type] = constraint_value
         return sampling_params

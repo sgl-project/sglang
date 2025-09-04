@@ -47,7 +47,7 @@ class PythonicDetector(BaseFormatDetector):
         return text
 
     def has_tool_call(self, text: str) -> bool:
-        return bool(self.tool_call_regex.search(self._text_strip(text.strip())))
+        return bool(self.tool_call_regex.search(self._text_strip(text.strip()))) or text.startswith("[")
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         # Try parsing the text as a Python list of function calls
@@ -58,6 +58,24 @@ class PythonicDetector(BaseFormatDetector):
 
         match = self.tool_call_regex.search(text)
         if match is None:
+            # If no pythonic match found, try JSON array format (from JSON schema constraints)
+            if text.startswith("["):
+                try:
+                    obj, end = json.JSONDecoder().raw_decode(text)
+                    if isinstance(obj, list):
+                        calls = []
+                        for item in obj:
+                            if isinstance(item, dict) and "name" in item and "parameters" in item:
+                                tool_call = ToolCallItem(
+                                    name=item["name"],
+                                    parameters=json.dumps(item["parameters"], ensure_ascii=False),
+                                    tool_index=0,
+                                )
+                                calls.append(tool_call)
+                        return StreamingParseResult(normal_text="", calls=calls)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON array: {text}, JSON parse error: {str(e)}")
+            
             return StreamingParseResult(normal_text=text, calls=[])
 
         # Extract the tool call part and any text before/after it
@@ -200,6 +218,28 @@ class PythonicDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text)
 
         # Otherwise, we're still accumulating a potential tool call
+        # Check if this might be a JSON array format (from JSON schema constraints)
+        if stripped_buffer.startswith("["):
+            try:
+                obj, end = json.JSONDecoder().raw_decode(stripped_buffer)
+                if isinstance(obj, list):
+                    calls = []
+                    for item in obj:
+                        if isinstance(item, dict) and "name" in item and "parameters" in item:
+                            tool_call = ToolCallItem(
+                                name=item["name"],
+                                parameters=json.dumps(item["parameters"], ensure_ascii=False),
+                                tool_index=0,
+                            )
+                            calls.append(tool_call)
+                    # Update buffer to remove processed JSON
+                    remaining_text = stripped_buffer[end:].strip() + held_back
+                    self._buffer = remaining_text
+                    return StreamingParseResult(normal_text="", calls=calls)
+            except json.JSONDecodeError:
+                # Not a complete JSON array yet, continue with normal pythonic parsing
+                pass
+        
         return StreamingParseResult(normal_text="")
 
     def _get_parameter_value(self, val):

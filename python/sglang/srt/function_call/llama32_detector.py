@@ -37,11 +37,11 @@ class Llama32Detector(BaseFormatDetector):
         """Check if the text contains a Llama 3.2 format tool call."""
         # depending on the prompt format the Llama model may or may not
         # prefix the output with the <|python_tag|> token
-        return "<|python_tag|>" in text or text.startswith("{")
+        return "<|python_tag|>" in text or text.startswith("{") or text.startswith("[")
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        """Parse function calls from text, handling multiple JSON objects."""
-        if "<|python_tag|>" not in text and not text.startswith("{"):
+        """Parse function calls from text, handling multiple JSON objects or JSON arrays."""
+        if "<|python_tag|>" not in text and not text.startswith("{") and not text.startswith("["):
             return StreamingParseResult(normal_text=text, calls=[])
 
         if "<|python_tag|>" in text:
@@ -49,6 +49,27 @@ class Llama32Detector(BaseFormatDetector):
         else:
             normal_text, action_text = "", text
 
+        # Handle JSON array format (from JSON schema constraints) - parse as single JSON
+        if action_text.startswith("["):
+            try:
+                obj, end = json.JSONDecoder().raw_decode(action_text)
+                if isinstance(obj, list):
+                    # Convert array format to individual objects for processing
+                    all_actions = []
+                    for item in obj:
+                        if isinstance(item, dict) and "name" in item and "parameters" in item:
+                            # Convert to the expected format
+                            all_actions.append({
+                                "name": item["name"],
+                                "arguments": item["parameters"]
+                            })
+                    calls = self.parse_base_json(all_actions, tools) if all_actions else []
+                    return StreamingParseResult(normal_text=normal_text, calls=calls)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse JSON array: {action_text}, JSON parse error: {str(e)}")
+                return StreamingParseResult(normal_text=normal_text + action_text, calls=[])
+
+        # Handle individual JSON objects (existing logic)
         decoder = json.JSONDecoder()
         idx = 0
         safe_idx = idx  # the index of the last valid JSON object
