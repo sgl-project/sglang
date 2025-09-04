@@ -465,17 +465,19 @@ class RouterArgs:
 
         # parse special arguments and remove "--prefill" and "--decode" from cli_args_dict
         args_dict["prefill_urls"] = cls._parse_prefill_urls(
-            cli_args_dict[f"{prefix}prefill"]
+            cli_args_dict.get(f"{prefix}prefill", None)
         )
         args_dict["decode_urls"] = cls._parse_decode_urls(
-            cli_args_dict[f"{prefix}decode"]
+            cli_args_dict.get(f"{prefix}decode", None)
         )
-        args_dict["selector"] = cls._parse_selector(cli_args_dict[f"{prefix}selector"])
+        args_dict["selector"] = cls._parse_selector(
+            cli_args_dict.get(f"{prefix}selector", None)
+        )
         args_dict["prefill_selector"] = cls._parse_selector(
-            cli_args_dict[f"{prefix}prefill-selector"]
+            cli_args_dict.get(f"{prefix}prefill_selector", None)
         )
         args_dict["decode_selector"] = cls._parse_selector(
-            cli_args_dict[f"{prefix}decode-selector"]
+            cli_args_dict.get(f"{prefix}decode_selector", None)
         )
 
         # Mooncake-specific annotation
