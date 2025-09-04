@@ -47,6 +47,45 @@ namespace {
     }                                                            \
   }()
 
+// dispatch with mixed dtypes (TYPE1, TYPE2):
+//   TYPE1: the primary dtype (input, output, weight);
+//   TYPE2: the secondary dtype (bias, etc.).
+#define CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(TYPE1, TYPE2, ...) \
+  [&] {                                                            \
+    if (TYPE2 == at::kFloat) {                                     \
+      switch (TYPE1) {                                             \
+        case at::ScalarType::BFloat16: {                           \
+          using scalar_t = at::BFloat16;                           \
+          using param_t = float;                                   \
+          return __VA_ARGS__();                                    \
+        }                                                          \
+        case at::ScalarType::Half: {                               \
+          using scalar_t = at::Half;                               \
+          using param_t = float;                                   \
+          return __VA_ARGS__();                                    \
+        }                                                          \
+        default:                                                   \
+          TORCH_CHECK(false, "Unsupported floating data type.\n"); \
+      }                                                            \
+    } else {                                                       \
+      TORCH_CHECK(TYPE1 == TYPE2);                                 \
+      switch (TYPE1) {                                             \
+        case at::ScalarType::BFloat16: {                           \
+          using scalar_t = at::BFloat16;                           \
+          using param_t = at::BFloat16;                            \
+          return __VA_ARGS__();                                    \
+        }                                                          \
+        case at::ScalarType::Half: {                               \
+          using scalar_t = at::Half;                               \
+          using param_t = at::Half;                                \
+          return __VA_ARGS__();                                    \
+        }                                                          \
+        default:                                                   \
+          TORCH_CHECK(false, "Unsupported floating data type.\n"); \
+      }                                                            \
+    }                                                              \
+  }()
+
 #define UNUSED(x) (void)(x)
 
 #define CHECK_CPU(x) TORCH_CHECK(x.device().type() == at::kCPU, #x " must be a CPU tensor")
@@ -66,7 +105,19 @@ namespace {
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
-// parallel routines
+// [NB] Parallel Routines
+//
+//  * at::parallel_for - applies for most of generic use cases, this will be compiled
+//                       against openmp in default torch release.
+//
+//  * parallel_for     - same function as above, can choose payload partition scheme in
+//                       balance211.
+//
+//  * parallel_2d      - parallel for 2 dimensions, used in GEMM, etc.
+//                       this one will do payload balance across 2 dimensions.
+//
+
+// grain size for each thread
 constexpr int GRAIN_SIZE = 1024;
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
@@ -74,6 +125,17 @@ inline T div_up(T x, T y) {
   return (x + y - 1) / y;
 }
 
+// you can only use at::get_thread_num() with at::parallel_for()
+// as it is lazy initialized, otherwise it will always return 0.
+inline int get_thread_num() {
+#if defined(_OPENMP)
+  return omp_get_thread_num();
+#else
+  return 0;
+#endif
+}
+
+// balance payload across each thread
 template <typename T>
 inline void balance211(T n, T nth, T ith, T& n_start, T& n_end) {
 #if 0
@@ -173,11 +235,39 @@ inline void parallel_2d(int m, int n, const func_t& f) {
 #endif
 }
 
+// limit max cache blocks
+// when we need to do pre-unpack for weights, e.g. fp8
+#define MAX_CACHE_BLOCK_SIZE 4
+
 template <typename T>
-int get_cache_blocks(int BLOCK_SIZE, int K) {
+inline int get_cache_blocks(int chunk_size) {
   // L2 2MB and ratio of 50%
   const int L2_size = 2048 * 1024 >> 1;
-  return std::max(1, int(L2_size / (BLOCK_SIZE * K * sizeof(T))));
+  return std::max(1, int(L2_size / (chunk_size * sizeof(T))));
+}
+
+template <>
+inline int get_cache_blocks<at::Float8_e4m3fn>(int chunk_size) {
+  // fp8 uses bf16 as accumulate type
+  int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
+  return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
+}
+
+// 2d sequential loop in range : [mb0, mb1), [nb0, nb1)
+template <typename T, typename func_t>
+inline void loop_2d(int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1, int64_t chunk_size, const func_t& f) {
+  // get number of blocks for L2 in most inner loop
+  int64_t cache_blocks_nb = get_cache_blocks<T>(chunk_size);
+
+  // loop order: [NB / cache_blocks_nb, MB, cache_blocks_nb]
+  // TODO: implement reverse order of [MB / cache_blocks_mb, NB, cache_blocks_mb]
+  for (int64_t nbb = nb0; nbb < nb1; nbb += cache_blocks_nb) {
+    for (int64_t mb = mb0; mb < mb1; ++mb) {
+      for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, nb1); ++nb) {
+        f(mb, nb, nb - nbb);
+      }
+    }
+  }
 }
 
 // data indexing for dimension collapse

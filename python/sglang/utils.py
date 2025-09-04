@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import random
-import signal
 import socket
 import subprocess
 import sys
@@ -14,6 +13,7 @@ import traceback
 import urllib.request
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
@@ -26,6 +26,24 @@ from pydantic import BaseModel
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+
+def execute_once(func):
+    has_run = None
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        nonlocal has_run
+        if not has_run:
+            func(*args, **kwargs)
+            has_run = True
+
+    return wrapper
+
+
+@execute_once
+def info_once(message: str):
+    logger.info(message)
 
 
 def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
@@ -272,17 +290,6 @@ def find_printable_text(text: str):
         return text[: text.rfind(" ") + 1]
 
 
-def graceful_registry(sub_module_name: str):
-    def graceful_shutdown(signum, frame):
-        logger.info(
-            f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
-        )
-        if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} receive sigterm")
-
-    signal.signal(signal.SIGTERM, graceful_shutdown)
-
-
 class LazyImport:
     """Lazy import to make `import sglang` run faster."""
 
@@ -450,7 +457,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
+                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break

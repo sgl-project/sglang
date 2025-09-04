@@ -101,9 +101,7 @@ def test_transfer_kv(
                 dst_pool_kernel[layer_idx_to_test],
                 src_indices_device,
                 dst_indices_device,
-                io_backend="kernel",
-                page_size=page_size,
-                item_size=item_size,
+                item_size=item_size * dtype.itemsize,
             )
             transfer_kv_direct(
                 [src_pool_host[layer_idx_to_test]],
@@ -138,7 +136,6 @@ def test_transfer_kv(
                 dst_layers_device,
                 src_indices_device,
                 dst_indices_device,
-                io_backend="kernel",
                 item_size=item_size * dtype.itemsize,
                 num_layers=num_layers,
             )
@@ -173,9 +170,7 @@ def test_transfer_kv(
                 dst_v_pool_kernel[layer_idx_to_test],
                 src_indices_device,
                 dst_indices_device,
-                io_backend="kernel",
-                page_size=page_size,
-                item_size=item_size,
+                item_size=item_size * dtype.itemsize,
             )
             transfer_kv_direct(
                 [src_k_pool[layer_idx_to_test], src_v_pool[layer_idx_to_test]],
@@ -235,7 +230,6 @@ def test_transfer_kv(
                 dst_v_layers_device,
                 src_indices_device,
                 dst_indices_device,
-                io_backend="kernel",
                 item_size=item_size * dtype.itemsize,
                 num_layers=num_layers,
             )

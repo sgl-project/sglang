@@ -321,6 +321,10 @@ class BaseFormatDetector(ABC):
         """
         raise NotImplementedError()
 
+    def supports_structural_tag(self) -> bool:
+        """Return True if this detector supports structural tag format."""
+        return True
+
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """

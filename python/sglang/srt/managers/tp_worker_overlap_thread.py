@@ -58,13 +58,14 @@ class TpModelWorkerClient:
         server_args: ServerArgs,
         gpu_id: int,
         tp_rank: int,
+        moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
     ):
         # Load the model
         self.worker = TpModelWorker(
-            server_args, gpu_id, tp_rank, pp_rank, dp_rank, nccl_port
+            server_args, gpu_id, tp_rank, moe_ep_rank, pp_rank, dp_rank, nccl_port
         )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
@@ -286,6 +287,9 @@ class TpModelWorkerClient:
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
         return self.worker.unload_lora_adapter(recv_req)
+
+    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
+        return self.worker.can_run_lora_batch(lora_ids)
 
     def __delete__(self):
         self.input_queue.put((None, None))
