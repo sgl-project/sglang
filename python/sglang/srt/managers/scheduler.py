@@ -227,8 +227,6 @@ class Scheduler(
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
-        logger.info(f"harrisonlim- debug")
-
         self.schedule_low_priority_values_first = (
             server_args.schedule_low_priority_values_first
         )
@@ -1297,17 +1295,9 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
-            reqs_with_p = [(req.rid, req.priority) for req in self.waiting_queue]
-            logger.info(
-                f"waiting_queue: {reqs_with_p} - incoming req: ({req.rid}, {req.priority})"
-            )
             if self._abort_on_queued_limit(req):
-                logger.info(f"abort incoming req: ({req.rid}, {req.priority}")
                 return
             self._prefetch_kvcache(req)
-            logger.info(
-                f"adding incoming req to waiting queue: ({req.rid}, {req.priority}"
-            )
             self.waiting_queue.append(req)
 
     def _prefetch_kvcache(self, req: Req):
@@ -1363,13 +1353,7 @@ class Scheduler(
                     key=lambda item: (-item[1].priority, item[1].queue_time_start),
                 )
                 abort_existing_req = recv_req.priority > min_priority_req.priority
-            logger.info(
-                f"min request - ({min_priority_req.rid}, {min_priority_req.priority})"
-            )
             if abort_existing_req:
-                logger.info(
-                    f"abort existing min request - ({min_priority_req.rid}, {min_priority_req.priority})"
-                )
                 self.waiting_queue.pop(idx)
                 req_to_abort = min_priority_req
                 message = "The request is aborted based on priority."
