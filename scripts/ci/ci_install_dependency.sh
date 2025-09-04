@@ -47,8 +47,8 @@ $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org
 
 if [ "$IS_BLACKWELL" = "1" ]; then
     # TODO auto determine sgl-kernel version
-    SGL_KERNEL_VERSION=0.3.2
-    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    SGL_KERNEL_VERSION=0.3.8
+    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu128-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages

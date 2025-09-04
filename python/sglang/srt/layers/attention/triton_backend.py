@@ -20,6 +20,14 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 
+def logit_capping_mod(logit_capping_method, logit_cap):
+    # positive logit_cap -> tanh cap
+    if logit_capping_method == "tanh":
+        return logit_cap
+    else:
+        raise ValueError()
+
+
 @dataclass
 class ForwardMetadata:
     attn_logits: torch.Tensor
@@ -172,7 +180,7 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
                 kv_indices = torch.empty(
-                    forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+                    forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
                 )
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
@@ -238,7 +246,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
-                kv_indptr[-1], dtype=torch.int32, device=self.device
+                kv_indptr[-1], dtype=torch.int64, device=self.device
             )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
@@ -289,6 +297,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.req_to_token,
                 )
             )
+            kv_indices = kv_indices.to(torch.int64)
             mask_indptr = None
             # TODO(FIXME): This will trigger an invalid Eagle tree when using
             # `max(spec_info.accept_length_cpu)`.
@@ -304,7 +313,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
                 forward_batch.extend_prefix_lens.sum().item(),
-                dtype=torch.int32,
+                dtype=torch.int64,
                 device=self.device,
             )
             create_flashinfer_kv_indices_triton[(bs,)](
@@ -379,7 +388,7 @@ class TritonAttnBackend(AttentionBackend):
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
                 (max_num_tokens * self.max_context_len),
-                dtype=torch.int32,
+                dtype=torch.int64,
                 device=self.device,
             )
         else:
@@ -396,7 +405,7 @@ class TritonAttnBackend(AttentionBackend):
             if kv_indices_buf is None:
                 self.cuda_graph_window_kv_indices = torch.zeros(
                     (max_num_tokens * self.sliding_window_size),
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=self.device,
                 )
             else:
@@ -717,6 +726,8 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
+
         causal = True
         if layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -749,10 +760,11 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.mask_indptr,
             self.forward_metadata.max_extend_len,
             layer.scaling,
-            layer.logit_cap,
+            logit_cap=logits_soft_cap,
             sliding_window_size=sliding_window_size,
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
+            xai_temperature_len=layer.xai_temperature_len,
         )
         return o
 
@@ -775,6 +787,8 @@ class TritonAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
+
+        logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -800,8 +814,9 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.num_kv_splits,
             self.max_kv_splits,
             layer.scaling,
-            layer.logit_cap,
+            logit_cap=logits_soft_cap,
             sinks=sinks,
+            xai_temperature_len=layer.xai_temperature_len,
         )
         return o
 
@@ -888,7 +903,7 @@ class TritonMultiStepDraftBackend:
                 self.speculative_num_steps,
                 forward_batch.batch_size * self.topk * self.max_context_len,
             ),
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
 
@@ -906,7 +921,7 @@ class TritonMultiStepDraftBackend:
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, max_num_tokens * self.max_context_len),
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
         for i in range(self.speculative_num_steps):
@@ -1015,7 +1030,7 @@ def update_sliding_window_buffer(
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
     window_kv_indices = torch.empty(
-        window_kv_indptr[-1], dtype=torch.int32, device=device
+        window_kv_indptr[-1], dtype=torch.int64, device=device
     )
     window_kv_start_idx = seq_lens - window_kv_lens
     create_flashinfer_kv_indices_triton[(bs,)](
