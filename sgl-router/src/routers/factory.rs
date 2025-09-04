@@ -146,17 +146,29 @@ impl RouterFactory {
         // Create policy
         let policy = PolicyFactory::create_from_config(policy_config);
 
-        // Determine which tokenizer path to use
-        // Priority: tokenizer_path > model_path
-        let tokenizer_path = ctx
-            .router_config
-            .tokenizer_path
-            .clone()
-            .or_else(|| ctx.router_config.model_path.clone())
+        // Get tokenizer from context
+        let tokenizer = ctx
+            .tokenizer
+            .as_ref()
             .ok_or_else(|| {
-                "gRPC router requires either --tokenizer-path or --model-path to be specified"
+                "gRPC router requires tokenizer to be initialized in AppContext".to_string()
+            })?
+            .clone();
+
+        // Get reasoning parser factory from context
+        let reasoning_parser_factory = ctx
+            .reasoning_parser_factory
+            .as_ref()
+            .ok_or_else(|| {
+                "gRPC router requires reasoning parser factory to be initialized in AppContext"
                     .to_string()
-            })?;
+            })?
+            .clone();
+
+        // Get tool parser registry from context
+        let tool_parser_registry = ctx.tool_parser_registry.ok_or_else(|| {
+            "gRPC router requires tool parser registry to be initialized in AppContext".to_string()
+        })?;
 
         // Create gRPC router
         let router = GrpcRouter::new(
@@ -169,7 +181,9 @@ impl RouterFactory {
             ctx.router_config.effective_retry_config(),
             ctx.router_config.effective_circuit_breaker_config(),
             ctx.router_config.health_check.clone(),
-            tokenizer_path,
+            tokenizer,
+            reasoning_parser_factory,
+            tool_parser_registry,
         )
         .await?;
 
@@ -193,17 +207,30 @@ impl RouterFactory {
         let decode_policy =
             PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
 
-        // Determine which tokenizer path to use
-        // Priority: tokenizer_path > model_path
-        let tokenizer_path = ctx
-            .router_config
-            .tokenizer_path
-            .clone()
-            .or_else(|| ctx.router_config.model_path.clone())
+        // Get tokenizer from context
+        let tokenizer = ctx
+            .tokenizer
+            .as_ref()
             .ok_or_else(|| {
-                "gRPC PD router requires either --tokenizer-path or --model-path to be specified"
+                "gRPC PD router requires tokenizer to be initialized in AppContext".to_string()
+            })?
+            .clone();
+
+        // Get reasoning parser factory from context
+        let reasoning_parser_factory = ctx
+            .reasoning_parser_factory
+            .as_ref()
+            .ok_or_else(|| {
+                "gRPC PD router requires reasoning parser factory to be initialized in AppContext"
                     .to_string()
-            })?;
+            })?
+            .clone();
+
+        // Get tool parser registry from context
+        let tool_parser_registry = ctx.tool_parser_registry.ok_or_else(|| {
+            "gRPC PD router requires tool parser registry to be initialized in AppContext"
+                .to_string()
+        })?;
 
         // Create gRPC PD router
         let router = GrpcPDRouter::new(
@@ -218,7 +245,9 @@ impl RouterFactory {
             ctx.router_config.effective_retry_config(),
             ctx.router_config.effective_circuit_breaker_config(),
             ctx.router_config.health_check.clone(),
-            tokenizer_path,
+            tokenizer,
+            reasoning_parser_factory,
+            tool_parser_registry,
         )
         .await?;
 
