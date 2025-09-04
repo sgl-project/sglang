@@ -848,6 +848,14 @@ class ServerArgs:
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
                 "using lookahead speculative decoding."
             )
+            if (
+                self.speculative_eagle_topk > 1
+                and self.page_size > 1
+                and self.attention_backend != "flashinfer"
+            ):
+                raise ValueError(
+                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                )
 
         # GGUF
         if (

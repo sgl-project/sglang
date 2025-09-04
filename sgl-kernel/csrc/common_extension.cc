@@ -295,12 +295,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("reconstruct_indices_from_tree_mask", torch::kCUDA, &reconstruct_indices_from_tree_mask);
 
   m.def(
-      "lookahead_verify_tree_greedy(Tensor accept_token_num, Tensor accept_token_ids, Tensor last_verified_ids, "
-      "Tensor flatten_index, Tensor total_accept_num, Tensor candidates, Tensor retrive_index, "
-      "Tensor retrive_next_token, Tensor retrive_next_sibling, Tensor target_predict, int eos_token_id) -> ()");
-  m.impl("lookahead_verify_tree_greedy", torch::kCUDA, &lookahead_verify_tree_greedy);
-
-  m.def(
       "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
       "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
       "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> "

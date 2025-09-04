@@ -112,34 +112,6 @@ def reconstruct_indices_from_tree_mask(
     )
 
 
-def lookahead_verify_tree_greedy(
-    accept_token_num,
-    accept_token_ids,
-    last_verified_ids,
-    flatten_index,
-    total_accept_num,
-    candidates,
-    retrive_index,
-    retrive_next_token,
-    retrive_next_sibling,
-    target_predict,
-    eos_token_id,
-) -> None:
-    torch.ops.sgl_kernel.lookahead_verify_tree_greedy.default(
-        accept_token_num,
-        accept_token_ids,
-        last_verified_ids,
-        flatten_index,
-        total_accept_num,
-        candidates,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
-        target_predict,
-        eos_token_id,
-    )
-
-
 def segment_packbits(
     x: torch.Tensor,
     input_indptr: torch.Tensor,

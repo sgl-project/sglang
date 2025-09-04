@@ -788,44 +788,6 @@ def assign_req_to_token_pool(
 
 
 @triton.jit
-def assign_req_to_token_pool_async(
-    req_pool_indices,
-    req_to_token,
-    start_offset,
-    end_offset,
-    out_cache_loc,
-    flatten_index,
-    pool_len: tl.constexpr,
-    bs_upper: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 32
-    pid = tl.program_id(axis=0)
-    kv_start = tl.load(start_offset + pid)
-    kv_end = tl.load(end_offset + pid)
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
-
-    length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid)
-    out_offset = tl.sum(end - start, axis=0)
-
-    flatten_index_ptr = flatten_index + out_offset
-
-    save_offset = tl.arange(0, BLOCK_SIZE) + kv_start
-    load_offset = tl.arange(0, BLOCK_SIZE)
-
-    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for _ in range(num_loop):
-        mask = save_offset < kv_end
-        accept_index = tl.load(flatten_index_ptr + load_offset, mask=mask)
-        data = tl.load(out_cache_loc + accept_index, mask=mask)
-
-        tl.store(token_pool + save_offset, data, mask=mask)
-        save_offset += BLOCK_SIZE
-        load_offset += BLOCK_SIZE
-
-
-@triton.jit
 def assign_draft_cache_locs(
     req_pool_indices,
     req_to_token,
