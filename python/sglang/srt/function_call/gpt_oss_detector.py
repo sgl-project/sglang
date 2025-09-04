@@ -37,31 +37,12 @@ class GptOssDetector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if text contains TypeScript-style function call markers."""
-        return self.bot_token in text or text.startswith("[")
+        return self.bot_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse TypeScript-style function calls from complete text."""
         if not self.has_tool_call(text):
             return StreamingParseResult(normal_text=text, calls=[])
-
-        # Handle JSON array format (from JSON schema constraints)
-        if text.startswith("["):
-            try:
-                obj, end = json.JSONDecoder().raw_decode(text)
-                if isinstance(obj, list):
-                    calls = []
-                    for item in obj:
-                        if isinstance(item, dict) and "name" in item and "parameters" in item:
-                            tool_call = ToolCallItem(
-                                name=item["name"],
-                                parameters=item["parameters"],
-                                tool_index=0,
-                            )
-                            calls.append(tool_call)
-                    return StreamingParseResult(normal_text="", calls=calls)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse JSON array: {text}, JSON parse error: {str(e)}")
-                return StreamingParseResult(normal_text=text, calls=[])
 
         # Parse with HarmonyParser
         events = self.harmony_parser.parse(text)

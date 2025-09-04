@@ -85,7 +85,7 @@ class Step3Detector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Step3 format tool call."""
-        return self.bot_token in text or text.startswith("[")
+        return self.bot_token in text
 
     def _parse_steptml_invoke(
         self, text: str, tools: List[Tool] = None
@@ -122,21 +122,6 @@ class Step3Detector(BaseFormatDetector):
         """
         One-time parsing: Detects and parses tool calls in the provided text.
         """
-        # Handle JSON array format (from JSON schema constraints)
-        if text.startswith("["):
-            try:
-                obj, end = json.JSONDecoder().raw_decode(text)
-                if isinstance(obj, list):
-                    calls = []
-                    for item in obj:
-                        if isinstance(item, dict) and "name" in item and "parameters" in item:
-                            action = {"name": item["name"], "arguments": item["parameters"]}
-                            calls.extend(self.parse_base_json(action, tools))
-                    return StreamingParseResult(normal_text="", calls=calls)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse JSON array: {text}, JSON parse error: {str(e)}")
-                return StreamingParseResult(normal_text=text, calls=[])
-
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
 

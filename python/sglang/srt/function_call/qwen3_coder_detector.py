@@ -67,28 +67,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self._function_name_sent: bool = False
 
     def has_tool_call(self, text: str) -> bool:
-        return self.tool_call_start_token in text or text.startswith("[")
+        return self.tool_call_start_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        # Handle JSON array format (from JSON schema constraints)
-        if text.startswith("["):
-            try:
-                obj, end = json.JSONDecoder().raw_decode(text)
-                if isinstance(obj, list):
-                    calls = []
-                    for item in obj:
-                        if isinstance(item, dict) and "name" in item and "parameters" in item:
-                            tool_call = ToolCallItem(
-                                name=item["name"],
-                                parameters=item["parameters"],
-                                tool_index=0,
-                            )
-                            calls.append(tool_call)
-                    return StreamingParseResult(normal_text="", calls=calls)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse JSON array: {text}, JSON parse error: {str(e)}")
-                return StreamingParseResult(normal_text=text, calls=[])
-
         normal, calls = self._extract(text, tools)
         return StreamingParseResult(normal_text=normal, calls=calls)
 
