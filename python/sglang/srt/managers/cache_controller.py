@@ -327,6 +327,7 @@ class HiCacheController:
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
+            self.batch_exists_func = self.storage_backend.batch_exists
             self.is_3fs_zerocopy = (
                 self.storage_backend_type == "hf3fs"
                 and self.mem_pool_host.layout == "page_first"
@@ -337,6 +338,7 @@ class HiCacheController:
             elif self.is_3fs_zerocopy:
                 self.page_get_func = self._3fs_zero_copy_page_get
                 self.page_set_func = self._3fs_zero_copy_page_set
+                self.batch_exists_func = self._3fs_zero_copy_batch_exists
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
@@ -631,6 +633,11 @@ class HiCacheController:
         for chunk in chunks:
             self.host_mem_release_queue.put(chunk)
 
+    def _3fs_zero_copy_batch_exists(self, batch_hashes):
+        _batch_hashes, _, factor = self.mem_pool_host.get_buffer_with_hash(batch_hashes)
+        hit_page_num = self.storage_backend.batch_exists(_batch_hashes) // factor
+        return hit_page_num
+
     def _3fs_zero_copy_page_get(self, operation, hash_values, host_indices):
         hashes, dsts, factor = self.mem_pool_host.get_buffer_with_hash(
             hash_values, host_indices
@@ -750,15 +757,7 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            if self.is_3fs_zerocopy:
-                _batch_hashes, _, factor = self.mem_pool_host.get_buffer_with_hash(
-                    batch_hashes
-                )
-                hit_page_num = (
-                    self.storage_backend.batch_exists(_batch_hashes) // factor
-                )
-            else:
-                hit_page_num = self.storage_backend.batch_exists(batch_hashes)
+            hit_page_num = self.batch_exists_func(batch_hashes)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
