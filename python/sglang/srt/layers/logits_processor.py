@@ -194,6 +194,7 @@ class LogitsMetadata:
         set_dp_buffer_len(
             self.global_dp_buffer_len,
             self.dp_local_num_tokens,
+            False,
             self.global_num_tokens_for_logprob_cpu,
         )
 
