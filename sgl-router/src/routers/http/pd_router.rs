@@ -1,11 +1,7 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
-use super::header_utils;
 use super::pd_types::{api_path, PDRouterError};
-use crate::config::types::{
-    CircuitBreakerConfig as ConfigCircuitBreakerConfig,
-    HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
-};
+use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig,
     RetryExecutor, Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
@@ -16,6 +12,7 @@ use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, StringOrArray,
     UserMessageContent,
 };
+use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -28,7 +25,7 @@ use axum::{
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -42,8 +39,8 @@ pub struct PDRouter {
     pub decode_workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
     pub prefill_policy: Arc<dyn LoadBalancingPolicy>,
     pub decode_policy: Arc<dyn LoadBalancingPolicy>,
-    pub timeout_secs: u64,
-    pub interval_secs: u64,
+    pub worker_startup_timeout_secs: u64,
+    pub worker_startup_check_interval_secs: u64,
     pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
@@ -72,10 +69,10 @@ impl PDRouter {
 
     // Private helper method to perform health check on a new server
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
-        crate::routers::router::Router::wait_for_healthy_workers(
+        crate::routers::http::router::Router::wait_for_healthy_workers(
             &[url.to_string()],
-            self.timeout_secs,
-            self.interval_secs,
+            self.worker_startup_timeout_secs,
+            self.worker_startup_check_interval_secs,
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -375,14 +372,10 @@ impl PDRouter {
         decode_urls: Vec<String>,
         prefill_policy: Arc<dyn LoadBalancingPolicy>,
         decode_policy: Arc<dyn LoadBalancingPolicy>,
-        client: Client,
-        timeout_secs: u64,
-        interval_secs: u64,
-        retry_config: RetryConfig,
-        circuit_breaker_config: ConfigCircuitBreakerConfig,
-        health_check_config: ConfigHealthCheckConfig,
+        ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
+        let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
         let core_cb_config = CircuitBreakerConfig {
             failure_threshold: circuit_breaker_config.failure_threshold,
             success_threshold: circuit_breaker_config.success_threshold,
@@ -402,11 +395,11 @@ impl PDRouter {
                 )
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {
-                    timeout_secs: health_check_config.timeout_secs,
-                    check_interval_secs: health_check_config.check_interval_secs,
-                    endpoint: health_check_config.endpoint.clone(),
-                    failure_threshold: health_check_config.failure_threshold,
-                    success_threshold: health_check_config.success_threshold,
+                    timeout_secs: ctx.router_config.health_check.timeout_secs,
+                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                    endpoint: ctx.router_config.health_check.endpoint.clone(),
+                    failure_threshold: ctx.router_config.health_check.failure_threshold,
+                    success_threshold: ctx.router_config.health_check.success_threshold,
                 });
                 Box::new(worker) as Box<dyn Worker>
             })
@@ -418,11 +411,11 @@ impl PDRouter {
                 let worker = BasicWorker::new(url, WorkerType::Decode)
                     .with_circuit_breaker_config(core_cb_config.clone())
                     .with_health_config(HealthConfig {
-                        timeout_secs: health_check_config.timeout_secs,
-                        check_interval_secs: health_check_config.check_interval_secs,
-                        endpoint: health_check_config.endpoint.clone(),
-                        failure_threshold: health_check_config.failure_threshold,
-                        success_threshold: health_check_config.success_threshold,
+                        timeout_secs: ctx.router_config.health_check.timeout_secs,
+                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                        endpoint: ctx.router_config.health_check.endpoint.clone(),
+                        failure_threshold: ctx.router_config.health_check.failure_threshold,
+                        success_threshold: ctx.router_config.health_check.success_threshold,
                     });
                 Box::new(worker) as Box<dyn Worker>
             })
@@ -435,10 +428,10 @@ impl PDRouter {
             .map(|worker| worker.url().to_string())
             .collect();
         if !all_urls.is_empty() {
-            crate::routers::router::Router::wait_for_healthy_workers(
+            crate::routers::http::router::Router::wait_for_healthy_workers(
                 &all_urls,
-                timeout_secs,
-                interval_secs,
+                ctx.router_config.worker_startup_timeout_secs,
+                ctx.router_config.worker_startup_check_interval_secs,
             )
             .await?;
         }
@@ -465,8 +458,8 @@ impl PDRouter {
         let load_monitor_handle =
             if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
                 let monitor_urls = all_urls.clone();
-                let monitor_interval = interval_secs;
-                let monitor_client = client.clone();
+                let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
+                let monitor_client = ctx.client.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
                 let decode_policy_clone = Arc::clone(&decode_policy);
 
@@ -491,11 +484,11 @@ impl PDRouter {
         // Start health checkers for both worker pools
         let prefill_health_checker = crate::core::start_health_checker(
             Arc::clone(&prefill_workers),
-            health_check_config.check_interval_secs,
+            ctx.router_config.health_check.check_interval_secs,
         );
         let decode_health_checker = crate::core::start_health_checker(
             Arc::clone(&decode_workers),
-            health_check_config.check_interval_secs,
+            ctx.router_config.health_check.check_interval_secs,
         );
 
         // Build a dedicated prefill client for fire-and-forget semantics
@@ -503,7 +496,7 @@ impl PDRouter {
             .pool_max_idle_per_host(0)
             .http1_only()
             .connect_timeout(Duration::from_millis(300))
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(ctx.router_config.request_timeout_secs))
             .build()
             .map_err(|e| format!("Failed to build prefill client: {}", e))?;
 
@@ -581,14 +574,16 @@ impl PDRouter {
             decode_workers,
             prefill_policy,
             decode_policy,
-            timeout_secs,
-            interval_secs,
+            worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
+            worker_startup_check_interval_secs: ctx
+                .router_config
+                .worker_startup_check_interval_secs,
             worker_loads,
             load_monitor_handle,
-            client,
+            client: ctx.client.clone(),
             prefill_client,
             prefill_drain_tx,
-            retry_config,
+            retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
             _prefill_health_checker: Some(prefill_health_checker),
             _decode_health_checker: Some(decode_health_checker),
@@ -808,6 +803,57 @@ impl PDRouter {
         .await
     }
 
+    async fn handle_decode_error_response(
+        &self,
+        res: reqwest::Response,
+        context: &PDRequestContext,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+    ) -> Response {
+        let status = res.status();
+
+        if context.is_stream {
+            // Handle streaming error response
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let error_payload = match res.bytes().await {
+                Ok(error_body) => {
+                    if let Ok(error_json) = serde_json::from_slice::<Value>(&error_body) {
+                        json!({ "message": error_json, "status": status.as_u16() })
+                    } else {
+                        json!({ "message": String::from_utf8_lossy(&error_body).to_string(), "status": status.as_u16() })
+                    }
+                }
+                Err(e) => {
+                    json!({ "message": format!("Decode server error: {}", e), "status": status.as_u16() })
+                }
+            };
+
+            let sse_data = format!(
+                "data: {{'error': {}}}",
+                serde_json::to_string(&error_payload).unwrap_or_default()
+            );
+            let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
+
+            let decode_url = decode.url().to_string();
+            self.create_streaming_response(
+                error_stream,
+                status,
+                None,
+                context.return_logprob,
+                Some(decode_url),
+                Some(response_headers),
+                prefill,
+                decode,
+            )
+        } else {
+            // Handle non-streaming error response
+            match res.bytes().await {
+                Ok(error_body) => (status, error_body).into_response(),
+                Err(e) => (status, format!("Decode server error: {}", e)).into_response(),
+            }
+        }
+    }
+
     // Internal method that performs the actual dual dispatch (without retry logic)
     async fn execute_dual_dispatch_internal(
         &self,
@@ -881,16 +927,9 @@ impl PDRouter {
                             status
                         );
 
-                        // Return the error response from decode server
-                        match res.bytes().await {
-                            Ok(error_body) => {
-                                return (status, error_body).into_response();
-                            }
-                            Err(e) => {
-                                return (status, format!("Decode server error: {}", e))
-                                    .into_response();
-                            }
-                        }
+                        return self
+                            .handle_decode_error_response(res, &context, prefill, decode)
+                            .await;
                     }
 
                     // Process prefill response for logprobs
@@ -1034,13 +1073,8 @@ impl PDRouter {
                             status
                         );
 
-                        // Return the error response from decode server
-                        match res.bytes().await {
-                            Ok(error_body) => (status, error_body).into_response(),
-                            Err(e) => {
-                                (status, format!("Decode server error: {}", e)).into_response()
-                            }
-                        }
+                        self.handle_decode_error_response(res, &context, prefill, decode)
+                            .await
                     } else if context.is_stream {
                         // Streaming response without logprobs - direct passthrough
                         let decode_url = decode.url().to_string();
@@ -1896,6 +1930,14 @@ impl RouterTrait for PDRouter {
         self.execute_dual_dispatch(headers, body, context).await
     }
 
+    async fn route_embeddings(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        todo!()
+    }
+
+    async fn route_rerank(&self, _headers: Option<&HeaderMap>, _body: Body) -> Response {
+        todo!()
+    }
+
     async fn flush_cache(&self) -> Response {
         // Process both prefill and decode workers
         let (prefill_results, prefill_errors) = self
@@ -2001,7 +2043,7 @@ impl RouterTrait for PDRouter {
         let total_decode = self.decode_workers.read().unwrap().len();
 
         if healthy_prefill_count > 0 && healthy_decode_count > 0 {
-            Json(serde_json::json!({
+            Json(json!({
                 "status": "ready",
                 "prefill": {
                     "healthy": healthy_prefill_count,
@@ -2057,8 +2099,8 @@ mod tests {
             decode_workers: Arc::new(RwLock::new(vec![])),
             prefill_policy,
             decode_policy,
-            timeout_secs: 5,
-            interval_secs: 1,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
             worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
             load_monitor_handle: None,
             client: Client::new(),

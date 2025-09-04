@@ -5,7 +5,6 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.code_completion_parser import generate_completion_prompt_from_request
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -23,6 +22,9 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.parser.code_completion_parser import (
+    generate_completion_prompt_from_request,
+)
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)

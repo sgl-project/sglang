@@ -567,7 +567,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Move the chunked request out of the batch so that we can merge
                 # only finished requests to running_batch.
                 self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-                self.tree_cache.cache_unfinished_req(self.chunked_req)
+                self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
                 if self.enable_overlap:
                     # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                     self.chunked_req.tmp_end_idx = min(

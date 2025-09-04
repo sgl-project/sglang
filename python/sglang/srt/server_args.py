@@ -25,7 +25,7 @@ from typing import List, Literal, Optional, Union
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -47,12 +47,87 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 
+# Define constants
+LOAD_FORMAT_CHOICES = [
+    "auto",
+    "pt",
+    "safetensors",
+    "npcache",
+    "dummy",
+    "sharded_state",
+    "gguf",
+    "bitsandbytes",
+    "layered",
+    "remote",
+]
+
+QUANTIZATION_CHOICES = [
+    "awq",
+    "fp8",
+    "gptq",
+    "marlin",
+    "gptq_marlin",
+    "awq_marlin",
+    "bitsandbytes",
+    "gguf",
+    "modelopt",
+    "modelopt_fp4",
+    "petit_nvfp4",
+    "w8a8_int8",
+    "w8a8_fp8",
+    "moe_wna16",
+    "qoq",
+    "w4afp8",
+    "mxfp4",
+]
+
+ATTENTION_BACKEND_CHOICES = [
+    # Common
+    "triton",
+    "torch_native",
+    # NVIDIA specific
+    "cutlass_mla",
+    "fa3",
+    "flashinfer",
+    "flashmla",
+    "trtllm_mla",
+    "trtllm_mha",
+    "dual_chunk_flash_attn",
+    # AMD specific
+    "aiter",
+    "wave",
+    # Other platforms
+    "intel_amx",
+    "ascend",
+]
+
+DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
+
+
+# Allow external code to add more choices
+def add_load_format_choices(choices):
+    LOAD_FORMAT_CHOICES.extend(choices)
+
+
+def add_quantization_method_choices(choices):
+    QUANTIZATION_CHOICES.extend(choices)
+
+
+def add_attention_backend_choices(choices):
+    ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_disagg_transfer_backend_choices(choices):
+    DISAGG_TRANSFER_BACKEND_CHOICES.extend(choices)
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
+    tokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -121,6 +196,8 @@ class ServerArgs:
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
     collect_tokens_histogram: bool = False
+    prompt_tokens_buckets: Optional[List[str]] = None
+    generation_tokens_buckets: Optional[List[str]] = None
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
@@ -201,6 +278,7 @@ class ServerArgs:
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
+    eplb_min_rebalancing_utilization_threshold: float = 1.0
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_approx", "per_pass", "per_token"]
     ] = None
@@ -213,7 +291,7 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
-    hicache_write_policy: str = "write_through_selective"
+    hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
@@ -674,6 +752,15 @@ class ServerArgs:
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
+            if (
+                self.speculative_eagle_topk > 1
+                and self.page_size > 1
+                and self.attention_backend != "flashinfer"
+            ):
+                raise ValueError(
+                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                )
+
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
             # assert self.speculative_num_steps < self.speculative_num_draft_tokens
@@ -745,6 +832,12 @@ class ServerArgs:
             help="The path of the tokenizer.",
         )
         parser.add_argument(
+            "--tokenizer-worker-num",
+            type=int,
+            default=ServerArgs.tokenizer_worker_num,
+            help="The worker num of the tokenizer manager.",
+        )
+        parser.add_argument(
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
@@ -762,18 +855,7 @@ class ServerArgs:
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=[
-                "auto",
-                "pt",
-                "safetensors",
-                "npcache",
-                "dummy",
-                "sharded_state",
-                "gguf",
-                "bitsandbytes",
-                "layered",
-                "remote",
-            ],
+            choices=LOAD_FORMAT_CHOICES,
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -892,25 +974,7 @@ class ServerArgs:
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
-            choices=[
-                "awq",
-                "fp8",
-                "gptq",
-                "marlin",
-                "gptq_marlin",
-                "awq_marlin",
-                "bitsandbytes",
-                "gguf",
-                "modelopt",
-                "modelopt_fp4",
-                "petit_nvfp4",
-                "w8a8_int8",
-                "w8a8_fp8",
-                "moe_wna16",
-                "qoq",
-                "w4afp8",
-                "mxfp4",
-            ],
+            choices=QUANTIZATION_CHOICES,
             help="The quantization method.",
         )
         parser.add_argument(
@@ -1186,6 +1250,26 @@ class ServerArgs:
             default=ServerArgs.collect_tokens_histogram,
             help="Collect prompt/generation tokens histogram.",
         )
+        bucket_rule = (
+            "Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' "
+            "generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets "
+            "[984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'customer <value1> "
+            "<value2> ...' uses custom bucket values (e.g., 'customer 10 50 100 500')."
+        )
+        parser.add_argument(
+            "--prompt-tokens-buckets",
+            type=str,
+            nargs="+",
+            default=ServerArgs.prompt_tokens_buckets,
+            help=f"The buckets rule of prompt tokens. {bucket_rule}",
+        )
+        parser.add_argument(
+            "--generation-tokens-buckets",
+            type=str,
+            nargs="+",
+            default=ServerArgs.generation_tokens_buckets,
+            help=f"The buckets rule for generation tokens histogram. {bucket_rule}",
+        )
         parser.add_argument(
             "--gc-warning-threshold-secs",
             type=float,
@@ -1373,43 +1457,24 @@ class ServerArgs:
         )
 
         # Kernel backend
-        ATTN_BACKENDS = [
-            # Common
-            "triton",
-            "torch_native",
-            # NVIDIA specific
-            "cutlass_mla",
-            "fa3",
-            "flashinfer",
-            "flashmla",
-            "trtllm_mla",
-            "trtllm_mha",
-            "dual_chunk_flash_attn",
-            # AMD specific
-            "aiter",
-            "wave",
-            # Other platforms
-            "intel_amx",
-            "ascend",
-        ]
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=ATTN_BACKENDS,
+            choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
         parser.add_argument(
             "--prefill-attention-backend",
             type=str,
-            choices=ATTN_BACKENDS,
+            choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.prefill_attention_backend,
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
         )
         parser.add_argument(
             "--decode-attention-backend",
             type=str,
-            choices=ATTN_BACKENDS,
+            choices=ATTENTION_BACKEND_CHOICES,
             default=ServerArgs.decode_attention_backend,
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
         )
@@ -1573,6 +1638,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.eplb_rebalance_layers_per_chunk,
             help="Number of layers to rebalance per forward pass.",
+        )
+        parser.add_argument(
+            "--eplb-min-rebalancing-utilization-threshold",
+            type=float,
+            default=ServerArgs.eplb_min_rebalancing_utilization_threshold,
+            help="Minimum threshold for GPU average utilization to trigger EPLB rebalancing. Must be in the range [0.0, 1.0].",
         )
         parser.add_argument(
             "--expert-distribution-recorder-mode",
@@ -1973,7 +2044,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "nixl", "ascend"],
+            choices=DISAGG_TRANSFER_BACKEND_CHOICES,
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -2148,6 +2219,15 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
+        # Check multi tokenizer
+        assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+        self.validate_buckets_rule(
+            "--prompt-tokens-buckets", self.prompt_tokens_buckets
+        )
+        self.validate_buckets_rule(
+            "--generation-tokens-buckets", self.generation_tokens_buckets
+        )
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
@@ -2239,6 +2319,54 @@ class ServerArgs:
             f"decode_tp={decode_tp}, prefill_tp={prefill_tp}"
         )
 
+    def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
+        if not buckets_rule:
+            return
+
+        assert len(buckets_rule) > 0, f"{arg_name} cannot be empty list"
+        rule = buckets_rule[0]
+        assert rule in [
+            "tse",
+            "default",
+            "customer",
+        ], f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'customer'"
+
+        if rule == "tse":
+            assert (
+                len(buckets_rule) == 4
+            ), f"{arg_name} TSE rule requires exactly 4 parameters: ['tse', middle, base, count], got {len(buckets_rule)}"
+            try:
+                middle = float(buckets_rule[1])
+                base = float(buckets_rule[2])
+                count = int(buckets_rule[3])
+            except (ValueError, IndexError):
+                assert (
+                    False
+                ), f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
+            assert base > 1, f"{arg_name} TSE base must be larger than 1, got: {base}"
+            assert count > 0, f"{arg_name} TSE count must be positive, got: {count}"
+            assert middle > 0, f"{arg_name} TSE middle must be positive, got: {middle}"
+
+        elif rule == "default":
+            assert (
+                len(buckets_rule) == 1
+            ), f"{arg_name} default rule should only have one parameter: ['default'], got {len(buckets_rule)}"
+
+        elif rule == "customer":
+            assert (
+                len(buckets_rule) >= 2
+            ), f"{arg_name} customer rule requires at least one bucket value: ['customer', value1, ...]"
+            try:
+                bucket_values = [float(x) for x in buckets_rule[1:]]
+            except ValueError:
+                assert False, f"{arg_name} customer rule bucket values must be numeric"
+            assert len(set(bucket_values)) == len(
+                bucket_values
+            ), f"{arg_name} customer rule bucket values should not contain duplicates"
+            assert all(
+                val >= 0 for val in bucket_values
+            ), f"{arg_name} customer rule bucket values should be non-negative"
+
     def model_specific_adjustments(self):
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
@@ -2298,7 +2426,8 @@ class ServerArgs:
             assert self.attention_backend in {
                 "fa3",
                 "aiter",
-            }, "fa3 or aiter is required for Llama4 model"
+                "triton",
+            }, "fa3, aiter, or triton is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
@@ -2391,6 +2520,9 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
+    # The ipc filename for Tokenizer and worker tokenizer
+    tokenizer_worker_ipc_name: Optional[str]
+
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
         if server_args.nccl_port is None:
@@ -2414,6 +2546,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                tokenizer_worker_ipc_name=None,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -2447,6 +2580,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
+                tokenizer_worker_ipc_name=None,
             )
 
 

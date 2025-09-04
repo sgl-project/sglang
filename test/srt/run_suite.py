@@ -80,13 +80,16 @@ suites = {
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
+        TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
         TestFile("test_mla_deepseek_v3.py", 700),
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
+        TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 234),
+        TestFile("test_original_logprobs.py", 200),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_priority_scheduling.py", 60),
@@ -122,6 +125,8 @@ suites = {
         TestFile("test_dp_attention.py", 277),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 127),
+        TestFile("hicache/test_hicache_storage_e2e.py", 400),
+        TestFile("hicache/test_hicache_storage_benchmark.py", 400),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 600),
@@ -138,6 +143,7 @@ suites = {
     ],
     "per-commit-8-gpu-b200": [
         # add more here
+        TestFile("test_gpt_oss_4gpu.py", 600),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -163,6 +169,9 @@ suites = {
 # Add AMD tests
 suite_amd = {
     "per-commit-amd": [
+        TestFile("hicache/test_hicache.py", 116),
+        TestFile("hicache/test_hicache_mla.py", 127),
+        TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
@@ -207,6 +216,7 @@ suite_amd = {
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
+        TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 242),
         TestFile("test_mla_deepseek_v3.py", 221),
         TestFile("test_no_chunked_prefill.py", 108),
