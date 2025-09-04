@@ -879,17 +879,16 @@ class GroupCoordinator:
         size_tensor = torch.tensor(
             [object_tensor.numel()],
             dtype=torch.long,
-            device=torch.cuda.current_device(),
+            device="cpu",
         )
-
         # Send object size
-        torch.distributed.send(
-            size_tensor, dst=self.ranks[dst], group=self.device_group
-        )
+        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
         # Send object
         torch.distributed.send(
-            object_tensor, dst=self.ranks[dst], group=self.device_group
+            object_tensor,
+            dst=self.ranks[dst],
+            group=self.device_group,
         )
 
         return None
@@ -904,13 +903,11 @@ class GroupCoordinator:
             src != self.rank_in_group
         ), "Invalid source rank. Source rank is the same as the current rank."
 
-        size_tensor = torch.empty(
-            1, dtype=torch.long, device=torch.cuda.current_device()
-        )
+        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
         rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.device_group
+            size_tensor, src=self.ranks[src], group=self.cpu_group
         )
 
         # Tensor to receive serialized objects into.
@@ -928,7 +925,7 @@ class GroupCoordinator:
             rank_object == rank_size
         ), "Received object sender rank does not match the size sender rank."
 
-        obj = pickle.loads(object_tensor.cpu().numpy().tobytes())
+        obj = pickle.loads(object_tensor.cpu().numpy())
 
         return obj
 
