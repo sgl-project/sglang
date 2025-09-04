@@ -6,8 +6,8 @@
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
-ARG BASE_IMAGE_942_ROCM700="rocm/sgl-dev:rocm7-vllm-20250821"
-ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250821"
+ARG BASE_IMAGE_942_ROCM700="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950

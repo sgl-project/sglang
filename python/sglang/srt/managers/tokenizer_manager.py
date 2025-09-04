@@ -329,6 +329,7 @@ class TokenizerManager:
         # Metrics
         if self.enable_metrics:
             self.metrics_collector = TokenizerMetricsCollector(
+                server_args=server_args,
                 labels={
                     "model_name": self.server_args.served_model_name,
                     # TODO: Add lora name/path in the future,
