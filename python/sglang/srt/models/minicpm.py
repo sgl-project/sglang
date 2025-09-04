@@ -420,7 +420,7 @@ class MiniCPMForCausalLM(nn.Module):
     
     #[MODIFIED: FOR EAGLE3 SUPPORT]
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        return self.model.embed_tokens.weight * self.config.scale_emb, self.lm_head.weight
 
     #[MODIFIED: FOR EAGLE3 SUPPORT]
     def set_embed_and_head(self, embed, head):
