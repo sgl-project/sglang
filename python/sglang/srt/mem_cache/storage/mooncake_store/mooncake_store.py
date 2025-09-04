@@ -168,9 +168,9 @@ class MooncakeStore(HiCacheStorage):
         target_locations: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
-        assert len(keys) == len(target_locations) == len(target_sizes)
         # Only support zero copy set for now
         assert target_locations is not None and target_sizes is not None
+        assert len(keys) == len(target_locations) == len(target_sizes)
 
         if len(keys) == 0:
             return False

@@ -76,7 +76,7 @@ First, create and save a configuration file in JSON format. For example:
     "metadata_server": "http://localhost:8080/metadata",
     "master_server_address": "localhost:50051",
     "protocol": "rdma",
-    "device_name": "erdma_0,erdma_1",
+    "device_name": "mlx5_0,mlx5_1",
     "global_segment_size": 2684354560,
     "local_buffer_size": 0
 }
@@ -107,7 +107,7 @@ Mooncake configuration can be provided via environment variables. Note that, for
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
 MOONCAKE_MASTER=127.0.0.1:50051 \
 MOONCAKE_PROTOCOL="rdma" \
-MOONCAKE_DEVICE="erdma_0,erdma_1" \
+MOONCAKE_DEVICE="mlx5_0,mlx5_1" \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
 python -m sglang.launch_server \
     --enable-hierarchical-cache \
@@ -145,7 +145,7 @@ First, start the `metadata service` and `master service`. Then run the `test_moo
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
 MOONCAKE_MASTER=127.0.0.1:50051 \
 MOONCAKE_PROTOCOL="rdma" \
-MOONCAKE_DEVICE="erdma_0,erdma_1" \
+MOONCAKE_DEVICE="mlx5_0,mlx5_1" \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=16777216 \
 python3 [path of test_mooncake_store.py]
 ```
