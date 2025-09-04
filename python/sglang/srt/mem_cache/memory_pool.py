@@ -83,7 +83,7 @@ class ReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, need_size: int, reqs: List["Req"]) -> List[int]:
+    def alloc(self, need_size: int) -> List[int]:
         if need_size > len(self.free_slots):
             return None
 
@@ -300,8 +300,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
-    def alloc(self, need_size: int, reqs: List["Req"]) -> Optional[List[int]]:
-        select_index = super().alloc(need_size, reqs)
+    def alloc(
+        self, need_size: int, reqs: Optional[List["Req"]] = None
+    ) -> Optional[List[int]]:
+        select_index = super().alloc(need_size)
         if select_index == None:
             return None
 
