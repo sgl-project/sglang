@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
     send_concurrent_generate_requests_with_custom_params,
 )
 
+
 class TestPriorityScheduling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -221,6 +222,7 @@ class TestPriorityScheduling(CustomTestCase):
 
         assert e2e_latencies[0] < e2e_latencies[1]
 
+
 class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -244,18 +246,18 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
-        
+
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
         _verify_max_running_requests_and_max_queued_request_validation(2, 3)
         cls.stdout.close()
         cls.stderr.close()
-        # os.remove(STDOUT_FILENAME)
-        # os.remove(STDERR_FILENAME)
+        os.remove(STDOUT_FILENAME)
+        os.remove(STDERR_FILENAME)
 
     def test_priority_scheduling_with_multiple_running_requests_preemption(self):
-        """Verify preempting a subset of running reuqests is safe."""
+        """Verify preempting a subset of running requests is safe."""
 
         responses = asyncio.run(
             send_concurrent_generate_requests_with_custom_params(
@@ -264,15 +266,15 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
                     {
                         "priority": 10,
                         "sampling_params": {"max_new_tokens": 10000},
-                    }, # finishs first
+                    },  # finishes first
                     {
                         "priority": 5,
                         "sampling_params": {"max_new_tokens": 10000},
-                    }, # preempted by fourth request, then finishes third
+                    },  # preempted by fourth request, then finishes third
                     {
                         "priority": 15,
                         "sampling_params": {"max_new_tokens": 10000},
-                    }, # preempt the first request
+                    },  # preempt the first request
                 ],
             )
         )
@@ -284,9 +286,8 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
             (200, None),
         ]
 
-        _verify_genereate_responses(
-            responses, expected_status_and_error_messages, []
-        )
+        _verify_genereate_responses(responses, expected_status_and_error_messages, [])
+
 
 def _verify_genereate_responses(
     responses: Tuple[int, Any, float],
@@ -317,7 +318,10 @@ def _verify_genereate_responses(
             got_json["meta_info"]["e2e_latency"] if got_status == 200 else None
         )
 
-def _verify_max_running_requests_and_max_queued_request_validation(max_running_requests: int, max_queued_requests: int):
+
+def _verify_max_running_requests_and_max_queued_request_validation(
+    max_running_requests: int, max_queued_requests: int
+):
     """Verify running request and queued request numbers based on server logs."""
     rr_pattern = re.compile(r"#running-req:\s*(\d+)")
     qr_pattern = re.compile(r"#queue-req:\s*(\d+)")

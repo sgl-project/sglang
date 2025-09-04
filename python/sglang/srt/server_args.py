@@ -160,6 +160,7 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
+    schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
@@ -1043,7 +1044,13 @@ class ServerArgs:
             "--enable-priority-scheduling",
             action="store_true",
             default=ServerArgs.enable_priority_scheduling,
-            help="Enable requests with higher priority values to be scheduled first.",
+            help="Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
+        )
+        parser.add_argument(
+            "--schedule-low-priority-values-first",
+            type=int,
+            default=ServerArgs.schedule_low_priority_values_first,
+            help="If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first.",
         )
         parser.add_argument(
             "--priority-scheduling-preemption-threshold",

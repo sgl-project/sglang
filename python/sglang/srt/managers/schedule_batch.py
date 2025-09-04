@@ -808,13 +808,6 @@ class Req:
             f"{self.sampling_params=})"
         )
 
-    def __lt__(self, other):
-        # Order based on priority and queue timestamp.
-        return self.priority < other.priority or (
-            self.priority == other.priority
-            and other.queue_time_start < self.queue_time_start
-        )
-
 
 # Batch id
 bid = 0
@@ -1492,7 +1485,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio
-    
+
     def unbudget_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
         seq_lens_cpu = self.seq_lens.cpu().numpy()

@@ -14,7 +14,6 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
-import heapq
 import logging
 import os
 import signal
@@ -228,7 +227,14 @@ class Scheduler(
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
-        self.priority_scheduling_preemption_threshold = server_args.priority_scheduling_preemption_threshold
+        logger.info(f"harrisonlim- debug")
+
+        self.schedule_low_priority_values_first = (
+            server_args.schedule_low_priority_values_first
+        )
+        self.priority_scheduling_preemption_threshold = (
+            server_args.priority_scheduling_preemption_threshold
+        )
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -462,6 +468,7 @@ class Scheduler(
             self.tree_cache,
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
+            self.schedule_low_priority_values_first,
         )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
@@ -1290,10 +1297,18 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
-            if self._abort_on_queued_limit(req, heapify=True):
+            reqs_with_p = [(req.rid, req.priority) for req in self.waiting_queue]
+            logger.info(
+                f"waiting_queue: {reqs_with_p} - incoming req: ({req.rid}, {req.priority})"
+            )
+            if self._abort_on_queued_limit(req):
+                logger.info(f"abort incoming req: ({req.rid}, {req.priority}")
                 return
             self._prefetch_kvcache(req)
-            self._add_to_waiting_queue(req)
+            logger.info(
+                f"adding incoming req to waiting queue: ({req.rid}, {req.priority}"
+            )
+            self.waiting_queue.append(req)
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
@@ -1317,29 +1332,47 @@ class Scheduler(
             # If this is a decode server, we put the request to the decode pending prealloc queue
             self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
         else:
-            if self.enable_priority_scheduling:
-                heapq.heapify(self.waiting_queue)
             for req in reqs:
                 if not self._abort_on_queued_limit(req):
-                    self._add_to_waiting_queue(req)
+                    self.waiting_queue.append(req)
 
-    def _abort_on_queued_limit(self, recv_req: Req, heapify=False) -> bool:
+    def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
         ):
             return False
-        
-        # TODO: Refactor to use a custom priority queue class that accepts scheduling policy.
-        if heapify:
-            heapq.heapify(self.waiting_queue)
 
         # Reject the incoming request by default.
-        req_to_abort, message = recv_req, "The request queue is full."
-        if self.enable_priority_scheduling and recv_req.priority > self.waiting_queue[0].priority:
-            # With priority scheduling, abort the existing request if it has a lower priority.
-            req_to_abort, message = heapq.heappop(self.waiting_queue),  "The request is aborted based on priority."
+        req_to_abort = recv_req
+        message = "The request queue is full."
+        if self.enable_priority_scheduling:
+            # With priority scheduling, consider aboritng an existing request based on the priority.
+            # Request with min priority is the last index item in the waiting queue after sorting.
+            abort_existing_req = False
+            if self.schedule_low_priority_values_first:
+                idx, min_priority_req = max(
+                    enumerate(self.waiting_queue),
+                    key=lambda item: (item[1].priority, item[1].queue_time_start),
+                )
+                abort_existing_req = recv_req.priority < min_priority_req.priority
+            else:
+                idx, min_priority_req = max(
+                    enumerate(self.waiting_queue),
+                    key=lambda item: (-item[1].priority, item[1].queue_time_start),
+                )
+                abort_existing_req = recv_req.priority > min_priority_req.priority
+            logger.info(
+                f"min request - ({min_priority_req.rid}, {min_priority_req.priority})"
+            )
+            if abort_existing_req:
+                logger.info(
+                    f"abort existing min request - ({min_priority_req.rid}, {min_priority_req.priority})"
+                )
+                self.waiting_queue.pop(idx)
+                req_to_abort = min_priority_req
+                message = "The request is aborted based on priority."
 
         self.send_to_tokenizer.send_pyobj(
             AbortReq(
@@ -1352,12 +1385,6 @@ class Scheduler(
             )
         )
         return req_to_abort.rid == recv_req.rid
-
-    def _add_to_waiting_queue(self, req: Req):
-        if self.enable_priority_scheduling:
-            heapq.heappush(self.waiting_queue, req)
-        else:
-            self.waiting_queue.append(req)
 
     def handle_embedding_request(
         self,
@@ -1625,7 +1652,11 @@ class Scheduler(
         # as the space for the chunked request has just been released.
         # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
-        if self.get_num_allocatable_reqs(running_bs) <= 0 and not self.chunked_req and not self.try_preemption:
+        if (
+            self.get_num_allocatable_reqs(running_bs) <= 0
+            and not self.chunked_req
+            and not self.try_preemption
+        ):
             self.running_batch.batch_is_full = True
             return None
 
