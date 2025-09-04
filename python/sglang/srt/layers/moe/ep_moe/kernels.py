@@ -164,12 +164,9 @@ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     return reorder_topk_ids, src2dst, seg_indptr
 
 
-def run_cutlass_moe_ep_preproess(local_topk_ids: torch.Tensor, local_num_experts: int):
-    reorder_topk_ids, reorder_ids = torch.sort(local_topk_ids.view(-1), stable=True)
+def run_cutlass_moe_ep_preproess(local_topk_ids: torch.Tensor):
+    _, reorder_ids = torch.sort(local_topk_ids.view(-1), stable=True)
 
-    seg_indptr = torch.zeros(
-        local_num_experts + 1, device=local_topk_ids.device, dtype=torch.int64
-    )
     src2dst = torch.empty(
         local_topk_ids.numel(), device=local_topk_ids.device, dtype=torch.int32
     )
@@ -180,7 +177,7 @@ def run_cutlass_moe_ep_preproess(local_topk_ids: torch.Tensor, local_num_experts
         reorder_ids, src2dst, local_topk_ids.numel(), BLOCK_SIZE
     )
 
-    return reorder_topk_ids, src2dst, seg_indptr
+    return src2dst
 
 
 @triton.jit

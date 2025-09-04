@@ -107,10 +107,7 @@ def cutlass_w4a8_moe(
 
     device = a.device
 
-    _, src2dst, _ = run_cutlass_moe_ep_preproess(
-        local_topk_ids,
-        num_experts,
-    )
+    src2dst = run_cutlass_moe_ep_preproess(local_topk_ids)
 
     gateup_input = torch.empty(
         (m * topk, k),
@@ -148,7 +145,7 @@ def cutlass_w4a8_moe(
     )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
-    c2 = torch.zeros((m * topk, k), device=device, dtype=torch.half)
+    c2 = torch.empty((m * topk, k), device=device, dtype=torch.half)
 
     cutlass_w4a8_moe_mm(
         c1,
@@ -197,7 +194,7 @@ def cutlass_w4a8_moe(
         src2dst,
         local_topk_ids,
         topk_weights,
-        num_experts,
+        total_num_experts,
         topk,
         k,
         0,
