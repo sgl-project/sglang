@@ -37,7 +37,7 @@ void copy_to_gpu_no_ce_impl(const at::Tensor& input, at::Tensor& output) {
   for (int i = 0; i < N; ++i)
     input_array.values[i] = input_ptr[i];
 
-  // TODO may use multi thread blocks?
+  // may use multi thread blocks if performance bottleneck
   dim3 grid(1);
   dim3 block(static_cast<int>(input.numel()));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
