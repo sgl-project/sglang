@@ -1108,7 +1108,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and topk_config.topk_group is not None
         ), "Current trtllm_fp8_block_scale_moe kernel does not support these two arguments as None"
 
-        if topk_config.correction_bias is None:
+        if topk_config.correction_bias is not None:
             correction_bias = topk_config.correction_bias.to(x.dtype)
         else:
             correction_bias = None
