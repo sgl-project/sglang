@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_int_env_var,
+    is_cpu,
     is_cuda_alike,
     is_hip,
     is_npu,
@@ -51,6 +52,7 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 IS_ONE_DEVICE_PER_PROCESS = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
 
@@ -877,17 +879,16 @@ class GroupCoordinator:
         size_tensor = torch.tensor(
             [object_tensor.numel()],
             dtype=torch.long,
-            device=torch.cuda.current_device(),
+            device="cpu",
         )
-
         # Send object size
-        torch.distributed.send(
-            size_tensor, dst=self.ranks[dst], group=self.device_group
-        )
+        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
         # Send object
         torch.distributed.send(
-            object_tensor, dst=self.ranks[dst], group=self.device_group
+            object_tensor,
+            dst=self.ranks[dst],
+            group=self.device_group,
         )
 
         return None
@@ -902,13 +903,11 @@ class GroupCoordinator:
             src != self.rank_in_group
         ), "Invalid source rank. Source rank is the same as the current rank."
 
-        size_tensor = torch.empty(
-            1, dtype=torch.long, device=torch.cuda.current_device()
-        )
+        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
         rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.device_group
+            size_tensor, src=self.ranks[src], group=self.cpu_group
         )
 
         # Tensor to receive serialized objects into.
@@ -926,7 +925,7 @@ class GroupCoordinator:
             rank_object == rank_size
         ), "Received object sender rank does not match the size sender rank."
 
-        obj = pickle.loads(object_tensor.cpu().numpy().tobytes())
+        obj = pickle.loads(object_tensor.cpu().numpy())
 
         return obj
 
@@ -1643,7 +1642,7 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
 
         ray.shutdown()
     gc.collect()
-    if not current_platform.is_cpu():
+    if not _is_cpu:
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
             if hasattr(torch._C, "_host_emptyCache"):
