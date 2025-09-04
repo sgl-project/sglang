@@ -187,7 +187,7 @@ async def health_check():
 
 
 @app.get("/health_generate")
-async def health_check():
+async def health_generate():
     prefill_servers, decode_servers = (
         load_balancer.prefill_servers,
         load_balancer.decode_servers,
