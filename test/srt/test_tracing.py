@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 import requests
 import zmq
 
+from sglang import Engine
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.tracing.trace import *
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
@@ -105,6 +106,35 @@ class TestTrace(CustomTestCase):
 
         finally:
             kill_process_tree(process.pid)
+            assert self.__stop_otel_jaeger()
+
+    def test_trace_engine_enable(self):
+        self.__clear_trace_file()
+        assert self.__launch_otel_jaeger()
+
+        prompt = "Today is a sunny day and I like"
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+
+        sampling_params = {"temperature": 0, "max_new_tokens": 8}
+
+        engine = Engine(
+            model_path=model_path,
+            random_seed=42,
+            enable_trace=True,
+            otel_endpoint="localhost:4317",
+        )
+
+        try:
+            engine.generate(prompt, sampling_params)
+
+            # sleep for a few seconds to wait for opentelemetry collector to asynchronously export data to file.
+            time.sleep(10)
+
+            # check trace file
+            assert os.path.isfile("/tmp/otel_trace.json"), "trace file not exist"
+            assert os.path.getsize("/tmp/otel_trace.json") > 0, "trace file is empty"
+        finally:
+            engine.shutdown()
             assert self.__stop_otel_jaeger()
 
     def test_slice_trace_simple(self):
