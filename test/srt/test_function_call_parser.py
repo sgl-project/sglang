@@ -11,7 +11,9 @@ from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
-from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+
+# from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.qwen3_coder_new_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -1744,7 +1746,6 @@ fahrenheit
                         tool_calls_by_index[call.tool_index][
                             "parameters"
                         ] += call.parameters
-
         self.assertEqual(accumulated_text, "Sure! Let me check the weather.")
         self.assertEqual(len(tool_calls_by_index), 1)
 
