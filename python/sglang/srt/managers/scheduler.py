@@ -1897,83 +1897,75 @@ class Scheduler(
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
         )
 
+    def gather_dp_balance_info(
+        self, holding_tokens_list
+    ) -> Union[None, List[List[int]]]:
+        """gather recv_dp_balance_id_this_term and holding tokens per worker for dp balance"""
+        recv_list = self.recv_dp_balance_id_this_term
+        assert len(recv_list) <= 511, (
+            "The number of requests received this round is too large. "
+            "Please increase gather_tensor_size and onfly_info_size."
+        )
+        # The maximum size of the tensor used for gathering data from all workers.
+        gather_tensor_size = 512
+
+        # recv_tensor: | holding_tokens | len(recv_dp_balance_id) | recv_dp_balance_ids
+        recv_tensor = torch.zeros(gather_tensor_size, dtype=torch.int32)
+        recv_tensor[0] = holding_tokens_list
+        recv_tensor[1] = len(recv_list)  # The first element is the length of the list.
+        recv_tensor[2 : len(recv_list) + 2] = torch.tensor(recv_list, dtype=torch.int32)
+
+        if self.tp_rank == 0:
+            gathered_list = [
+                torch.zeros(gather_tensor_size, dtype=torch.int32)
+                for _ in range(self.balance_meta.num_workers)
+            ]
+        else:
+            gathered_list = None
+
+        torch.distributed.gather(recv_tensor, gathered_list, group=self.tp_cpu_group)
+
+        gathered_id_list_per_worker = None
+        if self.tp_rank == 0:
+            gathered_id_list_per_worker = []
+            holding_tokens_list = []
+            for tensor in gathered_list:
+                holding_tokens_list.append(tensor[0].item())
+                list_length = tensor[1].item()
+                gathered_id_list_per_worker.append(tensor[2 : list_length + 2].tolist())
+
+        return gathered_id_list_per_worker, holding_tokens_list
+
+    def write_shared_dp_balance_info(self, new_recv_rid_lists, local_tokens):
+        meta = self.balance_meta
+
+        with meta.mutex:
+            onfly_list: List[Dict[int, int]] = meta.get_shared_onfly()
+            assert len(new_recv_rid_lists) == len(onfly_list), "num_worker not equal"
+            # 1.Check if the rid received by each worker this round is present in onfly.
+            #   If it is, remove the corresponding onfly item.
+            worker_id = 0
+            for new_recv_rids, on_fly_reqs in zip(new_recv_rid_lists, onfly_list):
+                for new_recv_rid in new_recv_rids:
+                    assert (
+                        new_recv_rid in on_fly_reqs
+                    ), f"{new_recv_rid=} not in {worker_id=} {on_fly_reqs=}, data consistency is wrong"
+                    del on_fly_reqs[new_recv_rid]
+                worker_id += 1
+            # 2. Atomically write local_tokens and onfly into shm under the mutex
+            meta.set_shared_onfly_info(onfly_list)
+            meta.set_shared_local_tokens(local_tokens)
+
     def handle_dp_balance_data(self, local_batch: ScheduleBatch):
-        def gather_dp_balance_info(holding_tokens_list) -> Union[None, List[List[int]]]:
-            """gather recv_dp_balance_id_this_term and holding tokens per worker for dp balance"""
-            recv_list = self.recv_dp_balance_id_this_term
-            assert len(recv_list) <= 511, (
-                "The number of requests received this round is too large. "
-                "Please increase gather_tensor_size and onfly_info_size."
-            )
-            # The maximum size of the tensor used for gathering data from all workers.
-            gather_tensor_size = 512
-
-            # recv_tensor: | holding_tokens | len(recv_dp_balance_id) | recv_dp_balance_ids
-            recv_tensor = torch.zeros(gather_tensor_size, dtype=torch.int32)
-            recv_tensor[0] = holding_tokens_list
-            recv_tensor[1] = len(
-                recv_list
-            )  # The first element is the length of the list.
-            recv_tensor[2 : len(recv_list) + 2] = torch.tensor(
-                recv_list, dtype=torch.int32
-            )
-
-            if self.tp_rank == 0:
-                gathered_list = [
-                    torch.zeros(gather_tensor_size, dtype=torch.int32)
-                    for _ in range(self.balance_meta.num_workers)
-                ]
-            else:
-                gathered_list = None
-
-            torch.distributed.gather(
-                recv_tensor, gathered_list, group=self.tp_cpu_group
-            )
-
-            gathered_id_list_per_worker = None
-            if self.tp_rank == 0:
-                gathered_id_list_per_worker = []
-                holding_tokens_list = []
-                for tensor in gathered_list:
-                    holding_tokens_list.append(tensor[0].item())
-                    list_length = tensor[1].item()
-                    gathered_id_list_per_worker.append(
-                        tensor[2 : list_length + 2].tolist()
-                    )
-
-            return gathered_id_list_per_worker, holding_tokens_list
-
-        def write_shared_dp_balance_info(new_recv_rid_lists, local_tokens):
-            meta = self.balance_meta
-
-            with meta.mutex:
-                onfly_list: List[Dict[int, int]] = meta.get_shared_onfly()
-                assert len(new_recv_rid_lists) == len(
-                    onfly_list
-                ), "num_worker not equal"
-                # 1.Check if the rid received by each worker this round is present in onfly.
-                #   If it is, remove the corresponding onfly item.
-                worker_id = 0
-                for new_recv_rids, on_fly_reqs in zip(new_recv_rid_lists, onfly_list):
-                    for new_recv_rid in new_recv_rids:
-                        assert (
-                            new_recv_rid in on_fly_reqs
-                        ), f"{new_recv_rid=} not in {worker_id=} {on_fly_reqs=}, data consistency is wrong"
-                        del on_fly_reqs[new_recv_rid]
-                    worker_id += 1
-                # 2. Atomically write local_tokens and onfly into shm under the mutex
-                meta.set_shared_onfly_info(onfly_list)
-                meta.set_shared_local_tokens(local_tokens)
-
         holding_tokens = self.get_load()
 
-        new_recv_dp_balance_id_list, holding_token_list = gather_dp_balance_info(
+        new_recv_dp_balance_id_list, holding_token_list = self.gather_dp_balance_info(
             holding_tokens
         )
 
         self.recv_dp_balance_id_this_term.clear()
         if self.tp_rank == 0:  # only first worker write info
-            write_shared_dp_balance_info(
+            self.write_shared_dp_balance_info(
                 new_recv_dp_balance_id_list, holding_token_list
             )
 
