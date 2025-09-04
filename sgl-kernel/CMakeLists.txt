@@ -188,7 +188,6 @@ endif()
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_80,code=sm_80"
-        "-gencode=arch=compute_87,code=sm_87"
         "-gencode=arch=compute_89,code=sm_89"
     )
 endif()
