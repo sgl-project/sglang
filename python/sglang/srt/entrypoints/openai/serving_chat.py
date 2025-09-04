@@ -735,7 +735,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.tool_choice != "none" and request.tools:
                 tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
                 tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, tool_call_parser, finish_reason
+                    text, request.tools, tool_call_parser, finish_reason, request.tool_choice
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -831,8 +831,47 @@ class OpenAIServingChat(OpenAIServingBase):
         tools: List[Any],
         tool_call_parser: Optional[str],
         finish_reason: Dict[str, Any],
+        tool_choice: Optional[Union[str, Any]] = None,
     ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
         """Process tool calls in the response"""
+        if tool_choice == "required":
+            try:
+                tool_call_data = json.loads(text)
+                tool_calls = []
+                for i, call_info in enumerate(tool_call_data):
+                    tool_id = f"call_{uuid.uuid4().hex[:24]}"
+                    tool_calls.append(
+                        ToolCall(
+                            id=tool_id,
+                            index=i,
+                            function=FunctionResponse(
+                                name=call_info['name'], 
+                                arguments=json.dumps(call_info['parameters'], ensure_ascii=False)
+                            ),
+                        )
+                    )
+                return tool_calls, "", finish_reason
+            except Exception as e:
+                logger.error(f"Tool call parsing error: {e}")
+                return None, text, finish_reason
+        
+        if isinstance(tool_choice, dict) and "function" in tool_choice:
+            try:
+                tool_id = f"call_{uuid.uuid4().hex[:24]}"
+                tool_calls = [
+                    ToolCall(
+                        id=tool_id,
+                        index=0,
+                        function=FunctionResponse(
+                            name=tool_choice["function"]["name"],
+                            arguments=text,
+                        ),
+                    )
+                ]
+                return tool_calls, "", finish_reason
+            except Exception as e:
+                logger.error(f"Tool call parsing error: {e}")
+                return None, text, finish_reason
         parser = FunctionCallParser(tools, tool_call_parser)
         if parser.has_tool_call(text):
             if finish_reason["type"] == "stop":
