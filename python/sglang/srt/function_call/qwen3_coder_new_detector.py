@@ -37,40 +37,40 @@ def _safe_val(raw: str) -> Any:
 
 class StreamingXMLToolCallParser:
     """
-    核心流式解析器，负责处理XML格式的工具调用
+    Core streaming parser responsible for handling XML format tool calls
 
 
-    ## 主要状态变量：
-    - current_call_id: 当前工具调用的唯一标识
-    - current_function_name: 当前函数名
-    - parameters: 存储已解析的参数
-    - current_param_name: 当前参数名
-    - current_param_value: 当前参数值
-    - tool_call_index: 工具调用索引计数器
-    - streaming_buffer: 流式处理缓冲区
-    - text_content_buffer: 文本内容缓冲区
+    ## Main state variables:
+    - current_call_id: unique identifier for the current tool call
+    - current_function_name: current function name
+    - parameters: stores parsed parameters
+    - current_param_name: current parameter name
+    - current_param_value: current parameter value
+    - tool_call_index: tool call index counter
+    - streaming_buffer: streaming processing buffer
+    - text_content_buffer: text content buffer
 
-    ## 处理流程：
-    a. 初始化状态：设置初始状态变量和XML解析器
-    b. 流式输入处理：通过parse_single_streaming_chunks接收数据块
-    c. XML元素识别：使用_find_next_complete_element识别完整XML元素
-    d. XML解析：使用expat解析器处理XML元素，触发_start_element、_char_data、_end_element回调
-    e. 状态转移：根据XML元素类型更新状态变量
-    f. Delta生成：在适当时候生成DeltaMessage并发送
+    ## Processing flow:
+    a. State initialization: set initial state variables and XML parser
+    b. Streaming input processing: receive data chunks through parse_single_streaming_chunks
+    c. XML element identification: use _find_next_complete_element to identify complete XML elements
+    d. XML parsing: use expat parser to process XML elements, triggering _start_element, _char_data, _end_element callbacks
+    e. State transition: update state variables based on XML element types
+    f. Delta generation: generate DeltaMessage at appropriate times and send
 
-    4. 状态转移过程：
-    a. 开始解析：<tool_call>标签重置工具调用状态
-    b. 函数识别：<function>标签提取函数名并生成初始工具调用Delta
-    c. 参数处理：<parameter>标签开始参数解析，_char_data处理参数值
-    d. 参数结束：根据参数类型决定是否添加引号，存储转换后的值
-    e. 函数结束：关闭JSON对象，输出完整的函数调用
-    f. 工具调用结束：<tool_call>标签结束当前工具调用，重置解析器状态
+    4. State transition process:
+    a. Start parsing: <tool_call> tag resets tool call state
+    b. Function identification: <function> tag extracts function name and generates initial tool call Delta
+    c. Parameter processing: <parameter> tag starts parameter parsing, _char_data processes parameter values
+    d. Parameter end: decide whether to add quotes based on parameter type, store converted value
+    e. Function end: close JSON object, output complete function call
+    f. Tool call end: </tool_call> tag ends current tool call, reset parser state
 
-    5. 特殊处理：
-    - XML特殊字符转义与反转义
-    - 参数类型转换（字符串、数字、布尔值等）
-    - 流式输出延迟处理，确保JSON格式正确
-    - 多个tool_call的处理与状态隔离
+    5. Special handling:
+    - XML special character escaping and unescaping
+    - Parameter type conversion (string, number, boolean, etc.)
+    - Streaming output delay processing to ensure correct JSON format
+    - Multiple tool_call handling and state isolation
 
     """
 
@@ -78,32 +78,36 @@ class StreamingXMLToolCallParser:
         self.call_id_counter = 0
         self.tool_call_index = 0
         self.current_call_id = None
-        self.last_completed_call_id = None  # 保存最近完成的call_id
+        self.last_completed_call_id = None  # Save the most recently completed call_id
         self.current_function_name = None
         self.current_function_open = False
         self.parameters = {}
         self.current_param_name = None
         self.current_param_value = ""
-        self.current_param_value_converted = ""  # 记录类型转换后的参数值
-        self.current_param_is_first = False  # 记录是否是第一个参数
-        # 这里需要延迟输出，因为参数的末尾会包含一个额外需要去除的换行符，但是中间的换行符需要保留
-        self.should_emit_end_newline = False  # 记录是否需要输出末尾换行符
-        self.start_quote_emitted = False  # 记录是否已经输出了字符串参数的开始引号
+        self.current_param_value_converted = (
+            ""  # Record parameter value after type conversion
+        )
+        self.current_param_is_first = (
+            False  # Record whether this is the first parameter
+        )
+        # Need to delay output here because parameter end will contain an extra newline that needs to be removed, but intermediate newlines need to be preserved
+        self.should_emit_end_newline = False  # Record whether to output ending newline
+        self.start_quote_emitted = False  # Record whether the starting quote for string parameter has been output
 
         self.deltas = []
 
-        # 单块流式处理状态
+        # Single chunk streaming processing state
         self.streaming_buffer = ""
         self.last_processed_pos = 0
 
-        # 用于收集tool_call前面的文本内容
+        # Used to collect text content before tool_call
         self.text_content_buffer = ""
 
-        # XML解析器相关
+        # XML parser related
         self.parser = ParserCreate()
         self.setup_parser()
 
-        # 工具配置信息
+        # Tool configuration information
         self.tools = []
 
         self.tool_call_start_token: str = "<tool_call>"
@@ -114,11 +118,11 @@ class StreamingXMLToolCallParser:
         self.parameter_end_token: str = "</parameter>"
 
     def set_tools(self, tools: List[Tool]):
-        """设置工具配置信息"""
+        """Set tool configuration information"""
         self.tools = tools
 
     def _get_param_type(self, param_name: str) -> str:
-        """根据tool配置获取参数类型，默认为string"""
+        """Get parameter type based on tool configuration, default to string"""
         if not self.tools or not self.current_function_name:
             return "string"
 
@@ -148,8 +152,8 @@ class StreamingXMLToolCallParser:
         return "string"
 
     def _convert_param_value(self, param_value: str, param_type: str) -> Any:
-        """根据参数类型转换值"""
-        # 特殊的case：比如模型为bool 值输出True/False，需要json.dumps转为true/false
+        """Convert value based on parameter type"""
+        # Special case: for example, model outputs True/False for bool value, need json.dumps to convert to true/false
         # Handle null value for any type
         if param_value.lower() == "null":
             return None
@@ -187,33 +191,33 @@ class StreamingXMLToolCallParser:
             return param_value
 
     def _convert_for_json_streaming(self, converted_value: Any, param_type: str) -> str:
-        """根据converted_value是否为空以及type是否为string，来对convert_value进行转换
+        """Convert convert_value based on whether converted_value is empty and whether type is string
 
         Args:
-            converted_value: 转换后的值
-            param_type: 参数类型
+            converted_value: converted value
+            param_type: parameter type
 
         Returns:
-            转换后的字符串，用于流式输出
+            converted string for streaming output
         """
-        # 检查是否为空值，但排除数字0
+        # Check if it's an empty value, but exclude the number 0
         if converted_value is None or converted_value == "":
             return ""
 
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
             # strip space and \n
             converted_value = converted_value.strip()
-            # 字符串类型，去掉双引号
+            # String type, remove double quotes
             return json.dumps(converted_value, ensure_ascii=False)[1:-1]
         else:
-            # 非字符串类型，返回完整的JSON字符串
+            # Non-string type, return complete JSON string
             if not isinstance(converted_value, str):
                 return json.dumps(converted_value, ensure_ascii=False)
             else:
                 return converted_value
 
     def reset_streaming_state(self):
-        """重置流式解析状态"""
+        """Reset streaming parsing state"""
         self.call_id_counter = 0
         self.tool_call_index = 0
         self.current_call_id = None
@@ -228,55 +232,55 @@ class StreamingXMLToolCallParser:
         self.should_emit_end_newline = False
         self.start_quote_emitted = False
 
-        # 重置单块流式处理状态
+        # Reset single chunk streaming processing state
         self.streaming_buffer = ""
         self.last_processed_pos = 0
 
-        # 重置文本内容缓冲区
+        # Reset text content buffer
         self.text_content_buffer = ""
 
         self.deltas = []
 
-        # 重新创建解析器
+        # Recreate parser
         self.parser = ParserCreate()
         self.setup_parser()
 
     def parse_single_streaming_chunks(self, xml_chunk: str) -> DeltaMessage:
         """
-        解析单个流式XML块并返回Delta响应
-        这是真正的流式接口，逐个接收chunk，维护内部状态
+        Parse single streaming XML chunk and return Delta response
+        This is the real streaming interface that receives chunks one by one and maintains internal state
 
         Args:
-            xml_chunk: 单个XML块字符串
+            xml_chunk: single XML chunk string
 
         Returns:
-            DeltaMessage: 包含此块生成的delta信息，如果没有完整元素则返回空响应
+            DeltaMessage: contains delta information generated by this chunk, returns empty response if no complete elements
         """
-        # 记录处理前的delta数量
+        # Record the number of deltas before processing
         initial_delta_count = len(self.deltas)
 
-        # 将新chunk添加到缓冲区
+        # Add new chunk to buffer
         self.streaming_buffer += xml_chunk
 
-        # 处理完整的XML元素
-        # 记录进入处理前的 call_id，用于多 tool_call 场景下的兜底保护
+        # Process complete XML elements
+        # Record call_id before entering processing for fallback protection in multi tool_call scenarios
         snapshot_call_id = self.current_call_id
         found_elements = self._process_complete_xml_elements()
 
         if found_elements:
-            # 如果找到了完整元素，检查是否遗漏了结束事件（可能存在部分标签未被触发）
+            # If complete elements are found, check if end events are missed (some partial tags might not be triggered)
             try:
                 new_deltas = self.deltas[initial_delta_count:]
-                # 若本chunk包含 </function> 但未生成 '}'，则补齐
-                # 仅当当前仍在同一个 call 上时才进行兜底，避免跨多次 <tool_call> 误关新开启的调用
+                # If this chunk contains </function> but didn't generate '}', complete it
+                # Only perform fallback when still on the same call to avoid closing newly opened calls across multiple <tool_call>s
                 if (
                     self.current_call_id is not None
                     and self.current_call_id == snapshot_call_id
                     and self.function_end_token in xml_chunk
                 ):
 
-                    # - 追加了 '}'（非空参数收尾）
-                    # - 追加了 '{}'（空参数函数）
+                    # - Appended '}' (non-empty parameter ending)
+                    # - Appended '{}' (empty parameter function)
                     has_function_close = any(
                         (
                             td.tool_calls
@@ -293,14 +297,14 @@ class StreamingXMLToolCallParser:
                         for td in new_deltas
                     )
                     if not has_function_close:
-                        # 关闭可能未闭合的参数
+                        # Close possibly unclosed parameters
                         if self.current_param_name:
                             self._end_element("parameter")
-                        # 补一个函数结束
+                        # Complete a function end
                         if self.current_function_name:
                             self._end_element("function")
-                # 若本chunk包含 </tool_call> 但未生成最终空delta，则补齐
-                # 同样仅当仍在同一调用上时兜底，避免关闭刚开启的下一个调用
+                # If this chunk contains </tool_call> but didn't generate final empty delta, complete it
+                # Similarly, only fallback when still on the same call to avoid closing just opened next call
                 if (
                     self.current_call_id is not None
                     and self.current_call_id == snapshot_call_id
@@ -322,7 +326,7 @@ class StreamingXMLToolCallParser:
                         for td in new_deltas
                     )
                     if not has_toolcall_close:
-                        # 关闭可能未闭合的参数
+                        # Close possibly unclosed parameters
                         if self.current_param_name:
                             self._end_element("parameter")
                         if self.current_function_name:
@@ -330,12 +334,12 @@ class StreamingXMLToolCallParser:
                         self._end_element("tool_call")
             except Exception:
                 pass
-            # 合并这次新生成的deltas为单个响应
+            # Merge newly generated deltas into a single response
             return self._merge_new_deltas_to_single_response(initial_delta_count)
         else:
-            # 没有完整元素，检查是否有未输出的文本内容
+            # No complete elements, check if there's unoutput text content
             if self.text_content_buffer and self.tool_call_index == 0:
-                # 有文本内容但还没有tool_call，输出文本内容
+                # Have text content but no tool_call yet, output text content
                 text_delta = DeltaMessage(
                     role=None,
                     content=self.text_content_buffer,
@@ -343,12 +347,12 @@ class StreamingXMLToolCallParser:
                     tool_calls=[],
                 )
                 self._emit_delta(text_delta)
-                # 清空缓冲区，避免重复输出
+                # Clear buffer to avoid duplicate output
                 self.text_content_buffer = ""
                 return text_delta
 
-            # 若本次chunk中包含结束标签但未被解析器触发，手动补齐结束事件
-            # 仅当仍处于与进入时相同的 call 上时才执行，防止在多 <tool_call> 场景误关新调用
+            # If this chunk contains end tags but wasn't triggered by parser, manually complete end events
+            # Only execute when still on the same call as when entered, prevent closing new calls in multi <tool_call> scenarios
             if (
                 self.current_call_id is not None
                 and self.current_call_id == snapshot_call_id
@@ -357,34 +361,34 @@ class StreamingXMLToolCallParser:
                     or self.tool_call_end_token in xml_chunk
                 )
             ):
-                # 若仍有未闭合参数，先关闭
+                # If there are still unclosed parameters, close them first
                 if self.current_param_name:
                     self._end_element("parameter")
-                # 若包含 </function>，尝试关闭函数
+                # If contains </function>, try to close function
                 if self.function_end_token in xml_chunk and self.current_function_name:
                     self._end_element("function")
-                # 若包含 </tool_call>，尝试关闭工具调用
+                # If contains </tool_call>, try to close tool call
                 if self.tool_call_end_token in xml_chunk:
                     self._end_element("tool_call")
-                # 返回这次兜底所生成的delta合并结果
+                # Return the delta merge result generated by this fallback
                 return self._merge_new_deltas_to_single_response(initial_delta_count)
 
-            # 没有完整元素，返回空响应
+            # No complete elements, return empty response
             return DeltaMessage(
                 role=None, content=None, reasoning_content=None, tool_calls=[]
             )
 
     def _escape_xml_special_chars(self, text: str) -> str:
         """
-        转义XML特殊字符
+        Escape XML special characters
 
         Args:
-            text: 原始文本
+            text: original text
 
         Returns:
-            转义后的文本
+            escaped text
         """
-        # XML特殊字符转义映射
+        # XML special character escape mapping
         xml_escapes = {
             "&": "&amp;",
             "<": "&lt;",
@@ -400,15 +404,15 @@ class StreamingXMLToolCallParser:
 
     def _unescape_xml_special_chars(self, text: str) -> str:
         """
-        反转义XML特殊字符
+        Unescape XML special characters
 
         Args:
-            text: 转义后的文本
+            text: escaped text
 
         Returns:
-            原始文本
+            original text
         """
-        # XML特殊字符反转义映射
+        # XML special character unescape mapping
         xml_unescapes = {
             "&amp;": "&",
             "&lt;": "<",
@@ -424,36 +428,36 @@ class StreamingXMLToolCallParser:
 
     def _process_complete_xml_elements(self) -> bool:
         """
-        处理缓冲区中的完整XML元素
+        Process complete XML elements in the buffer
 
         Returns:
-            bool: 是否找到并处理了完整的元素
+            bool: whether complete elements were found and processed
         """
         found_any = False
 
         while self.last_processed_pos < len(self.streaming_buffer):
-            # 查找下一个完整元素
+            # Find next complete element
             element, end_pos = self._find_next_complete_element(self.last_processed_pos)
             if element is None:
-                # 没有找到完整元素，等待更多数据
+                # No complete element found, wait for more data
                 break
 
-            # 检查是否应该跳过这个元素
+            # Check if this element should be skipped
             if self._should_skip_element(element):
-                # print(f"跳过非XML文本: {repr(element)}")
+                # print(f"Skip non-XML text: {repr(element)}")
                 self.last_processed_pos = end_pos
                 continue
 
-            # 找到完整的XML元素，处理它
+            # Found complete XML element, process it
             try:
-                # 预处理XML块
+                # Preprocess XML chunk
                 preprocessed_element = self._preprocess_xml_chunk(element)
-                # 检查是否是第一个tool_call开始
+                # Check if this is the first tool_call start
                 if (
                     preprocessed_element.strip().startswith("<tool_call>")
                     and self.tool_call_index == 0
                 ):
-                    # 第一个tool_call开始，先输出之前收集的文本内容
+                    # First tool_call starts, output previously collected text content first
                     if self.text_content_buffer:
                         text_delta = DeltaMessage(
                             role=None,
@@ -462,19 +466,19 @@ class StreamingXMLToolCallParser:
                             tool_calls=[],
                         )
                         self._emit_delta(text_delta)
-                        # 清空缓冲区，为后续可能的文本内容做准备
+                        # Clear buffer for potential subsequent text content
                         self.text_content_buffer = ""
 
-                # 检查是否是新的tool_call开始且当前已有完成的tool_call
+                # Check if this is a new tool_call start and there's already a completed tool_call
                 if (
                     preprocessed_element.strip().startswith("<tool_call>")
                     and self.tool_call_index > 0
                 ):
-                    # 新的tool_call开始，重置解析器状态但保留已生成的deltas
+                    # New tool_call starts, reset parser state but keep generated deltas
                     # print(f"reset parser for new tool call")
                     self._reset_parser_for_new_tool_call()
 
-                # 解析预处理后的元素
+                # Parse preprocessed element
                 self.parser.Parse(preprocessed_element, False)
                 found_any = True
 
@@ -482,25 +486,25 @@ class StreamingXMLToolCallParser:
                 print(f"exception occurs: {e}, preprocessed_element: {repr(element)}")
                 pass
 
-            # 更新已处理位置
+            # Update processed position
             self.last_processed_pos = end_pos
 
         return found_any
 
     def _reset_parser_for_new_tool_call(self):
         """
-        为新的tool_call重置解析器状态（但保留已生成的deltas）
+        Reset parser state for new tool_call (but keep generated deltas)
         """
-        # 在开始新的 tool_call 之前，若上一调用仍未正常闭合，则主动补齐：
-        # 1) 关闭未结束的 parameter -> 等价于解析 </parameter>
-        # 2) 关闭未结束的 function -> 触发输出 '}' 或 '{}'
-        # 3) 输出最终空的 tool_call delta，并重置解析器状态
+        # Before starting new tool_call, if previous call is still not properly closed, actively complete it:
+        # 1) Close unfinished parameter -> equivalent to parsing </parameter>
+        # 2) Close unfinished function -> trigger output '}' or '{}'
+        # 3) Output final empty tool_call delta and reset parser state
         if self.current_call_id:
             if self.current_param_name:
                 self._end_element("parameter")
             if self.current_function_open or self.current_function_name:
                 self._end_element("function")
-            # 输出最终的 tool_call 收尾 delta（与 _end_element('tool_call') 中一致）
+            # Output final tool_call ending delta (consistent with _end_element('tool_call'))
             final_delta = DeltaMessage(
                 role=None,
                 content=None,
@@ -515,14 +519,14 @@ class StreamingXMLToolCallParser:
                 ],
             )
             self._emit_delta(final_delta)
-            # 重置 XML 解析器与当前调用状态
+            # Reset XML parser and current call state
             self._reset_xml_parser_after_tool_call()
 
-        # 保存当前的deltas和tool_call_index（包含上一步补齐产生的deltas）
+        # Save current deltas and tool_call_index (including deltas generated by the above completion)
         current_deltas = self.deltas.copy()
         current_tool_call_index = self.tool_call_index
 
-        # 检查是否有文本内容需要输出（在tool_call之间）
+        # Check if there's text content that needs to be output (between tool_calls)
         if self.text_content_buffer.strip():
             text_delta = DeltaMessage(
                 role=None,
@@ -532,8 +536,8 @@ class StreamingXMLToolCallParser:
             )
             current_deltas.append(text_delta)
 
-        # 重置解析器状态
-        # 保存当前call_id到last_completed_call_id，然后重置current_call_id
+        # Reset parser state
+        # Save current call_id to last_completed_call_id, then reset current_call_id
         if self.current_call_id:
             self.last_completed_call_id = self.current_call_id
         self.current_call_id = None
@@ -545,45 +549,45 @@ class StreamingXMLToolCallParser:
         self.current_param_is_first = False
         self.start_quote_emitted = False
 
-        # 重置文本内容状态，为下一个tool_call做准备
+        # Reset text content state for next tool_call
         self.text_content_buffer = ""
 
-        # 创建新的解析器实例
+        # Create new parser instance
         self.parser = ParserCreate()
         self.setup_parser()
 
-        # 恢复已生成的deltas和tool_call_index
+        # Restore generated deltas and tool_call_index
         self.deltas = current_deltas
         self.tool_call_index = current_tool_call_index
 
     def _should_skip_element(self, element: str) -> bool:
         """
-        判断是否应该跳过某个元素
+        Determine whether to skip a certain element
 
         Args:
-            element: 要判断的元素
+            element: element to judge
 
         Returns:
-            bool: True表示应该跳过，False表示应该处理
+            bool: True means should skip, False means should process
         """
         # element = element.strip()
 
-        # 如果是tool_call的xml标签，不跳过
+        # If it's tool_call XML tag, don't skip
         if element.startswith("<tool_call>"):
             return False
 
-        # 如果当前没有在解析工具调用，且不是空白，收集这个文本而不是跳过
-        # 只有tool_call出现了，才处理其他xml元素，否则当成纯文本
+        # If currently not parsing tool call and not empty, collect this text instead of skipping
+        # Only process other XML elements when tool_call appears, otherwise treat as plain text
         if self.current_call_id is None and element:
-            # 收集文本内容到缓冲区
+            # Collect text content to buffer
             self.text_content_buffer += element
-            return True  # 仍然跳过，但已经收集了内容
+            return True  # Still skip, but content has been collected
 
-        # 如果当前正在解析工具调用，这可能是参数值，不跳过
+        # If currently parsing tool call, this might be parameter value, don't skip
         if self.current_call_id is not None:
             return False
 
-        # 空白内容跳过
+        # Skip empty content
         if not element:
             return True
 
@@ -591,29 +595,29 @@ class StreamingXMLToolCallParser:
 
     def _find_next_complete_element(self, start_pos: int) -> Tuple[Optional[str], int]:
         """
-        从指定位置查找下一个完整的XML元素
+        Find the next complete XML element from specified position
 
         Args:
-            start_pos: 开始查找的位置
+            start_pos: start position for search
 
         Returns:
-            (完整元素字符串, 元素结束位置)，如果没有找到完整元素返回(None, start_pos)
+            (complete element string, element end position), returns (None, start_pos) if no complete element found
         """
         buffer = self.streaming_buffer[start_pos:]
 
         if not buffer:
             return None, start_pos
 
-        # 查找XML标签
+        # Find XML tags
         if buffer.startswith("<"):
-            # 需要保证不出现新的<，找出<和>中最近的一个
+            # Need to ensure no new < appears, find the closest one between < and >
             tag_end = buffer.find("<", 1)
             tag_end2 = buffer.find(">", 1)
             if tag_end != -1 and tag_end2 != -1:
-                # 下一个最近的是<
+                # Next closest is <
                 if tag_end < tag_end2:
                     return buffer[:tag_end], start_pos + tag_end
-                # 下一个最近的是>，说明找到xml元素
+                # Next closest is >, found XML element
                 else:
                     return buffer[: tag_end2 + 1], start_pos + tag_end2 + 1
             elif tag_end != -1:
@@ -621,65 +625,65 @@ class StreamingXMLToolCallParser:
             elif tag_end2 != -1:
                 return buffer[: tag_end2 + 1], start_pos + tag_end2 + 1
             else:
-                # 如果当前没有在解析工具调用（进入一个tool_call），检查是否以<tool_call>开头
+                # If currently not parsing tool call (entering a tool_call), check if it starts with <tool_call>
                 if self.current_call_id is None:
-                    # 按照buffer的长度匹配<tool_call>
+                    # Match <tool_call> according to buffer length
                     tool_call_prefix = "<tool_call>"
                     if len(buffer) >= len(tool_call_prefix):
-                        # buffer长度足够，检查是否匹配<tool_call
+                        # Buffer length is sufficient, check if it matches <tool_call
                         if buffer.startswith(tool_call_prefix):
-                            # 匹配上了，等待更多数据
+                            # Matched, wait for more data
                             return None, start_pos
                         else:
-                            # 没匹配上，当文本处理
+                            # Didn't match, treat as text
                             return buffer, start_pos + len(buffer)
                     else:
-                        # buffer长度不够，检查是否可能是<tool_call>的开头
+                        # Buffer length insufficient, check if it might be the beginning of <tool_call>
                         if buffer == "<tool_call>"[: len(buffer)]:
-                            # 可能是<tool_call>的开头，等待更多数据
+                            # Might be the beginning of <tool_call>, wait for more data
                             return None, start_pos
                         else:
-                            # 不是<tool_call>的开头，当文本处理
+                            # Not the beginning of <tool_call>, treat as text
                             return buffer, start_pos + len(buffer)
                 else:
-                    # 正在解析工具调用时，等待更多数据以获取完整的标签
+                    # When parsing tool call, wait for more data to get complete tag
                     return None, start_pos
         else:
-            # 查找文本内容（直到下一个 < 或缓冲区结束）
+            # Find text content (until next < or end of buffer)
             next_tag_pos = buffer.find("<")
             if next_tag_pos != -1:
-                # 找到文本内容
+                # Found text content
                 text_content = buffer[:next_tag_pos]
-                if text_content.strip():  # 只处理非空白文本
+                if text_content.strip():  # Only process non-empty text
                     return text_content, start_pos + next_tag_pos
                 else:
-                    # 跳过空白内容
+                    # Skip empty content
                     return text_content, start_pos + next_tag_pos
             else:
-                # 缓冲区末尾都是文本，立即处理（不再等待更多数据）
+                # End of buffer is all text, process immediately (no longer wait for more data)
                 remaining = buffer
-                if remaining.strip():  # 有实际内容
+                if remaining.strip():  # Has actual content
                     return remaining, start_pos + len(remaining)
                 else:
-                    # 空白内容，跳过
+                    # Empty content, skip
                     return remaining, start_pos + len(remaining)
 
     def _merge_new_deltas(self, deltas: List[DeltaMessage]) -> DeltaMessage:
         """
-        将DeltaMessage数组合并为单个DeltaMessage
+        Merge DeltaMessage array into single DeltaMessage
 
         Args:
-            deltas: 要合并的DeltaMessage列表
+            deltas: list of DeltaMessage to merge
 
         Returns:
-            合并后的DeltaMessage，包含所有输入deltas的信息
+            merged DeltaMessage containing information from all input deltas
         """
         if not deltas:
             return DeltaMessage(
                 role=None, content=None, reasoning_content=None, tool_calls=[]
             )
 
-        # 过滤掉空的deltas（tool_calls为空或None的）
+        # Filter out empty deltas (tool_calls empty or None)
         valid_deltas = [
             delta for delta in deltas if delta is not None and delta.tool_calls
         ]
@@ -688,7 +692,7 @@ class StreamingXMLToolCallParser:
                 role=None, content=None, reasoning_content=None, tool_calls=[]
             )
 
-        # 收集所有的content和reasoning_content
+        # Collect all content and reasoning_content
         merged_content = ""
         merged_reasoning_content = ""
         merged_role = None
@@ -702,7 +706,7 @@ class StreamingXMLToolCallParser:
                 if delta.reasoning_content:
                     merged_reasoning_content += delta.reasoning_content
 
-        # 合并所有tool_calls
+        # Merge all tool_calls
         merged_tool_calls = []
         merged_tool_calls_index = []
         for delta in valid_deltas:
@@ -735,27 +739,27 @@ class StreamingXMLToolCallParser:
 
     def _merge_new_deltas_to_single_response(self, initial_count: int) -> DeltaMessage:
         """
-        将这次处理中新生成的deltas合并为单个DeltaMessage
+        Merge newly generated deltas in this processing into single DeltaMessage
 
         Args:
-            initial_count: 处理前的delta数量
+            initial_count: number of deltas before processing
 
         Returns:
-            合并后的DeltaMessage，包含所有新生成的delta信息
+            merged DeltaMessage containing all newly generated delta information
         """
         if len(self.deltas) <= initial_count:
             return DeltaMessage(
                 role=None, content=None, reasoning_content=None, tool_calls=[]
             )
 
-        # 获取新生成的deltas
+        # Get newly generated deltas
         new_deltas = self.deltas[initial_count:]
 
         if len(new_deltas) == 1:
-            # 只有一个新delta，直接返回
+            # Only one new delta, return directly
             return new_deltas[0]
 
-        # 合并多个新deltas
+        # Merge multiple new deltas
         merged_tool_calls = []
         merged_content = ""
         merged_reasoning_content = ""
@@ -769,9 +773,9 @@ class StreamingXMLToolCallParser:
             if delta.reasoning_content:
                 merged_reasoning_content += delta.reasoning_content
             if delta.tool_calls:
-                # 对于tool_calls，我们需要智能合并arguments
+                # For tool_calls, we need to intelligently merge arguments
                 for tool_call in delta.tool_calls:
-                    # 查找是否已经有相同call_id的tool_call
+                    # Check if there's already a tool_call with the same call_id
 
                     existing_call = None
                     for existing in merged_tool_calls:
@@ -780,7 +784,7 @@ class StreamingXMLToolCallParser:
                             break
 
                     if existing_call:
-                        # 合并到现有的tool_call
+                        # Merge into existing tool_call
                         if tool_call.function and tool_call.function.name:
                             existing_call.function.name = tool_call.function.name
                         if (
@@ -790,13 +794,13 @@ class StreamingXMLToolCallParser:
                             if existing_call.function.arguments is None:
                                 existing_call.function.arguments = ""
 
-                            # 对于流式JSON参数，简单按顺序拼接
+                            # For streaming JSON parameters, simply concatenate in order
                             new_args = tool_call.function.arguments
                             existing_call.function.arguments += new_args
                         if tool_call.type:
                             existing_call.type = tool_call.type
                     else:
-                        # 添加新的tool_call
+                        # Add new tool_call
                         merged_tool_calls.append(tool_call)
 
         return DeltaMessage(
@@ -810,52 +814,52 @@ class StreamingXMLToolCallParser:
 
     def _parse_incremental_xml(self, new_content: str) -> List[DeltaMessage]:
         """
-        增量解析XML内容
+        Incrementally parse XML content
 
         Args:
-            new_content: 新增的文本内容
+            new_content: newly added text content
 
         Returns:
-            DeltaMessage列表
+            list of DeltaMessage
         """
         if not new_content.strip():
             return []
 
-        # 清空之前的deltas，只返回新的
+        # Clear previous deltas, only return new ones
         previous_deltas_count = len(self.deltas)
 
-        # 检查是否有完整的XML标签可以解析
+        # Check if there are complete XML tags to parse
         xml_chunks = self._extract_complete_xml_chunks(new_content)
 
         if not xml_chunks:
             return []
 
         try:
-            # 预处理和解析完整的XML块
+            # Preprocess and parse complete XML chunks
             for chunk in xml_chunks:
                 if chunk.strip():
-                    # 预处理非标准格式
+                    # Preprocess non-standard format
                     processed_chunk = self._preprocess_xml_chunk(chunk)
                     self.parser.Parse(processed_chunk, False)
 
-            # 返回新生成的deltas
+            # Return newly generated deltas
             new_deltas = self.deltas[previous_deltas_count:]
             return new_deltas
 
         except Exception:
-            # 如果解析失败，可能是因为XML不完整，返回空列表
-            # print(f"增量解析失败: {e}")
+            # If parsing fails, might be due to incomplete XML, return empty list
+            # print(f"Incremental parsing failed: {e}")
             return []
 
     def _preprocess_xml_chunk(self, chunk: str) -> str:
         """
-        预处理XML块，处理非标准格式
+        Preprocess XML chunk, handle non-standard format
 
         Args:
-            chunk: 原始XML块
+            chunk: original XML chunk
 
         Returns:
-            处理后的XML块
+            processed XML chunk
         """
         is_tool_call = False
         if chunk.startswith("<tool_call>") or chunk.startswith("</tool_call>"):
@@ -864,54 +868,54 @@ class StreamingXMLToolCallParser:
             is_tool_call = True
         if chunk.startswith("<parameter=") or chunk.startswith("</parameter>"):
             is_tool_call = True
-        # 处理 <function=name> 格式 -> <function name="name">
+        # Handle <function=name> format -> <function name="name">
         processed = re.sub(r"<function=([^>]+)>", r'<function name="\1">', chunk)
-        # 处理 <parameter=name> 格式 -> <parameter name="name">
+        # Handle <parameter=name> format -> <parameter name="name">
         processed = re.sub(r"<parameter=([^>]+)>", r'<parameter name="\1">', processed)
-        # 如果processed中不包含special_token，则对processed进行转义
-        # 这是因为xml解析遇到特殊字符会报错，所以需要转义
+        # If processed doesn't contain special_token, escape processed
+        # This is because XML parsing will error on special characters, so escaping is needed
         if not is_tool_call:
             processed = self._escape_xml_special_chars(processed)
         return processed
 
     def _extract_complete_xml_chunks(self, new_content: str) -> List[str]:
         """
-        从新内容中提取完整的XML块
+        Extract complete XML chunks from new content
 
         Args:
-            new_content: 新增的文本内容
+            new_content: newly added text content
 
         Returns:
-            完整XML块的列表
+            list of complete XML chunks
         """
         chunks = []
         buffer = new_content
 
-        # 查找完整的XML标签
+        # Find complete XML tags
         i = 0
         while i < len(buffer):
             if buffer[i] == "<":
-                # 查找标签结束
+                # Find tag end
                 tag_end = buffer.find(">", i)
                 if tag_end != -1:
-                    # 找到完整标签
+                    # Found complete tag
                     tag = buffer[i : tag_end + 1]
                     chunks.append(tag)
                     i = tag_end + 1
                 else:
-                    # 标签不完整，停止处理
+                    # Tag incomplete, stop processing
                     break
             else:
-                # 查找下一个 < 或者累积文本内容
+                # Find next < or accumulate text content
                 next_tag = buffer.find("<", i)
                 if next_tag != -1:
-                    # 有文本内容
+                    # Have text content
                     text_content = buffer[i:next_tag]
                     if text_content.strip():
                         chunks.append(text_content)
                     i = next_tag
                 else:
-                    # 剩余都是文本内容
+                    # Remaining is all text content
                     remaining = buffer[i:]
                     if remaining.strip():
                         chunks.append(remaining)
@@ -923,18 +927,18 @@ class StreamingXMLToolCallParser:
         self, delta_responses: List[DeltaMessage]
     ) -> DeltaMessage:
         """
-        将DeltaMessage列表转换为DeltaMessage
+        Convert DeltaMessage list to DeltaMessage
 
         Args:
-            delta_responses: DeltaMessage列表
+            delta_responses: DeltaMessage list
 
         Returns:
-            DeltaMessage对象
+            DeltaMessage object
         """
         if not delta_responses:
             return DeltaMessage()
 
-        # 合并所有delta的内容
+        # Merge content from all deltas
         merged_tool_calls = []
         merged_content = ""
         merged_reasoning_content = ""
@@ -960,22 +964,22 @@ class StreamingXMLToolCallParser:
         )
 
     def setup_parser(self):
-        """设置XML解析器事件处理器"""
+        """Set up XML parser event handlers"""
         self.parser.buffer_text = True
         self.parser.StartElementHandler = self._start_element
         self.parser.EndElementHandler = self._end_element
         self.parser.CharacterDataHandler = self._char_data
 
     def _get_next_call_id(self):
-        """生成唯一的调用ID"""
+        """Generate unique call ID"""
         return f"call_{uuid.uuid4().hex[:24]}"
 
     def _extract_function_name(self, name: str, attrs: Dict[str, str]) -> Optional[str]:
-        """从各种格式中提取函数名"""
+        """Extract function name from various formats"""
         if attrs and "name" in attrs:
             return attrs["name"]
 
-        # 处理 <function=name> 格式
+        # Handle <function=name> format
         if "=" in name:
             parts = name.split("=", 1)
             if len(parts) == 2 and parts[0] == "function":
@@ -986,11 +990,11 @@ class StreamingXMLToolCallParser:
     def _extract_parameter_name(
         self, name: str, attrs: Dict[str, str]
     ) -> Optional[str]:
-        """从各种格式中提取参数名"""
+        """Extract parameter name from various formats"""
         if attrs and "name" in attrs:
             return attrs["name"]
 
-        # 处理 <parameter=name> 格式
+        # Handle <parameter=name> format
         if "=" in name:
             parts = name.split("=", 1)
             if len(parts) == 2 and parts[0] == "parameter":
@@ -999,58 +1003,58 @@ class StreamingXMLToolCallParser:
         return None
 
     def _emit_delta(self, delta: DeltaMessage):
-        """发送Delta响应（流式输出）"""
+        """Emit Delta response (streaming output)"""
         self.deltas.append(delta)
 
     def _auto_close_open_parameter_if_needed(self, incoming_tag: Optional[str] = None):
-        """在开始处理新的元素前，若之前存在未关闭的 tag，则自动补齐其结束到解析器中。
+        """Before starting to process new elements, if there are previously unclosed tags, automatically complete their end to the parser.
 
-        - 若存在未关闭的 parameter，则等价于喂入 `</parameter>`（通过直接调用结束处理器）。
-        - 当即将开始新的 function 或 tool_call 时，若存在未关闭的 function，则补齐 `</function>`。
-        - 当即将开始新的 tool_call 时，若存在未关闭的 tool_call，则补齐 `</tool_call>`。
+        - If there's an unclosed parameter, equivalent to feeding `</parameter>` (by directly calling the end handler).
+        - When about to start new function or tool_call, if there's an unclosed function, complete `</function>`.
+        - When about to start new tool_call, if there's an unclosed tool_call, complete `</tool_call>`.
         """
-        # 先关闭未结束的 parameter
+        # First close unfinished parameter
         if self.current_param_name:
-            # 调用 end 处理逻辑，效果等价于解析器收到了 </parameter>
+            # Call end processing logic, effect equivalent to parser receiving </parameter>
             self._end_element("parameter")
 
-        # 若即将开始新的 function 或 tool_call，且有未关闭的 function，则先关闭 function
+        # If about to start new function or tool_call, and there's an unclosed function, close function first
         if incoming_tag in ("function", "tool_call") and self.current_function_name:
             self._end_element("function")
 
-        # 若即将开始新的 tool_call，且有未关闭的 tool_call，则先关闭 tool_call
+        # If about to start new tool_call, and there's an unclosed tool_call, close tool_call first
         if incoming_tag == "tool_call" and self.current_call_id:
             self._end_element("tool_call")
 
     def _start_element(self, name: str, attrs: Dict[str, str]):
-        """处理XML开始元素事件"""
+        """Handle XML start element event"""
 
-        # 忽略根元素包装
+        # Ignore root element wrapper
         if name == "root":
             return
 
         if name == "tool_call":
-            # 在开启新 tool_call 之前，自动补齐上一个未闭合的标签
+            # Before opening new tool_call, automatically complete previous unclosed tags
             self._auto_close_open_parameter_if_needed("tool_call")
-            # 重置新的工具调用
+            # Reset new tool call
             self.parameters = {}
             self.current_call_id = self._get_next_call_id()
-            self.current_param_is_first = True  # 标记为第一个参数
+            self.current_param_is_first = True  # Mark as first parameter
 
-            # 第一个tool_call标签不立即输出，等到function标签再输出
-            # 这样第一个chunk会返回None，符合用户期望
+            # First tool_call tag doesn't output immediately, wait for function tag to output
+            # This way first chunk returns None, meeting user expectation
 
-            # 递增tool_call_index为下一个tool_call做准备
+            # Increment tool_call_index for next tool_call preparation
             self.tool_call_index += 1
 
         elif name.startswith("function") or (name == "function"):
-            # 在开启新 function 之前，自动补齐上一个未闭合的标签（parameter/function）
+            # Before opening new function, automatically complete previous unclosed tags (parameter/function)
             self._auto_close_open_parameter_if_needed("function")
             function_name = self._extract_function_name(name, attrs)
             self.current_function_name = function_name
             self.current_function_open = True
             if function_name:
-                # 现在才输出初始工具调用
+                # Now output initial tool call
                 delta = DeltaMessage(
                     role=None,
                     content=None,
@@ -1067,19 +1071,19 @@ class StreamingXMLToolCallParser:
                 self._emit_delta(delta)
 
         elif name.startswith("parameter") or (name == "parameter"):
-            # 若上一个参数尚未正常结束，先补齐其结束，再开始新的参数
+            # If previous parameter hasn't ended properly, complete its end first, then start new parameter
             self._auto_close_open_parameter_if_needed("parameter")
 
             param_name = self._extract_parameter_name(name, attrs)
             self.current_param_name = param_name
             self.current_param_value = ""
             self.current_param_value_converted = ""
-            self.start_quote_emitted = False  # 重置开始引号标志
+            self.start_quote_emitted = False  # Reset start quote flag
 
-            # 只输出参数名和冒号，不输出引号（等参数值确定类型后再决定）
+            # Only output parameter name and colon, don't output quotes (wait for parameter value type determination)
             if param_name:
                 if not self.parameters:
-                    # 第一个参数 - 开始JSON，只输出参数名和冒号
+                    # First parameter - start JSON, only output parameter name and colon
                     json_start = f'{{"{param_name}": '
                     delta = DeltaMessage(
                         role=None,
@@ -1098,7 +1102,7 @@ class StreamingXMLToolCallParser:
                     self._emit_delta(delta)
                     self.current_param_is_first = True
                 else:
-                    # 后续参数 - 添加逗号和参数名，不加引号
+                    # Subsequent parameters - add comma and parameter name, no quotes
                     json_continue = f', "{param_name}": '
                     delta = DeltaMessage(
                         role=None,
@@ -1118,18 +1122,18 @@ class StreamingXMLToolCallParser:
                     self.current_param_is_first = False
 
     def _char_data(self, data: str):
-        """处理XML字符数据事件"""
+        """Handle XML character data event"""
         if data and self.current_param_name:
-            # 获取参数类型
+            # Get parameter type
             param_type = self._get_param_type(self.current_param_name)
 
-            # 检查这是否是第一次接收到这个参数的数据
+            # Check if this is the first time receiving data for this parameter
             if not self.current_param_value:
-                # 如果是第一包数据，且以\n开头，则去掉\n
+                # If it's the first packet of data and starts with \n, remove \n
                 if data.startswith("\n"):
                     data = data[1:]
                     if not data:
-                        # 如果去掉换行符后数据为空，但还是需要为字符串类型输出开始引号
+                        # If data is empty after removing newline, but still need to output start quote for string type
                         if (
                             param_type
                             in ["string", "str", "text", "varchar", "char", "enum"]
@@ -1153,7 +1157,7 @@ class StreamingXMLToolCallParser:
                             self.start_quote_emitted = True
                         return
 
-            # 为字符串类型输出开始引号（如果还没有输出过）
+            # Output start quote for string type (if not output yet)
             if (
                 param_type in ["string", "str", "text", "varchar", "char", "enum"]
                 and not self.start_quote_emitted
@@ -1174,7 +1178,7 @@ class StreamingXMLToolCallParser:
                 self.start_quote_emitted = True
 
             original_data = data
-            # 延迟末尾换行符的输出
+            # Delay output of ending newline
             if self.should_emit_end_newline:
                 original_data = "\n" + original_data
                 self.should_emit_end_newline = False
@@ -1182,18 +1186,18 @@ class StreamingXMLToolCallParser:
                 self.should_emit_end_newline = True
                 original_data = original_data[:-1]
             self.current_param_value += original_data
-            # 使用_convert_param_value转换参数值
+            # Use _convert_param_value to convert parameter value
             converted_value = self._convert_param_value(
                 self.current_param_value, param_type
             )
 
-            # 使用_convert_for_json_streaming处理流式输出
+            # Use _convert_for_json_streaming to handle streaming output
             output_data = self._convert_for_json_streaming(converted_value, param_type)
 
             delta_data = output_data[len(self.current_param_value_converted) :]
             self.current_param_value_converted = output_data
 
-            # 立即输出参数值
+            # Immediately output parameter value
             delta = DeltaMessage(
                 role=None,
                 content=None,
@@ -1209,13 +1213,13 @@ class StreamingXMLToolCallParser:
             self._emit_delta(delta)
 
     def _end_element(self, name: str):
-        """处理XML结束元素事件"""
+        """Handle XML end element event"""
 
-        # 忽略根元素包装
+        # Ignore root element wrapper
         if name == "root":
             return
 
-        # 若函数或tool_call结束时仍有未关闭的参数，先补齐参数结束
+        # If function or tool_call ends while there are still unclosed parameters, complete parameter end first
         if (
             name.startswith("function") or name == "function" or name == "tool_call"
         ) and self.current_param_name:
@@ -1224,22 +1228,22 @@ class StreamingXMLToolCallParser:
         if (
             name.startswith("parameter") or name == "parameter"
         ) and self.current_param_name:
-            # 结束当前参数
+            # End current parameter
             param_name = self.current_param_name
             param_value = self.current_param_value
 
-            # 获取参数类型
+            # Get parameter type
             param_type = self._get_param_type(param_name)
 
-            # 使用_convert_param_value转换完整的参数值
+            # Use _convert_param_value to convert complete parameter value
             converted_value = self._convert_param_value(param_value, param_type)
 
-            # 根据参数类型决定是否需要结束引号
+            # Decide whether to need end quote based on parameter type
             if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
-                # 对于空的字符串参数，需要特殊处理
+                # Special handling for empty string parameters
                 if not param_value:
                     if self.start_quote_emitted:
-                        # 已经输出了开始引号，只需要输出结束引号
+                        # Already output start quote, only need to output end quote
                         delta = DeltaMessage(
                             role=None,
                             content=None,
@@ -1254,7 +1258,7 @@ class StreamingXMLToolCallParser:
                         )
                         self._emit_delta(delta)
                     else:
-                        # 没有输出过开始引号，直接输出完整的空字符串
+                        # Never output start quote, directly output complete empty string
                         delta = DeltaMessage(
                             role=None,
                             content=None,
@@ -1271,7 +1275,7 @@ class StreamingXMLToolCallParser:
                         )
                         self._emit_delta(delta)
                 else:
-                    # 非空参数值，输出结束引号
+                    # Non-empty parameter value, output end quote
                     delta = DeltaMessage(
                         role=None,
                         content=None,
@@ -1287,7 +1291,7 @@ class StreamingXMLToolCallParser:
                     self._emit_delta(delta)
 
             self.should_emit_end_newline = False
-            # 存储转换后的值
+            # Store converted value
             self.parameters[param_name] = converted_value
             self.current_param_name = None
             self.current_param_value = ""
@@ -1295,7 +1299,7 @@ class StreamingXMLToolCallParser:
             self.start_quote_emitted = False
 
         elif name.startswith("function") or name == "function":
-            # 只有当有参数时才关闭JSON对象
+            # Only close JSON object when there are parameters
             if self.parameters:
                 delta = DeltaMessage(
                     role=None,
@@ -1310,7 +1314,7 @@ class StreamingXMLToolCallParser:
                     ],
                 )
                 self._emit_delta(delta)
-            # 该函数没有参数，则输出空对象
+            # This function has no parameters, output empty object
             else:
                 delta = DeltaMessage(
                     role=None,
@@ -1325,18 +1329,18 @@ class StreamingXMLToolCallParser:
                     ],
                 )
                 self._emit_delta(delta)
-            # 标记函数已关闭
+            # Mark function as closed
             self.current_function_open = False
 
         elif name == "tool_call":
-            # 在结束tool_call之前，确保函数已经关闭以补齐缺失的右大括号
+            # Before ending tool_call, ensure function is closed to complete missing right brace
             if self.current_function_open:
-                # 若仍有未关闭的参数，先关闭
+                # If there are still unclosed parameters, close them first
                 if self.current_param_name:
                     self._end_element("parameter")
-                # 关闭函数，确保输出 '}' 或 '{}'
+                # Close function, ensure output '}' or '{}'
                 self._end_element("function")
-            # 最终Delta
+            # Final Delta
             delta = DeltaMessage(
                 role=None,
                 content=None,
@@ -1352,28 +1356,28 @@ class StreamingXMLToolCallParser:
             )
             self._emit_delta(delta)
 
-            # 完成tool_call后，结束当前XML文档并重新创建解析器
-            # 这样下一个非XML文本就不会被当作"junk after document element"
+            # After completing tool_call, end current XML document and recreate parser
+            # This way next non-XML text won't be treated as "junk after document element"
             self._reset_xml_parser_after_tool_call()
 
     def _reset_xml_parser_after_tool_call(self):
         """
-        在完成tool_call后重置XML解析器
-        结束当前文档并重新创建解析器，避免后续非XML文本被当作垃圾内容
+        Reset XML parser after completing tool_call
+        End current document and recreate parser to avoid subsequent non-XML text being treated as junk content
         """
         try:
-            # 结束当前XML文档
+            # End current XML document
             self.parser.Parse("", True)
         except Exception:
-            # 忽略结束文档时的错误
+            # Ignore errors when ending document
             pass
 
-        # 重新创建XML解析器
+        # Recreate XML parser
         self.parser = ParserCreate()
         self.setup_parser()
 
-        # 重置当前tool_call的状态
-        # 保存当前call_id到last_completed_call_id，然后重置current_call_id
+        # Reset current tool_call state
+        # Save current call_id to last_completed_call_id, then reset current_call_id
         if self.current_call_id:
             self.last_completed_call_id = self.current_call_id
         self.current_call_id = None
@@ -1406,7 +1410,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.tool_call_start_token: str = "<tool_call>"
         self.tool_call_end_token: str = "</tool_call>"
         self._buf: str = ""
-        # self.tool_call_prefix: str = "<function="
 
         # for non-stream extract
         self.tool_call_function_regex = re.compile(
@@ -1415,15 +1418,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.tool_call_parameter_regex = re.compile(
             r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL
         )
-
-        # Streaming state variables
-        # self._current_function_name: str = ""
-        # self._current_parameters: Dict[str, Any] = {}
-        # self._streamed_parameters: Dict[str, str] = (
-        #     {}
-        # )  # Track what parameter content we've streamed
-        # self._in_tool_call: bool = False
-        # self._function_name_sent: bool = False
 
         self.parser = StreamingXMLToolCallParser()
 
@@ -1438,14 +1432,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
 
-        # 模型有时候会单独输出导致delta_text为空。如果之前有tool_call，且当前所有的tool_call都已经结束，则返回一个空的tool_call
-        # 用于外层流式输出时，能够正确输出tool_call字段
+        # Model sometimes outputs separately causing delta_text to be empty. If there were previous tool_calls and all current tool_calls are ended, return empty tool_call
+        # Used for outer streaming output to correctly output tool_call field
         if not new_text:
             open_calls = self._buf.count(
                 self.parser.tool_call_start_token
             ) - self._buf.count(self.parser.tool_call_end_token)
             if open_calls == 0 and self.parser.tool_call_index > 0:
-                # 如果current_call_id为None，使用last_completed_call_id
+                # If current_call_id is None, use last_completed_call_id
                 call_id = (
                     self.parser.current_call_id or self.parser.last_completed_call_id
                 )
@@ -1457,10 +1451,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         self.parser.set_tools(tools)
         delta_message = self.parser.parse_single_streaming_chunks(new_text)
-        # print('-----new text--------')
-        # print(new_text)
-        # print('------delta message-----------')
-        # print(delta_message)
         return StreamingParseResult(
             normal_text=delta_message.content if delta_message.content else "",
             calls=[
@@ -1476,11 +1466,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
     def _reset_streaming_state(self):
         """Reset streaming state for the next tool call"""
         self._buf = ""
-        # self._in_tool_call = False
-        # self._function_name_sent = False
-        # self._current_function_name = ""
-        # self._current_parameters = {}
-        # self._streamed_parameters = {}
         self.parser.reset_streaming_state()
 
     def _extract(self, text: str, tools: List[Tool]) -> Tuple[str, List[ToolCallItem]]:
