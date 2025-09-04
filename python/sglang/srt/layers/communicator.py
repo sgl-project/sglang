@@ -48,7 +48,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
-    is_sm90_supported
+    is_sm90_supported,
     is_sm100_supported,
 )
 
