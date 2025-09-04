@@ -138,6 +138,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_cuda,
     is_hip,
     is_npu,
     log_info_on_rank0,
@@ -195,6 +196,7 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
         )
 
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1273,6 +1275,24 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+            if (
+                self.kv_cache_dtype == getattr(torch, "float4_e2m1fn_x2", None)
+                and _is_cuda
+            ):
+                # kv_scale_buffer
+                scale_block_size = 16
+                cell_size = (cell_size // 2) + (
+                    (
+                        (
+                            self.model_config.kv_lora_rank
+                            + self.model_config.qk_rope_head_dim
+                        )
+                        // scale_block_size
+                    )
+                    * num_layers
+                    * torch._utils._element_size(self.kv_cache_dtype)
+                )
+
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(self.model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)

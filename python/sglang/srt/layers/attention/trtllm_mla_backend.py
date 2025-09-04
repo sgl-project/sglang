@@ -360,19 +360,35 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         num_tokens_per_bs = max_num_tokens // max_bs
 
-        # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
-        self.padded_q_buffer = torch.zeros(
-            (max_bs, num_tokens_per_bs, self.num_q_heads, self.kv_cache_dim),
-            dtype=self.data_type,
-            device=self.device,
-        )
+        if self.data_type == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+            # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
+            self.store_dtype = torch.uint8
+            self.padded_q_buffer = torch.zeros(
+                (max_bs, num_tokens_per_bs // 2, self.num_q_heads, self.kv_cache_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
 
-        # Buffer for unpadded output: (max_num_tokens, num_q_heads, v_head_dim)
-        self.unpad_output_buffer = torch.zeros(
-            (max_num_tokens, self.num_q_heads, 512),
-            dtype=self.data_type,
-            device=self.device,
-        )
+            # Buffer for unpadded output: (max_num_tokens, num_q_heads, v_head_dim)
+            self.unpad_output_buffer = torch.zeros(
+                (max_num_tokens // 2, self.num_q_heads, 512),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+        else:
+            # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
+            self.padded_q_buffer = torch.zeros(
+                (max_bs, num_tokens_per_bs, self.num_q_heads, self.kv_cache_dim),
+                dtype=self.data_type,
+                device=self.device,
+            )
+
+            # Buffer for unpadded output: (max_num_tokens, num_q_heads, v_head_dim)
+            self.unpad_output_buffer = torch.zeros(
+                (max_num_tokens, self.num_q_heads, 512),
+                dtype=self.data_type,
+                device=self.device,
+            )
 
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
