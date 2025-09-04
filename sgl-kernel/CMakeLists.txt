@@ -190,6 +190,11 @@ if (ENABLE_BELOW_SM90)
         "-gencode=arch=compute_80,code=sm_80"
         "-gencode=arch=compute_89,code=sm_89"
     )
+    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_87,code=sm_87"
+        )
+    endif()
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
@@ -205,16 +210,14 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
         list(APPEND SGL_KERNEL_CUDA_FLAGS
             "-gencode=arch=compute_103,code=sm_103"
             "-gencode=arch=compute_103a,code=sm_103a"
+            "--compress-mode=size"
+        )
+        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
             "-gencode=arch=compute_110,code=sm_110"
             "-gencode=arch=compute_110a,code=sm_110a"
             "-gencode=arch=compute_121,code=sm_121"
             "-gencode=arch=compute_121a,code=sm_121a"
-            "--compress-mode=size"
-        )
-    else()
-        list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_101,code=sm_101"
-            "-gencode=arch=compute_101a,code=sm_101a"
         )
     endif()
 
