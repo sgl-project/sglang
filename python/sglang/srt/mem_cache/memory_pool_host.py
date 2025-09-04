@@ -7,7 +7,6 @@ from functools import wraps
 import psutil
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.utils import is_npu
 
@@ -464,10 +463,11 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_buffer_meta(self, keys, indices):
+    def get_buffer_meta(self, keys, indices, local_rank):
         ptr_list = []
         key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        indices = indices.tolist()
         v_offset = (
             self.layer_num
             * self.size
@@ -488,8 +488,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             ptr_list.append(k_ptr)
             ptr_list.append(v_ptr)
             key_ = keys[index // self.page_size]
-            key_list.append(f"{key_}_{get_tensor_model_parallel_rank()}_k")
-            key_list.append(f"{key_}_{get_tensor_model_parallel_rank()}_v")
+            key_list.append(f"{key_}_{local_rank}_k")
+            key_list.append(f"{key_}_{local_rank}_v")
         element_size = (
             self.layer_num
             * self.dtype.itemsize
@@ -703,10 +703,11 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def get_buffer_meta(self, keys, indices):
+    def get_buffer_meta(self, keys, indices, local_rank):
         ptr_list = []
         key_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        indices = indices.tolist()
         for index in range(0, len(indices), self.page_size):
             k_ptr = (
                 kv_buffer_data_ptr
