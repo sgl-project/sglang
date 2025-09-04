@@ -32,7 +32,6 @@ void copy_to_gpu_no_ce_impl(const at::Tensor& input, at::Tensor& output) {
   TORCH_CHECK(input.device().is_cpu(), "input must be a CPU tensor");
   TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
 
-  // Copy input tensor values into the small stack struct which will be passed as kernel argument.
   InputArray<N> input_array;
   const int* input_ptr = input.data_ptr<int>();
   for (int i = 0; i < N; ++i)
