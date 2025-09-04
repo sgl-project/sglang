@@ -141,7 +141,7 @@ from sglang.srt.mem_cache.lora_radix_cache import LoRARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
-from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -2403,6 +2403,9 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if self.enable_hicache_storage:
+                # to release prefetch events associated with the request
+                self.tree_cache.release_aborted_request(req.rid)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
