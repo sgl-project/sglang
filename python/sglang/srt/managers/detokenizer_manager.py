@@ -83,7 +83,9 @@ class DetokenizerManager(MultiTokenizerMixin):
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
         if server_args.tokenizer_worker_num > 1:
-            pass
+            self.tokenizer_num = (
+                server_args.tokenizer_worker_num // server_args.detokenizer_worker_num
+            )
         else:
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
@@ -293,7 +295,7 @@ def run_detokenizer_process(
         manager = DetokenizerManager(server_args, port_args)
         if server_args.tokenizer_worker_num > 1:
             manager.multi_tokenizer_manager_event_loop(
-                server_args.enable_multi_detokenizer
+                server_args.detokenizer_worker_num
             )
         else:
             manager.event_loop()

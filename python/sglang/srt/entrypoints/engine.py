@@ -811,11 +811,11 @@ def _launch_subprocesses(
         return None, None, None
 
     # Launch detokenizer process
-    if server_args.enable_multi_detokenizer:
+    if server_args.detokenizer_worker_num > 1:
         detoken_procs = []
         ports_list = []
         detokenizer_ipc_name = port_args.detokenizer_ipc_name
-        for i in range(server_args.tokenizer_worker_num):
+        for i in range(server_args.detokenizer_worker_num):
             port_args.detokenizer_ipc_name = (
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )

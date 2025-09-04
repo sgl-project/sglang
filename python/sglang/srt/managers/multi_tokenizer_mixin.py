@@ -357,7 +357,7 @@ class MultiTokenizerMixin:
             worker_ids = []
         return worker_ids
 
-    def multi_tokenizer_manager_event_loop(self, enable_multi_detokenizer=False):
+    def multi_tokenizer_manager_event_loop(self, detokenizer_worker_num):
         """The event loop that handles requests, for multi tokenizer manager mode only"""
         self.create_sockets_mapping()
         while True:
@@ -378,7 +378,7 @@ class MultiTokenizerMixin:
                 if isinstance(recv_obj, MultiTokenizerRegisterReq):
                     if self.register_tokenizer_ipc(recv_obj, worker_id):
                         logger.info(
-                            f"DetokenizerManager Created ZMQ socket for worker {worker_id}"
+                            f"TokenizerManager registered in DetokenizerManager {os.getpid()} : {len(self.tokenizer_mapping)}/{self.tokenizer_num}"
                         )
                     continue
                 else:
@@ -387,9 +387,10 @@ class MultiTokenizerMixin:
                             f"Tokenizer Worker ID {worker_id} not registered. Check if the server Process {worker_id} is alive"
                         )
                         continue
-                    if enable_multi_detokenizer:
+                    if detokenizer_worker_num > 1:
                         self.tokenizer_mapping[worker_id].send_pyobj(output)
-                        continue
+                        # only one request will receive when detokenizer_worker_num > 1
+                        break
                     new_output = self._handle_output_by_index(output, i)
                     self.tokenizer_mapping[worker_id].send_pyobj(new_output)
 
@@ -466,7 +467,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
             if isinstance(recv_obj, MultiTokenizerRegisterReq):
                 if self.register_tokenizer_ipc(recv_obj, worker_id):
                     logger.info(
-                        f"MultiTokenizerRouter Created ZMQ socket for worker {worker_id}"
+                        f"TokenizerManager registered in MultiTokenizerRouter : {len(self.tokenizer_mapping)}/{self.server_args.tokenizer_worker_num}"
                     )
                 continue
             else:
@@ -531,33 +532,53 @@ class MultiDetokenizerRouter(MultiTokenizerMixin):
     def __init__(self, ports_list: List[str], port_args: PortArgs):
         self.ports_list = ports_list
         self.send_to_detokenizer_mapping = {}
+        self.worker_id_to_ipc_mapping = {}
         self._zmq_context = zmq.Context()
         self.recv_from_scheduler = get_zmq_socket(
             self._zmq_context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
+        self.port_index = 0
+        self.port_num = len(ports_list)
 
-    async def event_loop(self):
+    def event_loop(self):
         while True:
-            recv_obj = await self.recv_from_scheduler.recv_pyobj()
+            recv_obj = self.recv_from_scheduler.recv_pyobj()
             if isinstance(recv_obj, MultiTokenizerRegisterReq):
                 worker_id = self.get_worker_ids_from_req_rids(recv_obj.rids)[0]
-                if worker_id not in self.send_to_detokenizer_mapping:
-                    socket = get_zmq_socket(
-                        self._zmq_context, zmq.PUSH, self.ports_list[0], False
-                    )
-                    self.send_to_detokenizer_mapping[worker_id] = socket
-                    self.send_to_detokenizer_mapping[worker_id].send_pyobj(recv_obj)
-                    del self.ports_list[0]
+                if worker_id not in self.worker_id_to_ipc_mapping:
+                    port = self.ports_list[self.port_index]
+                    if port not in self.send_to_detokenizer_mapping:
+                        socket = get_zmq_socket(
+                            self._zmq_context, zmq.PUSH, port, False
+                        )
+                        self.send_to_detokenizer_mapping[port] = socket
+                        logger.info(
+                            f"DetokenizerManager registered in MultiDetokenizerRouter : {self.port_index+1}/{self.port_num}"
+                        )
+                    self.send_to_detokenizer_mapping[port].send_pyobj(recv_obj)
+                    self.worker_id_to_ipc_mapping[worker_id] = port
+                    self.port_index = (self.port_index + 1) % self.port_num
             else:
                 worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
                 for i, worker_id in enumerate(worker_ids):
-                    if worker_id not in self.send_to_detokenizer_mapping:
+                    if worker_id not in self.worker_id_to_ipc_mapping:
                         logger.error(
                             f"Detokenizer Worker ID {worker_id} not registered in MultiDetokenizerRouter."
                         )
                         continue
                     new_recv_obj = self._handle_output_by_index(recv_obj, i)
-                    self.send_to_detokenizer_mapping[worker_id].send_pyobj(new_recv_obj)
+                    self.send_to_detokenizer_mapping[
+                        self.worker_id_to_ipc_mapping[worker_id]
+                    ].send_pyobj(new_recv_obj)
+
+    def clear_tokenizer_mapping(self):
+        if hasattr(self, "send_to_detokenizer_mapping"):
+            for socket in self.send_to_detokenizer_mapping.values():
+                try:
+                    socket.close()
+                except Exception as e:
+                    logger.warning(f"Failed to close socket: {e}")
+            self.send_to_detokenizer_mapping.clear()
 
 
 def run_multi_detokenizer_router_process(
