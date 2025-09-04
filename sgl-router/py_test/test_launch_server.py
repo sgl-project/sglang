@@ -426,3 +426,10 @@ def test_api_key_with_dp_aware(router_manager):
         )
         assert response.status_code == 200
 
+if __name__ == "__main__":
+    # Allow running this file directly via `python3 test_launch_server.py`
+    # which will invoke pytest under the hood to execute the tests.
+    import sys
+    import pytest as _pytest
+
+    sys.exit(_pytest.main([__file__] + sys.argv[1:]))
