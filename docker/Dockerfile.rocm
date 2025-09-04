@@ -37,7 +37,7 @@ ENV NO_DEPS_FLAG=""
 # ===============================
 # Base image 950 and args
 FROM $BASE_IMAGE_950 AS gfx950
-ENV BUILD_VLLM="0"
+ENV BUILD_VLLM="1"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
@@ -122,11 +122,12 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
 # -----------------------
 # Build vLLM
 ARG VLLM_REPO="https://github.com/ROCm/vllm.git"
-ARG VLLM_BRANCH="9f6b92db47c3444b7a7d67451ba0c3a2d6af4c2c"
+ARG VLLM_BRANCH="355_wip"
+ARG VLLM_COMMIT="93ee1c505840e6a35cc482d8ab5a17b99fac4ba4"
 RUN if [ "$BUILD_VLLM" = "1" ]; then \
-        git clone ${VLLM_REPO} \
+        git clone ${VLLM_REPO} -b ${VLLM_BRANCH}\
      && cd vllm \
-     && git checkout ${VLLM_BRANCH} \
+     && git checkout ${VLLM_COMMIT}\
      && python -m pip install -r requirements/rocm.txt \
      && python setup.py clean --all \
      && python setup.py develop; \
