@@ -412,9 +412,17 @@ class ModelConfig:
             is_local = os.path.exists(self.model_path)
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
-                from huggingface_hub import HfApi
 
-                hf_api = HfApi()
+                # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+                if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+                    from modelscope import HubApi
+
+                    hf_api = HubApi()
+                else:
+                    from huggingface_hub import HfApi
+
+                    hf_api = HfApi()
+
                 if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
                     quant_cfg = modelopt_quant_config
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
