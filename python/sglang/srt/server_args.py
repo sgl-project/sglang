@@ -1993,7 +1993,7 @@ class ServerArgs:
         )
 
         # PD disaggregation
-        
+
         parser.add_argument(
             "--disaggregation-mode",
             type=str,
@@ -2114,7 +2114,6 @@ class ServerArgs:
         )
 
         # LMCache
-        logger.info("Adding LMCache arguments")
         parser.add_argument(
             "--enable-lmcache",
             action="store_true",
