@@ -138,7 +138,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 
 # Detect stragger ranks in model loading
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(os.getenv("SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S", 300))
 
 logger = logging.getLogger(__name__)
 
