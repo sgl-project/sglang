@@ -503,7 +503,9 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(hidden_states)
+        shared_output = self._forward_shared_experts(
+            hidden_states, gemm_output_zero_allocator
+        )
 
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
@@ -542,7 +544,9 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
@@ -664,9 +668,13 @@ class DeepseekV2MoE(nn.Module):
 
         return final_hidden_states
 
-    def _forward_shared_experts(self, hidden_states):
+    def _forward_shared_experts(
+        self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
+    ):
         if self.num_fused_shared_experts == 0:
-            return self.shared_experts(hidden_states)
+            return self.shared_experts(
+                hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+            )
         else:
             return None
 
@@ -2016,8 +2024,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
+
+        if isinstance(self.mlp, DeepseekV2MLP):
+            gemm_output_zero_allocator = None
+
         hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+            hidden_states,
+            forward_batch,
+            should_allreduce_fusion,
+            use_reduce_scatter,
+            gemm_output_zero_allocator,
         )
 
         if should_allreduce_fusion:
