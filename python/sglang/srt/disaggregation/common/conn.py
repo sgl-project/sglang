@@ -47,6 +47,7 @@ class CommonKVManager(BaseKVManager):
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
+        self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
         self.tp_size = server_args.tp_size
@@ -71,17 +72,8 @@ class CommonKVManager(BaseKVManager):
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
-        if self.dist_init_addr:
-            if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
-                if self.dist_init_addr.endswith("]"):
-                    host = self.dist_init_addr
-                else:
-                    host, _ = self.dist_init_addr.rsplit(":", 1)
-            else:
-                host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
-        else:
-            host = get_ip()
-            host = maybe_wrap_ipv6_address(host)
+        host = self.bootstrap_host
+        host = maybe_wrap_ipv6_address(host)
 
         bootstrap_server_url = f"{host}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
