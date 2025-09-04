@@ -453,17 +453,24 @@ class RouterArgs:
             use_router_prefix: If True, look for arguments with 'router-' prefix
         """
         prefix = "router_" if use_router_prefix else ""
-        # auto strip prefix from args
-        args_dict = vars(args)
-        args_dict = {
-            key.lstrip(prefix) if key.startswith(prefix) else key: args_dict[key]
-            for key in args_dict
-        }
+        cli_args_dict = vars(args)
+        args_dict = {}
 
-        # parse special arguments and remove "--prefill" and "--decode" from args_dict
-        args_dict["prefill_urls"] = cls._parse_prefill_urls(args_dict.pop("prefill"))
-        args_dict["decode_urls"] = cls._parse_decode_urls(args_dict.pop("decode"))
-        args_dict["selector"] = cls._parse_selector(args_dict["selector"])
+        for attr in dataclasses.fields(cls):
+            # Auto strip prefix from args
+            if f"{prefix}{attr.name}" in cli_args_dict:
+                args_dict[attr.name] = cli_args_dict[f"{prefix}{attr.name}"]
+            elif attr.name in cli_args_dict:
+                args_dict[attr.name] = cli_args_dict[attr.name]
+
+        # parse special arguments and remove "--prefill" and "--decode" from cli_args_dict
+        args_dict["prefill_urls"] = cls._parse_prefill_urls(
+            cli_args_dict[f"{prefix}prefill"]
+        )
+        args_dict["decode_urls"] = cls._parse_decode_urls(
+            cli_args_dict[f"{prefix}decode"]
+        )
+        args_dict["selector"] = cls._parse_selector(cli_args_dict[f"{prefix}selector"])
 
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
