@@ -20,6 +20,11 @@ CALIBRATION_BATCH_SIZE = 36
 CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
+# Constants for calibration parameters to avoid hard-coded values
+CALIBRATION_BATCH_SIZE = 36
+CALIBRATION_NUM_SAMPLES = 512
+DEFAULT_DEVICE = "cuda:0"
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
