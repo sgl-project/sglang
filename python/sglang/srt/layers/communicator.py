@@ -48,10 +48,12 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_sm90_supported
     is_sm100_supported,
 )
 
 _is_flashinfer_available = is_flashinfer_available()
+_is_sm90_supported = is_cuda() and is_sm90_supported()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
@@ -520,11 +522,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
             # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
             # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
             if (
-                _is_sm100_supported
+                (_is_sm100_supported or _is_sm90_supported)
                 and _is_flashinfer_available
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
                 and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
-                and hidden_states.shape[0] <= 2048
+                and hidden_states.shape[0] <= 4096
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
