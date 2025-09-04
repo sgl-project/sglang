@@ -673,7 +673,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
-        device: Optional[str] = "cuda",
+        device: Optional[str] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -686,11 +686,16 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
             * attn_factor
         )
-        self.device = device
-        if _is_xpu:
+        if device is not None:
+            self.device = device
+        elif _is_xpu:
             self.device = "xpu"
         elif _is_npu:
             self.device = "npu"
+        elif _is_cuda:
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
