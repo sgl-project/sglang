@@ -187,7 +187,7 @@ async def health_check():
 
 
 @app.get("/health_generate")
-async def health_check():
+async def health_generate():
     prefill_servers, decode_servers = (
         load_balancer.prefill_servers,
         load_balancer.decode_servers,
@@ -196,7 +196,7 @@ async def health_check():
         # Create the tasks
         tasks = []
         for server in chain(prefill_servers, decode_servers):
-            tasks.append(session.post(f"{server}/health_generate"))
+            tasks.append(session.get(f"{server}/health_generate"))
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
     return Response(status_code=200)

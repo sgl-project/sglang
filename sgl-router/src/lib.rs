@@ -101,25 +101,13 @@ struct Router {
 impl Router {
     /// Determine connection mode from worker URLs
     fn determine_connection_mode(worker_urls: &[String]) -> config::ConnectionMode {
-        // Check if any URL is a gRPC endpoint (starts with grpc:// or has port that commonly indicates gRPC)
+        // Only consider it gRPC if explicitly specified with grpc:// or grpcs:// scheme
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
                 return config::ConnectionMode::Grpc;
             }
-            // Also check for common gRPC ports if the scheme isn't specified
-            if let Ok(parsed_url) = url::Url::parse(url) {
-                if let Some(port) = parsed_url.port() {
-                    // Common gRPC ports
-                    if port == 50051 || port == 9090 || ((50000..=50100).contains(&port)) {
-                        return config::ConnectionMode::Grpc;
-                    }
-                }
-            } else if url.contains(":50051") || url.contains(":9090") || url.contains(":5000") {
-                // Fallback check for URLs that might not parse correctly
-                return config::ConnectionMode::Grpc;
-            }
         }
-        // Default to HTTP
+        // Default to HTTP for all other cases (including http://, https://, or no scheme)
         config::ConnectionMode::Http
     }
 
