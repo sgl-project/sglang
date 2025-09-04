@@ -2209,13 +2209,15 @@ class DeepseekV2Model(nn.Module):
             device=device,
         )
 
+        has_gemm_output_zero_allocator = hasattr(self, "gemm_output_zero_allocator_size")
+
         gemm_output_zero_allocator = (
             BumpAllocator(
                 buffer_size=self.gemm_output_zero_allocator_size,
                 dtype=torch.float32,
                 device=device,
             )
-            if self.gemm_output_zero_allocator_size > 0
+            if has_gemm_output_zero_allocator and self.gemm_output_zero_allocator_size > 0
             else None
         )
 

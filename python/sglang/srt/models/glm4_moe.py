@@ -501,6 +501,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
@@ -543,6 +544,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -666,6 +668,7 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
