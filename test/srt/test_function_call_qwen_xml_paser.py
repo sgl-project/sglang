@@ -53,6 +53,7 @@ class TestQwen3CoderDetector(unittest.TestCase):
                 ),
             ),
         ]
+
         self.detector = Qwen3CoderDetector()
 
     def test_has_tool_call(self):
