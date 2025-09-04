@@ -3,6 +3,7 @@ import logging
 import sys
 from typing import List, Optional
 
+import setproctitle
 from sglang_router.mini_lb import MiniLoadBalancer
 from sglang_router.router_args import RouterArgs
 
@@ -28,6 +29,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
     Returns:
         Router instance if successful, None if failed
     """
+    setproctitle.setproctitle("sglang::router")
     try:
         # Convert to RouterArgs if needed
         if not isinstance(args, RouterArgs):
