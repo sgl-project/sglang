@@ -816,7 +816,10 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         topk_weights, topk_ids, _ = topk_output
-
+        if _is_hip:
+            topk_weights = topk_weights.to(
+                torch.float32
+            )  # aiter's moe_sorting requires topk_weights to be FP32
         return fused_moe(
             x,
             layer.w13_weight,
