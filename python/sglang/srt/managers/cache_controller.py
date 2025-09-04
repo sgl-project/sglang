@@ -659,7 +659,7 @@ class HiCacheController:
         )
         get_result = self.storage_backend.batch_get(
             key_strs,
-            target_location=buffer_ptrs,
+            target_locations=buffer_ptrs,
             target_sizes=buffer_sizes,
         )
         if get_result != len(hash_values):
@@ -843,7 +843,7 @@ class HiCacheController:
         )
         success = self.storage_backend.batch_set(
             key_strs,
-            target_location=buffer_ptrs,
+            target_locations=buffer_ptrs,
             target_sizes=buffer_sizes,
         )
         return success
