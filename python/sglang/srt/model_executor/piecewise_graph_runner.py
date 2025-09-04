@@ -162,9 +162,6 @@ class PiecewiseGraphRunner:
 
         set_torch_compile_config()
 
-        # if self.model_runner.server_args.lora_paths is not None:
-        #     self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
-
         # Graph inputs
         with torch.device(self.model_runner.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
