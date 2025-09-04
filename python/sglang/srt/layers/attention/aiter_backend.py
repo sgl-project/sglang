@@ -215,7 +215,8 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     # self.mla_indices_updater_prefill.kv_last_page_len,
                     self.kv_last_page_len[:bs],
-                    max(forward_batch.extend_seq_lens_cpu),
+                    #max(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.seq_lens_cpu.max().item(),
                     forward_batch.seq_lens_cpu.max().item(),
                 )
             else:
@@ -305,7 +306,8 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.extend_prefix_lens,
                     sum(forward_batch.extend_prefix_lens_cpu),
                     forward_batch.extend_seq_lens,
-                    max(forward_batch.extend_seq_lens_cpu),
+                    #max(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.seq_lens_cpu.max().item(),
                     forward_batch.seq_lens_cpu.max().item(),
                     spec_info=None,
                 )
@@ -650,16 +652,48 @@ class AiterAttnBackend(AttentionBackend):
                     ],
                     dim=-1,
                 )
+
                 assert (
                     forward_batch.extend_prefix_lens.shape
                     == forward_batch.extend_seq_lens.shape
                 )
-                k_prefix = torch.split(k_prefix, forward_batch.extend_prefix_lens_cpu)
-                k_extend = torch.split(k, forward_batch.extend_seq_lens_cpu)
+
+
+                # GW : Check the dtype of extend tensors
+                # Before modification, executing this code needs luck because of typecasting.
+                # torch.Tensor object which has 1 element behave like int type variable when it
+                # given to split argument but if it consist 2 or more elements, it behave as
+                # a torch.Tensor not a list type. so it makes terrible type miscasting.
+                # The code block below alleviate type miscasting.
+                #
+                # TODO
+                # * Make a rule for dtype and refactoring it.
+                if isinstance(forward_batch.extend_prefix_lens_cpu, torch.Tensor):
+                    if forward_batch.extend_prefix_lens_cpu.numel() == 1:
+                        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu.item()
+                    else :
+                        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu.tolist()
+
+                if isinstance(forward_batch.extend_seq_lens_cpu, torch.Tensor):
+                    if forward_batch.extend_seq_lens_cpu.numel() == 1:
+                        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu.item()
+                    else :
+                        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu.tolist()
+
+                #print(f"[GW DEBUG] {k_prefix.shape}, {forward_batch.extend_prefix_lens_cpu=}, extend_prefix_lens_cpu=")
+                #k_prefix = torch.split(k_prefix, forward_batch.extend_prefix_lens_cpu) # orig code
+                k_prefix = torch.split(k_prefix, extend_prefix_lens_cpu)
+
+                #print(f"[GW DEBUG] {k.device=}, {k.dtype=}, {k.shape}, {forward_batch.extend_seq_lens_cpu=}")
+                #k_extend = torch.split(k, forward_batch.extend_seq_lens_cpu) # orig code
+                k_extend = torch.split(k, extend_seq_lens_cpu)
+
                 assert len(k_prefix) == len(forward_batch.extend_prefix_lens_cpu)
                 k = torch.cat([x for el in zip(k_prefix, k_extend) for x in el])
-                v_prefix = torch.split(v_prefix, forward_batch.extend_prefix_lens_cpu)
-                v_extend = torch.split(v, forward_batch.extend_seq_lens_cpu)
+                #v_prefix = torch.split(v_prefix, forward_batch.extend_prefix_lens_cpu) # orig code
+                v_prefix = torch.split(v_prefix, extend_prefix_lens_cpu)
+                #v_extend = torch.split(v, forward_batch.extend_seq_lens_cpu) # orig code
+                v_extend = torch.split(v, extend_seq_lens_cpu)
                 v = torch.cat([x for el in zip(v_prefix, v_extend) for x in el])
 
                 o = flash_attn_varlen_func(

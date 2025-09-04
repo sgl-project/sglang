@@ -1784,9 +1784,16 @@ class ModelRunner:
             )
             return ret, can_run_cuda_graph
 
+        #logger.info( f"[GW DEBUG] LOC2 {forward_batch.batch_size=} {forward_batch.input_ids.shape=}, {forward_batch.seq_lens=}, {forward_batch.seq_lens_sum=}, {forward_batch.orig_seq_lens=}, "
+        #            f"{forward_batch.extend_num_tokens=}, {forward_batch.extend_seq_lens=}, {forward_batch.extend_seq_lens_cpu=}, {forward_batch.extend_prefix_lens_cpu=}"
+        #)
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
+
+        #logger.info( f"[GW DEBUG] LOC3 {forward_batch.batch_size=} {forward_batch.input_ids.shape=}, {forward_batch.seq_lens=}, {forward_batch.seq_lens_sum=}, {forward_batch.orig_seq_lens=}, "
+        #            f"{forward_batch.extend_num_tokens=}, {forward_batch.extend_seq_lens=}, {forward_batch.extend_seq_lens_cpu=}, {forward_batch.extend_prefix_lens_cpu=}"
+        #)
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
