@@ -1397,8 +1397,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             not moe_runner_config.apply_router_weight_on_input
         ), "apply_router_weight_on_input is not supported for Flashinfer"
 
-        from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
-        from sgl_kernel import scaled_fp4_grouped_quant
+        from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+            flashinfer_cutedsl_moe_masked,
+        )
 
         out = flashinfer_cutedsl_moe_masked(
             hidden_states=x,
