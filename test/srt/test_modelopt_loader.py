@@ -15,6 +15,11 @@ import torch.nn as nn
 # Add the sglang path for testing
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../python"))
 
+# Constants for calibration parameters to avoid hard-coded values
+CALIBRATION_BATCH_SIZE = 36
+CALIBRATION_NUM_SAMPLES = 512
+DEFAULT_DEVICE = "cuda:0"
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
@@ -41,7 +46,7 @@ class TestModelOptModelLoader(CustomTestCase):
         self.mock_base_model = MagicMock(spec=nn.Module)
         self.mock_base_model.eval.return_value = self.mock_base_model
         self.mock_base_model.device = (
-            "cuda:0"  # Add device attribute for calibration tests
+            DEFAULT_DEVICE  # Add device attribute for calibration tests
         )
 
     @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
@@ -379,9 +384,15 @@ class TestModelOptModelLoader(CustomTestCase):
 
         # Verify key calibration parameters are present in the source
         self.assertIn("cnn_dailymail", source, "Should use CNN/DailyMail dataset")
-        self.assertIn("batch_size=36", source, "Should use batch size of 36")
         self.assertIn(
-            "num_samples=512", source, "Should use 512 samples for calibration"
+            f"batch_size={CALIBRATION_BATCH_SIZE}",
+            source,
+            f"Should use batch size of {CALIBRATION_BATCH_SIZE}",
+        )
+        self.assertIn(
+            f"num_samples={CALIBRATION_NUM_SAMPLES}",
+            source,
+            f"Should use {CALIBRATION_NUM_SAMPLES} samples for calibration",
         )
         self.assertIn("include_labels=False", source, "Should not include labels")
         self.assertIn(
