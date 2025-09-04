@@ -1864,7 +1864,6 @@ class ModelOptModelLoader(DefaultModelLoader):
         # Import ModelOpt modules (already done in _load_modelopt_base_model, but needed here for quantization)
         try:
             import modelopt.torch.quantization as mtq
-            from modelopt.torch.utils.dataset_utils import create_forward_loop
         except ImportError:
             logger.error(
                 "NVIDIA Model Optimizer (modelopt) library not found. "
@@ -1893,22 +1892,6 @@ class ModelOptModelLoader(DefaultModelLoader):
                 "Please verify QUANT_CFG_CHOICES and the ModelOpt library."
             )
 
-        # For now, assume no calibration. Calibration setup is a separate, more complex step.
-        use_calibration = False  # This would ideally be a configurable parameter
-        calib_dataloader = None  # This would need to be provided/configured
-
-        calibrate_loop = (
-            create_forward_loop(dataloader=calib_dataloader)
-            if use_calibration
-            else None
-        )
-
-        if use_calibration and calib_dataloader is None:
-            logger.warning(
-                "ModelOpt calibration requested but no calib_dataloader provided. "
-                "Proceeding without calibration. Quantization accuracy may be affected."
-            )
-
         logger.info(
             f"Quantizing model with ModelOpt using config attribute: mtq.{quant_cfg_name}"
         )
@@ -1929,14 +1912,6 @@ class ModelOptModelLoader(DefaultModelLoader):
         except Exception as e:
             print(f"Warning: ModelOpt quantization failed: {e}")
             print("Proceeding without quantization...")
-
-        # try:
-        #     model = mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
-        #     logger.info("Model successfully quantized with ModelOpt.")
-        # except Exception as e:
-        #     logger.error(f"Error during ModelOpt mtq.quantize call: {e}")
-        #     raise
-        # mtq.print_quant_summary(model)
 
         return model.eval()
 
