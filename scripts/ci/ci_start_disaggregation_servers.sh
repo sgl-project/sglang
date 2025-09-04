@@ -27,7 +27,7 @@ for i in {0..3}; do
   BOOTSTRAP_PORT=$((9001 + i))
   HOST="127.0.0.$((i + 1))"
   echo "Launching PREFILL server on GPU $i at $HOST:$PORT (bootstrap: $BOOTSTRAP_PORT)"
-  CUDA_VISIBLE_DEVICES=$i SGLANG_HOST_IP=$HOST \
+  CUDA_VISIBLE_DEVICES=$i \
   python3 -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
     --disaggregation-mode prefill \
@@ -42,7 +42,7 @@ for i in {4..7}; do
   PORT=$((30001 + i))
   HOST="127.0.0.$((i + 1))"
   echo "Launching DECODE server on GPU $i at $HOST:$PORT"
-  CUDA_VISIBLE_DEVICES=$i SGLANG_HOST_IP=$HOST \
+  CUDA_VISIBLE_DEVICES=$i \
   python3 -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
     --disaggregation-mode decode \
