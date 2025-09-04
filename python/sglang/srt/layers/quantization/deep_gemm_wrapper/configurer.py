@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
-    if sm_version < 90:
+    if sm_version != 90:
         return False
 
     try:
