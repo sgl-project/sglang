@@ -1,9 +1,6 @@
 // PD (Prefill-Decode) gRPC Router Implementation
 
-use crate::config::types::{
-    CircuitBreakerConfig as ConfigCircuitBreakerConfig,
-    HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
-};
+use crate::config::types::RetryConfig;
 use crate::core::{
     BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig, Worker, WorkerType,
 };
@@ -61,27 +58,33 @@ pub struct GrpcPDRouter {
 
 impl GrpcPDRouter {
     /// Create a new gRPC PD router
-    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
         prefill_policy: Arc<dyn LoadBalancingPolicy>,
         decode_policy: Arc<dyn LoadBalancingPolicy>,
-        timeout_secs: u64,
-        interval_secs: u64,
-        dp_aware: bool,
-        api_key: Option<String>,
-        retry_config: RetryConfig,
-        circuit_breaker_config: ConfigCircuitBreakerConfig,
-        health_check_config: ConfigHealthCheckConfig,
-        tokenizer: Arc<dyn Tokenizer>,
-        reasoning_parser_factory: ParserFactory,
-        tool_parser_registry: &'static ParserRegistry,
+        ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
         // Update metrics
         RouterMetrics::set_active_workers(prefill_urls.len() + decode_urls.len());
 
+        // Extract necessary components from context
+        let tokenizer = ctx
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "gRPC PD router requires tokenizer".to_string())?
+            .clone();
+        let reasoning_parser_factory = ctx
+            .reasoning_parser_factory
+            .as_ref()
+            .ok_or_else(|| "gRPC PD router requires reasoning parser factory".to_string())?
+            .clone();
+        let tool_parser_registry = ctx
+            .tool_parser_registry
+            .ok_or_else(|| "gRPC PD router requires tool parser registry".to_string())?;
+
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
+        let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
         let core_cb_config = CircuitBreakerConfig {
             failure_threshold: circuit_breaker_config.failure_threshold,
             success_threshold: circuit_breaker_config.success_threshold,
@@ -138,11 +141,11 @@ impl GrpcPDRouter {
                 )
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {
-                    timeout_secs: health_check_config.timeout_secs,
-                    check_interval_secs: health_check_config.check_interval_secs,
-                    endpoint: health_check_config.endpoint.clone(),
-                    failure_threshold: health_check_config.failure_threshold,
-                    success_threshold: health_check_config.success_threshold,
+                    timeout_secs: ctx.router_config.health_check.timeout_secs,
+                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                    endpoint: ctx.router_config.health_check.endpoint.clone(),
+                    failure_threshold: ctx.router_config.health_check.failure_threshold,
+                    success_threshold: ctx.router_config.health_check.success_threshold,
                 });
                 Box::new(worker) as Box<dyn Worker>
             })
@@ -159,11 +162,11 @@ impl GrpcPDRouter {
                 )
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {
-                    timeout_secs: health_check_config.timeout_secs,
-                    check_interval_secs: health_check_config.check_interval_secs,
-                    endpoint: health_check_config.endpoint.clone(),
-                    failure_threshold: health_check_config.failure_threshold,
-                    success_threshold: health_check_config.success_threshold,
+                    timeout_secs: ctx.router_config.health_check.timeout_secs,
+                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                    endpoint: ctx.router_config.health_check.endpoint.clone(),
+                    failure_threshold: ctx.router_config.health_check.failure_threshold,
+                    success_threshold: ctx.router_config.health_check.success_threshold,
                 });
                 Box::new(worker) as Box<dyn Worker>
             })
@@ -187,10 +190,14 @@ impl GrpcPDRouter {
         let prefill_workers = Arc::new(RwLock::new(prefill_workers));
         let decode_workers = Arc::new(RwLock::new(decode_workers));
 
-        let prefill_health_checker =
-            crate::core::start_health_checker(Arc::clone(&prefill_workers), interval_secs);
-        let decode_health_checker =
-            crate::core::start_health_checker(Arc::clone(&decode_workers), interval_secs);
+        let prefill_health_checker = crate::core::start_health_checker(
+            Arc::clone(&prefill_workers),
+            ctx.router_config.worker_startup_check_interval_secs,
+        );
+        let decode_health_checker = crate::core::start_health_checker(
+            Arc::clone(&decode_workers),
+            ctx.router_config.worker_startup_check_interval_secs,
+        );
 
         Ok(GrpcPDRouter {
             prefill_workers,
@@ -204,11 +211,11 @@ impl GrpcPDRouter {
             tool_parser_registry,
             _prefill_health_checker: Some(prefill_health_checker),
             _decode_health_checker: Some(decode_health_checker),
-            timeout_secs,
-            interval_secs,
-            dp_aware,
-            api_key,
-            retry_config,
+            timeout_secs: ctx.router_config.worker_startup_timeout_secs,
+            interval_secs: ctx.router_config.worker_startup_check_interval_secs,
+            dp_aware: ctx.router_config.dp_aware,
+            api_key: ctx.router_config.api_key.clone(),
+            retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
         })
     }
