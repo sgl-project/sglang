@@ -36,6 +36,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_sm100_supported,
+    is_sm120_supported,
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
@@ -45,6 +46,7 @@ from sglang.srt.utils import (
 )
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
+_is_sm120_supported = is_cuda() and is_sm120_supported()
 has_triton_kernels = is_triton_kernels_available()
 
 
@@ -90,7 +92,7 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
         mx_axis=1, num_warps=num_warps
     )
-    if _is_sm100_supported:
+    if _is_sm100_supported or _is_sm120_supported:
         constraints = {
             "is_persistent": True,
             "epilogue_subtile": 1,

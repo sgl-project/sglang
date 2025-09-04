@@ -178,6 +178,12 @@ def is_sm100_supported(device=None) -> bool:
         torch.version.cuda >= "12.8"
     )
 
+@lru_cache(maxsize=1)
+def is_sm120_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 12) and (
+        torch.version.cuda >= "12.8"
+    )
+
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
