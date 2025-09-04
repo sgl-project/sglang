@@ -83,20 +83,8 @@ impl RouterFactory {
         // Create policy
         let policy = PolicyFactory::create_from_config(policy_config);
 
-        // Create regular router with injected policy and client
-        let router = Router::new(
-            worker_urls.to_vec(),
-            policy,
-            ctx.client.clone(),
-            ctx.router_config.worker_startup_timeout_secs,
-            ctx.router_config.worker_startup_check_interval_secs,
-            ctx.router_config.dp_aware,
-            ctx.router_config.api_key.clone(),
-            ctx.router_config.retry.clone(),
-            ctx.router_config.circuit_breaker.clone(),
-            ctx.router_config.health_check.clone(),
-        )
-        .await?;
+        // Create regular router with injected policy and context
+        let router = Router::new(worker_urls.to_vec(), policy, ctx).await?;
 
         Ok(Box::new(router))
     }
@@ -116,19 +104,13 @@ impl RouterFactory {
         let decode_policy =
             PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
 
-        // Create PD router with separate policies and client
+        // Create PD router with separate policies and context
         let router = PDRouter::new(
             prefill_urls.to_vec(),
             decode_urls.to_vec(),
             prefill_policy,
             decode_policy,
-            ctx.client.clone(),
-            ctx.router_config.request_timeout_secs,
-            ctx.router_config.worker_startup_timeout_secs,
-            ctx.router_config.worker_startup_check_interval_secs,
-            ctx.router_config.retry.clone(),
-            ctx.router_config.circuit_breaker.clone(),
-            ctx.router_config.health_check.clone(),
+            ctx,
         )
         .await?;
 
@@ -146,46 +128,8 @@ impl RouterFactory {
         // Create policy
         let policy = PolicyFactory::create_from_config(policy_config);
 
-        // Get tokenizer from context
-        let tokenizer = ctx
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| {
-                "gRPC router requires tokenizer to be initialized in AppContext".to_string()
-            })?
-            .clone();
-
-        // Get reasoning parser factory from context
-        let reasoning_parser_factory = ctx
-            .reasoning_parser_factory
-            .as_ref()
-            .ok_or_else(|| {
-                "gRPC router requires reasoning parser factory to be initialized in AppContext"
-                    .to_string()
-            })?
-            .clone();
-
-        // Get tool parser registry from context
-        let tool_parser_registry = ctx.tool_parser_registry.ok_or_else(|| {
-            "gRPC router requires tool parser registry to be initialized in AppContext".to_string()
-        })?;
-
-        // Create gRPC router
-        let router = GrpcRouter::new(
-            worker_urls.to_vec(),
-            policy,
-            ctx.router_config.worker_startup_timeout_secs,
-            ctx.router_config.worker_startup_check_interval_secs,
-            ctx.router_config.dp_aware,
-            ctx.router_config.api_key.clone(),
-            ctx.router_config.effective_retry_config(),
-            ctx.router_config.effective_circuit_breaker_config(),
-            ctx.router_config.health_check.clone(),
-            tokenizer,
-            reasoning_parser_factory,
-            tool_parser_registry,
-        )
-        .await?;
+        // Create gRPC router with context
+        let router = GrpcRouter::new(worker_urls.to_vec(), policy, ctx).await?;
 
         Ok(Box::new(router))
     }
@@ -207,47 +151,13 @@ impl RouterFactory {
         let decode_policy =
             PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
 
-        // Get tokenizer from context
-        let tokenizer = ctx
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| {
-                "gRPC PD router requires tokenizer to be initialized in AppContext".to_string()
-            })?
-            .clone();
-
-        // Get reasoning parser factory from context
-        let reasoning_parser_factory = ctx
-            .reasoning_parser_factory
-            .as_ref()
-            .ok_or_else(|| {
-                "gRPC PD router requires reasoning parser factory to be initialized in AppContext"
-                    .to_string()
-            })?
-            .clone();
-
-        // Get tool parser registry from context
-        let tool_parser_registry = ctx.tool_parser_registry.ok_or_else(|| {
-            "gRPC PD router requires tool parser registry to be initialized in AppContext"
-                .to_string()
-        })?;
-
-        // Create gRPC PD router
+        // Create gRPC PD router with context
         let router = GrpcPDRouter::new(
             prefill_urls.to_vec(),
             decode_urls.to_vec(),
             prefill_policy,
             decode_policy,
-            ctx.router_config.worker_startup_timeout_secs,
-            ctx.router_config.worker_startup_check_interval_secs,
-            ctx.router_config.dp_aware,
-            ctx.router_config.api_key.clone(),
-            ctx.router_config.effective_retry_config(),
-            ctx.router_config.effective_circuit_breaker_config(),
-            ctx.router_config.health_check.clone(),
-            tokenizer,
-            reasoning_parser_factory,
-            tool_parser_registry,
+            ctx,
         )
         .await?;
 

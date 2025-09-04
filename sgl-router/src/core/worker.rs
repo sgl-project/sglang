@@ -986,7 +986,7 @@ pub fn start_health_checker(
 
             // Periodically reset load counters to prevent drift
             // Only do this when we believe all workers should be idle
-            if check_count % LOAD_RESET_INTERVAL == 0 {
+            if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
                 let max_load = workers_to_check.iter().map(|w| w.load()).max().unwrap_or(0);
                 // Only reset if load appears to be very low (likely drift)
                 if max_load <= 2 {
