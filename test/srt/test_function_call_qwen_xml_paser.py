@@ -174,7 +174,7 @@ fahrenheit
 
         result = self.detector.detect_and_parse(model_output, tools=self.tools)
 
-        self.assertEqual(result.normal_text, "\n")
+        self.assertEqual(result.normal_text, "")
         self.assertEqual(len(result.calls), 2)
 
         # First call

@@ -1440,8 +1440,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
         return self.tool_call_start_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        normal, calls = self._extract(text, tools)
-        return StreamingParseResult(normal_text=normal, calls=calls)
+        # normal, calls = self._extract(text, tools)
+        # return StreamingParseResult(normal_text=normal, calls=calls)
+
+        return self.parse_streaming_increment(text, tools)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
