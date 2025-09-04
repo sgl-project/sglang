@@ -51,22 +51,22 @@ class StreamingXMLToolCallParser:
     - text_content_buffer: text content buffer
 
     ## Processing flow:
-    a. State initialization: set initial state variables and XML parser
-    b. Streaming input processing: receive data chunks through parse_single_streaming_chunks
-    c. XML element identification: use _find_next_complete_element to identify complete XML elements
-    d. XML parsing: use expat parser to process XML elements, triggering _start_element, _char_data, _end_element callbacks
-    e. State transition: update state variables based on XML element types
-    f. Delta generation: generate DeltaMessage at appropriate times and send
+    -. State initialization: set initial state variables and XML parser
+    -. Streaming input processing: receive data chunks through parse_single_streaming_chunks
+    -. XML element identification: use _find_next_complete_element to identify complete XML elements
+    -. XML parsing: use expat parser to process XML elements, triggering _start_element, _char_data, _end_element callbacks
+    -. State transition: update state variables based on XML element types
+    -. Delta generation: generate DeltaMessage at appropriate times and send
 
-    4. State transition process:
-    a. Start parsing: <tool_call> tag resets tool call state
-    b. Function identification: <function> tag extracts function name and generates initial tool call Delta
-    c. Parameter processing: <parameter> tag starts parameter parsing, _char_data processes parameter values
-    d. Parameter end: decide whether to add quotes based on parameter type, store converted value
-    e. Function end: close JSON object, output complete function call
-    f. Tool call end: </tool_call> tag ends current tool call, reset parser state
+    ## State transition process:
+    -. Start parsing: <tool_call> tag resets tool call state
+    -. Function identification: <function> tag extracts function name and generates initial tool call Delta
+    -. Parameter processing: <parameter> tag starts parameter parsing, _char_data processes parameter values
+    -. Parameter end: decide whether to add quotes based on parameter type, store converted value
+    -. Function end: close JSON object, output complete function call
+    -. Tool call end: </tool_call> tag ends current tool call, reset parser state
 
-    5. Special handling:
+     Special handling:
     - XML special character escaping and unescaping
     - Parameter type conversion (string, number, boolean, etc.)
     - Streaming output delay processing to ensure correct JSON format
@@ -187,6 +187,22 @@ class StreamingXMLToolCallParser:
         elif param_type in ["boolean", "bool", "binary"]:
             param_value = param_value.lower()
             return param_value == "true"
+        elif param_type in ["array"]:
+            try:
+                # First try ast.literal_eval for safe evaluation of Python literals
+                param_value = ast.literal_eval(param_value)
+                if not isinstance(param_value, list):
+                    param_value = list(param_value)
+            except (ValueError, SyntaxError):
+                # If literal_eval fails, try json.loads for JSON array format
+                try:
+                    param_value = json.loads(param_value)
+                    if not isinstance(param_value, list):
+                        param_value = list(param_value)
+                except (json.JSONDecodeError, TypeError):
+                    # If both parsing methods fail, keep as string
+                    pass
+            return param_value
         else:
             return param_value
 
@@ -1126,7 +1142,6 @@ class StreamingXMLToolCallParser:
         if data and self.current_param_name:
             # Get parameter type
             param_type = self._get_param_type(self.current_param_name)
-
             # Check if this is the first time receiving data for this parameter
             if not self.current_param_value:
                 # If it's the first packet of data and starts with \n, remove \n
