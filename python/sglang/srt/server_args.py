@@ -347,6 +347,7 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    offload_mm_feature: bool = False
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
 
@@ -1958,6 +1959,11 @@ class ServerArgs:
             "--disable-fast-image-processor",
             action="store_true",
             help="Adopt base image processor instead of fast image processor.",
+        )
+        parser.add_argument(
+            "--offload-mm-feature",
+            action="store_true",
+            help="Move multimodal feature tensors to host after processing to save device memory.",
         )
         parser.add_argument(
             "--enable-return-hidden-states",
