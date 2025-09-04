@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 
 from .compilation_counter import compilation_counter
-from sglang.srt.model_executor.compilation.wrapper import TorchCompileWrapperWithCustomDispatcher
+from sglang.srt.model_executor.wrapper import TorchCompileWrapperWithCustomDispatcher
 
 import logging
 
@@ -185,7 +185,6 @@ def support_torch_compile(
                 f"{cls}. Please provide dynamic_arg_dims explicitly.")
 
         for k in inferred_dynamic_arg_dims:
-            print(f"k: {k}")
             if k not in sig.parameters:
                 raise ValueError(
                     f"Argument {k} not found in the forward method of {cls}")
@@ -219,9 +218,18 @@ def _support_torch_compile(
 
     setattr(cls, IGNORE_COMPILE_KEY, False)
 
-    def __init__(self, *, config: Any, prefix: str = '', **kwargs):
-        old_init(self, config=config, prefix=prefix, **kwargs)
-        self.config = config
+    def __init__(self, *args, **kwargs):
+        old_init(self, *args, **kwargs)
+        sig = inspect.signature(old_init)
+        bound = sig.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        cfg = bound.arguments.get("config", getattr(self, "config", None))
+
+        if cfg is not None:
+            self.config = cfg
+        else:
+            self.config = None
+
         # for CompilationLevel.DYNAMO_AS_IS , the upper level model runner
         # will handle the compilation, so we don't need to do anything here.
         self.do_not_compile = False
