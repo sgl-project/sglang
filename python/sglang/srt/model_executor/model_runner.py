@@ -1180,6 +1180,14 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype == "fp4_e2m1":
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                self.kv_cache_dtype = torch.float4_e2m1fn_x2
+            else:
+                logging.warning(
+                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
+                )
+                self.kv_cache_dtype = self.dtype
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
