@@ -1058,7 +1058,6 @@ class ServerArgs:
             default=ServerArgs.priority_scheduling_preemption_threshold,
             help="Minimum difference in priorities for an incoming request to have to preempt running request(s).",
         )
-        # todo - consider adding validation for above with cache aware priroity mode. error out?
         parser.add_argument(
             "--schedule-conservativeness",
             type=float,
