@@ -706,6 +706,73 @@ def set_mla_kv_buffer_triton(
     )
 
 
+@triton.jit
+def set_mla_kv_scale_buffer_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    total_dim = nope_dim + rope_dim
+    mask = offs < total_dim  # Make sure don't cross the boundary
+
+    loc = tl.load(loc_ptr + pid_loc)
+    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+
+    # Check each offs should read 'nope' or 'rope'
+    is_nope = offs < nope_dim
+    src_nope = tl.load(
+        cache_k_nope_ptr + pid_loc * nope_stride + offs, mask=mask & is_nope, other=0.0
+    )
+    src_rope = tl.load(
+        cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
+        mask=mask & ~is_nope,
+        other=0.0,
+    )
+
+    # Combine nope + rope
+    src = src_nope + src_rope
+    tl.store(dst_ptr, src, mask=mask)
+
+
+def set_mla_kv_scale_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    nope_dim = cache_k_nope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1]
+    total_dim = nope_dim + rope_dim
+    BLOCK = 128  # Keep origin, works for smaller total_dim as well.
+    n_loc = loc.numel()
+    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
+
+    set_mla_kv_scale_buffer_kernel[grid](
+        kv_buffer,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+        BLOCK=BLOCK,
+    )
+
+
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -753,15 +820,41 @@ class MLATokenToKVPool(KVCache):
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
-                        dtype=self.store_dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
+                if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+                    m = size + page_size
+                    n = 1  # head_num
+                    k = kv_lora_rank + qk_rope_head_dim  # head_dim
+
+                    scale_block_size = 16
+                    self.store_dtype = torch.uint8
+
+                    self.kv_buffer = [
+                        torch.zeros(
+                            (m, n, k // 2),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
+
+                    self.kv_scale_buffer = [
+                        torch.zeros(
+                            (m, k // scale_block_size),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
+                else:
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.kv_buffer = [
+                        torch.zeros(
+                            (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
 
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
@@ -801,7 +894,23 @@ class MLATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+            if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+                cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(
+                    torch.uint8
+                )
+                cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
+
+                from sglang.srt.layers.quantization.kvfp4_tensor import (
+                    KVFP4QuantizeUtil,
+                )
+
+                cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
+                    cache_k_nope_fp4, cache_k_nope_fp4_sf
+                )
+                return cache_k_nope_fp4_dequant
+            else:
+                return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+
         return self.kv_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
@@ -826,11 +935,29 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
+            if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+                from sglang.srt.layers.quantization.kvfp4_tensor import (
+                    KVFP4QuantizeUtil,
+                )
+
+                cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
+                    cache_k
+                )
+            else:
+                cache_k = cache_k.to(self.dtype)
+
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
-                self.store_dtype
-            )
+            if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
+                    self.store_dtype
+                )
+                self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
+                    cache_k_fp4_sf.view(self.store_dtype)
+                )
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                    self.store_dtype
+                )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
@@ -843,15 +970,44 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         if cache_k_nope.dtype != self.dtype:
-            cache_k_nope = cache_k_nope.to(self.dtype)
-            cache_k_rope = cache_k_rope.to(self.dtype)
+            if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+                from sglang.srt.layers.quantization.kvfp4_tensor import (
+                    KVFP4QuantizeUtil,
+                )
+
+                cache_k_nope_fp4, cache_k_nope_fp4_sf = (
+                    KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
+                )
+                cache_k_rope_fp4, cache_k_rope_fp4_sf = (
+                    KVFP4QuantizeUtil.batched_quantize(cache_k_rope)
+                )
+            else:
+                cache_k_nope = cache_k_nope.to(self.dtype)
+                cache_k_rope = cache_k_rope.to(self.dtype)
         if self.store_dtype != self.dtype:
             cache_k_nope = cache_k_nope.view(self.store_dtype)
             cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-        set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id - self.start_layer], loc, cache_k_nope, cache_k_rope
-        )
+        if self.dtype == getattr(torch, "float4_e2m1fn_x2", None) and _is_cuda:
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope_fp4,
+                cache_k_rope_fp4,
+            )
+            set_mla_kv_scale_buffer_triton(
+                self.kv_scale_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope_fp4_sf,
+                cache_k_rope_fp4_sf,
+            )
+        else:
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+            )
 
     def get_cpu_copy(self, indices):
         torch.cuda.synchronize()
