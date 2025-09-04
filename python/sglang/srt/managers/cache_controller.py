@@ -884,7 +884,7 @@ class HiCacheController:
 
                 if not self.backup_skip:
                     self._page_backup(operation)
-                self.ack_backup_queue.put(operation.id)
+                self.ack_backup_queue.put(operation)
 
             except Empty:
                 continue

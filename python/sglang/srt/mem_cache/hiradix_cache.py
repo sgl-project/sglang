@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.metrics.collector import StorageMetricsCollector
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +32,16 @@ class HiRadixCache(RadixCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
+        tp_rank: int,
+        pp_rank: int,
+        dp_rank: Optional[int],
         page_size: int,
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
         hicache_io_backend: str,
         hicache_mem_layout: str,
+        enable_metrics: bool,
         hicache_storage_backend: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
         model_name: Optional[str] = None,
@@ -72,9 +77,18 @@ class HiRadixCache(RadixCache):
 
         self.tp_group = tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-        self.tp_rank = torch.distributed.get_rank(group=self.tp_group)
-
         self.enable_storage = hicache_storage_backend is not None
+        self.enable_storage_metrics = self.enable_storage and enable_metrics
+        if self.enable_storage_metrics:
+            labels = {
+                "storage_backend": hicache_storage_backend,
+                "tp_rank": tp_rank,
+                "pp_rank": pp_rank,
+            }
+            if dp_rank is not None:
+                labels["dp_rank"] = dp_rank
+            self.metrics_collector = StorageMetricsCollector(labels=labels)
+
         # todo: customizable storage prefetch threshold and timeout
         self.prefetch_threshold = 256
         self.prefetch_timeout = 3  # seconds
@@ -381,11 +395,9 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
-            if self.tp_rank == 0:
-                stats = self.cache_controller.storage_backend.get_stats()
-                if stats is not None:
-                    storage_log = self.cache_controller.storage_backend.log_stats(stats)
-                    logger.info(storage_log)
+        if self.enable_storage_metrics:
+            storage_metrics = self.cache_controller.storage_backend.get_stats()
+            self.metrics_collector.log_storage_metrics(storage_metrics)
 
     def drain_storage_control_queues(self):
         """
@@ -421,7 +433,9 @@ class HiRadixCache(RadixCache):
 
         # process backup acks
         for _ in range(n_backup):
-            ack_id = cc.ack_backup_queue.get()
+            operation = cc.ack_backup_queue.get()
+            self.metrics_collector.log_backuped_tokens(operation.completed_tokens)
+            ack_id = operation.id
             entry = self.ongoing_backup.pop(ack_id, None)
             if entry is not None:
                 entry.release_host()
@@ -521,6 +535,11 @@ class HiRadixCache(RadixCache):
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+        if self.enable_storage_metrics:
+            self.metrics_collector.log_prefetched_tokens(
+                min_completed_tokens - matched_length
+            )
 
         return True
 

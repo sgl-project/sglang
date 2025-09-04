@@ -131,9 +131,6 @@ class HiCacheStorage(ABC):
     def get_stats(self):
         return None
 
-    def log_stats(self, stats):
-        return None
-
 
 class HiCacheFile(HiCacheStorage):
 

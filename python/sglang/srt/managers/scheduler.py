@@ -624,12 +624,16 @@ class Scheduler(
                         if self.server_args.enable_dp_attention
                         else self.tp_cpu_group
                     ),
+                    tp_rank=self.tp_rank,
+                    pp_rank=self.pp_rank,
+                    dp_rank=self.dp_rank,
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
                     hicache_io_backend=server_args.hicache_io_backend,
                     hicache_mem_layout=server_args.hicache_mem_layout,
+                    enable_metrics=self.enable_metrics,
                     hicache_storage_backend=server_args.hicache_storage_backend,
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                     model_name=server_args.served_model_name,

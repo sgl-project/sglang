@@ -14,7 +14,7 @@
 """Utilities for Prometheus Metrics Collection."""
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
@@ -551,3 +551,100 @@ class TokenizerMetricsCollector:
 
     def observe_one_aborted_request(self):
         self.num_aborted_requests_total.labels(**self.labels).inc(1)
+
+
+@dataclass
+class StorageMetrics:
+    prefetch_io: List[int] = field(default_factory=list)
+    backup_io: List[int] = field(default_factory=list)
+    prefetch_bandwidth: List[float] = field(default_factory=list)
+    backup_bandwidth: List[float] = field(default_factory=list)
+
+
+class StorageMetricsCollector:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+    ):
+        from prometheus_client import Counter, Histogram
+
+        self.labels = labels
+
+        self.prefetched_tokens_total = Counter(
+            name="sglang:prefetched_tokens_total",
+            documentation="Number of prefetched prompt tokens.",
+            labelnames=labels.keys(),
+        )
+
+        self.backuped_tokens_total = Counter(
+            name="sglang:backuped_tokens_total",
+            documentation="Number of backuped tokens.",
+            labelnames=labels.keys(),
+        )
+
+        bucket_io = [
+            1,
+            5,
+            10,
+            50,
+            100,
+        ]
+
+        bucket_bandwidth = [
+            0.1,
+            0.5,
+            1,
+            5,
+            10,
+            50,
+            100,
+        ]
+
+        self.histogram_prefetch_io = Histogram(
+            name="sglang:prefetch_io",
+            documentation="Histogram of prefetch io.",
+            labelnames=labels.keys(),
+            buckets=bucket_io,
+        )
+
+        self.histogram_backup_io = Histogram(
+            name="sglang:backup_io",
+            documentation="Histogram of backup io.",
+            labelnames=labels.keys(),
+            buckets=bucket_io,
+        )
+
+        self.histogram_prefetch_bandwidth = Histogram(
+            name="sglang:prefetch_bandwidth",
+            documentation="Histogram of prefetch bandwidth in GB/s.",
+            labelnames=labels.keys(),
+            buckets=bucket_io,
+        )
+
+        self.histogram_backup_bandwidth = Histogram(
+            name="sglang:backup_bandwidth",
+            documentation="Histogram of backup bandwidth in GB/s.",
+            labelnames=labels.keys(),
+            buckets=bucket_io,
+        )
+
+    def log_prefetched_tokens(self, prefetched_tokens: int):
+        if prefetched_tokens > 0:
+            self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
+
+    def log_backuped_tokens(self, backuped_tokens: int):
+        if backuped_tokens > 0:
+            self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def _log_histogram(self, histogram, data: Union[int, float]):
+        histogram.labels(**self.labels).observe(data)
+
+    def log_storage_metrics(self, storage_metrics: StorageMetrics):
+        for v in storage_metrics.prefetch_io:
+            self._log_histogram(self.histogram_prefetch_io, v)
+        for v in storage_metrics.backup_io:
+            self._log_histogram(self.histogram_backup_io, v)
+        for v in storage_metrics.prefetch_bandwidth:
+            self._log_histogram(self.histogram_prefetch_bandwidth, v)
+        for v in storage_metrics.backup_bandwidth:
+            self._log_histogram(self.histogram_backup_bandwidth, v)

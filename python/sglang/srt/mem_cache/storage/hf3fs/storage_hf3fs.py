@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
+from sglang.srt.metrics.collector import StorageMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -176,8 +177,10 @@ class HiCacheHF3FS(HiCacheStorage):
         signal.signal(signal.SIGTERM, lambda sig, frame: self.close())
         signal.signal(signal.SIGQUIT, lambda sig, frame: self.close())
 
-        self.read_stats = []
-        self.write_stats = []
+        self.prefetch_io = []
+        self.backup_io = []
+        self.prefetch_bandwidth = []
+        self.backup_bandwidth = []
 
     @staticmethod
     def from_env_config(
@@ -327,7 +330,10 @@ class HiCacheHF3FS(HiCacheStorage):
 
         end_time = time.perf_counter()
         ionum = len(batch_indices)
-        self.read_stats.append((ionum, ionum / (end_time - start_time)))
+        self.prefetch_io.append(ionum)
+        self.prefetch_bandwidth.append(
+            ionum / (end_time - start_time) * self.gb_per_page
+        )
 
         results = [None] * len(keys)
         for batch_index, file_result, read_result in zip(
@@ -404,7 +410,8 @@ class HiCacheHF3FS(HiCacheStorage):
 
         end_time = time.perf_counter()
         ionum = len(batch_indices)
-        self.write_stats.append((ionum, ionum / (end_time - start_time)))
+        self.backup_io.append(ionum)
+        self.backup_bandwidth.append(ionum / (end_time - start_time) * self.gb_per_page)
 
         written_keys_to_confirm = []
         results = [index[0] for index in indices]
@@ -470,40 +477,13 @@ class HiCacheHF3FS(HiCacheStorage):
 
     @synchronized()
     def get_stats(self):
-        if not (len(self.read_stats) or len(self.write_stats)):
-            return None
-
-        iosize_gb = self.gb_per_page
-        read_stats = [(v[0], v[1] * iosize_gb) for v in self.read_stats]
-        write_stats = [(v[0], v[1] * iosize_gb) for v in self.write_stats]
-        self.read_stats.clear()
-        self.write_stats.clear()
-        return (read_stats, write_stats)
-
-    def get_quartile(self, sorted_stats):
-        if not len(sorted_stats):
-            return []
-
-        idx_25 = len(sorted_stats) // 4
-        indices = [0, idx_25, idx_25 * 2, idx_25 * 3, len(sorted_stats) - 1]
-        return [sorted_stats[i] for i in indices]
-
-    def log_stats(self, stats):
-        read_stats, write_stats = stats
-
-        if not (len(read_stats) or len(write_stats)):
-            return None
-
-        read_stats = sorted(read_stats, key=lambda x: x[1])
-        write_stats = sorted(write_stats, key=lambda x: x[1])
-        read_quartile = [
-            f"#io {v[0]}, {v[1]:.3f} GB/s" for v in self.get_quartile(read_stats)
-        ]
-        write_quartile = [
-            f"#io {v[0]}, {v[1]:.3f} GB/s" for v in self.get_quartile(write_stats)
-        ]
-        return (
-            f"Storage quartiles. "
-            f"#batch_get: {len(read_stats)}, quartiles: {read_quartile}; "
-            f"#batch_set: {len(write_stats)}, quartiles: {write_quartile}"
-        )
+        storage_metrics = StorageMetrics()
+        storage_metrics.prefetch_io.extend(self.prefetch_io)
+        storage_metrics.backup_io.extend(self.backup_io)
+        storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
+        storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
+        self.prefetch_io.clear()
+        self.backup_io.clear()
+        self.prefetch_bandwidth.clear()
+        self.backup_bandwidth.clear()
+        return storage_metrics
