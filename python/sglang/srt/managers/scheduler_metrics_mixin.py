@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import logging
 import time
 from collections import defaultdict
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -9,6 +11,9 @@ from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +33,9 @@ class KvMetrics:
 
 
 class SchedulerMetricsMixin:
-    def init_metrics(self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]):
+    def init_metrics(
+        self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+    ):
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -50,14 +57,14 @@ class SchedulerMetricsMixin:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(labels=labels)
 
-    def init_kv_events(self, kv_events_config: Optional[str]):
+    def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config, self.attn_dp_rank
             )
 
     def log_prefill_stats(
-        self,
+        self: Scheduler,
         adder: PrefillAdder,
         can_run_list: List[Req],
         running_bs: int,
@@ -138,7 +145,7 @@ class SchedulerMetricsMixin:
         self._publish_kv_events()
 
     def log_decode_stats(
-        self, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
+        self: Scheduler, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
     ):
         batch = running_batch or self.running_batch
 
@@ -220,7 +227,7 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
-    def _emit_kv_metrics(self):
+    def _emit_kv_metrics(self: Scheduler):
         kv_metrics = KvMetrics()
         kv_metrics.request_active_slots = self.stats.num_running_reqs
         kv_metrics.request_total_slots = self.max_running_requests
@@ -236,7 +243,7 @@ class SchedulerMetricsMixin:
         if not self.send_metrics_from_scheduler.closed:
             self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
 
-    def _publish_kv_events(self):
+    def _publish_kv_events(self: Scheduler):
         if self.enable_kv_cache_events:
             events = self.tree_cache.take_events()
             if events:
