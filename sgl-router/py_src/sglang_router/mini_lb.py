@@ -62,6 +62,8 @@ class MiniLoadBalancer:
             )
 
     def start(self):
+        global load_balancer
+        load_balancer = self
         uvicorn.run(app, host=self.host, port=self.port)
 
     def select_pair(self):
@@ -257,8 +259,6 @@ async def get_server_info():
 
 @app.get("/get_model_info")
 async def get_model_info():
-    global load_balancer
-
     if not load_balancer or not load_balancer.prefill_servers:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
