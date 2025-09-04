@@ -1,5 +1,6 @@
 from typing import Optional
 
+from sglang_router.router_args import RouterArgs
 from sglang_router_rs import PolicyType
 from sglang_router_rs import Router as _Router
 
@@ -95,8 +96,10 @@ class Router:
         self._router = router
 
     @staticmethod
-    def from_args_dict(args_dict: dict) -> "Router":
+    def from_args(args: RouterArgs) -> "Router":
         """Create a router from a RouterArgs instance."""
+
+        args_dict = vars(args)
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []

@@ -209,18 +209,7 @@ class TestLaunchRouter(unittest.TestCase):
         self.assertEqual(router_args.decode_urls[1], "http://decode2:8081")
 
         # Test Router creation in PD mode
-        router = Router(
-            worker_urls=[],  # Empty for PD mode
-            pd_disaggregation=True,
-            prefill_urls=[
-                ("http://prefill1:8080", 9000),
-                ("http://prefill2:8080", None),
-            ],
-            decode_urls=["http://decode1:8081", "http://decode2:8081"],
-            policy=PolicyType.CacheAware,
-            host="127.0.0.1",
-            port=3001,
-        )
+        router = Router.from_args(router_args)
         self.assertIsNotNone(router)
 
     def test_policy_validation(self):

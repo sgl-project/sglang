@@ -33,8 +33,7 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             mini_lb.start()
         else:
             router_args._validate_router_args()
-            router_args_dict = vars(router_args)
-            router = Router.from_args_dict(router_args_dict)
+            router = Router.from_args(router_args)
             router.start()
 
     except Exception as e:

@@ -471,6 +471,12 @@ class RouterArgs:
             cli_args_dict[f"{prefix}decode"]
         )
         args_dict["selector"] = cls._parse_selector(cli_args_dict[f"{prefix}selector"])
+        args_dict["prefill_selector"] = cls._parse_selector(
+            cli_args_dict[f"{prefix}prefill-selector"]
+        )
+        args_dict["decode_selector"] = cls._parse_selector(
+            cli_args_dict[f"{prefix}decode-selector"]
+        )
 
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
