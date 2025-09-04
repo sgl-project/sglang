@@ -4,7 +4,6 @@ from typing import Any, Dict, Iterable, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 from torch import nn
 
 from sglang.srt.configs.qwen3_hybrid_moe import Qwen3HybridMoeConfig
@@ -426,7 +425,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 projected_states,
             )
             query, key, value = map(
-                lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
+                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
         # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
@@ -471,10 +470,10 @@ class Qwen3GatedDeltaNet(nn.Module):
             z = z.reshape(-1, z.shape[-1])
             core_attn_out = self.norm(core_attn_out, z)
             core_attn_out = core_attn_out.reshape(z_shape_og)
-            core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
         else:
-            z = rearrange(z, "... h d -> ... (h d)")
-            core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+            z = z.reshape(*z.shape[:-2], -1)
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
             core_attn_out = self.norm(core_attn_out, z)
 
         output, _ = self.out_proj(core_attn_out)

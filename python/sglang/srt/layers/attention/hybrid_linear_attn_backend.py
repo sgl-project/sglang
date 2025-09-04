@@ -4,7 +4,6 @@ from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -292,14 +291,16 @@ class MambaAttnBackend(AttentionBackend):
             ],
             dim=-1,
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=head_k_dim),
-            (query, key),
-        )
-        value = rearrange(value, "l (h d) -> 1 l h d", d=head_v_dim)
+        # Reshape from [l, h*d] to [1, l, h, d]
+        seq_len = query.shape[0]
+        num_heads = query.shape[1] // head_k_dim
+        query = query.view(1, seq_len, num_heads, head_k_dim)
+        key = key.view(1, seq_len, num_heads, head_k_dim)
+        value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
         beta = b.sigmoid()
         g = fused_gdn_gating(A_log, a, dt_bias)
-        g, beta = map(lambda x: rearrange(x, "l  d -> 1 l d"), (g, beta))
+        g = g.view(1, *g.shape)
+        beta = beta.view(1, *beta.shape)
 
         if forward_batch.forward_mode.is_target_verify():
             # last_recurrent_state = ssm_states[cache_indices].clone()  # keep a copy
