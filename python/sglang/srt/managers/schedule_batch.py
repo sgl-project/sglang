@@ -965,7 +965,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
-    def alloc_req_slots(self, num_reqs: int, reqs: List[Req]):
+    def alloc_req_slots(self, num_reqs: int, reqs: Optional[List[Req]] = None):
         if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
             req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
         else:
