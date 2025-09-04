@@ -76,51 +76,29 @@ class LOOKAHEADWorker:
         )
 
         self.draft_tokens = torch.empty(
-            (max_total_drafts,), dtype=torch.int32, device=self.device
+            (max_total_drafts,), dtype=torch.int64, device=self.device
         )
         self.retrieve_indexes = torch.empty(
             (self.max_batch_size, self.draft_token_num),
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
         self.retrive_next_token = torch.empty(
             (self.max_batch_size, self.draft_token_num),
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
         self.retrive_next_sibling = torch.empty(
             (self.max_batch_size, self.draft_token_num),
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
         self.positions = torch.empty(
-            (max_total_drafts,), dtype=torch.int32, device=self.device
+            (max_total_drafts,), dtype=torch.int64, device=self.device
         )
         self.tree_mask = torch.empty(
             (max_total_mask_size,), dtype=torch.bool, device=self.device
         )
-        self.draft_token_nums = torch.full(
-            (self.max_batch_size,),
-            self.draft_token_num,
-            dtype=torch.int32,
-            device=self.device,
-        )
-
-        self.accept_length = torch.empty(
-            (self.max_batch_size,), dtype=torch.int32, device=self.device
-        )
-        self.accept_token_ids = torch.empty(
-            (self.max_batch_size, self.draft_token_num),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.last_verified_ids = torch.empty(
-            (self.max_batch_size,), dtype=torch.int32, device=self.device
-        )
-        self.flatten_index = torch.empty(
-            (max_total_drafts), dtype=torch.int32, device=self.device
-        )
-        self.total_accept_num = torch.empty((1,), dtype=torch.int32, device=self.device)
 
         self.draft_tokens_batch = []
         self.tree_mask_batch = []
@@ -128,10 +106,6 @@ class LOOKAHEADWorker:
         self.retrive_next_token_batch = []
         self.retrive_next_sibling_batch = []
         self.positions_batch = []
-        self.accept_length_batch = []
-        self.accept_token_ids_batch = []
-        self.last_verified_ids_batch = []
-        self.flatten_index_batch = []
 
         for bs in range(0, self.max_batch_size + 1):
             self.retrieve_indexes_batch.append(self.retrieve_indexes[:bs, :])
@@ -143,12 +117,6 @@ class LOOKAHEADWorker:
             )
             self.tree_mask_batch.append(
                 self.tree_mask[: bs * self.draft_token_num * self.draft_token_num]
-            )
-            self.accept_length_batch.append(self.accept_length[:bs])
-            self.accept_token_ids_batch.append(self.accept_token_ids[:bs, :])
-            self.last_verified_ids_batch.append(self.last_verified_ids[:bs])
-            self.flatten_index_batch.append(
-                self.flatten_index[: bs * self.draft_token_num]
             )
 
     def _prepare_draft_tokens(
@@ -191,8 +159,7 @@ class LOOKAHEADWorker:
 
         reconstruct_indices_from_tree_mask(
             tree_mask,
-            # seq_lens is int64
-            batch.seq_lens.to(dtype=torch.int32),
+            batch.seq_lens,
             positions,  # mutable
             retrive_index,  # mutable
             retrive_next_token,  # mutable
@@ -226,11 +193,6 @@ class LOOKAHEADWorker:
             retrive_index,
             retrive_next_token,
             retrive_next_sibling,
-            self.accept_length_batch[bs],
-            self.accept_token_ids_batch[bs],
-            self.last_verified_ids_batch[bs],
-            self.flatten_index_batch[bs],
-            self.total_accept_num,
             self.draft_token_num,
         )
         batch.spec_info.prepare_for_verify(batch, self.page_size)

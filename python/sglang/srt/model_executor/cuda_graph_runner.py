@@ -874,11 +874,6 @@ class CudaGraphRunner:
                 retrive_index=None,
                 retrive_next_token=None,
                 retrive_next_sibling=None,
-                accept_length=None,
-                accept_token_ids=None,
-                last_verified_ids=None,
-                flatten_index=None,
-                total_accept_num=None,
                 draft_token_num=self.num_tokens_per_bs,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
