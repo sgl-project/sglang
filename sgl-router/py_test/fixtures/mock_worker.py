@@ -174,13 +174,14 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         # Build response echoing minimal shape
         try:
             data = await request.json()
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             data = {}
 
+        now = time.time()
         ret = {
-            "id": f"cmpl-{int(time.time()*1000)}",
+            "id": f"cmpl-{int(now*1000)}",
             "object": "text_completion",
-            "created": int(time.time()),
+            "created": int(now),
             "model": "mock",
             "choices": [
                 {

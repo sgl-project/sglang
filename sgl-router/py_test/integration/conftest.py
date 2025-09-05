@@ -1,9 +1,11 @@
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import pytest
+import requests
 
 from ..fixtures.ports import find_free_port
 from ..fixtures.router_manager import RouterManager
@@ -43,10 +45,6 @@ def _spawn_mock_worker(args: List[str]) -> Tuple[subprocess.Popen, str, str]:
 
 
 def _wait_health(url: str, timeout: float = 10.0):
-    import time
-
-    import requests
-
     start = time.time()
     with requests.Session() as s:
         while time.time() - start < timeout:

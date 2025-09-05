@@ -1,5 +1,6 @@
 import collections
 import concurrent.futures
+import uuid
 
 import pytest
 import requests
@@ -50,8 +51,6 @@ def test_cache_aware_diverse_prompts_balances(mock_workers, router_manager):
 
     def call(i):
         # Use diverse, unrelated prompts to avoid prefix matches entirely
-        import uuid
-
         prompt = str(uuid.uuid4())
         r = requests.post(
             f"{rh.url}/v1/completions",
