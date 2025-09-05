@@ -82,7 +82,12 @@ def test_circuit_breaker_half_open_failure_reopens(router_manager):
         def post_once():
             return requests.post(
                 f"{rh.url}/v1/completions",
-                json={"model": "test-model", "prompt": "x", "max_tokens": 1, "stream": False},
+                json={
+                    "model": "test-model",
+                    "prompt": "x",
+                    "max_tokens": 1,
+                    "stream": False,
+                },
                 timeout=3,
             )
 
@@ -130,7 +135,12 @@ def test_circuit_breaker_disable_flag(router_manager):
         )
         r = requests.post(
             f"{rh.url}/v1/completions",
-            json={"model": "test-model", "prompt": "x", "max_tokens": 1, "stream": False},
+            json={
+                "model": "test-model",
+                "prompt": "x",
+                "max_tokens": 1,
+                "stream": False,
+            },
             timeout=3,
         )
         assert r.status_code == 500
@@ -166,7 +176,12 @@ def test_circuit_breaker_per_worker_isolation(router_manager):
         def post_once():
             return requests.post(
                 f"{rh.url}/v1/completions",
-                json={"model": "test-model", "prompt": "y", "max_tokens": 1, "stream": False},
+                json={
+                    "model": "test-model",
+                    "prompt": "y",
+                    "max_tokens": 1,
+                    "stream": False,
+                },
                 timeout=3,
             )
 
@@ -229,7 +244,12 @@ def test_circuit_breaker_with_retries(router_manager):
 
         r = requests.post(
             f"{rh.url}/v1/completions",
-            json={"model": "test-model", "prompt": "z", "max_tokens": 1, "stream": False},
+            json={
+                "model": "test-model",
+                "prompt": "z",
+                "max_tokens": 1,
+                "stream": False,
+            },
             timeout=5,
         )
         assert r.status_code == 200

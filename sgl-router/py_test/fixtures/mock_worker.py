@@ -9,6 +9,7 @@ Implements minimal endpoints used by the router:
 
 Behavior knobs are controlled via CLI flags to simulate failures, latency, and load.
 """
+
 import argparse
 import asyncio
 import os
@@ -42,6 +43,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--api-key", default=None)
     p.add_argument("--max-payload-bytes", type=int, default=10 * 1024 * 1024)
     p.add_argument("--stream", action="store_true")
+    p.add_argument("--crash-on-request", action="store_true")
+    p.add_argument("--health-fail-after-ms", type=int, default=0)
     return p.parse_args()
 
 
@@ -55,6 +58,8 @@ def _extract_worker_id(args: argparse.Namespace) -> str:
 def create_app(args: argparse.Namespace) -> FastAPI:
     app = FastAPI()
     worker_id = _extract_worker_id(args)
+    start_ts = time.time()
+    crashed = {"done": False}
 
     async def maybe_delay():
         if args.latency_ms > 0:
@@ -95,6 +100,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     @app.get("/health")
     async def health():
+        if (
+            args.health_fail_after_ms
+            and (time.time() - start_ts) * 1000.0 >= args.health_fail_after_ms
+        ):
+            return PlainTextResponse("bad", status_code=500)
         return PlainTextResponse("ok", status_code=200)
 
     @app.get("/health_generate")
@@ -140,6 +150,11 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         body = await request.body()
         if len(body) > args.max_payload_bytes:
             return make_json_response({"error": "payload too large"}, status_code=413)
+
+        # Simulate crash on first request
+        if args.crash_on_request and not crashed["done"]:
+            crashed["done"] = True
+            os._exit(1)
 
         # Optional timeout (simulate hang)
         if args.timeout:
