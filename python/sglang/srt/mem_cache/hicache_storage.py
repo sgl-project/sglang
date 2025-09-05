@@ -128,6 +128,9 @@ class HiCacheStorage(ABC):
                 return i
         return len(keys)
 
+    def get_stats(self):
+        return None
+
 
 class HiCacheFile(HiCacheStorage):
 
