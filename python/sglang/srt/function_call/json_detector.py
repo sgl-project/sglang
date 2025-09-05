@@ -16,7 +16,7 @@ class JsonDetector(BaseFormatDetector):
     def __init__(self):
         super().__init__()
         # Configure for JSON array parsing
-        self.bot_token = ""
+        self.bot_token = "["
         self.eot_token = ""
         self.tool_call_separator = ", "
 
