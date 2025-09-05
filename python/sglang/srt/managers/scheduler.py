@@ -85,7 +85,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MultiTokenizerRegisterReq,
-    MultiTokenizerWarpper,
+    MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -1096,13 +1096,13 @@ class Scheduler(
                     self.send_to_tokenizer.send_pyobj(abort_req)
                     continue
 
-            # If it is a MultiTokenizerWarpper, unwrap it and handle the inner request.
-            if isinstance(recv_req, MultiTokenizerWarpper):
+            # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
+            if isinstance(recv_req, MultiTokenizerWrapper):
                 worker_id = recv_req.worker_id
                 recv_req = recv_req.obj
                 output = self._request_dispatcher(recv_req)
                 if output is not None:
-                    output = MultiTokenizerWarpper(worker_id, output)
+                    output = MultiTokenizerWrapper(worker_id, output)
                     self.send_to_tokenizer.send_pyobj(output)
                 continue
 
