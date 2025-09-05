@@ -467,7 +467,7 @@ class DeepEPMoE(EPMoE):
             return self.forward_npu(dispatch_output)
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if self.use_w4afp8:
-                return self.forward_cutlass_w4a8(dispatch_output)
+                return self.forward_cutlass_w4afp8(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
