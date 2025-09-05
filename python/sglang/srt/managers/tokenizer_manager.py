@@ -122,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
+from sglang.srt.managers.multi_http_wroker_mixin import MultiHttpWorkerTokenizerMixin
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -180,7 +181,7 @@ class ReqState:
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
 
-class TokenizerManager:
+class TokenizerManager(MultiHttpWorkerTokenizerMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
     def __init__(
@@ -313,8 +314,9 @@ class TokenizerManager:
         # LoRA updates and inference to overlap.
         self.lora_update_lock = asyncio.Lock()
 
-        # TODO(lsyin): use this flag to indicate if this is a sub tokenizer in multi tokenizer manager mode
-        self.is_sub_tokenizer = False
+        self.maybe_init_multi_http_worker(
+            is_sub_tokenizer=self.server_args.num_http_workers > 1
+        )
         self.init_disaggregation()
 
         # For load balancing
