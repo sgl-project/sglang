@@ -10,9 +10,11 @@ from aiter import ActivationType, QuantType, biased_grouped_topk
 from aiter.fused_moe import fused_moe
 from aiter.utility.fp4_utils import e8m0_shuffle
 
-from sglang.srt.utils import get_bool_env_var, mxfp_supported, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, mxfp_supported, set_weight_attrs, is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 __all__ = ["QuarkMoEMethod", "QuarkW4A4MXFp4MoEMethod"]
 
@@ -178,7 +180,10 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
         topk_weights, topk_ids, _ = topk_output
-
+        if _is_hip:
+            topk_weights = topk_weights.to(
+                torch.float32
+            )  # aiter's moe_sorting requires topk_weights to be FP32
         return fused_moe(
             x,
             layer.w13_weight,
