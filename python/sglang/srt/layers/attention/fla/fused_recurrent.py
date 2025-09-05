@@ -323,6 +323,8 @@ def fused_recurrent_gated_delta_rule(
     {
         "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"]
+        is not None,
     }
 )
 @triton.jit(do_not_specialize=["T"])
@@ -337,6 +339,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     h0_indices,
     cu_seqlens,
     scale,
+    intermediate_states_buffer,
+    cache_steps,
     T,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -351,6 +355,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     DISABLE_STATE_UPDATE: tl.constexpr,  # whether to disable final state update
     DISABLE_OUTPUT_CALCULATION: tl.constexpr,  # whether to disable output calculation
+    CACHE_INTERMEDIATE_STATES: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -395,6 +400,20 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
+    # Prepare intermediate state cache pointer if enabled
+    if CACHE_INTERMEDIATE_STATES:
+        idx = tl.load(h0_indices + i_n)
+        if idx >= 0:
+            step_stride = HV * K * V
+            base_offset = idx * cache_steps * step_stride
+            p_cache = (
+                intermediate_states_buffer
+                + base_offset
+                + i_hv * K * V
+                + o_k[:, None] * V
+                + o_v[None, :]
+            )
+
     for _ in range(0, T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
@@ -421,6 +440,12 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
             b_o = tl.sum(b_h * b_q[:, None], 0)
             # core attn output
             tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        # store intermediate states if enabled
+        if CACHE_INTERMEDIATE_STATES:
+            if idx >= 0:
+                tl.store(p_cache, b_h.to(p_cache.dtype.element_ty), mask=mask_h)
+                p_cache += HV * K * V
 
         p_q += H * K
         p_k += H * K
@@ -457,6 +482,8 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     disable_state_update: bool = False,
     disable_output_calculation: bool = False,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    cache_steps: Optional[int] = None,
 ) -> torch.Tensor:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -486,6 +513,8 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         h0_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         scale=scale,
+        intermediate_states_buffer=intermediate_states_buffer,
+        cache_steps=0 if cache_steps is None else cache_steps,
         T=T,
         B=B,
         H=H,

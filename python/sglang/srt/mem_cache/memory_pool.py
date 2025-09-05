@@ -199,6 +199,20 @@ class MambaPool:
                 dtype=conv_dtype,
                 device="cuda",
             )
+            # Cache intermediate SSM states per draft token during target verify
+            # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+            intermediate_ssm_state_cache = torch.empty(
+                size=(
+                    num_mamba_layers,
+                    size + 1,
+                    speculative_num_draft_tokens,
+                    temporal_state_shape[0],
+                    temporal_state_shape[1],
+                    temporal_state_shape[2],
+                ),
+                dtype=ssm_dtype,
+                device="cuda",
+            )
             self.mamba_cache = (
                 conv_state,
                 temporal_state,
@@ -208,6 +222,7 @@ class MambaPool:
                 value_cache,
                 g_cache,
                 beta_cache,
+                intermediate_ssm_state_cache,
             )
         else:
             self.mamba_cache = (conv_state, temporal_state)

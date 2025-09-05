@@ -306,6 +306,8 @@ class MambaAttnBackend(AttentionBackend):
             # last_recurrent_state = ssm_states[cache_indices].clone()  # keep a copy
             # since target verify usually use small seq lens (num_draft_tokens)
             # it's faster to use fused_recurrent_gated_delta_rule_update
+            # also cache intermediate ssm states for each draft step
+            intermediate_state_cache = self.req_to_token_pool.mamba_pool.mamba_cache[8]
             core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
                 k=key,
@@ -317,6 +319,8 @@ class MambaAttnBackend(AttentionBackend):
                 cu_seqlens=query_start_loc,
                 use_qk_l2norm_in_kernel=True,
                 disable_state_update=True,
+                intermediate_states_buffer=intermediate_state_cache[layer_id],
+                cache_steps=value.shape[1],
             )
             query_cache[cache_indices] = query.view((-1,) + query_cache.shape[1:])
             key_cache[cache_indices] = key.view((-1,) + key_cache.shape[1:])
@@ -517,6 +521,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         conv_states = mamba_caches[0]
         ssm_states = mamba_caches[1]
+        intermediate_state_cache = mamba_caches[8]
 
         mixed_qkvs = mamba_caches[2][:, state_indices_tensor][:, mask]
         queries = mamba_caches[3][:, state_indices_tensor][:, mask]
@@ -561,15 +566,21 @@ class HybridLinearAttnBackend(AttentionBackend):
                 )
 
                 # we do in-place update for ssm_state
-                _ = fused_recurrent_gated_delta_rule_update(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    initial_state_source=ssm_state,
-                    initial_state_indices=state_indices_tensor,
-                    cu_seqlens=query_start_loc,
-                    use_qk_l2norm_in_kernel=True,
-                    disable_output_calculation=True,
-                )
+                # Copy cached state of the accepted last step directly into ssm_state
+                # accepted_length gives the number of accepted drafts per request
+                # We only need the state after the accepted prefix
+                # Shape of cache per layer: [size+1, num_draft_tokens, HV, K, V]
+                accepted_steps = accepted_length
+                # Mask selects last accepted step (step-1) per request; handle zeros by skipping
+                # Prepare indices: gather using view to match [batch, steps, ...]
+                # Here we simply copy per-request accepted state into ssm_state
+                if intermediate_state_cache is not None:
+                    # Gather the last accepted step state
+                    # For requests with 0 acceptance, skip copy
+                    valid_mask = accepted_steps > 0
+                    if torch.any(valid_mask):
+                        last_steps = (accepted_steps[valid_mask] - 1).to(torch.int64)
+                        src_indices = state_indices_tensor[valid_mask].to(torch.int64)
+                        ssm_state[src_indices] = intermediate_state_cache[layer_id][
+                            src_indices, last_steps
+                        ].to(ssm_state.dtype)
