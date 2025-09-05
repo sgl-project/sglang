@@ -151,7 +151,7 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
         json.loads(output)
 
 
-class TestDisaggregationMooncakeFailure(CustomTestCase):
+class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
@@ -245,7 +245,7 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
                 raise e from health_check_error
 
 
-class TestDisaggregationMooncakeSpec(CustomTestCase):
+class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
 
     @classmethod
     def setUpClass(cls):
@@ -340,7 +340,7 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.20)
 
 
-class TestDisaggregationSimulatedRetract(CustomTestCase):
+class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         os.environ["SGLANG_TEST_RETRACT"] = "true"

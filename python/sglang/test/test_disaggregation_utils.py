@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
 class TestDisaggregationBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
         pass
 
     @classmethod
