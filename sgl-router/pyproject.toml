@@ -29,6 +29,7 @@ test = [
     "coverage[toml]>=7.0.0",
     "setproctitle>=1.2.0",
     "requests>=2.25.0",
+    "aiohttp>=3.9.0",
 ]
 
 # https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
