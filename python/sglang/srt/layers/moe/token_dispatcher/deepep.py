@@ -278,6 +278,7 @@ class _DeepEPDispatcherImplBase:
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
+        input_global_scale: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
@@ -311,6 +312,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
+        input_global_scale: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
@@ -483,6 +485,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
+        input_global_scale: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
@@ -494,6 +497,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
+            input_global_scale,
             topk_idx,
             # TODO(shuw): pending https://github.com/deepseek-ai/DeepEP/pull/341
             use_fp8=not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"),
@@ -546,6 +550,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def _dispatch_core(
         self,
         hidden_states: torch.Tensor,
+        input_global_scale: torch.Tensor,
         topk_idx: torch.Tensor,
         use_fp8: bool = False,
     ):
@@ -557,6 +562,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
+                use_nvfp4=True,
+                x_global_scales=input_global_scale,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -670,6 +677,7 @@ class DeepEPDispatcher(BaseDispatcher):
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
+        input_global_scale: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -677,6 +685,7 @@ class DeepEPDispatcher(BaseDispatcher):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl(forward_batch).dispatch_a(
             hidden_states=hidden_states,
+            input_global_scale=input_global_scale,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
         )

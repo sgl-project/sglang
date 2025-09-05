@@ -20,7 +20,7 @@ def get_cute_dtype(input: torch.Tensor) -> str:
 
 
 def flashinfer_cutedsl_moe_masked(
-    hidden_states: torch.Tensor,
+    hidden_states: tuple[torch.Tensor, torch.Tensor],
     input_global_scale: torch.Tensor,
     w1: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -36,7 +36,7 @@ def flashinfer_cutedsl_moe_masked(
     kernels.
 
     Args:
-        hidden_states (torch.Tensor): [num_experts, m, k], bf16
+        hidden_states (tuple[torch.Tensor, torch.Tensor]): [num_experts, m, k // 2], uint8, [num_experts, m, k // 16], float8_e4m3fn
         input_global_scale (torch.Tensor): (l,)
         w1 (torch.Tensor): fp4 weights, [l, 2 * n, k // 2], uint8
         w1_blockscale (torch.Tensor): blockscale factors, e4m3,
@@ -72,10 +72,12 @@ def flashinfer_cutedsl_moe_masked(
     assert (
         w2_alpha.dtype == torch.float32
     ), f"w2_alpha must be float32, got {w2_alpha.dtype}"
-
     # === Assertions on shapes ===
     n = w2.shape[-1] * 2  # intermediate dimension
-    num_experts, m, k = hidden_states.shape
+    a_q = hidden_states[0].view(torch.uint8)
+    a_q_sf = hidden_states[1].view(torch.float8_e4m3fn)
+    num_experts, m, k_by_2 = a_q.shape
+    k = k_by_2 * 2
 
     assert w1.shape[-2] == 2 * n, f"w1 last-2 dim must be 2*n, got {w1.shape}"
     assert (
@@ -99,27 +101,20 @@ def flashinfer_cutedsl_moe_masked(
         num_experts,
     ), f"w2_alpha must be (l,), got {w2_alpha.shape}"
 
-    aq, aq_sf = scaled_fp4_grouped_quant(
-        hidden_states,
-        input_global_scale,
-        masked_m,
-    )
+    # TODO(kaixih@nvidia): dtype should be based on inputs.
     gateup_output = torch.empty(
-        (num_experts, m, n * 2), dtype=hidden_states.dtype, device=aq.device
+        (num_experts, m, n * 2), dtype=torch.bfloat16, device=a_q.device
     )
     gateup_output = gateup_output.permute(1, 2, 0)  # requirement of kernel
     sf_vec_size = 16
-    assert aq_sf.dtype == torch.float8_e4m3fn
-    assert aq.dtype == torch.uint8
     ab_dtype = "float4_e2m1fn"
     sf_dtype = "float8_e4m3fn"
-
-    c_dtype = get_cute_dtype(hidden_states)
+    c_dtype = "bfloat16"
 
     # Gemm1
-
+    a_q = a_q.permute(1, 2, 0)
     grouped_gemm_nt_masked(
-        (aq, aq_sf),
+        (a_q, a_q_sf),
         (w1.permute(1, 2, 0), w1_blockscale),
         gateup_output,
         masked_m,
@@ -139,7 +134,9 @@ def flashinfer_cutedsl_moe_masked(
     )
 
     # Gemm2
-    out = torch.empty_like(hidden_states)
+    out = torch.empty(
+        (num_experts, m, k), dtype=torch.bfloat16, device=a_q.device
+    )
     out = out.permute(1, 2, 0)  # requirement of kernel
     grouped_gemm_nt_masked(
         (diq, diq_sf),
