@@ -46,11 +46,13 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda_alike,
     is_hip,
+    is_musa,
     is_npu,
     is_shm_available,
     supports_custom_op,
 )
 
+_is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
@@ -66,7 +68,7 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
 def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]]
+    tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
@@ -261,6 +263,8 @@ class GroupCoordinator:
             self.device = torch.device(f"cuda:{device_id}")
         elif _is_npu:
             self.device = torch.device(f"npu:{device_id}")
+        elif _is_musa:
+            self.device = torch.device(f"musa:{device_id}")
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
@@ -456,7 +460,7 @@ class GroupCoordinator:
                 maybe_pynccl_context = nullcontext()
             else:
                 maybe_pynccl_context = pynccl_comm.change_state(
-                    enable=True, stream=torch.cuda.current_stream()
+                    enable=True, stream=self.device_module.current_stream()
                 )
 
             pymscclpp_comm = self.pymscclpp_comm
@@ -515,7 +519,7 @@ class GroupCoordinator:
             and input_.symmetric_memory
         ):
             with self.pynccl_comm.change_state(
-                enable=True, stream=torch.cuda.current_stream()
+                enable=True, stream=self.device_module.current_stream()
             ):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
@@ -602,7 +606,9 @@ class GroupCoordinator:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True, stream=torch.cuda.current_stream()):
+        with pynccl_comm.change_state(
+            enable=True, stream=self.device_module.current_stream()
+        ):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
             ), "pynccl is required for reduce_scatterv"
@@ -728,7 +734,9 @@ class GroupCoordinator:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True, stream=torch.cuda.current_stream()):
+        with pynccl_comm.change_state(
+            enable=True, stream=self.device_module.current_stream()
+        ):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
             ), "pynccl is required for all_gatherv"
@@ -872,8 +880,8 @@ class GroupCoordinator:
         )
 
         # Serialize object to tensor and get the size as well
-        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8).cuda(
-            device=torch.cuda.current_device()
+        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8).musa(
+            device=self.device_module.current_device()
         )
 
         size_tensor = torch.tensor(
@@ -914,7 +922,7 @@ class GroupCoordinator:
         object_tensor = torch.empty(  # type: ignore[call-overload]
             size_tensor.item(),  # type: ignore[arg-type]
             dtype=torch.uint8,
-            device=torch.cuda.current_device(),
+            device=self.device_module.current_device(),
         )
 
         rank_object = torch.distributed.recv(

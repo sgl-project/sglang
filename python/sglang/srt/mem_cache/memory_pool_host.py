@@ -8,10 +8,11 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_musa, is_npu
 
+_is_musa = is_musa()
 _is_npu = is_npu()
-if not _is_npu:
+if not (_is_npu or _is_musa):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_lf_pf,
