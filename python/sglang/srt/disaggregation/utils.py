@@ -7,7 +7,6 @@ from contextlib import nullcontext
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Type, Union
 
-
 import numpy as np
 import torch
 import torch.distributed as dist
