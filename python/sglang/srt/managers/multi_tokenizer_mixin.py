@@ -568,16 +568,6 @@ def serialize_server_args(server_args: ServerArgs) -> dict:
     return dataclasses.asdict(server_args)
 
 
-def serialize_scheduler_info(scheduler_info: Dict) -> dict:
-    """Serialize scheduler_info into a shareable dictionary"""
-    return scheduler_info
-
-
-def deserialize_scheduler_info(data: dict) -> Dict:
-    """Deserialize scheduler_info from a shared dictionary"""
-    return data
-
-
 def write_to_shared_memory(data: dict, name: str) -> shared_memory.SharedMemory:
     """Write data to shared memory"""
     serialized = json.dumps(data).encode("utf-8")
@@ -633,7 +623,7 @@ def write_data_for_multi_tokenizer(
     )
     # Write scheduler_info to shared memory
     scheduler_info_shm = write_to_shared_memory(
-        serialize_scheduler_info(scheduler_info), f"scheduler_info_{current_pid}"
+        scheduler_info, f"scheduler_info_{current_pid}"
     )
 
     port_args_shm.close()
