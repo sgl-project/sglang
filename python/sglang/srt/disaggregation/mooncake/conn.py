@@ -48,7 +48,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_free_port,
     get_int_env_var,
-    get_ip,
     get_local_ip_auto,
     is_valid_ipv6_address,
     maybe_wrap_ipv6_address,
