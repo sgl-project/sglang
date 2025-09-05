@@ -185,11 +185,12 @@ class MambaAttnBackend(AttentionBackend):
             ],
             dim=-1,
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=head_k_dim),
-            (query, key),
-        )
-        value = rearrange(value, "l (h d) -> 1 l h d", d=head_v_dim)
+        # Reshape from [l, h*d] to [1, l, h, d]
+        seq_len = query.shape[0]
+        num_heads = query.shape[1] // head_k_dim
+        query = query.view(1, seq_len, num_heads, head_k_dim)
+        key = key.view(1, seq_len, num_heads, head_k_dim)
+        value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
