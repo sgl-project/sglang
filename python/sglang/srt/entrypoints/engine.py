@@ -813,8 +813,9 @@ def _launch_subprocesses(
     # Launch detokenizer process
     if server_args.detokenizer_worker_num > 1:
         detoken_procs = []
-        ports_list = []
+        ipc_name_list = []
         detokenizer_ipc_name = port_args.detokenizer_ipc_name
+        # Launch multi detokenizer processes
         for i in range(server_args.detokenizer_worker_num):
             port_args.detokenizer_ipc_name = (
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -828,13 +829,13 @@ def _launch_subprocesses(
             )
             detoken_proc.start()
             detoken_procs.append(detoken_proc)
-            ports_list.append(port_args.detokenizer_ipc_name)
-        # init Detokenizer router process
+            ipc_name_list.append(port_args.detokenizer_ipc_name)
+        # Launch multi-detokenizer router
         port_args.detokenizer_ipc_name = detokenizer_ipc_name
         detoken_router_proc = mp.Process(
             target=run_multi_detokenizer_router_process,
             args=(
-                ports_list,
+                ipc_name_list,
                 server_args,
                 port_args,
             ),

@@ -529,16 +529,17 @@ class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
 
 
 class MultiDetokenizerRouter(MultiTokenizerMixin):
-    def __init__(self, ports_list: List[str], port_args: PortArgs):
-        self.ports_list = ports_list
+    """A router to receive requests from Scheduler and route to DetokenizerManager"""
+    def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
+        self.ipc_name_list = ipc_name_list
         self.send_to_detokenizer_mapping = {}
         self.worker_id_to_ipc_mapping = {}
         self._zmq_context = zmq.Context()
         self.recv_from_scheduler = get_zmq_socket(
             self._zmq_context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
-        self.port_index = 0
-        self.port_num = len(ports_list)
+        self.ipc_name_index = 0
+        self.detokenizer_worker_num = len(ipc_name_list)
 
     def event_loop(self):
         while True:
@@ -546,18 +547,18 @@ class MultiDetokenizerRouter(MultiTokenizerMixin):
             if isinstance(recv_obj, MultiTokenizerRegisterReq):
                 worker_id = self.get_worker_ids_from_req_rids(recv_obj.rids)[0]
                 if worker_id not in self.worker_id_to_ipc_mapping:
-                    port = self.ports_list[self.port_index]
-                    if port not in self.send_to_detokenizer_mapping:
+                    ipc_name = self.ipc_name_list[self.ipc_name_index]
+                    if ipc_name not in self.send_to_detokenizer_mapping:
                         socket = get_zmq_socket(
-                            self._zmq_context, zmq.PUSH, port, False
+                            self._zmq_context, zmq.PUSH, ipc_name, False
                         )
-                        self.send_to_detokenizer_mapping[port] = socket
+                        self.send_to_detokenizer_mapping[ipc_name] = socket
                         logger.info(
-                            f"DetokenizerManager registered in MultiDetokenizerRouter : {self.port_index+1}/{self.port_num}"
+                            f"DetokenizerManager registered in MultiDetokenizerRouter : {self.ipc_name_index+1}/{self.detokenizer_worker_num}"
                         )
-                    self.send_to_detokenizer_mapping[port].send_pyobj(recv_obj)
-                    self.worker_id_to_ipc_mapping[worker_id] = port
-                    self.port_index = (self.port_index + 1) % self.port_num
+                    self.send_to_detokenizer_mapping[ipc_name].send_pyobj(recv_obj)
+                    self.worker_id_to_ipc_mapping[worker_id] = ipc_name
+                    self.ipc_name_index = (self.ipc_name_index + 1) % self.detokenizer_worker_num
             else:
                 worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
                 for i, worker_id in enumerate(worker_ids):
@@ -582,17 +583,17 @@ class MultiDetokenizerRouter(MultiTokenizerMixin):
 
 
 def run_multi_detokenizer_router_process(
-    ports_list: List[str],
+    ipc_name_list: List[str],
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
     kill_itself_when_parent_died()
-    setproctitle.setproctitle("sglang::detokenizerrouter")
+    setproctitle.setproctitle("sglang::detokenizer/router")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 
     try:
-        router = MultiDetokenizerRouter(ports_list, port_args)
+        router = MultiDetokenizerRouter(ipc_name_list, port_args)
         router.event_loop()
     except Exception:
         router.clear_tokenizer_mapping()
