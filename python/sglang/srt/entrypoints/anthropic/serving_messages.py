@@ -25,7 +25,6 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicDelta,
@@ -40,10 +39,11 @@ from sglang.srt.entrypoints.anthropic.protocol import (
 )
 from sglang.srt.entrypoints.openai.protocol import MessageProcessingResult
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.jinja_template_utils import process_content_for_template_format
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
