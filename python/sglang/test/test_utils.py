@@ -467,10 +467,9 @@ def try_cached_model(model_repo: str):
 
 
 def popen_with_error_check(command: list[str], allow_exit: bool = False):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     def _run_and_check():
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
         stdout, stderr = process.communicate()
 
         while process.poll() is None:
@@ -481,11 +480,9 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
                 f"{command} exited with code {process.returncode}\n{stdout=}\n{stderr=}"
             )
 
-        return process
-
     t = threading.Thread(target=_run_and_check)
     t.start()
-    return t
+    return process
 
 
 def popen_launch_server(

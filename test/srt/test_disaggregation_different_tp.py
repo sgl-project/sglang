@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_pd_server,
-    run_with_timeout,
+    popen_with_error_check,
 )
 
 
@@ -63,9 +63,7 @@ class TestDisaggregationMooncakePrefillLargerTP(CustomTestCase):
         ]
 
         print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health")
 
     @classmethod
@@ -199,9 +197,7 @@ class TestDisaggregationMooncakeDecodeLargerTP(CustomTestCase):
         ]
 
         print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health")
 
     @classmethod
