@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 import os
@@ -6,10 +5,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-import numpy as np
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
@@ -154,21 +151,36 @@ class MooncakeStore(HiCacheStorage):
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
-        return self.batch_set([key], [value], [target_location], [target_sizes])
+        # Only support zero copy set for now
+        assert target_location is not None and target_sizes is not None
+        exist_result = self._batch_exist([key])
+        if exist_result[0] == 1:
+            return True
+        put_result = self._put_batch_zero_copy_impl(
+            [key], [target_location], [target_sizes]
+        )
+        return put_result[0] == 0
 
     def batch_set(
         self,
         keys: List[str],
         values: Optional[List[torch.Tensor]] = None,
-        target_location: Optional[List[int]] = None,
+        target_locations: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
-        assert len(keys) == len(target_location) == len(target_sizes)
+        # Only support zero copy set for now
+        assert target_locations is not None and target_sizes is not None
+        assert len(keys) == len(target_locations) == len(target_sizes)
+
         if len(keys) == 0:
             return False
 
         for i in range(len(keys)):
-            if keys[i] is None or target_location[i] is None or target_sizes[i] is None:
+            if (
+                keys[i] is None
+                or target_locations[i] is None
+                or target_sizes[i] is None
+            ):
                 return False
 
         exist_result = self._batch_exist(keys)
@@ -179,7 +191,7 @@ class MooncakeStore(HiCacheStorage):
         for i in range(len(keys)):
             if exist_result[i] != 1:
                 set_keys.append(keys[i])
-                set_target_locations.append(target_location[i])
+                set_target_locations.append(target_locations[i])
                 set_target_sizes.append(target_sizes[i])
                 set_indices.append(i)
         # Only set non-existing keys to storage
@@ -204,18 +216,24 @@ class MooncakeStore(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        return self.batch_get([key], [target_location], [target_sizes]) == 1
+        assert target_location is not None and target_sizes is not None
+        get_result = self._get_batch_zero_copy_impl(
+            [key], [target_location], [target_sizes]
+        )
+        return get_result[0] >= 0
 
     def batch_get(
         self,
         keys: List[str],
-        target_location: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> int:
-        assert len(keys) == len(target_location) == len(target_sizes)
+        assert len(keys) == len(target_locations) == len(target_sizes)
         if len(keys) == 0:
             return 0
-        get_result = self._get_batch_zero_copy_impl(keys, target_location, target_sizes)
+        get_result = self._get_batch_zero_copy_impl(
+            keys, target_locations, target_sizes
+        )
         if self.is_mla_backend:
             key_multiplier = 1
         else:
@@ -226,7 +244,8 @@ class MooncakeStore(HiCacheStorage):
         return len(keys) // key_multiplier
 
     def exists(self, key) -> bool:
-        return self.batch_exists([key]) > 0
+        exist_result = self._batch_exist([key])
+        return exist_result[0] == 1
 
     def batch_exists(self, keys) -> int:
         if self.is_mla_backend:
