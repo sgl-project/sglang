@@ -37,7 +37,7 @@ The implementation supports Anthropic's streaming format with events:
 - `message_start` - Start of message
 - `content_block_start` - Start of content block
 - `content_block_delta` - Text deltas
-- `content_block_stop` - End of content block  
+- `content_block_stop` - End of content block
 - `message_stop` - End of message with usage stats
 
 ## Implementation Details
@@ -109,7 +109,7 @@ import json
 response = requests.post(
     "http://localhost:30000/v1/messages",
     json={
-        "model": "claude-sonnet-4-20250514", 
+        "model": "claude-sonnet-4-20250514",
         "max_tokens": 100,
         "stream": True,
         "messages": [
@@ -227,7 +227,7 @@ Any model supported by SGLang can be used with the Anthropic API endpoint. The `
 
 The Anthropic API layer adds minimal overhead:
 - Request/response conversion: ~1ms
-- Streaming overhead: Negligible  
+- Streaming overhead: Negligible
 - Memory usage: Minimal additional allocation
 
 ## Future Enhancements

@@ -21,18 +21,21 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 class AnthropicError(BaseModel):
     """Error structure for Anthropic API"""
+
     type: str
     message: str
 
 
 class AnthropicErrorResponse(BaseModel):
     """Error response structure for Anthropic API"""
+
     type: Literal["error"] = "error"
     error: AnthropicError
 
 
 class AnthropicUsage(BaseModel):
     """Token usage information"""
+
     input_tokens: int
     output_tokens: int
     cache_creation_input_tokens: Optional[int] = None
@@ -41,6 +44,7 @@ class AnthropicUsage(BaseModel):
 
 class AnthropicContentBlock(BaseModel):
     """Content block in message"""
+
     type: Literal["text", "image", "tool_use", "tool_result"]
     text: Optional[str] = None
     # For image content
@@ -55,12 +59,14 @@ class AnthropicContentBlock(BaseModel):
 
 class AnthropicMessage(BaseModel):
     """Message structure"""
+
     role: Literal["user", "assistant"]
     content: Union[str, List[AnthropicContentBlock]]
 
 
 class AnthropicTool(BaseModel):
     """Tool definition"""
+
     name: str
     description: Optional[str] = None
     input_schema: Dict[str, Any]
@@ -74,13 +80,17 @@ class AnthropicTool(BaseModel):
             v["type"] = "object"  # Default to object type
         return v
 
+
 class AnthropicToolChoice(BaseModel):
     """Tool Choice definition"""
+
     type: Literal["auto", "any", "tool"]
     name: Optional[str]
 
+
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request"""
+
     model: str
     messages: List[AnthropicMessage]
     max_tokens: int
@@ -111,6 +121,7 @@ class AnthropicMessagesRequest(BaseModel):
 
 class AnthropicDelta(BaseModel):
     """Delta for streaming responses"""
+
     type: Literal["text_delta", "input_json_delta"]
     text: Optional[str] = None
     partial_json: Optional[str] = None
@@ -118,10 +129,16 @@ class AnthropicDelta(BaseModel):
 
 class AnthropicStreamEvent(BaseModel):
     """Streaming event"""
+
     type: Literal[
-        "message_start", "message_delta", "message_stop",
-        "content_block_start", "content_block_delta", "content_block_stop",
-        "ping", "error"
+        "message_start",
+        "message_delta",
+        "message_stop",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "ping",
+        "error",
     ]
     message: Optional["AnthropicMessagesResponse"] = None
     delta: Optional[AnthropicDelta] = None
@@ -132,12 +149,15 @@ class AnthropicStreamEvent(BaseModel):
 
 class AnthropicMessagesResponse(BaseModel):
     """Anthropic Messages API response"""
+
     id: str
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
     content: List[AnthropicContentBlock]
     model: str
-    stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]] = None
+    stop_reason: Optional[
+        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
+    ] = None
     stop_sequence: Optional[str] = None
     usage: AnthropicUsage
 

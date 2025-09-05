@@ -29,8 +29,8 @@ from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicDelta,
-    AnthropicErrorResponse,
     AnthropicError,
+    AnthropicErrorResponse,
     AnthropicMessage,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
@@ -557,11 +557,7 @@ class AnthropicServingMessages(ABC):
         """Create an error response"""
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
         error = AnthropicErrorResponse(
-            type="error",
-            error=AnthropicError(
-                type=err_type,
-                message=message
-            )
+            type="error", error=AnthropicError(type=err_type, message=message)
         )
         return ORJSONResponse(content=error.model_dump(), status_code=status_code)
 
@@ -572,10 +568,6 @@ class AnthropicServingMessages(ABC):
     ) -> str:
         """Create a streaming error response"""
         error = AnthropicErrorResponse(
-            type="error",
-            error=AnthropicError(
-                type=err_type,
-                message=message
-            )
+            type="error", error=AnthropicError(type=err_type, message=message)
         )
         return json.dumps({"error": error.model_dump()})
