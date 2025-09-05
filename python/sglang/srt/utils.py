@@ -2289,15 +2289,15 @@ def get_local_ip_auto(fallback: str = None) -> str:
     """
     if ip := get_ip():
         return ip
-    logger.warning("get_ip failed: fallback to get_local_ip_by_remote")
+    logger.debug("get_ip failed: fallback to get_local_ip_by_remote")
     # Fallback
     if ip := get_local_ip_by_remote():
         return ip
-    logger.warning("get_local_ip_by_remote failed: fallback to get_local_ip_by_nic")
+    logger.debug("get_local_ip_by_remote failed: fallback to get_local_ip_by_nic")
     # Fallback
     if ip := get_local_ip_by_nic():
         return ip
-    logger.warning("get_local_ip_by_nic failed")
+    logger.debug("get_local_ip_by_nic failed")
     if fallback:
         return fallback
     raise ValueError("Can not get local ip")
