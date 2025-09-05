@@ -82,7 +82,7 @@ srt_hip = [
     "sglang[runtime_common]",
     "torch",
     "petit_kernel==0.0.2",
-    "wave-lang==1.0.1",
+    "wave-lang==3.7.0",
 ]
 
 # https://docs.sglang.ai/platforms/cpu_server.html
