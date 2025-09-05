@@ -20,7 +20,7 @@ Page-aligned memory pool.
 """
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Union
 
 import torch
 import triton
@@ -172,6 +172,50 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
 
+class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+        need_sort: bool,
+    ):
+        super().__init__(size, 1, dtype, device, kvcache, need_sort)
+        self.clear()
+
+        # sanity check
+        from sglang.srt.mem_cache.memory_pool import ElasticMHATokenToKVPool
+
+        if not isinstance(kvcache, ElasticMHATokenToKVPool):
+            raise ValueError(
+                f"ElasticTokenToKVPoolAllocator requires kvcache to be an ElasticMHATokenToKVPool, but got {type(kvcache)}"
+            )
+
+        self.kvcached_allocator = kvcache.kvcached_allocator
+
+        if "cuda" not in device:
+            raise ValueError("ElasticTokenToKVPoolAllocator only supports cuda device")
+
+    def available_size(self):
+        return self.kvcached_allocator.available_size()
+
+    def alloc(self, need_size: int):
+        indices: List[int] = self.kvcached_allocator.alloc(need_size)
+        indices = torch.tensor(indices, dtype=torch.int32, device="cuda")
+        return indices
+
+    def free(self, free_index: torch.Tensor):
+        if self.is_not_in_free_group:
+            return self.kvcached_allocator.free(free_index.cpu().numpy().tolist())
+        else:
+            self.free_group.append(free_index)
+
+    def clear(self):
+        if hasattr(self, "kvcached_allocator"):
+            self.kvcached_allocator.clear()
+
+
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
@@ -183,19 +227,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: SWAKVPool,
         need_sort: bool,
+        allocator_class: BaseTokenToKVPoolAllocator = TokenToKVPoolAllocator,
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
-        self.full_attn_allocator = TokenToKVPoolAllocator(
+        self.full_attn_allocator = allocator_class(
             size,
             dtype,
             device,
             kvcache.full_kv_pool,
             need_sort,
         )
-        self.swa_attn_allocator = TokenToKVPoolAllocator(
+        self.swa_attn_allocator = allocator_class(
             size_swa,
             dtype,
             device,
@@ -207,7 +252,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             dtype=torch.int64,
             device=device,
         )
-        self.clear()
+        # self.clear()
 
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
@@ -251,7 +296,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices.to(torch.int64)
         return alloc_full_indices
 
     def free(self, free_index: torch.Tensor):
@@ -262,10 +307,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
-        assert (
-            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
-        )
-        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
+        def _is_elastic(self, alloc):
+            return hasattr(alloc, "kvcached_allocator")
+
+        if not self._is_elastic(self.full_attn_allocator):
+            assert (
+                self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+            )
+        if not self._is_elastic(self.swa_attn_allocator):
+            assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
@@ -280,8 +331,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         raise NotImplementedError
 
     def clear(self):
-        self.swa_attn_allocator.clear()
-        self.full_attn_allocator.clear()
+        # self.swa_attn_allocator.clear()
+        # self.full_attn_allocator.clear()
         self.full_to_swa_index_mapping.fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []

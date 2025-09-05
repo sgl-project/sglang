@@ -130,6 +130,29 @@ class KVCache(abc.ABC):
         # used for chunked cpu-offloading
         self.cpu_offloading_chunk_size = 8192
 
+        # default state for optional layer-wise transfer control
+        self.layer_transfer_counter = None
+
+    def _finalize_allocation_log(self, num_tokens: int):
+        """Common logging and mem_usage computation for KV cache allocation.
+        Supports both tuple (K, V) size returns and single KV size returns.
+        """
+        if isinstance(self, MLATokenToKVPool):
+            kv_size = self.get_kv_size_bytes()
+            kv_size_GB = kv_size / GB
+            logger.info(
+                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+            )
+            self.mem_usage = kv_size_GB
+        else:
+            k_size, v_size = self.get_kv_size_bytes()
+            k_size_GB = k_size / GB
+            v_size_GB = v_size / GB
+            logger.info(
+                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+            )
+            self.mem_usage = k_size_GB + v_size_GB
+
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -205,15 +228,9 @@ class MHATokenToKVPool(KVCache):
 
         self._create_buffers()
 
-        self.layer_transfer_counter = None
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
-
-        k_size, v_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
-        )
-        self.mem_usage = (k_size + v_size) / GB
+        self._finalize_allocation_log(size)
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -420,6 +437,88 @@ class MHATokenToKVPool(KVCache):
         )
 
 
+class ElasticMHATokenToKVPool(MHATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_overlap_schedule: bool = True,
+    ):
+        super(MHATokenToKVPool, self).__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.custom_mem_pool = None
+
+        try:
+            import kvcached.integration.sglang.interfaces as kvcached_interfaces
+
+            self.kvcached_interfaces = kvcached_interfaces
+            self.kvcached_interfaces.init_kvcached(async_sched=enable_overlap_schedule)
+
+            # Initialize KV allocator based on per-token KV size (cell_size)
+            self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
+
+            self.kvcached_allocator = kvcached_interfaces.get_kv_cache_manager(
+                self.size + self.page_size,
+                self.page_size,
+                self.cell_size,
+                num_layers=layer_num,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "kvcached is not found. Please install kvcached with `pip install kvcached --no-build-isolation` to use elastic KV cache."
+            ) from e
+
+        self._create_buffers()
+
+        self.layer_transfer_counter = None
+        self.device_module = torch.get_device_module(self.device)
+        self.alt_stream = self.device_module.Stream() if _is_cuda else None
+
+        k_size, v_size = self.get_kv_size_bytes()
+        logger.info(
+            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
+        )
+        self.mem_usage = (k_size + v_size) / GB
+
+    def __del__(self):
+        self.kvcached_interfaces.shutdown_kvcached()
+        del self.kvcached_allocator
+        self.k_buffer = None
+        self.v_buffer = None
+
+    def _create_buffers(self):
+        if "cuda" not in self.device:
+            raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
+
+        self.k_buffer, self.v_buffer = self.kvcached_interfaces.alloc_kv_cache(
+            kvcache_shape=(self.size + self.page_size, self.head_num, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+            num_layers=self.layer_num,
+            page_size=self.page_size,
+            attention_type="MHA",
+            kv_layout="NHD",
+        )
+
+
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
 
@@ -427,43 +526,30 @@ class SWAKVPool(KVCache):
         self,
         size: int,
         size_swa: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
         swa_attention_layer_ids: List[int],
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
-        device: str,
+        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        **kwargs,
     ):
         self.size = size
         self.size_swa = size_swa
-        self.dtype = dtype
-        self.device = device
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
-        self.page_size = 1
+        kwargs["page_size"] = 1
+        kwargs["enable_memory_saver"] = False
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
-        TokenToKVPoolClass = MHATokenToKVPool
-        self.swa_kv_pool = TokenToKVPoolClass(
+
+        self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
-            page_size=self.page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
             layer_num=self.swa_layer_nums,
-            device=device,
-            enable_memory_saver=False,
+            **kwargs,
         )
-        self.full_kv_pool = TokenToKVPoolClass(
+        self.full_kv_pool = token_to_kv_pool_class(
             size=size,
-            page_size=self.page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
             layer_num=self.full_layer_nums,
-            device=device,
-            enable_memory_saver=False,
+            **kwargs,
         )
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
@@ -768,13 +854,7 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        self.layer_transfer_counter = None
-
-        kv_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
-        )
-        self.mem_usage = kv_size / GB
+        self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -936,13 +1016,7 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
                 device=self.device,
             )
 
-        self.layer_transfer_counter = None
-
-        kv_size = self.get_kv_size_bytes()
-        logger.info(
-            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
-        )
-        self.mem_usage = kv_size / GB
+        self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
