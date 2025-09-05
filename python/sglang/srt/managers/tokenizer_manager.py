@@ -732,6 +732,7 @@ class TokenizerManager:
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
+                priority=obj.priority,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -741,6 +742,7 @@ class TokenizerManager:
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
+                priority=obj.priority,
             )
 
         return tokenized_obj
