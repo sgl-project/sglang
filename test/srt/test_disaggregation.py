@@ -1,6 +1,5 @@
 import json
 import os
-import subprocess
 import time
 import unittest
 from types import SimpleNamespace
@@ -18,6 +17,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_pd_server,
+    popen_with_error_check,
 )
 
 
@@ -47,7 +47,9 @@ class TestDisaggregationAccuracy(CustomTestCase):
         lb_command = [
             "python3",
             "-m",
-            "sglang.srt.disaggregation.mini_lb",
+            "sglang_router.launch_router",
+            "--pd-disaggregation",
+            "--mini-lb",  # FIXME: remove this
             "--prefill",
             cls.prefill_url,
             "--decode",
@@ -59,9 +61,7 @@ class TestDisaggregationAccuracy(CustomTestCase):
         ]
 
         print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health")
 
     @classmethod
@@ -228,7 +228,9 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
         lb_command = [
             "python3",
             "-m",
-            "sglang.srt.disaggregation.mini_lb",
+            "sglang_router.launch_router",
+            "--pd-disaggregation",
+            "--mini-lb",  # FIXME: remove this
             "--prefill",
             cls.prefill_url,
             "--decode",
@@ -240,9 +242,7 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
         ]
 
         print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health")
 
     @classmethod
@@ -383,7 +383,9 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
         lb_command = [
             "python3",
             "-m",
-            "sglang.srt.disaggregation.mini_lb",
+            "sglang_router.launch_router",
+            "--pd-disaggregation",
+            "--mini-lb",  # FIXME: remove this
             "--prefill",
             cls.prefill_url,
             "--decode",
@@ -395,9 +397,7 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
         ]
 
         print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health")
 
     @classmethod
@@ -509,7 +509,9 @@ class TestDisaggregationSimulatedRetract(CustomTestCase):
         lb_command = [
             "python3",
             "-m",
-            "sglang.srt.disaggregation.mini_lb",
+            "sglang_router.launch_router",
+            "--pd-disaggregation",
+            "--mini-lb",  # FIXME: remove this
             "--prefill",
             cls.prefill_url,
             "--decode",
@@ -521,9 +523,7 @@ class TestDisaggregationSimulatedRetract(CustomTestCase):
         ]
 
         print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health")
 
     @classmethod
