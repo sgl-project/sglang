@@ -9,9 +9,8 @@ from einops import rearrange
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
     fused_recurrent_gated_delta_rule_update,
-    
+    fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
