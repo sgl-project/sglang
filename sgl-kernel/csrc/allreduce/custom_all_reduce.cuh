@@ -32,7 +32,11 @@ struct Signal {
 };
 
 struct __align__(16) RankData {
+#ifdef USE_MUSA
+  const void* ptrs[8];
+#else
   const void* __restrict__ ptrs[8];
+#endif
 };
 
 struct __align__(16) RankSignals {
@@ -134,7 +138,9 @@ DINLINE O downcast(array_t<float, O::size> val) {
 }
 
 static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#ifdef USE_MUSA
+  volatile_store((uint32_t)flag, (uint32_t*)flag_addr);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
   asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
 #else
   asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
@@ -142,6 +148,11 @@ static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
 }
 
 static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
+#ifdef USE_MUSA
+  asm("DMA.CFI_FLUSHINV.SLC.BYPASS");
+  return (uint32_t)volatile_load((uint32_t*)flag_addr);
+#endif
+
   FlagType flag;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
   asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
@@ -152,10 +163,20 @@ static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
 }
 
 static DINLINE void st_flag_volatile(FlagType* flag_addr, FlagType flag) {
+#ifdef USE_MUSA
+  volatile FlagType* volatile_ptr = (volatile FlagType*)flag_addr;
+  *volatile_ptr = flag;
+#else
   asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
+#endif
 }
 
 static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
+#ifdef USE_MUSA
+  volatile FlagType* volatile_ptr = (volatile FlagType*)flag_addr;
+  return *volatile_ptr;
+#endif
+
   FlagType flag;
   asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
   return flag;

@@ -16,7 +16,29 @@ limitations under the License.
 #pragma once
 
 #include <ATen/Tensor.h>
+#ifdef USE_MUSA
+#include <musa_runtime.h>
+#define CU_POINTER_ATTRIBUTE_RANGE_START_ADDR MU_POINTER_ATTRIBUTE_RANGE_START_ADDR
+#define CUdeviceptr MUdeviceptr
+#define CUDA_SUCCESS MUSA_SUCCESS
+#define cuPointerGetAttribute muPointerGetAttribute
+#define cudaDevAttrComputeCapabilityMajor musaDevAttrComputeCapabilityMajor
+#define cudaDevAttrComputeCapabilityMinor musaDevAttrComputeCapabilityMinor
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
+#define cudaDeviceProp musaDeviceProp
+#define cudaError_t musaError_t
+#define cudaGetDevice musaGetDevice
+#define cudaGetDeviceCount musaGetDeviceCount
+#define cudaGetDeviceProperties musaGetDeviceProperties
+#define cudaGetErrorString musaGetErrorString
+#define cudaSuccess musaSuccess
+using __nv_bfloat16 = __mt_bfloat16;
+using __nv_bfloat162 = __mt_bfloat162;
+using nv_bfloat16 = __mt_bfloat16;
+using nv_bfloat162 = __mt_bfloat162;
+#else
 #include <cuda_runtime.h>
+#endif
 #include <torch/all.h>
 
 #ifdef USE_ROCM

@@ -114,6 +114,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_musa,
     is_non_idle_and_non_empty,
     is_npu,
     is_sm100_supported,
@@ -130,6 +131,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
+_is_musa = is_musa()
 _is_gfx95_supported = is_gfx95_supported()
 
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
@@ -1502,12 +1504,23 @@ class DeepseekV2AttentionMLA(nn.Module):
                 dtype=attn_output.dtype,
                 device=attn_output.device,
             )
+            input = attn_output.transpose(0, 1)
+            mat2 = self.w_vc
+            out = attn_bmm_output.view(
+                -1, self.num_local_heads, self.v_head_dim
+            ).transpose(0, 1)
+            if _is_musa:
+                # XXX (MUSA): Revisit this.
+                if not input.is_contiguous():
+                    input = input.contiguous()
+                if not mat2.is_contiguous():
+                    mat2 = mat2.contiguous()
+                if not out.is_contiguous():
+                    out = out.contiguous()
             torch.bmm(
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                out=attn_bmm_output.view(
-                    -1, self.num_local_heads, self.v_head_dim
-                ).transpose(0, 1),
+                input,
+                mat2,
+                out=out,
             )
         output, _ = self.o_proj(attn_bmm_output)
 
@@ -2147,7 +2160,7 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = torch.cuda.Stream() if (_is_cuda or _is_musa) else None
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(

@@ -10,7 +10,7 @@ class DeviceConfig:
     device: Optional[torch.device]
 
     def __init__(self, device: str = "cuda") -> None:
-        if device in ["cuda", "xpu", "hpu", "cpu", "npu"]:
+        if device in ["cuda", "xpu", "hpu", "cpu", "npu", "musa"]:
             self.device_type = device
         else:
             raise RuntimeError(f"Not supported device type: {device}")
