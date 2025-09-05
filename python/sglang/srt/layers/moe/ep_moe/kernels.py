@@ -1072,38 +1072,6 @@ def compute_problem_sizes_w4a8(
     return problem_sizes1, problem_sizes2
 
 
-@triton.jit
-def compute_expert_offsets_w4a8_kernel(
-    problem_sizes_ptr, expert_offsets_ptr, num_experts, BLOCK_SIZE: tl.constexpr
-):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    block_end = min(block_start + BLOCK_SIZE, num_experts)
-    tot_offset = 0
-    if pid == 0:
-        tl.store(expert_offsets_ptr + 0, 0)
-    for i in range(block_start, block_end):
-        problem_size = tl.load(problem_sizes_ptr + i * 3 + 1)
-        tot_offset += problem_size
-        tl.store(expert_offsets_ptr + i + 1, tot_offset)
-
-
-def compute_expert_offsets_w4a8(
-    problem_sizes: torch.Tensor, expert_offsets: torch.Tensor
-):
-    num_experts = problem_sizes.size(0)
-    BLOCK_SIZE = 32
-    grid = lambda meta: (triton.cdiv(num_experts, meta["BLOCK_SIZE"]),)
-
-    compute_expert_offsets_w4a8_kernel[grid](
-        problem_sizes,
-        expert_offsets,
-        num_experts,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return expert_offsets
-
-
 def deepep_ll_get_cutlass_w4a8_moe_mm_data(
     masked_m,
     problem_sizes1,

@@ -325,9 +325,44 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
         )
-        if self.moe_runner_config.routed_scaling_factor is not None:
-            output *= self.moe_runner_config.routed_scaling_factor
-        return StandardCombineInput(hidden_states=output)
+        if moe_runner_config.routed_scaling_factor is not None:
+            output *= moe_runner_config.routed_scaling_factor
+        return output
+
+    def apply_deepep_ll(
+        self,
+        layer: DeepEPMoE,
+        dispatch_output: DeepEPLLOutput,
+    ) -> torch.Tensor:
+
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
+
+        hidden_states, topk_idx, _, masked_m, _ = dispatch_output
+
+        output = cutlass_w4a8_moe_deepep_ll(
+            hidden_states,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            topk_idx,
+            masked_m,
+            layer.quant_method.a_strides1,
+            layer.quant_method.b_strides1,
+            layer.quant_method.c_strides1,
+            layer.quant_method.a_strides2,
+            layer.quant_method.b_strides2,
+            layer.quant_method.c_strides2,
+            layer.quant_method.s_strides13,
+            layer.quant_method.s_strides2,
+            layer.quant_method.expert_offsets,
+            layer.quant_method.problem_sizes1,
+            layer.quant_method.problem_sizes2,
+            layer.w13_input_scale,
+            layer.w2_input_scale,
+        )
+
+        return output
 
     def apply_deepep_normal(
         self,
