@@ -552,6 +552,8 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         disable_state_update: bool = False,
         disable_output_calculation: bool = False,
+        intermediate_states_buffer: Optional[torch.Tensor] = None,
+        cache_steps: Optional[int] = None,
     ):
         o = fused_recurrent_gated_delta_rule_update_fwd(
             q=q,
@@ -566,6 +568,8 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             disable_state_update=disable_state_update,
             disable_output_calculation=disable_output_calculation,
+            intermediate_states_buffer=intermediate_states_buffer,
+            cache_steps=cache_steps,
         )
 
         return o
@@ -593,6 +597,8 @@ def fused_recurrent_gated_delta_rule_update(
     use_qk_l2norm_in_kernel: bool = False,
     disable_state_update: bool = False,
     disable_output_calculation: bool = False,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    cache_steps: Optional[int] = None,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -627,5 +633,7 @@ def fused_recurrent_gated_delta_rule_update(
         use_qk_l2norm_in_kernel,
         disable_state_update,
         disable_output_calculation,
+        intermediate_states_buffer,
+        cache_steps,
     )
     return o
