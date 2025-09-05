@@ -109,8 +109,7 @@ __global__ void int4_fp8_get_group_gemm_starts_3d(
             per_act_token,                                                                   \
             per_out_ch,                                                                      \
             num_experts);                                                                    \
-  } 
-
+  }
 
 namespace {
 
