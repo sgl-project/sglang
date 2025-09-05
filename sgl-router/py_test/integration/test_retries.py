@@ -12,10 +12,11 @@ def test_retry_reroutes_to_healthy_worker(router_manager):
     # Worker A always 500; Worker B healthy
     proc_a, url_a, id_a = _spawn_mock_worker(["--status-code", "500"])  # always fail
     proc_b, url_b, id_b = _spawn_mock_worker([])
+    proc_c, url_c, id_c = _spawn_mock_worker([])
     try:
         rh = router_manager.start_router(
-            worker_urls=[url_a, url_b],
-            policy="random",
+            worker_urls=[url_a, url_b, url_c],
+            policy="round_robin",
             extra={
                 "retry_max_retries": 3,
                 "retry_initial_backoff_ms": 10,
@@ -39,7 +40,7 @@ def test_retry_reroutes_to_healthy_worker(router_manager):
     finally:
         import subprocess
 
-        for p in (proc_a, proc_b):
+        for p in (proc_a, proc_b, proc_c):
             if p.poll() is None:
                 p.terminate()
                 try:

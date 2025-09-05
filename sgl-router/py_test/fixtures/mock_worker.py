@@ -124,6 +124,10 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             }
         )
 
+    @app.get("/get_load")
+    async def get_load():
+        return JSONResponse({"load": _inflight})
+
     def make_json_response(obj: dict, status_code: int = 200) -> JSONResponse:
         resp = JSONResponse(obj, status_code=status_code)
         resp.headers["X-Worker-Id"] = worker_id
