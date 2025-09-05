@@ -1674,7 +1674,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-mem-layout",
             type=str,
-            choices=["layer_first", "page_first"],
+            choices=["layer_first", "page_first", "page_first_direct"],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
         )
