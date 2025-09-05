@@ -6,18 +6,15 @@ from typing import TYPE_CHECKING, Protocol, TypeGuard, Union, runtime_checkable
 
 import torch
 
-from sglang.srt.layers.moe.token_dispatcher.deepep import (
-    DeepEPLLCombineInput,
-    DeepEPNormalCombineInput,
-)
-from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         AscendDeepEPLLOutput,
         DeepEPLLOutput,
         DeepEPNormalOutput,
         StandardDispatchOutput,
+        DeepEPLLCombineInput,
+        DeepEPNormalCombineInput,
+        StandardCombineInput,
     )
     from sglang.srt.layers.moe.topk import TopKOutput
 
