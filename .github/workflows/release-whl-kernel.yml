@@ -206,7 +206,7 @@ jobs:
 
   build-cu129-aarch64:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: sgl-kernel-release-node-arm
+    runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
         python-version: ["3.10"]
