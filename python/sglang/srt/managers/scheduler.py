@@ -158,6 +158,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     is_cpu,
     kill_itself_when_parent_died,
+    numa_bind_to_node,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
     require_mlp_sync,
@@ -2519,6 +2520,9 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
+    if (numa_node := server_args.numa_node) is not None:
+        numa_bind_to_node(numa_node[gpu_id])
+
     # Generate the prefix
     prefix = ""
     if dp_rank is not None:
