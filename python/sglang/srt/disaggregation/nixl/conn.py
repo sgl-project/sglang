@@ -460,7 +460,12 @@ class NixlKVReceiver(CommonKVReceiver):
         self.conclude_state = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room, data_parallel_rank)
 
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def init(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        prefix_cache_len: int = 0,
+    ):
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"

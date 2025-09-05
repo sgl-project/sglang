@@ -218,6 +218,7 @@ class DecodePreallocQueue:
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
+        kv_args.page_size = self.token_to_kv_pool_allocator.page_size
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -418,7 +419,11 @@ class DecodePreallocQueue:
             page_indices = kv_to_page_indices(
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
-            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
+            decode_req.kv_receiver.init(
+                page_indices,
+                decode_req.metadata_buffer_index,
+                len(decode_req.req.prefix_indices),
+            )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -453,11 +458,16 @@ class DecodePreallocQueue:
 
         if self.scheduler.model_config.is_hybrid:
             available_size = min(
-                self.token_to_kv_pool_allocator.full_available_size(),
-                self.token_to_kv_pool_allocator.swa_available_size(),
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size(),
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size(),
             )
         else:
-            available_size = self.token_to_kv_pool_allocator.available_size()
+            available_size = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
 
         allocatable_tokens = available_size - max(
             # preserve some space for future decode
@@ -500,17 +510,31 @@ class DecodePreallocQueue:
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
+        req.init_next_round_input(self.tree_cache)
+
         req.req_pool_idx = req_pool_indices[0]
+        num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        extend_num_tokens = num_tokens - len(req.prefix_indices)
+
+        dummy_batch = ScheduleBatch(
+            reqs=None,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            model_config=self.scheduler.model_config,
+            tree_cache=self.tree_cache,
+        )
+
+        if self.scheduler.model_config.is_hybrid:
+            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+            req.swa_uuid_for_lock = swa_uuid_for_lock
+        else:
+            self.tree_cache.inc_lock_ref(req.last_node)
 
         if self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(
-                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-            )
+            kv_loc = dummy_batch.alloc_token_slots(extend_num_tokens)
         else:
-            num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+            kv_loc = dummy_batch.alloc_paged_token_slots_extend(
                 prefix_lens=torch.tensor(
-                    [0],
+                    [len(req.prefix_indices)],
                     dtype=torch.int64,
                     device=self.token_to_kv_pool_allocator.device,
                 ),
@@ -520,22 +544,24 @@ class DecodePreallocQueue:
                     device=self.token_to_kv_pool_allocator.device,
                 ),
                 last_loc=torch.tensor(
-                    [-1],
+                    [len(req.prefix_indices) - 1],
                     dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
+                    device=self.token_to_kv_pool.device,
                 ),
-                extend_num_tokens=num_tokens,
+                extend_num_tokens=extend_num_tokens,
             )
 
         assert (
             kv_loc is not None
         ), "KV cache is full! There is a bug in memory estimation."
 
-        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
-
-        # populate metadata
-        req.fill_ids = req.origin_input_ids + req.output_ids
-        req.extend_input_len = len(req.origin_input_ids)
+        self.req_to_token_pool.write(
+            (
+                req.req_pool_idx,
+                slice(len(req.prefix_indices), num_tokens),
+            ),
+            kv_loc,
+        )
 
         return kv_loc
 
@@ -851,7 +877,6 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                req.init_next_round_input(self.tree_cache)
             else:
                 waiting_queue.append(req)
 
