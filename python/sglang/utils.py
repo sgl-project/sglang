@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Common utilities"""
 
 import importlib
@@ -472,6 +474,10 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
+
+    def __iadd__(self, other: "TypeBasedDispatcher"):
+        self._mapping += other._mapping
+        return self
 
     def __call__(self, obj: Any):
         for ty, fn in self._mapping:
