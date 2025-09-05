@@ -89,7 +89,7 @@ jobs:
         run: |
           cd sgl-router
           source "$HOME/.cargo/env"
-          pip install -e .[test]
+          pip install pytest pytest-cov pytest-xdist
           pytest -q py_test/unit
 
       - name: Run e2e test
