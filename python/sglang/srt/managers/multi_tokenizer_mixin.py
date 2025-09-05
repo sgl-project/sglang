@@ -44,6 +44,16 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+class MultiTokenizerSender:
+    def __init__(self, worker_id: int, sender: zmq.Socket):
+        self.worker_id = worker_id
+        self.sender = sender
+
+    def send_pyobj(self, obj):
+        obj = MultiTokenizerWrapper(self.worker_id, obj)
+        self.sender.send_pyobj(obj)
+
+
 class MultiTokenizerMixin:
     """Mixin class for MultiTokenizerManager and DetokenizerManager"""
 
@@ -410,7 +420,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
         self.receive_from_worker = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_worker_ipc_name, True
+            context, zmq.PULL, port_args.multi_tokenizer_ipc_name, True
         )
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -544,7 +554,7 @@ def serialize_port_args(port_args: PortArgs) -> dict:
         "nccl_port": port_args.nccl_port,
         "rpc_ipc_name": port_args.rpc_ipc_name,
         "metrics_ipc_name": port_args.metrics_ipc_name,
-        "tokenizer_worker_ipc_name": port_args.tokenizer_worker_ipc_name,
+        "multi_tokenizer_ipc_name": port_args.multi_tokenizer_ipc_name,
     }
 
 
