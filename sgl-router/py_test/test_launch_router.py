@@ -33,7 +33,7 @@ class TestLaunchRouter(unittest.TestCase):
             cache_threshold=0.5,
             balance_abs_threshold=32,
             balance_rel_threshold=1.0001,
-            eviction_interval=60,
+            eviction_interval_secs=60,
             max_tree_size=2**24,
             max_payload_size=256 * 1024 * 1024,  # 256MB
             verbose=False,
@@ -176,9 +176,8 @@ class TestLaunchRouter(unittest.TestCase):
         """Test basic PD router functionality without actually starting servers."""
         # This test just verifies the PD router can be created and configured
         # without actually starting it (which would require real prefill/decode servers)
-        from sglang_router import Router
         from sglang_router.launch_router import RouterArgs
-        from sglang_router_rs import PolicyType
+        from sglang_router.router import PolicyType, Router
 
         # Test RouterArgs parsing for PD mode
         # Simulate the parsed args structure from argparse with action="append"
@@ -209,18 +208,7 @@ class TestLaunchRouter(unittest.TestCase):
         self.assertEqual(router_args.decode_urls[1], "http://decode2:8081")
 
         # Test Router creation in PD mode
-        router = Router(
-            worker_urls=[],  # Empty for PD mode
-            pd_disaggregation=True,
-            prefill_urls=[
-                ("http://prefill1:8080", 9000),
-                ("http://prefill2:8080", None),
-            ],
-            decode_urls=["http://decode1:8081", "http://decode2:8081"],
-            policy=PolicyType.CacheAware,
-            host="127.0.0.1",
-            port=3001,
-        )
+        router = Router.from_args(router_args)
         self.assertIsNotNone(router)
 
     def test_policy_validation(self):
