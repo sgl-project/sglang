@@ -89,6 +89,7 @@ ATTENTION_BACKEND_CHOICES = [
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
+    "fa4",
     "flashinfer",
     "flashmla",
     "trtllm_mla",

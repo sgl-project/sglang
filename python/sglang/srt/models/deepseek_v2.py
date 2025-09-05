@@ -1079,6 +1079,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return _dispatch_mla_subtype()
+        elif attention_backend == "fa4":
+            # TODO: FA4 support is at an early stage, this is a hacky way to support MLA models.
+            return AttnForwardMethod.MHA_CHUNKED_KV
         elif attention_backend == "aiter":
             if (
                 forward_batch.forward_mode.is_extend()
