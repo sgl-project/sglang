@@ -22,7 +22,7 @@ from sglang.srt.utils import set_weight_attrs
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, FusedMoE
-    from sglang.srt.layers.moe.token_dispatcher import DeepEPNormalOutput
+    from sglang.srt.layers.moe.token_dispatcher import DeepEPLLOutput
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -345,25 +345,25 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         output = cutlass_w4a8_moe_deepep_ll(
             hidden_states,
-            self.w13_weight,
-            self.w2_weight,
-            self.w13_weight_scale_inv,
-            self.w2_weight_scale_inv,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
             topk_idx,
             masked_m,
-            self.quant_method.a_strides1,
-            self.quant_method.b_strides1,
-            self.quant_method.c_strides1,
-            self.quant_method.a_strides2,
-            self.quant_method.b_strides2,
-            self.quant_method.c_strides2,
-            self.quant_method.s_strides13,
-            self.quant_method.s_strides2,
-            self.quant_method.expert_offsets,
-            self.quant_method.problem_sizes1,
-            self.quant_method.problem_sizes2,
-            self.w13_input_scale,
-            self.w2_input_scale,
+            layer.quant_method.a_strides1,
+            layer.quant_method.b_strides1,
+            layer.quant_method.c_strides1,
+            layer.quant_method.a_strides2,
+            layer.quant_method.b_strides2,
+            layer.quant_method.c_strides2,
+            layer.quant_method.s_strides13,
+            layer.quant_method.s_strides2,
+            layer.quant_method.expert_offsets,
+            layer.quant_method.problem_sizes1,
+            layer.quant_method.problem_sizes2,
+            layer.w13_input_scale,
+            layer.w2_input_scale,
         )
 
         return output
