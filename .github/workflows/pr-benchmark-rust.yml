@@ -37,18 +37,14 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.3
         continue-on-error: true
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            sgl-router/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          workspaces: sgl-router
+          # Share cache across all benchmark jobs
+          shared-key: "rust-cache"
+          # Save cache even on failure
+          save-if: true
 
       - name: Check benchmarks compile
         run: |
@@ -96,18 +92,14 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.3
         continue-on-error: true
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            sgl-router/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          workspaces: sgl-router
+          # Share cache across all benchmark jobs
+          shared-key: "rust-cache"
+          # Save cache even on failure
+          save-if: true
 
       - name: Run request processing benchmark
         timeout-minutes: 30
@@ -164,18 +156,14 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.3
         continue-on-error: true
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            sgl-router/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          workspaces: sgl-router
+          # Share cache across all benchmark jobs
+          shared-key: "rust-cache"
+          # Save cache even on failure
+          save-if: true
 
       - name: Run tokenizer benchmark
         timeout-minutes: 30
@@ -231,18 +219,14 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.3
         continue-on-error: true
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            sgl-router/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          workspaces: sgl-router
+          # Share cache across all benchmark jobs
+          shared-key: "rust-cache"
+          # Save cache even on failure
+          save-if: true
 
       - name: Run tool parser benchmark
         timeout-minutes: 30

@@ -36,7 +36,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     ibverbs-providers infiniband-diags perftest \
     libgoogle-glog-dev libgtest-dev libjsoncpp-dev libunwind-dev \
     libboost-all-dev libssl-dev \
-    libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+    libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
     pybind11-dev \
     libhiredis-dev libcurl4-openssl-dev \
     libczmq4 libczmq-dev \
@@ -217,6 +217,19 @@ RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1
     && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
     && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
     && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
+
+# Install Rust toolchain for sgl-router
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && rustc --version && cargo --version
+
+# Build and install sgl-router
+RUN python3 -m pip install --no-cache-dir setuptools-rust \
+    && cd /sgl-workspace/sglang/sgl-router \
+    && cargo build --release \
+    && python3 -m pip install --no-cache-dir . \
+    && rm -rf /root/.cache
+
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
