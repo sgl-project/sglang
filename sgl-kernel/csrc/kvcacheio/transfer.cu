@@ -494,7 +494,6 @@ void transfer_kv_direct(
   }
 }
 
-
 template <bool IsLf2Pf>
 inline void transfer_kv_page_first_direct_impl(
     const std::vector<at::Tensor>& src_ptrs,
