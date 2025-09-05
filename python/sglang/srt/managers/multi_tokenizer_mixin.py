@@ -360,6 +360,17 @@ class MultiHttpWorkerTokenizerMixin:
             worker_ids = []
         return worker_ids
 
+    def clear_tokenizer_mapping(self):
+        if hasattr(self, "tokenizer_mapping"):
+            for socket in self.tokenizer_mapping.values():
+                try:
+                    socket.close()
+                except Exception as e:
+                    logger.warning(f"Failed to close socket: {e}")
+            self.tokenizer_mapping.clear()
+
+
+class MultiHttpWorkerDetokenizerMixin:
     def multi_tokenizer_manager_event_loop(self):
         """The event loop that handles requests, for multi tokenizer manager mode only"""
         self.create_sockets_mapping()
@@ -392,15 +403,6 @@ class MultiHttpWorkerTokenizerMixin:
                         continue
                     new_output = self._handle_output_by_index(output, i)
                     self.tokenizer_mapping[worker_id].send_pyobj(new_output)
-
-    def clear_tokenizer_mapping(self):
-        if hasattr(self, "tokenizer_mapping"):
-            for socket in self.tokenizer_mapping.values():
-                try:
-                    socket.close()
-                except Exception as e:
-                    logger.warning(f"Failed to close socket: {e}")
-            self.tokenizer_mapping.clear()
 
 
 class MultiTokenizerRouter(TokenizerManager, MultiHttpWorkerTokenizerMixin):
