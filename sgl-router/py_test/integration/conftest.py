@@ -88,14 +88,16 @@ def mock_workers():
 
     def _start(n: int, args: List[str] | None = None):
         args = args or []
+        new_procs: List[subprocess.Popen] = []
         urls: List[str] = []
         ids: List[str] = []
         for _ in range(n):
             p, url, wid = _spawn_mock_worker(args)
             procs.append(p)
+            new_procs.append(p)
             urls.append(url)
             ids.append(wid)
-        return procs, urls, ids
+        return new_procs, urls, ids
 
     try:
         yield _start

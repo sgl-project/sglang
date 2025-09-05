@@ -12,6 +12,7 @@ Behavior knobs are controlled via CLI flags to simulate failures, latency, and l
 
 import argparse
 import asyncio
+import json
 import os
 import random
 import signal
@@ -204,7 +205,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     "choices": [{"delta": {"content": "x"}}],
                     "worker_id": worker_id,
                 }
-                yield f"data: {chunk}\n\n"
+                yield f"data: {json.dumps(chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         headers = {"X-Worker-Id": worker_id}

@@ -828,8 +828,9 @@ impl PDRouter {
                 }
             };
 
+            // Emit a valid JSON payload for SSE and terminate the event with a blank line
             let sse_data = format!(
-                "data: {{'error': {}}}",
+                "data: {{\"error\": {}}}\n\n",
                 serde_json::to_string(&error_payload).unwrap_or_default()
             );
             let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
