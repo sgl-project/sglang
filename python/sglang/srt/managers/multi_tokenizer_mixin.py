@@ -54,7 +54,7 @@ class MultiTokenizerSender:
         self.sender.send_pyobj(obj)
 
 
-class MultiTokenizerMixin:
+class MultiHttpWorkerTokenizerMixin:
     """Mixin class for MultiTokenizerManager and DetokenizerManager"""
 
     def create_sockets_mapping(self):
@@ -403,7 +403,7 @@ class MultiTokenizerMixin:
             self.tokenizer_mapping.clear()
 
 
-class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
+class MultiTokenizerRouter(TokenizerManager, MultiHttpWorkerTokenizerMixin):
     """A router to receive requests from MultiTokenizerManager"""
 
     def __init__(
@@ -479,7 +479,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
                 self.tokenizer_mapping[worker_id].send_pyobj(new_recv_obj)
 
 
-class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
+class MultiTokenizerManager(TokenizerManager, MultiHttpWorkerTokenizerMixin):
     """Multi Process Tokenizer Manager that tokenizes the text."""
 
     def __init__(
