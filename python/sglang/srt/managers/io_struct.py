@@ -1191,3 +1191,9 @@ class BlockReqType(Enum):
 @dataclass
 class BlockReqInput:
     type: BlockReqType
+
+
+@dataclass
+class MultiHttpWorkerObjWrapper:
+    worker_id: int
+    obj: Any

@@ -191,6 +191,7 @@ class TokenizerManager(MultiHttpWorkerTokenizerMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.port_args = port_args
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
@@ -265,12 +266,12 @@ class TokenizerManager(MultiHttpWorkerTokenizerMixin):
                 )
 
         # Init inter-process communication
-        context = zmq.asyncio.Context(2)
+        self.context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name, True
+            self.context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
 
         # Request states
@@ -314,9 +315,7 @@ class TokenizerManager(MultiHttpWorkerTokenizerMixin):
         # LoRA updates and inference to overlap.
         self.lora_update_lock = asyncio.Lock()
 
-        self.maybe_init_multi_http_worker(
-            is_sub_tokenizer=self.server_args.num_http_workers > 1
-        )
+        self.maybe_init_multi_http_worker()
         self.init_disaggregation()
 
         # For load balancing
