@@ -128,6 +128,75 @@ class HiCacheStorage(ABC):
                 return i
         return len(keys)
 
+    @abstractmethod
+    def get_v1(
+        self,
+        key: str,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+        previous_hashes: Optional[Any] = None,
+    ) -> torch.Tensor | None:
+        pass
+
+    @abstractmethod
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+        previous_hashes: Optional[Any] = None,
+    ) -> List[torch.Tensor | None] | int:
+        pass
+
+    @abstractmethod
+    def set_v1(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+        previous_hashes: Optional[Any] = None,
+    ) -> bool:
+        pass
+
+    @abstractmethod
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+        previous_hashes: Optional[Any] = None,
+    ) -> List[bool]:
+        pass
+
+    @abstractmethod
+    def exists_v1(
+        self,
+        key: str,
+        previous_hashes: Optional[Any] = None,
+    ) -> bool:
+        pass
+
+    @abstractmethod
+    def delete_v1(
+        self,
+        key: str,
+        previous_hashes: Optional[Any] = None,
+    ) -> bool:
+        pass
+
+    def batch_exists_v1(
+        self,
+        keys: List[str],
+        previous_hashes: Optional[Any] = None,
+    ) -> int:
+        for i in range(len(keys)):
+            if not self.exists(keys[i], previous_hashes=previous_hashes):
+                return i
+            previous_hashes.append(keys[i])
+        return len(keys)
+
 
 class HiCacheFile(HiCacheStorage):
 
