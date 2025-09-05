@@ -136,8 +136,14 @@ impl OAuthHelper {
         let addr = SocketAddr::from(([127, 0, 0, 1], self.callback_port));
 
         // Start server in background
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            McpError::Auth(format!(
+                "Failed to bind to callback port {}: {}",
+                self.callback_port, e
+            ))
+        })?;
+
         tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
             let _ = axum::serve(listener, app).await;
         });
 

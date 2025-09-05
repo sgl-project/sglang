@@ -106,6 +106,13 @@ impl McpClientManager {
             Ok(ts) => {
                 tracing::info!("Discovered {} tools from '{}'", ts.len(), server_name);
                 for t in ts {
+                    if self.tools.contains_key(t.name.as_ref()) {
+                        tracing::warn!(
+                            "Tool '{}' from server '{}' is overwriting an existing tool.",
+                            &t.name,
+                            server_name
+                        );
+                    }
                     self.tools
                         .insert(t.name.to_string(), (server_name.to_string(), t));
                 }
@@ -118,6 +125,13 @@ impl McpClientManager {
             Ok(ps) => {
                 tracing::info!("Discovered {} prompts from '{}'", ps.len(), server_name);
                 for p in ps {
+                    if self.prompts.contains_key(&p.name) {
+                        tracing::warn!(
+                            "Prompt '{}' from server '{}' is overwriting an existing prompt.",
+                            &p.name,
+                            server_name
+                        );
+                    }
                     self.prompts
                         .insert(p.name.clone(), (server_name.to_string(), p));
                 }
@@ -130,6 +144,13 @@ impl McpClientManager {
             Ok(rs) => {
                 tracing::info!("Discovered {} resources from '{}'", rs.len(), server_name);
                 for r in rs {
+                    if self.resources.contains_key(&r.uri) {
+                        tracing::warn!(
+                            "Resource '{}' from server '{}' is overwriting an existing resource.",
+                            &r.uri,
+                            server_name
+                        );
+                    }
                     self.resources
                         .insert(r.uri.clone(), (server_name.to_string(), r));
                 }
@@ -330,9 +351,7 @@ impl McpClientManager {
                     name: tool_name,
                     description: tool.description.as_deref().unwrap_or_default().to_string(),
                     server: server_name.clone(),
-                    parameters: Some(serde_json::Value::Object(
-                        tool.input_schema.as_ref().clone(),
-                    )),
+                    parameters: Some(serde_json::Value::Object((*tool.input_schema).clone())),
                 }
             })
             .collect()
@@ -346,9 +365,7 @@ impl McpClientManager {
                 name: name.to_string(),
                 description: tool.description.as_deref().unwrap_or_default().to_string(),
                 server: server_name.clone(),
-                parameters: Some(serde_json::Value::Object(
-                    tool.input_schema.as_ref().clone(),
-                )),
+                parameters: Some(serde_json::Value::Object((*tool.input_schema).clone())),
             }
         })
     }
