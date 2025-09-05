@@ -19,11 +19,6 @@ TEST_MODEL_MATRIX = {
         "latency": 180,
         "output_throughput": 20,
     },
-    "Qwen/Qwen3-30B-A3B-Instruct-2507": {
-        "accuracy": 0.90,
-        "latency": 180,
-        "output_throughput": 20,
-    },
 }
 
 

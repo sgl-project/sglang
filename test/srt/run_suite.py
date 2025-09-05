@@ -290,6 +290,7 @@ suite_ascend = {
     ],
     "per-commit-4-ascend-npu": [
         TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
+        TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
 }
 

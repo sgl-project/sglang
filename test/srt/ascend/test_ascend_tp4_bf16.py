@@ -14,15 +14,15 @@ from sglang.test.test_utils import (
 )
 
 TEST_MODEL_MATRIX = {
-    "Qwen/Qwen2.5-7B-Instruct": {
-        "accuracy": 0.85,
+    "Qwen/Qwen3-30B-A3B-Instruct-2507": {
+        "accuracy": 0.90,
         "latency": 180,
         "output_throughput": 20,
     },
 }
 
 
-class TestAscendTp2Bf16(CustomTestCase):
+class TestAscendTp4Bf16(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -31,13 +31,12 @@ class TestAscendTp2Bf16(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.common_args = [
             "--trust-remote-code",
-            "--disable-cuda-graph",
             "--mem-fraction-static",
             0.8,
             "--attention-backend",
             "ascend",
             "--tp-size",
-            2,
+            4,
         ]
 
     def test_a_gsm8k(self):
