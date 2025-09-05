@@ -67,7 +67,7 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
 
 class TestFlashMLAAttnLatency(unittest.TestCase):
     def test_latency(self):
-        output_throughput = run_bench_one_batch(
+        _, output_throughput, _ = run_bench_one_batch(
             DEFAULT_MODEL_NAME_FOR_TEST_MLA,
             [
                 "--attention-backend",
@@ -100,7 +100,7 @@ class TestFlashMLAMTP(CustomTestCase):
                     "1",
                     "--speculative-algorithm",
                     "EAGLE",
-                    "--speculative-draft",
+                    "--speculative-draft-model-path",
                     "lmsys/sglang-ci-dsv3-test-NextN",
                     "--speculative-num-steps",
                     "1",

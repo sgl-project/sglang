@@ -18,7 +18,7 @@ from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import expand2square, process_anyres_image
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import load_image, logger
+from sglang.srt.utils import ImageData, load_image, logger
 from sglang.utils import get_exception_traceback
 
 
@@ -30,12 +30,12 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         LlavaMistralForCausalLM,
     ]
 
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
     @staticmethod
     def _process_single_image_task(
-        image_data: Union[str, bytes],
+        image_data: Union[str, bytes, ImageData],
         image_aspect_ratio: Optional[str] = None,
         image_grid_pinpoints: Optional[str] = None,
         processor=None,
@@ -44,10 +44,11 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         image_processor = processor.image_processor
 
         try:
-            image, image_size = load_image(image_data)
+            url = image_data.url if isinstance(image_data, ImageData) else image_data
+            image, image_size = load_image(url)
             if image_size is not None:
                 # It is a video with multiple images
-                image_hash = hash(image_data)
+                image_hash = hash(url)
                 pixel_values = image_processor(image)["pixel_values"]
                 for _ in range(len(pixel_values)):
                     pixel_values[_] = pixel_values[_].astype(np.float16)
@@ -55,7 +56,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 return pixel_values, image_hash, image_size
             else:
                 # It is an image
-                image_hash = hash(image_data)
+                image_hash = hash(url)
                 if image_aspect_ratio == "pad":
                     image = expand2square(
                         image,
@@ -82,7 +83,10 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
 
     async def _process_single_image(
-        self, image_data: Union[bytes, str], aspect_ratio: str, grid_pinpoints: str
+        self,
+        image_data: Union[bytes, str, ImageData],
+        aspect_ratio: str,
+        grid_pinpoints: str,
     ):
         if self.cpu_executor is not None:
             loop = asyncio.get_event_loop()
@@ -104,15 +108,12 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
     async def process_mm_data_async(
         self,
-        image_data: List[Union[str, bytes]],
+        image_data: List[Union[str, bytes, ImageData]],
         input_text,
         request_obj,
         *args,
         **kwargs,
     ):
-        if not image_data:
-            return None
-
         modalities = request_obj.modalities or ["image"]
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
@@ -121,9 +122,6 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             and "anyres" in aspect_ratio
             else None
         )
-
-        if isinstance(image_data, str):
-            image_data = [image_data]
 
         if isinstance(image_data, list) and len(image_data) > 0:
             if "multi-images" in modalities or "video" in modalities:
@@ -164,8 +162,10 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         return {
             "mm_items": [
                 MultimodalDataItem(
-                    pixel_values=pixel_values,
-                    image_sizes=image_sizes,
+                    feature=pixel_values,
+                    model_specific_data={
+                        "image_sizes": image_sizes,
+                    },
                     modality=modality,
                 )
             ],
@@ -191,7 +191,7 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
             f"Cannot find corresponding multimodal processor registered in sglang for model type `{model_type}`"
         )
 
-    def __init__(self, hf_config, server_args, _processor):
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         assert hasattr(hf_config, "vision_config")
         assert hasattr(hf_config, "text_config")
         self.vision_config = hf_config.vision_config
@@ -200,7 +200,7 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
 
         if vision_type := getattr(self.vision_config, "model_type"):
             self.inner = self._get_sgl_processor_cls(vision_type)(
-                hf_config, server_args, _processor
+                hf_config, server_args, _processor, *args, **kwargs
             )
         else:
             raise ValueError(

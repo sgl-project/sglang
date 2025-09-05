@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
 if TYPE_CHECKING:
@@ -93,20 +93,21 @@ class SchedulerOutputProcessorMixin:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
 
-                    if req.return_logprob:
+                    if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
                         assert extend_input_len_per_req is not None
                         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                         extend_input_len = extend_input_len_per_req[i]
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_logprob_return_values(
-                            i,
-                            req,
-                            logprob_pt,
-                            next_token_ids,
-                            num_input_logprobs,
-                            logits_output,
-                        )
+                        if req.return_logprob:
+                            self.add_logprob_return_values(
+                                i,
+                                req,
+                                logprob_pt,
+                                next_token_ids,
+                                num_input_logprobs,
+                                logits_output,
+                            )
                         logprob_pt += num_input_logprobs
 
                     if (
@@ -126,7 +127,16 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
-                        req.grammar.accept_token(next_token_id)
+                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                        try:
+                            req.grammar.accept_token(next_token_id)
+                        except ValueError as e:
+                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                            # This can happen if the grammar is not set correctly or the token is invalid.
+                            logger.error(
+                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                            )
+                            self.abort_request(AbortReq(req.rid))
                         req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
@@ -137,7 +147,7 @@ class SchedulerOutputProcessorMixin:
                     skip_stream_req = req
 
                     # Incrementally update input logprobs.
-                    if req.return_logprob:
+                    if batch.return_logprob:
                         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                         extend_input_len = extend_input_len_per_req[i]
                         if extend_logprob_start_len < extend_input_len:
@@ -145,14 +155,15 @@ class SchedulerOutputProcessorMixin:
                             num_input_logprobs = (
                                 extend_input_len - extend_logprob_start_len
                             )
-                            self.add_input_logprob_return_values(
-                                i,
-                                req,
-                                logits_output,
-                                logprob_pt,
-                                num_input_logprobs,
-                                last_prefill_chunk=False,
-                            )
+                            if req.return_logprob:
+                                self.add_input_logprob_return_values(
+                                    i,
+                                    req,
+                                    logits_output,
+                                    logprob_pt,
+                                    num_input_logprobs,
+                                    last_prefill_chunk=False,
+                                )
                             logprob_pt += num_input_logprobs
 
             self.set_next_batch_sampling_info_done(batch)
@@ -263,7 +274,16 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
-                req.grammar.accept_token(next_token_id)
+                # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                try:
+                    req.grammar.accept_token(next_token_id)
+                except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    # This can happen if the grammar is not set correctly or the token is invalid.
+                    logger.error(
+                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                    )
+                    self.abort_request(AbortReq(req.rid))
                 req.grammar.finished = req.finished()
 
         self.set_next_batch_sampling_info_done(batch)
@@ -272,7 +292,7 @@ class SchedulerOutputProcessorMixin:
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         if (
-            self.attn_tp_rank == 0
+            self.current_scheduler_metrics_enabled()
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
@@ -521,11 +541,17 @@ class SchedulerOutputProcessorMixin:
                     stream_interval = (
                         req.sampling_params.stream_interval or self.stream_interval
                     )
-                    should_output = len(req.output_ids) % stream_interval == 0
+                    should_output = (
+                        len(req.output_ids) % stream_interval == 1
+                        if not self.model_config.is_multimodal_gen
+                        and stream_interval > 1
+                        else len(req.output_ids) % stream_interval == 0
+                    )
                 else:
                     should_output = (
                         len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
-                        and not self.model_config.is_multimodal_gen
+                        if not self.model_config.is_multimodal_gen
+                        else False
                     )
 
             if should_output:
@@ -547,8 +573,7 @@ class SchedulerOutputProcessorMixin:
 
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
-                if self.skip_tokenizer_init:
-                    output_ids.append(req.output_ids[send_token_offset:])
+                output_ids.append(req.output_ids[send_token_offset:])
                 req.send_token_offset = len(req.output_ids)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(

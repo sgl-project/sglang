@@ -34,14 +34,10 @@ def sglang_topk_softmax(gating_output, topk):
     topk_indices = torch.empty(
         (num_tokens, topk), dtype=torch.int32, device=gating_output.device
     )
-    token_expert_indices = torch.empty(
-        (num_tokens, topk), dtype=torch.int32, device=gating_output.device
-    )
 
     topk_softmax(
         topk_weights=topk_weights,
         topk_ids=topk_indices,
-        token_expert_indices=token_expert_indices,
         gating_output=gating_output,
     )
 

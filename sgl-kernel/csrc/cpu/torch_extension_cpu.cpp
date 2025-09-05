@@ -212,11 +212,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
 void initialize(int64_t size, int64_t rank);
 
 // shared mmeory all_reduce
-void shm_allreduce(
-    at::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, c10::intrusive_ptr<c10d::ReduceOp> op);
+void shm_allreduce(at::Tensor& data, int64_t op);
 
 // shared memory all_gather
-at::Tensor shm_allgather(at::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, int64_t dim);
+at::Tensor shm_allgather(at::Tensor& data, int64_t dim);
 
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
@@ -226,6 +225,9 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     int64_t head_size,
     at::Tensor& cos_sin_cache,
     bool is_neox);
+
+// CPU and memory binding
+std::string init_cpu_threads_env(const std::string& cpu_ids);
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
@@ -340,12 +342,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // all reduce
   m.def("initialize(int size, int rank) -> ()");
-  m.impl("initialize", torch::kCPU, &initialize);
-  m.def(
-      "shm_allreduce(Tensor data, __torch__.torch.classes.c10d.ProcessGroup process_group, "
-      "__torch__.torch.classes.c10d.ReduceOp reduce_op) -> ()");
+  m.def("shm_allreduce(Tensor data, int reduce_op) -> ()");
   m.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
-  m.def("shm_allgather(Tensor data, __torch__.torch.classes.c10d.ProcessGroup process_group, int dim) -> Tensor");
+  m.def("shm_allgather(Tensor data, int dim) -> Tensor");
   m.impl("shm_allgather", torch::kCPU, &shm_allgather);
 
   // rope
@@ -353,6 +352,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
+
+  // CPU and memory binding
+  m.def("init_cpu_threads_env(str cpu_ids) -> str");
+}
+
+TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
+  m.impl("init_cpu_threads_env", init_cpu_threads_env);
+  m.impl("initialize", &initialize);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -9,7 +9,7 @@ import torch.distributed
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process
 
-from sglang.srt.model_executor import expert_location_updater
+from sglang.srt.eplb import expert_location_updater
 from sglang.test.test_utils import CustomTestCase, find_available_port
 from sglang.utils import is_in_ci
 

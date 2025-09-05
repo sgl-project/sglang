@@ -72,6 +72,7 @@ def build_tree_kernel_efficient(
     topk: int,
     depth: int,
     draft_token_num: int,
+    tree_mask_mode: int,
 ) -> None:
     torch.ops.sgl_kernel.build_tree_kernel_efficient.default(
         parent_list,
@@ -85,6 +86,7 @@ def build_tree_kernel_efficient(
         topk,
         depth,
         draft_token_num,
+        tree_mask_mode,
     )
 
 
