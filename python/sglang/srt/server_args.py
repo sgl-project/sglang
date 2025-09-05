@@ -128,6 +128,7 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
+    num_http_workers: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -838,6 +839,12 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--num-http-workers",
+            type=int,
+            default=ServerArgs.num_http_workers,
+            help="Whether to enable multi http worker, which will launch multiple http workers and tokenizers to process requests in parallel.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -2214,6 +2221,9 @@ class ServerArgs:
             "--generation-tokens-buckets", self.generation_tokens_buckets
         )
 
+        # Check multi http worker
+        assert self.num_http_workers > 0, "num_http_workers must be positive"
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
@@ -2506,8 +2516,11 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
+    # The ipc filename for multi http worker
+    multi_http_worker_ipc_name: str
+
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def init_new(server_args: ServerArgs, dp_rank: Optional[int] = None) -> "PortArgs":
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
@@ -2520,6 +2533,13 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
+        if server_args.num_http_workers > 0:
+            multi_http_worker_ipc_name = (
+                f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+            )
+        else:
+            multi_http_worker_ipc_name = None
+
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -2529,6 +2549,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                multi_http_worker_ipc_name=multi_http_worker_ipc_name,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -2562,6 +2583,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
+                multi_http_worker_ipc_name=multi_http_worker_ipc_name,
             )
 
 
