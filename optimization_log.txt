@@ -1,0 +1,2 @@
+Currently we are running on a single H100 PCIe variant.
+

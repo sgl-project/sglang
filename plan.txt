@@ -1,0 +1,38 @@
+8×H100 Node Setup (single NVSwitch box, as it is in hyperstack). NVL bandwidth for H100 is around 450GB/s (full-duplex), meaning we are effectively limited by a total peer-to-peer communication band of 3.6TB/s. So we want to ideally keep as much in HBM per-GPU as possible. Below are some strategies to minimize GPU-to-GPU transactions, but make use of efficient expert parallel scheme for good occupancy.
+
+- Split GPUs into two pools:
+  • 2 GPUs for prefill (handle long prompts fast)
+  • 6 GPUs for decode (handle token-by-token streaming)
+
+- Prefill pool:
+  • Tensor parallel = 2
+  • Focus on throughput for initial prompt load
+
+- Decode pool:
+  • Tensor parallel = 3
+  • This means the 6 remaining GPUs for the decode pool are split into 2 replicas of 3 GPUs each.
+  • Each replica handles its own batch of decode requests in parallel.
+  • This increases total throughput compared to using TP=6 (all 6 GPUs as one replica).
+
+- Router:
+  • Send full prompt to prefill pool
+  • Stream key/value cache into decode pool
+  • Use continuous batching to keep decode busy
+
+- Speculative decoding (EAGLE v3):
+  • Run draft model on the decode pool
+  • Start with draft length 8–12 tokens
+  • Acceptance top-k around 4–8
+  • 1–2 speculative steps per cycle
+  • Goal is to measure the acceptance rate, and adjust the eagle params accordingly. This is something that can be autotuned for a given model.
+
+- Attention backend:
+  • FlashInfer kernels for both prefill and decode
+  • Paged KV cache for long prompts (we can start with a target of supporting 32k context, and adjust accordingly)
+  • Keep decode KV cache in HBM if it is not needed to be evicted. We want to minimize system memory transactions.
+
+- Goal:
+  • Prefill never blocks decode
+  • Decode GPUs run at full load
+  • Speculative decoding adds extra tokens per step
+  
