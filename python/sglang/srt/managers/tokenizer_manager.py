@@ -1084,6 +1084,9 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
+        if obj.online:
+            return await self._wait_for_model_update_from_disk(obj)
+
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -1142,6 +1145,10 @@ class TokenizerManager:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
+        if obj.online:
+            result = (await self.update_weights_from_distributed_communicator(obj))[0]
+            return result.success, result.message
+
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -1160,6 +1167,10 @@ class TokenizerManager:
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+
+        if obj.online:
+            result = (await self.update_weights_from_tensor_communicator(obj))[0]
+            return result.success, result.message
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
