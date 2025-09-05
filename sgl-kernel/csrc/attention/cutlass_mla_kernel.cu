@@ -105,10 +105,10 @@ typename T::Fmha::Arguments args_from_options(
   hw_info.device_id = q_nope.device().index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
-  int batches = q_nope.sizes()[0];
-  int page_count_per_seq = page_table.sizes()[1];
-  int page_count_total = kv_c_and_k_pe_cache.sizes()[0];
-  int page_size = kv_c_and_k_pe_cache.sizes()[1];
+  int batches = q_nope.size(0);
+  int page_count_per_seq = page_table.size(1);
+  int page_count_total = kv_c_and_k_pe_cache.size(0);
+  int page_size = kv_c_and_k_pe_cache.size(1);
   int max_seq_len = page_size * page_count_per_seq;
   using TileShapeH = typename T::TileShapeH;
   using TileShapeD = typename T::TileShapeD;
@@ -162,7 +162,7 @@ typename T::Fmha::Arguments args_from_options(
       // TODO(trevor-m): Change split_kv back to -1 when
       // https://github.com/NVIDIA/cutlass/issues/2274 is fixed. Split_kv=1 will
       // perform worse with larger context length and smaller batch sizes.
-      num_kv_splits, // split_kv
+      static_cast<int>(num_kv_splits), // split_kv
       nullptr,       // is_var_split_kv
   };
   // TODO(kaixih@nvidia): When split_kv=-1 and is_var_split_kv=false, we compute
@@ -220,7 +220,7 @@ void cutlass_mla_decode(
   auto in_dtype = q_nope.dtype();
   at::cuda::CUDAGuard device_guard{(char)q_nope.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope.get_device());
-  const int page_size = kv_c_and_k_pe_cache.sizes()[1];
+  const int page_size = kv_c_and_k_pe_cache.size(1);
 
   // NOTE(alcanderian): IsPersistent has bug with manual split_kv.
   // Kernel will hang if batch is too large with large num_kv_splits. (for example bs=8, num_kv_splits=8)
@@ -259,7 +259,7 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
   // Assumes device 0 when getting sm_count.
   arguments.hw_info.sm_count =
       sm_count <= 0 ? cutlass::KernelHardwareInfo::query_device_multiprocessor_count(/*device_id=*/0) : sm_count;
-  arguments.split_kv = num_kv_splits;
+  arguments.split_kv = static_cast<int>(num_kv_splits);
   MlaSm100Type::Fmha::set_split_kv(arguments);
 
   return MlaSm100Type::Fmha::get_workspace_size(arguments);

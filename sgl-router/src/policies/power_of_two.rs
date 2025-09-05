@@ -55,13 +55,13 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         }
 
         // Select two random workers
-        let mut rng = rand::thread_rng();
-        let idx1 = rng.gen_range(0..healthy_indices.len());
-        let mut idx2 = rng.gen_range(0..healthy_indices.len());
+        let mut rng = rand::rng();
+        let idx1 = rng.random_range(0..healthy_indices.len());
+        let mut idx2 = rng.random_range(0..healthy_indices.len());
 
         // Ensure we pick two different workers
         while idx2 == idx1 {
-            idx2 = rng.gen_range(0..healthy_indices.len());
+            idx2 = rng.random_range(0..healthy_indices.len());
         }
 
         let worker_idx1 = healthy_indices[idx1];
@@ -90,6 +90,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         // Increment processed counter
         workers[selected_idx].increment_processed();
         RouterMetrics::record_processed_request(workers[selected_idx].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
 
         Some(selected_idx)
     }
@@ -140,7 +141,7 @@ mod tests {
             vec![Box::new(worker1), Box::new(worker2), Box::new(worker3)];
 
         // Run multiple selections
-        let mut selected_counts = vec![0; 3];
+        let mut selected_counts = [0; 3];
         for _ in 0..100 {
             if let Some(idx) = policy.select_worker(&workers, None) {
                 selected_counts[idx] += 1;

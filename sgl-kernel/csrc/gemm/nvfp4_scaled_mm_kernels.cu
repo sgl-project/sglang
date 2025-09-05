@@ -273,20 +273,20 @@ void cutlass_scaled_fp4_mm_sm100a(
   TORCH_CHECK(A.dim() == 2, "a must be a matrix");
   TORCH_CHECK(B.dim() == 2, "b must be a matrix");
   TORCH_CHECK(
-      A.sizes()[1] == B.sizes()[1],
+      A.size(1) == B.size(1),
       "a and b shapes cannot be multiplied (",
-      A.sizes()[0],
+      A.size(0),
       "x",
-      A.sizes()[1],
+      A.size(1),
       " and ",
-      B.sizes()[0],
+      B.size(0),
       "x",
-      B.sizes()[1],
+      B.size(1),
       ")");
 
-  auto const m = A.sizes()[0];
-  auto const n = B.sizes()[0];
-  auto const k = A.sizes()[1] * 2;
+  auto const m = A.size(0);
+  auto const n = B.size(0);
+  auto const k = A.size(1) * 2;
 
   constexpr int alignment = 32;
   TORCH_CHECK(
@@ -294,9 +294,9 @@ void cutlass_scaled_fp4_mm_sm100a(
       "Expected k to be divisible by ",
       alignment,
       ", but got a shape: (",
-      A.sizes()[0],
+      A.size(0),
       "x",
-      A.sizes()[1],
+      A.size(1),
       "), k: ",
       k,
       ".");
@@ -305,9 +305,9 @@ void cutlass_scaled_fp4_mm_sm100a(
       "Expected n to be divisible by ",
       alignment,
       ", but got b shape: (",
-      B.sizes()[0],
+      B.size(0),
       "x",
-      B.sizes()[1],
+      B.size(1),
       ").");
 
   auto round_up = [](int x, int y) { return (x + y - 1) / y * y; };
@@ -320,37 +320,37 @@ void cutlass_scaled_fp4_mm_sm100a(
   TORCH_CHECK(A_sf.dim() == 2, "scale_a must be a matrix");
   TORCH_CHECK(B_sf.dim() == 2, "scale_b must be a matrix");
   TORCH_CHECK(
-      A_sf.sizes()[1] == B_sf.sizes()[1],
+      A_sf.size(1) == B_sf.size(1),
       "scale_a and scale_b shapes cannot be multiplied (",
-      A_sf.sizes()[0],
+      A_sf.size(0),
       "x",
-      A_sf.sizes()[1],
+      A_sf.size(1),
       " and ",
-      B_sf.sizes()[0],
+      B_sf.size(0),
       "x",
-      B_sf.sizes()[1],
+      B_sf.size(1),
       ")");
   TORCH_CHECK(
-      A_sf.sizes()[0] == rounded_m && A_sf.sizes()[1] == rounded_k,
+      A_sf.size(0) == rounded_m && A_sf.size(1) == rounded_k,
       "scale_a must be padded and swizzled to a shape (",
       rounded_m,
       "x",
       rounded_k,
       "), but got a shape (",
-      A_sf.sizes()[0],
+      A_sf.size(0),
       "x",
-      A_sf.sizes()[1],
+      A_sf.size(1),
       ")");
   TORCH_CHECK(
-      B_sf.sizes()[0] == rounded_n && B_sf.sizes()[1] == rounded_k,
+      B_sf.size(0) == rounded_n && B_sf.size(1) == rounded_k,
       "scale_b must be padded and swizzled to a shape (",
       rounded_n,
       "x",
       rounded_k,
       "), but got a shape (",
-      B_sf.sizes()[0],
+      B_sf.size(0),
       "x",
-      B_sf.sizes()[1],
+      B_sf.size(1),
       ")");
 
   auto out_dtype = D.dtype();
