@@ -1,9 +1,6 @@
 // gRPC Router Implementation
 
-use crate::config::types::{
-    CircuitBreakerConfig as ConfigCircuitBreakerConfig,
-    HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
-};
+use crate::config::types::RetryConfig;
 use crate::core::{
     BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig, Worker, WorkerType,
 };
@@ -54,25 +51,31 @@ pub struct GrpcRouter {
 
 impl GrpcRouter {
     /// Create a new gRPC router
-    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         worker_urls: Vec<String>,
         policy: Arc<dyn LoadBalancingPolicy>,
-        timeout_secs: u64,
-        interval_secs: u64,
-        dp_aware: bool,
-        api_key: Option<String>,
-        retry_config: RetryConfig,
-        circuit_breaker_config: ConfigCircuitBreakerConfig,
-        health_check_config: ConfigHealthCheckConfig,
-        tokenizer: Arc<dyn Tokenizer>,
-        reasoning_parser_factory: ParserFactory,
-        tool_parser_registry: &'static ParserRegistry,
+        ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
         // Update metrics
         RouterMetrics::set_active_workers(worker_urls.len());
 
+        // Extract necessary components from context
+        let tokenizer = ctx
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "gRPC router requires tokenizer".to_string())?
+            .clone();
+        let reasoning_parser_factory = ctx
+            .reasoning_parser_factory
+            .as_ref()
+            .ok_or_else(|| "gRPC router requires reasoning parser factory".to_string())?
+            .clone();
+        let tool_parser_registry = ctx
+            .tool_parser_registry
+            .ok_or_else(|| "gRPC router requires tool parser registry".to_string())?;
+
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
+        let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
         let core_cb_config = CircuitBreakerConfig {
             failure_threshold: circuit_breaker_config.failure_threshold,
             success_threshold: circuit_breaker_config.success_threshold,
@@ -112,11 +115,11 @@ impl GrpcRouter {
                 )
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {
-                    timeout_secs: health_check_config.timeout_secs,
-                    check_interval_secs: health_check_config.check_interval_secs,
-                    endpoint: health_check_config.endpoint.clone(),
-                    failure_threshold: health_check_config.failure_threshold,
-                    success_threshold: health_check_config.success_threshold,
+                    timeout_secs: ctx.router_config.health_check.timeout_secs,
+                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                    endpoint: ctx.router_config.health_check.endpoint.clone(),
+                    failure_threshold: ctx.router_config.health_check.failure_threshold,
+                    success_threshold: ctx.router_config.health_check.success_threshold,
                 })
                 .with_grpc_client(client);
 
@@ -135,7 +138,10 @@ impl GrpcRouter {
         }
 
         let workers = Arc::new(RwLock::new(workers));
-        let health_checker = crate::core::start_health_checker(Arc::clone(&workers), interval_secs);
+        let health_checker = crate::core::start_health_checker(
+            Arc::clone(&workers),
+            ctx.router_config.worker_startup_check_interval_secs,
+        );
 
         Ok(GrpcRouter {
             workers,
@@ -145,11 +151,11 @@ impl GrpcRouter {
             reasoning_parser_factory,
             tool_parser_registry,
             _health_checker: Some(health_checker),
-            timeout_secs,
-            interval_secs,
-            dp_aware,
-            api_key,
-            retry_config,
+            timeout_secs: ctx.router_config.worker_startup_timeout_secs,
+            interval_secs: ctx.router_config.worker_startup_check_interval_secs,
+            dp_aware: ctx.router_config.dp_aware,
+            api_key: ctx.router_config.api_key.clone(),
+            retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
         })
     }
