@@ -49,6 +49,9 @@ jobs:
       - name: Run Python unit tests
         run: |
           cd sgl-router
+          # Build Rust module for Python unit tests (compile only, no optimization)
+          source "$HOME/.cargo/env"
+          cargo test --no-run
           pip install pytest pytest-cov
           PYTHONPATH=py_src python3 -m pytest py_test/unit/ --cov=sglang_router.launch_router --cov-fail-under=80
 
