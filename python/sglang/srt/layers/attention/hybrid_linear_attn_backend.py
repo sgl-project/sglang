@@ -248,6 +248,7 @@ class MambaAttnBackend(AttentionBackend):
                 value_cache,
                 g_cache,
                 beta_cache,
+                intermediate_state_cache,
             ) = self.req_to_token_pool.get_mamba_params(layer_id)
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
@@ -307,7 +308,6 @@ class MambaAttnBackend(AttentionBackend):
             # since target verify usually use small seq lens (num_draft_tokens)
             # it's faster to use fused_recurrent_gated_delta_rule_update
             # also cache intermediate ssm states for each draft step
-            intermediate_state_cache = self.req_to_token_pool.mamba_pool.mamba_cache[8]
             core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
                 k=key,
@@ -319,8 +319,8 @@ class MambaAttnBackend(AttentionBackend):
                 cu_seqlens=query_start_loc,
                 use_qk_l2norm_in_kernel=True,
                 disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache[layer_id],
-                cache_steps=value.shape[1],
+                intermediate_states_buffer=intermediate_state_cache,
+                cache_steps=forward_batch.spec_info.draft_token_num,
             )
             query_cache[cache_indices] = query.view((-1,) + query_cache.shape[1:])
             key_cache[cache_indices] = key.view((-1,) + key_cache.shape[1:])
