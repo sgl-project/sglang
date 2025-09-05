@@ -137,6 +137,34 @@ class TestTrace(CustomTestCase):
             engine.shutdown()
             assert self.__stop_otel_jaeger()
 
+    def test_trace_engine_encode(self):
+        self.__clear_trace_file()
+        assert self.__launch_otel_jaeger()
+
+        prompt = "Today is a sunny day and I like"
+        model_path = "Qwen/Qwen2-7B"
+
+        engine = Engine(
+            model_path=model_path,
+            random_seed=42,
+            enable_trace=True,
+            otel_endpoint="localhost:4317",
+            is_embedding=True,
+        )
+
+        try:
+            engine.encode(prompt)
+
+            # sleep for a few seconds to wait for opentelemetry collector to asynchronously export data to file.
+            time.sleep(10)
+
+            # check trace file
+            assert os.path.isfile("/tmp/otel_trace.json"), "trace file not exist"
+            assert os.path.getsize("/tmp/otel_trace.json") > 0, "trace file is empty"
+        finally:
+            engine.shutdown()
+            assert self.__stop_otel_jaeger()
+
     def test_slice_trace_simple(self):
         self.__clear_trace_file()
         assert self.__launch_otel_jaeger()
