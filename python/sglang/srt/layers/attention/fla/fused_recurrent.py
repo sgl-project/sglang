@@ -400,22 +400,12 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    # Prepare intermediate state cache pointer if enabled
+    # Prepare intermediate state cache variables if enabled
     cache_idx = -1
-    cache_base_ptr = intermediate_states_buffer
     if CACHE_INTERMEDIATE_STATES:
         cache_idx = tl.load(h0_indices + i_n)
-        if cache_idx >= 0:
-            step_stride = HV * K * V
-            base_offset = cache_idx * cache_steps * step_stride
-            cache_base_ptr = (
-                intermediate_states_buffer
-                + base_offset
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
-            )
 
+    step_idx = 0
     for _ in range(0, T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
@@ -446,8 +436,19 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         # store intermediate states if enabled
         if CACHE_INTERMEDIATE_STATES:
             if cache_idx >= 0:
-                tl.store(cache_base_ptr, b_h.to(cache_base_ptr.dtype.element_ty), mask=mask_h)
-                cache_base_ptr += HV * K * V
+                # Compute cache pointer for this step
+                step_offset = step_idx * HV * K * V
+                cache_ptr = (
+                    intermediate_states_buffer
+                    + cache_idx * cache_steps * HV * K * V
+                    + step_offset
+                    + i_hv * K * V
+                    + o_k[:, None] * V
+                    + o_v[None, :]
+                )
+                tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
+
+        step_idx += 1
 
         p_q += H * K
         p_k += H * K
