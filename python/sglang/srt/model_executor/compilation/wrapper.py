@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import os
 import sys
 from abc import abstractmethod
 from contextlib import contextmanager
 from types import CodeType
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import torch
 
-import logging
-
 logger = logging.getLogger(__name__)
+
 
 class TorchCompileWrapperWithCustomDispatcher:
     """
@@ -27,9 +27,15 @@ class TorchCompileWrapperWithCustomDispatcher:
         `torch.compile` over the forward method.
     """
 
-    def __init__(self,
-                 compiled_callable: Optional[Callable] = None,
-                 compilation_level: int = 0):
+    def __init__(
+        self, compiled_callable: Optional[Callable] = None, compilation_level: int = 0
+    ):
+        if compiled_callable is None:
+            backend = self.init_backend()
+            options = None
+            compiled_callable = torch.compile(
+                self.forward, fullgraph=True, backend=backend, options=options
+            )
         self.compiled_callable = compiled_callable
         self.original_code_object = self.__class__.forward.__code__
         self.compiled_codes: list[CodeType] = []
@@ -38,7 +44,7 @@ class TorchCompileWrapperWithCustomDispatcher:
         # read the env var to determine whether to use the custom dispatcher
         # subclasses can use this to switch between the custom dispatcher
         # and the default Dynamo guard mechanism.
-        self.use_custom_dispatcher: True
+        self.use_custom_dispatcher = True
 
     def __call__(self, *args, **kwargs):
         """Implement the dispatch logic here, beyond the torch.compile level.
@@ -48,8 +54,28 @@ class TorchCompileWrapperWithCustomDispatcher:
         return self.compiled_callable(*args, **kwargs)
 
     @abstractmethod
-    def forward(self, *args, **kwargs):
-        ...
+    def forward(self, *args, **kwargs): ...
+
+    def init_backend(self) -> Union[str, Callable]:
+
+        # from torch._dynamo.backends.registry import list_backends
+        # torch_backends = list_backends(exclude_tags=tuple())
+        # if self.level in [
+        #         CompilationLevel.DYNAMO_AS_IS, CompilationLevel.DYNAMO_ONCE
+        # ]:
+        #     if self.backend == "":
+        #         return "eager"
+        #     if self.backend in torch_backends:
+        #         return self.backend
+        #     return resolve_obj_by_qualname(self.backend)
+
+        # TODO: pass user-specified backend to piecewise compilation
+        # merge with the config use_inductor
+        # assert self.level == CompilationLevel.PIECEWISE
+
+        from sglang.srt.model_executor.compilation.backend import SGLangBackend
+
+        return SGLangBackend()
 
     def bytecode_hook(self, old_code: CodeType, new_code: CodeType):
         """Hook to save the compiled bytecode for direct execution."""
@@ -70,11 +96,12 @@ class TorchCompileWrapperWithCustomDispatcher:
             return
 
         self.compiled_codes.append(new_code)
-        debug_dump_dir = self.vllm_config.compilation_config.debug_dump_path
+        debug_dump_dir = "/home/ubuntu/debug_dump/"
         if isinstance(debug_dump_dir, str) and debug_dump_dir != "":
-            rank = self.vllm_config.parallel_config.rank
-            decompiled_file = os.path.join(debug_dump_dir, f"rank_{rank}",
-                                           "transformed_code.py")
+            rank = 0
+            decompiled_file = os.path.join(
+                debug_dump_dir, f"rank_{rank}", "transformed_code.py"
+            )
             if not os.path.exists(decompiled_file):
                 try:
                     # usually the decompilation will succeed for most models,
@@ -82,22 +109,22 @@ class TorchCompileWrapperWithCustomDispatcher:
                     # but there's no 100% guarantee, since decompliation is
                     # not a reversible process.
                     import depyf
+
                     src = depyf.decompile(new_code)
 
                     with open(decompiled_file, "w") as f:
                         f.write(src)
 
-                    logger.debug("Dynamo transformed code saved to %s",
-                                 decompiled_file)
+                    logger.debug("Dynamo transformed code saved to %s", decompiled_file)
                 except Exception:
                     pass
 
-        if self.vllm_config.compilation_config.use_cudagraph and \
-            "update" in new_code.co_names:
-            import depyf
-            src = depyf.decompile(new_code)
-            msg = "Assigning / modifying buffers of nn.Module during forward pass is not allowed when using cudagraph inside the compiler because it will cause silent errors. Please use eager mode or fix the code. The following code contains clues about which buffer is being modified (please search for the usage of the function `update`):\n" + src  # noqa
-            raise RuntimeError(msg)
+        # if self.vllm_config.compilation_config.use_cudagraph and \
+        #     "update" in new_code.co_names:
+        #     import depyf
+        #     src = depyf.decompile(new_code)
+        #     msg = "Assigning / modifying buffers of nn.Module during forward pass is not allowed when using cudagraph inside the compiler because it will cause silent errors. Please use eager mode or fix the code. The following code contains clues about which buffer is being modified (please search for the usage of the function `update`):\n" + src  # noqa
+        #     raise RuntimeError(msg)
 
     @contextmanager
     def dispatch_to_code(self, index: int):
@@ -108,7 +135,7 @@ class TorchCompileWrapperWithCustomDispatcher:
         the code object in the function and call it.
 
         See https://dev-discuss.pytorch.org/t/what-is-the-relationship-requirement-among-original-bytecode-transformed-bytecode-and-bytecode-returned-by-hooks-in-dynamo/1693/7 for more details.
-        """ # noqa
+        """  # noqa
         self.__class__.forward.__code__ = self.compiled_codes[index]
         yield
         self.__class__.forward.__code__ = self.original_code_object

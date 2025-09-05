@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import operator
 from collections.abc import Iterable
 from typing import Optional, Union
-import logging
+
 import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
-from .fx_utils import is_func
-from .inductor_pass import SGLangInductorPass
+from sglang.srt.model_executor.compilation.fx_utils import is_func
+from sglang.srt.model_executor.compilation.inductor_pass import SGLangInductorPass
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ class FixFunctionalizationPass(SGLangInductorPass):
             at_target = node.args[0]
 
             if at_target == torch.ops._C.rotary_embedding.default:
-                query = kwargs['query']
+                query = kwargs["query"]
                 mm_node = query.args[0].args[0]
 
                 # rotary_embedding is a special case: the two mutating inputs
@@ -47,8 +48,9 @@ class FixFunctionalizationPass(SGLangInductorPass):
                 # use mm_node directly.
                 for idx, user in self.getitem_users(node).items():
                     for user_of_getitem in user.users:
-                        if is_func(user_of_getitem,
-                                   torch.ops.aten.slice_scatter.default):
+                        if is_func(
+                            user_of_getitem, torch.ops.aten.slice_scatter.default
+                        ):
                             user_of_getitem.replace_all_uses_with(mm_node)
                             self._remove(user_of_getitem)
                     self._remove(user)
@@ -58,35 +60,37 @@ class FixFunctionalizationPass(SGLangInductorPass):
 
             # rms_norm replacements avoid the most copies for LLaMa.
             elif at_target == torch.ops._C.fused_add_rms_norm.default:
-                mutated_args = {1: 'input', 2: 'residual'}
+                mutated_args = {1: "input", 2: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
-            elif at_target == torch.ops._C.fused_add_rms_norm_static_fp8_quant.default:  # noqa: E501
-                mutated_args = {1: 'result', 2: 'residual'}
+            elif (
+                at_target == torch.ops._C.fused_add_rms_norm_static_fp8_quant.default
+            ):  # noqa: E501
+                mutated_args = {1: "result", 2: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
-            elif at_target == torch.ops._C.rms_norm_dynamic_per_token_quant.default:  # noqa: E501
-                mutated_args = {1: 'result', 2: 'scale', 3: 'residual'}
+            elif (
+                at_target == torch.ops._C.rms_norm_dynamic_per_token_quant.default
+            ):  # noqa: E501
+                mutated_args = {1: "result", 2: "scale", 3: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
             elif at_target in [
-                    torch.ops._C.rms_norm.default,
-                    torch.ops._C.rms_norm_static_fp8_quant.default,
+                torch.ops._C.rms_norm.default,
+                torch.ops._C.rms_norm_static_fp8_quant.default,
             ]:
-                mutated_args = {1: 'result'}
+                mutated_args = {1: "result"}
                 self.defunctionalize(graph, node, mutated_args)
             # For some reason we need to specify the args for both
             # silu_and_mul and silu_and_mul_quant. The kwargs
             # pathway gets the wrong answer.
             elif at_target == torch.ops._C.silu_and_mul.default:
-                mutated_args = {1: 'result'}
-                self.defunctionalize(graph,
-                                     node,
-                                     mutated_args,
-                                     args=('result', 'input'))
+                mutated_args = {1: "result"}
+                self.defunctionalize(
+                    graph, node, mutated_args, args=("result", "input")
+                )
             elif at_target == torch.ops._C.silu_and_mul_quant.default:
-                mutated_args = {1: 'result'}
-                self.defunctionalize(graph,
-                                     node,
-                                     mutated_args,
-                                     args=('result', 'input', 'scale'))
+                mutated_args = {1: "result"}
+                self.defunctionalize(
+                    graph, node, mutated_args, args=("result", "input", "scale")
+                )
             else:
                 continue  # skip the count
 
@@ -99,13 +103,13 @@ class FixFunctionalizationPass(SGLangInductorPass):
         for node in self.nodes_to_remove:
             graph.erase_node(node)
 
-        logger.debug("De-functionalized %s nodes, removed %s nodes", count,
-                     count_removed)
+        logger.debug(
+            "De-functionalized %s nodes, removed %s nodes", count, count_removed
+        )
         self.dump_graph(graph, "after_fix_functionalization")
         self.end_and_log()
 
-    def _remove(self, node_or_nodes: Union[torch.fx.Node,
-                                           Iterable[torch.fx.Node]]):
+    def _remove(self, node_or_nodes: Union[torch.fx.Node, Iterable[torch.fx.Node]]):
         """
         Stage a node (or nodes) for removal at the end of the pass.
         """
@@ -114,12 +118,13 @@ class FixFunctionalizationPass(SGLangInductorPass):
         else:
             self.nodes_to_remove.extend(node_or_nodes)
 
-    def defunctionalize(self,
-                        graph: torch.fx.Graph,
-                        node: torch.fx.Node,
-                        mutated_args: dict[int, Union[torch.fx.Node, str]],
-                        args: Optional[tuple[Union[torch.fx.Node, str],
-                                             ...]] = None):
+    def defunctionalize(
+        self,
+        graph: torch.fx.Graph,
+        node: torch.fx.Node,
+        mutated_args: dict[int, Union[torch.fx.Node, str]],
+        args: Optional[tuple[Union[torch.fx.Node, str], ...]] = None,
+    ):
         """
         De-functionalize a node by replacing it with a call to the original.
         It also replaces the getitem users with the mutated arguments.
@@ -129,10 +134,9 @@ class FixFunctionalizationPass(SGLangInductorPass):
         self.insert_defunctionalized(graph, node, args=args)
         self._remove(node)
 
-    def replace_users_with_mutated_args(self, node: torch.fx.Node,
-                                        mutated_args: dict[int,
-                                                           Union[torch.fx.Node,
-                                                                 str]]):
+    def replace_users_with_mutated_args(
+        self, node: torch.fx.Node, mutated_args: dict[int, Union[torch.fx.Node, str]]
+    ):
         """
         Replace all getitem users of the auto-functionalized node with the
         mutated arguments.
@@ -158,11 +162,12 @@ class FixFunctionalizationPass(SGLangInductorPass):
                 users[idx] = user
         return users
 
-    def insert_defunctionalized(self,
-                                graph: torch.fx.Graph,
-                                node: torch.fx.Node,
-                                args: Optional[tuple[Union[torch.fx.Node, str],
-                                                     ...]] = None):
+    def insert_defunctionalized(
+        self,
+        graph: torch.fx.Graph,
+        node: torch.fx.Node,
+        args: Optional[tuple[Union[torch.fx.Node, str], ...]] = None,
+    ):
         """
         Insert a new defunctionalized node into the graph before node.
         If one of the kwargs is 'out', provide args directly,
@@ -174,8 +179,9 @@ class FixFunctionalizationPass(SGLangInductorPass):
         :param args: If we cannot use kwargs, specify args directly.
         If an arg is a string, `node.kwargs[arg]` is used.
         """  # noqa: E501
-        assert is_func(node, auto_functionalized), \
-            f"node must be auto-functionalized, is {node} instead"
+        assert is_func(
+            node, auto_functionalized
+        ), f"node must be auto-functionalized, is {node} instead"
 
         # Create a new call to the original function
         with graph.inserting_before(node):
@@ -184,6 +190,7 @@ class FixFunctionalizationPass(SGLangInductorPass):
                 graph.call_function(function, kwargs=node.kwargs)
             else:
                 # Args passed as strings refer to items in node.kwargs
-                args = tuple(node.kwargs[arg] if isinstance(arg, str) else arg
-                             for arg in args)
+                args = tuple(
+                    node.kwargs[arg] if isinstance(arg, str) else arg for arg in args
+                )
                 graph.call_function(function, args=args)

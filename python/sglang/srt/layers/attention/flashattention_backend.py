@@ -633,12 +633,10 @@ class FlashAttentionBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                )
+                cache_loc = forward_batch.out_cache_loc
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, None, None, layer_id_override = layer_id
+                        layer, cache_loc, k, v, None, None, layer_id_override=layer_id
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -654,7 +652,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        window_size = ((-1, -1))
+        window_size = (-1, -1)
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -704,17 +702,21 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id if layer_id is None else layer_id
             )
-            key_cache = key_cache.view(
-                -1, self.page_size, 8, 128
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, 8, 128
-            )
+            key_cache = key_cache.view(-1, self.page_size, 8, 128)
+            value_cache = value_cache.view(-1, self.page_size, 8, 128)
             # if layer.is_cross_attention:
             #     page_table = metadata.encoder_page_table
             #     cache_seqlens = metadata.encoder_lens_int32
             #     cu_seqlens_k = metadata.encoder_cu_seqlens_k
             #     window_size = (-1, -1)
+
+            print("q shape", q.contiguous().view(-1, 32, 128).shape)
+            print("key_cache shape", key_cache.shape)
+            print("value_cache shape", value_cache.shape)
+            # print("cache_seqlens shape", cache_seqlens.shape)
+            # print("cu_seqlens_q shape", cu_seqlens_q.shape)
+            # print("cu_seqlens_k shape", cu_seqlens_k.shape)
+            # print("max_seqlen_q shape", max_seqlen_q)
 
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, 32, 128),

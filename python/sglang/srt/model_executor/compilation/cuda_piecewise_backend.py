@@ -2,17 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import logging
 from contextlib import ExitStack
 from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 
 import torch
 import torch.fx as fx
-import logging
 
-from .compilation_counter import compilation_counter
+from sglang.srt.model_executor.compilation.compilation_counter import (
+    compilation_counter,
+)
 
 logger = logging.getLogger(__name__)
+
 
 def weak_ref_tensor(tensor: Any) -> Any:
     """
@@ -24,6 +27,7 @@ def weak_ref_tensor(tensor: Any) -> Any:
         return torch.ops._C.weak_ref_tensor(tensor)
     else:
         return tensor
+
 
 def weak_ref_tensors(
     tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]]
@@ -60,11 +64,17 @@ class ConcreteSizeEntry:
 
 class CUDAPiecewiseBackend:
 
-    def __init__(self, graph: fx.GraphModule, inductor_config: dict[str, Any],
-                 graph_pool: Any, piecewise_compile_index: int,
-                 total_piecewise_compiles: int, sym_shape_indices: list[int],
-                 compiled_graph_for_general_shape: Callable,
-                 sglang_backend):
+    def __init__(
+        self,
+        graph: fx.GraphModule,
+        inductor_config: dict[str, Any],
+        graph_pool: Any,
+        piecewise_compile_index: int,
+        total_piecewise_compiles: int,
+        sym_shape_indices: list[int],
+        compiled_graph_for_general_shape: Callable,
+        sglang_backend,
+    ):
         """
         The backend for piecewise compilation.
         It mainly handles the compilation and cudagraph capturing.
@@ -86,13 +96,79 @@ class CUDAPiecewiseBackend:
         self.sglang_backend = sglang_backend
 
         self.is_first_graph = piecewise_compile_index == 0
-        self.is_last_graph = (
-            piecewise_compile_index == total_piecewise_compiles - 1)
+        self.is_last_graph = piecewise_compile_index == total_piecewise_compiles - 1
 
-        self.compile_sizes: set[int] = set(
-            [])
+        self.compile_sizes: set[int] = set([])
         self.cudagraph_capture_sizes: set[int] = set(
-            [512,504,496,488,480,472,464,456,448,440,432,424,416,408,400,392,384,376,368,360,352,344,336,328,320,312,304,296,288,280,272,264,256,248,240,232,224,216,208,200,192,184,176,168,160,152,144,136,128,120,112,104,96,88,80,72,64,56,48,40,32,24,16,8,4,2,1]
+            [
+                512,
+                504,
+                496,
+                488,
+                480,
+                472,
+                464,
+                456,
+                448,
+                440,
+                432,
+                424,
+                416,
+                408,
+                400,
+                392,
+                384,
+                376,
+                368,
+                360,
+                352,
+                344,
+                336,
+                328,
+                320,
+                312,
+                304,
+                296,
+                288,
+                280,
+                272,
+                264,
+                256,
+                248,
+                240,
+                232,
+                224,
+                216,
+                208,
+                200,
+                192,
+                184,
+                176,
+                168,
+                160,
+                152,
+                144,
+                136,
+                128,
+                120,
+                112,
+                104,
+                96,
+                88,
+                80,
+                72,
+                64,
+                56,
+                48,
+                40,
+                32,
+                24,
+                16,
+                8,
+                4,
+                2,
+                1,
+            ]
         )
 
         self.first_run_finished = False
@@ -148,7 +224,8 @@ class CUDAPiecewiseBackend:
                 self.inductor_config,
                 graph_index=self.piecewise_compile_index,
                 num_graphs=self.total_piecewise_compiles,
-                runtime_shape=runtime_shape)
+                runtime_shape=runtime_shape,
+            )
 
             # finished compilations for all required shapes
             if self.is_last_graph and not self.to_be_compiled_sizes:
@@ -164,19 +241,19 @@ class CUDAPiecewiseBackend:
             if entry.num_finished_warmup < 1:  # noqa
                 entry.num_finished_warmup += 1
                 if self.is_first_graph:
-                    logger.debug(
+                    logger.info(
                         "Warming up %s/%s for shape %s",
                         entry.num_finished_warmup,
-                        self.compilation_config.cudagraph_num_of_warmups,
-                        runtime_shape)
+                        1,
+                        runtime_shape,
+                    )
                 return entry.runnable(*args)
 
             if self.is_first_graph:
                 # Since we capture cudagraph for many different shapes and
                 # capturing is fast, we don't need to log it for every shape.
                 # We only log it in the debug mode.
-                logger.debug("Capturing a cudagraph for shape %s",
-                             runtime_shape)
+                logger.info("Capturing a cudagraph for shape %s", runtime_shape)
 
             input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
@@ -193,8 +270,7 @@ class CUDAPiecewiseBackend:
                     # therefore, we only run gc for the first graph,
                     # and disable gc for the rest of the graphs.
                     stack.enter_context(patch("gc.collect", lambda: None))
-                    stack.enter_context(
-                        patch("torch.cuda.empty_cache", lambda: None))
+                    stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool):

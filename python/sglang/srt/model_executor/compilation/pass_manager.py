@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from torch import fx as fx
-
-from .fix_functionalization import FixFunctionalizationPass
-from .inductor_pass import CustomGraphPass, InductorPass, get_pass_context
-from .inductor_pass import SGLangInductorPass
-
 import logging
 
+from torch import fx as fx
+
+from sglang.srt.model_executor.compilation.fix_functionalization import (
+    FixFunctionalizationPass,
+)
+from sglang.srt.model_executor.compilation.inductor_pass import (
+    CustomGraphPass,
+    InductorPass,
+    SGLangInductorPass,
+    get_pass_context,
+)
+
 logger = logging.getLogger(__name__)
+
 
 class PostGradPassManager(CustomGraphPass):
     """
@@ -38,7 +45,9 @@ class PostGradPassManager(CustomGraphPass):
         # always run fix_functionalization last
         self.fix_functionalization(graph)
 
-    def configure(self,):
+    def configure(
+        self,
+    ):
         self.pass_config = dict()
         self.fix_functionalization = FixFunctionalizationPass()
 

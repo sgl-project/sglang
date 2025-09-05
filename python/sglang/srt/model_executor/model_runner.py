@@ -20,9 +20,11 @@ import json
 import logging
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -31,6 +33,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.context_manager import set_forward_context
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -89,8 +92,17 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.model_executor.compilation.backend import SGLangBackend
+from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
+from sglang.srt.model_executor.compilation.compilation_counter import (
+    compilation_counter,
+)
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -120,9 +132,6 @@ from sglang.srt.utils import (
     set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
-
-from .backend import SGLangBackend
-from sglang.srt.context_manager import set_forward_context
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -241,126 +250,163 @@ class ModelRunner:
         )
         self._model_update_group = {}
 
-        # compile model
-        backend = SGLangBackend()
-        
-        self.model.forward = torch.compile(self.model.forward, 
-            fullgraph=True,
-            backend=backend,
-            options=None
+    def capture_model(self) -> None:
+        compilation_counter.num_gpu_runner_capture_triggers += 1
+
+        start_time = time.perf_counter()
+        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+
+        self.max_num_tokens = 1024
+        with torch.device("cuda"):
+            self.input_ids = torch.zeros(
+                self.max_num_tokens, dtype=torch.int64, device=self.device
+            )
+            self.positions = torch.zeros(
+                self.max_num_tokens, dtype=torch.int64, device=self.device
+            )
+            self.out_cache_loc = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+            self.req_pool_indices = torch.ones((1,), dtype=torch.int32)
+            self.seq_lens = torch.full((1,), 0, dtype=torch.int32)
+            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+
+        @contextmanager
+        def freeze_gc():
+            # Optimize garbage collection during CUDA graph capture.
+            # Clean up, then freeze all remaining objects from being included
+            # in future collections.
+            gc.collect()
+            should_freeze = True
+            if should_freeze:
+                gc.freeze()
+            try:
+                yield
+            finally:
+                if should_freeze:
+                    gc.unfreeze()
+
+        # Trigger CUDA graph capture for specific shapes.
+        # Capture the large shapes first so that the smaller shapes
+        # can reuse the memory pool allocated for the large shapes.
+        with freeze_gc():
+            # Only rank 0 should print progress bar during capture
+            self.cudagraph_batch_sizes = [512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+            compilation_cases = reversed(self.cudagraph_batch_sizes)
+            from tqdm import tqdm
+
+            for num_tokens in tqdm(compilation_cases):
+                # We skip EPLB here since we don't want to record dummy metrics
+                for _ in range(1):
+                    self._dummy_run(
+                        num_tokens, capture_attn_cudagraph=False, skip_eplb=True
+                    )
+                self._dummy_run(
+                    num_tokens, capture_attn_cudagraph=False, skip_eplb=True
+                )
+
+        end_time = time.perf_counter()
+        end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        elapsed_time = end_time - start_time
+        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        # This usually takes 5~20 seconds.
+        logger.info(
+            "Graph capturing finished in %.0f secs, took %.2f GiB",
+            elapsed_time,
+            cuda_graph_size / (1 << 30),
         )
-        # self.model.forward = torch.compile(self.model.forward)
-        # self.model = torch.compile(self.model, fullgraph=True)
 
-    # @torch.inference_mode()
-    # def _dummy_run(
-    #     self,
-    #     num_tokens: int,
-    #     capture_attn_cudagraph: bool = False,
-    #     skip_eplb: bool = False,
-    #     is_profile: bool = False,
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
+    @torch.inference_mode()
+    def _dummy_run(
+        self,
+        num_tokens: int,
+        capture_attn_cudagraph: bool = False,
+        skip_eplb: bool = False,
+        is_profile: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
 
+        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+        # for dummy run with LoRA so that the num_reqs collectively
+        # has num_tokens in total.
+        max_num_reqs = 1024
+        num_reqs = min(num_tokens, max_num_reqs)
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+        assert sum(num_scheduled_tokens_list) == num_tokens
+        assert len(num_scheduled_tokens_list) == num_reqs
+        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
 
-    #     # Set num_scheduled_tokens based on num_tokens and max_num_seqs
-    #     # for dummy run with LoRA so that the num_reqs collectively
-    #     # has num_tokens in total.
-    #     max_num_reqs = self.scheduler_config.max_num_seqs
-    #     num_reqs = min(num_tokens, max_num_reqs)
-    #     min_tokens_per_req = num_tokens // num_reqs
-    #     num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-    #     num_scheduled_tokens_list[-1] += num_tokens % num_reqs
-    #     assert sum(num_scheduled_tokens_list) == num_tokens
-    #     assert len(num_scheduled_tokens_list) == num_reqs
-    #     num_scheduled_tokens = np.array(num_scheduled_tokens_list,
-    #                                     dtype=np.int32)
+        attn_metadata: Optional[dict[str, Any]] = None
 
-    #     attn_metadata: Optional[dict[str, Any]] = None
-    #     if capture_attn_cudagraph:
-    #         attn_metadata = {}
+        model = self.model
+        # if self.is_multimodal_model:
+        #     model_kwargs = self._init_model_kwargs_for_multimodal_model(
+        #         num_reqs=num_reqs)
+        #     input_ids = None
+        #     inputs_embeds = self.inputs_embeds[:num_tokens]
+        # else:
+        input_ids = self.input_ids[:num_tokens]
+        inputs_embeds = None
+        model_kwargs = {}
 
-    #         # Make sure max_model_len is used at the graph capture time.
-    #         self.seq_lens_np[:num_reqs] = self.max_model_len
-    #         self.seq_lens_np[num_reqs:] = 0
-    #         self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
-    #                                        non_blocking=True)
+        # if self.uses_mrope:
+        #     positions = self.mrope_positions[:, :num_tokens]
+        # else:
+        positions = self.positions[:num_tokens]
+        req_pool_indices = self.req_pool_indices
 
-    #         for kv_cache_group_id, kv_cache_group_spec in enumerate(
-    #                 self.kv_cache_config.kv_cache_groups):
-    #             common_attn_metadata = CommonAttentionMetadata(
-    #                 query_start_loc=self.query_start_loc[:num_reqs + 1],
-    #                 query_start_loc_cpu=self.query_start_loc_cpu[:num_reqs +
-    #                                                              1],
-    #                 seq_lens=self.seq_lens[:num_reqs],
-    #                 seq_lens_cpu=self.seq_lens_cpu[:num_reqs],
-    #                 num_computed_tokens_cpu=self.input_batch.
-    #                 num_computed_tokens_cpu_tensor[:num_reqs],
-    #                 num_reqs=num_reqs,
-    #                 num_actual_tokens=num_tokens,
-    #                 max_query_len=num_tokens,
-    #                 block_table_tensor=self.input_batch.block_table[
-    #                     kv_cache_group_id].get_device_tensor()[:num_reqs],
-    #                 slot_mapping=self.input_batch.
-    #                 block_table[kv_cache_group_id].slot_mapping[:num_tokens],
-    #                 causal=True)
+        # if get_pp_group().is_first_rank:
+        #     intermediate_tensors = None
+        # else:
+        #     if self.intermediate_tensors is None:
+        #         self.intermediate_tensors = (
+        #             self.model.make_empty_intermediate_tensors(
+        #                 batch_size=self.max_num_tokens,
+        #                 dtype=self.model_config.dtype,
+        #                 device=self.device))
 
-    #             attn_metadata_i = self.attn_metadata_builders[
-    #                 kv_cache_group_id].build_for_cudagraph_capture(
-    #                     common_attn_metadata)
-    #             for layer_name in kv_cache_group_spec.layer_names:
-    #                 attn_metadata[layer_name] = attn_metadata_i
+        #     intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+        #         num_tokens, None, False)
+        intermediate_tensors = None
 
-    #     with self.maybe_dummy_run_with_lora(self.lora_config,
-    #                                         num_scheduled_tokens):
-    #         model = self.model
-    #         if self.is_multimodal_model:
-    #             model_kwargs = self._init_model_kwargs_for_multimodal_model(
-    #                 num_reqs=num_reqs)
-    #             input_ids = None
-    #             inputs_embeds = self.inputs_embeds[:num_tokens]
-    #         else:
-    #             input_ids = self.input_ids[:num_tokens]
-    #             inputs_embeds = None
-    #             model_kwargs = {}
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=self.seq_lens,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            attn_backend=self.attn_backend,
+            out_cache_loc=self.out_cache_loc,
+            seq_lens_sum=self.seq_lens.sum().item(),
+            encoder_lens=None,
+            return_logprob=False,
+            positions=positions,
+            global_num_tokens_gpu=num_tokens,
+            global_num_tokens_for_logprob_gpu=num_tokens,
+        )
 
-    #         if self.uses_mrope:
-    #             positions = self.mrope_positions[:, :num_tokens]
-    #         else:
-    #             positions = self.positions[:num_tokens]
+        self.attn_backend.init_forward_metadata_capture_cuda_graph(
+            1,
+            num_tokens,
+            req_pool_indices,
+            self.seq_lens,
+            None,
+            forward_batch.forward_mode,
+            None,
+        )
 
-    #         if get_pp_group().is_first_rank:
-    #             intermediate_tensors = None
-    #         else:
-    #             if self.intermediate_tensors is None:
-    #                 self.intermediate_tensors = (
-    #                     self.model.make_empty_intermediate_tensors(
-    #                         batch_size=self.max_num_tokens,
-    #                         dtype=self.model_config.dtype,
-    #                         device=self.device))
+        with set_forward_context(forward_batch):
+            outputs = model(
+                input_ids=forward_batch.input_ids,
+                positions=forward_batch.positions,
+                forward_batch=forward_batch,
+            )
 
-    #             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-    #                 num_tokens, None, False)
-
-    #         with self.maybe_randomize_inputs(input_ids), set_forward_context(
-    #                 attn_metadata,
-    #                 self.config,
-    #                 num_tokens=num_tokens,
-    #                 num_tokens_across_dp=num_tokens_across_dp):
-    #             outputs = model(
-    #                 input_ids=input_ids,
-    #                 positions=positions,
-    #                 intermediate_tensors=intermediate_tensors,
-    #                 inputs_embeds=inputs_embeds,
-    #                 **MultiModalKwargs.as_kwargs(
-    #                     model_kwargs,
-    #                     device=self.device,
-    #                 ),
-    #             )
-
-    #         if self.use_aux_hidden_state_outputs:
-    #             hidden_states, _ = outputs
-    #         else:
-    #             hidden_states = outputs
+        if self.use_aux_hidden_state_outputs:
+            hidden_states, _ = outputs
+        else:
+            hidden_states = outputs
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -451,7 +497,8 @@ class ModelRunner:
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
-            self.init_cuda_graphs()
+            # self.init_cuda_graphs()
+            # self.capture_model()
         else:
             self.cuda_graph_runner = None
             self.cuda_graph_mem_usage = 0
@@ -1769,11 +1816,13 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
 
         if forward_batch.forward_mode.is_decode():
-            ret = self.forward_decode(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            print(f"set_forward_context in forward_decode")
+            with set_forward_context(forward_batch):
+                ret = self.forward_decode(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
         elif forward_batch.forward_mode.is_extend():
             with set_forward_context(forward_batch):
                 ret = self.forward_extend(
@@ -1788,7 +1837,10 @@ class ModelRunner:
                 forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_idle():
-            ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            with set_forward_context(forward_batch):
+                ret = self.forward_idle(
+                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
