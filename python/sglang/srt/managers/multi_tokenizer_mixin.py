@@ -371,7 +371,7 @@ class MultiHttpWorkerTokenizerMixin:
 
 
 class MultiHttpWorkerDetokenizerMixin:
-    def multi_tokenizer_manager_event_loop(self):
+    def multi_http_worker_event_loop(self):
         """The event loop that handles requests, for multi tokenizer manager mode only"""
         self.create_sockets_mapping()
         while True:
