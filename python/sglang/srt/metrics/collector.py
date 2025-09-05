@@ -639,7 +639,12 @@ class StorageMetricsCollector:
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
 
-    def log_storage_metrics(self, storage_metrics: StorageMetrics):
+    def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
+        if storage_metrics is None:
+            return
+
+        assert isinstance(storage_metrics, StorageMetrics)
+
         for v in storage_metrics.prefetch_io:
             self._log_histogram(self.histogram_prefetch_io, v)
         for v in storage_metrics.backup_io:
