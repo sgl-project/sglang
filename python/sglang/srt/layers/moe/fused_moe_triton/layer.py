@@ -924,12 +924,7 @@ class FusedMoE(torch.nn.Module):
         ]
 
     def should_fuse_routed_scaling_factor_in_topk(self):
-        # TODO(shuw): Revisit flag handling – need a cleaner way to specify
-        #     method capabilities w.r.t routed scaling factor.
-        return (
-            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
-            and not self.quant_method.enable_flashinfer_cutedsl_moe
-        ) or (
+        return isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod) or (
             isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method.use_cutlass_fused_experts_fp8
         )
