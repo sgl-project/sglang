@@ -236,7 +236,6 @@ def cutlass_w4a8_moe_deepep_normal(
     problem_sizes2: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -388,4 +387,21 @@ def cutlass_w4a8_moe_deepep_normal(
         128,
         topk,
     )
-    return c2
+    num_tokens = src2dst.shape[0] // topk
+    output = torch.empty(
+        (num_tokens, c2.shape[1]),
+        device=c2.device,
+        dtype=torch.bfloat16,
+    )
+    deepep_post_reorder_triton_kernel[(num_tokens,)](
+        c2,
+        output,
+        src2dst,
+        topk_ids_,
+        topk_weights,
+        topk,
+        c2.shape[1],
+        BLOCK_SIZE=512,
+    )
+
+    return output

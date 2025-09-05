@@ -22,6 +22,7 @@ from sglang.srt.utils import set_weight_attrs
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, FusedMoE
+    from sglang.srt.layers.moe.token_dispatcher import DeepEPNormalOutput
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -355,7 +356,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale_inv,
                 layer.w2_weight_scale_inv,
                 topk_weights,
-                topk_ids,
+                topk_idx,
                 self.a_strides1,
                 self.b_strides1,
                 self.c_strides1,

@@ -735,7 +735,7 @@ class DeepEPMoE(EPMoE):
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
         return self.quant_method.apply_deepep_normal(
             layer=self,
-            x=dispatch_output,
+            dispatch_output=dispatch_output,
         )
 
     def forward_npu(
