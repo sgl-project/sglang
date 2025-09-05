@@ -401,14 +401,14 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     # Prepare intermediate state cache pointer if enabled
-    # Always declare p_cache so it exists in scope; only used when idx >= 0
-    p_cache = intermediate_states_buffer
+    cache_idx = -1
+    cache_base_ptr = intermediate_states_buffer
     if CACHE_INTERMEDIATE_STATES:
-        idx = tl.load(h0_indices + i_n)
-        if idx >= 0:
+        cache_idx = tl.load(h0_indices + i_n)
+        if cache_idx >= 0:
             step_stride = HV * K * V
-            base_offset = idx * cache_steps * step_stride
-            p_cache = (
+            base_offset = cache_idx * cache_steps * step_stride
+            cache_base_ptr = (
                 intermediate_states_buffer
                 + base_offset
                 + i_hv * K * V
@@ -445,9 +445,9 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
 
         # store intermediate states if enabled
         if CACHE_INTERMEDIATE_STATES:
-            if idx >= 0:
-                tl.store(p_cache, b_h.to(p_cache.dtype.element_ty), mask=mask_h)
-                p_cache += HV * K * V
+            if cache_idx >= 0:
+                tl.store(cache_base_ptr, b_h.to(cache_base_ptr.dtype.element_ty), mask=mask_h)
+                cache_base_ptr += HV * K * V
 
         p_q += H * K
         p_k += H * K
