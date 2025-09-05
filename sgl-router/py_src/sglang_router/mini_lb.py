@@ -43,8 +43,9 @@ class MiniLoadBalancer:
         self.host = router_args.host
         self.port = router_args.port
         self.timeout = router_args.request_timeout_secs
-        self.prefill_urls = router_args.prefill_urls  # (url, bootstrap_port)
-        self.decode_urls = router_args.decode_urls  # urls
+        self.prefill_urls = [url[0] for url in router_args.prefill_urls]
+        self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
+        self.decode_urls = router_args.decode_urls
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -56,23 +57,29 @@ class MiniLoadBalancer:
             logger.warning("[MiniLB] Overriding policy to random")
             router_args.policy = "random"
 
+        if not router_args.pd_disaggregation:
+            raise ValueError("MiniLB only supports PD disaggregation mode")
+
         if len(router_args.prefill_urls) == 0 or len(router_args.decode_urls) == 0:
             raise ValueError(
                 "MiniLB requires at least one prefill and one decode server"
             )
 
     def start(self):
-        global load_balancer
-        load_balancer = self
+        global lb
+        lb = self
         uvicorn.run(app, host=self.host, port=self.port)
 
     def select_pair(self):
         assert len(self.prefill_urls) > 0, "No prefill servers available"
         assert len(self.decode_urls) > 0, "No decode servers available"
-
-        prefill = random.choice(self.prefill_urls)
-        decode = random.choice(self.decode_urls)
-        return prefill[0], prefill[1], decode
+        pidx = random.randint(0, len(self.prefill_urls) - 1)
+        didx = random.randint(0, len(self.decode_urls) - 1)
+        return (
+            self.prefill_urls[pidx],
+            self.prefill_bootstrap_ports[pidx],
+            self.decode_urls[didx],
+        )
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
@@ -174,7 +181,7 @@ class MiniLoadBalancer:
 
 
 app = FastAPI()
-load_balancer: Optional[MiniLoadBalancer] = None
+lb: Optional[MiniLoadBalancer] = None
 
 
 @app.get("/health")
@@ -184,14 +191,10 @@ async def health_check():
 
 @app.get("/health_generate")
 async def health_generate():
-    prefill_servers, decode_servers = (
-        load_balancer.prefill_servers,
-        load_balancer.decode_servers,
-    )
     async with aiohttp.ClientSession() as session:
         # Create the tasks
         tasks = []
-        for server in chain(prefill_servers, decode_servers):
+        for server in chain(lb.prefill_urls, lb.decode_urls):
             tasks.append(session.get(f"{server}/health_generate"))
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
@@ -200,14 +203,10 @@ async def health_generate():
 
 @app.post("/flush_cache")
 async def flush_cache():
-    prefill_servers, decode_servers = (
-        load_balancer.prefill_servers,
-        load_balancer.decode_servers,
-    )
     async with aiohttp.ClientSession() as session:
         # Create the tasks
         tasks = []
-        for server in chain(prefill_servers, decode_servers):
+        for server in chain(lb.prefill_urls, lb.decode_urls):
             tasks.append(session.post(f"{server}/flush_cache"))
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
@@ -216,19 +215,15 @@ async def flush_cache():
 
 @app.get("/get_server_info")
 async def get_server_info():
-    prefill_servers, decode_servers = (
-        load_balancer.prefill_servers,
-        load_balancer.decode_servers,
-    )
     prefill_infos = []
     decode_infos = []
     all_internal_states = []
 
     async with aiohttp.ClientSession() as session:
-        for server in chain(prefill_servers):
+        for server in lb.prefill_urls:
             server_info = await session.get(f"{server}/get_server_info")
             prefill_infos.append(await server_info.json())
-        for server in chain(decode_servers):
+        for server in lb.decode_urls:
             server_info = await session.get(f"{server}/get_server_info")
             info_json = await server_info.json()
             decode_infos.append(info_json)
@@ -259,13 +254,13 @@ async def get_server_info():
 
 @app.get("/get_model_info")
 async def get_model_info():
-    if not load_balancer or not load_balancer.prefill_servers:
+    if not lb or not lb.prefill_urls:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
             detail="There is no server registered",
         )
 
-    target_server_url = load_balancer.prefill_servers[0]
+    target_server_url = lb.prefill_urls[0]
     endpoint_url = f"{target_server_url}/get_model_info"
 
     async with aiohttp.ClientSession() as session:
@@ -293,7 +288,7 @@ async def get_model_info():
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
+    prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
@@ -321,17 +316,17 @@ async def handle_generate_request(request_data: dict):
         )
 
     if request_data.get("stream", False):
-        return await load_balancer.generate_stream(
+        return await lb.generate_stream(
             modified_request, prefill_server, decode_server, "generate"
         )
     else:
-        return await load_balancer.generate(
+        return await lb.generate(
             modified_request, prefill_server, decode_server, "generate"
         )
 
 
 async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
+    prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
@@ -346,14 +341,14 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     )
 
     if request_data.get("stream", False):
-        return await load_balancer.generate_stream(
+        return await lb.generate_stream(
             modified_request,
             prefill_server,
             decode_server,
             endpoint=endpoint_name,
         )
     else:
-        return await load_balancer.generate(
+        return await lb.generate(
             modified_request,
             prefill_server,
             decode_server,
@@ -386,7 +381,7 @@ def _get_request_batch_size(request):
 
 @app.get("/v1/models")
 async def get_models():
-    prefill_server = load_balancer.prefill_servers[0]  # Get the first prefill server
+    prefill_server = lb.prefill_urls[0]  # Get the first prefill server
     async with aiohttp.ClientSession() as session:
         try:
             response = await session.get(f"{prefill_server}/v1/models")
