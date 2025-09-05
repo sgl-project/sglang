@@ -145,38 +145,6 @@ def _calc_rel_diff(x: torch.Tensor, y: torch.Tensor):
 
 
 def _comparison_preprocessor(x_baseline, x_target, name):
-    # TODO remove this when PR
-    # if name in ["attn_core_q", "attn_core_k", "attn_core_v"]:
-    #     import einops
-    #     x_baseline = einops.rearrange(x_baseline, '1 num_head num_token head_dim -> num_token (num_head head_dim)')
-    # if name in ["attn_core_out"]:
-    #     import einops
-    #     x_baseline = einops.rearrange(x_baseline, '1 num_token num_head head_dim -> num_token (num_head head_dim)')
-    if name in [
-        "attn_q_raw",
-        "attn_k_raw",
-        "attn_v_raw",
-        "attn_q_rotated",
-        "attn_k_rotated",
-    ]:
-        import einops
-
-        # print("HACK: only use first 1/4 heads")
-        # _, num_head, _, _ = x_baseline.shape
-        # x_baseline = x_baseline[:, :num_head//4, :, :]
-        x_baseline = einops.rearrange(
-            x_baseline, "1 num_head num_token head_dim -> num_token (num_head head_dim)"
-        )
-    if name in ["attn_core_output"]:
-        import einops
-
-        # print("HACK: only use first 1/4 heads")
-        # _, _, num_head, _ = x_baseline.shape
-        # x_baseline = x_baseline[:, :, :num_head//4, :]
-        x_baseline = einops.rearrange(
-            x_baseline, "1 num_token num_head head_dim -> num_token (num_head head_dim)"
-        )
-
     # can insert arbitrary adhoc postprocessing logic here
     return x_baseline, x_target
 
