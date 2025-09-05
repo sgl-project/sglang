@@ -126,7 +126,7 @@ ARG VLLM_BRANCH="9f6b92db47c3444b7a7d67451ba0c3a2d6af4c2c"
 RUN if [ "$BUILD_VLLM" = "1" ]; then \
         git clone ${VLLM_REPO} \
      && cd vllm \
-     && git checkout ${VLLM_BRANCH}\
+     && git checkout ${VLLM_BRANCH} \
      && python -m pip install -r requirements/rocm.txt \
      && python setup.py clean --all \
      && python setup.py develop; \
