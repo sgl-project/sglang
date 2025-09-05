@@ -30,19 +30,20 @@ class JsonDetector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """
-        Check if the given text contains a JSON array tool call.
+        Check if the given text contains a JSON tool call (array or single object).
         
         Args:
             text: The text to check for tool calls
             
         Returns:
-            True if the text starts with a JSON array, False otherwise
+            True if the text starts with a JSON array or object, False otherwise
         """
-        return text.strip().startswith("[")
+        stripped = text.strip()
+        return stripped.startswith("[") or stripped.startswith("{")
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
-        Parse JSON array tool calls in one go.
+        Parse JSON tool calls (array or single object) in one go.
         
         Args:
             text: The text to parse
@@ -52,13 +53,21 @@ class JsonDetector(BaseFormatDetector):
             StreamingParseResult with parsed tool calls
         """
         try:
-            # Parse JSON array
+            # Parse JSON
             tool_call_data = json.loads(text)
-            if not isinstance(tool_call_data, list):
+            
+            # Handle both arrays and single objects
+            if isinstance(tool_call_data, list):
+                # Array format: [{"name": "func", "parameters": {...}}, ...]
+                call_list = tool_call_data
+            elif isinstance(tool_call_data, dict) and "name" in tool_call_data:
+                # Single object format: {"name": "func", "parameters": {...}}
+                call_list = [tool_call_data]
+            else:
                 return StreamingParseResult()
             
             calls = []
-            for i, call_info in enumerate(tool_call_data):
+            for i, call_info in enumerate(call_list):
                 if isinstance(call_info, dict) and "name" in call_info:
                     # Convert parameters to arguments for consistency
                     arguments = call_info.get("parameters", call_info.get("arguments", {}))
@@ -82,10 +91,9 @@ class JsonDetector(BaseFormatDetector):
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         """
-        Custom streaming parser for JSON arrays.
+        Simple streaming parser for JSON tool calls.
         
-        This method handles streaming JSON arrays like [{"name": "func1", "parameters": {...}}, ...]
-        by parsing them incrementally as they arrive.
+        Handles both single JSON objects and JSON arrays directly.
         
         Args:
             new_text: The new chunk of text to parse
@@ -98,7 +106,7 @@ class JsonDetector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we have a tool call (JSON array)
+        # Check if we have a tool call (JSON array or object)
         if not self.has_tool_call(current_text):
             # No tool call detected, return as normal text
             normal_text = self._buffer
@@ -109,72 +117,44 @@ class JsonDetector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # Try to parse as complete JSON first
         try:
-            # Try to parse as complete JSON array first
-            if current_text.strip().startswith('[') and current_text.strip().endswith(']'):
-                try:
-                    tool_call_data = json.loads(current_text)
-                    if isinstance(tool_call_data, list):
-                        # Complete array - parse all elements
-                        calls = []
-                        for i, call_info in enumerate(tool_call_data):
-                            if isinstance(call_info, dict) and "name" in call_info:
-                                # Validate tool name
-                                if call_info["name"] not in self._tool_indices:
-                                    return StreamingParseResult()
-                                
-                                # Convert parameters to arguments
-                                arguments = call_info.get("parameters", call_info.get("arguments", {}))
-                                calls.append(ToolCallItem(
-                                    name=call_info["name"],
-                                    parameters=json.dumps(arguments, ensure_ascii=False),
-                                    tool_index=i
-                                ))
+            if current_text.strip().endswith('}') or current_text.strip().endswith(']'):
+                tool_call_data = json.loads(current_text)
+                
+                # Handle both arrays and single objects
+                if isinstance(tool_call_data, list):
+                    # Array format: [{"name": "func", "parameters": {...}}, ...]
+                    call_list = tool_call_data
+                elif isinstance(tool_call_data, dict) and "name" in tool_call_data:
+                    # Single object format: {"name": "func", "parameters": {...}}
+                    call_list = [tool_call_data]
+                else:
+                    return StreamingParseResult()
+                
+                calls = []
+                for i, call_info in enumerate(call_list):
+                    if isinstance(call_info, dict) and "name" in call_info:
+                        # Validate tool name
+                        if call_info["name"] not in self._tool_indices:
+                            return StreamingParseResult()
                         
-                        # Clear buffer and return all calls
-                        self._buffer = ""
-                        return StreamingParseResult(calls=calls)
-                except json.JSONDecodeError:
-                    pass
-
-            # Handle partial array streaming
-            # Parse incrementally to get partial results
-            try:
-                (obj, end_idx) = _partial_json_loads(current_text, Allow.ALL)
+                        # Convert parameters to arguments
+                        arguments = call_info.get("parameters", call_info.get("arguments", {}))
+                        calls.append(ToolCallItem(
+                            name=call_info["name"],
+                            parameters=json.dumps(arguments, ensure_ascii=False),
+                            tool_index=i
+                        ))
                 
-                # Check if we got a complete array
-                if isinstance(obj, list) and _is_complete_json(current_text[:end_idx]):
-                    calls = []
-                    for i, call_info in enumerate(obj):
-                        if isinstance(call_info, dict) and "name" in call_info:
-                            # Validate tool name
-                            if call_info["name"] not in self._tool_indices:
-                                return StreamingParseResult()
-                            
-                            # Convert parameters to arguments
-                            arguments = call_info.get("parameters", call_info.get("arguments", {}))
-                            calls.append(ToolCallItem(
-                                name=call_info["name"],
-                                parameters=json.dumps(arguments, ensure_ascii=False),
-                                tool_index=i
-                            ))
-                    
-                    # Update buffer to remove parsed content
-                    self._buffer = current_text[end_idx:]
-                    return StreamingParseResult(calls=calls)
-                
-                # Partial array - return empty result, keep buffering
-                return StreamingParseResult()
-                
-            except MalformedJSON:
-                # Invalid JSON - return as normal text
-                normal_text = self._buffer
+                # Clear buffer and return calls
                 self._buffer = ""
-                return StreamingParseResult(normal_text=normal_text)
+                return StreamingParseResult(calls=calls)
+        except json.JSONDecodeError:
+            pass
 
-        except Exception as e:
-            logger.error(f"Error in JSON array streaming parser: {e}")
-            return StreamingParseResult()
+        # For partial JSON, buffer until complete
+        return StreamingParseResult()
 
     def structure_info(self) -> callable:
         """

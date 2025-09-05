@@ -51,7 +51,7 @@ class FunctionCallParser:
 
     def __init__(self, tools: List[Tool], tool_call_parser: str, tool_choice: Optional[Union[str, ToolChoice]] = None):
         # Use JSON parsing for tool_choice="required" or named tool
-        if tool_choice == "required" or (isinstance(tool_choice, dict) and "function" in tool_choice):
+        if tool_choice == "required" or isinstance(tool_choice, ToolChoice) or (isinstance(tool_choice, dict) and "function" in tool_choice):
             detector = JsonDetector()
         else:
             detector_class = self.ToolCallParserEnum.get(tool_call_parser)
@@ -176,7 +176,7 @@ class FunctionCallParser:
         ):
             strict_tag = self.get_structure_tag()
             return ("structural_tag", strict_tag)
-        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice) or (isinstance(tool_choice, dict) and "function" in tool_choice):
             json_schema = self.get_json_schema_constraint(tool_choice)
             if json_schema is not None:
                 return ("json_schema", json_schema)
@@ -248,9 +248,13 @@ class FunctionCallParser:
                 },
                 "required": ["name", "parameters"]
             }
-        if isinstance(tool_choice, ToolChoice):
+        
+        if isinstance(tool_choice, ToolChoice) or (isinstance(tool_choice, dict) and "function" in tool_choice):
             # For specific function choice, return the user's parameters schema directly
-            fn_name = tool_choice.function.name
+            if isinstance(tool_choice, ToolChoice):
+                fn_name = tool_choice.function.name
+            else:
+                fn_name = tool_choice["function"]["name"]
             for tool in self.tools:
                 if tool.function.name == fn_name:
                     return get_tool_schema(tool)
