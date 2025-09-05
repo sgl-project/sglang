@@ -213,12 +213,12 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
             "--compress-mode=size"
         )
         if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-        list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_110,code=sm_110"
-            "-gencode=arch=compute_110a,code=sm_110a"
-            "-gencode=arch=compute_121,code=sm_121"
-            "-gencode=arch=compute_121a,code=sm_121a"
-        )
+            list(APPEND SGL_KERNEL_CUDA_FLAGS
+                "-gencode=arch=compute_110,code=sm_110"
+                "-gencode=arch=compute_110a,code=sm_110a"
+                "-gencode=arch=compute_121,code=sm_121"
+                "-gencode=arch=compute_121a,code=sm_121a"
+            )
         endif()
     endif()
 
