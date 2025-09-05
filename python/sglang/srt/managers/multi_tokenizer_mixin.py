@@ -34,7 +34,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
     MultiTokenizerRegisterReq,
-    MultiTokenizerWarpper,
+    MultiTokenizerWrapper,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager, _Communicator
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -441,7 +441,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
 
     async def _distribute_result_to_workers(self, recv_obj):
         """Distribute result to corresponding workers based on rid"""
-        if isinstance(recv_obj, MultiTokenizerWarpper):
+        if isinstance(recv_obj, MultiTokenizerWrapper):
             worker_ids = [recv_obj.worker_id]
             recv_obj = recv_obj.obj
         else:
