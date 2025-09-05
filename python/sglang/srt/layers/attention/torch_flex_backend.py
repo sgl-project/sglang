@@ -33,7 +33,7 @@ class TorchFlexAttnBackend(AttentionBackend):
     def _decode_mask(self, b, h, q_idx, kv_idx):
         return q_idx == q_idx
 
-    def _run_sdpa_forward_extend(
+    def _run_flex_forward_extend(
         self,
         query: torch.Tensor,
         output: torch.Tensor,
@@ -48,7 +48,7 @@ class TorchFlexAttnBackend(AttentionBackend):
         enable_gqa=False,
         causal=False,
     ):
-        """Run the extend forward by using torch native sdpa op.
+        """Run the extend forward by using torch flex attention op.
 
         Args:
             query: [num_tokens, num_heads, head_size]
@@ -132,7 +132,7 @@ class TorchFlexAttnBackend(AttentionBackend):
             start_q, start_kv = end_q, end_kv
         return output
 
-    def _run_sdpa_forward_decode(
+    def _run_flex_forward_decode(
         self,
         query: torch.Tensor,
         output: torch.Tensor,
@@ -145,7 +145,7 @@ class TorchFlexAttnBackend(AttentionBackend):
         enable_gqa=False,
         causal=False,
     ):
-        """Run the decode forward by using torch native sdpa op.
+        """Run the decode forward by using torch flex attention op.
 
         Args:
             query: [num_tokens, num_heads, head_size]
@@ -238,9 +238,11 @@ class TorchFlexAttnBackend(AttentionBackend):
 
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
-            causal = False
+            raise NotImplementedError(
+                "TorchFlexAttnBackend does not support non-causal attention for now."
+            )
 
-        self._run_sdpa_forward_extend(
+        self._run_flex_forward_extend(
             q_,
             o_,
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -283,7 +285,7 @@ class TorchFlexAttnBackend(AttentionBackend):
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        self._run_sdpa_forward_decode(
+        self._run_flex_forward_decode(
             q_,
             o_,
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
