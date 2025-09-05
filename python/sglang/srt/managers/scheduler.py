@@ -624,9 +624,6 @@ class Scheduler(
                         if self.server_args.enable_dp_attention
                         else self.tp_cpu_group
                     ),
-                    tp_rank=self.tp_rank,
-                    pp_rank=self.pp_rank,
-                    dp_rank=self.dp_rank,
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,

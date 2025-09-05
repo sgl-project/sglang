@@ -32,9 +32,6 @@ class HiRadixCache(RadixCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
-        tp_rank: int,
-        pp_rank: int,
-        dp_rank: Optional[int],
         page_size: int,
         hicache_ratio: float,
         hicache_size: int,
@@ -79,15 +76,6 @@ class HiRadixCache(RadixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.enable_storage = hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and enable_metrics
-        if self.enable_storage_metrics:
-            labels = {
-                "storage_backend": hicache_storage_backend,
-                "tp_rank": tp_rank,
-                "pp_rank": pp_rank,
-            }
-            if dp_rank is not None:
-                labels["dp_rank"] = dp_rank
-            self.metrics_collector = StorageMetricsCollector(labels=labels)
 
         # todo: customizable storage prefetch threshold and timeout
         self.prefetch_threshold = 256
@@ -108,6 +96,14 @@ class HiRadixCache(RadixCache):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
         )
+        if self.enable_storage_metrics:
+            # TODO: support pp
+            labels = {
+                "storage_backend": hicache_storage_backend,
+                "tp_rank": self.cache_controller.tp_rank,
+                "dp_rank": self.cache_controller.dp_rank,
+            }
+            self.metrics_collector = StorageMetricsCollector(labels=labels)
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
