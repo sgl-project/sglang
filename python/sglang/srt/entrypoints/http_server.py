@@ -47,11 +47,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.srt.disaggregation.utils import (
-    FAKE_BOOTSTRAP_HOST,
-    DisaggregationMode,
-    register_disaggregation_server,
-)
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -1404,14 +1400,6 @@ def _wait_and_warmup(
 
     if server_args.debug_tensor_dump_input_file:
         kill_process_tree(os.getpid())
-
-    if server_args.pdlb_url is not None:
-        register_disaggregation_server(
-            server_args.disaggregation_mode,
-            server_args.port,
-            server_args.disaggregation_bootstrap_port,
-            server_args.pdlb_url,
-        )
 
     if launch_callback is not None:
         launch_callback()

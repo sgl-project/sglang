@@ -249,6 +249,7 @@ class ServerArgs:
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
+    speculative_draft_model_revision: Optional[str] = None
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -351,6 +352,7 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
+    numa_node: Optional[List[int]] = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -367,7 +369,6 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
-    pdlb_url: Optional[str] = None
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -1499,6 +1500,14 @@ class ServerArgs:
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
         )
         parser.add_argument(
+            "--speculative-draft-model-revision",
+            type=str,
+            default=None,
+            help="The specific draft model version to use. It can be a branch "
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
+        )
+        parser.add_argument(
             "--speculative-num-steps",
             type=int,
             help="The number of steps sampled from draft model in Speculative Decoding.",
@@ -1992,6 +2001,12 @@ class ServerArgs:
             default=ServerArgs.scheduler_recv_interval,
             help="The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",
         )
+        parser.add_argument(
+            "--numa-node",
+            type=int,
+            nargs="+",
+            help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess.",
+        )
 
         # Debug tensor dumps
         parser.add_argument(
@@ -2070,12 +2085,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.num_reserved_decode_tokens,
             help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
-        )
-        parser.add_argument(
-            "--pdlb-url",
-            type=str,
-            default=None,
-            help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
         # Custom weight loader
