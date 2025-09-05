@@ -286,7 +286,7 @@ def init_process_sgl(
 
     if online:
 
-        def run_decode(self, max_new_tokens=32):
+        def run_decode(max_new_tokens=32):
             response = requests.post(
                 url + "/generate",
                 json={
