@@ -1,5 +1,6 @@
 import collections
 import concurrent.futures
+import time
 
 import pytest
 import requests
@@ -9,17 +10,13 @@ import requests
 def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
     # Start two workers: one slow (higher inflight), one fast
     # Router monitors /get_load and Power-of-Two uses cached loads to choose
-    procs, urls, ids = mock_workers(
-        n=2, args=["--latency-ms", "0"]
-    )  # start fast by default
-
-    # Replace one with a slow worker
-    from ..conftest import _spawn_mock_worker
-
-    slow_proc, slow_url, slow_id = _spawn_mock_worker(["--latency-ms", "200"])  # slower
-    procs.append(slow_proc)
-    urls[0] = slow_url
-    ids[0] = slow_id
+    # Start one slow and one fast worker using the fixture factory
+    procs_slow, urls_slow, ids_slow = mock_workers(n=1, args=["--latency-ms", "200"])
+    procs_fast, urls_fast, ids_fast = mock_workers(n=1, args=["--latency-ms", "0"])
+    procs = procs_slow + procs_fast
+    urls = urls_slow + urls_fast
+    ids = ids_slow + ids_fast
+    slow_id = ids_slow[0]
 
     rh = router_manager.start_router(
         worker_urls=urls,
@@ -28,7 +25,6 @@ def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
     )
 
     # Prime: fire a burst to create measurable load on slow worker, then wait for monitor tick
-    import time as _t
 
     def _prime_call(i):
         try:
@@ -47,7 +43,7 @@ def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
         list(ex.map(_prime_call, range(128)))
-    _t.sleep(2)
+    time.sleep(2)
 
     # Apply direct background load on the slow worker to amplify load diff
     def _direct_load(i):
@@ -67,7 +63,7 @@ def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
         list(ex.map(_direct_load, range(128)))
-    _t.sleep(1)
+    time.sleep(1)
 
     def call(i):
         r = requests.post(
@@ -89,4 +85,5 @@ def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
             counts[wid] += 1
 
     # Expect the slow worker (higher latency/inflight) to receive fewer requests
-    assert counts[slow_id] < counts[[i for i in ids if i != slow_id][0]], counts
+    fast_worker_id = [i for i in ids if i != slow_id][0]
+    assert counts[slow_id] < counts[fast_worker_id], counts
