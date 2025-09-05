@@ -56,25 +56,7 @@ def _moe_sum_reduce_kernel(
     )
 
 
-# ---------------- Autotune wrapper ----------------
-_moe_sum_reduce_kernel = triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 1, "BLOCK_DIM": 2048, "NUM_STAGE": 1}, num_warps=8),
-        triton.Config({"BLOCK_M": 1, "BLOCK_DIM": 2048, "NUM_STAGE": 1}, num_warps=16),
-        triton.Config({"BLOCK_M": 1, "BLOCK_DIM": 2048, "NUM_STAGE": 1}, num_warps=32),
-        triton.Config({"BLOCK_M": 2, "BLOCK_DIM": 2048, "NUM_STAGE": 1}, num_warps=4),
-        triton.Config({"BLOCK_M": 4, "BLOCK_DIM": 2048, "NUM_STAGE": 1}, num_warps=4),
-        triton.Config({"BLOCK_M": 8, "BLOCK_DIM": 1024, "NUM_STAGE": 1}, num_warps=4),
-        triton.Config({"BLOCK_M": 16, "BLOCK_DIM": 1024, "NUM_STAGE": 1}, num_warps=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_DIM": 512, "NUM_STAGE": 2}, num_warps=4),
-        triton.Config({"BLOCK_M": 64, "BLOCK_DIM": 256, "NUM_STAGE": 2}, num_warps=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_DIM": 256, "NUM_STAGE": 2}, num_warps=4),
-        triton.Config({"BLOCK_M": 256, "BLOCK_DIM": 256, "NUM_STAGE": 2}, num_warps=4),
-    ],
-    key=["token_num", "hidden_dim", "topk_num"],
-)(_moe_sum_reduce_kernel)
-
-
+# _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 def moe_sum_reduce(
     input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float
 ):
@@ -84,9 +66,14 @@ def moe_sum_reduce(
     token_num, topk_num, hidden_dim = input.shape
     assert output.shape[0] == token_num and output.shape[1] == hidden_dim
 
-    grid = lambda META: (
-        triton.cdiv(token_num, META["BLOCK_M"]),
-        triton.cdiv(hidden_dim, META["BLOCK_DIM"]),
+    BLOCK_M = 1
+    BLOCK_DIM = 2048
+    NUM_STAGE = 1
+    num_warps = 16
+
+    grid = (
+        triton.cdiv(token_num, BLOCK_M),
+        triton.cdiv(hidden_dim, BLOCK_DIM),
     )
 
     _moe_sum_reduce_kernel[grid](
@@ -98,6 +85,10 @@ def moe_sum_reduce(
         topk_num=topk_num,
         hidden_dim=hidden_dim,
         routed_scaling_factor=routed_scaling_factor,
+        BLOCK_M=BLOCK_M,
+        BLOCK_DIM=BLOCK_DIM,
+        NUM_STAGE=NUM_STAGE,
+        num_warps=num_warps,
     )
     return
 
