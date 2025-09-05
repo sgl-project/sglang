@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     is_triton_kernels_available,
     is_valid_ipv6_address,
     nullable_str,
@@ -178,7 +179,7 @@ class ServerArgs:
     watchdog_timeout: float = 300
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
-    base_gpu_id: int = 0
+    base_gpu_id: int = int(os.environ.get("SGLANG_BASE_GPU_ID", 0))
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
 
@@ -2384,10 +2385,25 @@ class ServerArgs:
                 )
             else:
                 if self.moe_runner_backend == "triton_kernel":
-                    assert (
-                        self.ep_size == 1
-                    ), "Triton kernel MoE is only supported when ep_size == 1"
-                if (
+                    if os.environ.get("SGLANG_DISABLE_TRITON_MOE", "0") == "1":
+                        self.moe_runner_backend = "flashinfer_trtllm"
+                        self.enable_triton_kernel_moe = False
+                        self.enable_flashinfer_mxfp4_moe = True
+                        self.enable_flashinfer_trtllm_moe = True
+                        logger.warning(
+                            "SGLANG_DISABLE_TRITON_MOE=1 → forcing FlashInfer MoE backend"
+                        )
+                    elif is_sm120_supported():
+                        self.moe_runner_backend = "flashinfer_trtllm"
+                        self.enable_triton_kernel_moe = False
+                        self.enable_flashinfer_mxfp4_moe = True
+                        self.enable_flashinfer_trtllm_moe = True
+                        logger.warning(
+                            "Detected Blackwell (SM120) → forcing FlashInfer MoE backend"
+                        )
+                    else:
+                        assert self.ep_size == 1, "Triton kernel MoE is only supported when ep_size == 1"
+                elif (
                     self.moe_runner_backend == "auto"
                     and self.ep_size == 1
                     and is_triton_kernels_available()

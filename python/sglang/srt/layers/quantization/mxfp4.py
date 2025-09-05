@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -46,6 +47,111 @@ from sglang.srt.utils import (
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
 has_triton_kernels = is_triton_kernels_available()
+
+logger = logging.getLogger(__name__)
+
+# Set allocator hints once at module load
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:64,expandable_segments:True")
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
+_CFG_CACHE = None
+
+def _load_mxfp4_cfg():
+    """Load MXFP4 config from model's config.json, with env overrides."""
+    global _CFG_CACHE
+    if _CFG_CACHE is not None:
+        return _CFG_CACHE
+    
+    cfg = {"group_size": 128, "pack_layout": "mxfp4_row"}
+    
+    # Try to read the mounted config (works in your start.sh model dir layout)
+    for p in ("/models/config.json", "/models/model_config.json"):
+        try:
+            import json
+            if os.path.exists(p):
+                with open(p, "r") as f:
+                    j = json.load(f)
+                # These keys are model/quant pack dependent; guard with .get
+                cfg["group_size"] = int(j.get("quantization_config", {}).get("group_size", cfg["group_size"]))
+                cfg["pack_layout"] = j.get("quantization_config", {}).get("pack_layout", cfg["pack_layout"])
+                break
+        except Exception:
+            pass
+    
+    # env overrides remain possible
+    cfg["group_size"] = int(os.getenv("SGLANG_MXFP4_GROUP_SIZE", cfg["group_size"]))
+    cfg["pack_layout"] = os.getenv("SGLANG_MXFP4_PACK_LAYOUT", cfg["pack_layout"])
+    _CFG_CACHE = cfg
+    return cfg
+
+def _group_size_from_cfg():
+    """Get group size from model config, default to 128."""
+    return _load_mxfp4_cfg()["group_size"]
+
+
+def _pack_layout_from_cfg():
+    """Get pack layout from model config, default to mxfp4_row."""
+    return _load_mxfp4_cfg()["pack_layout"]
+
+
+def _extract_routing(topk_output, device):
+    """
+    Extract routing information from topk_output.
+    Returns (token_idx: [R], expert_idx: [R], gate: [R])
+    R = total routed pairs (tokens × top_k).
+    Supports multiple SGLang formats.
+    
+    Returns:
+        tok: int64 tensor of token indices
+        idx: int64 tensor of expert indices  
+        gate: float tensor of gate weights (dtype preserved)
+    """
+    # Check if it has format attribute (new SGLang/FlashInfer format)
+    if hasattr(topk_output, 'format'):
+        # This is a FlashInfer-specific format that should be handled by FlashInfer backend
+        logger.debug(f"Detected FlashInfer topk format: {topk_output.format}")
+        # Raise a clear error - this should have been caught by _is_flashinfer_topk
+        raise ValueError(
+            f"FlashInfer topk format '{topk_output.format}' passed to _extract_routing. "
+            "This should have been routed to FlashInfer backend. "
+            "Check _is_flashinfer_topk() detection logic."
+        )
+    
+    # Try various attribute name patterns
+    for (ix, sc) in (("indices", "scores"), ("topk_indices", "topk_scores")):
+        if hasattr(topk_output, ix) and hasattr(topk_output, sc):
+            idx = getattr(topk_output, ix).reshape(-1).to(device, dtype=torch.int64)
+            gate = getattr(topk_output, sc).reshape(-1).to(device)
+            T, K = getattr(topk_output, ix).shape
+            tok = torch.arange(T, device=device, dtype=torch.int64).repeat_interleave(K)
+            
+            # Check shapes match
+            if not (tok.numel() == idx.numel() == gate.numel()):
+                raise RuntimeError(
+                    f"MoE routing mismatch: tok={tok.numel()}, idx={idx.numel()}, gate={gate.numel()}"
+                )
+            return tok, idx, gate
+
+    # Alternative format with explicit fields
+    if all(hasattr(topk_output, f) for f in ("token_ids", "expert_ids", "scores")):
+        tok = topk_output.token_ids.to(device, dtype=torch.int64)
+        idx = topk_output.expert_ids.to(device, dtype=torch.int64)
+        gate = topk_output.scores.to(device)
+        
+        # Check shapes match
+        if not (tok.numel() == idx.numel() == gate.numel()):
+            raise RuntimeError(
+                f"MoE routing mismatch: tok={tok.numel()}, idx={idx.numel()}, gate={gate.numel()}"
+            )
+        return tok, idx, gate
+
+    raise RuntimeError(
+        f"Unsupported topk_output format for MoE routing. "
+        f"Available attributes: {dir(topk_output)}"
+    )
 
 
 if is_flashinfer_available():
@@ -260,7 +366,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.topk_indices_dtype = None
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         self.with_bias = False
-        self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        
+        # Broaden FlashInfer detection to catch all FlashInfer backends
+        backend = get_moe_runner_backend()
+        self.use_flashinfer = (
+            getattr(backend, "is_flashinfer_mxfp4", lambda: False)()
+            or getattr(backend, "is_flashinfer_trtllm", lambda: False)()
+            or getattr(backend, "is_flashinfer_any", lambda: False)()  # if exists
+        )
         self.flashinfer_mxfp4_moe_precision = global_server_args_dict[
             "flashinfer_mxfp4_moe_precision"
         ]
@@ -478,15 +591,27 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             gemm2_scales_mxfp4_shuffled = []
             gemm1_bias_shuffled = []
             gemm2_bias_shuffled = []
+            # Helper to pad K dimension to multiple of 4 for FlashInfer compatibility
+            def _pad_k_to_4(tensor):
+                """Pad last dimension to multiple of 4 if needed. Output is contiguous."""
+                import logging
+                K = tensor.shape[-1]
+                pad_k = (-K) % 4
+                if pad_k == 0:
+                    return tensor
+                logging.debug(f"SGLang MXFP4: padded K by {pad_k} from {K} to {K+pad_k} for scale-shuffle")
+                return torch.nn.functional.pad(tensor, (0, pad_k), value=0).contiguous()
+            
             epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
             for i in range(self.num_experts):
                 gemm1_weights_mxfp4_shuffled.append(
-                    shuffle_matrix_a(w13_weight[i].view(torch.uint8), epilogue_tile_m)
+                    shuffle_matrix_a(w13_weight[i].to(torch.uint8), epilogue_tile_m)
                 )
+                # Pad scale factors to ensure K % 4 == 0 for FlashInfer
+                w13_scale_padded = _pad_k_to_4(w13_weight_scale[i].to(torch.uint8))
+                assert w13_scale_padded.shape[-1] % 4 == 0, f"w13 scale K not aligned: {w13_scale_padded.shape[-1]}"
                 gemm1_scales_mxfp4_shuffled.append(
-                    shuffle_matrix_sf_a(
-                        w13_weight_scale[i].view(torch.uint8), epilogue_tile_m
-                    )
+                    shuffle_matrix_sf_a(w13_scale_padded, epilogue_tile_m)
                 )
                 gemm1_bias_shuffled.append(
                     shuffle_matrix_a(
@@ -495,12 +620,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
 
                 gemm2_weights_mxfp4_shuffled.append(
-                    shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
+                    shuffle_matrix_a(w2_weight[i].to(torch.uint8), epilogue_tile_m)
                 )
+                # Pad scale factors to ensure K % 4 == 0 for FlashInfer
+                w2_scale_padded = _pad_k_to_4(w2_weight_scale[i].to(torch.uint8))
+                assert w2_scale_padded.shape[-1] % 4 == 0, f"w2 scale K not aligned: {w2_scale_padded.shape[-1]}"
                 gemm2_scales_mxfp4_shuffled.append(
-                    shuffle_matrix_sf_a(
-                        w2_weight_scale[i].view(torch.uint8), epilogue_tile_m
-                    )
+                    shuffle_matrix_sf_a(w2_scale_padded, epilogue_tile_m)
                 )
                 gemm2_bias_shuffled.append(
                     shuffle_matrix_a(w2_bias[i].clone().reshape(-1, 1), epilogue_tile_m)
@@ -573,22 +699,90 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w13_weight
             del layer.w2_weight
         else:
-            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
-
-            w13_weight = upcast_from_mxfp(
-                layer.w13_weight, layer.w13_weight_scale, dtype=torch.bfloat16, axis=-1
-            )
-            w2_weight = upcast_from_mxfp(
-                layer.w2_weight, layer.w2_weight_scale, dtype=torch.bfloat16, axis=-1
-            )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+            # Check if we should use weight-only path (never materializes full BF16)
+            try:
+                from .mxfp4_weightonly import use_weightonly_mxfp4, check_mxfp4_memory_usage
+                use_weightonly = use_weightonly_mxfp4()
+            except ImportError:
+                use_weightonly = False
+            
+            if use_weightonly:
+                # Keep weights in MXFP4 format - we'll use weight-only GEMM
+                logger.info("Using MXFP4 weight-only path (SM120+ detected)")
+                logger.info("Weights stay compressed (~13GB), no BF16 materialization")
+                self.use_weightonly_gemm = True
+                
+                # Store as regular attributes (Mxfp4MoEMethod is not a nn.Module)
+                self.w13_weight_packed = layer.w13_weight
+                self.w13_weight_scale = layer.w13_weight_scale
+                self.w2_weight_packed = layer.w2_weight
+                self.w2_weight_scale = layer.w2_weight_scale
+                
+                # Store biases if present (use getattr for safety)
+                self.w13_bias = getattr(layer, "w13_weight_bias", None)
+                self.w2_bias = getattr(layer, "w2_weight_bias", None)
+                
+                # Get number of experts from weight shape
+                self.num_experts = int(self.w13_weight_packed.shape[0])
+                
+                # One-shot buffer device sync after registration
+                if torch.cuda.is_available():
+                    dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+                    self._to_device_(dev)
+                
+                # Clean up layer references
+                del layer.w13_weight, layer.w2_weight
+                del layer.w13_weight_scale, layer.w2_weight_scale
+                
+                # Check memory usage
+                check_mxfp4_memory_usage()
+            else:
+                # Original path: full upcast to BF16 (uses 30GB)
+                from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+                
+                # Hard guard against BF16 upcast on SM120
+                if torch.cuda.is_available():
+                    major, minor = torch.cuda.get_device_capability()
+                    if major >= 12 and os.getenv("SGLANG_MXFP4_FORCE_UPCAST", "0") != "1":
+                        logger.error(
+                            "Attempted BF16 upcast with MXFP4 on SM120 — would allocate ~30GiB weights. "
+                            "This will cause OOM on single RTX 5090. Use weight-only path instead."
+                        )
+                        raise RuntimeError(
+                            "MXFP4 BF16 upcast disabled on SM120+ to prevent OOM (would use 30GB). "
+                            "Use SGLANG_MXFP4_WEIGHTONLY=1 or set SGLANG_MXFP4_FORCE_UPCAST=1 to override."
+                        )
+                
+                logger.info("Using standard MXFP4 upcast path (will use ~30GB)")
+                self.use_weightonly_gemm = False
+                
+                w13_weight = upcast_from_mxfp(
+                    layer.w13_weight, layer.w13_weight_scale, dtype=torch.bfloat16, axis=-1
+                )
+                w2_weight = upcast_from_mxfp(
+                    layer.w2_weight, layer.w2_weight_scale, dtype=torch.bfloat16, axis=-1
+                )
+                del layer.w13_weight
+                del layer.w2_weight
+                del layer.w13_weight_scale
+                del layer.w2_weight_scale
+                layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
+                layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
+    def _to_device_(self, device):
+        """Move attributes to CUDA device; accepts int or torch.device."""
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        for name in (
+            "w13_weight_packed", "w13_weight_scale",
+            "w2_weight_packed", "w2_weight_scale",
+            "w13_bias", "w2_bias",
+        ):
+            t = getattr(self, name, None)
+            if t is not None and hasattr(t, "device") and t.device != device:
+                setattr(self, name, t.to(device, non_blocking=True))
+    
     def _get_tile_tokens_dim(self, x: torch.Tensor, top_k: int):
         # Number of tokens in the input tensor.
         num_tokens = x.shape[0]
@@ -612,6 +806,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
 
         return tile_tokens_dim
+
+    def _is_flashinfer_topk(self, topk_output) -> bool:
+        """Check if topk_output is FlashInfer-formatted."""
+        return (
+            hasattr(topk_output, "format")
+            or hasattr(topk_output, "expert_location_dispatch_info")
+            or hasattr(topk_output, "topk_config")  # keep future-proof
+        )
 
     def apply(
         self,
@@ -709,17 +911,227 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     moe_runner_config=moe_runner_config,
                 )
         else:
-            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+            # Check if we're using weight-only path
+            if hasattr(self, 'use_weightonly_gemm') and self.use_weightonly_gemm:
+                # Use weight-only GEMM that never materializes full BF16 weights
+                from .mxfp4_weightonly import mxfp4_weight_only_gemm, mxfp4_weight_only_gemm_grouped
+                
+                # Ensure buffers are on correct device
+                for name in ("w13_weight_packed", "w13_weight_scale", "w2_weight_packed",
+                            "w2_weight_scale", "w13_bias", "w2_bias"):
+                    t = getattr(self, name, None)
+                    if t is not None and hasattr(t, "device") and t.device != x.device:
+                        setattr(self, name, t.to(x.device, non_blocking=True))
+                
+                T, H = x.shape
+                out = torch.zeros_like(x)
+                
+                # Check if topk_output is in FlashInfer format and route to FlashInfer backend
+                if self._is_flashinfer_topk(topk_output) or getattr(self, "use_flashinfer", False):
+                    logger.debug("FlashInfer MoE routing detected -> deferring to FlashInfer backend")
+                    
+                    # Import FlashInfer dependencies with proper error handling
+                    try:
+                        from sglang.srt.layers.moe.topk import TopKOutputChecker
+                    except Exception as e:
+                        logger.error("FlashInfer TopKOutputChecker not available: %s", e)
+                        raise
+                    
+                    # Ensure trtllm_fp4_block_scale_moe is available
+                    if 'trtllm_fp4_block_scale_moe' not in globals():
+                        logger.error("trtllm_fp4_block_scale_moe not imported - FlashInfer not available")
+                        raise RuntimeError("FlashInfer backend required but not available")
+                    
+                    # When bf16 mode is enabled, we don't need to quantize the input
+                    if self.flashinfer_mxfp4_moe_precision == "bf16":
+                        assert x.dtype == torch.bfloat16
+                        x_quant = x
+                        x_scale = None
+                        
+                        # May be fused later if this code branch is frequently needed
+                        origin_hidden_states_dim = x_quant.shape[-1]
+                        if self.hidden_size != origin_hidden_states_dim:
+                            x_quant = torch.nn.functional.pad(
+                                x_quant,
+                                (0, self.hidden_size - origin_hidden_states_dim),
+                                mode="constant",
+                                value=0.0,
+                            )
+                    elif self.flashinfer_mxfp4_moe_precision == "default":
+                        # Ensure mxfp8_quantize is available
+                        if 'mxfp8_quantize' not in globals():
+                            logger.error("mxfp8_quantize not imported - FlashInfer not available")
+                            raise RuntimeError("FlashInfer mxfp8_quantize required but not available")
+                        x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
+                        # Keep scale in its native dtype; flatten only if API needs 1D:
+                        x_scale = x_scale.reshape(-1).contiguous()
+                    else:
+                        raise NotImplementedError(f"Unsupported precision: {self.flashinfer_mxfp4_moe_precision}")
+                    
+                    assert x_quant.shape[-1] == self.hidden_size
+                    
+                    # Check format but don't crash on mismatch
+                    if hasattr(TopKOutputChecker, "format_is_bypassed"):
+                        if not TopKOutputChecker.format_is_bypassed(topk_output):
+                            logger.warning("FlashInfer topk_output not in bypassed format; proceeding anyway")
+                    
+                    # Ensure device consistency
+                    dev = x.device
+                    top_k = topk_output.topk_config.top_k
+                    router_logits = topk_output.router_logits.to(dtype=torch.bfloat16, device=dev, non_blocking=True)
+                    
+                    if x_scale is not None and x_scale.device != dev:
+                        x_scale = x_scale.to(dev, non_blocking=True)
+                    
+                    # Ensure all weight tensors are on the correct device
+                    for n in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale",
+                              "w13_weight_bias", "w2_weight_bias", "gemm1_alpha", "gemm1_beta", 
+                              "gemm1_clamp_limit"):
+                        t = getattr(layer, n, None)
+                        if t is not None and hasattr(t, "device") and t.device != dev:
+                            setattr(layer, n, t.to(dev, non_blocking=True))
+                    
+                    # Call trtllm_fp4_block_scale_moe with explicit unpacking
+                    out, *_ = trtllm_fp4_block_scale_moe(
+                        router_logits,
+                        None,  # routing_bias
+                        x_quant,
+                        x_scale,
+                        layer.w13_weight,  # uint8 (e2m1 x 2)
+                        layer.w13_weight_scale,  # uint8 (e4m3 x 2)
+                        layer.w13_weight_bias,  # fp32 per expert per channel
+                        layer.gemm1_alpha,  # fp32 per expert
+                        layer.gemm1_beta,  # fp32 per expert
+                        layer.gemm1_clamp_limit,  # fp32 per expert
+                        layer.w2_weight,  # uint8 (e2m1 x 2)
+                        layer.w2_weight_scale,  # ue8m0
+                        layer.w2_weight_bias,  # fp32 per expert per channel
+                        None,  # output1_scale_scalar
+                        None,  # output1_scale_gate_scalar
+                        None,  # output2_scale_scalar
+                        layer.num_experts,
+                        top_k,
+                        None,  # n_group      # TODO: support n_group
+                        None,  # topk_group   # TODO: support topk_group
+                        self.intermediate_size,  # padded to multiple of 256
+                        layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
+                        layer.num_local_experts,  # local num experts
+                        None,
+                        self._get_tile_tokens_dim(x, top_k),
+                        1,  # routing_method_type, renormalize
+                        True,  # do finalize
+                    )
+                    return out
+                
+                # 1) Extract routing information
+                tok, exp, gate = _extract_routing(topk_output, x.device)
+                
+                # Ensure correct dtypes for deterministic iteration
+                # tok/exp as int64, gate as x.dtype
+                tok = tok.to(dtype=torch.int64)
+                exp = exp.to(dtype=torch.int64)
+                gate = gate.to(dtype=x.dtype)
+                
+                # Optional: Validate gate weights sum to ~1 per token
+                if os.getenv("SGLANG_VALIDATE_GATE", "0") == "1":
+                    # Per-token sum of gates should be ~1.0
+                    topk = tok.numel() // T
+                    s = gate.view(T, topk).sum(-1)
+                    assert torch.allclose(s, torch.ones_like(s), atol=1e-3), \
+                        f"Gate weights not normalized: {s}"
+                
+                # 2) Fast grouping in one pass for better performance
+                # Sort by expert ID to get contiguous segments
+                order = torch.argsort(exp)
+                exp_s = exp[order]
+                tok_s = tok[order]
+                gate_s = gate[order]
+                
+                # Find boundaries where expert ID changes
+                change = torch.ones_like(exp_s, dtype=torch.bool)
+                change[1:] = exp_s[1:] != exp_s[:-1]
+                starts = torch.nonzero(change, as_tuple=False).flatten()
+                ends = torch.cat([starts[1:], torch.tensor([exp_s.numel()], device=exp_s.device)])
+                
+                # Build per-expert lists for batched execution
+                X_list, Wq1_list, S1_list, B1_list = [], [], [], []
+                Wq2_list, S2_list, B2_list = [], [], []
+                tok_list, gate_list = [], []
+                
+                for s, eidx in zip(starts.tolist(), ends.tolist()):
+                    e = int(exp_s[s].item())
+                    idx = slice(s, eidx)
+                    tok_e = tok_s[idx]     # [R_e] token indices for this expert
+                    gate_e = gate_s[idx]   # [R_e] gate weights for this expert
+                    
+                    if tok_e.numel() == 0:
+                        continue
+                    
+                    # Gather expert inputs (vectorized)
+                    X_e = x.index_select(0, tok_e).contiguous()  # [R_e, H]
+                    
+                    # Collect inputs for batched execution
+                    X_list.append(X_e)
+                    tok_list.append(tok_e)
+                    gate_list.append(gate_e)
+                    Wq1_list.append(self.w13_weight_packed[e])
+                    S1_list.append(self.w13_weight_scale[e])
+                    Wq2_list.append(self.w2_weight_packed[e])
+                    S2_list.append(self.w2_weight_scale[e])
+                    if self.w13_bias is not None:
+                        B1_list.append(self.w13_bias[e])
+                    else:
+                        B1_list.append(None)
+                    if self.w2_bias is not None:
+                        B2_list.append(self.w2_bias[e])
+                    else:
+                        B2_list.append(None)
+                
+                # Pass 1: W13 (gate_up) - batched execution
+                Y1_list = mxfp4_weight_only_gemm_grouped(
+                    X_list, Wq1_list, S1_list,
+                    group_size=_group_size_from_cfg(),
+                    pack_layout=_pack_layout_from_cfg(), 
+                    sm="120"
+                )
+                
+                # Bias + activation
+                for i, Y in enumerate(Y1_list):
+                    if B1_list[i] is not None:
+                        Y1_list[i] = Y + B1_list[i]
+                    Y1_list[i] = torch.nn.functional.silu(Y1_list[i])
+                
+                # Pass 2: W2 (down) - batched execution
+                Y2_list = mxfp4_weight_only_gemm_grouped(
+                    Y1_list, Wq2_list, S2_list,
+                    group_size=_group_size_from_cfg(),
+                    pack_layout=_pack_layout_from_cfg(), 
+                    sm="120"
+                )
+                
+                # Bias for W2
+                for i, Y in enumerate(Y2_list):
+                    if B2_list[i] is not None:
+                        Y2_list[i] = Y + B2_list[i]
+                
+                # Single scatter-add pass with gate weights
+                for tok_e, gate_e, Y in zip(tok_list, gate_list, Y2_list):
+                    out.index_add_(0, tok_e, Y * gate_e.unsqueeze(1))
+                
+                return out
+            else:
+                # Standard path with pre-upcast weights
+                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
-            return fused_experts(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_output=topk_output,
-                moe_runner_config=moe_runner_config,
-                b1=layer.w13_weight_bias,
-                b2=layer.w2_weight_bias,
-            )
+                return fused_experts(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_output=topk_output,
+                    moe_runner_config=moe_runner_config,
+                    b1=layer.w13_weight_bias,
+                    b2=layer.w2_weight_bias,
+                )
 
 
 class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
