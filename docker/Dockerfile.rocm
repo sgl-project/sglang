@@ -1,13 +1,13 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.2rc0 --build-arg GPU_ARCH=gfx942 -t v0.5.2rc0-rocm630-mi30x -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.5.2rc0 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.2rc0-rocm700-mi30x -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.5.2rc0 --build-arg GPU_ARCH=gfx950 -t v0.5.2rc0-rocm700-mi35x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.2rc2 --build-arg GPU_ARCH=gfx942 -t v0.5.2rc2-rocm630-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.2rc2 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.2rc2-rocm700-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.2rc2 --build-arg GPU_ARCH=gfx950 -t v0.5.2rc2-rocm700-mi35x -f Dockerfile.rocm .
 
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
-ARG BASE_IMAGE_942_ROCM700="rocm/sgl-dev:rocm7-vllm-20250821"
-ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250821"
+ARG BASE_IMAGE_942_ROCM700="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950

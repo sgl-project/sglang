@@ -2787,16 +2787,6 @@ def lru_cache_frozenset(maxsize=128):
     return decorator
 
 
-def get_worker_ids_from_req_rids(rids):
-    if isinstance(rids, list):
-        worker_ids = [int(rid.split("_")[0]) for rid in rids]
-    elif isinstance(rids, str):
-        worker_ids = [int(rids.split("_")[0])]
-    else:
-        worker_ids = []
-    return worker_ids
-
-
 def get_origin_rid(rid):
     return rid.split("_", 1)[1] if "_" in rid else rid
 
@@ -2900,6 +2890,18 @@ def parse_module_path(module_path, function_name, create_dummy):
 
 
 def mxfp_supported():
+    """
+    Returns whether the current platform supports MX types.
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx95"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx95_supported():
     """
     Returns whether the current platform supports MX types.
     """
