@@ -1,5 +1,4 @@
 import sys
-import types
 from pathlib import Path
 
 # Ensure local sources in py_src are importable ahead of any installed package
