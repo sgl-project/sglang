@@ -25,6 +25,7 @@ import einops
 import torch
 import torch.distributed
 
+from python.sglang.srt.metrics.collector import ExpertDispatchCollector
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
@@ -586,6 +587,9 @@ class _Accumulator(ABC):
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+        self._expert_dispatch_collector = ExpertDispatchCollector(
+            expert_location_metadata.ep_size
+        )
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -649,6 +653,23 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
 
         if self._rank == 0:
+            for layer_idx in range(self._expert_location_metadata.num_layers):
+                count_of_layer = (
+                    self._expert_dispatch_collector.eplb_gpu_physical_count.labels(
+                        layer=str(layer_idx)
+                    )
+                )
+                # Exclude the +Inf bucket.
+                assert (
+                    self._expert_location_metadata.ep_size
+                    == len(count_of_layer._buckets) - 1
+                ), f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+                for gpu_rank in range(self._expert_location_metadata.ep_size):
+                    count = gpu_physical_count[layer_idx, gpu_rank]
+                    if count > 0:
+                        count_of_layer._sum.inc(count * gpu_rank)
+                        count_of_layer._buckets[gpu_rank].inc(count)
+
             utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
             utilization_rate = torch.mean(utilization_rate_tensor).item()
             self._history.append(utilization_rate)
