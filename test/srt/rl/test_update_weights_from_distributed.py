@@ -18,6 +18,7 @@ import os
 import random
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import requests
@@ -25,7 +26,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import sglang as sgl
 from sglang.srt.utils import init_custom_process_group
@@ -97,7 +97,7 @@ def init_process(
             state_dict_key_to_shape,
             backend,
             tp_size,
-            online=online
+            online=online,
         )
 
 
@@ -209,7 +209,7 @@ def init_process_sgl(
     state_dict_key_to_shape,
     backend,
     tp_size,
-    online=False
+    online=False,
 ):
     torch.cuda.set_device(rank)
     torch.cuda.synchronize()
@@ -285,6 +285,7 @@ def init_process_sgl(
         )
 
     if online:
+
         def run_decode(self, max_new_tokens=32):
             response = requests.post(
                 url + "/generate",
@@ -300,9 +301,7 @@ def init_process_sgl(
             return response.json()
 
         with ThreadPoolExecutor(32) as executor:
-            futures = [
-                executor.submit(run_decode, 3000) for _ in range(32)
-            ]
+            futures = [executor.submit(run_decode, 3000) for _ in range(32)]
             time.sleep(2)
 
     torch.cuda.synchronize()
@@ -338,7 +337,7 @@ def init_process_sgl(
                 "dtypes": dtypes,
                 "shapes": shapes,
                 "group_name": "test_parameter_update_group",
-                "online": online
+                "online": online,
             },
         )
     torch.cuda.synchronize()
@@ -648,8 +647,9 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 model_state_dict_shapes[model_name],
                 truncate_size,
                 checking_parameters,
-                online=True
+                online=True,
             )
+
 
 if __name__ == "__main__":
     unittest.main()

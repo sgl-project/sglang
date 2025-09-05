@@ -1,15 +1,15 @@
-import json
 import gc
+import json
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import torch
 import requests
+import torch
 
 import sglang as sgl
-from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+
 
 def test_update_weights_from_tensor(tp_size):
     assert torch.cuda.device_count() >= tp_size, f"At least {tp_size} GPUs are required"
@@ -252,9 +253,7 @@ class TestServerUpdateWeightsFromTensorOnline(CustomTestCase):
             for param_name in param_names[:3]:
                 response = requests.post(
                     self.base_url + "/get_weights_by_name",
-                    json={
-                        "name": param_name
-                    },
+                    json={"name": param_name},
                 )
                 actual_values = torch.tensor(response.json())[0, :5]
                 assert torch.allclose(

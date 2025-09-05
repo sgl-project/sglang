@@ -2222,8 +2222,8 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if (self.running_batch.is_empty()
-            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+        if self.running_batch.is_empty() and (
+            self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs)
         ):
             self.cur_batch = None
             self.last_batch = None
@@ -2261,15 +2261,15 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             tmp_batch.next_batch_sampling_info = None
             # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
-            self.process_batch_result(
-                tmp_batch, tmp_result, None
-            )
+            self.process_batch_result(tmp_batch, tmp_result, None)
             self.last_batch = None
 
         if len(self.running_batch.reqs) != 0:
-            retracted_reqs = self.running_batch.retract_decode(self.server_args, retract_all=True)
+            retracted_reqs = self.running_batch.retract_decode(
+                self.server_args, retract_all=True
+            )
             self._extend_requests_to_queue(retracted_reqs)
-        
+
         self.running_batch.batch_is_full = False
 
     def get_load(self):

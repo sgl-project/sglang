@@ -207,7 +207,7 @@ class TpModelWorkerClient:
             )
 
             if self.input_queue.empty():
-                self.input_queue_empty.set() # allow weight update
+                self.input_queue_empty.set()  # allow weight update
 
     def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
         """
