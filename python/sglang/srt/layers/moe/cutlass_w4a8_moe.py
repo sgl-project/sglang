@@ -112,10 +112,6 @@ def cutlass_w4a8_moe(
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
-    local_topk_ids = topk_ids_
-    local_topk_ids = (
-        torch.where(local_topk_ids == -1, num_experts, topk_ids_).to(torch.int32)
-    ).contiguous()
 
     _, src2dst, _ = run_cutlass_moe_ep_preproess(
         local_topk_ids,
