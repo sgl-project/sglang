@@ -3,7 +3,6 @@ mod tests {
     use sglang_router_rs::tokenizer::chat_template::{ChatMessage, ChatTemplateProcessor};
 
     #[test]
-    #[cfg(feature = "huggingface")]
     fn test_chat_message_helpers() {
         let system_msg = ChatMessage::system("You are a helpful assistant");
         assert_eq!(system_msg.role, "system");
@@ -19,7 +18,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "huggingface")]
     fn test_llama_style_template() {
         // Test a Llama-style chat template
         let template = r#"
@@ -67,7 +65,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "huggingface")]
     fn test_chatml_template() {
         // Test a ChatML-style template
         let template = r#"
@@ -97,7 +94,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "huggingface")]
     fn test_template_without_generation_prompt() {
         let template = r#"
 {%- for message in messages -%}
@@ -122,7 +118,6 @@ assistant:
     }
 
     #[test]
-    #[cfg(feature = "huggingface")]
     fn test_template_with_special_tokens() {
         let template = r#"{{ bos_token }}{% for msg in messages %}{{ msg.content }}{{ eos_token }}{% endfor %}"#;
 
@@ -139,7 +134,6 @@ assistant:
     }
 
     #[test]
-    #[cfg(feature = "huggingface")]
     fn test_empty_messages() {
         let template =
             r#"{% for msg in messages %}{{ msg.role }}: {{ msg.content }}\n{% endfor %}"#;

@@ -131,6 +131,7 @@ __device__ bool try_wait_barrier(uint64_t* smem_ptr, int phase_bit) {
       : "r"(smem_int_ptr), "r"(phase_bit));
   return static_cast<bool>(wait_complete);
 #endif
+  return false;
 }
 
 // Barrier arrive

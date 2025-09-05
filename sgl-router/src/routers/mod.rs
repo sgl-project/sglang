@@ -12,10 +12,9 @@ use std::fmt::Debug;
 use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 
 pub mod factory;
+pub mod grpc;
 pub mod header_utils;
-pub mod pd_router;
-pub mod pd_types;
-pub mod router;
+pub mod http;
 
 pub use factory::RouterFactory;
 
@@ -76,6 +75,10 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
     ) -> Response;
+
+    async fn route_embeddings(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
+
+    async fn route_rerank(&self, headers: Option<&HeaderMap>, body: Body) -> Response;
 
     /// Flush cache on all workers
     async fn flush_cache(&self) -> Response;

@@ -162,7 +162,6 @@ def get_deepep_config() -> str:
 def is_tbo_enabled() -> bool:
     global IS_TBO_ENABLED
     if IS_TBO_ENABLED is None:
-        logger.warning("IS_TBO_ENABLED is not initialized, using False")
         IS_TBO_ENABLED = False
     return IS_TBO_ENABLED
 

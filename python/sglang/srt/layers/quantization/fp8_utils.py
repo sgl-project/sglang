@@ -5,7 +5,7 @@ import torch
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported
 
 try:
     from vllm import _custom_ops as ops
@@ -248,22 +248,12 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
 
-    # NOTE(alcanderian): Useless when scale is packed to int32
-    # if get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK_UE8M0"):
-    #     _check_ue8m0("x_scale", x_scale)
-    #     _check_ue8m0("weight_scale", ws)
-
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
     )
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
-
-
-def _check_ue8m0(name, x):
-    x_ceil = ceil_to_ue8m0(x)
-    assert torch.all(x == x_ceil), f"{name=} {x=} {x_ceil=}"
 
 
 def aiter_w8a8_block_fp8_linear(
@@ -459,7 +449,7 @@ def _requant_weight_ue8m0(
         import deep_gemm.utils.layout
 
         sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
-        sf = deep_gemm.utils.layout.get_col_major_tma_aligned_packed_tensor(sf)
+        sf = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
         return sf
 
     out_s = _transform_scale(out_s, mn=out_w.shape[-2])

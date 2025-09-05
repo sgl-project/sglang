@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Union
 
+from sglang.srt.metrics.utils import generate_buckets
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
@@ -309,6 +311,7 @@ class SchedulerMetricsCollector:
 class TokenizerMetricsCollector:
     def __init__(
         self,
+        server_args: ServerArgs,
         labels: Dict[str, str],
         bucket_time_to_first_token: Optional[List[float]] = None,
         bucket_inter_token_latency: Optional[List[float]] = None,
@@ -334,7 +337,7 @@ class TokenizerMetricsCollector:
         )
 
         if collect_tokens_histogram:
-            bucket_prompt_tokens = [
+            default_bucket_prompt_tokens = [
                 100,
                 300,
                 500,
@@ -363,9 +366,11 @@ class TokenizerMetricsCollector:
                 name="sglang:prompt_tokens_histogram",
                 documentation="Histogram of prompt token length.",
                 labelnames=labels.keys(),
-                buckets=bucket_prompt_tokens,
+                buckets=generate_buckets(
+                    server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+                ),
             )
-            bucket_generation_tokens = [
+            default_bucket_generation_tokens = [
                 100,
                 300,
                 500,
@@ -390,7 +395,10 @@ class TokenizerMetricsCollector:
                 name="sglang:generation_tokens_histogram",
                 documentation="Histogram of generation token length.",
                 labelnames=labels.keys(),
-                buckets=bucket_generation_tokens,
+                buckets=generate_buckets(
+                    server_args.generation_tokens_buckets,
+                    default_bucket_generation_tokens,
+                ),
             )
 
         self.cached_tokens_total = Counter(

@@ -175,6 +175,7 @@ class MooncakeKVManager(BaseKVManager):
         self.disaggregation_mode = disaggregation_mode
         self.init_engine()
         # for p/d multi node infer
+        self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
         self.attn_tp_size = get_attention_tp_size()
@@ -1020,6 +1021,7 @@ class MooncakeKVManager(BaseKVManager):
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
+            # multi node case: bootstrap server's host is dist_init_addr
             if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
                 if self.dist_init_addr.endswith("]"):
                     host = self.dist_init_addr
@@ -1028,7 +1030,8 @@ class MooncakeKVManager(BaseKVManager):
             else:
                 host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
         else:
-            host = get_ip()
+            # single node case: bootstrap server's host is same as http server's host
+            host = self.bootstrap_host
             host = maybe_wrap_ipv6_address(host)
 
         bootstrap_server_url = f"{host}:{self.bootstrap_port}"
@@ -1545,7 +1548,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
 
 class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
-    def __init__(self, port: int):
+    def __init__(self, host: str, port: int):
+        self.host = host
         self.port = port
         self.app = web.Application()
         self.store = dict()
@@ -1673,7 +1677,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             self._runner = web.AppRunner(self.app, access_log=access_log)
             self._loop.run_until_complete(self._runner.setup())
 
-            site = web.TCPSite(self._runner, port=self.port)
+            site = web.TCPSite(self._runner, host=self.host, port=self.port)
             self._loop.run_until_complete(site.start())
             self._loop.run_forever()
         except Exception as e:

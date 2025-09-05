@@ -191,6 +191,7 @@ async def async_request_sglang_generate(
                     output.latency = latency
                     output.prompt_len = prompt_tokens
                     output.cached_tokens = cached_tokens
+                    output.generated_len = len(output.itl) + 1
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -321,6 +322,7 @@ class WorkloadGenerator:
             "latency": [],
             "prompt_len": [],
             "cached_tokens": [],
+            "generated_len": [],
         }
         self.num_rounds = args.num_rounds
         self.max_parallel = args.max_parallel
@@ -383,6 +385,7 @@ class WorkloadGenerator:
                 self.performance_metrics["latency"].append(response.latency)
                 self.performance_metrics["prompt_len"].append(response.prompt_len)
                 self.performance_metrics["cached_tokens"].append(response.cached_tokens)
+                self.performance_metrics["generated_len"].append(response.generated_len)
                 self.completed_requests += 1
 
                 if self.client_records[client_id]["round"] < self.num_rounds:
@@ -418,6 +421,7 @@ class WorkloadGenerator:
         response_thread.join()
         self.pbar.close()
 
+        duration = self.finished_time - self.start_time
         performance_data = {
             "summary": {
                 "total_requests": len(self.performance_metrics["ttft"]),
@@ -438,7 +442,13 @@ class WorkloadGenerator:
                 "median_latency": sorted(self.performance_metrics["latency"])[
                     len(self.performance_metrics["latency"]) // 2
                 ],
-                "throughput": self.pbar.total / (self.finished_time - self.start_time),
+                "input_token_throughput": sum(self.performance_metrics["prompt_len"])
+                / duration,
+                "output_token_throughput": sum(
+                    self.performance_metrics["generated_len"]
+                )
+                / duration,
+                "throughput": self.pbar.total / duration,
                 "cache_hit_rate": (
                     0
                     if sum(self.performance_metrics["prompt_len"]) == 0
@@ -461,7 +471,13 @@ class WorkloadGenerator:
         print(f"  P90 latency: {performance_data['summary']['p90_latency']:.2f}")
         print(f"  Median latency: {performance_data['summary']['median_latency']:.2f}")
         print(
-            f"  Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
+            f"  Input token throughput: {performance_data['summary']['input_token_throughput']:.2f} tokens per second"
+        )
+        print(
+            f"  Output token throughput: {performance_data['summary']['output_token_throughput']:.2f} tokens per second"
+        )
+        print(
+            f"  Request Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
         print(f"  Cache Hit Rate: {performance_data['summary']['cache_hit_rate']:.6f}")
         return performance_data

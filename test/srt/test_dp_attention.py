@@ -74,7 +74,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(CustomTestCase):
             "4",
             "--speculative-num-draft-tokens",
             "4",
-            "--speculative-draft",
+            "--speculative-draft-model-path",
             DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
             "--tp-size",
             "2",
