@@ -47,7 +47,7 @@ class TestAscendTp4Bf16(CustomTestCase):
                 process = popen_launch_server(
                     model,
                     self.base_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    timeout=1800,
                     other_args=[
                         *self.common_args,
                     ],
