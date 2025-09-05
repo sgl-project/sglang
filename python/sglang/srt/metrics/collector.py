@@ -555,8 +555,8 @@ class TokenizerMetricsCollector:
 
 @dataclass
 class StorageMetrics:
-    prefetch_io: List[int] = field(default_factory=list)
-    backup_io: List[int] = field(default_factory=list)
+    prefetch_pgs: List[int] = field(default_factory=list)
+    backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
 
@@ -600,16 +600,16 @@ class StorageMetricsCollector:
             100,
         ]
 
-        self.histogram_prefetch_io = Histogram(
-            name="sglang:prefetch_io",
-            documentation="Histogram of prefetch io.",
+        self.histogram_prefetch_pgs = Histogram(
+            name="sglang:prefetch_pgs",
+            documentation="Histogram of prefetch pages of batches.",
             labelnames=labels.keys(),
             buckets=bucket_io,
         )
 
-        self.histogram_backup_io = Histogram(
-            name="sglang:backup_io",
-            documentation="Histogram of backup io.",
+        self.histogram_backup_pgs = Histogram(
+            name="sglang:backup_pgs",
+            documentation="Histogram of backup pages of batches.",
             labelnames=labels.keys(),
             buckets=bucket_io,
         )
@@ -618,14 +618,14 @@ class StorageMetricsCollector:
             name="sglang:prefetch_bandwidth",
             documentation="Histogram of prefetch bandwidth in GB/s.",
             labelnames=labels.keys(),
-            buckets=bucket_io,
+            buckets=bucket_bandwidth,
         )
 
         self.histogram_backup_bandwidth = Histogram(
             name="sglang:backup_bandwidth",
             documentation="Histogram of backup bandwidth in GB/s.",
             labelnames=labels.keys(),
-            buckets=bucket_io,
+            buckets=bucket_bandwidth,
         )
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
@@ -645,10 +645,10 @@ class StorageMetricsCollector:
 
         assert isinstance(storage_metrics, StorageMetrics)
 
-        for v in storage_metrics.prefetch_io:
-            self._log_histogram(self.histogram_prefetch_io, v)
-        for v in storage_metrics.backup_io:
-            self._log_histogram(self.histogram_backup_io, v)
+        for v in storage_metrics.prefetch_pgs:
+            self._log_histogram(self.histogram_prefetch_pgs, v)
+        for v in storage_metrics.backup_pgs:
+            self._log_histogram(self.histogram_backup_pgs, v)
         for v in storage_metrics.prefetch_bandwidth:
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:

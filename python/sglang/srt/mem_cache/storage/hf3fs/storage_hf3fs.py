@@ -177,8 +177,8 @@ class HiCacheHF3FS(HiCacheStorage):
         signal.signal(signal.SIGTERM, lambda sig, frame: self.close())
         signal.signal(signal.SIGQUIT, lambda sig, frame: self.close())
 
-        self.prefetch_io = []
-        self.backup_io = []
+        self.prefetch_pgs = []
+        self.backup_pgs = []
         self.prefetch_bandwidth = []
         self.backup_bandwidth = []
 
@@ -330,7 +330,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
         end_time = time.perf_counter()
         ionum = len(batch_indices)
-        self.prefetch_io.append(ionum)
+        self.prefetch_pgs.append(ionum)
         self.prefetch_bandwidth.append(
             ionum / (end_time - start_time) * self.gb_per_page
         )
@@ -410,7 +410,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
         end_time = time.perf_counter()
         ionum = len(batch_indices)
-        self.backup_io.append(ionum)
+        self.backup_pgs.append(ionum)
         self.backup_bandwidth.append(ionum / (end_time - start_time) * self.gb_per_page)
 
         written_keys_to_confirm = []
@@ -478,12 +478,12 @@ class HiCacheHF3FS(HiCacheStorage):
     @synchronized()
     def get_stats(self):
         storage_metrics = StorageMetrics()
-        storage_metrics.prefetch_io.extend(self.prefetch_io)
-        storage_metrics.backup_io.extend(self.backup_io)
+        storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
+        storage_metrics.backup_pgs.extend(self.backup_pgs)
         storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
         storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
-        self.prefetch_io.clear()
-        self.backup_io.clear()
+        self.prefetch_pgs.clear()
+        self.backup_pgs.clear()
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
         return storage_metrics
