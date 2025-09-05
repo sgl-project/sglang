@@ -156,7 +156,10 @@ class HiRadixCache(RadixCache):
 
     def write_backup_storage(self, node: TreeNode):
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.hash_value
+            node.host_value,
+            node.key,
+            node.hash_value,
+            node.get_previous_hash_values(node.parent),
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -558,6 +561,7 @@ class HiRadixCache(RadixCache):
         last_host_node: TreeNode,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
+        previous_hashes: Optional[List[str]] = None,
     ):
         # align the number of fetching tokens to the page size
         prefetch_length = len(new_input_tokens) - (
@@ -581,7 +585,7 @@ class HiRadixCache(RadixCache):
             # no sufficient host memory for prefetch
             return
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash
+            req_id, host_indices, new_input_tokens, last_hash, previous_hashes
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,

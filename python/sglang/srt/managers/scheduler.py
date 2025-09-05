@@ -1306,10 +1306,15 @@ class Scheduler(
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity
                 last_hash = req.last_host_node.get_last_hash_value()
+                previous_hashes = req.last_host_node.get_previous_hash_values()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
                 self.tree_cache.prefetch_from_storage(
-                    req.rid, req.last_host_node, new_input_tokens, last_hash
+                    req.rid,
+                    req.last_host_node,
+                    new_input_tokens,
+                    last_hash,
+                    previous_hashes,
                 )
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):

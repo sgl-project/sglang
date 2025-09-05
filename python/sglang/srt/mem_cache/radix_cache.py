@@ -94,6 +94,19 @@ class TreeNode:
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
 
+    @lru_cache(maxsize=1)
+    def get_previous_hash_values(self, parent) -> List[str]:
+        if parent.parent == None:  # root
+            return []
+        # TODO: parent.hash_value can be None when prefetch
+        return parent.get_previous_hash_values(parent.parent) + parent.hash_value
+
+    @lru_cache(maxsize=1)
+    def get_previous_keys(self, parent) -> List[int]:
+        if parent.parent == None:  # root
+            return []
+        return parent.get_previous_keys(parent.parent) + parent.key
+
 
 def _key_match_page_size1(key0: List, key1: List):
     i = 0
