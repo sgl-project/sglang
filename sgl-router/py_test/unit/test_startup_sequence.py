@@ -10,11 +10,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-from sglang_router.launch_router import (
-    RouterArgs,
-    launch_router,
-)
+from sglang_router.launch_router import RouterArgs, launch_router
 from sglang_router.router import policy_from_str
+
 
 # Local helper mirroring the router logger setup used in production
 def setup_logger():
@@ -29,6 +27,8 @@ def setup_logger():
         handler.setFormatter(formatter)
         logger.addHandler(handler)
     return logger
+
+
 from sglang_router_rs import PolicyType
 
 
@@ -744,6 +744,7 @@ def test_router_defaults_and_start(monkeypatch):
     assert captured["cors_allowed_origins"] is None
     assert captured["worker_urls"] == ["http://w1:8000"]
     from sglang_router_rs import PolicyType
+
     assert captured["policy"] == PolicyType.RoundRobin
 
     r.start()

@@ -5,6 +5,9 @@ from typing import List, Optional
 
 import setproctitle
 from sglang_router.mini_lb import MiniLoadBalancer
+from sglang_router.router import (
+    policy_from_str,  # Re-export for compatibility with tests
+)
 from sglang_router.router_args import RouterArgs
 
 logger = logging.getLogger("router")
