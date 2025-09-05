@@ -2263,7 +2263,30 @@ def get_local_ip_by_remote() -> str:
     return None
 
 
-def get_local_ip_auto() -> str:
+def get_local_ip_auto(fallback: str = None) -> str:
+    """
+    Automatically detect the local IP address using multiple fallback strategies.
+
+    This function attempts to obtain the local IP address through several methods。
+    If all methods fail, it returns the specified fallback value or raises an exception.
+
+    Args:
+        fallback (str, optional): Fallback IP address to return if all detection
+            methods fail. For server applications, explicitly set this to "0.0.0.0"
+            (IPv4) or "::" (IPv6) to bind to all available interfaces. Defaults to None.
+
+    Returns:
+        str: The detected local IP address, or the fallback value if detection fails.
+
+    Raises:
+        ValueError: If IP detection fails and no fallback value is provided.
+
+    Note:
+        The function tries detection methods in the following order:
+        1. Direct IP detection via get_ip()
+        2. Remote connection method via get_local_ip_by_remote()
+        3. Network interface enumeration via get_local_ip_by_nic()
+    """
     if ip := get_ip():
         return ip
     logger.warning("get_ip failed: fallback to get_local_ip_by_remote")
@@ -2275,6 +2298,8 @@ def get_local_ip_auto() -> str:
     if ip := get_local_ip_by_nic():
         return ip
     logger.warning("get_local_ip_by_nic failed")
+    if fallback:
+        return fallback
     raise ValueError("Can not get local ip")
 
 
