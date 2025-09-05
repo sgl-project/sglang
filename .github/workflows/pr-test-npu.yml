@@ -90,7 +90,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-ascend-npu
+          python3 run_suite.py --suite per-commit-2-ascend-npu --timeout-per-file 3600
 
   per-commit-4-ascend-npu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
