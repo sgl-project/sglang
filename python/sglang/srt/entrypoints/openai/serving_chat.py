@@ -184,7 +184,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.function.model_dump() for item in request.tools]
 
             tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-            parser = FunctionCallParser(request.tools, tool_call_parser)
+            parser = FunctionCallParser(request.tools, tool_call_parser, request.tool_choice)
             tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
 
         # Use chat template
@@ -882,7 +882,7 @@ class OpenAIServingChat(OpenAIServingBase):
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
                 return None, text, finish_reason
-        parser = FunctionCallParser(tools, tool_call_parser)
+        parser = FunctionCallParser(tools, tool_call_parser, tool_choice)
         if parser.has_tool_call(text):
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
@@ -988,6 +988,7 @@ class OpenAIServingChat(OpenAIServingBase):
             parser_dict[index] = FunctionCallParser(
                 tools=request.tools,
                 tool_call_parser=self.tokenizer_manager.server_args.tool_call_parser,
+                tool_choice=request.tool_choice,
             )
         parser = parser_dict[index]
 
