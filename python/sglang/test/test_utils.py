@@ -61,6 +61,12 @@ DEFAULT_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST_FP8 = (
 DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
     "nvidia/Llama-3.1-8B-Instruct-FP8"
 )
+DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8 = "Qwen/Qwen3-1.7B-FP8"
+DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
+
+# W8A8 models
+DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
+DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE = "nytopop/Qwen3-30B-A3B.w8a8"
 
 # EAGLE
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
@@ -78,6 +84,7 @@ DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
 DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 
 # Nightly tests
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
@@ -457,6 +464,25 @@ def _get_default_models():
 def try_cached_model(model_repo: str):
     model_dir = _use_cached_default_models(model_repo)
     return model_dir if model_dir else model_repo
+
+
+def popen_with_error_check(command: list[str], allow_exit: bool = False):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _run_and_check():
+        stdout, stderr = process.communicate()
+
+        while process.poll() is None:
+            time.sleep(5)
+
+        if not allow_exit or process.returncode != 0:
+            raise Exception(
+                f"{command} exited with code {process.returncode}\n{stdout=}\n{stderr=}"
+            )
+
+    t = threading.Thread(target=_run_and_check)
+    t.start()
+    return process
 
 
 def popen_launch_server(

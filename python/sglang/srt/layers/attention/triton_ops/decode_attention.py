@@ -69,6 +69,7 @@ def _fwd_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -84,6 +85,12 @@ def _fwd_kernel_stage1(
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
     kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    if xai_temperature_len > 0:
+        offs_qidx = cur_batch_seq_len - 1
+        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+        _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
+        xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
 
@@ -121,6 +128,9 @@ def _fwd_kernel_stage1(
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
+
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg
 
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
@@ -181,6 +191,7 @@ def _decode_att_m_fwd(
     max_kv_splits,
     sm_scale,
     logit_cap,
+    xai_temperature_len=-1,
 ):
     BLOCK = 64
     # [TODO] work around SGPR limit on MI3xx
@@ -190,7 +201,7 @@ def _decode_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
-    batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
+    batch, head_num = q.shape[0], q.shape[1]
 
     grid = (batch, head_num, MAX_KV_SPLITS)
     kv_group_num = q.shape[1] // k_buffer.shape[1]
@@ -230,6 +241,7 @@ def _decode_att_m_fwd(
         BLOCK_N=BLOCK,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
         num_warps=num_warps,
         num_stages=2,
         Lk=Lk,
@@ -266,6 +278,7 @@ def _fwd_grouped_kernel_stage1(
     BLOCK_H: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     logit_cap: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
 ):
@@ -290,6 +303,12 @@ def _fwd_grouped_kernel_stage1(
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
     kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    if xai_temperature_len > 0:
+        offs_qidx = cur_batch_seq_len - 1
+        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+        _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
+        xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
 
     offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
 
@@ -350,6 +369,9 @@ def _fwd_grouped_kernel_stage1(
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
+
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg[:, None]
 
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
@@ -413,6 +435,7 @@ def _decode_grouped_att_m_fwd(
     max_kv_splits,
     sm_scale,
     logit_cap,
+    xai_temperature_len=-1,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
@@ -433,7 +456,7 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
+    batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     BLOCK_H = 16
@@ -480,6 +503,7 @@ def _decode_grouped_att_m_fwd(
         BLOCK_H=BLOCK_H,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
         num_warps=4,
         num_stages=num_stages,
         Lk=Lk,
@@ -620,6 +644,7 @@ def decode_attention_fwd_normal(
     sm_scale,
     logit_cap=0.0,
     sinks=None,
+    xai_temperature_len=-1,
 ):
     _decode_att_m_fwd(
         q,
@@ -633,6 +658,7 @@ def decode_attention_fwd_normal(
         max_kv_splits,
         sm_scale,
         logit_cap,
+        xai_temperature_len,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -661,6 +687,7 @@ def decode_attention_fwd_grouped(
     sm_scale,
     logit_cap=0.0,
     sinks=None,
+    xai_temperature_len=-1,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -674,6 +701,7 @@ def decode_attention_fwd_grouped(
         max_kv_splits,
         sm_scale,
         logit_cap,
+        xai_temperature_len,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -702,6 +730,7 @@ def decode_attention_fwd(
     sm_scale,
     logit_cap=0.0,
     sinks=None,
+    xai_temperature_len=-1,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -725,6 +754,7 @@ def decode_attention_fwd(
             sm_scale,
             logit_cap=logit_cap,
             sinks=sinks,
+            xai_temperature_len=xai_temperature_len,
         )
     else:
         # GQA/MQA/MLA
@@ -742,4 +772,5 @@ def decode_attention_fwd(
             sm_scale,
             logit_cap=logit_cap,
             sinks=sinks,
+            xai_temperature_len=xai_temperature_len,
         )

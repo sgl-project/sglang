@@ -39,6 +39,8 @@ jobs:
           - python-version: "3.10"
             cuda-version: "12.4"
           - python-version: "3.10"
+            cuda-version: "12.8"
+          - python-version: "3.10"
             cuda-version: "12.9"
     name: Build Wheel (CUDA ${{ matrix.cuda-version }})
     steps:
@@ -80,11 +82,11 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.9-cuda12.4
+          pattern: wheel-python3.10-cuda12.4
 
       - name: Install
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
           pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126 && pip3 install pytest
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
@@ -112,11 +114,11 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.9-cuda12.4
+          pattern: wheel-python3.10-cuda12.4
 
       - name: Install
         run: |
-          bash scripts/ci_install_dependency.sh
+          bash scripts/ci/ci_install_dependency.sh
           pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps

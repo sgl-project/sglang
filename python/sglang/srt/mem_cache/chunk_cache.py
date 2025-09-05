@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -47,7 +47,7 @@ class ChunkCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
 
-    def cache_unfinished_req(self, req: Req):
+    def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]

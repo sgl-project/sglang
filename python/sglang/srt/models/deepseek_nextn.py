@@ -20,8 +20,9 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -56,7 +57,7 @@ class DeepseekModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -134,6 +135,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
+        self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
 
         self.model = DeepseekModelNextN(

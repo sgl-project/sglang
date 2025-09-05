@@ -20,8 +20,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
+
+_is_npu = is_npu()
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -486,6 +488,8 @@ def get_embedding_and_mask(
         if embedding is None:
             return None, None
     # 2. Get mask
+    if _is_npu:
+        torch.npu.current_stream().synchronize()
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
     embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
@@ -560,7 +564,7 @@ def embed_mm_inputs(
                 ]
                 items_size[i + 1] = len(mm_items)
                 items_offsets.append(
-                    flatten_nested_list([item.offsets for item in mm_inputs.mm_items])
+                    flatten_nested_list([item.offsets for item in mm_items])
                 )
             items_size = torch.cumsum(items_size, dim=0).tolist()
 
@@ -614,8 +618,7 @@ def general_mm_embed_routine(
         input_ids: Input token IDs tensor
         forward_batch: Batch information for model forward pass
         language_model: Base language model to use
-        image_data_embedding_func: Function to embed image data
-        audio_data_embedding_func: Function to embed audio data
+        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
         placeholder_tokens: Token IDs for multimodal placeholders
         **kwargs: Additional arguments passed to language model
 
