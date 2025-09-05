@@ -2202,7 +2202,7 @@ def bind_or_assign(target, source):
         return source
 
 
-def get_local_ip_by_nic(interface: str = None) -> str:
+def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
     if interface is None:
         interface = os.environ.get("SGLANG_LOCAL_IP_NIC", None)
     if interface is None:
@@ -2234,7 +2234,7 @@ def get_local_ip_by_nic(interface: str = None) -> str:
     return None
 
 
-def get_local_ip_by_remote() -> str:
+def get_local_ip_by_remote() -> Optional[str]:
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
