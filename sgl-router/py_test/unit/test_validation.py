@@ -426,30 +426,28 @@ class TestLaunchValidation:
         )
 
         # Should not raise validation error
-        with patch("sglang_router.launch_router.Router") as mock_router:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            result = launch_router(args)
+            launch_router(args)
 
-            # Should create router instance
-            mock_router.assert_called_once()
-            assert result == mock_router_instance
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
 
     def test_regular_mode_allows_empty_worker_urls(self):
         """Test that regular mode allows empty worker URLs."""
         args = RouterArgs(worker_urls=[], service_discovery=False)
 
         # Should not raise validation error
-        with patch("sglang_router.launch_router.Router") as mock_router:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            result = launch_router(args)
+            launch_router(args)
 
-            # Should create router instance
-            mock_router.assert_called_once()
-            assert result == mock_router_instance
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
 
     def test_launch_with_valid_config(self):
         """Test launching with valid configuration."""
@@ -461,15 +459,14 @@ class TestLaunchValidation:
         )
 
         # Should not raise validation error
-        with patch("sglang_router.launch_router.Router") as mock_router:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            result = launch_router(args)
+            launch_router(args)
 
-            # Should create router instance
-            mock_router.assert_called_once()
-            assert result == mock_router_instance
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
 
     def test_launch_with_pd_config(self):
         """Test launching with valid PD configuration."""
@@ -481,15 +478,14 @@ class TestLaunchValidation:
         )
 
         # Should not raise validation error
-        with patch("sglang_router.launch_router.Router") as mock_router:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            result = launch_router(args)
+            launch_router(args)
 
-            # Should create router instance
-            mock_router.assert_called_once()
-            assert result == mock_router_instance
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
 
     def test_launch_with_service_discovery_config(self):
         """Test launching with valid service discovery configuration."""
@@ -500,12 +496,11 @@ class TestLaunchValidation:
         )
 
         # Should not raise validation error
-        with patch("sglang_router.launch_router.Router") as mock_router:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            result = launch_router(args)
+            launch_router(args)
 
-            # Should create router instance
-            mock_router.assert_called_once()
-            assert result == mock_router_instance
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()

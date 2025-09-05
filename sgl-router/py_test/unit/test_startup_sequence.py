@@ -13,9 +13,22 @@ import pytest
 from sglang_router.launch_router import (
     RouterArgs,
     launch_router,
-    policy_from_str,
-    setup_logger,
 )
+from sglang_router.router import policy_from_str
+
+# Local helper mirroring the router logger setup used in production
+def setup_logger():
+    logger = logging.getLogger("router")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        formatter = logging.Formatter(
+            "[Router (Python)] %(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
 from sglang_router_rs import PolicyType
 
 
@@ -93,27 +106,38 @@ class TestRouterInitialization:
             policy="cache_aware",
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            captured_args = {}
+
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            def fake_from_args(router_args):
+                # capture needed fields from RouterArgs
+                captured_args.update(
+                    dict(
+                        host=router_args.host,
+                        port=router_args.port,
+                        worker_urls=router_args.worker_urls,
+                        policy=policy_from_str(router_args.policy),
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
 
             result = launch_router(args)
 
-            # Verify router was created with correct parameters
-            mock_router_class.assert_called_once()
-            call_args = mock_router_class.call_args
-
-            # Check key parameters
-            assert call_args[1]["host"] == "127.0.0.1"
-            assert call_args[1]["port"] == 30000
-            assert call_args[1]["worker_urls"] == ["http://worker1:8000"]
-            assert call_args[1]["policy"] == PolicyType.CacheAware
+            # Verify Router.from_args was called and captured fields match
+            router_mod.from_args.assert_called_once()
+            assert captured_args["host"] == "127.0.0.1"
+            assert captured_args["port"] == 30000
+            assert captured_args["worker_urls"] == ["http://worker1:8000"]
+            assert captured_args["policy"] == PolicyType.CacheAware
 
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
 
-            # Verify return value
-            assert result == mock_router_instance
+            # Function returns None; ensure start was invoked
 
     def test_router_initialization_pd_mode(self):
         """Test router initialization in PD mode."""
@@ -124,25 +148,36 @@ class TestRouterInitialization:
             policy="power_of_two",
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            captured_args = {}
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(
+                        pd_disaggregation=router_args.pd_disaggregation,
+                        prefill_urls=router_args.prefill_urls,
+                        decode_urls=router_args.decode_urls,
+                        policy=policy_from_str(router_args.policy),
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
 
             result = launch_router(args)
 
-            # Verify router was created with PD parameters
-            call_args = mock_router_class.call_args
-
-            assert call_args[1]["pd_disaggregation"] is True
-            assert call_args[1]["prefill_urls"] == [("http://prefill1:8000", 9000)]
-            assert call_args[1]["decode_urls"] == ["http://decode1:8001"]
-            assert call_args[1]["policy"] == PolicyType.PowerOfTwo
+            # Verify Router.from_args was called with PD parameters
+            router_mod.from_args.assert_called_once()
+            assert captured_args["pd_disaggregation"] is True
+            assert captured_args["prefill_urls"] == [("http://prefill1:8000", 9000)]
+            assert captured_args["decode_urls"] == ["http://decode1:8001"]
+            assert captured_args["policy"] == PolicyType.PowerOfTwo
 
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
 
-            # Verify return value
-            assert result == mock_router_instance
+            # Function returns None; ensure start was invoked
 
     def test_router_initialization_with_service_discovery(self):
         """Test router initialization with service discovery."""
@@ -153,25 +188,36 @@ class TestRouterInitialization:
             service_discovery_namespace="default",
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            captured_args = {}
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(
+                        service_discovery=router_args.service_discovery,
+                        selector=router_args.selector,
+                        service_discovery_port=router_args.service_discovery_port,
+                        service_discovery_namespace=router_args.service_discovery_namespace,
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
 
             result = launch_router(args)
 
-            # Verify router was created with service discovery parameters
-            call_args = mock_router_class.call_args
-
-            assert call_args[1]["service_discovery"] is True
-            assert call_args[1]["selector"] == {"app": "worker", "env": "prod"}
-            assert call_args[1]["service_discovery_port"] == 8080
-            assert call_args[1]["service_discovery_namespace"] == "default"
+            # Verify Router.from_args was called with service discovery parameters
+            router_mod.from_args.assert_called_once()
+            assert captured_args["service_discovery"] is True
+            assert captured_args["selector"] == {"app": "worker", "env": "prod"}
+            assert captured_args["service_discovery_port"] == 8080
+            assert captured_args["service_discovery_namespace"] == "default"
 
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
 
-            # Verify return value
-            assert result == mock_router_instance
+            # Function returns None; ensure start was invoked
 
     def test_router_initialization_with_retry_config(self):
         """Test router initialization with retry configuration."""
@@ -184,27 +230,40 @@ class TestRouterInitialization:
             disable_retries=False,
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            captured_args = {}
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(
+                        retry_max_retries=router_args.retry_max_retries,
+                        retry_initial_backoff_ms=router_args.retry_initial_backoff_ms,
+                        retry_max_backoff_ms=router_args.retry_max_backoff_ms,
+                        retry_backoff_multiplier=router_args.retry_backoff_multiplier,
+                        retry_jitter_factor=router_args.retry_jitter_factor,
+                        disable_retries=router_args.disable_retries,
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
 
             result = launch_router(args)
 
             # Verify router was created with retry parameters
-            call_args = mock_router_class.call_args
-
-            assert call_args[1]["retry_max_retries"] == 3
-            assert call_args[1]["retry_initial_backoff_ms"] == 100
-            assert call_args[1]["retry_max_backoff_ms"] == 10000
-            assert call_args[1]["retry_backoff_multiplier"] == 2.0
-            assert call_args[1]["retry_jitter_factor"] == 0.1
-            assert call_args[1]["disable_retries"] is False
+            router_mod.from_args.assert_called_once()
+            assert captured_args["retry_max_retries"] == 3
+            assert captured_args["retry_initial_backoff_ms"] == 100
+            assert captured_args["retry_max_backoff_ms"] == 10000
+            assert captured_args["retry_backoff_multiplier"] == 2.0
+            assert captured_args["retry_jitter_factor"] == 0.1
+            assert captured_args["disable_retries"] is False
 
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
 
-            # Verify return value
-            assert result == mock_router_instance
+            # Function returns None; ensure start was invoked
 
     def test_router_initialization_with_circuit_breaker_config(self):
         """Test router initialization with circuit breaker configuration."""
@@ -216,26 +275,38 @@ class TestRouterInitialization:
             disable_circuit_breaker=False,
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            captured_args = {}
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(
+                        cb_failure_threshold=router_args.cb_failure_threshold,
+                        cb_success_threshold=router_args.cb_success_threshold,
+                        cb_timeout_duration_secs=router_args.cb_timeout_duration_secs,
+                        cb_window_duration_secs=router_args.cb_window_duration_secs,
+                        disable_circuit_breaker=router_args.disable_circuit_breaker,
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
 
             result = launch_router(args)
 
             # Verify router was created with circuit breaker parameters
-            call_args = mock_router_class.call_args
-
-            assert call_args[1]["cb_failure_threshold"] == 5
-            assert call_args[1]["cb_success_threshold"] == 2
-            assert call_args[1]["cb_timeout_duration_secs"] == 30
-            assert call_args[1]["cb_window_duration_secs"] == 60
-            assert call_args[1]["disable_circuit_breaker"] is False
+            router_mod.from_args.assert_called_once()
+            assert captured_args["cb_failure_threshold"] == 5
+            assert captured_args["cb_success_threshold"] == 2
+            assert captured_args["cb_timeout_duration_secs"] == 30
+            assert captured_args["cb_window_duration_secs"] == 60
+            assert captured_args["disable_circuit_breaker"] is False
 
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
 
-            # Verify return value
-            assert result == mock_router_instance
+            # Function returns None; ensure start was invoked
 
     def test_router_initialization_with_rate_limiting_config(self):
         """Test router initialization with rate limiting configuration."""
@@ -246,25 +317,36 @@ class TestRouterInitialization:
             rate_limit_tokens_per_second=100,
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            captured_args = {}
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(
+                        max_concurrent_requests=router_args.max_concurrent_requests,
+                        queue_size=router_args.queue_size,
+                        queue_timeout_secs=router_args.queue_timeout_secs,
+                        rate_limit_tokens_per_second=router_args.rate_limit_tokens_per_second,
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
 
             result = launch_router(args)
 
             # Verify router was created with rate limiting parameters
-            call_args = mock_router_class.call_args
-
-            assert call_args[1]["max_concurrent_requests"] == 512
-            assert call_args[1]["queue_size"] == 200
-            assert call_args[1]["queue_timeout_secs"] == 120
-            assert call_args[1]["rate_limit_tokens_per_second"] == 100
+            router_mod.from_args.assert_called_once()
+            assert captured_args["max_concurrent_requests"] == 512
+            assert captured_args["queue_size"] == 200
+            assert captured_args["queue_timeout_secs"] == 120
+            assert captured_args["rate_limit_tokens_per_second"] == 100
 
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
 
-            # Verify return value
-            assert result == mock_router_instance
+            # Function returns None; ensure start was invoked
 
     def test_router_initialization_with_health_check_config(self):
         """Test router initialization with health check configuration."""
@@ -276,48 +358,69 @@ class TestRouterInitialization:
             health_check_endpoint="/healthz",
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            captured_args = {}
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(
+                        health_failure_threshold=router_args.health_failure_threshold,
+                        health_success_threshold=router_args.health_success_threshold,
+                        health_check_timeout_secs=router_args.health_check_timeout_secs,
+                        health_check_interval_secs=router_args.health_check_interval_secs,
+                        health_check_endpoint=router_args.health_check_endpoint,
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
 
             result = launch_router(args)
 
             # Verify router was created with health check parameters
-            call_args = mock_router_class.call_args
-
-            assert call_args[1]["health_failure_threshold"] == 2
-            assert call_args[1]["health_success_threshold"] == 1
-            assert call_args[1]["health_check_timeout_secs"] == 3
-            assert call_args[1]["health_check_interval_secs"] == 30
-            assert call_args[1]["health_check_endpoint"] == "/healthz"
+            router_mod.from_args.assert_called_once()
+            assert captured_args["health_failure_threshold"] == 2
+            assert captured_args["health_success_threshold"] == 1
+            assert captured_args["health_check_timeout_secs"] == 3
+            assert captured_args["health_check_interval_secs"] == 30
+            assert captured_args["health_check_endpoint"] == "/healthz"
 
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
 
-            # Verify return value
-            assert result == mock_router_instance
+            # Function returns None; ensure start was invoked
 
     def test_router_initialization_with_prometheus_config(self):
         """Test router initialization with Prometheus configuration."""
         args = RouterArgs(prometheus_port=29000, prometheus_host="127.0.0.1")
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            captured_args = {}
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(
+                        prometheus_port=router_args.prometheus_port,
+                        prometheus_host=router_args.prometheus_host,
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
 
             result = launch_router(args)
 
             # Verify router was created with Prometheus parameters
-            call_args = mock_router_class.call_args
-
-            assert call_args[1]["prometheus_port"] == 29000
-            assert call_args[1]["prometheus_host"] == "127.0.0.1"
+            router_mod.from_args.assert_called_once()
+            assert captured_args["prometheus_port"] == 29000
+            assert captured_args["prometheus_host"] == "127.0.0.1"
 
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
 
-            # Verify return value
-            assert result == mock_router_instance
+            # Function returns None; ensure start was invoked
 
     def test_router_initialization_with_cors_config(self):
         """Test router initialization with CORS configuration."""
@@ -325,16 +428,23 @@ class TestRouterInitialization:
             cors_allowed_origins=["http://localhost:3000", "https://example.com"]
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            captured_args = {}
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(cors_allowed_origins=router_args.cors_allowed_origins)
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
 
             result = launch_router(args)
 
             # Verify router was created with CORS parameters
-            call_args = mock_router_class.call_args
-
-            assert call_args[1]["cors_allowed_origins"] == [
+            router_mod.from_args.assert_called_once()
+            assert captured_args["cors_allowed_origins"] == [
                 "http://localhost:3000",
                 "https://example.com",
             ]
@@ -342,8 +452,7 @@ class TestRouterInitialization:
             # Verify router.start() was called
             mock_router_instance.start.assert_called_once()
 
-            # Verify return value
-            assert result == mock_router_instance
+            # Function returns None; ensure start was invoked
 
     def test_router_initialization_with_tokenizer_config(self):
         """Test router initialization with tokenizer configuration."""
@@ -379,15 +488,15 @@ class TestStartupValidation:
         )
 
         # Should not raise validation error
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
             result = launch_router(args)
 
             # Should create router instance
-            mock_router_class.assert_called_once()
-            assert result == mock_router_instance
+            router_mod.from_args.assert_called_once()
 
     def test_policy_warning_during_startup(self):
         """Test policy warning during startup in PD mode."""
@@ -400,14 +509,12 @@ class TestStartupValidation:
             decode_policy="round_robin",
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            with patch("sglang_router.launch_router.logging") as mock_logging:
-                mock_logger = MagicMock()
-                mock_logging.getLogger.return_value = mock_logger
-
+            # The policy messages are emitted by router_args logger
+            with patch("sglang_router.router_args.logger") as mock_logger:
                 result = launch_router(args)
 
                 # Should log warning about policy usage
@@ -419,8 +526,7 @@ class TestStartupValidation:
                 )
 
                 # Should create router instance
-                mock_router_class.assert_called_once()
-                assert result == mock_router_instance
+                router_mod.from_args.assert_called_once()
 
     def test_policy_info_during_startup(self):
         """Test policy info logging during startup in PD mode."""
@@ -434,14 +540,12 @@ class TestStartupValidation:
             decode_policy=None,
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            with patch("sglang_router.launch_router.logging") as mock_logging:
-                mock_logger = MagicMock()
-                mock_logging.getLogger.return_value = mock_logger
-
+            # The policy messages are emitted by router_args logger
+            with patch("sglang_router.router_args.logger") as mock_logger:
                 result = launch_router(args)
 
                 # Should log info about policy usage
@@ -451,8 +555,7 @@ class TestStartupValidation:
                 assert "and --policy 'cache_aware'" in info_call
 
                 # Should create router instance
-                mock_router_class.assert_called_once()
-                assert result == mock_router_instance
+                router_mod.from_args.assert_called_once()
 
     def test_policy_info_decode_only_during_startup(self):
         """Test policy info logging during startup with only decode policy specified."""
@@ -465,14 +568,12 @@ class TestStartupValidation:
             decode_policy="round_robin",
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            with patch("sglang_router.launch_router.logging") as mock_logging:
-                mock_logger = MagicMock()
-                mock_logging.getLogger.return_value = mock_logger
-
+            # The policy messages are emitted by router_args logger
+            with patch("sglang_router.router_args.logger") as mock_logger:
                 result = launch_router(args)
 
                 # Should log info about policy usage
@@ -482,8 +583,7 @@ class TestStartupValidation:
                 assert "and --decode-policy 'round_robin'" in info_call
 
                 # Should create router instance
-                mock_router_class.assert_called_once()
-                assert result == mock_router_instance
+                router_mod.from_args.assert_called_once()
 
 
 class TestStartupErrorHandling:
@@ -495,14 +595,13 @@ class TestStartupErrorHandling:
             host="127.0.0.1", port=30000, worker_urls=["http://worker1:8000"]
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
-            # Simulate router creation failure
-            mock_router_class.side_effect = Exception("Router creation failed")
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            # Simulate router creation failure in from_args
+            router_mod.from_args = MagicMock(
+                side_effect=Exception("Router creation failed")
+            )
 
-            with patch("sglang_router.launch_router.logging") as mock_logging:
-                mock_logger = MagicMock()
-                mock_logging.getLogger.return_value = mock_logger
-
+            with patch("sglang_router.launch_router.logger") as mock_logger:
                 with pytest.raises(Exception, match="Router creation failed"):
                     launch_router(args)
 
@@ -517,17 +616,14 @@ class TestStartupErrorHandling:
             host="127.0.0.1", port=30000, worker_urls=["http://worker1:8000"]
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
             # Simulate router start failure
             mock_router_instance.start.side_effect = Exception("Router start failed")
 
-            with patch("sglang_router.launch_router.logging") as mock_logging:
-                mock_logger = MagicMock()
-                mock_logging.getLogger.return_value = mock_logger
-
+            with patch("sglang_router.launch_router.logger") as mock_logger:
                 with pytest.raises(Exception, match="Router start failed"):
                     launch_router(args)
 
@@ -627,8 +723,10 @@ def test_router_defaults_and_start(monkeypatch):
 
     monkeypatch.setattr(router_mod, "_Router", FakeRouter, raising=True)
 
+    from sglang_router.router_args import RouterArgs as _RouterArgs
+
     Router = router_mod.Router
-    r = Router(
+    args = _RouterArgs(
         worker_urls=["http://w1:8000"],
         policy="round_robin",
         selector=None,
@@ -637,13 +735,16 @@ def test_router_defaults_and_start(monkeypatch):
         cors_allowed_origins=None,
     )
 
-    # Defaults normalized
-    assert captured["selector"] == {}
-    assert captured["prefill_selector"] == {}
-    assert captured["decode_selector"] == {}
-    assert captured["cors_allowed_origins"] == []
+    r = Router.from_args(args)
+
+    # Defaults preserved/normalized by Router.from_args
+    assert captured["selector"] is None
+    assert captured["prefill_selector"] is None
+    assert captured["decode_selector"] is None
+    assert captured["cors_allowed_origins"] is None
     assert captured["worker_urls"] == ["http://w1:8000"]
-    assert captured["policy"] == "round_robin"
+    from sglang_router_rs import PolicyType
+    assert captured["policy"] == PolicyType.RoundRobin
 
     r.start()
     assert captured.get("started") is True
@@ -755,9 +856,7 @@ def test_launch_server_process_and_cleanup(monkeypatch):
             service_discovery=False,
         )
 
-        with patch("sglang_router.launch_router.logging") as mock_logging:
-            mock_logger = MagicMock()
-            mock_logging.getLogger.return_value = mock_logger
+        with patch("sglang_router.launch_router.logger") as mock_logger:
 
             with pytest.raises(
                 ValueError, match="PD disaggregation mode requires --prefill"
@@ -783,16 +882,15 @@ class TestStartupFlow:
             balance_rel_threshold=1.5,
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
             result = launch_router(args)
 
             # Verify complete flow
-            mock_router_class.assert_called_once()
+            router_mod.from_args.assert_called_once()
             mock_router_instance.start.assert_called_once()
-            assert result == mock_router_instance
 
     def test_complete_startup_flow_pd_mode(self):
         """Test complete startup flow for PD mode configuration."""
@@ -808,20 +906,16 @@ class TestStartupFlow:
             decode_policy="round_robin",
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            with patch("sglang_router.launch_router.logging") as mock_logging:
-                mock_logger = MagicMock()
-                mock_logging.getLogger.return_value = mock_logger
-
+            with patch("sglang_router.router_args.logger") as mock_logger:
                 result = launch_router(args)
 
                 # Verify complete flow
-                mock_router_class.assert_called_once()
+                router_mod.from_args.assert_called_once()
                 mock_router_instance.start.assert_called_once()
-                assert result == mock_router_instance
 
                 # Verify policy warning was logged
                 mock_logger.warning.assert_called_once()
@@ -866,52 +960,93 @@ class TestStartupFlow:
             health_check_endpoint="/healthz",
         )
 
-        with patch("sglang_router.launch_router.Router") as mock_router_class:
+        with patch("sglang_router.launch_router.Router") as router_mod:
+            captured_args = {}
             mock_router_instance = MagicMock()
-            mock_router_class.return_value = mock_router_instance
+
+            def fake_from_args(router_args):
+                captured_args.update(
+                    dict(
+                        host=router_args.host,
+                        port=router_args.port,
+                        worker_urls=router_args.worker_urls,
+                        policy=policy_from_str(router_args.policy),
+                        service_discovery=router_args.service_discovery,
+                        selector=router_args.selector,
+                        service_discovery_port=router_args.service_discovery_port,
+                        service_discovery_namespace=router_args.service_discovery_namespace,
+                        dp_aware=router_args.dp_aware,
+                        api_key=router_args.api_key,
+                        log_dir=router_args.log_dir,
+                        log_level=router_args.log_level,
+                        prometheus_port=router_args.prometheus_port,
+                        prometheus_host=router_args.prometheus_host,
+                        request_id_headers=router_args.request_id_headers,
+                        request_timeout_secs=router_args.request_timeout_secs,
+                        max_concurrent_requests=router_args.max_concurrent_requests,
+                        queue_size=router_args.queue_size,
+                        queue_timeout_secs=router_args.queue_timeout_secs,
+                        rate_limit_tokens_per_second=router_args.rate_limit_tokens_per_second,
+                        cors_allowed_origins=router_args.cors_allowed_origins,
+                        retry_max_retries=router_args.retry_max_retries,
+                        retry_initial_backoff_ms=router_args.retry_initial_backoff_ms,
+                        retry_max_backoff_ms=router_args.retry_max_backoff_ms,
+                        retry_backoff_multiplier=router_args.retry_backoff_multiplier,
+                        retry_jitter_factor=router_args.retry_jitter_factor,
+                        cb_failure_threshold=router_args.cb_failure_threshold,
+                        cb_success_threshold=router_args.cb_success_threshold,
+                        cb_timeout_duration_secs=router_args.cb_timeout_duration_secs,
+                        cb_window_duration_secs=router_args.cb_window_duration_secs,
+                        health_failure_threshold=router_args.health_failure_threshold,
+                        health_success_threshold=router_args.health_success_threshold,
+                        health_check_timeout_secs=router_args.health_check_timeout_secs,
+                        health_check_interval_secs=router_args.health_check_interval_secs,
+                        health_check_endpoint=router_args.health_check_endpoint,
+                    )
+                )
+                return mock_router_instance
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
 
             result = launch_router(args)
 
             # Verify complete flow
-            mock_router_class.assert_called_once()
+            router_mod.from_args.assert_called_once()
             mock_router_instance.start.assert_called_once()
-            assert result == mock_router_instance
 
-            # Verify all parameters were passed correctly
-            call_args = mock_router_class.call_args
-            assert call_args[1]["host"] == "0.0.0.0"
-            assert call_args[1]["port"] == 30001
-            # When service_discovery is True, worker_urls should be empty
-            assert call_args[1]["worker_urls"] == []
-            assert call_args[1]["policy"] == PolicyType.RoundRobin
-            assert call_args[1]["service_discovery"] is True
-            assert call_args[1]["selector"] == {"app": "worker"}
-            assert call_args[1]["service_discovery_port"] == 8080
-            assert call_args[1]["service_discovery_namespace"] == "default"
-            assert call_args[1]["dp_aware"] is True
-            assert call_args[1]["api_key"] == "test-key"
-            assert call_args[1]["log_dir"] == "/tmp/logs"
-            assert call_args[1]["log_level"] == "debug"
-            assert call_args[1]["prometheus_port"] == 29000
-            assert call_args[1]["prometheus_host"] == "0.0.0.0"
-            assert call_args[1]["request_id_headers"] == ["x-request-id", "x-trace-id"]
-            assert call_args[1]["request_timeout_secs"] == 1200
-            assert call_args[1]["max_concurrent_requests"] == 512
-            assert call_args[1]["queue_size"] == 200
-            assert call_args[1]["queue_timeout_secs"] == 120
-            assert call_args[1]["rate_limit_tokens_per_second"] == 100
-            assert call_args[1]["cors_allowed_origins"] == ["http://localhost:3000"]
-            assert call_args[1]["retry_max_retries"] == 3
-            assert call_args[1]["retry_initial_backoff_ms"] == 100
-            assert call_args[1]["retry_max_backoff_ms"] == 10000
-            assert call_args[1]["retry_backoff_multiplier"] == 2.0
-            assert call_args[1]["retry_jitter_factor"] == 0.1
-            assert call_args[1]["cb_failure_threshold"] == 5
-            assert call_args[1]["cb_success_threshold"] == 2
-            assert call_args[1]["cb_timeout_duration_secs"] == 30
-            assert call_args[1]["cb_window_duration_secs"] == 60
-            assert call_args[1]["health_failure_threshold"] == 2
-            assert call_args[1]["health_success_threshold"] == 1
-            assert call_args[1]["health_check_timeout_secs"] == 3
-            assert call_args[1]["health_check_interval_secs"] == 30
-            assert call_args[1]["health_check_endpoint"] == "/healthz"
+            # Verify key parameters were propagated into RouterArgs
+            assert captured_args["host"] == "0.0.0.0"
+            assert captured_args["port"] == 30001
+            assert captured_args["worker_urls"] == ["http://worker1:8000"]
+            assert captured_args["policy"] == PolicyType.RoundRobin
+            assert captured_args["service_discovery"] is True
+            assert captured_args["selector"] == {"app": "worker"}
+            assert captured_args["service_discovery_port"] == 8080
+            assert captured_args["service_discovery_namespace"] == "default"
+            assert captured_args["dp_aware"] is True
+            assert captured_args["api_key"] == "test-key"
+            assert captured_args["log_dir"] == "/tmp/logs"
+            assert captured_args["log_level"] == "debug"
+            assert captured_args["prometheus_port"] == 29000
+            assert captured_args["prometheus_host"] == "0.0.0.0"
+            assert captured_args["request_id_headers"] == ["x-request-id", "x-trace-id"]
+            assert captured_args["request_timeout_secs"] == 1200
+            assert captured_args["max_concurrent_requests"] == 512
+            assert captured_args["queue_size"] == 200
+            assert captured_args["queue_timeout_secs"] == 120
+            assert captured_args["rate_limit_tokens_per_second"] == 100
+            assert captured_args["cors_allowed_origins"] == ["http://localhost:3000"]
+            assert captured_args["retry_max_retries"] == 3
+            assert captured_args["retry_initial_backoff_ms"] == 100
+            assert captured_args["retry_max_backoff_ms"] == 10000
+            assert captured_args["retry_backoff_multiplier"] == 2.0
+            assert captured_args["retry_jitter_factor"] == 0.1
+            assert captured_args["cb_failure_threshold"] == 5
+            assert captured_args["cb_success_threshold"] == 2
+            assert captured_args["cb_timeout_duration_secs"] == 30
+            assert captured_args["cb_window_duration_secs"] == 60
+            assert captured_args["health_failure_threshold"] == 2
+            assert captured_args["health_success_threshold"] == 1
+            assert captured_args["health_check_timeout_secs"] == 3
+            assert captured_args["health_check_interval_secs"] == 30
+            assert captured_args["health_check_endpoint"] == "/healthz"

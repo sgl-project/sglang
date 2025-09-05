@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sglang_router.launch_router import RouterArgs, parse_router_args, policy_from_str
+from sglang_router.launch_router import RouterArgs, parse_router_args
+from sglang_router.router import policy_from_str
 
 
 class TestRouterArgs:

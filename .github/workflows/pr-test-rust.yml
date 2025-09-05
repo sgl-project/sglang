@@ -39,6 +39,13 @@ jobs:
           cd sgl-router/
           cargo fmt -- --check
 
+      - name: Run Python unit tests
+        run: |
+          cd sgl-router
+          source "$HOME/.cargo/env"
+          pip install -e .[test]
+          pytest -q py_test/unit
+
       - name: Run Rust tests
         timeout-minutes: 20
         run: |
@@ -83,13 +90,6 @@ jobs:
           pip install setuptools-rust wheel build
           python3 -m build
           pip install --force-reinstall dist/*.whl
-
-      - name: Run Python unit tests
-        run: |
-          cd sgl-router
-          source "$HOME/.cargo/env"
-          pip install pytest pytest-cov pytest-xdist
-          pytest -q py_test/unit
 
       - name: Run e2e test
         run: |

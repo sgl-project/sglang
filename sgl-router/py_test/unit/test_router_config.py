@@ -9,7 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sglang_router.launch_router import RouterArgs, launch_router, policy_from_str
+from sglang_router.launch_router import RouterArgs, launch_router
+from sglang_router.router import policy_from_str
 from sglang_router_rs import PolicyType
 
 
@@ -78,30 +79,28 @@ class TestRouterConfigValidation:
         )
 
         # Should not raise validation error when service discovery is enabled
-        with patch("sglang_router.launch_router.Router") as mock_router:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            result = launch_router(args)
+            launch_router(args)
 
-            # Should create router instance
-            mock_router.assert_called_once()
-            assert result == mock_router_instance
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
 
     def test_regular_mode_without_workers_allows_empty_urls(self):
         """Test that regular mode allows empty worker URLs."""
         args = RouterArgs(worker_urls=[], service_discovery=False)
 
         # Should not raise validation error
-        with patch("sglang_router.launch_router.Router") as mock_router:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            result = launch_router(args)
+            launch_router(args)
 
-            # Should create router instance
-            mock_router.assert_called_once()
-            assert result == mock_router_instance
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
 
     def test_cache_threshold_validation(self):
         """Test cache threshold validation."""
@@ -291,15 +290,14 @@ class TestRouterConfigValidation:
         )
 
         # Should not raise validation error
-        with patch("sglang_router.launch_router.Router") as mock_router:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            result = launch_router(args)
+            launch_router(args)
 
-            # Should create router instance
-            mock_router.assert_called_once()
-            assert result == mock_router_instance
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
 
     def test_policy_fallback_validation(self):
         """Test policy fallback validation in PD mode."""
@@ -314,15 +312,14 @@ class TestRouterConfigValidation:
         )
 
         # Should not raise validation error
-        with patch("sglang_router.launch_router.Router") as mock_router:
+        with patch("sglang_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
-            mock_router.return_value = mock_router_instance
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            result = launch_router(args)
+            launch_router(args)
 
-            # Should create router instance
-            mock_router.assert_called_once()
-            assert result == mock_router_instance
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
 
     def test_policy_enum_conversion(self):
         """Test policy string to enum conversion."""
