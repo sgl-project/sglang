@@ -892,11 +892,7 @@ class StandaloneWorker(TpModelWorker):
         if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
-            hidden_size = (
-                self.model_config.hidden_size * 3
-                if self.speculative_algorithm.is_eagle3()
-                else self.model_config.hidden_size
-            )
+            hidden_size = self.model_config.hidden_size
             batch.spec_info = EagleDraftInput.create_idle_input(
                 device=self.device,
                 hidden_size=hidden_size,
