@@ -1942,7 +1942,6 @@ def get_ip() -> Optional[str]:
     host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
     if host_ip:
         return host_ip
-    logger.warning("env SGLANG_HOST_IP or HOST_IP is not set")
     return None
 
 
@@ -2203,10 +2202,7 @@ def bind_or_assign(target, source):
 
 
 def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
-    if interface is None:
-        interface = os.environ.get("SGLANG_LOCAL_IP_NIC", None)
-    if interface is None:
-        logger.warning("no interface name passed and SGLANG_LOCAL_IP_NIC is not set")
+    if (interface or os.environ.get("SGLANG_LOCAL_IP_NIC", None)) is None:
         return None
     try:
         import netifaces
@@ -2289,15 +2285,15 @@ def get_local_ip_auto(fallback: str = None) -> str:
     """
     if ip := get_ip():
         return ip
-    logger.debug("get_ip failed: fallback to get_local_ip_by_remote")
-    # Fallback
-    if ip := get_local_ip_by_remote():
-        return ip
-    logger.debug("get_local_ip_by_remote failed: fallback to get_local_ip_by_nic")
+    logger.debug("get_ip failed")
     # Fallback
     if ip := get_local_ip_by_nic():
         return ip
     logger.debug("get_local_ip_by_nic failed")
+    # Fallback
+    if ip := get_local_ip_by_remote():
+        return ip
+    logger.debug("get_local_ip_by_remote failed")
     if fallback:
         return fallback
     raise ValueError("Can not get local ip")
