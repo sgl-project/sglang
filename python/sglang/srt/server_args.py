@@ -368,7 +368,6 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
-    pdlb_url: Optional[str] = None
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -2077,12 +2076,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.num_reserved_decode_tokens,
             help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
-        )
-        parser.add_argument(
-            "--pdlb-url",
-            type=str,
-            default=None,
-            help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
         # Custom weight loader
