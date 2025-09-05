@@ -2,32 +2,29 @@
 #include <cudaTypedefs.h>
 #include <torch/all.h>
 
-#include <iostream>
+#include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
 
-constexpr uint64_t THREADS_PER_EXPERT = 512;
-
+template <int BLOCK_SIZE>
 __global__ void compute_problem_sizes_w4a8(
     const int32_t* __restrict__ topk_ids,
     int32_t* problem_sizes1,
     int32_t* problem_sizes2,
-    int32_t* atomic_buffer,
     const int topk_length,
     const int n,
     const int k) {
   int expert_id = blockIdx.x;
-  if (threadIdx.x == 0) {
-    atomic_buffer[expert_id] = 0;
-  }
 
   int occurrences = 0;
-  for (int i = threadIdx.x; i < topk_length; i += THREADS_PER_EXPERT) {
+  for (int i = threadIdx.x; i < topk_length; i += BLOCK_SIZE) {
     occurrences += (topk_ids[i] == expert_id);
   }
-  atomicAdd(&atomic_buffer[expert_id], occurrences);
-  __syncthreads();
+
+  using BlockReduce = cub::BlockReduce<int, BLOCK_SIZE>;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+  int final_occurrences = BlockReduce(temp_storage).Sum(occurrences);
 
   if (threadIdx.x == 0) {
-    int final_occurrences = atomic_buffer[expert_id];
     problem_sizes1[expert_id * 3] = 2 * n;
     problem_sizes1[expert_id * 3 + 1] = final_occurrences;
     problem_sizes1[expert_id * 3 + 2] = k;
@@ -37,78 +34,56 @@ __global__ void compute_problem_sizes_w4a8(
   }
 }
 
-__global__ void compute_expert_offsets_w4a8_default(
-    const int32_t* __restrict__ count_buffer, int32_t* expert_offsets, const int num_experts) {
-  int32_t tot_offset = 0;
-  expert_offsets[0] = 0;
-  for (int i = 0; i < num_experts; ++i) {
-    tot_offset += count_buffer[i];
-    expert_offsets[i + 1] = tot_offset;
-  }
-}
-
-constexpr int WARP_SIZE = 32;
-constexpr int MAX_BLOCK_SIZE = 1024;
-
-__inline__ __device__ int32_t warp_prefix_sum(int32_t val, int lane, int n = WARP_SIZE, unsigned mask = 0xffffffff) {
-  for (int offset = 1; offset < n; offset <<= 1) {
-    int32_t x = __shfl_up_sync(mask, val, offset, WARP_SIZE);
-    if (lane >= offset) {
-      val += x;
-    }
-  }
-  return val;
-}
-
-__device__ void cumsum(const int32_t* __restrict__ input, int32_t* __restrict__ output, int n, int stride) {
-  __shared__ int32_t warp_sums[MAX_BLOCK_SIZE / WARP_SIZE];
+template <int BLOCK_SIZE>
+__device__ void
+cumsum_block_scan(const int32_t* __restrict__ input, int32_t* __restrict__ output, int n, int input_stride) {
+  using BlockScan = cub::BlockScan<int32_t, BLOCK_SIZE>;
+  __shared__ typename BlockScan::TempStorage temp_scan_storage;
+  __shared__ int32_t s_broadcast_val;
 
   int tid = threadIdx.x;
-  int lane = threadIdx.x % WARP_SIZE;     // warp 内的 lane id
-  int warp_id = threadIdx.x / WARP_SIZE;  // 当前 warp id
-
-  // prefix sum within a warp
-  int32_t val = tid < n ? input[tid * stride] : 0;
-  val = warp_prefix_sum(val, lane);
-
-  // write warp sum to shared memory
-  if (lane == WARP_SIZE - 1) {
-    warp_sums[warp_id] = val;
-  }
-  __syncthreads();
-
-  // prefix sum of warp sums
-  if (warp_id == 0) {
-    int num_warps = blockDim.x / WARP_SIZE;
-    // it does not matter if lane >= num_warps, since we do not use the result for these lanes
-    int warp_total = warp_sums[lane];
-    warp_total = warp_prefix_sum(warp_total, lane, num_warps);
-    warp_sums[lane] = warp_total;
-  }
-  __syncthreads();
-
-  // finalize the result
-  if (warp_id > 0) {
-    val += warp_sums[warp_id - 1];
-  }
-
-  if (tid < n) {
-    output[tid] = val;
+  int32_t base_prefix_sum = 0;
+  for (int base_idx = 0; base_idx < n; base_idx += BLOCK_SIZE) {
+    int index = base_idx + tid;
+    int32_t val = index < n ? input[index * input_stride] : 0;
+    int32_t local_prefix_sum;
+    BlockScan(temp_scan_storage).InclusiveSum(val, local_prefix_sum);
+    int32_t prefix_sum = local_prefix_sum + base_prefix_sum;
+    if (index < n) {
+      output[index] = prefix_sum;
+    }
+    if (base_idx + BLOCK_SIZE < n) {
+      if (tid == BLOCK_SIZE - 1) {
+        s_broadcast_val = prefix_sum;
+      }
+      __syncthreads();
+      base_prefix_sum = s_broadcast_val;
+    }
   }
 }
 
-__global__ void compute_expert_offsets_w4a8_parallel_kernel(
-    const int32_t* __restrict__ input, int32_t* __restrict__ output, int n, int stride) {
+template <int BLOCK_SIZE>
+__global__ void compute_expert_offsets_w4a8_kernel(
+    const int32_t* __restrict__ problem_sizes1, int32_t* __restrict__ expert_offsets, int n, int stride) {
   if (threadIdx.x == 0) {
-    output[0] = 0;
+    expert_offsets[0] = 0;
   }
-  cumsum(input, output + 1, n, stride);
+  cumsum_block_scan<BLOCK_SIZE>(problem_sizes1, expert_offsets + 1, n, stride);
 }
 
-void compute_expert_offsets_w4a8_parallel(
-    cudaStream_t stream, const int32_t* input, int32_t* output, int n, int stride = 1, int off = 0) {
-  int block_size = max((n + WARP_SIZE - 1) / WARP_SIZE, 1) * WARP_SIZE;
-  compute_expert_offsets_w4a8_parallel_kernel<<<1, block_size, 0, stream>>>(input + off, output, n, stride);
+void compute_expert_offsets_w4a8(
+    cudaStream_t stream, const int32_t* problem_sizes1, int32_t* expert_offsets, int n, int stride = 1, int off = 0) {
+#define compute_expert_offsets_w4a8_call(BLOCK_SIZE) \
+  compute_expert_offsets_w4a8_kernel<BLOCK_SIZE>     \
+      <<<1, BLOCK_SIZE, 0, stream>>>(problem_sizes1 + off, expert_offsets, n, stride);
+
+  if (n <= 32) {
+    compute_expert_offsets_w4a8_call(32);
+  } else if (n <= 256) {
+    compute_expert_offsets_w4a8_call(256);
+  } else {
+    compute_expert_offsets_w4a8_call(1024);
+  }
 }
 
 void get_cutlass_w4a8_moe_mm_data_caller(
@@ -123,28 +98,21 @@ void get_cutlass_w4a8_moe_mm_data_caller(
     const int64_t k) {
   auto stream = at::cuda::getCurrentCUDAStream(topk_ids.device().index());
   auto options_int32 = torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
-  torch::Tensor atomic_buffer = torch::empty(num_experts, options_int32);
 
-  int num_threads = min(THREADS_PER_EXPERT, topk_ids.numel());
-  compute_problem_sizes_w4a8<<<num_experts, num_threads, 0, stream>>>(
+  constexpr uint64_t BLOCK_SIZE = 512;
+  compute_problem_sizes_w4a8<BLOCK_SIZE><<<num_experts, BLOCK_SIZE, 0, stream>>>(
       static_cast<const int32_t*>(topk_ids.data_ptr()),
       static_cast<int32_t*>(problem_sizes1.data_ptr()),
       static_cast<int32_t*>(problem_sizes2.data_ptr()),
-      static_cast<int32_t*>(atomic_buffer.data_ptr()),
       topk_ids.numel(),
       n,
       k);
 
-  if (num_experts <= 1024) {
-    compute_expert_offsets_w4a8_parallel(
-        stream,
-        static_cast<const int32_t*>(atomic_buffer.data_ptr()),
-        static_cast<int32_t*>(expert_offsets.data_ptr()),
-        num_experts);
-  } else {
-    compute_expert_offsets_w4a8_default<<<1, 1, 0, stream>>>(
-        static_cast<const int32_t*>(atomic_buffer.data_ptr()),
-        static_cast<int32_t*>(expert_offsets.data_ptr()),
-        num_experts);
-  }
+  compute_expert_offsets_w4a8(
+      stream,
+      static_cast<const int32_t*>(problem_sizes1.data_ptr()),
+      static_cast<int32_t*>(expert_offsets.data_ptr()),
+      num_experts,
+      3,
+      1);
 }
