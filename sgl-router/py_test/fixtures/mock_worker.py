@@ -1,4 +1,3 @@
-## Note: no shebang to avoid pre-commit executable checks
 """
 Lightweight mock worker HTTP server for router integration tests.
 
