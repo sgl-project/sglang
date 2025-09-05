@@ -147,12 +147,14 @@ def flashinfer_cutedsl_grouped_gemm_nt_masked(
     aq, aq_sf = scaled_fp4_grouped_quant(
         hidden_states,
         input_global_scale,
+        masked_m.to(hidden_states.device),
     )
+    num_experts, n, k = weights.shape
     bq, bq_sf = scaled_fp4_grouped_quant(
         weights,
         w_global_scale,
+        torch.ones(num_experts, device=weights.device, dtype=torch.int32) * n,
     )
-    num_experts, n, k = weights.shape
 
     out = torch.zeros(
         (num_experts, max(masked_m), n), dtype=weights.dtype, device=aq.device
@@ -201,6 +203,7 @@ def test_grouped_gemm_nt_masked(
     shape: tuple[int, int, int, int, int],
 ) -> None:
     B, D, N, num_experts, topk = shape
+    torch.manual_seed(42)
     hidden_states = torch.randn(B, D, dtype=torch.bfloat16, device="cuda")
     weights = torch.randn(num_experts, N, D, dtype=torch.bfloat16, device="cuda")
     router_logits = torch.randn(B, num_experts, dtype=torch.float32)
@@ -276,12 +279,15 @@ def test_grouped_gemm_nt_masked(
         out_ref[expert_id, expert_slot[expert_id], :] = out[i]
         expert_slot[expert_id] += 1
 
-    torch.testing.assert_close(
-        out_flashinfer.permute(2, 0, 1),
-        out_ref.to(out_flashinfer.device),
-        atol=1e-1,
-        rtol=5e-2,
-    )
+    # Note: just to compare the masked position due to cutedsl may write nan
+    # into unmasked position.
+    for i in range(num_experts):
+        torch.testing.assert_close(
+            out_flashinfer.permute(2, 0, 1)[i, : masked_m[i]],
+            out_ref.to(out_flashinfer.device)[i, : masked_m[i]],
+            atol=1e-1,
+            rtol=5e-2,
+        )
 
 
 @pytest.mark.skipif(
@@ -322,10 +328,12 @@ def test_moe_masked(
     w1_fp4, w1_blockscale = scaled_fp4_grouped_quant(
         w1,
         w1_global_scale,
+        torch.ones(num_experts, dtype=torch.int32, device=w1.device) * 2 * N,
     )
     w2_fp4, w2_blockscale = scaled_fp4_grouped_quant(
         w2,
         w2_global_scale,
+        torch.ones(num_experts, dtype=torch.int32, device=w2.device) * D,
     )
 
     w1_alpha = 1.0 / (input_global_scale * w1_global_scale)
