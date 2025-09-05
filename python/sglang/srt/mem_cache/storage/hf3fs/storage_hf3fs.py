@@ -415,22 +415,12 @@ class HiCacheHF3FS(HiCacheStorage):
         return result[0] if result else False
 
     def batch_exists(self, keys: List[str]) -> int:
-        if self.is_page_first_layout and not self.is_mla_model:
-            query_keys = []
-            # Compatible with page_first layout's key format, Refer to memory_pool_host.py#get_buffer_with_hash
-            for key in keys:
-                query_keys.append(f"{key}-k")
-                query_keys.append(f"{key}-v")
-            key_multiplier = 2
-        else:
-            query_keys = keys
-            key_multiplier = 1
+        results = self.metadata_client.exists(self.rank, keys)
+        for i in range(len(keys)):
+            if not results[i]:
+                return i
 
-        exist_result = self.metadata_client.exists(self.rank, query_keys)
-        for i in range(len(query_keys)):
-            if not exist_result[i]:
-                return i // key_multiplier
-        return len(query_keys) // key_multiplier
+        return len(keys)
 
     def clear(self) -> bool:
         try:
