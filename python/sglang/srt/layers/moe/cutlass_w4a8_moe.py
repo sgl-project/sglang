@@ -14,8 +14,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 
 
 def cutlass_w4a8_moe(
-    start_expert_id: int,
-    end_expert_id: int,
     total_num_experts: int,
     a: torch.Tensor,
     w1_q: torch.Tensor,

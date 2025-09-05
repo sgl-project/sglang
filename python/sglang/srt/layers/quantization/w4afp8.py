@@ -303,8 +303,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             )
 
         output = cutlass_w4a8_moe(
-            layer.start_expert_id,
-            layer.end_expert_id,
             layer.num_experts,
             x,
             layer.w13_weight,
