@@ -130,13 +130,13 @@ class LoRAMemoryPool:
         module_name: str,
         base_model: torch.nn.Module,
         max_lora_dim: int,
-        layer_id: int,
+        layer_idx: int,
     ) -> Tuple[int]:
         """
         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
         _, output_dim = get_hidden_dim(
-            module_name, self.base_hf_config, base_model, layer_id
+            module_name, self.base_hf_config, base_model, layer_idx
         )
         if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             output_dim = divide(output_dim, self.tp_size)
@@ -152,13 +152,16 @@ class LoRAMemoryPool:
         def init_buffer(
             buffer: Dict[str, List[torch.Tensor]],
             target_modules: Set[str],
-            get_lora_shape_fn: Callable[[str, torch.nn.Module, int], Tuple[int]],
+            get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
         ):
             for module_name in target_modules:
                 buffer[module_name] = [
                     torch.empty(
                         get_lora_shape_fn(
-                            module_name, base_model, self.max_lora_rank, idx
+                            module_name,
+                            base_model,
+                            self.max_lora_rank,
+                            idx,
                         ),
                         dtype=self.dtype,
                         device=device,
