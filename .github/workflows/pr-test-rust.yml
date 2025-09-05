@@ -43,7 +43,9 @@ jobs:
         run: |
           cd sgl-router
           source "$HOME/.cargo/env"
-          SGLANG_ROUTER_BUILD_NO_RUST=1 pip install -e .[test]
+          # Install test extras from pyproject.toml (builds wheel with Rust ext)
+          pip install .[test]
+          # Run unit tests
           pytest -q py_test/unit
 
       - name: Run Rust tests
