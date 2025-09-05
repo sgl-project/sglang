@@ -28,6 +28,9 @@ def _sgemm_lora_a_kernel(
     seg_indptr,
     weight_indices,
     lora_ranks,
+    ordered_indices,
+    chunk_to_weight,
+    cu_chunk_lens,
     # Meta parameters
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -48,36 +51,35 @@ def _sgemm_lora_a_kernel(
             with shape `(num_lora, N, K)`.
         output (torch.Tensor): The output tensor of shape `(s, N)`.
     """
+    chunk_id = tl.program_id(1)
+    slice_id = tl.program_id(0)
 
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len
-    batch_id = tl.program_id(axis=1)
-    w_index = tl.load(weight_indices + batch_id)
+    w_index = tl.load(chunk_to_weight + chunk_id)
     rank = tl.load(lora_ranks + w_index)
 
     # If rank is 0, this kernel becomes a no-op as the output is always trivially correct.
     if rank == 0:
         return
 
-    pid = tl.program_id(axis=0)
-    seg_start = tl.load(seg_indptr + batch_id)
-    seg_len = tl.load(seg_lens + batch_id)
+    seg_start = tl.load(cu_chunk_lens + chunk_id)
+    seg_end = tl.load(cu_chunk_lens + chunk_id + 1)
 
     # Adjust N (stack_num * max_rank) according to the specific LoRA adapter
     N = tl.minimum(N, rank * stack_num)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    pid_s = pid // num_pid_n
-    pid_n = pid % num_pid_n
 
     # Create pointers for the first block of x and weights[batch_id]
     # The pointers will be advanced as we move in the K direction
     # and accumulate
-    s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
-    n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
+    s_offset_orig = tl.arange(0, BLOCK_S) + seg_start
+    s_offset = tl.load(ordered_indices + s_offset_orig, mask=s_offset_orig < seg_end, other=0)  # (BLOCK_S,)
+
+    n_offset = tl.arange(0, BLOCK_N) + slice_id * BLOCK_N
     k_offset = tl.arange(0, BLOCK_K)
-    x_ptrs = (x + seg_start * x_stride_0) + (
+    x_ptrs = x + (
         s_offset[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
     )
     w_ptrs = (weights + w_index * w_stride_0) + (
@@ -89,7 +91,7 @@ def _sgemm_lora_a_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset[:, None] < seg_end) & (k_offset[None, :] < K - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
@@ -104,11 +106,47 @@ def _sgemm_lora_a_kernel(
 
     # Store result to output matrix
     partial_sum = partial_sum.to(x.dtype.element_ty)
-    output_ptr = (output + seg_start * output_stride_0) + (
+    output_ptr = output  + (
         s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < N)
+    output_mask = (s_offset[:, None] < seg_end) & (n_offset[None, :] < N)
     tl.store(output_ptr, partial_sum, mask=output_mask)
+
+def reorder_and_prepare_chunks(weight_indices, seg_lens, chunk_size: int, device: torch.device = torch.device("cpu")):
+    # Create a weight index for each row by repeating weight_indices according to seg_lens
+    row_weight_indices = torch.repeat_interleave(weight_indices, seg_lens)
+    
+    # Sort rows by weight index (stable sort keeps relative order within each weight)
+    reorder_indices = torch.argsort(row_weight_indices, stable=True)
+    
+    # Get reordered weights to find group boundaries
+    weights_reordered = row_weight_indices[reorder_indices]
+    
+    # Get unique weights and their counts
+    unique_weights, counts = torch.unique_consecutive(weights_reordered, return_counts=True)
+    
+    # Build chunk arrays
+    chunk_to_weight = []
+    cu_chunk_lens = [0]
+    
+    cumulative_pos = 0
+    for weight_idx, group_len in zip(unique_weights, counts):
+        group_len = group_len.item()
+        num_chunks = (group_len + chunk_size - 1) // chunk_size
+        
+        chunk_to_weight.extend([weight_idx.item()] * num_chunks)
+        
+        # Add boundaries for each chunk
+        for i in range(1, num_chunks):
+            cu_chunk_lens.append(cumulative_pos + i * chunk_size)
+        cu_chunk_lens.append(cumulative_pos + group_len)
+        
+        cumulative_pos += group_len
+    
+    chunk_to_weight = torch.tensor(chunk_to_weight, dtype=torch.int32, device=device)
+    cu_chunk_lens = torch.tensor(cu_chunk_lens, dtype=torch.int32, device=device)
+    
+    return reorder_indices, chunk_to_weight, cu_chunk_lens
 
 
 def sgemm_lora_a_fwd(
@@ -129,27 +167,27 @@ def sgemm_lora_a_fwd(
     assert len(x.shape) == 2
     assert len(weights.shape) == 3
 
-    S = x.shape[0]
-    R = weights.shape[-2]
-    K = weights.shape[-1]
-    assert x.shape[-1] == K
-
     # Block shapes
     BLOCK_S = 16
+    BLOCK_N = 16
     BLOCK_K = 256
-    BLOCK_R = 16
+
+    S = x.shape[0]
+    N = weights.shape[1]
+    K = weights.shape[2]
+    assert x.shape[-1] == K
 
     grid = (
-        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(R, BLOCK_R),
-        batch_info.bs,
+        triton.cdiv(N, BLOCK_N),
+        len(batch_info.chunk_to_weight),
     )
 
-    output = torch.empty((S, R), device=x.device, dtype=x.dtype)
+    output = torch.empty((S, N), device=x.device, dtype=x.dtype)
     _sgemm_lora_a_kernel[grid](
         x,
         weights,
         output,
-        R,
+        N,
         K,
         stack_num,
         x.stride(0),
@@ -163,8 +201,12 @@ def sgemm_lora_a_fwd(
         batch_info.seg_indptr,
         batch_info.weight_indices,
         batch_info.lora_ranks,
+        batch_info.ordered_indices,
+        batch_info.chunk_to_weight,
+        batch_info.cu_chunk_lens,
         BLOCK_S,
-        BLOCK_R,
+        BLOCK_N,
         BLOCK_K,
     )
+
     return output

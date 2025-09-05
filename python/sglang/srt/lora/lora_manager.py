@@ -93,6 +93,9 @@ class LoRAManager:
                 ),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+                reorder_indices=torch.zeros(8192, dtype=torch.int32),
+                chunk_to_weight=torch.zeros(256, dtype=torch.int32), # FIXME
+                cu_chunk_lens=torch.zeros(256, dtype=torch.int32), # FIXME
             )
 
             # Initialize seg_lens and seg_indptr for CUDA graph as they remain constant
@@ -247,10 +250,55 @@ class LoRAManager:
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
+        def reorder_and_prepare_chunks(weight_indices, seg_lens, chunk_size: int):
+            # Create a weight index for each row by repeating weight_indices according to seg_lens
+            row_weight_indices = torch.repeat_interleave(weight_indices, seg_lens)
+
+            # Sort rows by weight index (stable sort keeps relative order within each weight)
+            reorder_indices = torch.argsort(row_weight_indices, stable=True)
+
+            # Get reordered weights to find group boundaries
+            weights_reordered = row_weight_indices[reorder_indices]
+
+            # Get unique weights and their counts
+            unique_weights, counts = torch.unique_consecutive(
+                weights_reordered, return_counts=True
+            )
+
+            # Build chunk arrays
+            chunk_to_weight = []
+            cu_chunk_lens = [0]
+
+            cumulative_pos = 0
+            for weight_idx, group_len in zip(unique_weights, counts):
+                group_len = group_len.item()
+                num_chunks = (group_len + chunk_size - 1) // chunk_size
+
+                chunk_to_weight.extend([weight_idx.item()] * num_chunks)
+
+                # Add boundaries for each chunk
+                for i in range(1, num_chunks):
+                    cu_chunk_lens.append(cumulative_pos + i * chunk_size)
+                cu_chunk_lens.append(cumulative_pos + group_len)
+
+                cumulative_pos += group_len
+
+            chunk_to_weight = torch.tensor(
+                chunk_to_weight, dtype=torch.int32, pin_memory=True, device="cpu"
+            )
+            cu_chunk_lens = torch.tensor(
+                cu_chunk_lens, dtype=torch.int32, pin_memory=True, device="cpu"
+            )
+
+            return reorder_indices, chunk_to_weight, cu_chunk_lens
+
         def transfer_adapter_info(
             weight_indices_out: torch.Tensor,
             lora_ranks_out: torch.Tensor,
             scalings_out: torch.Tensor,
+            reorder_indices: torch.Tensor,
+            chunk_to_weight: torch.Tensor,
+            cu_chunk_lens: torch.Tensor,
         ):
             """
             Transfer adapter metadata (weight indices, LoRA rank, scalings) from host
@@ -277,6 +325,14 @@ class LoRAManager:
                 scalings, dtype=torch.float, pin_memory=True, device="cpu"
             )
 
+            reorder_indices, chunk_to_weight, cu_chunk_lens = (
+                reorder_and_prepare_chunks(
+                    torch.tensor(weight_indices_tensor, dtype=torch.int32, device="cpu"),
+                    forward_batch.extend_seq_lens_cpu,
+                    chunk_size=64,
+                )
+            )  # TODO: fixme
+
             # Copy to device tensors asynchronously
             weight_indices_out[:bs].copy_(weight_indices_tensor, non_blocking=True)
             lora_ranks_out[: self.max_loras_per_batch].copy_(
@@ -285,6 +341,11 @@ class LoRAManager:
             scalings_out[: self.max_loras_per_batch].copy_(
                 scalings_tensor, non_blocking=True
             )
+            reorder_indices[:bs].copy_(reorder_indices, non_blocking=True)
+            chunk_to_weight[: len(chunk_to_weight)].copy_(
+                chunk_to_weight, non_blocking=True
+            )
+            cu_chunk_lens[: len(cu_chunk_lens)].copy_(cu_chunk_lens, non_blocking=True)
 
         if (
             hasattr(self, "max_bs_in_cuda_graph")
@@ -298,6 +359,9 @@ class LoRAManager:
                 self.cuda_graph_batch_info.weight_indices,
                 self.cuda_graph_batch_info.lora_ranks,
                 self.cuda_graph_batch_info.scalings,
+                self.cuda_graph_batch_info.reorder_indices,
+                self.cuda_graph_batch_info.chunk_to_weight,
+                self.cuda_graph_batch_info.cu_chunk_lens,
             )
 
             self.cuda_graph_batch_info.bs = bs
@@ -311,16 +375,26 @@ class LoRAManager:
             scalings = torch.zeros(
                 (self.max_loras_per_batch,), dtype=torch.float, device=self.device
             )
+            reorder_indices = torch.empty((bs,), dtype=torch.int32, device=self.device)
+            chunk_to_weight = torch.empty(
+                (256,), dtype=torch.int32, device=self.device # FIXME!
+            )  
+            cu_chunk_lens = torch.empty(
+                (256,), dtype=torch.int32, device=self.device
+            )  
             transfer_adapter_info(
                 weight_indices,
                 lora_ranks,
                 scalings,
+                reorder_indices,
+                chunk_to_weight,
+                cu_chunk_lens,
             )
 
             seg_lens = (
                 forward_batch.extend_seq_lens
                 if forward_batch.forward_mode.is_extend()
-                else torch.ones(bs, device=self.device)
+                else torch.ones(bs, dtype=torch.int32, device=self.device)
             )
 
             max_len = (

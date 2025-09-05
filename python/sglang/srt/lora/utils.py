@@ -31,6 +31,11 @@ class LoRABatchInfo:
     # scaling of each lora adapter, in shape (lora_num,)
     scalings: torch.Tensor
 
+    # TODO: ADD COMMENTS! Maybe replace seg_lens, seg_indptr, etc.
+    reorder_indices: torch.Tensor
+    chunk_to_weight: torch.Tensor
+    cu_chunk_lens: torch.Tensor
+
 
 class LoRAType(Enum):
     LORA_A = 0
