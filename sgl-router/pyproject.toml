@@ -20,6 +20,14 @@ classifiers = [
 dev = [
     "requests>=2.25.0",
 ]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-xdist>=3.0.0",
+    "pytest-timeout>=2.0.0",
+    "pytest-mock>=3.10.0",
+    "coverage[toml]>=7.0.0",
+]
 
 # https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
 [tool.setuptools.packages]
