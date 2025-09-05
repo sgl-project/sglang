@@ -86,8 +86,8 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            host=f"http://{self.base_host}",
+            port=int(self.lb_port),
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
