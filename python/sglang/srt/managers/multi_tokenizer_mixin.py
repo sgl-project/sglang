@@ -530,6 +530,7 @@ class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
 
 class MultiDetokenizerRouter(MultiTokenizerMixin):
     """A router to receive requests from Scheduler and route to DetokenizerManager"""
+
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
         self.ipc_name_list = ipc_name_list
         self.send_to_detokenizer_mapping = {}
@@ -558,7 +559,9 @@ class MultiDetokenizerRouter(MultiTokenizerMixin):
                         )
                     self.send_to_detokenizer_mapping[ipc_name].send_pyobj(recv_obj)
                     self.worker_id_to_ipc_mapping[worker_id] = ipc_name
-                    self.ipc_name_index = (self.ipc_name_index + 1) % self.detokenizer_worker_num
+                    self.ipc_name_index = (
+                        self.ipc_name_index + 1
+                    ) % self.detokenizer_worker_num
             else:
                 worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
                 for i, worker_id in enumerate(worker_ids):
