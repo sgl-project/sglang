@@ -58,7 +58,8 @@ logger = logging.getLogger(__name__)
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
-@torch.compile
+# TODO temp disable compile
+# @torch.compile
 def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
     temp = x.to(torch.float32).view(torch.int32)
     exp = torch.bitwise_right_shift(temp, 23)
@@ -212,6 +213,7 @@ class EPMoE(FusedMoE):
                 self.start_expert_id,
                 self.end_expert_id,
                 self.block_shape,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
         )
 

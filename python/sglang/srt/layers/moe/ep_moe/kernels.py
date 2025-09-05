@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import triton
@@ -1293,6 +1293,7 @@ def moe_ep_deepgemm_preprocess(
     start_expert_id,
     end_expert_id,
     block_shape,
+    scale_ue8m0: bool,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
 ):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
@@ -1330,7 +1331,11 @@ def moe_ep_deepgemm_preprocess(
         block_shape = [128, 128]
     assert len(block_shape) == 2
     block_n, block_k = block_shape[0], block_shape[1]
-    hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+
+    assert block_k == 128
+    # TODO inefficient, but this code path is already so inefficient...
+    hidden_states, scale = deep_gemm_utils_per_token_cast_to_fp8(hidden_states, use_ue8m0=scale_ue8m0)
+    # hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k, scale_ue8m0=scale_ue8m0)
 
     gateup_input_scale = torch.empty(
         (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
@@ -1436,3 +1441,19 @@ def zero_experts_compute_triton(
     )
 
     return output
+
+
+# copy and modified from deepgemm
+def deep_gemm_utils_per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2 and x.size(1) % 128 == 0
+    m, n = x.shape
+    x_view = x.view(m, -1, 128)
+    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    sf = x_amax / 448.0
+    # print(f"hi deep_gemm_utils_per_token_cast_to_fp8 {x=} {x_amax=} {sf=}")
+    sf = deep_gemm_utils_ceil_to_ue8m0(sf) if use_ue8m0 else sf
+    return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), sf
+
+def deep_gemm_utils_ceil_to_ue8m0(x: torch.Tensor):
+    # assert x.view(-1).amax().item() > 0, f"{x=}"
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
