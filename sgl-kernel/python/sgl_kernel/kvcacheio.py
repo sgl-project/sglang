@@ -146,7 +146,7 @@ def transfer_kv_all_layer_direct_lf_pf(
     dst_indices: torch.Tensor,
     page_size: int,
 ):
-    torch.ops.sgl_kernel.transfer_kv_per_layer_direct_pf_lf(
+    torch.ops.sgl_kernel.transfer_kv_all_layer_direct_lf_pf(
         src_ptrs, dst_ptrs, src_indices, dst_indices, page_size
     )
 
