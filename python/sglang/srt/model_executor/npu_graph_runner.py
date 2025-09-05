@@ -31,25 +31,88 @@ if TYPE_CHECKING:
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
+from torch.fx import symbolic_trace
+
+from sglang.srt.model_executor.compilation.npu_graph_compiler import NpuGraphCompiler
+from sglang.srt.model_executor.compilation.config import CompilationConfig
+from sglang.srt.model_executor.compilation.compilation_context import CompilationContext
+
+class NpuAddRmsNormFuse:
+    def pattern(rms_norm_input, residual, rms_norm_weight, scale, offset, v1, v2, v3):
+        output = torch.ops.npu.npu_add_rms_norm(
+            rms_norm_input,
+            residual,
+            rms_norm_weight,
+            1e-6)
+        out0 = output[0]
+        out2 = output[2]
+        quantized_output = torch.ops.npu.npu_quantize(
+            out0,
+            scale,
+            offset,
+            v1,
+            v2,
+            v3)
+        return quantized_output, out2
+
+    def replacement(rms_norm_input, residual, rms_norm_weight, scale, offset, v1, v2, v3):
+        output = torch.ops.npu.npu_add_rms_norm_quant(
+            rms_norm_input,
+            residual,
+            rms_norm_weight,
+            1. / scale,
+            offset,
+            epsilon=1e-6)
+        quantized_output = output[0]
+        out2 = output[2]
+        return quantized_output, out2
+
 
 class NPUGraphRunner(CudaGraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
+        self.compilation_config = CompilationConfig()
+        self.compilation_context = CompilationContext()
         super().__init__(model_runner)
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
 
+    # compiler
     def _capture_graph(self, graph, pool, stream, run_once_fn):
+        compiler = NpuGraphCompiler(
+            self.model_runner,
+            run_once_fn,
+            self.compilation_config,
+            self.compilation_context,
+            self.model_runner.page_size)
+
+        out = compiler.compiled_callable()
+
         with torch.npu.graph(
             graph,
             pool=pool,
             stream=stream,
             auto_dispatch_capture=True,
         ):
-            out = run_once_fn()
+            out = compiler.compiled_callable()
         return out
+
+    # symbolic_trace
+    # def _capture_graph(self, graph, pool, stream, run_once_fn):
+    #     graph_module = symbolic_trace(run_once_fn)
+    #     torch.fx.replace_pattern(graph_module, NpuAddRmsNormFuse.pattern, NpuAddRmsNormFuse.replacement)
+    #     graph_module.recompile()
+
+    #     with torch.npu.graph(
+    #         graph,
+    #         pool=pool,
+    #         stream=stream,
+    #         auto_dispatch_capture=True,
+    #     ):
+    #         out = graph_module.forward()
+    #     return out
 
     def _update_inputs(self, seq_lens):
         self.graphs[self.bs].update(

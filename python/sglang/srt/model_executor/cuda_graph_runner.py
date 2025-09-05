@@ -657,6 +657,29 @@ class CudaGraphRunner:
             )
             return logits_output_or_pp_proxy_tensors
 
+        # Run and capture
+        def run_once2():
+            # Clean intermediate result cache for DP attention
+            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            # set_dp_buffer_len(global_dp_buffer_len, num_tokens)
+
+            kwargs = {}
+            if (
+                self.pp_size > 1
+                and "pp_proxy_tensors" in inspect.signature(forward).parameters
+            ):
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                )
+
+            logits_output_or_pp_proxy_tensors = forward(
+                input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
+            return logits_output_or_pp_proxy_tensors
+
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
@@ -667,7 +690,7 @@ class CudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
         out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
+            graph, get_global_graph_memory_pool(), stream, run_once2
         )
 
         return graph, out
