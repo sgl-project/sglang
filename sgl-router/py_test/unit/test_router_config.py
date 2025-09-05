@@ -5,10 +5,10 @@ These tests focus on testing the router configuration logic in isolation,
 including validation of configuration parameters and their interactions.
 """
 
-import pytest
-from unittest.mock import patch, MagicMock
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+import pytest
 from sglang_router.launch_router import RouterArgs, launch_router, policy_from_str
 from sglang_router_rs import PolicyType
 
@@ -22,9 +22,9 @@ class TestRouterConfigValidation:
             host="127.0.0.1",
             port=30000,
             worker_urls=["http://worker1:8000", "http://worker2:8000"],
-            policy="cache_aware"
+            policy="cache_aware",
         )
-        
+
         # Should not raise any exceptions
         assert args.host == "127.0.0.1"
         assert args.port == 30000
@@ -37,13 +37,19 @@ class TestRouterConfigValidation:
             host="127.0.0.1",
             port=30000,
             pd_disaggregation=True,
-            prefill_urls=[("http://prefill1:8000", 9000), ("http://prefill2:8000", None)],
+            prefill_urls=[
+                ("http://prefill1:8000", 9000),
+                ("http://prefill2:8000", None),
+            ],
             decode_urls=["http://decode1:8001", "http://decode2:8001"],
-            policy="cache_aware"
+            policy="cache_aware",
         )
-        
+
         assert args.pd_disaggregation is True
-        assert args.prefill_urls == [("http://prefill1:8000", 9000), ("http://prefill2:8000", None)]
+        assert args.prefill_urls == [
+            ("http://prefill1:8000", 9000),
+            ("http://prefill2:8000", None),
+        ]
         assert args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert args.policy == "cache_aware"
 
@@ -53,11 +59,13 @@ class TestRouterConfigValidation:
             pd_disaggregation=True,
             prefill_urls=[],
             decode_urls=[],
-            service_discovery=False
+            service_discovery=False,
         )
-        
+
         # This should raise an error when trying to launch
-        with pytest.raises(ValueError, match="PD disaggregation mode requires --prefill"):
+        with pytest.raises(
+            ValueError, match="PD disaggregation mode requires --prefill"
+        ):
             launch_router(args)
 
     def test_pd_config_with_service_discovery_allows_empty_urls(self):
@@ -66,34 +74,31 @@ class TestRouterConfigValidation:
             pd_disaggregation=True,
             prefill_urls=[],
             decode_urls=[],
-            service_discovery=True
+            service_discovery=True,
         )
-        
+
         # Should not raise validation error when service discovery is enabled
-        with patch('sglang_router.launch_router.Router') as mock_router:
+        with patch("sglang_router.launch_router.Router") as mock_router:
             mock_router_instance = MagicMock()
             mock_router.return_value = mock_router_instance
-            
+
             result = launch_router(args)
-            
+
             # Should create router instance
             mock_router.assert_called_once()
             assert result == mock_router_instance
 
     def test_regular_mode_without_workers_allows_empty_urls(self):
         """Test that regular mode allows empty worker URLs."""
-        args = RouterArgs(
-            worker_urls=[],
-            service_discovery=False
-        )
-        
+        args = RouterArgs(worker_urls=[], service_discovery=False)
+
         # Should not raise validation error
-        with patch('sglang_router.launch_router.Router') as mock_router:
+        with patch("sglang_router.launch_router.Router") as mock_router:
             mock_router_instance = MagicMock()
             mock_router.return_value = mock_router_instance
-            
+
             result = launch_router(args)
-            
+
             # Should create router instance
             mock_router.assert_called_once()
             assert result == mock_router_instance
@@ -103,29 +108,23 @@ class TestRouterConfigValidation:
         # Valid cache threshold
         args = RouterArgs(cache_threshold=0.5)
         assert args.cache_threshold == 0.5
-        
+
         # Edge cases
         args = RouterArgs(cache_threshold=0.0)
         assert args.cache_threshold == 0.0
-        
+
         args = RouterArgs(cache_threshold=1.0)
         assert args.cache_threshold == 1.0
 
     def test_balance_threshold_validation(self):
         """Test load balancing threshold validation."""
         # Valid thresholds
-        args = RouterArgs(
-            balance_abs_threshold=64,
-            balance_rel_threshold=1.5
-        )
+        args = RouterArgs(balance_abs_threshold=64, balance_rel_threshold=1.5)
         assert args.balance_abs_threshold == 64
         assert args.balance_rel_threshold == 1.5
-        
+
         # Edge cases
-        args = RouterArgs(
-            balance_abs_threshold=0,
-            balance_rel_threshold=1.0
-        )
+        args = RouterArgs(balance_abs_threshold=0, balance_rel_threshold=1.0)
         assert args.balance_abs_threshold == 0
         assert args.balance_rel_threshold == 1.0
 
@@ -136,7 +135,7 @@ class TestRouterConfigValidation:
             worker_startup_timeout_secs=600,
             worker_startup_check_interval=30,
             request_timeout_secs=1800,
-            queue_timeout_secs=60
+            queue_timeout_secs=60,
         )
         assert args.worker_startup_timeout_secs == 600
         assert args.worker_startup_check_interval == 30
@@ -152,7 +151,7 @@ class TestRouterConfigValidation:
             retry_max_backoff_ms=30000,
             retry_backoff_multiplier=1.5,
             retry_jitter_factor=0.2,
-            disable_retries=False
+            disable_retries=False,
         )
         assert args.retry_max_retries == 5
         assert args.retry_initial_backoff_ms == 50
@@ -169,7 +168,7 @@ class TestRouterConfigValidation:
             cb_success_threshold=3,
             cb_timeout_duration_secs=60,
             cb_window_duration_secs=120,
-            disable_circuit_breaker=False
+            disable_circuit_breaker=False,
         )
         assert args.cb_failure_threshold == 10
         assert args.cb_success_threshold == 3
@@ -185,7 +184,7 @@ class TestRouterConfigValidation:
             health_success_threshold=2,
             health_check_timeout_secs=5,
             health_check_interval_secs=60,
-            health_check_endpoint="/health"
+            health_check_endpoint="/health",
         )
         assert args.health_failure_threshold == 3
         assert args.health_success_threshold == 2
@@ -200,7 +199,7 @@ class TestRouterConfigValidation:
             max_concurrent_requests=256,
             queue_size=100,
             queue_timeout_secs=60,
-            rate_limit_tokens_per_second=100
+            rate_limit_tokens_per_second=100,
         )
         assert args.max_concurrent_requests == 256
         assert args.queue_size == 100
@@ -214,7 +213,7 @@ class TestRouterConfigValidation:
             service_discovery=True,
             selector={"app": "worker", "env": "prod"},
             service_discovery_port=8080,
-            service_discovery_namespace="default"
+            service_discovery_namespace="default",
         )
         assert args.service_discovery is True
         assert args.selector == {"app": "worker", "env": "prod"}
@@ -229,7 +228,7 @@ class TestRouterConfigValidation:
             service_discovery=True,
             prefill_selector={"app": "prefill"},
             decode_selector={"app": "decode"},
-            bootstrap_port_annotation="sglang.ai/bootstrap-port"
+            bootstrap_port_annotation="sglang.ai/bootstrap-port",
         )
         assert args.pd_disaggregation is True
         assert args.service_discovery is True
@@ -240,10 +239,7 @@ class TestRouterConfigValidation:
     def test_prometheus_config_validation(self):
         """Test Prometheus configuration validation."""
         # Valid Prometheus config
-        args = RouterArgs(
-            prometheus_port=29000,
-            prometheus_host="127.0.0.1"
-        )
+        args = RouterArgs(prometheus_port=29000, prometheus_host="127.0.0.1")
         assert args.prometheus_port == 29000
         assert args.prometheus_host == "127.0.0.1"
 
@@ -253,7 +249,10 @@ class TestRouterConfigValidation:
         args = RouterArgs(
             cors_allowed_origins=["http://localhost:3000", "https://example.com"]
         )
-        assert args.cors_allowed_origins == ["http://localhost:3000", "https://example.com"]
+        assert args.cors_allowed_origins == [
+            "http://localhost:3000",
+            "https://example.com",
+        ]
 
     def test_tokenizer_config_validation(self):
         """Test tokenizer configuration validation."""
@@ -263,10 +262,7 @@ class TestRouterConfigValidation:
     def test_dp_aware_config_validation(self):
         """Test data parallelism aware configuration validation."""
         # Valid DP aware config
-        args = RouterArgs(
-            dp_aware=True,
-            api_key="test-api-key"
-        )
+        args = RouterArgs(dp_aware=True, api_key="test-api-key")
         assert args.dp_aware is True
         assert args.api_key == "test-api-key"
 
@@ -276,7 +272,11 @@ class TestRouterConfigValidation:
         args = RouterArgs(
             request_id_headers=["x-request-id", "x-trace-id", "x-correlation-id"]
         )
-        assert args.request_id_headers == ["x-request-id", "x-trace-id", "x-correlation-id"]
+        assert args.request_id_headers == [
+            "x-request-id",
+            "x-trace-id",
+            "x-correlation-id",
+        ]
 
     def test_policy_consistency_validation(self):
         """Test policy consistency validation in PD mode."""
@@ -287,16 +287,16 @@ class TestRouterConfigValidation:
             decode_urls=["http://decode1:8001"],
             policy="cache_aware",
             prefill_policy="power_of_two",
-            decode_policy="round_robin"
+            decode_policy="round_robin",
         )
-        
+
         # Should not raise validation error
-        with patch('sglang_router.launch_router.Router') as mock_router:
+        with patch("sglang_router.launch_router.Router") as mock_router:
             mock_router_instance = MagicMock()
             mock_router.return_value = mock_router_instance
-            
+
             result = launch_router(args)
-            
+
             # Should create router instance
             mock_router.assert_called_once()
             assert result == mock_router_instance
@@ -310,16 +310,16 @@ class TestRouterConfigValidation:
             decode_urls=["http://decode1:8001"],
             policy="cache_aware",
             prefill_policy="power_of_two",
-            decode_policy=None
+            decode_policy=None,
         )
-        
+
         # Should not raise validation error
-        with patch('sglang_router.launch_router.Router') as mock_router:
+        with patch("sglang_router.launch_router.Router") as mock_router:
             mock_router_instance = MagicMock()
             mock_router.return_value = mock_router_instance
-            
+
             result = launch_router(args)
-            
+
             # Should create router instance
             mock_router.assert_called_once()
             assert result == mock_router_instance
@@ -340,11 +340,9 @@ class TestRouterConfigValidation:
     def test_config_immutability(self):
         """Test that configuration objects are properly immutable."""
         args = RouterArgs(
-            host="127.0.0.1",
-            port=30000,
-            worker_urls=["http://worker1:8000"]
+            host="127.0.0.1", port=30000, worker_urls=["http://worker1:8000"]
         )
-        
+
         # Test that we can't modify the configuration after creation
         # (This is more of a design test - dataclasses are mutable by default)
         original_host = args.host
@@ -356,7 +354,7 @@ class TestRouterConfigValidation:
         """Test that configuration defaults are consistent."""
         args1 = RouterArgs()
         args2 = RouterArgs()
-        
+
         # Both instances should have the same defaults
         assert args1.host == args2.host
         assert args1.port == args2.port
@@ -371,15 +369,15 @@ class TestRouterConfigValidation:
             port=30000,
             worker_urls=["http://worker1:8000"],
             policy="cache_aware",
-            cache_threshold=0.5
+            cache_threshold=0.5,
         )
-        
+
         # Test that we can access all attributes
-        assert hasattr(args, 'host')
-        assert hasattr(args, 'port')
-        assert hasattr(args, 'worker_urls')
-        assert hasattr(args, 'policy')
-        assert hasattr(args, 'cache_threshold')
+        assert hasattr(args, "host")
+        assert hasattr(args, "port")
+        assert hasattr(args, "worker_urls")
+        assert hasattr(args, "policy")
+        assert hasattr(args, "cache_threshold")
 
     def test_config_with_none_values(self):
         """Test configuration with None values."""
@@ -391,9 +389,9 @@ class TestRouterConfigValidation:
             prometheus_host=None,
             request_id_headers=None,
             rate_limit_tokens_per_second=None,
-            service_discovery_namespace=None
+            service_discovery_namespace=None,
         )
-        
+
         # All None values should be preserved
         assert args.api_key is None
         assert args.log_dir is None
@@ -407,12 +405,9 @@ class TestRouterConfigValidation:
     def test_config_with_empty_lists(self):
         """Test configuration with empty lists."""
         args = RouterArgs(
-            worker_urls=[],
-            prefill_urls=[],
-            decode_urls=[],
-            cors_allowed_origins=[]
+            worker_urls=[], prefill_urls=[], decode_urls=[], cors_allowed_origins=[]
         )
-        
+
         # All empty lists should be preserved
         assert args.worker_urls == []
         assert args.prefill_urls == []
@@ -421,12 +416,8 @@ class TestRouterConfigValidation:
 
     def test_config_with_empty_dicts(self):
         """Test configuration with empty dictionaries."""
-        args = RouterArgs(
-            selector={},
-            prefill_selector={},
-            decode_selector={}
-        )
-        
+        args = RouterArgs(selector={}, prefill_selector={}, decode_selector={})
+
         # All empty dictionaries should be preserved
         assert args.selector == {}
         assert args.prefill_selector == {}

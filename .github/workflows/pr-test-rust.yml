@@ -39,18 +39,18 @@ jobs:
           cd sgl-router/
           cargo fmt -- --check
 
-      - name: Run Python unit tests
-        run: |
-          cd sgl-router
-          pip install pytest pytest-cov
-          PYTHONPATH=py_src python3 -m pytest py_test/unit/ --cov=sglang_router.launch_router --cov-fail-under=80
-
       - name: Run Rust tests
         timeout-minutes: 20
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
           cargo test
+
+      - name: Run Python unit tests
+        run: |
+          cd sgl-router
+          pip install pytest pytest-cov
+          PYTHONPATH=py_src python3 -m pytest py_test/unit/ --cov=sglang_router.launch_router --cov-fail-under=80
 
       - name: Check benchmark compilation
         run: |

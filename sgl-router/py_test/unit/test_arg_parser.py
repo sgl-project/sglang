@@ -6,11 +6,11 @@ without starting actual router instances.
 """
 
 import argparse
-import pytest
-from unittest.mock import patch, MagicMock
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-from sglang_router.launch_router import RouterArgs, policy_from_str, parse_router_args
+import pytest
+from sglang_router.launch_router import RouterArgs, parse_router_args, policy_from_str
 
 
 class TestRouterArgs:
@@ -19,7 +19,7 @@ class TestRouterArgs:
     def test_default_values(self):
         """Test that RouterArgs has correct default values."""
         args = RouterArgs()
-        
+
         # Test basic defaults
         assert args.host == "127.0.0.1"
         assert args.port == 30000
@@ -28,17 +28,17 @@ class TestRouterArgs:
         assert args.pd_disaggregation is False
         assert args.prefill_urls == []
         assert args.decode_urls == []
-        
+
         # Test PD-specific defaults
         assert args.prefill_policy is None
         assert args.decode_policy is None
-        
+
         # Test service discovery defaults
         assert args.service_discovery is False
         assert args.selector == {}
         assert args.service_discovery_port == 80
         assert args.service_discovery_namespace is None
-        
+
         # Test retry and circuit breaker defaults
         assert args.retry_max_retries == 5
         assert args.cb_failure_threshold == 10
@@ -50,15 +50,15 @@ class TestRouterArgs:
         # Test single key-value pair
         result = RouterArgs._parse_selector(["app=worker"])
         assert result == {"app": "worker"}
-        
+
         # Test multiple key-value pairs
         result = RouterArgs._parse_selector(["app=worker", "env=prod", "version=v1"])
         assert result == {"app": "worker", "env": "prod", "version": "v1"}
-        
+
         # Test empty list
         result = RouterArgs._parse_selector([])
         assert result == {}
-        
+
         # Test None
         result = RouterArgs._parse_selector(None)
         assert result == {}
@@ -68,7 +68,7 @@ class TestRouterArgs:
         # Test malformed selector (no equals sign)
         result = RouterArgs._parse_selector(["app"])
         assert result == {}
-        
+
         # Test multiple equals signs (should use first one)
         result = RouterArgs._parse_selector(["app=worker=extra"])
         assert result == {"app": "worker=extra"}
@@ -78,32 +78,34 @@ class TestRouterArgs:
         # Test with bootstrap port
         result = RouterArgs._parse_prefill_urls([["http://prefill1:8000", "9000"]])
         assert result == [("http://prefill1:8000", 9000)]
-        
+
         # Test with 'none' bootstrap port
         result = RouterArgs._parse_prefill_urls([["http://prefill1:8000", "none"]])
         assert result == [("http://prefill1:8000", None)]
-        
+
         # Test without bootstrap port
         result = RouterArgs._parse_prefill_urls([["http://prefill1:8000"]])
         assert result == [("http://prefill1:8000", None)]
-        
+
         # Test multiple prefill URLs
-        result = RouterArgs._parse_prefill_urls([
-            ["http://prefill1:8000", "9000"],
-            ["http://prefill2:8000", "none"],
-            ["http://prefill3:8000"]
-        ])
+        result = RouterArgs._parse_prefill_urls(
+            [
+                ["http://prefill1:8000", "9000"],
+                ["http://prefill2:8000", "none"],
+                ["http://prefill3:8000"],
+            ]
+        )
         expected = [
             ("http://prefill1:8000", 9000),
             ("http://prefill2:8000", None),
-            ("http://prefill3:8000", None)
+            ("http://prefill3:8000", None),
         ]
         assert result == expected
-        
+
         # Test empty list
         result = RouterArgs._parse_prefill_urls([])
         assert result == []
-        
+
         # Test None
         result = RouterArgs._parse_prefill_urls(None)
         assert result == []
@@ -119,18 +121,17 @@ class TestRouterArgs:
         # Test single decode URL
         result = RouterArgs._parse_decode_urls([["http://decode1:8001"]])
         assert result == ["http://decode1:8001"]
-        
+
         # Test multiple decode URLs
-        result = RouterArgs._parse_decode_urls([
-            ["http://decode1:8001"],
-            ["http://decode2:8001"]
-        ])
+        result = RouterArgs._parse_decode_urls(
+            [["http://decode1:8001"], ["http://decode2:8001"]]
+        )
         assert result == ["http://decode1:8001", "http://decode2:8001"]
-        
+
         # Test empty list
         result = RouterArgs._parse_decode_urls([])
         assert result == []
-        
+
         # Test None
         result = RouterArgs._parse_decode_urls(None)
         assert result == []
@@ -190,22 +191,22 @@ class TestRouterArgs:
             router_health_success_threshold=1,
             router_health_check_timeout_secs=3,
             router_health_check_interval_secs=30,
-            router_health_check_endpoint="/healthz"
+            router_health_check_endpoint="/healthz",
         )
-        
+
         router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
-        
+
         # Test basic configuration
         assert router_args.host == "0.0.0.0"
         assert router_args.port == 30001
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
-        
+
         # Test PD configuration
         assert router_args.pd_disaggregation is False
         assert router_args.prefill_urls == []
         assert router_args.decode_urls == []
-        
+
         # Test service discovery
         assert router_args.service_discovery is True
         assert router_args.selector == {"app": "worker", "env": "test"}
@@ -213,7 +214,7 @@ class TestRouterArgs:
         assert router_args.service_discovery_namespace == "default"
         assert router_args.prefill_selector == {"app": "prefill"}
         assert router_args.decode_selector == {"app": "decode"}
-        
+
         # Test other configurations
         assert router_args.dp_aware is True
         assert router_args.api_key == "test-key"
@@ -228,14 +229,14 @@ class TestRouterArgs:
         assert router_args.queue_timeout_secs == 120
         assert router_args.rate_limit_tokens_per_second == 100
         assert router_args.cors_allowed_origins == ["http://localhost:3000"]
-        
+
         # Test retry configuration
         assert router_args.retry_max_retries == 3
         assert router_args.retry_initial_backoff_ms == 100
         assert router_args.retry_max_backoff_ms == 10000
         assert router_args.retry_backoff_multiplier == 2.0
         assert router_args.retry_jitter_factor == 0.1
-        
+
         # Test circuit breaker configuration
         assert router_args.cb_failure_threshold == 5
         assert router_args.cb_success_threshold == 2
@@ -243,14 +244,14 @@ class TestRouterArgs:
         assert router_args.cb_window_duration_secs == 60
         assert router_args.disable_retries is False
         assert router_args.disable_circuit_breaker is False
-        
+
         # Test health check configuration
         assert router_args.health_failure_threshold == 2
         assert router_args.health_success_threshold == 1
         assert router_args.health_check_timeout_secs == 3
         assert router_args.health_check_interval_secs == 30
         assert router_args.health_check_endpoint == "/healthz"
-        
+
         # Note: model_path and tokenizer_path are not available in current RouterArgs
 
     def test_from_cli_args_pd_mode(self):
@@ -260,9 +261,15 @@ class TestRouterArgs:
             port=30000,
             worker_urls=[],
             policy="cache_aware",
-            prefill=[["http://prefill1:8000", "9000"], ["http://prefill2:8000", "none"]],
+            prefill=[
+                ["http://prefill1:8000", "9000"],
+                ["http://prefill2:8000", "none"],
+            ],
             decode=[["http://decode1:8001"], ["http://decode2:8001"]],
-            router_prefill=[["http://prefill1:8000", "9000"], ["http://prefill2:8000", "none"]],
+            router_prefill=[
+                ["http://prefill1:8000", "9000"],
+                ["http://prefill2:8000", "none"],
+            ],
             router_decode=[["http://decode1:8001"], ["http://decode2:8001"]],
             router_policy="cache_aware",
             router_pd_disaggregation=True,
@@ -311,16 +318,16 @@ class TestRouterArgs:
             router_health_success_threshold=2,
             router_health_check_timeout_secs=5,
             router_health_check_interval_secs=60,
-            router_health_check_endpoint="/health"
+            router_health_check_endpoint="/health",
         )
-        
+
         router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
-        
+
         # Test PD configuration
         assert router_args.pd_disaggregation is True
         assert router_args.prefill_urls == [
             ("http://prefill1:8000", 9000),
-            ("http://prefill2:8000", None)
+            ("http://prefill2:8000", None),
         ]
         assert router_args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert router_args.prefill_policy == "power_of_two"
@@ -383,11 +390,11 @@ class TestRouterArgs:
             health_check_interval_secs=60,
             health_check_endpoint="/health",
             model_path=None,
-            tokenizer_path=None
+            tokenizer_path=None,
         )
-        
+
         router_args = RouterArgs.from_cli_args(args, use_router_prefix=False)
-        
+
         assert router_args.host == "127.0.0.1"
         assert router_args.port == 30000
         assert router_args.worker_urls == ["http://worker1:8000"]
@@ -401,7 +408,7 @@ class TestPolicyFromStr:
     def test_valid_policies(self):
         """Test conversion of valid policy strings."""
         from sglang_router_rs import PolicyType
-        
+
         assert policy_from_str("random") == PolicyType.Random
         assert policy_from_str("round_robin") == PolicyType.RoundRobin
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
@@ -419,14 +426,19 @@ class TestParseRouterArgs:
     def test_parse_basic_args(self):
         """Test parsing basic router arguments."""
         args = [
-            "--host", "0.0.0.0",
-            "--port", "30001",
-            "--worker-urls", "http://worker1:8000", "http://worker2:8000",
-            "--policy", "round_robin"
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "30001",
+            "--worker-urls",
+            "http://worker1:8000",
+            "http://worker2:8000",
+            "--policy",
+            "round_robin",
         ]
-        
+
         router_args = parse_router_args(args)
-        
+
         assert router_args.host == "0.0.0.0"
         assert router_args.port == 30001
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
@@ -436,20 +448,28 @@ class TestParseRouterArgs:
         """Test parsing PD disaggregated mode arguments."""
         args = [
             "--pd-disaggregation",
-            "--prefill", "http://prefill1:8000", "9000",
-            "--prefill", "http://prefill2:8000", "none",
-            "--decode", "http://decode1:8001",
-            "--decode", "http://decode2:8001",
-            "--prefill-policy", "power_of_two",
-            "--decode-policy", "round_robin"
+            "--prefill",
+            "http://prefill1:8000",
+            "9000",
+            "--prefill",
+            "http://prefill2:8000",
+            "none",
+            "--decode",
+            "http://decode1:8001",
+            "--decode",
+            "http://decode2:8001",
+            "--prefill-policy",
+            "power_of_two",
+            "--decode-policy",
+            "round_robin",
         ]
-        
+
         router_args = parse_router_args(args)
-        
+
         assert router_args.pd_disaggregation is True
         assert router_args.prefill_urls == [
             ("http://prefill1:8000", 9000),
-            ("http://prefill2:8000", None)
+            ("http://prefill2:8000", None),
         ]
         assert router_args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert router_args.prefill_policy == "power_of_two"
@@ -459,13 +479,17 @@ class TestParseRouterArgs:
         """Test parsing service discovery arguments."""
         args = [
             "--service-discovery",
-            "--selector", "app=worker", "env=prod",
-            "--service-discovery-port", "8080",
-            "--service-discovery-namespace", "default"
+            "--selector",
+            "app=worker",
+            "env=prod",
+            "--service-discovery-port",
+            "8080",
+            "--service-discovery-namespace",
+            "default",
         ]
-        
+
         router_args = parse_router_args(args)
-        
+
         assert router_args.service_discovery is True
         assert router_args.selector == {"app": "worker", "env": "prod"}
         assert router_args.service_discovery_port == 8080
@@ -474,21 +498,30 @@ class TestParseRouterArgs:
     def test_parse_retry_and_circuit_breaker_args(self):
         """Test parsing retry and circuit breaker arguments."""
         args = [
-            "--retry-max-retries", "3",
-            "--retry-initial-backoff-ms", "100",
-            "--retry-max-backoff-ms", "10000",
-            "--retry-backoff-multiplier", "2.0",
-            "--retry-jitter-factor", "0.1",
+            "--retry-max-retries",
+            "3",
+            "--retry-initial-backoff-ms",
+            "100",
+            "--retry-max-backoff-ms",
+            "10000",
+            "--retry-backoff-multiplier",
+            "2.0",
+            "--retry-jitter-factor",
+            "0.1",
             "--disable-retries",
-            "--cb-failure-threshold", "5",
-            "--cb-success-threshold", "2",
-            "--cb-timeout-duration-secs", "30",
-            "--cb-window-duration-secs", "60",
-            "--disable-circuit-breaker"
+            "--cb-failure-threshold",
+            "5",
+            "--cb-success-threshold",
+            "2",
+            "--cb-timeout-duration-secs",
+            "30",
+            "--cb-window-duration-secs",
+            "60",
+            "--disable-circuit-breaker",
         ]
-        
+
         router_args = parse_router_args(args)
-        
+
         # Test retry configuration
         assert router_args.retry_max_retries == 3
         assert router_args.retry_initial_backoff_ms == 100
@@ -496,7 +529,7 @@ class TestParseRouterArgs:
         assert router_args.retry_backoff_multiplier == 2.0
         assert router_args.retry_jitter_factor == 0.1
         assert router_args.disable_retries is True
-        
+
         # Test circuit breaker configuration
         assert router_args.cb_failure_threshold == 5
         assert router_args.cb_success_threshold == 2
@@ -507,14 +540,18 @@ class TestParseRouterArgs:
     def test_parse_rate_limiting_args(self):
         """Test parsing rate limiting arguments."""
         args = [
-            "--max-concurrent-requests", "512",
-            "--queue-size", "200",
-            "--queue-timeout-secs", "120",
-            "--rate-limit-tokens-per-second", "100"
+            "--max-concurrent-requests",
+            "512",
+            "--queue-size",
+            "200",
+            "--queue-timeout-secs",
+            "120",
+            "--rate-limit-tokens-per-second",
+            "100",
         ]
-        
+
         router_args = parse_router_args(args)
-        
+
         assert router_args.max_concurrent_requests == 512
         assert router_args.queue_size == 200
         assert router_args.queue_timeout_secs == 120
@@ -523,15 +560,20 @@ class TestParseRouterArgs:
     def test_parse_health_check_args(self):
         """Test parsing health check arguments."""
         args = [
-            "--health-failure-threshold", "2",
-            "--health-success-threshold", "1",
-            "--health-check-timeout-secs", "3",
-            "--health-check-interval-secs", "30",
-            "--health-check-endpoint", "/healthz"
+            "--health-failure-threshold",
+            "2",
+            "--health-success-threshold",
+            "1",
+            "--health-check-timeout-secs",
+            "3",
+            "--health-check-interval-secs",
+            "30",
+            "--health-check-endpoint",
+            "/healthz",
         ]
-        
+
         router_args = parse_router_args(args)
-        
+
         assert router_args.health_failure_threshold == 2
         assert router_args.health_success_threshold == 1
         assert router_args.health_check_timeout_secs == 3
@@ -541,12 +583,17 @@ class TestParseRouterArgs:
     def test_parse_cors_args(self):
         """Test parsing CORS arguments."""
         args = [
-            "--cors-allowed-origins", "http://localhost:3000", "https://example.com"
+            "--cors-allowed-origins",
+            "http://localhost:3000",
+            "https://example.com",
         ]
-        
+
         router_args = parse_router_args(args)
-        
-        assert router_args.cors_allowed_origins == ["http://localhost:3000", "https://example.com"]
+
+        assert router_args.cors_allowed_origins == [
+            "http://localhost:3000",
+            "https://example.com",
+        ]
 
     def test_parse_tokenizer_args(self):
         """Test parsing tokenizer arguments."""
@@ -559,18 +606,22 @@ class TestParseRouterArgs:
         # Test invalid policy
         with pytest.raises(SystemExit):
             parse_router_args(["--policy", "invalid_policy"])
-        
+
         # Test invalid bootstrap port
         with pytest.raises(ValueError, match="Invalid bootstrap port"):
-            parse_router_args([
-                "--pd-disaggregation",
-                "--prefill", "http://prefill1:8000", "invalid_port"
-            ])
+            parse_router_args(
+                [
+                    "--pd-disaggregation",
+                    "--prefill",
+                    "http://prefill1:8000",
+                    "invalid_port",
+                ]
+            )
 
     def test_help_output(self):
         """Test that help output is generated correctly."""
         with pytest.raises(SystemExit) as exc_info:
             parse_router_args(["--help"])
-        
+
         # SystemExit with code 0 indicates help was displayed
         assert exc_info.value.code == 0

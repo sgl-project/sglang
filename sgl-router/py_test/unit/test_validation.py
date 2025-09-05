@@ -5,10 +5,10 @@ These tests focus on testing the validation logic in isolation,
 including parameter validation, URL validation, and configuration validation.
 """
 
-import pytest
-from unittest.mock import patch, MagicMock
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+import pytest
 from sglang_router.launch_router import RouterArgs, launch_router
 
 
@@ -23,9 +23,9 @@ class TestURLValidation:
             "http://localhost:8000",
             "http://127.0.0.1:8000",
             "http://192.168.1.100:8000",
-            "http://worker.example.com:8000"
+            "http://worker.example.com:8000",
         ]
-        
+
         for url in valid_urls:
             args = RouterArgs(worker_urls=[url])
             # Should not raise any validation errors
@@ -37,9 +37,9 @@ class TestURLValidation:
             ("http://prefill1:8000", 9000),
             ("https://prefill2:8000", None),
             ("http://localhost:8000", 9000),
-            ("http://127.0.0.1:8000", None)
+            ("http://127.0.0.1:8000", None),
         ]
-        
+
         for url, bootstrap_port in valid_prefill_urls:
             args = RouterArgs(prefill_urls=[(url, bootstrap_port)])
             # Should not raise any validation errors
@@ -51,9 +51,9 @@ class TestURLValidation:
             "http://decode1:8001",
             "https://decode2:8001",
             "http://localhost:8001",
-            "http://127.0.0.1:8001"
+            "http://127.0.0.1:8001",
         ]
-        
+
         for url in valid_decode_urls:
             args = RouterArgs(decode_urls=[url])
             # Should not raise any validation errors
@@ -70,7 +70,7 @@ class TestURLValidation:
             ":8000",  # Missing protocol and host
             "http://worker1",  # Missing port
         ]
-        
+
         for url in malformed_urls:
             args = RouterArgs(worker_urls=[url])
             # Currently, malformed URLs are accepted
@@ -84,7 +84,7 @@ class TestPortValidation:
     def test_valid_ports(self):
         """Test validation of valid port numbers."""
         valid_ports = [1, 80, 8000, 30000, 65535]
-        
+
         for port in valid_ports:
             args = RouterArgs(port=port)
             assert args.port == port
@@ -94,7 +94,7 @@ class TestPortValidation:
         # Note: The current implementation doesn't validate port ranges
         # This test documents the current behavior
         invalid_ports = [0, -1, 65536, 70000]
-        
+
         for port in invalid_ports:
             args = RouterArgs(port=port)
             # Currently, invalid ports are accepted
@@ -104,7 +104,7 @@ class TestPortValidation:
     def test_bootstrap_port_validation(self):
         """Test validation of bootstrap ports in PD mode."""
         valid_bootstrap_ports = [1, 80, 9000, 30000, 65535, None]
-        
+
         for bootstrap_port in valid_bootstrap_ports:
             args = RouterArgs(prefill_urls=[("http://prefill1:8000", bootstrap_port)])
             assert args.prefill_urls[0][1] == bootstrap_port
@@ -117,7 +117,7 @@ class TestParameterValidation:
         """Test cache threshold parameter validation."""
         # Valid cache thresholds
         valid_thresholds = [0.0, 0.1, 0.5, 0.9, 1.0]
-        
+
         for threshold in valid_thresholds:
             args = RouterArgs(cache_threshold=threshold)
             assert args.cache_threshold == threshold
@@ -129,7 +129,7 @@ class TestParameterValidation:
         for threshold in valid_abs_thresholds:
             args = RouterArgs(balance_abs_threshold=threshold)
             assert args.balance_abs_threshold == threshold
-        
+
         # Valid relative thresholds
         valid_rel_thresholds = [1.0, 1.1, 1.5, 2.0, 10.0]
         for threshold in valid_rel_thresholds:
@@ -140,13 +140,13 @@ class TestParameterValidation:
         """Test timeout parameter validation."""
         # Valid timeouts
         valid_timeouts = [1, 30, 60, 300, 600, 1800, 3600]
-        
+
         for timeout in valid_timeouts:
             args = RouterArgs(
                 worker_startup_timeout_secs=timeout,
                 worker_startup_check_interval=timeout,
                 request_timeout_secs=timeout,
-                queue_timeout_secs=timeout
+                queue_timeout_secs=timeout,
             )
             assert args.worker_startup_timeout_secs == timeout
             assert args.worker_startup_check_interval == timeout
@@ -160,23 +160,22 @@ class TestParameterValidation:
         for count in valid_retry_counts:
             args = RouterArgs(retry_max_retries=count)
             assert args.retry_max_retries == count
-        
+
         # Valid backoff parameters
         valid_backoff_ms = [1, 50, 100, 1000, 30000]
         for backoff in valid_backoff_ms:
             args = RouterArgs(
-                retry_initial_backoff_ms=backoff,
-                retry_max_backoff_ms=backoff
+                retry_initial_backoff_ms=backoff, retry_max_backoff_ms=backoff
             )
             assert args.retry_initial_backoff_ms == backoff
             assert args.retry_max_backoff_ms == backoff
-        
+
         # Valid multiplier parameters
         valid_multipliers = [1.0, 1.5, 2.0, 3.0]
         for multiplier in valid_multipliers:
             args = RouterArgs(retry_backoff_multiplier=multiplier)
             assert args.retry_backoff_multiplier == multiplier
-        
+
         # Valid jitter parameters
         valid_jitter = [0.0, 0.1, 0.2, 0.5]
         for jitter in valid_jitter:
@@ -190,19 +189,18 @@ class TestParameterValidation:
         for threshold in valid_failure_thresholds:
             args = RouterArgs(cb_failure_threshold=threshold)
             assert args.cb_failure_threshold == threshold
-        
+
         # Valid success thresholds
         valid_success_thresholds = [1, 2, 3, 5]
         for threshold in valid_success_thresholds:
             args = RouterArgs(cb_success_threshold=threshold)
             assert args.cb_success_threshold == threshold
-        
+
         # Valid timeout durations
         valid_timeouts = [10, 30, 60, 120, 300]
         for timeout in valid_timeouts:
             args = RouterArgs(
-                cb_timeout_duration_secs=timeout,
-                cb_window_duration_secs=timeout
+                cb_timeout_duration_secs=timeout, cb_window_duration_secs=timeout
             )
             assert args.cb_timeout_duration_secs == timeout
             assert args.cb_window_duration_secs == timeout
@@ -214,19 +212,18 @@ class TestParameterValidation:
         for threshold in valid_failure_thresholds:
             args = RouterArgs(health_failure_threshold=threshold)
             assert args.health_failure_threshold == threshold
-        
+
         # Valid success thresholds
         valid_success_thresholds = [1, 2, 3, 5]
         for threshold in valid_success_thresholds:
             args = RouterArgs(health_success_threshold=threshold)
             assert args.health_success_threshold == threshold
-        
+
         # Valid timeouts and intervals
         valid_times = [1, 5, 10, 30, 60, 120]
         for time_val in valid_times:
             args = RouterArgs(
-                health_check_timeout_secs=time_val,
-                health_check_interval_secs=time_val
+                health_check_timeout_secs=time_val, health_check_interval_secs=time_val
             )
             assert args.health_check_timeout_secs == time_val
             assert args.health_check_interval_secs == time_val
@@ -238,13 +235,13 @@ class TestParameterValidation:
         for limit in valid_limits:
             args = RouterArgs(max_concurrent_requests=limit)
             assert args.max_concurrent_requests == limit
-        
+
         # Valid queue sizes
         valid_queue_sizes = [0, 10, 50, 100, 500, 1000]
         for size in valid_queue_sizes:
             args = RouterArgs(queue_size=size)
             assert args.queue_size == size
-        
+
         # Valid token rates
         valid_rates = [1, 10, 50, 100, 500, 1000]
         for rate in valid_rates:
@@ -255,7 +252,7 @@ class TestParameterValidation:
         """Test tree size parameter validation."""
         # Valid tree sizes (powers of 2)
         valid_sizes = [2**10, 2**20, 2**24, 2**26, 2**28, 2**30]
-        
+
         for size in valid_sizes:
             args = RouterArgs(max_tree_size=size)
             assert args.max_tree_size == size
@@ -271,7 +268,7 @@ class TestParameterValidation:
             512 * 1024 * 1024,  # 512MB
             1024 * 1024 * 1024,  # 1GB
         ]
-        
+
         for size in valid_sizes:
             args = RouterArgs(max_payload_size=size)
             assert args.max_payload_size == size
@@ -286,9 +283,9 @@ class TestConfigurationValidation:
         args = RouterArgs(
             pd_disaggregation=True,
             prefill_urls=[("http://prefill1:8000", 9000)],
-            decode_urls=["http://decode1:8001"]
+            decode_urls=["http://decode1:8001"],
         )
-        
+
         assert args.pd_disaggregation is True
         assert len(args.prefill_urls) > 0
         assert len(args.decode_urls) > 0
@@ -300,9 +297,9 @@ class TestConfigurationValidation:
             service_discovery=True,
             selector={"app": "worker", "env": "prod"},
             service_discovery_port=8080,
-            service_discovery_namespace="default"
+            service_discovery_namespace="default",
         )
-        
+
         assert args.service_discovery is True
         assert args.selector == {"app": "worker", "env": "prod"}
         assert args.service_discovery_port == 8080
@@ -315,9 +312,9 @@ class TestConfigurationValidation:
             pd_disaggregation=True,
             service_discovery=True,
             prefill_selector={"app": "prefill"},
-            decode_selector={"app": "decode"}
+            decode_selector={"app": "decode"},
         )
-        
+
         assert args.pd_disaggregation is True
         assert args.service_discovery is True
         assert args.prefill_selector == {"app": "prefill"}
@@ -327,7 +324,7 @@ class TestConfigurationValidation:
         """Test policy configuration validation."""
         # Valid policies
         valid_policies = ["random", "round_robin", "cache_aware", "power_of_two"]
-        
+
         for policy in valid_policies:
             args = RouterArgs(policy=policy)
             assert args.policy == policy
@@ -336,7 +333,7 @@ class TestConfigurationValidation:
         """Test PD policy configuration validation."""
         # Valid PD policies
         valid_policies = ["random", "round_robin", "cache_aware", "power_of_two"]
-        
+
         for prefill_policy in valid_policies:
             for decode_policy in valid_policies:
                 args = RouterArgs(
@@ -344,7 +341,7 @@ class TestConfigurationValidation:
                     prefill_urls=[("http://prefill1:8000", None)],
                     decode_urls=["http://decode1:8001"],
                     prefill_policy=prefill_policy,
-                    decode_policy=decode_policy
+                    decode_policy=decode_policy,
                 )
                 assert args.prefill_policy == prefill_policy
                 assert args.decode_policy == decode_policy
@@ -357,9 +354,9 @@ class TestConfigurationValidation:
             ["http://localhost:3000"],
             ["https://example.com"],
             ["http://localhost:3000", "https://example.com"],
-            ["*"]  # Wildcard (if supported)
+            ["*"],  # Wildcard (if supported)
         ]
-        
+
         for origins in valid_origins:
             args = RouterArgs(cors_allowed_origins=origins)
             assert args.cors_allowed_origins == origins
@@ -368,7 +365,7 @@ class TestConfigurationValidation:
         """Test logging configuration validation."""
         # Valid log levels
         valid_log_levels = ["debug", "info", "warning", "error", "critical"]
-        
+
         for level in valid_log_levels:
             args = RouterArgs(log_level=level)
             assert args.log_level == level
@@ -376,11 +373,8 @@ class TestConfigurationValidation:
     def test_prometheus_validation(self):
         """Test Prometheus configuration validation."""
         # Valid Prometheus configuration
-        args = RouterArgs(
-            prometheus_port=29000,
-            prometheus_host="127.0.0.1"
-        )
-        
+        args = RouterArgs(prometheus_port=29000, prometheus_host="127.0.0.1")
+
         assert args.prometheus_port == 29000
         assert args.prometheus_host == "127.0.0.1"
 
@@ -396,9 +390,9 @@ class TestConfigurationValidation:
             ["x-request-id"],
             ["x-request-id", "x-trace-id"],
             ["x-request-id", "x-trace-id", "x-correlation-id"],
-            ["custom-header"]
+            ["custom-header"],
         ]
-        
+
         for headers in valid_headers:
             args = RouterArgs(request_id_headers=headers)
             assert args.request_id_headers == headers
@@ -414,10 +408,12 @@ class TestLaunchValidation:
             pd_disaggregation=True,
             prefill_urls=[],
             decode_urls=[],
-            service_discovery=False
+            service_discovery=False,
         )
-        
-        with pytest.raises(ValueError, match="PD disaggregation mode requires --prefill"):
+
+        with pytest.raises(
+            ValueError, match="PD disaggregation mode requires --prefill"
+        ):
             launch_router(args)
 
     def test_pd_mode_with_service_discovery_allows_empty_urls(self):
@@ -426,34 +422,31 @@ class TestLaunchValidation:
             pd_disaggregation=True,
             prefill_urls=[],
             decode_urls=[],
-            service_discovery=True
+            service_discovery=True,
         )
-        
+
         # Should not raise validation error
-        with patch('sglang_router.launch_router.Router') as mock_router:
+        with patch("sglang_router.launch_router.Router") as mock_router:
             mock_router_instance = MagicMock()
             mock_router.return_value = mock_router_instance
-            
+
             result = launch_router(args)
-            
+
             # Should create router instance
             mock_router.assert_called_once()
             assert result == mock_router_instance
 
     def test_regular_mode_allows_empty_worker_urls(self):
         """Test that regular mode allows empty worker URLs."""
-        args = RouterArgs(
-            worker_urls=[],
-            service_discovery=False
-        )
-        
+        args = RouterArgs(worker_urls=[], service_discovery=False)
+
         # Should not raise validation error
-        with patch('sglang_router.launch_router.Router') as mock_router:
+        with patch("sglang_router.launch_router.Router") as mock_router:
             mock_router_instance = MagicMock()
             mock_router.return_value = mock_router_instance
-            
+
             result = launch_router(args)
-            
+
             # Should create router instance
             mock_router.assert_called_once()
             assert result == mock_router_instance
@@ -464,16 +457,16 @@ class TestLaunchValidation:
             host="127.0.0.1",
             port=30000,
             worker_urls=["http://worker1:8000"],
-            policy="cache_aware"
+            policy="cache_aware",
         )
-        
+
         # Should not raise validation error
-        with patch('sglang_router.launch_router.Router') as mock_router:
+        with patch("sglang_router.launch_router.Router") as mock_router:
             mock_router_instance = MagicMock()
             mock_router.return_value = mock_router_instance
-            
+
             result = launch_router(args)
-            
+
             # Should create router instance
             mock_router.assert_called_once()
             assert result == mock_router_instance
@@ -484,16 +477,16 @@ class TestLaunchValidation:
             pd_disaggregation=True,
             prefill_urls=[("http://prefill1:8000", 9000)],
             decode_urls=["http://decode1:8001"],
-            policy="cache_aware"
+            policy="cache_aware",
         )
-        
+
         # Should not raise validation error
-        with patch('sglang_router.launch_router.Router') as mock_router:
+        with patch("sglang_router.launch_router.Router") as mock_router:
             mock_router_instance = MagicMock()
             mock_router.return_value = mock_router_instance
-            
+
             result = launch_router(args)
-            
+
             # Should create router instance
             mock_router.assert_called_once()
             assert result == mock_router_instance
@@ -503,16 +496,16 @@ class TestLaunchValidation:
         args = RouterArgs(
             service_discovery=True,
             selector={"app": "worker"},
-            service_discovery_port=8080
+            service_discovery_port=8080,
         )
-        
+
         # Should not raise validation error
-        with patch('sglang_router.launch_router.Router') as mock_router:
+        with patch("sglang_router.launch_router.Router") as mock_router:
             mock_router_instance = MagicMock()
             mock_router.return_value = mock_router_instance
-            
+
             result = launch_router(args)
-            
+
             # Should create router instance
             mock_router.assert_called_once()
             assert result == mock_router_instance
