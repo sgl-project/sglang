@@ -377,6 +377,7 @@ Set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml`:
 The continuous integration pipeline includes comprehensive testing, benchmarking, and publishing:
 
 #### Build & Test
+
 1. **Build Wheels**: Uses `cibuildwheel` for manylinux x86_64 packages
 2. **Build Source Distribution**: Creates source distribution for pip fallback
 3. **Rust HTTP Server Benchmarking**: Performance testing of router overhead
