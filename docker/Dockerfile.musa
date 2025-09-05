@@ -1,0 +1,73 @@
+# Usage (to build SGLang MUSA docker image):
+#   docker build --build-arg SGL_BRANCH=v0.5.2rc1 --build-arg GPU_ARCH=mp_22 -t v0.5.2rc1-musa-s4000 -f Dockerfile.musa .
+
+
+# Default base images
+ARG BASE_IMAGE_QY2="registry.mthreads.com/mcconline/vllm-musa-qy2-py310:v0.9.2-rc2"
+ARG BASE_IMAGE_PH1="registry.mthreads.com/mcconline/vllm-musa-ph1-py310:v0.9.2-rc2"
+
+# This is necessary for scope purpose
+ARG GPU_ARCH=mp_22
+
+# ===============================
+# Base image mp_22 and args
+FROM $BASE_IMAGE_QY2 AS mp_22
+ENV NO_DEPS_FLAG=""
+
+# ===============================
+# Base image ph1 and args
+FROM $BASE_IMAGE_PH1 AS mp_31
+ENV NO_DEPS_FLAG=""
+
+# ===============================
+# Chosen arch and args
+FROM ${GPU_ARCH}
+
+# This is necessary for scope purpose, again
+ARG GPU_ARCH=mp_22
+
+ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
+ARG SGL_DEFAULT="main"
+ARG SGL_BRANCH=${SGL_DEFAULT}
+
+USER root
+
+# Install some basic utilities
+RUN python -m pip install --upgrade pip
+
+WORKDIR /sgl-workspace
+
+# -----------------------
+# Build SGLang
+ARG BUILD_TYPE=all
+
+RUN pip uninstall -y sgl_kernel sglang
+RUN git clone ${SGL_REPO} \
+    && cd sglang \
+    && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
+         echo "Using ${SGL_DEFAULT}, default branch."; \
+         git checkout ${SGL_DEFAULT}; \
+       else \
+         echo "Using ${SGL_BRANCH} branch."; \
+         git checkout ${SGL_BRANCH}; \
+       fi \
+    && cd sgl-kernel \
+    && rm -f pyproject.toml \
+    && mv pyproject_musa.toml pyproject.toml \
+    && MTGPU_TARGET=$GPU_ARCH python setup_musa.py install \
+    && cd .. \
+    && if [ "$BUILD_TYPE" = "srt" ]; then \
+         python -m pip --no-cache-dir install -e "python[srt_musa]" ${NO_DEPS_FLAG}; \
+       else \
+         python -m pip --no-cache-dir install -e "python[all_musa]" ${NO_DEPS_FLAG}; \
+       fi
+
+# XXX (MUSA): Consider updating package versions in the vllm base image,
+# or switch to a newer vllm image if available.
+RUN python -m pip uninstall -y openai transformers xgrammar \
+    && python -m pip install openai==1.90.0 transformers==4.52.4 xgrammar==0.1.19 \
+    && python -m pip cache purge
+
+# Performance environment variable.
+
+CMD ["/bin/bash"]
