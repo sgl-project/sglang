@@ -392,8 +392,9 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
-            storage_metrics = self.cache_controller.storage_backend.get_stats()
-            self.metrics_collector.log_storage_metrics(storage_metrics)
+            self.metrics_collector.log_storage_metrics(
+                self.cache_controller.storage_backend.get_stats()
+            )
 
     def drain_storage_control_queues(self):
         """
@@ -430,11 +431,12 @@ class HiRadixCache(RadixCache):
         # process backup acks
         for _ in range(n_backup):
             operation = cc.ack_backup_queue.get()
-            self.metrics_collector.log_backuped_tokens(operation.completed_tokens)
             ack_id = operation.id
             entry = self.ongoing_backup.pop(ack_id, None)
             if entry is not None:
                 entry.release_host()
+            if self.enable_storage_metrics:
+                self.metrics_collector.log_backuped_tokens(operation.completed_tokens)
 
         # release host memory
         host_indices_list = []
