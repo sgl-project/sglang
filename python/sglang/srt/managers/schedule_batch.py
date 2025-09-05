@@ -1422,7 +1422,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
-        while first_iter or (not self.check_decode_mem(sorted_indices)):
+        while first_iter or (
+            not self.check_decode_mem(selected_indices=sorted_indices)
+        ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 if self.is_hybrid:
