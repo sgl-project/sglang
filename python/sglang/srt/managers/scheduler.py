@@ -2141,10 +2141,8 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if (
-            len(self.waiting_queue) == 0
-            and self.running_batch.is_empty()
-            and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+        if self.running_batch.is_empty() and (
+            self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs)
         ):
             self.cur_batch = None
             self.last_batch = None
@@ -2169,12 +2167,29 @@ class Scheduler(
             if_success = True
         else:
             logging.warning(
-                f"Cache not flushed because there are pending requests. "
-                f"#queue-req: {len(self.waiting_queue)}, "
+                f"Cache not flushed because there are running requests. "
                 f"#running-req: {len(self.running_batch.reqs)}"
             )
             if_success = False
         return if_success
+
+    def interrupt_generation(self):
+        """process last batch's result and retract reqs into waiting queue"""
+        if self.enable_overlap and self.last_batch:
+            # Process the results of the last batch
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            tmp_batch.next_batch_sampling_info = None
+            # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
+            self.process_batch_result(tmp_batch, tmp_result, None)
+            self.last_batch = None
+
+        if len(self.running_batch.reqs) != 0:
+            retracted_reqs = self.running_batch.retract_decode(
+                self.server_args, retract_all=True
+            )
+            self._extend_requests_to_queue(retracted_reqs)
+
+        self.running_batch.batch_is_full = False
 
     def get_load(self):
         # TODO(lsyin): use dynamically maintained num_waiting_tokens

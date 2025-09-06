@@ -18,6 +18,7 @@ import os
 import random
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import requests
@@ -69,6 +70,7 @@ def init_process(
     backend,
     checking_parameters,
     tie_word_embeddings,
+    online=False,
 ):
     torch.cuda.set_device(rank)
 
@@ -95,6 +97,7 @@ def init_process(
             state_dict_key_to_shape,
             backend,
             tp_size,
+            online=online,
         )
 
 
@@ -206,6 +209,7 @@ def init_process_sgl(
     state_dict_key_to_shape,
     backend,
     tp_size,
+    online=False,
 ):
     torch.cuda.set_device(rank)
     torch.cuda.synchronize()
@@ -280,6 +284,26 @@ def init_process_sgl(
             },
         )
 
+    if online:
+
+        def run_decode(max_new_tokens=32):
+            response = requests.post(
+                url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": max_new_tokens,
+                        "ignore_eos": True,
+                    },
+                },
+            )
+            return response.json()
+
+        with ThreadPoolExecutor(32) as executor:
+            futures = [executor.submit(run_decode, 3000) for _ in range(32)]
+            time.sleep(2)
+
     torch.cuda.synchronize()
     time_begin_update = time.perf_counter()
 
@@ -313,6 +337,7 @@ def init_process_sgl(
                 "dtypes": dtypes,
                 "shapes": shapes,
                 "group_name": "test_parameter_update_group",
+                "online": online,
             },
         )
     torch.cuda.synchronize()
@@ -367,6 +392,7 @@ def test_update_weights_from_distributed(
     state_dict_key_to_shape,
     truncate_size,
     checking_parameters,
+    online=False,
 ):
     tie_word_embeddings = (
         True if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else False
@@ -390,6 +416,7 @@ def test_update_weights_from_distributed(
             backend,
             checking_parameters,
             tie_word_embeddings,
+            online,
         ),
         nprocs=1 + dp_size,
         join=False,
@@ -608,6 +635,19 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 model_state_dict_shapes[model_name],
                 truncate_size,
                 checking_parameters,
+            )
+
+            # test update weights online
+            backend = "Server"
+            test_update_weights_from_distributed(
+                tp_size,
+                dp_size,
+                model_name,
+                backend,
+                model_state_dict_shapes[model_name],
+                truncate_size,
+                checking_parameters,
+                online=True,
             )
 
 

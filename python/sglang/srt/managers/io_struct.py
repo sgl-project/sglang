@@ -844,6 +844,8 @@ class UpdateWeightFromDiskReqInput:
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Whether to update weights online
+    online: bool = False
 
 
 @dataclass
@@ -867,6 +869,8 @@ class UpdateWeightsFromDistributedReqInput:
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Whether to update weights online
+    online: bool = False
 
 
 @dataclass
@@ -892,6 +896,8 @@ class UpdateWeightsFromTensorReqInput:
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Whether to update weights online
+    online: bool = False
 
 
 @dataclass
