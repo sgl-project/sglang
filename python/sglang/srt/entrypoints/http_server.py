@@ -1056,6 +1056,20 @@ def _create_error_response(e):
     )
 
 
+def add_middleware(fast_api_app: FastAPI, server_args: ServerArgs):
+    worker_pid = os.getpid()
+    # Add api key authorization
+    if server_args.api_key:
+        add_api_key_middleware(fast_api_app, server_args.api_key)
+        logger.info(f"Worker {worker_pid} added API key middleware")
+
+    # Add prometheus middleware
+    if server_args.enable_metrics:
+        add_prometheus_middleware(fast_api_app)
+        enable_func_timer()
+        logger.info(f"Worker {worker_pid} added prometheus middleware")
+
+
 def launch_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
@@ -1087,15 +1101,7 @@ def launch_server(
         )
     )
 
-    # Add api key authorization
-    if server_args.api_key:
-        add_api_key_middleware(app, server_args.api_key)
-
-    # Add prometheus middleware
-    if server_args.enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
-
+    add_middleware(app, server_args)
     # Send a warmup request - we will create the thread launch it
     # in the lifespan after all other warmups have fired.
     warmup_thread = threading.Thread(
