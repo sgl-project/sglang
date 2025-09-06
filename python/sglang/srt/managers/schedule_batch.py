@@ -107,6 +107,9 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "quantization",
     "enable_custom_logit_processor",
     "disaggregation_mode",
+    "speculative_num_steps",
+    "speculative_eagle_topk",
+    "speculative_num_draft_tokens",
 ]
 
 # Put some global args for easy access
@@ -902,6 +905,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
+    # Used for EAGLE + Overlap scheduling. Stores the temporary draft output KV cache locations.
+    draft_out_cache_loc: Optional[torch.Tensor] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1539,7 +1544,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.spec_algorithm.is_eagle():
+        if self.enable_overlap and self.spec_algorithm.is_eagle():
+            assert (
+                self.token_to_kv_pool_allocator.page_size == 1
+            ), "Eagle + Overlap Scheduler currently only supports page size 1"
+            self.draft_out_cache_loc, backup_state = self.alloc_token_slots(
+                bs
+                * global_server_args_dict["speculative_num_steps"]
+                * global_server_args_dict["speculative_eagle_topk"],
+                backup_state=True,
+            )
+            self.token_to_kv_pool_allocator.restore_state(backup_state)
+            self.out_cache_loc = self.alloc_token_slots(
+                bs * global_server_args_dict["speculative_num_draft_tokens"]
+            )
+            return
+        elif self.spec_algorithm.is_eagle():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
@@ -1647,11 +1667,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+
+        if self.spec_algorithm.is_eagle() and self.enable_overlap:
+            # In eagle overlap mode, seq_lens is mutated in the EagleWorkerClient's forward_stream,
+            # but we copy seq_lens in the scheduler's stream. This is a problem because seq_lens may
+            # not have been mutated by EagleWorkerClient before the scheduler stream starts making
+            # a copy of it. To avoid this, we synchronize all streams before copying seq_lens.
+            torch.cuda.synchronize()
+
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
-        self.output_ids = self.output_ids[keep_indices_device]
+        if self.output_ids is not None:
+            self.output_ids = self.output_ids[keep_indices_device]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -1665,7 +1694,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
-            self.spec_info.filter_batch(keep_indices_device)
+            self.spec_info.filter_batch(
+                keep_indices_device, has_been_filtered=not self.enable_overlap
+            )
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1765,6 +1796,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            draft_out_cache_loc=self.draft_out_cache_loc,
             hicache_consumer_index=self.hicache_consumer_index,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -1917,6 +1949,8 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = 0
+    # Used for EAGLE + Overlap scheduling. Stores the temporary draft output KV cache locations.
+    draft_out_cache_loc: Optional[torch.Tensor] = None
 
     # Overlap event
     launch_done: Optional[threading.Event] = None

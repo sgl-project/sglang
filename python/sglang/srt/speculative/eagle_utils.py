@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -17,12 +17,14 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
     Req,
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
@@ -82,7 +84,7 @@ class EagleDraftInput:
     seq_lens_for_draft_extend: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
 
-    def prepare_for_extend(self, batch: ScheduleBatch):
+    def prepare_for_extend(self, batch: Union[ScheduleBatch, ModelWorkerBatch]):
 
         if batch.forward_mode.is_idle():
             return
@@ -91,7 +93,9 @@ class EagleDraftInput:
         assert len(self.verified_id) == len(batch.seq_lens)
 
         pt = 0
-        for i, extend_len in enumerate(batch.extend_lens):
+        for i, extend_len in enumerate(
+            batch.extend_lens if isinstance(batch, ScheduleBatch) else batch.seq_lens
+        ):
             input_ids = batch.input_ids[pt : pt + extend_len]
             batch.input_ids[pt : pt + extend_len] = torch.cat(
                 (input_ids[1:], self.verified_id[i].reshape(1))
@@ -119,7 +123,7 @@ class EagleDraftInput:
 
     def prepare_extend_after_decode(
         self,
-        batch: ScheduleBatch,
+        batch: Union[ScheduleBatch, ModelWorkerBatch],
         speculative_num_steps: int,
     ):
 
@@ -127,16 +131,18 @@ class EagleDraftInput:
             return
 
         batch.input_ids = self.verified_id
-        batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
-        batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         batch.return_logprob = False
-        batch.return_hidden_states = False
+
+        if isinstance(batch, ScheduleBatch):
+            batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
+            batch.extend_num_tokens = sum(batch.extend_lens)
+            batch.return_hidden_states = False
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.accept_length.add_(1)
-        self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
+        self.positions = torch.zeros_like(batch.input_ids, dtype=torch.long)
         self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
 
         create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
@@ -223,10 +229,12 @@ class EagleVerifyOutput:
     logits_output: LogitsProcessorOutput
     # Accepted token ids including the bonus token
     verified_id: torch.Tensor
-    # Accepted token length per sequence in a batch in CPU.
+    # Accepted token length per sequence in a batch in CPU. Not set in overlap scheduling.
     accept_length_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
+    # KV indices to free. Only set in overlap scheduling.
+    free_cache_loc_cpu: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -301,6 +309,35 @@ class EagleVerifyInput:
             end_offset,
             batch.out_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+
+    def overlap_prepare_for_verify(
+        self,
+        batch: ModelWorkerBatch,
+        page_size: int,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    ):
+        """Equivalent to prepare_for_verify, but accepts a ModelWorkerBatch. Used in overlap scheduling."""
+        assert (
+            page_size == 1
+        ), "We currently only support page_size == 1 for overlap scheduling"
+        if batch.forward_mode.is_idle():
+            return
+
+        batch.input_ids = self.draft_token
+
+        end_offset = batch.seq_lens + self.draft_token_num
+
+        bs = len(batch.seq_lens)
+        assign_req_to_token_pool[(bs,)](
+            batch.req_pool_indices,
+            req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
 
@@ -724,6 +761,201 @@ class EagleVerifyInput:
                 accept_length_per_req_cpu=accept_length_cpu,
                 accepted_indices=accept_index,
             )
+
+    def overlap_verify(
+        self,
+        batch: ModelWorkerBatch,
+        logits_output: LogitsProcessorOutput,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        page_size: int,
+        device: torch.device,
+        vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+    ) -> EagleVerifyOutput:
+        """Equivalent to verify, but accepts a ModelWorkerBatch. Used in overlap scheduling."""
+        if batch.forward_mode.is_idle():
+            raise NotImplementedError(
+                "Idle mode is not supported in EAGLE + Overlap scheduling"
+            )
+
+        bs = self.retrive_index.shape[0]
+        candidates = self.draft_token.reshape(bs, self.draft_token_num)
+        sampling_info = batch.sampling_info
+        predict_shape = list(logits_output.next_token_logits.shape)[:-1]
+        predict_shape[-1] += 1
+        predict = torch.empty(predict_shape, dtype=torch.int32, device="cuda")
+        accept_index = torch.full(
+            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        )
+        accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
+        if bs != len(sampling_info):
+            sampling_info = copy.deepcopy(sampling_info)
+            # NOTE: retrive_index are the indices of the requests that are kept.
+            sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
+        # Apply the custom logit processors if registered in the sampling info.
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(
+                logits_output.next_token_logits,
+                sampling_info,
+                num_tokens_in_batch=self.draft_token_num,
+            )
+        # Apply penalty
+        if sampling_info.penalizer_orchestrator.is_required:
+            # This is a relaxed version of penalties for speculative decoding.
+            linear_penalty = torch.zeros(
+                (bs, logits_output.next_token_logits.shape[1]),
+                dtype=torch.float32,
+                device="cuda",
+            )
+            sampling_info.apply_logits_bias(linear_penalty)
+            logits_output.next_token_logits.add_(
+                torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
+            )
+        # Apply grammar mask
+        if vocab_mask is not None:
+            assert self.grammar is not None
+            self.grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
+            )
+        # Sample tokens. Force greedy sampling on AMD
+        is_all_greedy = sampling_info.is_all_greedy
+        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+            logger.warning(
+                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
+                "Falling back to greedy verification."
+            )
+        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(bs, self.draft_token_num)
+            verify_tree_greedy(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=accept_length,  # mutable
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
+                target_predict=target_predict,
+            )
+        else:
+            # apply temperature and get target probs
+            expanded_temperature = torch.repeat_interleave(
+                sampling_info.temperatures, self.draft_token_num, dim=0
+            )  # (bs * draft_token_num, 1)
+            target_probs = F.softmax(
+                logits_output.next_token_logits / expanded_temperature, dim=-1
+            )  # (bs * draft_token_num, vocab_size)
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, self.draft_token_num, dim=0
+                ),
+            )  # (bs * draft_token_num, vocab_size)
+            if not torch.all(sampling_info.top_ps == 1.0):
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, self.draft_token_num, dim=0
+                    ),
+                )
+            target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
+            draft_probs = torch.zeros(
+                target_probs.shape, dtype=torch.float32, device="cuda"
+            )
+            # coins for rejection sampling
+            coins = torch.rand_like(candidates, dtype=torch.float32, device="cuda")
+            # coins for final sampling
+            coins_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device="cuda"
+            )
+            tree_speculative_sampling_target_only(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=accept_length,  # mutable
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=global_server_args_dict[
+                    "speculative_accept_threshold_single"
+                ],
+                threshold_acc=global_server_args_dict[
+                    "speculative_accept_threshold_acc"
+                ],
+                deterministic=True,
+            )
+        if SIMULATE_ACC_LEN:
+            # Do simulation
+            accept_index = _generate_simulated_accept_index(
+                accept_index=accept_index,
+                predict=predict,  # mutable
+                accept_length=accept_length,  # mutable
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                bs=bs,
+                spec_steps=self.spec_steps,
+            )
+
+        # Free the KV cache for unaccepted tokens
+        # TODO: fuse them
+        accept_index_full = accept_index.flatten()
+        compact_indices = torch.argsort(accept_index_full == -1, stable=True)
+        accept_index = accept_index_full[compact_indices]
+
+        verified_id = torch.where(accept_index != -1, predict[accept_index], 0)
+        evict_mask = torch.full(
+            (self.draft_token.shape[0] + 1,),
+            True,
+            dtype=torch.bool,
+            device=self.draft_token.device,
+        )
+        evict_mask.scatter_(0, accept_index.to(torch.int64) + 1, False)
+        evict_mask = evict_mask[1:]
+
+        if page_size > 1:
+            raise NotImplementedError(
+                "Free cache loc cpu is not supported for page size > 1"
+            )
+        free_cache_loc_cpu = torch.where(evict_mask, batch.out_cache_loc, 0).to(
+            "cpu", non_blocking=True
+        )
+
+        # Construct EagleVerifyOutput
+        batch.out_cache_loc = torch.where(
+            accept_index != -1, batch.out_cache_loc[accept_index], 0
+        )
+        assign_req_to_token_pool[(bs,)](
+            batch.req_pool_indices,
+            req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + accept_length + 1,
+            batch.out_cache_loc,
+            req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+        batch.seq_lens.add_(accept_length + 1)
+        # Optimistically estimate the seq_lens_cpu for the next draft forward
+        batch.seq_lens_cpu.add_(self.spec_steps + 1)
+
+        draft_input = EagleDraftInput(
+            hidden_states=batch.spec_info.hidden_states[accept_index],
+            verified_id=verified_id,
+            accept_length=accept_length,
+            seq_lens_for_draft_extend=batch.seq_lens,
+            req_pool_indices_for_draft_extend=batch.req_pool_indices,
+        )
+
+        return EagleVerifyOutput(
+            draft_input=draft_input,
+            logits_output=logits_output,
+            accept_length_per_req_cpu=None,
+            verified_id=verified_id,
+            accepted_indices=accept_index,
+            free_cache_loc_cpu=free_cache_loc_cpu,
+        )
 
 
 @triton.jit
