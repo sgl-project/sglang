@@ -222,7 +222,13 @@ class SamplingBatchInfo:
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
 
         if self.logit_bias is not None:
-            logits.add_(self.logit_bias)
+            current_batch_size = logits.shape[0]
+            if self.logit_bias.shape[0] > current_batch_size:
+                logits.add_(self.logit_bias[:current_batch_size])
+            elif self.logit_bias.shape[0] == current_batch_size:
+                logits.add_(self.logit_bias)
+            else:
+                logits[: self.logit_bias.shape[0]].add_(self.logit_bias)
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
