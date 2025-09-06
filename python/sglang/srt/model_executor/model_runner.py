@@ -307,7 +307,10 @@ class ModelRunner:
         model_num_layers = (
             self.model_config.num_nextn_predict_layers
             if self.is_draft_worker and model_has_mtp_layers
-            else self.model_config.num_hidden_layers
+            else max(
+                self.model_config.num_hidden_layers,
+                self.model_config.num_attention_layers,
+            )
         )
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
@@ -1652,7 +1655,7 @@ class ModelRunner:
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
-        from sglang.srt.model_parallel import tensor_parallel
+        from sglang.srt.layers.model_parallel import tensor_parallel
 
         device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
         tensor_parallel(self.model, device_mesh)
