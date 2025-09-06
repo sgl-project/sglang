@@ -12,7 +12,9 @@ from sglang.test.run_eval import run_eval
 def test_mmlu(e2e_router_only_rr, e2e_primary_worker, e2e_model):
     # Attach the primary worker to a fresh router-only instance (single model)
     base = e2e_router_only_rr.url
-    r = requests.post(f"{base}/add_worker", params={"url": e2e_primary_worker.url}, timeout=60)
+    r = requests.post(
+        f"{base}/add_worker", params={"url": e2e_primary_worker.url}, timeout=60
+    )
     r.raise_for_status()
 
     args = SimpleNamespace(
@@ -39,7 +41,12 @@ def test_add_and_remove_worker_live(e2e_router_only_rr, e2e_primary_worker, e2e_
         for i in range(8):
             r = s.post(
                 f"{base}/v1/completions",
-                json={"model": e2e_model, "prompt": f"x{i}", "max_tokens": 1, "stream": False},
+                json={
+                    "model": e2e_model,
+                    "prompt": f"x{i}",
+                    "max_tokens": 1,
+                    "stream": False,
+                },
                 timeout=120,
             )
             r.raise_for_status()
@@ -169,7 +176,9 @@ def test_dp_aware_worker_expansion_and_api_key(e2e_model):
         worker_proc = subprocess.Popen(worker_cmd)
         try:
             # Attach worker to router; router should expand to dp_size logical workers
-            r = requests.post(f"{router_url}/add_worker", params={"url": worker_url}, timeout=120)
+            r = requests.post(
+                f"{router_url}/add_worker", params={"url": worker_url}, timeout=120
+            )
             r.raise_for_status()
 
             r = requests.get(f"{router_url}/list_workers", timeout=30)
@@ -198,6 +207,7 @@ def test_dp_aware_worker_expansion_and_api_key(e2e_model):
 
             # Finally, run MMLU eval through the router with auth
             import os
+
             os.environ["OPENAI_API_KEY"] = api_key
             args = SimpleNamespace(
                 base_url=router_url,

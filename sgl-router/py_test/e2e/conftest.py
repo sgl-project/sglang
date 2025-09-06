@@ -141,6 +141,7 @@ def e2e_model() -> str:
     # Always use the default test model
     return DEFAULT_MODEL_NAME_FOR_TEST
 
+
 @pytest.fixture
 def e2e_router(e2e_model: str):
     # Keep this available but tests below use router-only to avoid GPU contention

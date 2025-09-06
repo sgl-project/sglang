@@ -135,7 +135,6 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                 "load_in_flight": _inflight,
                 "cache": {"size": 0, "hit_rate": 0.0},
                 "dp_size": int(args.dp_size),
-
             }
         )
 

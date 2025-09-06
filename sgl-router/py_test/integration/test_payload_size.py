@@ -31,4 +31,3 @@ def test_payload_size_limit(router_manager, mock_workers):
     }
     r = requests.post(f"{rh.url}/v1/completions", json=payload_large)
     assert r.status_code == 413
-
