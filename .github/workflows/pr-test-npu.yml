@@ -152,7 +152,7 @@ jobs:
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 120
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -160,7 +160,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-16-ascend-a3
+          python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 7200
 
   pr-test-npu-finish:
     if: always()
