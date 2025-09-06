@@ -711,6 +711,8 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
+        if global_server_args_dict.get("enable_torch_fx_passes", False):
+            self._apply_fx_optimization()
         get_offloader().post_init()
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
@@ -1907,6 +1909,17 @@ class ModelRunner:
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
+
+    def _apply_fx_optimization(self):
+        try:
+            from sglang.srt.fx_pass_manager import apply_sglang_fx_optimization
+
+            logger.info("Applying FX optimizations to model...")
+            self.model = apply_sglang_fx_optimization(self.model)
+            logger.info("FX optimizations applied successfully")
+
+        except Exception as e:
+            logger.warning(f"FX optimization failed, using original model: {e}")
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
