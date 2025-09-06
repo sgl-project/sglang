@@ -302,11 +302,16 @@ class ModelConfig:
         ) or getattr(self.hf_config, "image_token_index", None)
 
     @staticmethod
-    def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
+    def from_server_args(
+        server_args: ServerArgs,
+        model_path: str = None,
+        model_revision: str = None,
+        **kwargs,
+    ):
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
+            revision=model_revision or server_args.revision,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
@@ -405,9 +410,10 @@ class ModelConfig:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
         if quant_cfg is None:
-            # check if is modelopt model -- modelopt doesn't have corresponding field
+            # check if is modelopt or mixed-precision model -- Both of them don't have corresponding field
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
+            # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:

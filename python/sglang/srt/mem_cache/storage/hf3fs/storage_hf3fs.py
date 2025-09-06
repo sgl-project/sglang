@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from abc import ABC, abstractmethod
 from functools import wraps
 from typing import Any, List, Optional, Tuple
@@ -13,6 +14,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
+from sglang.srt.metrics.collector import StorageMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,8 @@ def synchronized():
 
 
 class HiCacheHF3FS(HiCacheStorage):
+    """HiCache backend that stores KV cache pages in HF3FS files."""
+
     default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
 
     def __init__(
@@ -126,16 +130,19 @@ class HiCacheHF3FS(HiCacheStorage):
         dtype: torch.dtype,
         metadata_client: Hf3fsMetadataInterface,
         is_mla_model: bool = False,
+        is_page_first_layout: bool = False,
     ):
         self.rank = rank
         self.file_path = file_path
         self.file_size = file_size
         self.numjobs = numjobs
         self.bytes_per_page = bytes_per_page
+        self.gb_per_page = bytes_per_page / (1 << 30)
         self.entries = entries
         self.dtype = dtype
         self.metadata_client = metadata_client
         self.is_mla_model = is_mla_model
+        self.is_page_first_layout = is_page_first_layout
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
         self.skip_backup = False
@@ -170,21 +177,47 @@ class HiCacheHF3FS(HiCacheStorage):
         signal.signal(signal.SIGTERM, lambda sig, frame: self.close())
         signal.signal(signal.SIGQUIT, lambda sig, frame: self.close())
 
+        self.prefetch_pgs = []
+        self.backup_pgs = []
+        self.prefetch_bandwidth = []
+        self.backup_bandwidth = []
+
     @staticmethod
     def from_env_config(
         bytes_per_page: int,
         dtype: torch.dtype,
         storage_config: HiCacheStorageConfig = None,
     ) -> "HiCacheHF3FS":
+        """Create a HiCacheHF3FS instance from environment configuration.
+
+        Environment:
+            - Uses env var stored in `HiCacheHF3FS.default_env_var` to locate a JSON config.
+            - Falls back to a local single-machine config when the env var is not set.
+
+        Raises:
+            ValueError: If MLA Model is requested without global metadata server or required keys are missing.
+        """
         from sglang.srt.mem_cache.storage.hf3fs.mini_3fs_metadata_server import (
             Hf3fsGlobalMetadataClient,
             Hf3fsLocalMetadataClient,
         )
 
-        rank = storage_config.tp_rank if storage_config is not None else 0
+        if storage_config is not None:
+            rank, is_mla_model, is_page_first_layout = (
+                storage_config.tp_rank,
+                storage_config.is_mla_model,
+                storage_config.is_page_first_layout,
+            )
+        else:
+            rank, is_mla_model, is_page_first_layout = 0, False, False
+
+        mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
 
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
+            if is_mla_model:
+                raise ValueError(mla_unsupported_msg)
+
             return HiCacheHF3FS(
                 rank=rank,
                 file_path=f"/data/hicache.{rank}.bin",
@@ -194,6 +227,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 entries=8,
                 dtype=dtype,
                 metadata_client=Hf3fsLocalMetadataClient(),
+                is_page_first_layout=is_page_first_layout,
             )
 
         try:
@@ -214,25 +248,27 @@ class HiCacheHF3FS(HiCacheStorage):
             raise ValueError(f"Missing required keys in config: {missing_keys}")
 
         # Choose metadata client based on configuration
-        is_mla_model = False
-        if "metadata_server_url" in config and config["metadata_server_url"]:
+        if config.get("metadata_server_url"):
             # Use global metadata client to connect to metadata server
             metadata_server_url = config["metadata_server_url"]
             metadata_client = Hf3fsGlobalMetadataClient(metadata_server_url)
 
-            # Enable MLA optimization only when using the global metadata client
-            is_mla_model = storage_config.is_mla_model if storage_config else False
             logger.info(
                 f"Using global metadata client with server url: {metadata_server_url}"
             )
         else:
+            # Enable MLA optimization only when using the global metadata client
+            if is_mla_model:
+                raise ValueError(mla_unsupported_msg)
+
             # Use local metadata client for single-machine deployment
             metadata_client = Hf3fsLocalMetadataClient()
 
+        rank_for_path = 0 if is_mla_model else rank
         return HiCacheHF3FS(
             rank=rank,
             # Let all ranks use the same file path for MLA model
-            file_path=f"{config['file_path_prefix']}.{rank if not is_mla_model else 0}.bin",
+            file_path=f"{config['file_path_prefix']}.{rank_for_path}.bin",
             file_size=int(config["file_size"]),
             numjobs=int(config["numjobs"]),
             bytes_per_page=bytes_per_page,
@@ -240,6 +276,7 @@ class HiCacheHF3FS(HiCacheStorage):
             dtype=dtype,
             metadata_client=metadata_client,
             is_mla_model=is_mla_model,
+            is_page_first_layout=is_page_first_layout,
         )
 
     def get(
@@ -279,6 +316,8 @@ class HiCacheHF3FS(HiCacheStorage):
                 for _ in range(len(batch_indices))
             ]
 
+        start_time = time.perf_counter()
+
         futures = [
             self.executor.submit(
                 self.clients[self.ac.next()].batch_read,
@@ -288,6 +327,13 @@ class HiCacheHF3FS(HiCacheStorage):
             for i in range(0, len(batch_indices), self.entries)
         ]
         read_results = [result for future in futures for result in future.result()]
+
+        end_time = time.perf_counter()
+        ionum = len(batch_indices)
+        self.prefetch_pgs.append(ionum)
+        self.prefetch_bandwidth.append(
+            ionum / (end_time - start_time) * self.gb_per_page
+        )
 
         results = [None] * len(keys)
         for batch_index, file_result, read_result in zip(
@@ -316,6 +362,7 @@ class HiCacheHF3FS(HiCacheStorage):
             [target_sizes] if target_sizes is not None else None,
         )
 
+    @synchronized()
     def batch_set(
         self,
         keys: List[str],
@@ -345,6 +392,8 @@ class HiCacheHF3FS(HiCacheStorage):
             assert value.is_contiguous()
             file_values.append(value)
 
+        start_time = time.perf_counter()
+
         futures = [
             self.executor.submit(
                 self.clients[self.ac.next()].batch_write,
@@ -358,6 +407,11 @@ class HiCacheHF3FS(HiCacheStorage):
             for future in futures
             for result in future.result()
         ]
+
+        end_time = time.perf_counter()
+        ionum = len(batch_indices)
+        self.backup_pgs.append(ionum)
+        self.backup_bandwidth.append(ionum / (end_time - start_time) * self.gb_per_page)
 
         written_keys_to_confirm = []
         results = [index[0] for index in indices]
@@ -410,3 +464,16 @@ class HiCacheHF3FS(HiCacheStorage):
         except Exception as e:
             logger.error(f"close HiCacheHF3FS: {e}")
         logger.info("close HiCacheHF3FS")
+
+    @synchronized()
+    def get_stats(self):
+        storage_metrics = StorageMetrics()
+        storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
+        storage_metrics.backup_pgs.extend(self.backup_pgs)
+        storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
+        storage_metrics.backup_bandwidth.extend(self.backup_bandwidth)
+        self.prefetch_pgs.clear()
+        self.backup_pgs.clear()
+        self.prefetch_bandwidth.clear()
+        self.backup_bandwidth.clear()
+        return storage_metrics

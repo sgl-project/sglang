@@ -80,11 +80,13 @@ suites = {
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
+        TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
         TestFile("test_mla_deepseek_v3.py", 700),
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
+        TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 234),
         TestFile("test_original_logprobs.py", 200),
@@ -122,6 +124,8 @@ suites = {
         TestFile("test_dp_attention.py", 277),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 127),
+        TestFile("hicache/test_hicache_storage_e2e.py", 400),
+        TestFile("hicache/test_hicache_storage_benchmark.py", 400),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 600),
@@ -132,12 +136,14 @@ suites = {
     "per-commit-8-gpu": [
         # Disabled because it hangs on the CI.
         # TestFile("ep/test_moe_ep.py", 181),
+        TestFile("lora/test_lora_llama4.py", 600),
         TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_different_tp.py", 155),
         TestFile("test_full_deepseek_v3.py", 333),
     ],
     "per-commit-8-gpu-b200": [
         # add more here
+        TestFile("test_gpt_oss_4gpu.py", 600),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -210,6 +216,7 @@ suite_amd = {
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_metrics.py", 32),
+        TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 242),
         TestFile("test_mla_deepseek_v3.py", 221),
         TestFile("test_no_chunked_prefill.py", 108),
