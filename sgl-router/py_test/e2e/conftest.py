@@ -2,10 +2,10 @@ import socket
 import subprocess
 import time
 from types import SimpleNamespace
+from urllib.parse import urlparse
 
 import pytest
 import requests
-from urllib.parse import urlparse
 
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -27,7 +27,9 @@ def _parse_url(base_url: str) -> tuple[str, str]:
     and URL shapes like trailing paths.
     """
     parsed = urlparse(base_url)
-    return parsed.hostname or "127.0.0.1", str(parsed.port) if parsed.port is not None else ""
+    return parsed.hostname or "127.0.0.1", (
+        str(parsed.port) if parsed.port is not None else ""
+    )
 
 
 def _wait_router_health(base_url: str, timeout: float) -> None:
