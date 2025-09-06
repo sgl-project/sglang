@@ -1436,3 +1436,75 @@ def zero_experts_compute_triton(
     )
 
     return output
+
+
+@triton.jit
+def compute_problem_sizes_w4a8_kernel(
+    masked_m_ptr,
+    problem_sizes1_ptr,
+    problem_sizes2_ptr,
+    n,
+    k,
+    num_experts,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = pid < num_experts
+    final_occurrences = tl.load(masked_m_ptr + pid, mask=mask, other=0)
+
+    ps1_idx_0 = pid * 3
+    ps1_idx_1 = ps1_idx_0 + 1
+    ps1_idx_2 = ps1_idx_0 + 2
+
+    ps2_idx_0 = pid * 3
+    ps2_idx_1 = ps2_idx_0 + 1
+    ps2_idx_2 = ps2_idx_0 + 2
+
+    ps1_mask_0 = ps1_idx_0 < num_experts * 3
+    ps1_mask_1 = ps1_idx_1 < num_experts * 3
+    ps1_mask_2 = ps1_idx_2 < num_experts * 3
+    ps2_mask_0 = ps2_idx_0 < num_experts * 3
+    ps2_mask_1 = ps2_idx_1 < num_experts * 3
+    ps2_mask_2 = ps2_idx_2 < num_experts * 3
+
+    tl.store(problem_sizes1_ptr + ps1_idx_0, 2 * n, mask=ps1_mask_0)
+    tl.store(problem_sizes1_ptr + ps1_idx_1, final_occurrences, mask=ps1_mask_1)
+    tl.store(problem_sizes1_ptr + ps1_idx_2, k, mask=ps1_mask_2)
+
+    tl.store(problem_sizes2_ptr + ps2_idx_0, k, mask=ps2_mask_0)
+    tl.store(problem_sizes2_ptr + ps2_idx_1, final_occurrences, mask=ps2_mask_1)
+    tl.store(problem_sizes2_ptr + ps2_idx_2, n, mask=ps2_mask_2)
+
+
+def compute_problem_sizes_w4a8(
+    masked_m, problem_sizes1, problem_sizes2, n, k, num_experts
+):
+    BLOCK_SIZE = 256
+    grid = lambda meta: (triton.cdiv(num_experts, meta["BLOCK_SIZE"]),)
+    compute_problem_sizes_w4a8_kernel[grid](
+        masked_m,
+        problem_sizes1,
+        problem_sizes2,
+        n,
+        k,
+        num_experts,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return problem_sizes1, problem_sizes2
+
+
+def deepep_ll_get_cutlass_w4a8_moe_mm_data(
+    masked_m,
+    problem_sizes1,
+    problem_sizes2,
+    num_experts,
+    n,
+    k,
+):
+    problem_sizes1, problem_sizes2 = compute_problem_sizes_w4a8(
+        masked_m, problem_sizes1, problem_sizes2, n, k, num_experts
+    )
+    return (
+        problem_sizes1.to(torch.int32),
+        problem_sizes2.to(torch.int32),
+    )
