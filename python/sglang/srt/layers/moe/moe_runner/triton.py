@@ -18,12 +18,15 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.token_dispatcher import (
-    StandardCombineInput,
-    StandardDispatchOutput,
-)
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.base import (
+        StandardCombineInput,
+        StandardDispatchOutput,
+    )
+
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -325,6 +328,7 @@ def fused_experts_none_to_triton(
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+    from sglang.srt.layers.moe.token_dispatcher.base import StandardCombineInput
 
     output = fused_experts(
         hidden_states=dispatch_output.hidden_states,
@@ -436,6 +440,8 @@ def post_permute_triton_to_standard(
 
     # NOTE: this is dead code as a fused func for standard format is registered.
     # This is left here for testing and examples.
+
+    from sglang.srt.layers.moe.token_dispatcher.base import StandardCombineInput
 
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
