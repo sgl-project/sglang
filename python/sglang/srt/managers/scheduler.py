@@ -85,7 +85,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MultiTokenizerRegisterReq,
-    MultiTokenizerWarpper,
+    MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -158,6 +158,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     is_cpu,
     kill_itself_when_parent_died,
+    numa_bind_to_node,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
     require_mlp_sync,
@@ -488,7 +489,7 @@ class Scheduler(
             enable=server_args.enable_memory_saver
         )
         self.offload_tags = set()
-        self.init_profier()
+        self.init_profiler()
 
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
@@ -622,6 +623,7 @@ class Scheduler(
                     hicache_write_policy=server_args.hicache_write_policy,
                     hicache_io_backend=server_args.hicache_io_backend,
                     hicache_mem_layout=server_args.hicache_mem_layout,
+                    enable_metrics=self.enable_metrics,
                     hicache_storage_backend=server_args.hicache_storage_backend,
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                     model_name=server_args.served_model_name,
@@ -1096,13 +1098,13 @@ class Scheduler(
                     self.send_to_tokenizer.send_pyobj(abort_req)
                     continue
 
-            # If it is a MultiTokenizerWarpper, unwrap it and handle the inner request.
-            if isinstance(recv_req, MultiTokenizerWarpper):
+            # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
+            if isinstance(recv_req, MultiTokenizerWrapper):
                 worker_id = recv_req.worker_id
                 recv_req = recv_req.obj
                 output = self._request_dispatcher(recv_req)
                 if output is not None:
-                    output = MultiTokenizerWarpper(worker_id, output)
+                    output = MultiTokenizerWrapper(worker_id, output)
                     self.send_to_tokenizer.send_pyobj(output)
                 continue
 
@@ -2519,6 +2521,9 @@ def run_scheduler_process(
     pipe_writer,
     balance_meta: Optional[DPBalanceMeta] = None,
 ):
+    if (numa_node := server_args.numa_node) is not None:
+        numa_bind_to_node(numa_node[gpu_id])
+
     # Generate the prefix
     prefix = ""
     if dp_rank is not None:

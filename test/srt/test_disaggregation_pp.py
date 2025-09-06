@@ -49,7 +49,9 @@ class TestPDPPAccuracy(unittest.TestCase):
         lb_command = [
             "python3",
             "-m",
-            "sglang.srt.disaggregation.mini_lb",
+            "sglang_router.launch_router",
+            "--pd-disaggregation",
+            "--mini-lb",  # FIXME: remove this
             "--prefill",
             cls.prefill_url,
             "--decode",
