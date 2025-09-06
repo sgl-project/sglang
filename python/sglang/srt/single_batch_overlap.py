@@ -63,6 +63,8 @@ def execute_sbo(
     forward_batch: ForwardBatch,
     alt_stream: Optional = None,
 ):
+    shared_output = None
+
     dispatch_output = experts.dispatch(
         hidden_states, topk_idx, topk_weights, forward_batch
     )
@@ -78,7 +80,7 @@ def execute_sbo(
     if SboFlags.enable_combine_shared_two_stream_overlap():
         # TODO reduce sm for non-deepgemm
         with deep_gemm_wrapper.configure_deep_gemm_num_sms(meta_overlap_args["compute_num_sms"]):
-            forward_shared_experts()
+            shared_output = forward_shared_experts()
 
     hidden_states = experts.combine(
         hidden_states,
@@ -88,7 +90,7 @@ def execute_sbo(
         overlap_args=combine_overlap_args,
     )
 
-    return hidden_states
+    return hidden_states, shared_output
 
 def _compute_overlap_args(dispatch_output, alt_stream):
     if not (SboFlags.enable_combine_down_gemm_two_stream_overlap() or SboFlags.enable_combine_shared_two_stream_overlap()):
