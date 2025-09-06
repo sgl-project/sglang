@@ -432,22 +432,15 @@ class TestToolChoiceLlama32(CustomTestCase):
 
     def test_error_handling_invalid_tool_choice(self):
         """Test error handling for invalid tool_choice"""
-        import logging
-        from unittest.mock import patch
-
         tools = self.get_test_tools()
         messages = self.get_test_messages()
 
         # Test with invalid function name
         tool_choice = {"type": "function", "function": {"name": "nonexistent_function"}}
 
-        # The behavior could be either:
-        # 1. Log a warning and continue (if fallback is implemented)
-        # 2. Raise an exception (if strict validation is implemented)
-
-        # First try to capture any logging that might happen
-        with patch("logging.warning") as mock_warning:
-            response = self.client.chat.completions.create(
+        # Expect a 400 BadRequestError to be raised for invalid tool_choice
+        with self.assertRaises(openai.BadRequestError) as context:
+            self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
                 max_tokens=2048,
@@ -456,11 +449,8 @@ class TestToolChoiceLlama32(CustomTestCase):
                 stream=False,
             )
 
-            self.assertIsNotNone(response.choices[0].message)
-
-            if mock_warning.called:
-                warning_message = mock_warning.call_args[0][0]
-                self.assertIn("nonexistent_function", warning_message)
+        # Verify the error message contains the expected text
+        self.assertIn("Tool 'nonexistent_function' not found in tools list", str(context.exception))
 
 
 class TestToolChoiceQwen25(TestToolChoiceLlama32):

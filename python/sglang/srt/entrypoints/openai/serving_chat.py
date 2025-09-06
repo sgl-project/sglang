@@ -23,6 +23,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     LogProbs,
     MessageProcessingResult,
     ToolCall,
+    ToolChoice,
     TopLogprob,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -68,6 +69,17 @@ class OpenAIServingChat(OpenAIServingBase):
             and not request.tools
         ):
             return "Tools cannot be empty if tool choice is set to required."
+
+        if (
+            request.tool_choice is not None
+            and not isinstance(request.tool_choice, str)
+        ):
+            if not request.tools:
+                return "Tools cannot be empty if tool choice is set to a specific tool."
+            tool_name = request.tool_choice.function.name
+            tool_exists = any(tool.function.name == tool_name for tool in request.tools)
+            if not tool_exists:
+                return f"Tool '{tool_name}' not found in tools list."
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
@@ -174,7 +186,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.function.model_dump() for item in request.tools]
 
             tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-            parser = FunctionCallParser(request.tools, tool_call_parser)
+            parser = FunctionCallParser(request.tools, tool_call_parser, request.tool_choice)
             tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
 
         # Use chat template
@@ -422,6 +434,10 @@ class OpenAIServingChat(OpenAIServingBase):
             if constraint_type == "structural_tag":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
                     constraint_value.model_dump(by_alias=True)
+                )
+            elif constraint_type == "json_schema":
+                sampling_params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value
                 )
             else:
                 sampling_params[constraint_type] = constraint_value
@@ -730,7 +746,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.tool_choice != "none" and request.tools:
                 tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
                 tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, tool_call_parser, finish_reason
+                    text, request.tools, tool_call_parser, finish_reason, request.tool_choice
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -826,9 +842,58 @@ class OpenAIServingChat(OpenAIServingBase):
         tools: List[Any],
         tool_call_parser: Optional[str],
         finish_reason: Dict[str, Any],
+        tool_choice: Optional[Union[str, ToolChoice]] = None,
     ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
         """Process tool calls in the response"""
-        parser = FunctionCallParser(tools, tool_call_parser)
+
+        # Handle required tool choice
+        if tool_choice == "required":
+            try:
+                # For required tool choice, we expect a JSON array of tool calls
+                tool_call_data = json.loads(text)
+                tool_calls = []
+                for i, call_info in enumerate(tool_call_data):
+                    tool_id = f"call_{uuid.uuid4().hex[:24]}"
+                    tool_calls.append(
+                        ToolCall(
+                            id=tool_id,
+                            index=i,
+                            function=FunctionResponse(
+                                name=call_info['name'], 
+                                arguments=json.dumps(call_info['parameters'], ensure_ascii=False)
+                            ),
+                        )
+                    )
+                return tool_calls, "", finish_reason
+            except Exception as e:
+                logger.error(f"Tool call parsing error: {e}")
+                return None, text, finish_reason
+        
+        # Hande a named tool choice
+        elif isinstance(tool_choice, ToolChoice) and tool_choice.type == "function":
+            try:
+                # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
+                if tool_call_parser == "kimi_k2" and tool_choice.function.name is not None:
+                    tool_id = f"functions.{tool_choice.function.name}:0"
+                else:
+                    tool_id = f"call_{uuid.uuid4().hex[:24]}"
+
+                call_info = json.loads(text)
+                tool_calls = [
+                    ToolCall(
+                        id=tool_id,
+                        index=0, # only one tool call when a specific function is chosen
+                        function=FunctionResponse(
+                            name=tool_choice.function.name,
+                            arguments=json.dumps(call_info['parameters']),
+                        ),
+                    )
+                ]
+                return tool_calls, "", finish_reason
+            except Exception as e:
+                logger.error(f"Tool call parsing error: {e}")
+                return None, text, finish_reason
+        parser = FunctionCallParser(tools, tool_call_parser, tool_choice)
         if parser.has_tool_call(text):
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
@@ -934,6 +999,7 @@ class OpenAIServingChat(OpenAIServingBase):
             parser_dict[index] = FunctionCallParser(
                 tools=request.tools,
                 tool_call_parser=self.tokenizer_manager.server_args.tool_call_parser,
+                tool_choice=request.tool_choice,
             )
         parser = parser_dict[index]
 
