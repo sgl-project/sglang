@@ -1414,8 +1414,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_blockscale=layer.w2_blockscale_swizzled,
             w2_alpha=layer.g2_alphas,
             masked_m=masked_m,
-            down_sm_count=down_gemm_overlap_args.num_sms,
-            down_signals=down_gemm_overlap_args.signal,
-            down_start_event=down_gemm_overlap_args.start_event,
+            **(
+                dict(
+                    down_sm_count=down_gemm_overlap_args.num_sms,
+                    down_signals=down_gemm_overlap_args.signal,
+                    down_start_event=down_gemm_overlap_args.start_event,
+                )
+                if down_gemm_overlap_args is not None else {}
+            ),
         )
         return out
