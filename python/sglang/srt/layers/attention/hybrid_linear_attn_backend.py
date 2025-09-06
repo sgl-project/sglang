@@ -238,67 +238,68 @@ class MambaAttnBackend(AttentionBackend):
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
 
-        if forward_batch.forward_mode.is_target_verify():
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
+
+        if is_target_verify:
             (
                 conv_states,
                 ssm_states,
                 mixed_qkv_cache,
                 intermediate_state_cache,
             ) = self.req_to_token_pool.get_mamba_params(layer_id)
+            mixed_qkv_cache[cache_indices] = mixed_qkv.view(
+                (-1,) + mixed_qkv_cache.shape[1:]
+            ).clone()
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
+            conv_states_to_use = conv_states.clone()
         else:
             conv_states, ssm_states, *rest = self.req_to_token_pool.get_mamba_params(
                 layer_id
             )
             has_initial_states = forward_batch.extend_prefix_lens > 0
-
-        query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
-
-        if forward_batch.forward_mode.is_target_verify():
-            mixed_qkv_cache[cache_indices] = mixed_qkv.view(
-                (-1,) + mixed_qkv_cache.shape[1:]
-            ).clone()
+            conv_states_to_use = conv_states
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             conv_weights,
             bias,
             activation=activation,
-            conv_states=(
-                conv_states.clone()
-                if forward_batch.forward_mode.is_target_verify()
-                else conv_states
-            ),
+            conv_states=conv_states_to_use,
             has_initial_state=has_initial_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
         ).transpose(0, 1)[:seq_len]
 
+        key_split_dim = key_dim // attn_tp_size
+        value_split_dim = value_dim // attn_tp_size
+
         query, key, value = torch.split(
             mixed_qkv,
-            [
-                key_dim // attn_tp_size,
-                key_dim // attn_tp_size,
-                value_dim // attn_tp_size,
-            ],
+            [key_split_dim, key_split_dim, value_split_dim],
             dim=-1,
         )
-        # Reshape from [l, h*d] to [1, l, h, d]
-        seq_len = query.shape[0]
+
+        actual_seq_len = query.shape[0]
         num_heads = query.shape[1] // head_k_dim
-        query = query.view(1, seq_len, num_heads, head_k_dim)
-        key = key.view(1, seq_len, num_heads, head_k_dim)
-        value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
+        num_value_heads = value.shape[1] // head_v_dim
+
+        query = query.view(1, actual_seq_len, num_heads, head_k_dim)
+        key = key.view(1, actual_seq_len, num_heads, head_k_dim)
+        value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
+
         beta = b.sigmoid()
         g = fused_gdn_gating(A_log, a, dt_bias)
-        g = g.view(1, *g.shape)
-        beta = beta.view(1, *beta.shape)
 
-        if forward_batch.forward_mode.is_target_verify():
+        g = g.unsqueeze(0)
+        beta = beta.unsqueeze(0)
+
+        if is_target_verify:
             core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
                 k=key,
@@ -314,6 +315,7 @@ class MambaAttnBackend(AttentionBackend):
                 cache_steps=forward_batch.spec_info.draft_token_num,
             )
         else:
+            # Get recurrent state once
             recurrent_state = ssm_states[cache_indices]
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
@@ -321,7 +323,7 @@ class MambaAttnBackend(AttentionBackend):
                 v=value,
                 g=g,
                 beta=beta,
-                initial_state=recurrent_state,  # unified use existing state (zeros for new sequences)
+                initial_state=recurrent_state,
                 output_final_state=True,
                 cu_seqlens=query_start_loc,
                 head_first=False,
