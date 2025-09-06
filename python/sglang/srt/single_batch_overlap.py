@@ -124,12 +124,10 @@ def _compute_overlap_args(dispatch_output, alt_stream):
             start_event=combine_wait_event,
             num_sms=compute_num_sms,
         )
-        combine_overlap_args |= dict(
-            overlap=True,
-            signal=combine_signal,
-            block_m=block_m,
-            threshold=ceil_div(hidden_dim, block_n),
-        )
+        combine_overlap_args.overlap = True
+        combine_overlap_args.signal = combine_signal
+        combine_overlap_args.block_m = block_m
+        combine_overlap_args.threshold = ceil_div(hidden_dim, block_n)
     else:
         meta_overlap_args |= dict(
             record_event_after_down=combine_wait_event,
