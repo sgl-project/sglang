@@ -1,4 +1,4 @@
-from typing import Optional, Callable
+from typing import Optional, Callable, Any
 
 import torch
 
@@ -43,12 +43,12 @@ class DownGemmOverlapArgs:
 
 
 def execute_sbo(
+    forward_shared_experts: Callable[[], Any],
     experts: DeepEPMoE,
     hidden_states: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     forward_batch: ForwardBatch,
-    hook_overlap_on_combine: Optional[Callable] = None,
     alt_stream: Optional = None,
 ):
     dispatch_output = experts.dispatch(
@@ -63,9 +63,9 @@ def execute_sbo(
     if (e := meta_overlap_args.get("record_event_after_down")) is not None:
         e.record()
 
-    if hook_overlap_on_combine is not None:
+    if SboFlags.enable_combine_shared_overlap():
         with deep_gemm_wrapper.configure_deep_gemm_num_sms(meta_overlap_args["compute_num_sms"]):
-            hook_overlap_on_combine()
+            forward_shared_experts()
 
     hidden_states = experts.combine(
         hidden_states,
