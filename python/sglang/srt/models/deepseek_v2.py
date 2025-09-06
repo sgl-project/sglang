@@ -250,7 +250,7 @@ class DeepseekV2MLP(nn.Module):
             return x
 
         if (
-            gemm_output_zero_allocator != None
+            gemm_output_zero_allocator is not None
             and x.shape[0] <= 256
             and self.gate_up_proj.weight.dtype == torch.uint8
         ):
