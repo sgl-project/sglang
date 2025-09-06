@@ -614,8 +614,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             # TODO refactor and improve the whole logic, e.g. move to save level
             overlap_args["stream"].wait_event(overlap_args["wait_event"])
             with torch.cuda.stream(overlap_args["stream"]):
-                # TODO let ant change DeepEP to unify the two APIs?
-                combined_hidden_states, event, hook = buffer.ll_overlap_combine(
+                # TODO unify the two APIs
+                combined_hidden_states, event, hook = buffer.low_latency_combine(
                     x=hidden_states,
                     topk_idx=topk_idx,
                     topk_weights=topk_weights,
