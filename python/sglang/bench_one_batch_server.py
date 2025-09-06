@@ -47,6 +47,7 @@ class BenchArgs:
     profile: bool = False
     profile_steps: int = 3
     profile_by_stage: bool = False
+    dataset_path: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -83,6 +84,9 @@ class BenchArgs:
             "--profile-steps", type=int, default=BenchArgs.profile_steps
         )
         parser.add_argument("--profile-by-stage", action="store_true")
+        parser.add_argument(
+            "--dataset-path", type=str, default=BenchArgs.dataset_path, help="Path to the dataset."
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -138,6 +142,7 @@ def run_one_case(
     profile: bool = False,
     profile_steps: int = 3,
     profile_by_stage: bool = False,
+    dataset_path: str = "",
 ):
     requests.post(url + "/flush_cache")
     input_requests = sample_random_requests(
@@ -146,7 +151,7 @@ def run_one_case(
         num_prompts=batch_size,
         range_ratio=1.0,
         tokenizer=tokenizer,
-        dataset_path="",
+        dataset_path=dataset_path,
         random_sample=True,
         return_text=False,
     )
@@ -345,6 +350,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             run_name="",
             result_filename="",
             tokenizer=tokenizer,
+            dataset_path=bench_args.dataset_path
         )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
