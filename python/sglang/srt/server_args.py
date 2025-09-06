@@ -990,8 +990,8 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "fp4_e2m1"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+. "fp4_e2m1" is supported for CUDA 12.8+',
         )
 
         # Memory and scheduling
