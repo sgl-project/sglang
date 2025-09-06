@@ -135,70 +135,6 @@ class MambaPool:
                 dtype=conv_dtype,
                 device="cuda",
             )
-            linear_num_value_heads_per_tp_rank = temporal_state_shape[0]
-            key_head_dim = temporal_state_shape[1]
-            value_head_dim = temporal_state_shape[2]
-            linear_num_key_heads_per_tp_rank = int(
-                (
-                    conv_state_shape[0]
-                    - value_head_dim * linear_num_value_heads_per_tp_rank
-                )
-                / 2
-                / key_head_dim
-            )
-            query_cache = torch.empty(
-                size=(
-                    num_mamba_layers,
-                    size + 1,
-                    speculative_num_draft_tokens,
-                    linear_num_key_heads_per_tp_rank,
-                    key_head_dim,
-                ),
-                dtype=conv_dtype,
-                device="cuda",
-            )
-            key_cache = torch.empty(
-                size=(
-                    num_mamba_layers,
-                    size + 1,
-                    speculative_num_draft_tokens,
-                    linear_num_key_heads_per_tp_rank,
-                    key_head_dim,
-                ),
-                dtype=conv_dtype,
-                device="cuda",
-            )
-            value_cache = torch.empty(
-                size=(
-                    num_mamba_layers,
-                    size + 1,
-                    speculative_num_draft_tokens,
-                    linear_num_value_heads_per_tp_rank,
-                    value_head_dim,
-                ),
-                dtype=conv_dtype,
-                device="cuda",
-            )
-            g_cache = torch.empty(
-                size=(
-                    num_mamba_layers,
-                    size + 1,
-                    speculative_num_draft_tokens,
-                    linear_num_value_heads_per_tp_rank,
-                ),
-                dtype=ssm_dtype,  # QQ: only g has same dtype as ssm state, need to double check later to see if g always need fp32
-                device="cuda",
-            )
-            beta_cache = torch.empty(
-                size=(
-                    num_mamba_layers,
-                    size + 1,
-                    speculative_num_draft_tokens,
-                    linear_num_value_heads_per_tp_rank,
-                ),
-                dtype=conv_dtype,
-                device="cuda",
-            )
             # Cache intermediate SSM states per draft token during target verify
             # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
             intermediate_ssm_state_cache = torch.empty(
@@ -217,11 +153,6 @@ class MambaPool:
                 conv_state,
                 temporal_state,
                 mixed_qkv_cache,
-                query_cache,
-                key_cache,
-                value_cache,
-                g_cache,
-                beta_cache,
                 intermediate_ssm_state_cache,
             )
         else:

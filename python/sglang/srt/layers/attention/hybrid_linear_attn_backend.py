@@ -243,11 +243,6 @@ class MambaAttnBackend(AttentionBackend):
                 conv_states,
                 ssm_states,
                 mixed_qkv_cache,
-                query_cache,
-                key_cache,
-                value_cache,
-                g_cache,
-                beta_cache,
                 intermediate_state_cache,
             ) = self.req_to_token_pool.get_mamba_params(layer_id)
             has_initial_states = torch.ones(
@@ -322,11 +317,6 @@ class MambaAttnBackend(AttentionBackend):
                 intermediate_states_buffer=intermediate_state_cache,
                 cache_steps=forward_batch.spec_info.draft_token_num,
             )
-            query_cache[cache_indices] = query.view((-1,) + query_cache.shape[1:])
-            key_cache[cache_indices] = key.view((-1,) + key_cache.shape[1:])
-            value_cache[cache_indices] = value.view((-1,) + value_cache.shape[1:])
-            g_cache[cache_indices] = g.view((-1,) + g_cache.shape[1:])
-            beta_cache[cache_indices] = beta.view((-1,) + beta_cache.shape[1:])
         else:
             recurrent_state = ssm_states[cache_indices]
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
@@ -519,16 +509,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             1
         ].req_to_token_pool.get_mamba_params_all_layers()
 
-        conv_states = mamba_caches[0]
-        ssm_states = mamba_caches[1]
-        intermediate_state_cache = mamba_caches[8]
+        conv_states, ssm_states, mix_qkv_cache, intermediate_state_cache = mamba_caches
+        # ssm_states = mamba_caches[1]
+        # intermediate_state_cache = mamba_caches[-1]
 
-        mixed_qkvs = mamba_caches[2][:, state_indices_tensor][:, mask]
-        queries = mamba_caches[3][:, state_indices_tensor][:, mask]
-        keys = mamba_caches[4][:, state_indices_tensor][:, mask]
-        values = mamba_caches[5][:, state_indices_tensor][:, mask]
-        gs = mamba_caches[6][:, state_indices_tensor][:, mask]
-        betas = mamba_caches[7][:, state_indices_tensor][:, mask]
+        mixed_qkvs = mix_qkv_cache[:, state_indices_tensor][:, mask]
 
         mamba_map = self.attn_backend_list[1].req_to_token_pool.mamba_map
 
@@ -536,31 +521,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             request_number, dtype=torch.bool, device=accepted_length.device
         )
 
-        # Pre-compute indices for SSM state updates (outside the loop for efficiency)
-        # cached_states_per_layer = {}
+        # Batch SSM state updates (outside the loop for efficiency)
         valid_mask = accepted_length > 0
         if intermediate_state_cache is not None:
             last_steps = (accepted_length - 1).to(torch.int64)
             valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
-            
-            # Pre-gather all cached states for valid requests
-            # Shape: [num_valid_requests, HV, K, V] for each layer
-            # for i in range(len(model.model.layers)):
-            #     layer = model.model.layers[i]
-            #     if isinstance(layer, Qwen3HybridLinearDecoderLayer):
-            #         layer_id = mamba_map[i]
-            #         # Gather cached states: [valid_indices, last_steps] -> [num_valid, HV, K, V]
-            #         # cached_states_per_layer[layer_id] = intermediate_state_cache[layer_id][
-            #         #     valid_state_indices, last_steps
-            #         # ].to(ssm_states.dtype)
-                    
-            #         ssm_state[valid_state_indices] = intermediate_state_cache[layer_id][
-            #             valid_state_indices, last_steps
-            #         ].to(ssm_states.dtype)
                     
             ssm_states[:, valid_state_indices, :] = intermediate_state_cache[:, valid_state_indices, last_steps].to(ssm_states.dtype)
 
-        # QQ: can be parallelized
+        # For loop conv state updates (can be optimized)
         for i in range(len(model.model.layers)):
             layer = model.model.layers[i]
             if isinstance(layer, Qwen3HybridLinearDecoderLayer):
@@ -571,13 +540,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
                 layer_id = mamba_map[i]
                 conv_state = conv_states[layer_id]
-                # ssm_state = ssm_states[layer_id]
                 mixed_qkv = mixed_qkvs[layer_id]
-                query = queries[layer_id].unsqueeze(0)
-                key = keys[layer_id].unsqueeze(0)
-                value = values[layer_id].unsqueeze(0)
-                g = gs[layer_id].unsqueeze(0)
-                beta = betas[layer_id].unsqueeze(0)
 
                 _ = causal_conv1d_fn(
                     mixed_qkv.transpose(0, 1),
@@ -589,7 +552,3 @@ class HybridLinearAttnBackend(AttentionBackend):
                     cache_indices=state_indices_tensor,
                     query_start_loc=query_start_loc,
                 )
-
-                # # Copy pre-computed cached states directly (no indexing operations in loop)
-                # if layer_id in cached_states_per_layer:
-                #     ssm_state[valid_state_indices] = cached_states_per_layer[layer_id]
