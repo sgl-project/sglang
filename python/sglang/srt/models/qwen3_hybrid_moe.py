@@ -508,7 +508,10 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
 
         if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
-                layer_id=layer_id, config=config, quant_config=quant_config
+                layer_id=layer_id,
+                config=config,
+                quant_config=quant_config,
+                alt_stream=alt_stream,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -681,7 +684,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
-                layer_id=layer_id, config=config, quant_config=quant_config
+                layer_id=layer_id,
+                config=config,
+                quant_config=quant_config,
+                alt_stream=alt_stream,
             )
         else:
             self.mlp = Qwen2MoeMLP(
