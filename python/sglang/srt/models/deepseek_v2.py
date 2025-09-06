@@ -641,7 +641,7 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            if not SboFlags.enable_combine_shared_overlap():
+            if not SboFlags.enable_combine_shared_two_stream_overlap():
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
@@ -656,7 +656,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device
             )
 
-        if SboFlags.enable_combine_shared_overlap():
+        if SboFlags.enable_combine_shared_two_stream_overlap():
             final_hidden_states, shared_output = single_batch_overlap.execute_sbo(
                 forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
                 experts=self.experts,
