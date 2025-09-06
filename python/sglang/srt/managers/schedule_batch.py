@@ -71,6 +71,7 @@ from sglang.srt.utils import flatten_nested_list, support_triton
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -901,7 +902,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
+    spec_info: Optional[
+        Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
+    ] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1539,7 +1542,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.spec_algorithm.is_eagle():
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_lookahead():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
@@ -1913,7 +1916,9 @@ class ModelWorkerBatch:
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: Optional[
+        Union[EagleVerifyInput, EagleDraftInput, LookaheadVerifyInput]
+    ] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = 0

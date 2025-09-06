@@ -1216,7 +1216,7 @@ class ModelRunner:
                 4096,
             )
 
-        if not self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_eagle():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
