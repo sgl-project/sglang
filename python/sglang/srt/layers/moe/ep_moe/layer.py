@@ -416,41 +416,6 @@ class DeepEPMoE(EPMoE):
                 ),
             )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
-        hook_overlap_on_combine: Optional[Callable] = None,
-        alt_stream: Optional = None,
-    ):
-        dispatch_output = self.dispatch(
-            hidden_states, topk_idx, topk_weights, forward_batch
-        )
-
-        combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
-            self._compute_overlap_args(dispatch_output, alt_stream)
-        )
-
-        hidden_states = self.moe_impl(dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args)
-        if (e := meta_overlap_args.get("record_event_after_down")) is not None:
-            e.record()
-
-        if hook_overlap_on_combine is not None:
-            with deep_gemm_wrapper.configure_deep_gemm_num_sms(meta_overlap_args["compute_num_sms"]):
-                hook_overlap_on_combine()
-
-        hidden_states = self.combine(
-            hidden_states,
-            dispatch_output.topk_idx,
-            dispatch_output.topk_weights,
-            forward_batch,
-            overlap_args=combine_overlap_args,
-        )
-
-        return hidden_states
-
     def dispatch(
         self,
         hidden_states: torch.Tensor,

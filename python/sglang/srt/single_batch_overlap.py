@@ -1,9 +1,12 @@
-from typing import Optional
+from typing import Optional, Callable
 
 import torch
 
 from dataclasses import dataclass
 
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_int_env_var, ceil_div
 
 
@@ -24,6 +27,41 @@ class DownGemmOverlapArgs:
     signal: torch.Tensor
     start_event: torch.cuda.Event
 
+
+def execute_sbo(
+    experts: DeepEPMoE,
+    hidden_states: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    forward_batch: ForwardBatch,
+    hook_overlap_on_combine: Optional[Callable] = None,
+    alt_stream: Optional = None,
+):
+    dispatch_output = experts.dispatch(
+        hidden_states, topk_idx, topk_weights, forward_batch
+    )
+
+    combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+        experts._compute_overlap_args(dispatch_output, alt_stream)
+    )
+
+    hidden_states = experts.moe_impl(dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args)
+    if (e := meta_overlap_args.get("record_event_after_down")) is not None:
+        e.record()
+
+    if hook_overlap_on_combine is not None:
+        with deep_gemm_wrapper.configure_deep_gemm_num_sms(meta_overlap_args["compute_num_sms"]):
+            hook_overlap_on_combine()
+
+    hidden_states = experts.combine(
+        hidden_states,
+        dispatch_output.topk_idx,
+        dispatch_output.topk_weights,
+        forward_batch,
+        overlap_args=combine_overlap_args,
+    )
+
+    return hidden_states
 
 def _compute_overlap_args(dispatch_output, alt_stream):
     if not ENABLE_DEEPEP_COMBINE_OVERLAP:
