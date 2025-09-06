@@ -32,7 +32,7 @@ class TestAscendTp4Bf16(CustomTestCase):
         cls.common_args = [
             "--trust-remote-code",
             "--mem-fraction-static",
-            0.8,
+            0.7,
             "--attention-backend",
             "ascend",
             "--tp-size",
