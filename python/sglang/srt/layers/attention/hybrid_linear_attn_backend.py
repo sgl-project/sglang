@@ -535,6 +535,31 @@ class HybridLinearAttnBackend(AttentionBackend):
         has_initial_states = torch.ones(
             request_number, dtype=torch.bool, device=accepted_length.device
         )
+
+        # Pre-compute indices for SSM state updates (outside the loop for efficiency)
+        # cached_states_per_layer = {}
+        valid_mask = accepted_length > 0
+        if intermediate_state_cache is not None:
+            last_steps = (accepted_length - 1).to(torch.int64)
+            valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
+            
+            # Pre-gather all cached states for valid requests
+            # Shape: [num_valid_requests, HV, K, V] for each layer
+            # for i in range(len(model.model.layers)):
+            #     layer = model.model.layers[i]
+            #     if isinstance(layer, Qwen3HybridLinearDecoderLayer):
+            #         layer_id = mamba_map[i]
+            #         # Gather cached states: [valid_indices, last_steps] -> [num_valid, HV, K, V]
+            #         # cached_states_per_layer[layer_id] = intermediate_state_cache[layer_id][
+            #         #     valid_state_indices, last_steps
+            #         # ].to(ssm_states.dtype)
+                    
+            #         ssm_state[valid_state_indices] = intermediate_state_cache[layer_id][
+            #             valid_state_indices, last_steps
+            #         ].to(ssm_states.dtype)
+                    
+            ssm_states[:, valid_state_indices, :] = intermediate_state_cache[:, valid_state_indices, last_steps].to(ssm_states.dtype)
+
         # QQ: can be parallelized
         for i in range(len(model.model.layers)):
             layer = model.model.layers[i]
@@ -546,7 +571,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
                 layer_id = mamba_map[i]
                 conv_state = conv_states[layer_id]
-                ssm_state = ssm_states[layer_id]
+                # ssm_state = ssm_states[layer_id]
                 mixed_qkv = mixed_qkvs[layer_id]
                 query = queries[layer_id].unsqueeze(0)
                 key = keys[layer_id].unsqueeze(0)
@@ -565,22 +590,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                     query_start_loc=query_start_loc,
                 )
 
-                # we do in-place update for ssm_state
-                # Copy cached state of the accepted last step directly into ssm_state
-                # accepted_length gives the number of accepted drafts per request
-                # We only need the state after the accepted prefix
-                # Shape of cache per layer: [size+1, num_draft_tokens, HV, K, V]
-                accepted_steps = accepted_length
-                # Mask selects last accepted step (step-1) per request; handle zeros by skipping
-                # Prepare indices: gather using view to match [batch, steps, ...]
-                # Here we simply copy per-request accepted state into ssm_state
-                if intermediate_state_cache is not None:
-                    # Gather the last accepted step state
-                    # For requests with 0 acceptance, skip copy
-                    valid_mask = accepted_steps > 0
-                    if torch.any(valid_mask):
-                        last_steps = (accepted_steps[valid_mask] - 1).to(torch.int64)
-                        src_indices = state_indices_tensor[valid_mask].to(torch.int64)
-                        ssm_state[src_indices] = intermediate_state_cache[layer_id][
-                            src_indices, last_steps
-                        ].to(ssm_state.dtype)
+                # # Copy pre-computed cached states directly (no indexing operations in loop)
+                # if layer_id in cached_states_per_layer:
+                #     ssm_state[valid_state_indices] = cached_states_per_layer[layer_id]
