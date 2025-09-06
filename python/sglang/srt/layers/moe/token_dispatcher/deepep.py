@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.single_batch_overlap import CombineOverlapArgs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
