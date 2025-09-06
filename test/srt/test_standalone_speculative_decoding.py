@@ -25,7 +25,7 @@ DEFAULT_SERVER_ARGS = [
     "8",
     "--speculative-algorithm",
     "STANDALONE",
-    "--speculative-draft",
+    "--speculative-draft-model-path",
     DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST,
     "--speculative-num-steps",
     "3",
@@ -38,7 +38,7 @@ DEFAULT_SERVER_ARGS = [
 ]
 
 
-class TestStandaloneSpeculativeDecoding(CustomTestCase):
+class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
 
     model = DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST
     draft_model = DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST
@@ -49,7 +49,7 @@ class TestStandaloneSpeculativeDecoding(CustomTestCase):
     @classmethod
     def get_server_args(cls):
         """Return the arguments for the server launch. Override in subclasses."""
-        return DEFAULT_SERVER_ARGS
+        return DEFAULT_SERVER_ARGS + ["--attention-backend", "fa3"]
 
     @classmethod
     def setUpClass(cls):
@@ -94,6 +94,21 @@ class TestStandaloneSpeculativeDecoding(CustomTestCase):
         ]
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
+
+
+class TestStandaloneSpeculativeDecodingTriton(TestStandaloneSpeculativeDecodingBase):
+
+    @classmethod
+    def get_server_args(cls):
+        return DEFAULT_SERVER_ARGS + ["--attention-backend", "triton"]
+
+
+class TestStandaloneSpeculativeDecodingFlashinfer(
+    TestStandaloneSpeculativeDecodingBase
+):
+    @classmethod
+    def get_server_args(cls):
+        return DEFAULT_SERVER_ARGS + ["--attention-backend", "flashinfer"]
 
 
 if __name__ == "__main__":
