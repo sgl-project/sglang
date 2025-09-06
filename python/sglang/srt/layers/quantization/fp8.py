@@ -635,11 +635,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-            if (
-                get_bool_env_var("SGLANG_CUTLASS_MOE")
-                and self.cutlass_fp8_supported
-                and (is_sm100_supported() or is_sm90_supported())
-            ):
+            if self.use_cutlass_fused_experts_fp8:
                 self.ab_strides1 = torch.full(
                     (num_experts,),
                     hidden_size,
