@@ -26,8 +26,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     format_tcp_address,
     get_free_port,
-    get_ip,
-    get_local_ip_by_remote,
+    get_local_ip_auto,
     is_valid_ipv6_address,
     maybe_wrap_ipv6_address,
 )
@@ -92,7 +91,7 @@ class CommonKVManager(BaseKVManager):
             "role": "Prefill",
             "tp_size": self.tp_size,
             "dp_size": self.dp_size,
-            "rank_ip": get_local_ip_by_remote(),
+            "rank_ip": get_local_ip_auto(),
             "rank_port": self.rank_port,
             "engine_rank": self.kv_args.engine_rank,
         }

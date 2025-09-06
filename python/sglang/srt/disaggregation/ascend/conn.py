@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.utils import get_local_ip_by_remote
+from sglang.srt.utils import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 class AscendKVManager(MooncakeKVManager):
     def init_engine(self):
         # TransferEngine initialized on ascend.
-        local_ip = get_local_ip_by_remote()
+        local_ip = get_local_ip_auto()
         self.engine = AscendTransferEngine(
             hostname=local_ip,
             npu_id=self.kv_args.gpu_id,
