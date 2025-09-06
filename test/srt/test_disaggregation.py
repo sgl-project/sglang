@@ -180,6 +180,11 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
         cls.launch_lb()
 
     @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB")
+        super().tearDownClass()
+
+    @classmethod
     def start_prefill(cls):
         prefill_args = [
             "--trust-remote-code",
@@ -364,23 +369,12 @@ class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
         cls.wait_server_ready(cls.prefill_url + "/health")
         cls.wait_server_ready(cls.decode_url + "/health")
 
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang_router.launch_router",
-            "--pd-disaggregation",
-            "--mini-lb",  # FIXME: remove this
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
-
         cls.launch_lb()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("SGLANG_TEST_RETRACT")
+        super().tearDownClass()
 
     @classmethod
     def start_prefill(cls):
