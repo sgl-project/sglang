@@ -16,8 +16,8 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.utils import is_layer_skipped, is_npu
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.utils import set_weight_attrs, is_npu
 
 _is_npu = is_npu()
 if not _is_npu:
