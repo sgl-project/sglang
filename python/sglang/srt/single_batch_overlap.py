@@ -12,16 +12,16 @@ from sglang.srt.utils import get_int_env_var, ceil_div
 
 class SboFlags:
     @classmethod
-    def enable_deepep_combine_down_gemm_overlap(cls):
+    def enable_combine_down_gemm_overlap(cls):
         return TODO
 
     @classmethod
-    def enable_deepep_combine_shared_overlap(cls):
+    def enable_combine_shared_overlap(cls):
         return TODO
 
     @classmethod
-    def enable_deepep_combine_overlap(cls):
-        return cls.enable_deepep_combine_down_gemm_overlap() or cls.enable_deepep_combine_shared_overlap()
+    def enable_combine_overlap(cls):
+        return cls.enable_combine_down_gemm_overlap() or cls.enable_combine_shared_overlap()
 
 
 @dataclass
@@ -78,7 +78,7 @@ def execute_sbo(
     return hidden_states
 
 def _compute_overlap_args(dispatch_output, alt_stream):
-    if not SboFlags.enable_deepep_combine_overlap():
+    if not SboFlags.enable_combine_overlap():
         return None, None, {}
 
     hidden_states = dispatch_output.hidden_states_fp8
@@ -107,7 +107,7 @@ def _compute_overlap_args(dispatch_output, alt_stream):
     )
     down_gemm_overlap_args = None
 
-    if SboFlags.enable_deepep_combine_down_gemm_overlap():
+    if SboFlags.enable_combine_down_gemm_overlap():
         # TODO use zero_allocator
         combine_signal = torch.zeros(
             # TODO their deepep requires the size to be this large, temp use theirs to avoid changing their code
