@@ -1,16 +1,17 @@
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, TYPE_CHECKING
 
 import torch
 
 from dataclasses import dataclass
 
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_int_env_var, ceil_div
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 
 class SboFlags:
     # TODO may have: "enable_dispatch_shared_one_stream_overlap", "enable_dispatch_gateup_gemm_two_stream_overlap", ...
@@ -55,7 +56,7 @@ class DownGemmOverlapArgs:
 
 def execute_sbo(
     forward_shared_experts: Callable[[], Any],
-    experts: DeepEPMoE,
+    experts: "DeepEPMoE",
     hidden_states: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
