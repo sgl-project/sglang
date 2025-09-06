@@ -96,7 +96,7 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
     a_q = torch.clamp((a / a_scale), -448.0, 448.0).to(torch.float8_e4m3fn).to(device)
 
     # Create output tensor
-    c = torch.empty((m, n), dtype=torch.float16, device=device)
+    c = torch.empty((m, n), dtype=torch.bfloat16, device=device)
     cutlass_w4a8_moe_mm(
         c,
         a_q,
@@ -211,7 +211,7 @@ def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts):
     b_strides = a_strides
     s_strides = c_strides
 
-    c_perm = torch.empty((batch_size, n), dtype=torch.float16, device=device)
+    c_perm = torch.empty((batch_size, n), dtype=torch.bfloat16, device=device)
     cutlass_w4a8_moe_mm(
         c_perm,
         a_q_perm,
@@ -262,10 +262,9 @@ def ref_grouped_gemm(c, a, a_scale, w, w_scale, num_experts, experts_selection_r
             continue
         a = a_q[token_idx]
 
-        ref_w_scale_repeat = w_scale[i].repeat_interleave(128, dim=1).to(float)
-        ref_w = (w[i].to(float) * ref_w_scale_repeat).to(dtype)
-        c = torch.matmul(a.to(dtype), ref_w.t().to(dtype)) * a_scale
-        c = c.to(dtype)
+        ref_w_scale_repeat = w_scale[i].repeat_interleave(128, dim=1).to(torch.float32)
+        ref_w = w[i].to(torch.float32) * ref_w_scale_repeat
+        c = torch.matmul(a.to(torch.float32), ref_w.t()) * a_scale
         c_ref[token_idx] = c.to(dtype)
 
     return c_ref
