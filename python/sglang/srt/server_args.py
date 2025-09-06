@@ -297,6 +297,8 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
+    # LMCache
+    enable_lmcache: bool = False
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -385,9 +387,6 @@ class ServerArgs:
     enable_flashinfer_trtllm_moe: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
-
-    # LMCache
-    enable_lmcache: bool = False
 
     def __post_init__(self):
         # Check deprecated arguments
@@ -1732,6 +1731,12 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
         )
+        # LMCache
+        parser.add_argument(
+            "--enable-lmcache",
+            action="store_true",
+            help="Using LMCache as an alternative hierarchical cache solution",
+        )
 
         # Double Sparsity
         parser.add_argument(
@@ -2037,7 +2042,6 @@ class ServerArgs:
         )
 
         # PD disaggregation
-
         parser.add_argument(
             "--disaggregation-mode",
             type=str,
@@ -2149,13 +2153,6 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action="store_true",
             help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
-        )
-
-        # LMCache
-        parser.add_argument(
-            "--enable-lmcache",
-            action="store_true",
-            help="Enable LMCache for the model.",
         )
 
     @classmethod
