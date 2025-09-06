@@ -15,6 +15,9 @@ class CombineOverlapArgs:
     block_m: int = -1
     threshold: int = -1
 
+
 @dataclass
 class DownGemmOverlapArgs:
-    TODO
+    sm_count: int
+    signals: torch.Tensor
+    start_event: torch.cuda.Event

@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
@@ -1387,7 +1388,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
-        down_gemm_overlap_args: Optional[Dict[str, Any]],
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
     ) -> torch.Tensor:
         assert (
             moe_runner_config.activation == "silu"
@@ -1413,8 +1414,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_blockscale=layer.w2_blockscale_swizzled,
             w2_alpha=layer.g2_alphas,
             masked_m=masked_m,
-            down_sm_count=down_gemm_overlap_args["down_sm_count"],
-            down_signals=down_gemm_overlap_args["down_signals"],
-            down_start_event=down_gemm_overlap_args["down_start_event"],
+            down_sm_count=down_gemm_overlap_args.sm_count,
+            down_signals=down_gemm_overlap_args.signals,
+            down_start_event=down_gemm_overlap_args.start_event,
         )
         return out
