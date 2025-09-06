@@ -101,7 +101,6 @@ assert isinstance(DeepEPLLOutput, DispatchOutput)
 assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
 
 
-
 class DeepEPDispatchMode(IntEnum):
     NORMAL = auto()
     LOW_LATENCY = auto()
