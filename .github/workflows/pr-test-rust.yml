@@ -27,6 +27,11 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-router
+
       - name: Run lint
         run: |
           source "$HOME/.cargo/env"
@@ -90,7 +95,15 @@ jobs:
           cd sgl-router
           source "$HOME/.cargo/env"
           pip install pytest pytest-cov pytest-xdist
-          pytest -q py_test/unit
+          pytest -q py_test/unit --cov=sglang_router --cov-report=term-missing --cov-fail-under=80
+
+      - name: Run Python integration tests
+        run: |
+          cd sgl-router
+          source "$HOME/.cargo/env"
+          # Integration tests use FastAPI/uvicorn for mock workers
+          pip install fastapi uvicorn orjson
+          pytest -q -m integration
 
       - name: Run e2e test
         run: |
