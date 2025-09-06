@@ -130,7 +130,12 @@ def parse_args():
         help="Tag of a certain run in the log file",
     )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
-    parser.add_argument("--lora-path", type=str, default="", help="String of LoRA path. Currently we only support benchmarking on a single LoRA adaptor.")
+    parser.add_argument(
+        "--lora-path",
+        type=str,
+        default="",
+        help="String of LoRA path. Currently we only support benchmarking on a single LoRA adaptor.",
+    )
     return parser.parse_args()
 
 
@@ -304,7 +309,12 @@ class WorkloadGenerator:
         )
 
         init_requests = [
-            (i, gen_payload(self.candidate_inputs[i], args.output_length, args.lora_path))
+            (
+                i,
+                gen_payload(
+                    self.candidate_inputs[i], args.output_length, args.lora_path
+                ),
+            )
             for i in range(args.num_clients)
         ]
         self.client_records = {
