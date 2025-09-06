@@ -10,6 +10,12 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import is_dp_max_padding
+
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
@@ -1033,6 +1039,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = topk_output
+            with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
+                symm_output = torch.empty_like(x)
             output = cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
@@ -1055,6 +1063,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes1,
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
+                output=symm_output,
             )
             # Scale by routed_scaling_factor is fused into select_experts.
             return output
@@ -1112,31 +1121,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             correction_bias = topk_config.correction_bias.to(x.dtype)
         else:
             correction_bias = None
-        return trtllm_fp8_block_scale_moe(
-            routing_logits=router_logits.to(torch.float32),
-            routing_bias=correction_bias,
-            hidden_states=a_q,
-            hidden_states_scale=a_sf_t,
-            gemm1_weights=layer.w13_weight,
-            gemm1_weights_scale=layer.w13_weight_scale_inv,
-            gemm2_weights=layer.w2_weight,
-            gemm2_weights_scale=layer.w2_weight_scale_inv,
-            num_experts=layer.num_experts,
-            top_k=topk_config.top_k,
-            n_group=topk_config.num_expert_group,
-            topk_group=topk_config.topk_group,
-            intermediate_size=layer.w2_weight.shape[2],
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            local_num_experts=layer.num_local_experts,
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            ),
-            tile_tokens_dim=get_tile_tokens_dim(
-                x.shape[0], topk_config.top_k, layer.num_experts
-            ),
-            routing_method_type=2,  # DeepSeek-styled routing method
-            use_shuffled_weight=False,
-        )
+        with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
+            return trtllm_fp8_block_scale_moe(
+                routing_logits=router_logits.to(torch.float32),
+                routing_bias=correction_bias,
+                hidden_states=a_q,
+                hidden_states_scale=a_sf_t,
+                gemm1_weights=layer.w13_weight,
+                gemm1_weights_scale=layer.w13_weight_scale_inv,
+                gemm2_weights=layer.w2_weight,
+                gemm2_weights_scale=layer.w2_weight_scale_inv,
+                num_experts=layer.num_experts,
+                top_k=topk_config.top_k,
+                n_group=topk_config.num_expert_group,
+                topk_group=topk_config.topk_group,
+                intermediate_size=layer.w2_weight.shape[2],
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=layer.num_local_experts,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
+                tile_tokens_dim=get_tile_tokens_dim(
+                    x.shape[0], topk_config.top_k, layer.num_experts
+                ),
+                routing_method_type=2,  # DeepSeek-styled routing method
+                use_shuffled_weight=False,
+            )
 
     def maybe_apply_hip_fused_experts(
         self,

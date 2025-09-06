@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.layers.dp_attention import is_dp_max_padding
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_runner_backend,
@@ -812,15 +813,12 @@ class FusedMoE(torch.nn.Module):
                 raise NotImplementedError()
 
         # Matrix multiply.
-        with use_symmetric_memory(get_tp_group()) as sm:
-
-            final_hidden_states = self.quant_method.apply(
-                layer=self,
-                x=hidden_states,
-                topk_output=topk_output,
-                moe_runner_config=self.moe_runner_config,
-            )
-            sm.tag(final_hidden_states)
+        final_hidden_states = self.quant_method.apply(
+            layer=self,
+            x=hidden_states,
+            topk_output=topk_output,
+            moe_runner_config=self.moe_runner_config,
+        )
 
         final_hidden_states = final_hidden_states[
             ..., :origin_hidden_states_dim
@@ -1018,6 +1016,8 @@ class FlashInferFP4MoE(FusedMoE):
 
         router_logits = router_logits.to(torch.float32)
 
+        with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
+            symm_output = torch.empty_like(hidden_states)
         result = trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=topk_config.correction_bias.to(hidden_states.dtype),
@@ -1052,6 +1052,7 @@ class FlashInferFP4MoE(FusedMoE):
             ),
             routing_method_type=RoutingMethodType.DeepSeekV3,
             do_finalize=True,
+            output=symm_output,
         )[0]
 
         return result
