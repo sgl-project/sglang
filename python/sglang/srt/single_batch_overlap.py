@@ -41,6 +41,7 @@ class CombineOverlapArgs:
     wait_event: torch.cuda.Event
     num_sms: int
     signal: Optional[torch.Tensor] = None
+    # TODO maybe antgroup can rename these args to be a bit more clear
     block_m: int = -1
     threshold: int = -1
 
@@ -116,27 +117,27 @@ def _compute_overlap_args(dispatch_output, alt_stream):
     down_gemm_overlap_args = None
 
     if SboFlags.enable_combine_down_gemm_two_stream_overlap():
-        block_m, block_n = 128, 128
+        down_gemm_block_m, down_gemm_block_n = 128, 128
         MIN_BLOCK_M = 64
 
         # TODO use zero_allocator
         combine_signal = torch.zeros(
-            # TODO should we use (num_local_experts, ceil_div(num_tokens_static, block_m))
+            # TODO should we use (num_local_experts, ceil_div(num_tokens_static, down_gemm_block_m))
             num_local_experts * ceil_div(num_tokens_static, MIN_BLOCK_M),
             dtype=torch.int32,
             device=hidden_states.device,
         )
         down_gemm_overlap_args = DownGemmOverlapArgs(
             # TODO after improving DeepEP's `combine_signal`, simplify this
-            signal=combine_signal[:num_local_experts * ceil_div(num_tokens_static, block_m)].view(
-                num_local_experts, ceil_div(num_tokens_static, block_m)),
+            signal=combine_signal[:num_local_experts * ceil_div(num_tokens_static, down_gemm_block_m)].view(
+                num_local_experts, ceil_div(num_tokens_static, down_gemm_block_m)),
             start_event=combine_wait_event,
             num_sms=compute_num_sms,
         )
         combine_overlap_args.overlap = True
         combine_overlap_args.signal = combine_signal
-        combine_overlap_args.block_m = block_m
-        combine_overlap_args.threshold = ceil_div(hidden_dim, block_n)
+        combine_overlap_args.block_m = down_gemm_block_m
+        combine_overlap_args.threshold = ceil_div(hidden_dim, down_gemm_block_n)
     else:
         meta_overlap_args |= dict(
             record_event_after_down=combine_wait_event,
