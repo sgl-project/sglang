@@ -621,7 +621,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         ctx = nullcontext()
         if overlap_args is not None:
-            # TODO refactor and improve the whole logic, e.g. move to save level
             overlap_args.stream.wait_event(overlap_args.wait_event)
             ctx = torch.cuda.stream(overlap_args.stream)
 
