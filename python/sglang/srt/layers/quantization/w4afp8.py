@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.nn import Module
@@ -21,7 +21,8 @@ from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
-    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, FusedMoE
+    from sglang.srt.layers.moe.token_dispatcher import DeepEPNormalOutput
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -284,7 +285,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: EPMoE,
+        layer: FusedMoE,
         x: torch.Tensor,
         topk_output: StandardTopKOutput,
         moe_runner_config: MoeRunnerConfig,
@@ -331,3 +332,44 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_config.routed_scaling_factor is not None:
             output *= moe_runner_config.routed_scaling_factor
         return output
+
+    def apply_deepep_normal(
+        self,
+        layer: DeepEPMoE,
+        dispatch_output: DeepEPNormalOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+            cutlass_w4a8_moe_deepep_normal,
+        )
+
+        hidden_states, topk_idx, topk_weights = (
+            dispatch_output.hidden_states,
+            dispatch_output.topk_idx,
+            dispatch_output.topk_weights,
+        )
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > 0:
+            return cutlass_w4a8_moe_deepep_normal(
+                hidden_states,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                topk_weights,
+                topk_idx,
+                self.a_strides1,
+                self.b_strides1,
+                self.c_strides1,
+                self.a_strides2,
+                self.b_strides2,
+                self.c_strides2,
+                self.s_strides13,
+                self.s_strides2,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
+            )
+        else:
+            return hidden_states
