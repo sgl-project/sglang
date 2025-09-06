@@ -34,6 +34,9 @@ from transformers import AutoTokenizer
 ###############################################################################
 # CONFIG
 ###############################################################################
+# Garbage Collection Control
+FREEZE_GC = True  # Enable/disable garbage collection freezing
+
 # Server Configuration
 SERVER_TYPE = "HTTP"  # Fixed to HTTP for open source
 
@@ -48,7 +51,7 @@ SCORE_MODEL_PATH = "Qwen/Qwen3-0.6B"
 SCORE_LABEL_TOKEN_IDS = [9454, 2753]  # Yes/No token IDs
 
 # Array of RPS values to test
-RPS_VALUES = [70]
+RPS_VALUES = [170]
 # Array of duration values to test
 DURATION_SECS_VALUES = [60]  # Duration values in seconds
 # Array of item count values to test
@@ -60,7 +63,7 @@ DISTRIBUTION = "POISSON"  # Options: "CONSTANT", "POISSON"
 # Profiling Configuration
 PROFILE = False  # Enable profiling with START_PROFILE/STOP_PROFILE prompts
 # Directory for profiler output
-SGLANG_TORCH_PROFILER_DIR = "/shared/user/sglang-oss-trace/remove-decode"
+SGLANG_TORCH_PROFILER_DIR = "/path/to/save/trace"
 if PROFILE:
     os.environ["SGLANG_TORCH_PROFILER_DIR"] = SGLANG_TORCH_PROFILER_DIR
 
@@ -228,6 +231,26 @@ async def send_profile_request(profile_text, item_count, session=None):
 
 
 ###############################################################################
+# GC FREEZE
+###############################################################################
+async def call_freeze_gc_http(session):
+    """Call the /freeze_gc HTTP endpoint."""
+    try:
+        freeze_gc_url = HTTP_URL.replace("/v1/score", "/freeze_gc")
+        print(f"Calling freeze_gc endpoint: {freeze_gc_url}")
+
+        async with session.post(freeze_gc_url) as resp:
+            if resp.status == 200:
+                print("freeze_gc called successfully")
+            else:
+                resp_text = await resp.text()
+                print(f"freeze_gc failed with status {resp.status}: {resp_text}")
+
+    except Exception as e:
+        print(f"Failed to call freeze_gc: {e}")
+
+
+###############################################################################
 # HTTP CALLS
 ###############################################################################
 def build_http_request_json(score_data):
@@ -246,6 +269,69 @@ def build_http_request_json(score_data):
     """
     # score_data is already in the correct format from build_request
     return json.dumps(score_data)
+
+
+###############################################################################
+# WARMUP
+###############################################################################
+async def send_warmup_requests_http(session, num_warmup=3):
+    """Send warmup requests to HTTP server."""
+    print(f"Sending {num_warmup} HTTP warmup requests...")
+
+    for i in range(num_warmup):
+        try:
+            # Create a simple warmup request
+            warmup_query = SPECIAL_REPLICATED_TOKEN * SCORE_QUERY_TOKENS
+            warmup_items = [
+                SPECIAL_REPLICATED_TOKEN * SCORE_ITEM_TOKENS for _ in range(3)
+            ]
+
+            warmup_data = {
+                "query": warmup_query,
+                "items": warmup_items,
+                "label_token_ids": SCORE_LABEL_TOKEN_IDS,
+                "model": SCORE_MODEL_PATH,
+                # Add missing parameters for consistency with local-benchmark.py
+                "apply_softmax": True,
+                "item_first": False,
+            }
+
+            request_json = build_http_request_json(warmup_data)
+            headers = {"Content-Type": "application/json"}
+
+            async with session.post(
+                HTTP_URL, data=request_json, headers=headers
+            ) as resp:
+                if resp.status == 200:
+                    print(f"Warmup request {i+1}/{num_warmup} completed successfully")
+                else:
+                    print(
+                        f"Warmup request {i+1}/{num_warmup} failed with status {resp.status}"
+                    )
+
+        except Exception as e:
+            print(f"Warmup request {i+1}/{num_warmup} failed with error: {e}")
+
+    print("HTTP warmup requests completed")
+
+
+async def perform_global_warmup_and_freeze():
+    """Perform warmup and optionally GC freeze operations once before all benchmark runs."""
+    print("=" * 80)
+    print(f"PERFORMING GLOBAL WARMUP{' AND GC FREEZE' if FREEZE_GC else ''}")
+    print("=" * 80)
+
+    print(f"Performing HTTP warmup{' and GC freeze' if FREEZE_GC else ''}...")
+    async with aiohttp.ClientSession() as session:
+        await send_warmup_requests_http(session)
+        if FREEZE_GC:
+            await call_freeze_gc_http(session)
+        print(
+            f"HTTP warmup{' and GC freeze' if FREEZE_GC else ''} completed successfully."
+        )
+
+    print(f"Global warmup{' and GC freeze' if FREEZE_GC else ''} operations completed.")
+    print("=" * 80)
 
 
 async def make_http_call(session, score_data, request_id, results_queue):
@@ -442,12 +528,26 @@ async def run_benchmark(rps, duration_secs, item_count):
     tasks = []
 
     # Track timing for sending requests
-    send_start_time = asyncio.get_event_loop().time()
+    loop = asyncio.get_event_loop()
+    send_start_time = loop.time()
+
+    # Pre-generate absolute scheduled send times to avoid cumulative drift
+    if DISTRIBUTION == "CONSTANT":
+        scheduled_times = [send_start_time + (i / rps) for i in range(num_requests)]
+    elif DISTRIBUTION == "POISSON":
+        scheduled_times = []
+        current_time = send_start_time
+        for _ in range(num_requests):
+            current_time += random.expovariate(rps)
+            scheduled_times.append(current_time)
+    else:
+        raise ValueError(
+            f"Unknown distribution: {DISTRIBUTION}. Use 'CONSTANT' or 'POISSON'."
+        )
 
     # HTTP implementation (open source only supports HTTP with /v1/score API)
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=300)
-    ) as session:
+    # Remove timeout to match local-benchmark.py behavior
+    async with aiohttp.ClientSession() as session:
 
         # Send START_PROFILE if profiling is enabled
         if PROFILE:
@@ -460,6 +560,11 @@ async def run_benchmark(rps, duration_secs, item_count):
             unit="req",
         ) as pbar:
             for i, score_data in enumerate(all_requests):
+                now = loop.time()
+                delay = scheduled_times[i] - now
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
                 request_id = i + 1
                 tasks.append(
                     asyncio.create_task(
@@ -469,22 +574,6 @@ async def run_benchmark(rps, duration_secs, item_count):
 
                 # Update progress bar
                 pbar.update(1)
-
-                # Throttle based on distribution
-                if i < len(all_requests) - 1:
-                    if DISTRIBUTION == "CONSTANT":
-                        interval = 1 / rps
-                        await asyncio.sleep(interval)
-                    elif DISTRIBUTION == "POISSON":
-                        # For Poisson process, inter-arrival times follow
-                        # exponential distribution
-                        interval = random.expovariate(rps)
-                        await asyncio.sleep(interval)
-                    else:
-                        raise ValueError(
-                            f"Unknown distribution: {DISTRIBUTION}. "
-                            f"Use 'CONSTANT' or 'POISSON'."
-                        )
 
         send_end_time = asyncio.get_event_loop().time()
         send_duration = send_end_time - send_start_time
@@ -541,6 +630,9 @@ async def main():
     print(f"RPS values: {RPS_VALUES}")
     print(f"Item count values: {ITEM_COUNT_VALUES}")
     print("=" * 80)
+
+    # Perform global warmup and GC freeze operations once before all benchmark runs
+    await perform_global_warmup_and_freeze()
 
     all_results = []
 
