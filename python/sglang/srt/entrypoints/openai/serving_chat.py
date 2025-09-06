@@ -463,11 +463,16 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        
+        # Store the last content's meta_info for use after the loop
+        last_content_id = ""
 
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
+                # Store the content id for use after the loop
+                last_content_id = content["meta_info"]["id"]
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
@@ -586,9 +591,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_finish_reason = "tool_calls"
 
                 finish_reason_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"][
-                        "id"
-                    ],  # NOTE: openai uses the same chatcmpl-id for all indices
+                    id=last_content_id,  # NOTE: openai uses the same chatcmpl-id for all indices
                     created=int(time.time()),
                     choices=[
                         ChatCompletionResponseStreamChoice(
@@ -617,7 +620,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             else []
                         )
                         hidden_states_chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
+                            id=last_content_id,
                             created=int(time.time()),
                             choices=[
                                 ChatCompletionResponseStreamChoice(
@@ -642,7 +645,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
+                    id=last_content_id,
                     created=int(time.time()),
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
