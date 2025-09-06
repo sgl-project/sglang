@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union, Any, Dict
 
@@ -593,7 +594,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def combine_b(self, hidden_states, event, hook, overlap_args):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
-        # TODO refactor and improve the whole logic
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args["stream"])
 
@@ -607,35 +607,36 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         overlap_args: Optional[Dict[str, Any]],
     ):
         buffer = self._get_buffer()
+
+        ctx = nullcontext()
         if overlap_args is not None:
             # TODO refactor and improve the whole logic, e.g. move to save level
             overlap_args["stream"].wait_event(overlap_args["wait_event"])
-            with torch.cuda.stream(overlap_args["stream"]):
-                # TODO unify the two APIs
-                combined_hidden_states, event, hook = buffer.low_latency_combine(
-                    x=hidden_states,
-                    topk_idx=topk_idx,
-                    topk_weights=topk_weights,
-                    handle=self.handle,
-                    packed_recv_count=self.packed_recv_count,
-                    # TODO overlap_args may use stronger typing
-                    overlap=overlap_args["overlap"],
-                    comp_signal=overlap_args.get("signal"),
-                    block_m=overlap_args.get("block_m", -1),
-                    threshold=overlap_args.get("threshold", -1),
-                    num_sms=overlap_args["num_sms"],
-                    async_finish=not self.return_recv_hook,
-                    return_recv_hook=self.return_recv_hook,
-                )
-        else:
+            ctx = torch.cuda.stream(overlap_args["stream"])
+
+        with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                self.handle,
+                x=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                handle=self.handle,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
+                **(
+                    dict(
+                        packed_recv_count=self.packed_recv_count,
+                        # TODO overlap_args may use stronger typing
+                        overlap=overlap_args["overlap"],
+                        comp_signal=overlap_args.get("signal"),
+                        block_m=overlap_args.get("block_m", -1),
+                        threshold=overlap_args.get("threshold", -1),
+                        num_sms=overlap_args["num_sms"],
+                    )
+                    if overlap_args is not None
+                    else {}
+                ),
             )
+
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
 
