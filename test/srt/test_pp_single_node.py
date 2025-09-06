@@ -105,7 +105,7 @@ class TestDPAttentionDP2PP2(CustomTestCase):
                 "--tp",
                 "2",
                 "--pp-size",
-                2,
+                "2",
                 "--enable-dp-attention",
                 "--dp",
                 "2",
