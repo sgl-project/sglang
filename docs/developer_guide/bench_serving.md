@@ -317,3 +317,83 @@ python3 -m sglang.bench_serving \
 
 - The script raises the file descriptor soft limit (`RLIMIT_NOFILE`) to help with many concurrent connections.
 - For sglang, `/get_server_info` is queried post-run to report speculative decoding accept length when available.
+
+## Audio ASR benchmarking (chat/completions, streaming or non-streaming)
+
+SGLang bench-serving now supports audio transcription-style inputs via `--dataset-name asr`. Audio is provided to the OpenAI-compatible Chat Completions endpoint using `messages[].content[]` with `"type": "audio_url"` and a WAV data URL (`data:audio/wav;base64,...`). This aligns with the server-side audio loader [`load_audio()`](python/sglang/srt/utils.py:659).
+
+Key flags
+- `--dataset-name asr`: Enable the ASR dataset adapter
+- `--asr-dataset`: HF dataset repo name (default: `openslr/librispeech_asr`)
+- `--asr-subset`: Dataset subset/config (e.g., `clean`)
+- `--asr-split`: Split (default: `test`)
+- `--asr-target-sr`: Resample to this sampling rate (default: 16000)
+- `--asr-max-duration-s`: Skip samples longer than this many seconds (default: 30.0)
+- `--asr-output-len`: Max generated tokens per request (default: 128)
+
+Recommended backends
+- For SGLang: `--backend sglang-oai-chat`
+- For vLLM: `--backend vllm-chat`
+
+Examples
+
+1) SGLang server (audio-capable model, MiniCPM-o as an example)
+```bash
+# terminal 1: launch server
+python -m sglang.launch_server \
+  --model-path openbmb/MiniCPM-o-2_6 \
+  --port 30000 \
+  --trust-remote-code
+```
+
+```bash
+# terminal 2: bench-serving with ASR dataset
+export OPENAI_API_KEY=sk
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 --port 30000 \
+  --dataset-name asr \
+  --num-prompts 16 \
+  --asr-dataset openslr/librispeech_asr \
+  --asr-subset clean \
+  --asr-split test \
+  --asr-target-sr 16000 \
+  --asr-max-duration-s 30 \
+  --asr-output-len 128 \
+  --max-concurrency 4 \
+  --request-rate inf
+```
+
+2) Non-streaming mode (ITL not applicable)
+```bash
+export OPENAI_API_KEY=sk
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 --port 30000 \
+  --dataset-name asr \
+  --num-prompts 8 \
+  --asr-dataset openslr/librispeech_asr \
+  --asr-subset clean \
+  --asr-split test \
+  --disable-stream \
+  --max-concurrency 2
+```
+
+Payload shape (client-side)
+- Bench-serving builds messages as:
+```json
+[
+  {
+    "role": "user",
+    "content": [
+      { "type": "audio_url", "audio_url": { "url": "data:audio/wav;base64,..." } },
+      { "type": "text", "text": "Please transcribe the audio into text." }
+    ]
+  }
+]
+```
+
+Notes
+- Token accounting excludes the base64 blob; token counts measure only text tokens.
+- For streaming runs, TTFT and ITL are measured from streamed deltas as in the existing text and image flows.
+- For accuracy (WER and RTFx), use the dedicated script [`benchmark/asr/accuracy_asr.py`](benchmark/asr/accuracy_asr.py:1), which runs non-streaming requests and computes WER and RTFx across the dataset slice.
