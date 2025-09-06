@@ -77,7 +77,7 @@ def popen_launch_router(
         port,
         "--dp",
         str(dp_size),
-        "--router-eviction-interval",
+        "--router-eviction-interval-secs",
         "5",
         "--router-policy",
         policy,

@@ -32,7 +32,9 @@ from sglang.srt.managers.io_struct import (
     BatchStrOut,
     BatchTokenIDOut,
     FreezeGCReq,
+    MultiTokenizerRegisterReq,
 )
+from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerMixin
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -67,7 +69,7 @@ class DecodeStatus:
     sent_offset: int = 0
 
 
-class DetokenizerManager:
+class DetokenizerManager(MultiTokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -102,6 +104,7 @@ class DetokenizerManager:
                 (BatchEmbeddingOut, self.handle_batch_embedding_out),
                 (BatchTokenIDOut, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
+                (MultiTokenizerRegisterReq, lambda x: x),
                 (FreezeGCReq, self.handle_freeze_gc_req),
             ]
         )
@@ -285,8 +288,12 @@ def run_detokenizer_process(
 
     try:
         manager = DetokenizerManager(server_args, port_args)
-        manager.event_loop()
+        if server_args.tokenizer_worker_num > 1:
+            manager.multi_tokenizer_manager_event_loop()
+        else:
+            manager.event_loop()
     except Exception:
+        manager.clear_tokenizer_mapping()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
