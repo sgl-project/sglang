@@ -282,8 +282,6 @@ set(SOURCES
     "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
-    "csrc/moe/ep_moe_reorder_kernel.cu"
-    "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
 
     "csrc/memory/store.cu"
     "csrc/kvcacheio/transfer.cu"
