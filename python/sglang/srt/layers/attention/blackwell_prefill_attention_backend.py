@@ -52,9 +52,6 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         self.device = model_runner.device
         self.forward_metadata: Optional[ForwardMetaData] = None
 
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-        self._triton_backend = TritonAttnBackend(model_runner=model_runner, skip_prefill=False)
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         assert (
             forward_batch.forward_mode.is_extend()
@@ -84,14 +81,6 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         self.forward_metadata = ForwardMetaData(
             cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, page_table=page_table, seqlens_k=seqlens_k,
         )
-
-        print("=" * 120)
-        print(_red("forward_batch.encoder_lens:"), forward_batch.encoder_lens)
-        print(_red("page_table:"), page_table)
-        print(_red("max_seqlens_k:"), max_seqlen_k)
-        print(_red("cu_seqlens_k:"), cu_seqlens_k)
-
-        self._triton_backend.init_forward_metadata(forward_batch)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -129,16 +118,6 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         save_kv_cache: bool = True,
         sinks: Optional[torch.Tensor] = None,
     ):
-        save_kv_cache = True
-
-        torch.set_printoptions(precision=3, sci_mode=False, linewidth=160)
-        np.set_printoptions(suppress=True, precision=3, linewidth=120, formatter={"float": "{:>8.3f}".format})
-
-        # if layer.layer_id == 0:
-        #     print("=" * 120)
-        #     print(_yellow("k_cache:"), k_cache.abs().sum().item())
-        #     print(_yellow("v_cache:"), v_cache.abs().sum().item())
-
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer=layer,
@@ -152,16 +131,6 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
         v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
 
         metadata = self.forward_metadata
-        if layer.layer_id == 0:
-            print(_yellow(f"{layer.is_cross_attention=}"))
-            print(_yellow(f"{forward_batch.encoder_out_cache_loc=}"))
-            print(_yellow("k:"), "\n", k.shape, "\n", k.reshape(-1)[:-8], "\n", k.sum().item())
-            print(_yellow("v:"), "\n", v.shape, "\n", v.reshape(-1)[:-8], "\n", v.sum().item())
-            print(_yellow("cu_seqlens_q:"), metadata.cu_seqlens_q)
-            print(_yellow("out_cache_loc:"), forward_batch.out_cache_loc.reshape(-1))
-            print(_yellow("k_cache:"), "\n", k_cache.shape, "\n", k_cache.view(-1, layer.tp_k_head_num, layer.head_dim)[forward_batch.out_cache_loc].reshape(-1)[:8], "\n", torch.where(k_cache.reshape(-1) != 0.)[0], "\n", k_cache.sum().item())
-            print(_yellow("v_cache:"), "\n", v_cache.shape, "\n", v_cache.view(-1, layer.tp_v_head_num, layer.head_dim)[forward_batch.out_cache_loc].reshape(-1)[:8], "\n", torch.where(v_cache.reshape(-1) != 0.)[0], "\n", v_cache.sum().item())
-            print(_yellow("page_table:"), metadata.page_table)
 
         out = self.flash_attn_func(
             q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
@@ -176,44 +145,6 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
             causal=True,
             learnable_sink=sinks.to(torch.bfloat16) if sinks is not None else None,
         )[0]
-
-        ref = self._triton_backend.forward_extend(
-            q=q,
-            k=k,
-            v=v,
-            layer=layer,
-            forward_batch=forward_batch,
-            save_kv_cache=False,
-            sinks=sinks,
-        )
-
-        max_diff = (out.reshape(-1) - ref.reshape(-1)).float().abs().max().item()
-        print(_yellow(f"out: {layer.layer_id=}"), "\n", out.reshape(-1)[:8], "\n", out.reshape(-1)[-8:])
-        print(_green(f"ref: {layer.layer_id=}"), "\n", ref.reshape(-1)[:8], "\n", ref.reshape(-1)[-8:])
-        if max_diff > 0.75:
-            print(_yellow("sliding_window_size:"), "\n", f"{layer.sliding_window_size=}")
-            print(_red("big difference!!!"), f"{layer.layer_id=} {max_diff=:<.5f} SAVING TO DISK!!!", flush=True)
-
-            from pathlib import Path
-            out_path = Path("/sgl-workspace/debug_output")
-
-            torch.save(q, str((out_path / "q.pt").absolute()))
-            torch.save(k, str((out_path / "k.pt").absolute()))
-            torch.save(v, str((out_path / "v.pt").absolute()))
-            torch.save(k_cache, str((out_path / "k_cache.pt").absolute()))
-            torch.save(v_cache, str((out_path / "v_cache.pt").absolute()))
-            torch.save(metadata.cu_seqlens_q, str((out_path / "cu_seqlens_q.pt").absolute()))
-            torch.save(metadata.cu_seqlens_k, str((out_path / "cu_seqlens_k.pt").absolute()))
-            torch.save(metadata.page_table, str((out_path / "page_table.pt").absolute()))
-            torch.save(out, str((out_path / "out_backend.pt").absolute()))
-            torch.save(ref, str((out_path / "ref_backend.pt").absolute()))
-
-            torch.distributed.breakpoint()
-
-            print("DONE", flush=True)
-            assert False
-        else:
-            print(_green("okay"), f"{layer.layer_id=}", flush=True)
 
         return out.view(-1, layer.tp_q_head_num * layer.head_dim)
 
