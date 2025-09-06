@@ -118,12 +118,11 @@ def _compute_overlap_args(dispatch_output, alt_stream):
     down_gemm_overlap_args = None
 
     if SboFlags.enable_combine_down_gemm_two_stream_overlap():
+        MIN_BLOCK_M = 64
         # TODO use zero_allocator
         combine_signal = torch.zeros(
-            # TODO their deepep requires the size to be this large, temp use theirs to avoid changing their code
-            #      but should optimize later
-            #      this may be better: (num_local_experts, ceil_div(num_tokens_static, block_m)),
-            num_local_experts * ceil_div(num_tokens_static, 64),
+            # TODO should we use (num_local_experts, ceil_div(num_tokens_static, block_m))
+            num_local_experts * ceil_div(num_tokens_static, MIN_BLOCK_M),
             dtype=torch.int32,
             device=hidden_states.device,
         )
