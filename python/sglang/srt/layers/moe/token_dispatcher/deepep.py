@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled,get_moe_runner_backend
+from sglang.srt.layers.moe import (
+    DeepEPMode,
+    get_deepep_config,
+    get_moe_runner_backend,
+    is_tbo_enabled,
+)
 from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     BaseDispatcher,
     BaseDispatcherConfig,
