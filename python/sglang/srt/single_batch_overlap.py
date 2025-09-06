@@ -57,7 +57,7 @@ def execute_sbo(
     )
 
     combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
-        experts._compute_overlap_args(dispatch_output, alt_stream)
+        _compute_overlap_args(dispatch_output, alt_stream)
     )
 
     hidden_states = experts.moe_impl(dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args)
