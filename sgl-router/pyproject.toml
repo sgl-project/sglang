@@ -21,6 +21,7 @@ dev = [
     "requests>=2.25.0",
 ]
 
+
 # https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
 [tool.setuptools.packages]
 find = { where = ["py_src"] }
