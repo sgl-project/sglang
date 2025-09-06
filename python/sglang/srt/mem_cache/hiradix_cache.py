@@ -134,23 +134,23 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
-def clear_storage_backend(self) -> bool:
-    if self.enable_storage:
-        try:
-            # Check if the storage backend has a clear method (for nixl backends)
-            if hasattr(self.cache_controller.storage_backend, 'clear'):
-                self.cache_controller.storage_backend.clear()
-                logger.info("Hierarchical cache storage backend cleared successfully!")
-                return True
-            else:
-                logger.warning(f"Storage backend {type(self.cache_controller.storage_backend).__name__} does not support clear operation.")
+    def clear_storage_backend(self) -> bool:
+        if self.enable_storage:
+            try:
+                # Check if the storage backend has a clear method (for nixl backends)
+                if hasattr(self.cache_controller.storage_backend, 'clear'):
+                    self.cache_controller.storage_backend.clear()
+                    logger.info("Hierarchical cache storage backend cleared successfully!")
+                    return True
+                else:
+                    logger.warning(f"Storage backend {type(self.cache_controller.storage_backend).__name__} does not support clear operation.")
+                    return False
+            except Exception as e:
+                logger.error(f"Failed to clear hierarchical cache storage backend: {e}")
                 return False
-        except Exception as e:
-            logger.error(f"Failed to clear hierarchical cache storage backend: {e}")
+        else:
+            logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
-    else:
-        logger.warning("Hierarchical cache storage backend is not enabled.")
-        return False
 
     def write_backup(self, node: TreeNode, write_back=False):
         host_indices = self.cache_controller.write(
