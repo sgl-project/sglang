@@ -378,6 +378,9 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # Multimodal settings
+    max_num_images: Optional[int] = None
+
     # Deprecated arguments
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
@@ -2113,6 +2116,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.sm_group_num,
             help="Number of sm partition groups.",
+        )
+
+        parser.add_argument(
+            "--weight-loader-disable-mmap",
+            action="store_true",
+            help="Disable mmap while loading weight using safetensors.",
+        )
+        parser.add_argument(
+            "--max-num-images",
+            type=int,
+            default=None,
+            help="The maximum number of images allowed in a single multimodal request to prevent OOM errors.",
         )
 
         # Deprecated arguments
