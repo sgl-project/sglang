@@ -875,6 +875,61 @@ class UpdateWeightsFromDistributedReqOutput:
     message: str
 
 
+DISAGGREGATION_PREFILL_ENVS = [
+    "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE",
+    "SGLANG_DISAGGREGATION_QUEUE_SIZE",
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT",
+    "SGLANG_MOONCAKE_CUSTOM_MEM_POOL",
+]
+DISAGGREGATION_DECODE_ENVS = [
+    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT",
+    "SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURES",
+    "SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL",
+]
+
+
+@dataclass
+class ConvertDisaggregationRoleReqInput:
+    # the server url to convert
+    server_url: str
+    failed_bootstrap_addr: Optional[str] = None
+    # convert decode to prefill
+    bootstrap_port: Optional[int] = None
+    disaggregation_decode_tp: Optional[int] = None
+    disaggregation_decode_dp: Optional[int] = None
+    disaggregation_prefill_pp: Optional[int] = 1
+    disable_radix_cache: bool = True  # default open radix cache in prefill
+    enable_hierarchical_cache: bool = False
+    hicache_ratio: float = 2.0
+    hicache_size: int = 0
+    hicache_write_policy: str = "write_through_selective"
+    hicache_io_backend: str = ""
+    hicache_mem_layout: str = "layer_first"
+    hicache_storage_backend: Optional[str] = None
+    hicache_storage_prefetch_policy: str = "best_effort"
+    # convert prefill to decode
+    cuda_graph_max_bs: Optional[int] = None
+    cuda_graph_bs: Optional[List[int]] = None
+    disable_cuda_graph: bool = True  # default open cuda graph in decode
+    disable_cuda_graph_padding: bool = False
+    enable_profile_cuda_graph: bool = False
+    # disaggregation envs
+    disaggregation_decode_envs: Optional[Dict[str, Any]] = field(
+        default_factory=lambda: {k: None for k in DISAGGREGATION_DECODE_ENVS}
+    )
+    disaggregation_prefill_envs: Optional[Dict[str, Any]] = field(
+        default_factory=lambda: {k: None for k in DISAGGREGATION_PREFILL_ENVS}
+    )
+
+
+@dataclass
+class ConvertDisaggregationRoleReqOutput:
+    """Converse PD disaggregation identity"""
+
+    success: bool
+    message: str
+
+
 @dataclass
 class UpdateWeightsFromTensorReqInput:
     """Update model weights from tensor input.
