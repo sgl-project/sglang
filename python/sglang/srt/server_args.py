@@ -696,7 +696,7 @@ class ServerArgs:
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3"):
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.max_running_requests is None:
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
@@ -742,6 +742,11 @@ class ServerArgs:
                     raise ValueError(
                         "trtllm_mha backend only supports topk = 1 for speculative decoding."
                     )
+            # TODO(Qiaolin-Yu): Support topk > 1 for standalone speculative decoding.
+            if self.speculative_algorithm == "STANDALONE":
+                assert (
+                    self.speculative_eagle_topk == 1
+                ), "For standalone speculative decoding, topk must be 1"
 
             if (
                 self.speculative_eagle_topk == 1
@@ -1491,7 +1496,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -2621,7 +2626,9 @@ def auto_choose_speculative_params(self: ServerArgs):
     """
     hf_config = self.get_hf_config()
     arch = hf_config.architectures[0]
-
+    if self.speculative_algorithm == "STANDALONE":
+        # The default value for standalone speculative decoding
+        return (3, 1, 4)
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
