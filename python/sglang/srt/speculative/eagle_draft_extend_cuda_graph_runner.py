@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
+from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -139,7 +140,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 vocab_size = self.model_runner.model_config.vocab_size
 
             self.next_token_logits_buffer = torch.zeros(
-                (self.max_bs, vocab_size),
+                (self.max_bs, pad_vocab_size(vocab_size)),
                 dtype=torch.float,
             )
 
