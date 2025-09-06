@@ -625,6 +625,7 @@ class Scheduler(
                     hicache_mem_layout=server_args.hicache_mem_layout,
                     enable_metrics=self.enable_metrics,
                     hicache_storage_backend=server_args.hicache_storage_backend,
+                    hicache_storage_backend_tag=server_args.hicache_storage_backend_tag,
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                     model_name=server_args.served_model_name,
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,

@@ -231,6 +231,14 @@ class PrefetchOperation(StorageOperation):
 
 class HiCacheController:
 
+    @staticmethod
+    def get_hash_str_with_prefix(get_hash_str, prefix):
+        def prefix_hash(input_str, prior_hash: str = None):
+            hash_result = get_hash_str(input_str)
+            return prefix + hash_result
+
+        return prefix_hash
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -241,6 +249,7 @@ class HiCacheController:
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
+        storage_backend_tag: Optional[str] = None,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
@@ -252,15 +261,24 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
-
+        self.enable_storage_tag = (
+            storage_backend_tag is not None and storage_backend_tag != ""
+        )
+        # todo: move backend initialization to storage backend module
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
             from sglang.srt.mem_cache.hicache_storage import get_hash_str
 
-            self.get_hash_str = get_hash_str
             self.storage_config = self._generate_storage_config(
-                model_name, storage_backend_extra_config
+                model_name, storage_backend_tag, storage_backend_extra_config
             )
+            if self.enable_storage_tag:
+                prefix = f"{self.storage_config.storage_backend_tag}_"
+                self.get_hash_str = HiCacheController.get_hash_str_with_prefix(
+                    get_hash_str, prefix
+                )
+            else:
+                self.get_hash_str = get_hash_str
             # for MLA models, only one rank needs to backup the KV cache
             self.backup_skip = (
                 self.storage_config.is_mla_model
@@ -397,6 +415,7 @@ class HiCacheController:
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
+        storage_backend_tag: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
     ):
 
@@ -428,6 +447,7 @@ class HiCacheController:
             is_mla_model=is_mla_backend,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
+            storage_backend_tag=storage_backend_tag,
             extra_config=extra_config,
         )
 
