@@ -77,24 +77,8 @@ class DeepEPLLOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_LL
 
 
-class AscendDeepEPLLOutput(NamedTuple):
-    """AscendDeepEP low latency dispatch output."""
-
-    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
-    topk_idx: torch.Tensor
-    topk_weights: torch.Tensor
-    masked_m: torch.Tensor
-    seg_indptr: torch.Tensor
-    expected_m: int
-
-    @property
-    def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.ASCENT_LL
-
-
 assert isinstance(DeepEPNormalOutput, DispatchOutput)
 assert isinstance(DeepEPLLOutput, DispatchOutput)
-assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
@@ -434,12 +418,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-
         from sglang.srt.layers.moe.ep_moe.kernels import (
             deepep_post_reorder_triton_kernel,
         )
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
@@ -553,23 +536,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             masked_m
         )
 
-        if _is_npu:
-            deepep_output = AscendDeepEPLLOutput(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                masked_m,
-                self.handle[1],
-                expected_m,
-            )
-        else:
-            deepep_output = DeepEPLLOutput(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                masked_m,
-                expected_m,
-            )
+        deepep_output = DeepEPLLOutput(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            masked_m,
+            expected_m,
+        )
         return deepep_output
 
     def _dispatch_core(
