@@ -265,7 +265,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.fullatt_block_indexes = vision_config.fullatt_block_indexes
         self.window_size = vision_config.window_size
         self.patch_size = vision_config.patch_size
-        mlp_hidden_size: int = vision_config.intermediate_size
+        mlp_hidden_size: int = ((vision_config.intermediate_size + 7) // 8) * 8
         self.patch_embed = Qwen2_5_VisionPatchEmbed(
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,
