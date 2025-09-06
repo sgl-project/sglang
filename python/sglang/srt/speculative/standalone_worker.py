@@ -130,11 +130,6 @@ class StandaloneWorker(TpModelWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
 
-        if self.hot_token_id is not None:
-            head = head.clone()
-            self.hot_token_id = self.hot_token_id.to(head.device)
-            head.data = head.data[self.hot_token_id]
-
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
@@ -285,7 +280,7 @@ class StandaloneWorker(TpModelWorker):
             self.has_prefill_wrapper_verify = True
         else:
             raise ValueError(
-                f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
+                f"Standalone is not supported in attention backend {self.server_args.attention_backend}"
             )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
