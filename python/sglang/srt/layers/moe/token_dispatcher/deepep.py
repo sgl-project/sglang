@@ -599,20 +599,30 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         return hidden_states
 
+    @dataclass
+    class DeepEPLLCombineOverlapArgs:
+        overlap: bool
+        stream: torch.cuda.Stream
+        wait_event: torch.cuda.Event
+        num_sms: int
+        signal: Optional[torch.Tensor] = None
+        block_m: int = -1
+        threshold: int = -1
+
     def _combine_core(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[Dict[str, Any]],
+        overlap_args: Optional[DeepEPLLCombineOverlapArgs],
     ):
         buffer = self._get_buffer()
 
         ctx = nullcontext()
         if overlap_args is not None:
             # TODO refactor and improve the whole logic, e.g. move to save level
-            overlap_args["stream"].wait_event(overlap_args["wait_event"])
-            ctx = torch.cuda.stream(overlap_args["stream"])
+            overlap_args.stream.wait_event(overlap_args.wait_event)
+            ctx = torch.cuda.stream(overlap_args.stream)
 
         with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
@@ -625,12 +635,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 **(
                     dict(
                         packed_recv_count=self.packed_recv_count,
-                        # TODO overlap_args may use stronger typing
-                        overlap=overlap_args["overlap"],
-                        comp_signal=overlap_args.get("signal"),
-                        block_m=overlap_args.get("block_m", -1),
-                        threshold=overlap_args.get("threshold", -1),
-                        num_sms=overlap_args["num_sms"],
+                        overlap=overlap_args.overlap,
+                        comp_signal=overlap_args.signal,
+                        block_m=overlap_args.block_m,
+                        threshold=overlap_args.threshold,
+                        num_sms=overlap_args.num_sms,
                     )
                     if overlap_args is not None
                     else {}
