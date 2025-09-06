@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
@@ -12,10 +13,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.utils import logger
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 
 class MoeA2ABackend(Enum):
@@ -131,7 +133,7 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
     global MOE_A2A_BACKEND
     if MOE_A2A_BACKEND is None:
         logger.warning("MOE_A2A_BACKEND is not initialized, using default backend")
-        MOE_A2A_BACKEND = MoeA2ABackend(None)
+        MOE_A2A_BACKEND = MoeA2ABackend.NONE
     return MOE_A2A_BACKEND
 
 
@@ -139,7 +141,7 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
     global MOE_RUNNER_BACKEND
     if MOE_RUNNER_BACKEND is None:
         logger.warning("MOE_RUNNER_BACKEND is not initialized, using triton backend")
-        MOE_RUNNER_BACKEND = MoeRunnerBackend("triton")
+        MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND
 
 
@@ -147,7 +149,7 @@ def get_deepep_mode() -> DeepEPMode:
     global DEEPEP_MODE
     if DEEPEP_MODE is None:
         logger.warning("DEEPEP_MODE is not initialized, using auto mode")
-        DEEPEP_MODE = DeepEPMode("auto")
+        DEEPEP_MODE = DeepEPMode.AUTO
     return DEEPEP_MODE
 
 
