@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
-from sglang.srt.layers.moe.token_dispatcher.deepep import ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP
+from sglang.srt.single_batch_overlap import SboFlags
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -640,7 +640,7 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            if not ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP:
+            if not SboFlags.enable_deepep_combine_shared_overlap():
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
@@ -657,7 +657,7 @@ class DeepseekV2MoE(nn.Module):
 
         # TODO shared can be overlapped in dispatch/combine/dispatch-and-combine
         hook_overlap_on_combine = None
-        if ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP:
+        if SboFlags.enable_deepep_combine_shared_overlap():
             def hook_overlap_on_combine():
                 nonlocal shared_output
                 # TODO maybe put the `if shape>0` into `_forward_shared_experts`
