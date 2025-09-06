@@ -1097,7 +1097,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                and not self.disable_chunked_prefix_cache
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
