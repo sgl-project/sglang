@@ -542,9 +542,9 @@ class ChatCompletionRequest(BaseModel):
     rid: Optional[Union[List[str], str]] = None
 
     # For PD disaggregation
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
 
 
 class ChatMessage(BaseModel):

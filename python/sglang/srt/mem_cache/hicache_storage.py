@@ -103,20 +103,6 @@ class HiCacheStorage(ABC):
         """
         pass
 
-    @abstractmethod
-    def delete(self, key: str) -> bool:
-        """
-        Delete the entry associated with the given key.
-        """
-        pass
-
-    @abstractmethod
-    def clear(self) -> bool:
-        """
-        Clear all entries in the storage.
-        """
-        pass
-
     def batch_exists(self, keys: List[str]) -> int:
         """
         Check if the keys exist in the storage.
@@ -128,6 +114,9 @@ class HiCacheStorage(ABC):
                 return i
         return len(keys)
 
+    def get_stats(self):
+        return None
+
 
 class HiCacheFile(HiCacheStorage):
 
@@ -136,13 +125,18 @@ class HiCacheFile(HiCacheStorage):
     ):
         self.file_path = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", file_path)
 
-        tp_rank, tp_size, model_name = (
+        tp_rank, tp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
             storage_config.tp_size,
             storage_config.model_name,
+            storage_config.is_mla_model,
         )
         model_name = "-".join(model_name.split("/")) if model_name else ""
-        self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+        if is_mla_model:
+            self.config_suffix = f"_{model_name}"
+        else:
+            self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
@@ -218,15 +212,6 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
-
-    def delete(self, key: str) -> None:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        try:
-            os.remove(tensor_path)
-        except FileNotFoundError:
-            logger.warning(f"Key {key} does not exist. Cannot delete.")
-            return
 
     def clear(self) -> bool:
         try:
