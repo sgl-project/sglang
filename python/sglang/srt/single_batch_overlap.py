@@ -20,10 +20,6 @@ class SboFlags:
     def enable_combine_shared_overlap(cls):
         return TODO
 
-    @classmethod
-    def enable_combine_overlap(cls):
-        return cls.enable_combine_down_gemm_overlap() or cls.enable_combine_shared_overlap()
-
 
 @dataclass
 class CombineOverlapArgs:
@@ -80,7 +76,7 @@ def execute_sbo(
     return hidden_states
 
 def _compute_overlap_args(dispatch_output, alt_stream):
-    if not SboFlags.enable_combine_overlap():
+    if not (SboFlags.enable_combine_down_gemm_overlap() or SboFlags.enable_combine_shared_overlap()):
         return None, None, {}
 
     hidden_states = dispatch_output.hidden_states_fp8
