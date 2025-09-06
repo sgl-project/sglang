@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -402,9 +403,11 @@ class HiCacheController:
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
             self.tp_size = get_attention_tp_size()
+            self.dp_rank = get_attention_dp_rank()
         else:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
+            self.dp_rank = 0
 
         # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
@@ -885,7 +888,7 @@ class HiCacheController:
 
                 if not self.backup_skip:
                     self._page_backup(operation)
-                self.ack_backup_queue.put(operation.id)
+                self.ack_backup_queue.put(operation)
 
             except Empty:
                 continue
