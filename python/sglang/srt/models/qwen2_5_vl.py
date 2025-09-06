@@ -41,6 +41,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -218,7 +219,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.0", prefix),
                 ),
-                nn.GELU(),
+                get_act_fn("gelu"),
                 RowParallelLinear(
                     self.hidden_size,
                     dim,
