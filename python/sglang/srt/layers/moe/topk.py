@@ -357,17 +357,28 @@ def fused_topk_torch_native(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    correction_bias: torch.Tensor = None,
 ):
-    assert (
-        hidden_states.shape[0] == gating_output.shape[0]
-    ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
-    M, _ = hidden_states.shape
-    topk_weights = torch.empty(
-        M, topk, dtype=torch.float32, device=hidden_states.device
-    )
-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    topk_weights = F.softmax(gating_output.float(), dim=-1)
-    topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+    if correction_bias is not None:
+        n_routed_experts = gating_output.shape[-1]
+        scores = gating_output.softmax(dim=-1)
+        scores_for_choice = scores.view(
+            -1, n_routed_experts
+        ) + correction_bias.unsqueeze(0)
+        topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
+        topk_weights = scores.gather(1, topk_ids)
+    else:
+        assert (
+            hidden_states.shape[0] == gating_output.shape[0]
+        ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+        M, _ = hidden_states.shape
+        topk_weights = torch.empty(
+            M, topk, dtype=torch.float32, device=hidden_states.device
+        )
+        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+        topk_weights = F.softmax(gating_output.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     return topk_weights, topk_ids
@@ -380,6 +391,7 @@ def fused_topk_cpu(
     renormalize: bool,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    correction_bias: torch.Tensor = None,
 ):
     topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
         hidden_states=hidden_states,
@@ -825,6 +837,7 @@ def select_experts(
             gating_output=router_logits,
             topk=top_k,
             renormalize=renormalize,
+            correction_bias=correction_bias,
         )
     elif custom_routing_function is None:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"

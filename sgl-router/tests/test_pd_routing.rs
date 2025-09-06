@@ -2,7 +2,7 @@
 mod test_pd_routing {
     use serde_json::json;
     use sglang_router_rs::config::{
-        CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
     };
     use sglang_router_rs::core::{WorkerFactory, WorkerType};
     use sglang_router_rs::routers::http::pd_types::get_hostname;
@@ -188,11 +188,15 @@ mod test_pd_routing {
                 health_check: sglang_router_rs::config::HealthCheckConfig::default(),
                 enable_igw: false,
                 rate_limit_tokens_per_second: None,
+                connection_mode: ConnectionMode::Http,
+                model_path: None,
+                tokenizer_path: None,
             };
 
             // Router creation will fail due to health checks, but config should be valid
             let app_context =
-                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64, None);
+                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64, None)
+                    .expect("Failed to create AppContext");
             let app_context = std::sync::Arc::new(app_context);
             let result = RouterFactory::create_router(&app_context).await;
             assert!(result.is_err());

@@ -20,7 +20,14 @@ impl SglangSchedulerClient {
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error>> {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
-        let channel = Channel::from_shared(endpoint.to_string())?
+        // Convert grpc:// to http:// for tonic
+        let http_endpoint = if endpoint.starts_with("grpc://") {
+            endpoint.replace("grpc://", "http://")
+        } else {
+            endpoint.to_string()
+        };
+
+        let channel = Channel::from_shared(http_endpoint)?
             .timeout(Duration::from_secs(30))
             .connect()
             .await?;
@@ -59,11 +66,13 @@ impl SglangSchedulerClient {
     pub async fn health_check(
         &mut self,
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error>> {
+        debug!("Sending health check request");
         let request = Request::new(proto::HealthCheckRequest {
             include_detailed_metrics: false,
         });
 
         let response = self.client.health_check(request).await?;
+        debug!("Health check response received");
         Ok(response.into_inner())
     }
 

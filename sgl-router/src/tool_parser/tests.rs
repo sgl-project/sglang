@@ -74,7 +74,7 @@ fn test_parser_registry() {
 
 #[test]
 fn test_parser_registry_pattern_matching() {
-    let mut registry = ParserRegistry::new();
+    let mut registry = ParserRegistry::new_for_testing();
 
     // Test that model mappings work by checking the list
     registry.map_model("test-model", "json");

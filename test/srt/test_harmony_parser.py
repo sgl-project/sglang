@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.harmony_parser import (
+from sglang.srt.parser.harmony_parser import (
     CanonicalStrategy,
     Event,
     HarmonyParser,

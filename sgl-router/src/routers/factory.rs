@@ -4,7 +4,7 @@ use super::{
     http::{pd_router::PDRouter, router::Router},
     RouterTrait,
 };
-use crate::config::{PolicyConfig, RoutingMode};
+use crate::config::{ConnectionMode, PolicyConfig, RoutingMode};
 use crate::policies::PolicyFactory;
 use crate::server::AppContext;
 use std::sync::Arc;
@@ -20,28 +20,56 @@ impl RouterFactory {
             return Self::create_igw_router(ctx).await;
         }
 
-        // TODO: Add gRPC mode check here when implementing gRPC support
-
-        // Default to HTTP proxy mode
-        match &ctx.router_config.mode {
-            RoutingMode::Regular { worker_urls } => {
-                Self::create_regular_router(worker_urls, &ctx.router_config.policy, ctx).await
+        // Check connection mode and route to appropriate implementation
+        match ctx.router_config.connection_mode {
+            ConnectionMode::Grpc => {
+                // Route to gRPC implementation based on routing mode
+                match &ctx.router_config.mode {
+                    RoutingMode::Regular { worker_urls } => {
+                        Self::create_grpc_router(worker_urls, &ctx.router_config.policy, ctx).await
+                    }
+                    RoutingMode::PrefillDecode {
+                        prefill_urls,
+                        decode_urls,
+                        prefill_policy,
+                        decode_policy,
+                    } => {
+                        Self::create_grpc_pd_router(
+                            prefill_urls,
+                            decode_urls,
+                            prefill_policy.as_ref(),
+                            decode_policy.as_ref(),
+                            &ctx.router_config.policy,
+                            ctx,
+                        )
+                        .await
+                    }
+                }
             }
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy,
-                decode_policy,
-            } => {
-                Self::create_pd_router(
-                    prefill_urls,
-                    decode_urls,
-                    prefill_policy.as_ref(),
-                    decode_policy.as_ref(),
-                    &ctx.router_config.policy,
-                    ctx,
-                )
-                .await
+            ConnectionMode::Http => {
+                // Route to HTTP implementation based on routing mode
+                match &ctx.router_config.mode {
+                    RoutingMode::Regular { worker_urls } => {
+                        Self::create_regular_router(worker_urls, &ctx.router_config.policy, ctx)
+                            .await
+                    }
+                    RoutingMode::PrefillDecode {
+                        prefill_urls,
+                        decode_urls,
+                        prefill_policy,
+                        decode_policy,
+                    } => {
+                        Self::create_pd_router(
+                            prefill_urls,
+                            decode_urls,
+                            prefill_policy.as_ref(),
+                            decode_policy.as_ref(),
+                            &ctx.router_config.policy,
+                            ctx,
+                        )
+                        .await
+                    }
+                }
             }
         }
     }
@@ -55,20 +83,8 @@ impl RouterFactory {
         // Create policy
         let policy = PolicyFactory::create_from_config(policy_config);
 
-        // Create regular router with injected policy and client
-        let router = Router::new(
-            worker_urls.to_vec(),
-            policy,
-            ctx.client.clone(),
-            ctx.router_config.worker_startup_timeout_secs,
-            ctx.router_config.worker_startup_check_interval_secs,
-            ctx.router_config.dp_aware,
-            ctx.router_config.api_key.clone(),
-            ctx.router_config.retry.clone(),
-            ctx.router_config.circuit_breaker.clone(),
-            ctx.router_config.health_check.clone(),
-        )
-        .await?;
+        // Create regular router with injected policy and context
+        let router = Router::new(worker_urls.to_vec(), policy, ctx).await?;
 
         Ok(Box::new(router))
     }
@@ -88,18 +104,13 @@ impl RouterFactory {
         let decode_policy =
             PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
 
-        // Create PD router with separate policies and client
+        // Create PD router with separate policies and context
         let router = PDRouter::new(
             prefill_urls.to_vec(),
             decode_urls.to_vec(),
             prefill_policy,
             decode_policy,
-            ctx.client.clone(),
-            ctx.router_config.worker_startup_timeout_secs,
-            ctx.router_config.worker_startup_check_interval_secs,
-            ctx.router_config.retry.clone(),
-            ctx.router_config.circuit_breaker.clone(),
-            ctx.router_config.health_check.clone(),
+            ctx,
         )
         .await?;
 
@@ -108,25 +119,49 @@ impl RouterFactory {
 
     /// Create a gRPC router with injected policy
     pub async fn create_grpc_router(
-        _worker_urls: &[String],
-        _policy_config: &PolicyConfig,
-        _ctx: &Arc<AppContext>,
+        worker_urls: &[String],
+        policy_config: &PolicyConfig,
+        ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // For now, return an error as gRPC router is not yet implemented
-        Err("gRPC router is not yet implemented".to_string())
+        use super::grpc::router::GrpcRouter;
+
+        // Create policy
+        let policy = PolicyFactory::create_from_config(policy_config);
+
+        // Create gRPC router with context
+        let router = GrpcRouter::new(worker_urls.to_vec(), policy, ctx).await?;
+
+        Ok(Box::new(router))
     }
 
-    /// Create a gRPC PD router (placeholder for now)
+    /// Create a gRPC PD router with tokenizer and worker configuration
     pub async fn create_grpc_pd_router(
-        _prefill_urls: &[(String, Option<u16>)],
-        _decode_urls: &[String],
-        _prefill_policy_config: Option<&PolicyConfig>,
-        _decode_policy_config: Option<&PolicyConfig>,
-        _main_policy_config: &PolicyConfig,
-        _ctx: &Arc<AppContext>,
+        prefill_urls: &[(String, Option<u16>)],
+        decode_urls: &[String],
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // For now, return an error as gRPC PD router is not yet implemented
-        Err("gRPC PD router is not yet implemented".to_string())
+        use super::grpc::pd_router::GrpcPDRouter;
+
+        // Create policies - use specific policies if provided, otherwise fall back to main policy
+        let prefill_policy =
+            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
+        let decode_policy =
+            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+
+        // Create gRPC PD router with context
+        let router = GrpcPDRouter::new(
+            prefill_urls.to_vec(),
+            decode_urls.to_vec(),
+            prefill_policy,
+            decode_policy,
+            ctx,
+        )
+        .await?;
+
+        Ok(Box::new(router))
     }
 
     /// Create an IGW router (placeholder for future implementation)

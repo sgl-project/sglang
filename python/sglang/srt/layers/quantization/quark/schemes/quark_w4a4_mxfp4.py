@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from aiter.ops.gemm_op_a4w4 import gemm_a4w4
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility import dtypes
 from aiter.utility.fp4_utils import e8m0_shuffle
@@ -37,15 +38,6 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         return
-
-        # for aiter implement
-        # wshuffle = shuffle_weight(layer.weight.data, layout=(16, 16))
-        # w_scales_shuffle = e8m0_shuffle(layer.weight_scale.data).view(dtypes.fp8_e8m0)
-
-        # layer.weight = torch.nn.Parameter(wshuffle,
-        #                                  requires_grad=False)
-        # layer.weight_scale = torch.nn.Parameter(w_scales_shuffle,
-        #                                        requires_grad=False)
 
     def create_weights(
         self,
@@ -93,26 +85,53 @@ class QuarkW4A4MXFP4(QuarkScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # This path does not have support for bias currently
+        assert bias is None, "bias is not supported"
 
-        out_dtype = x.dtype
-        # M = x.shape[0]
-        # N = layer.weight.shape[0]
+        three_d = False
+        x_s = None
+        y = None
+        if isinstance(x, tuple):
+            assert len(x) in [
+                2,
+                3,
+            ], "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+            if len(x) == 2:
+                x, x_s = x
+            elif len(x) == 3:
+                x, x_s, y = x
 
-        # quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-        # x, x_scales_shuffle = quant_func(x, shuffle=True)
-
-        # y = torch.zeros((M + 255) // 256 * 256, N, device=x.device, dtype=self.out_dtype)
-
-        # out = gemm_a4w4(x, layer.weight.data, x_scales_shuffle, layer.weight_scale.data, y, bias=bias)
-
-        # return out[:M]
-
-        # triton implement
-        x_q, x_s = dynamic_mxfp4_quant(x)
-        y = torch.empty(
-            x_q.shape[0], layer.weight.shape[0], device=x_q.device, dtype=out_dtype
+        use_fused_quant_gemm = (
+            x_s is None and y is not None and layer.weight.shape[0] == y.shape[1]
         )
 
-        out = gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, out_dtype, y)
+        if x.dim() == 3:
+            three_d = True
+            x = x.view(-1, x.shape[-1])
+            output_shape = [*x.shape[:-1], layer.weight.shape[0]]
 
-        return out
+        # use_fused_quant_gemm = true, x_q is a bf16/fp16 num
+        # x_s is not None = true, x_q is uint8 num
+        if use_fused_quant_gemm or x_s is not None:
+            x_q = x
+        else:
+            x_q, x_s = dynamic_mxfp4_quant(x)
+
+        if y is None:
+            y = torch.empty(
+                x_q.shape[0],
+                layer.weight.shape[0],
+                device=x_q.device,
+                dtype=self.out_dtype,
+            )
+
+        if use_fused_quant_gemm:
+            gemm_afp4wfp4_pre_quant(x_q, layer.weight, layer.weight_scale, y.dtype, y)
+            y = y.to(x.dtype)
+        else:
+            gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, self.out_dtype, y)
+
+        if three_d:
+            return y.view(*output_shape)
+
+        return y

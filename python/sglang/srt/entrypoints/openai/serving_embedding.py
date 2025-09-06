@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
-from sglang.srt.conversation import generate_embedding_convs
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingObject,
     EmbeddingRequest,
@@ -16,6 +15,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.parser.conversation import generate_embedding_convs
 
 
 class OpenAIServingEmbedding(OpenAIServingBase):

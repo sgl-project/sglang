@@ -1,10 +1,7 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
 use super::pd_types::{api_path, PDRouterError};
-use crate::config::types::{
-    CircuitBreakerConfig as ConfigCircuitBreakerConfig,
-    HealthCheckConfig as ConfigHealthCheckConfig, RetryConfig,
-};
+use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, HealthChecker, HealthConfig,
     RetryExecutor, Worker, WorkerFactory, WorkerLoadGuard, WorkerType,
@@ -42,8 +39,8 @@ pub struct PDRouter {
     pub decode_workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
     pub prefill_policy: Arc<dyn LoadBalancingPolicy>,
     pub decode_policy: Arc<dyn LoadBalancingPolicy>,
-    pub timeout_secs: u64,
-    pub interval_secs: u64,
+    pub worker_startup_timeout_secs: u64,
+    pub worker_startup_check_interval_secs: u64,
     pub worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
@@ -74,8 +71,8 @@ impl PDRouter {
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
         crate::routers::http::router::Router::wait_for_healthy_workers(
             &[url.to_string()],
-            self.timeout_secs,
-            self.interval_secs,
+            self.worker_startup_timeout_secs,
+            self.worker_startup_check_interval_secs,
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -375,14 +372,10 @@ impl PDRouter {
         decode_urls: Vec<String>,
         prefill_policy: Arc<dyn LoadBalancingPolicy>,
         decode_policy: Arc<dyn LoadBalancingPolicy>,
-        client: Client,
-        timeout_secs: u64,
-        interval_secs: u64,
-        retry_config: RetryConfig,
-        circuit_breaker_config: ConfigCircuitBreakerConfig,
-        health_check_config: ConfigHealthCheckConfig,
+        ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
+        let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
         let core_cb_config = CircuitBreakerConfig {
             failure_threshold: circuit_breaker_config.failure_threshold,
             success_threshold: circuit_breaker_config.success_threshold,
@@ -402,11 +395,11 @@ impl PDRouter {
                 )
                 .with_circuit_breaker_config(core_cb_config.clone())
                 .with_health_config(HealthConfig {
-                    timeout_secs: health_check_config.timeout_secs,
-                    check_interval_secs: health_check_config.check_interval_secs,
-                    endpoint: health_check_config.endpoint.clone(),
-                    failure_threshold: health_check_config.failure_threshold,
-                    success_threshold: health_check_config.success_threshold,
+                    timeout_secs: ctx.router_config.health_check.timeout_secs,
+                    check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                    endpoint: ctx.router_config.health_check.endpoint.clone(),
+                    failure_threshold: ctx.router_config.health_check.failure_threshold,
+                    success_threshold: ctx.router_config.health_check.success_threshold,
                 });
                 Box::new(worker) as Box<dyn Worker>
             })
@@ -418,11 +411,11 @@ impl PDRouter {
                 let worker = BasicWorker::new(url, WorkerType::Decode)
                     .with_circuit_breaker_config(core_cb_config.clone())
                     .with_health_config(HealthConfig {
-                        timeout_secs: health_check_config.timeout_secs,
-                        check_interval_secs: health_check_config.check_interval_secs,
-                        endpoint: health_check_config.endpoint.clone(),
-                        failure_threshold: health_check_config.failure_threshold,
-                        success_threshold: health_check_config.success_threshold,
+                        timeout_secs: ctx.router_config.health_check.timeout_secs,
+                        check_interval_secs: ctx.router_config.health_check.check_interval_secs,
+                        endpoint: ctx.router_config.health_check.endpoint.clone(),
+                        failure_threshold: ctx.router_config.health_check.failure_threshold,
+                        success_threshold: ctx.router_config.health_check.success_threshold,
                     });
                 Box::new(worker) as Box<dyn Worker>
             })
@@ -437,8 +430,8 @@ impl PDRouter {
         if !all_urls.is_empty() {
             crate::routers::http::router::Router::wait_for_healthy_workers(
                 &all_urls,
-                timeout_secs,
-                interval_secs,
+                ctx.router_config.worker_startup_timeout_secs,
+                ctx.router_config.worker_startup_check_interval_secs,
             )
             .await?;
         }
@@ -465,8 +458,8 @@ impl PDRouter {
         let load_monitor_handle =
             if prefill_policy.name() == "power_of_two" || decode_policy.name() == "power_of_two" {
                 let monitor_urls = all_urls.clone();
-                let monitor_interval = interval_secs;
-                let monitor_client = client.clone();
+                let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
+                let monitor_client = ctx.client.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
                 let decode_policy_clone = Arc::clone(&decode_policy);
 
@@ -491,11 +484,11 @@ impl PDRouter {
         // Start health checkers for both worker pools
         let prefill_health_checker = crate::core::start_health_checker(
             Arc::clone(&prefill_workers),
-            health_check_config.check_interval_secs,
+            ctx.router_config.health_check.check_interval_secs,
         );
         let decode_health_checker = crate::core::start_health_checker(
             Arc::clone(&decode_workers),
-            health_check_config.check_interval_secs,
+            ctx.router_config.health_check.check_interval_secs,
         );
 
         // Build a dedicated prefill client for fire-and-forget semantics
@@ -503,7 +496,7 @@ impl PDRouter {
             .pool_max_idle_per_host(0)
             .http1_only()
             .connect_timeout(Duration::from_millis(300))
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(ctx.router_config.request_timeout_secs))
             .build()
             .map_err(|e| format!("Failed to build prefill client: {}", e))?;
 
@@ -581,14 +574,16 @@ impl PDRouter {
             decode_workers,
             prefill_policy,
             decode_policy,
-            timeout_secs,
-            interval_secs,
+            worker_startup_timeout_secs: ctx.router_config.worker_startup_timeout_secs,
+            worker_startup_check_interval_secs: ctx
+                .router_config
+                .worker_startup_check_interval_secs,
             worker_loads,
             load_monitor_handle,
-            client,
+            client: ctx.client.clone(),
             prefill_client,
             prefill_drain_tx,
-            retry_config,
+            retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
             _prefill_health_checker: Some(prefill_health_checker),
             _decode_health_checker: Some(decode_health_checker),
@@ -2104,8 +2099,8 @@ mod tests {
             decode_workers: Arc::new(RwLock::new(vec![])),
             prefill_policy,
             decode_policy,
-            timeout_secs: 5,
-            interval_secs: 1,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
             worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
             load_monitor_handle: None,
             client: Client::new(),

@@ -22,7 +22,7 @@ Reference: https://pytorch.org/docs/stable/distributed.tensor.parallel.html
 
 Here is a quick example to enable TP:
 ```python
-from sglang.srt.model_parallel import tensor_parallel
+from sglang.srt.layers.model_parallel import tensor_parallel
 
 device_mesh = torch.distributed.init_device_mesh("cuda", (tp_size,))
 tensor_parallel(model, device_mesh)
