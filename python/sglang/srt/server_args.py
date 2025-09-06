@@ -181,6 +181,7 @@ class ServerArgs:
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
+    enable_torch_fx_passes: bool = False
 
     # Logging
     log_level: str = "info"
@@ -1160,6 +1161,11 @@ class ServerArgs:
             "--sleep-on-idle",
             action="store_true",
             help="Reduce CPU usage when sglang is idle.",
+        )
+        parser.add_argument(
+            "--enable-torch-fx-passes",
+            action="store_true",
+            help="Enable torch.fx do kernel fusion passes for model optimization.",
         )
 
         # Logging
