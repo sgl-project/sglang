@@ -299,10 +299,6 @@ class MambaAttnBackend(AttentionBackend):
         beta = beta.view(1, *beta.shape)
 
         if forward_batch.forward_mode.is_target_verify():
-            # last_recurrent_state = ssm_states[cache_indices].clone()  # keep a copy
-            # since target verify usually use small seq lens (num_draft_tokens)
-            # it's faster to use fused_recurrent_gated_delta_rule_update
-            # also cache intermediate ssm states for each draft step
             core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
                 k=key,
@@ -510,8 +506,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         ].req_to_token_pool.get_mamba_params_all_layers()
 
         conv_states, ssm_states, mix_qkv_cache, intermediate_state_cache = mamba_caches
-        # ssm_states = mamba_caches[1]
-        # intermediate_state_cache = mamba_caches[-1]
 
         mixed_qkvs = mix_qkv_cache[:, state_indices_tensor][:, mask]
 
@@ -526,8 +520,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         if intermediate_state_cache is not None:
             last_steps = (accepted_length - 1).to(torch.int64)
             valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
-                    
-            ssm_states[:, valid_state_indices, :] = intermediate_state_cache[:, valid_state_indices, last_steps].to(ssm_states.dtype)
+
+            ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
+                :, valid_state_indices, last_steps
+            ].to(ssm_states.dtype)
 
         # For loop conv state updates (can be optimized)
         for i in range(len(model.model.layers)):
