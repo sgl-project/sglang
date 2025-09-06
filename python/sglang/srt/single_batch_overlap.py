@@ -95,7 +95,7 @@ def _compute_overlap_args(dispatch_output, alt_stream):
 
     assert alt_stream is not None
     combine_wait_event = torch.cuda.Event()
-    combine_overlap_args = dict(
+    combine_overlap_args = CombineOverlapArgs(
         # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
         overlap=False,
         num_sms=communicate_num_sms,
@@ -117,12 +117,12 @@ def _compute_overlap_args(dispatch_output, alt_stream):
             dtype=torch.int32,
             device=hidden_states.device,
         )
-        down_gemm_overlap_args = dict(
+        down_gemm_overlap_args = DownGemmOverlapArgs(
             # TODO after improving DeepEP's `combine_signal`, simplify this
-            down_signals=combine_signal[:num_local_experts * ceil_div(num_tokens_static, block_m)].view(
+            signal=combine_signal[:num_local_experts * ceil_div(num_tokens_static, block_m)].view(
                 num_local_experts, ceil_div(num_tokens_static, block_m)),
-            down_start_event=combine_wait_event,
-            down_sm_count=compute_num_sms,
+            start_event=combine_wait_event,
+            num_sms=compute_num_sms,
         )
         combine_overlap_args |= dict(
             overlap=True,
