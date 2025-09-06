@@ -315,7 +315,6 @@ class MambaAttnBackend(AttentionBackend):
                 cache_steps=forward_batch.spec_info.draft_token_num,
             )
         else:
-            # Get recurrent state once
             recurrent_state = ssm_states[cache_indices]
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
