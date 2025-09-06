@@ -107,7 +107,7 @@ def _compute_overlap_args(dispatch_output, alt_stream):
     )
     down_gemm_overlap_args = None
 
-    if enable_deepep_combine_down_gemm_overlap:
+    if SboFlags.enable_deepep_combine_down_gemm_overlap():
         # TODO use zero_allocator
         combine_signal = torch.zeros(
             # TODO their deepep requires the size to be this large, temp use theirs to avoid changing their code
