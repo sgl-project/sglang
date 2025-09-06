@@ -3,8 +3,10 @@ import unittest
 import torch
 import random
 
-from sglang.srt.lora.triton_ops.sgemm_lora_a import sgemm_lora_a_fwd
+from sglang.srt.lora.triton_ops.sgemm_lora_a_chunked import sgemm_lora_a_fwd_chunked 
+from sglang.srt.lora.triton_ops.sgemm_lora_a import sgemm_lora_a_fwd 
 from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -41,6 +43,13 @@ class TestTritonSgemmLoraA(CustomTestCase):
         else:
             scalings = torch.tensor(scalings, device=self.device, dtype=self.dtype)
 
+        # Use the new reorder_and_prepare_chunks function to generate the required fields
+        BLOCK_S = 16  # Match the block size used in the kernel
+        index_map, chunk_to_weight, cu_chunk_lens = LoRAManager.reorder_and_prepare_chunks(
+            weight_indices_tensor, seg_lens_tensor, BLOCK_S, self.device
+        )
+        num_chunks = len(chunk_to_weight)
+
         return LoRABatchInfo(
             bs=bs,
             seg_lens=seg_lens_tensor,
@@ -49,6 +58,10 @@ class TestTritonSgemmLoraA(CustomTestCase):
             weight_indices=weight_indices_tensor,
             lora_ranks=lora_ranks_tensor,
             scalings=scalings,
+            index_map=index_map,
+            chunk_to_weight=chunk_to_weight,
+            cu_chunk_lens=cu_chunk_lens,
+            num_chunks=num_chunks,
         )
 
     def _reference_sgemm_lora_a(

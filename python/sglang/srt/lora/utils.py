@@ -32,9 +32,10 @@ class LoRABatchInfo:
     scalings: torch.Tensor
 
     # TODO: ADD COMMENTS! Maybe replace seg_lens, seg_indptr, etc.
-    reorder_indices: torch.Tensor
+    index_map: torch.Tensor
     chunk_to_weight: torch.Tensor
     cu_chunk_lens: torch.Tensor
+    num_chunks: int
 
 
 class LoRAType(Enum):

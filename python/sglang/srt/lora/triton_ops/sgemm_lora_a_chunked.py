@@ -24,10 +24,11 @@ def _sgemm_lora_a_kernel(
     output_stride_0,
     output_stride_1,
     # Information on sequence lengths,ranks and weight id
-    seg_lens,
-    seg_indptr,
-    weight_indices,
+    cu_chunk_lens,
+    index_map,
+    chunk_to_weight,
     lora_ranks,
+    num_chunks,
     # Meta parameters
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -48,36 +49,38 @@ def _sgemm_lora_a_kernel(
             with shape `(num_lora, N, K)`.
         output (torch.Tensor): The output tensor of shape `(s, N)`.
     """
+    chunk_id = tl.program_id(1)
+    if chunk_id >= num_chunks:
+        return 
+
+    slice_id = tl.program_id(0)
 
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len
-    batch_id = tl.program_id(axis=1)
-    w_index = tl.load(weight_indices + batch_id)
+    w_index = tl.load(chunk_to_weight + chunk_id)
     rank = tl.load(lora_ranks + w_index)
 
     # If rank is 0, this kernel becomes a no-op as the output is always trivially correct.
     if rank == 0:
         return
 
-    pid = tl.program_id(axis=0)
-    seg_start = tl.load(seg_indptr + batch_id)
-    seg_len = tl.load(seg_lens + batch_id)
+    seg_start = tl.load(cu_chunk_lens + chunk_id)
+    seg_end = tl.load(cu_chunk_lens + chunk_id + 1)
 
     # Adjust N (stack_num * max_rank) according to the specific LoRA adapter
     N = tl.minimum(N, rank * stack_num)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    pid_s = pid // num_pid_n
-    pid_n = pid % num_pid_n
 
     # Create pointers for the first block of x and weights[batch_id]
     # The pointers will be advanced as we move in the K direction
     # and accumulate
-    s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
-    n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
+    s_offset_orig = tl.arange(0, BLOCK_S) + seg_start
+    s_offset = tl.load(index_map + s_offset_orig, mask=s_offset_orig < seg_end, other=0)  # (BLOCK_S,)
+
+    n_offset = tl.arange(0, BLOCK_N) + slice_id * BLOCK_N
     k_offset = tl.arange(0, BLOCK_K)
-    x_ptrs = (x + seg_start * x_stride_0) + (
+    x_ptrs = x + (
         s_offset[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
     )
     w_ptrs = (weights + w_index * w_stride_0) + (
@@ -89,7 +92,7 @@ def _sgemm_lora_a_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset[:, None] < seg_end) & (k_offset[None, :] < K - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
@@ -104,14 +107,13 @@ def _sgemm_lora_a_kernel(
 
     # Store result to output matrix
     partial_sum = partial_sum.to(x.dtype.element_ty)
-    output_ptr = (output + seg_start * output_stride_0) + (
+    output_ptr = output  + (
         s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < N)
+    output_mask = (s_offset[:, None] < seg_end) & (n_offset[None, :] < N)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
-
-def sgemm_lora_a_fwd(
+def sgemm_lora_a_fwd_chunked(
     x: torch.Tensor,
     weights: torch.Tensor,
     batch_info: LoRABatchInfo,
@@ -129,27 +131,27 @@ def sgemm_lora_a_fwd(
     assert len(x.shape) == 2
     assert len(weights.shape) == 3
 
-    S = x.shape[0]
-    R = weights.shape[-2]
-    K = weights.shape[-1]
-    assert x.shape[-1] == K
-
     # Block shapes
     BLOCK_S = 16
+    BLOCK_N = 16
     BLOCK_K = 256
-    BLOCK_R = 16
+
+    S = x.shape[0]
+    N = weights.shape[1]
+    K = weights.shape[2]
+    assert x.shape[-1] == K
 
     grid = (
-        triton.cdiv(batch_info.max_len, BLOCK_S) * triton.cdiv(R, BLOCK_R),
-        batch_info.bs,
+        triton.cdiv(N, BLOCK_N),
+        8192 // BLOCK_S, # FIXME!
     )
 
-    output = torch.empty((S, R), device=x.device, dtype=x.dtype)
+    output = torch.empty((S, N), device=x.device, dtype=x.dtype)
     _sgemm_lora_a_kernel[grid](
         x,
         weights,
         output,
-        R,
+        N,
         K,
         stack_num,
         x.stride(0),
@@ -159,12 +161,14 @@ def sgemm_lora_a_fwd(
         weights.stride(2),
         output.stride(0),
         output.stride(1),
-        batch_info.seg_lens,
-        batch_info.seg_indptr,
-        batch_info.weight_indices,
+        batch_info.cu_chunk_lens,
+        batch_info.index_map,
+        batch_info.chunk_to_weight,
         batch_info.lora_ranks,
+        batch_info.num_chunks,
         BLOCK_S,
-        BLOCK_R,
+        BLOCK_N,
         BLOCK_K,
     )
+
     return output
