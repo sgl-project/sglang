@@ -22,7 +22,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.moe.token_dispatcher.deepep import ENABLE_DEEPEP_COMBINE_OVERLAP, ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
