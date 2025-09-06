@@ -42,11 +42,6 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
-from sglang.srt.layers.moe.ep_moe.kernels import (
-    deepep_permute_triton_kernel,
-    deepep_post_reorder_triton_kernel,
-    deepep_run_moe_deep_preprocess,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -439,6 +434,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            deepep_post_reorder_triton_kernel,
+        )
+
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
             output = hidden_states
         else:
