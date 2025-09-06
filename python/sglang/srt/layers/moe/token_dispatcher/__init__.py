@@ -12,10 +12,10 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     AscendDeepEPLLOutput,
     DeepEPConfig,
     DeepEPDispatcher,
-    DeepEPLLOutput,
-    DeepEPNormalOutput,
     DeepEPLLCombineInput,
+    DeepEPLLOutput,
     DeepEPNormalCombineInput,
+    DeepEPNormalOutput,
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,

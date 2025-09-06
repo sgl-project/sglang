@@ -9,12 +9,12 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         AscendDeepEPLLOutput,
-        DeepEPLLOutput,
-        DeepEPNormalOutput,
-        StandardDispatchOutput,
         DeepEPLLCombineInput,
+        DeepEPLLOutput,
         DeepEPNormalCombineInput,
+        DeepEPNormalOutput,
         StandardCombineInput,
+        StandardDispatchOutput,
     )
     from sglang.srt.layers.moe.topk import TopKOutput
 
