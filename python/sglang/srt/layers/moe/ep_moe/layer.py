@@ -481,7 +481,7 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
-        overlap_args: Optional[Dict[str, Any]],
+        overlap_args: Optional[Dict[str, Any]] = None,
     ):
         return self.deepep_dispatcher.combine(
             hidden_states=hidden_states,
