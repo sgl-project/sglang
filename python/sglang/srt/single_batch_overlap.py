@@ -97,8 +97,6 @@ def _compute_overlap_args(dispatch_output, alt_stream):
         hidden_states = hidden_states[0]
 
     num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
-    # TODO do not hardcode
-    block_m, block_n = 128, 128
 
     total_num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     communicate_num_sms = get_int_env_var("SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32)
@@ -118,7 +116,9 @@ def _compute_overlap_args(dispatch_output, alt_stream):
     down_gemm_overlap_args = None
 
     if SboFlags.enable_combine_down_gemm_two_stream_overlap():
+        block_m, block_n = 128, 128
         MIN_BLOCK_M = 64
+
         # TODO use zero_allocator
         combine_signal = torch.zeros(
             # TODO should we use (num_local_experts, ceil_div(num_tokens_static, block_m))
