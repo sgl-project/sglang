@@ -105,6 +105,14 @@ jobs:
           pip install fastapi uvicorn orjson
           pytest -q -m integration
 
+      - name: Run Python integration tests
+        run: |
+          cd sgl-router
+          source "$HOME/.cargo/env"
+          # Integration tests use FastAPI/uvicorn for mock workers
+          pip install fastapi uvicorn orjson
+          pytest -q -m integration
+
       - name: Run Python E2E tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
