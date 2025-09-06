@@ -268,17 +268,17 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
 
         # Process input scales
-        w13_input_scale_max = layer.w13_input_scale.max().to(dtype).item()
+        w13_input_scale_max = layer.w13_input_scale.max().to(torch.float32).item()
         new_w13_input_scale = torch.tensor(
             [w13_input_scale_max],
-            dtype=dtype,
+            dtype=torch.float32,
             device=device,
         )
         layer.w13_input_scale = Parameter(new_w13_input_scale, requires_grad=False)
 
-        w2_input_scale_max = layer.w2_input_scale.max().to(dtype).item()
+        w2_input_scale_max = layer.w2_input_scale.max().to(torch.float32).item()
         new_w2_input_scale = torch.tensor(
-            [w2_input_scale_max], dtype=dtype, device=device
+            [w2_input_scale_max], dtype=torch.float32, device=device
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
@@ -303,8 +303,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             )
 
         output = cutlass_w4a8_moe(
-            layer.start_expert_id,
-            layer.end_expert_id,
             layer.num_experts,
             x,
             layer.w13_weight,
@@ -327,7 +325,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             self.problem_sizes2,
             layer.w13_input_scale,
             layer.w2_input_scale,
+            routed_scaling_factor=moe_runner_config.routed_scaling_factor or 1.0,
         )
-        if moe_runner_config.routed_scaling_factor is not None:
-            output *= moe_runner_config.routed_scaling_factor
         return output
