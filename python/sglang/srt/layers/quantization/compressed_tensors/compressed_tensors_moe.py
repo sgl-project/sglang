@@ -51,6 +51,13 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import fused_marlin_moe
+
 logger = logging.getLogger(__name__)
 
 
@@ -84,7 +91,9 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             if not VLLM_AVAILABLE:
                 raise ImportError(
-                    "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm."
+                    "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm. "
+                    "Please refer to `compressed_tensors.md` for the vllm installation instructions: "
+                    "https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/compressed_tensors.md"
                 )
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
@@ -355,6 +364,10 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self.actorder = config.actorder
         assert config.symmetric, "Only symmetric quantization is supported for MoE"
 
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+            WNA16_SUPPORTED_BITS,
+        )
+
         if not (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
             and self.num_bits in WNA16_SUPPORTED_BITS
@@ -376,11 +389,20 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         **extra_weight_attrs,
     ):
 
-        assert (
-            params_dtype == torch.float16
-        ), "float16 is required for MoE compressed models. Set dtype=torch.float16"  # noqa: E501
+        if params_dtype not in (torch.float16, torch.bfloat16):
+            raise AssertionError(
+                "float16 or bfloat16 is required for MoE compressed models. "
+                "Set dtype=torch.float16 or torch.bfloat16"
+            )
 
-        intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
+        for key in ("intermediate_size_full", "intermediate_size"):
+            if key in extra_weight_attrs:
+                intermediate_size_full = extra_weight_attrs.pop(key)
+                break
+        else:
+            raise KeyError(
+                "extra_weight_attrs must contain 'intermediate_size_full' or 'intermediate_size'"
+            )
 
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
@@ -654,12 +676,26 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         topk_weights, topk_ids, router_logits = topk_output
 
-        return torch.ops.vllm.fused_marlin_moe(
+        # The environments/kernel implementations expect float16 scales.
+        # If the stored parameter dtype is bfloat16, cast the scales to float16
+        # for the fused op on-the-fly to improve compatibility.
+        w13_ws = layer.w13_weight_scale
+        w2_ws = layer.w2_weight_scale
+        if w13_ws is not None and w13_ws.dtype == torch.bfloat16:
+            w13_ws = w13_ws.to(torch.float16)
+        if w2_ws is not None and w2_ws.dtype == torch.bfloat16:
+            w2_ws = w2_ws.to(torch.float16)
+
+        # The input must currently be float16
+        orig_dtype = x.dtype
+        x = x.half()
+
+        return fused_marlin_moe(
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
+            w13_ws,
+            w2_ws,
             router_logits,
             topk_weights,
             topk_ids,
@@ -669,4 +705,4 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             sort_indices2=layer.w2_g_idx_sort_indices,
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
-        )
+        ).to(orig_dtype)

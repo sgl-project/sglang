@@ -14,7 +14,9 @@ on-the-fly to convert high-precision weights into a lower-precision format.
 If you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time.
 For popular pre-quantized models, please visit [ModelCloud](https://huggingface.co/collections/ModelCloud/vortex-673743382af0a52b2a8b9fe2)
 or [NeuralMagic](https://huggingface.co/collections/neuralmagic) collections on HF for some
-popular quality validated quantized models. Quantized models must be validated via benchmarks post-quantization
+popular quality validated quantized models.
+To run the Mixture of Experts (MoE) models that are quantized with the `compressed-tensors` format, please refer to [compressed_tensors.md](./compressed_tensors.md) for more information.
+Quantized models must be validated via benchmarks post-quantization
 to guard against abnormal quantization loss regressions.
 
 ## Offline Quantization
