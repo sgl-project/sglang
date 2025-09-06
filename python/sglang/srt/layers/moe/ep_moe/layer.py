@@ -416,6 +416,25 @@ class DeepEPMoE(EPMoE):
                 ),
             )
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        dispatch_output = self.dispatch(
+            hidden_states, topk_idx, topk_weights, forward_batch
+        )
+        hidden_states = self.moe_impl(dispatch_output)
+        hidden_states = self.combine(
+            hidden_states,
+            dispatch_output.topk_idx,
+            dispatch_output.topk_weights,
+            forward_batch,
+        )
+        return hidden_states
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
