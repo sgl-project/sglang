@@ -138,12 +138,16 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             try:
                 # Check if the storage backend has a clear method (for nixl backends)
-                if hasattr(self.cache_controller.storage_backend, 'clear'):
+                if hasattr(self.cache_controller.storage_backend, "clear"):
                     self.cache_controller.storage_backend.clear()
-                    logger.info("Hierarchical cache storage backend cleared successfully!")
+                    logger.info(
+                        "Hierarchical cache storage backend cleared successfully!"
+                    )
                     return True
                 else:
-                    logger.warning(f"Storage backend {type(self.cache_controller.storage_backend).__name__} does not support clear operation.")
+                    logger.warning(
+                        f"Storage backend {type(self.cache_controller.storage_backend).__name__} does not support clear operation."
+                    )
                     return False
             except Exception as e:
                 logger.error(f"Failed to clear hierarchical cache storage backend: {e}")
