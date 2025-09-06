@@ -154,30 +154,27 @@ class EagleDraftInput:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        page_size: int,
     ):
         bs = self.accept_length.numel()
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
-        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-
-        if paged_kernel_lens_sum is None:
-            paged_kernel_lens_sum = cum_kv_seq_len[-1]
-
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
-        )
+        kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
+        num_pages_per_req = (paged_kernel_lens + page_size - 1) // page_size
+        kv_indptr[1:] = torch.cumsum(num_pages_per_req, dim=0)
+        kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
 
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
-            cum_kv_seq_len,
+            kv_indptr,
             None,
             kv_indices,
             req_to_token.size(1),
+            page_size,
         )
-        return kv_indices, cum_kv_seq_len, qo_indptr, None
+        return paged_kernel_lens, kv_indices, kv_indptr, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if has_been_filtered:
@@ -310,37 +307,53 @@ class EagleVerifyInput:
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        page_size: int,
     ):
+
+        device = req_to_token.device
         batch_size = len(req_pool_indices)
+
         qo_indptr = torch.arange(
             0,
             (1 + batch_size) * self.draft_token_num,
             step=self.draft_token_num,
             dtype=torch.int32,
-            device="cuda",
+            device=device,
         )
         cum_kv_seq_len = torch.zeros(
-            (batch_size + 1,), dtype=torch.int32, device="cuda"
+            (batch_size + 1,), dtype=torch.int32, device=device
         )
 
-        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+        seq_lens_with_draft_tokens = paged_kernel_lens + self.draft_token_num
+        cum_kv_seq_len[1:] = torch.cumsum(seq_lens_with_draft_tokens, dim=0)
+
+        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device=device)
+        num_pages_per_req = (seq_lens_with_draft_tokens + page_size - 1) // page_size
+        kv_indptr[1 : batch_size + 1] = torch.cumsum(num_pages_per_req, dim=0)
 
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * batch_size,
+            kv_indptr[-1],
             dtype=torch.int32,
-            device="cuda",
+            device=device,
         )
+
         create_flashinfer_kv_indices_triton[(batch_size,)](
             req_to_token,
             req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
+            seq_lens_with_draft_tokens,
+            kv_indptr,
             None,
             kv_indices,
             req_to_token.size(1),
+            page_size,
         )
-        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
+        return (
+            seq_lens_with_draft_tokens,
+            kv_indices,
+            kv_indptr,
+            qo_indptr,
+            self.custom_mask,
+        )
 
     def verify(
         self,
@@ -879,6 +892,83 @@ def generate_draft_decode_kv_indices(
     num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
 ):
+    """
+    Generate KV indices for speculative decoding with draft tokens.
+
+    This Triton kernel builds KV cache indices for speculative decoding scenarios where
+    multiple draft tokens are generated and verified. It handles both the existing sequence
+    tokens and the newly generated draft tokens, with special handling for different page sizes
+    and top-k configurations.
+
+    **Parallelization Strategy:**
+    The kernel is parallelized across three dimensions:
+    - axis=0 (iters): Speculative decoding steps (0 to num_steps-1)
+    - axis=1 (bid): Batch sequence index (0 to num_seqs-1)
+    - axis=2 (topk_id): Top-k candidate index (0 to topk-1)
+
+    Each thread block handles one (step, sequence, topk_candidate) combination, allowing
+    independent processing of different speculative paths.
+
+    **Page Size and Top-k Relationship:**
+    The kernel has two different code paths based on page_size and topk values:
+
+    1. **Simple Path (page_size == 1 or topk == 1):**
+       - Used when page_size=1 (no paging) or topk=1 (single candidate)
+       - Draft tokens are stored sequentially after existing tokens
+       - Example: If seq_len=5, num_steps=3, topk=2:
+         - Sequence 0, topk=0: tokens [0,1,2,3,4] + draft [5,6,7]
+         - Sequence 0, topk=1: tokens [0,1,2,3,4] + draft [8,9,10]
+
+    2. **Page-aligned Path (page_size > 1 and topk > 1):**
+       - Used when both page_size > 1 and topk > 1
+       - Ensures draft tokens are properly aligned to page boundaries
+       - Calculates new pages needed per topk candidate
+       - Example: If seq_len=7, page_size=4, num_steps=3, topk=2:
+         - Sequence 0, topk=0: pages [0,1] + new_pages [2,3] for draft tokens
+         - Sequence 0, topk=1: pages [0,1] + new_pages [4,5] for draft tokens
+
+    **Input Examples:**
+
+    Example 1 - Simple case (page_size=1, topk=1):
+        req_pool_indices = [0, 1]           # Sequence 0 uses pool 0, sequence 1 uses pool 1
+        paged_kernel_lens = [5, 3]          # Sequence 0 has 5 tokens, sequence 1 has 3 tokens
+        req_to_token = [[10,11,12,13,14,-1], [20,21,22,-1,-1,-1]]  # Token locations in radix tree
+        num_steps = 2, topk = 1
+
+        Output for sequence 0, step 0:
+        - kv_indices: [10,11,12,13,14,15,16]  # 5 existing + 2 draft tokens
+        - kv_indptr: [0,7]                     # Cumulative token count
+
+    Example 2 - Page-aligned case (page_size=4, topk=2):
+        req_pool_indices = [0]
+        paged_kernel_lens = [7]              # 7 tokens = 1 full page + 3 tokens
+        req_to_token = [[10,11,12,13,14,15,16,-1]]
+        num_steps = 3, topk = 2, page_size = 4
+
+        Output for sequence 0, topk=0, step=0:
+        - Existing: pages [10,11,12,13], [14,15,16,-1]  # 2 pages
+        - Draft tokens: new pages starting at position 20
+        - kv_indices: [10,11,12,13, 14,15,16,-1, 20,21,22,23]  # 3 pages total
+
+    **Args:**
+        req_pool_indices: Request pool indices for each sequence [num_seqs]
+        req_to_token: Token location lookup table [max_batch, max_context_len]
+        paged_kernel_lens: Sequence lengths per request [num_seqs]
+        kv_indices: Output KV indices buffer [num_steps, max_tokens]
+        kv_indptr: Output KV index pointers [num_steps, num_seqs*topk+1]
+        positions: Position offsets for each sequence [num_seqs*topk]
+        pool_len: Maximum context length per pool
+        kv_indices_stride: Stride for kv_indices buffer
+        kv_indptr_stride: Stride for kv_indptr buffer
+        bs_upper: Upper bound for batch size (power of 2)
+        iter_upper: Upper bound for iterations (power of 2)
+        num_tokens_upper: Upper bound for token count (power of 2)
+        page_size: Number of tokens per page (1 for no paging)
+
+    **Usage:**
+        Called from common_template method in FlashInferMLAMultiStepDraftBackend
+        to generate KV indices for each speculative decoding step.
+    """
     BLOCK_SIZE: tl.constexpr = 128
     iters = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
