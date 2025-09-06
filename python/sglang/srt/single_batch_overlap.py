@@ -14,3 +14,7 @@ class CombineOverlapArgs:
     signal: Optional[torch.Tensor] = None
     block_m: int = -1
     threshold: int = -1
+
+@dataclass
+class DownGemmOverlapArgs:
+    TODO
