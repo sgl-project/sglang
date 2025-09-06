@@ -26,6 +26,7 @@ class SboFlags:
 
 @dataclass
 class CombineOverlapArgs:
+    # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
     overlap: bool
     stream: torch.cuda.Stream
     wait_event: torch.cuda.Event
@@ -96,7 +97,6 @@ def _compute_overlap_args(dispatch_output, alt_stream):
     assert alt_stream is not None
     combine_wait_event = torch.cuda.Event()
     combine_overlap_args = CombineOverlapArgs(
-        # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
         overlap=False,
         num_sms=communicate_num_sms,
         stream=alt_stream,
