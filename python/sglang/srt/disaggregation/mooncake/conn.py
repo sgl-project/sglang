@@ -167,12 +167,14 @@ class MooncakeKVManager(BaseKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
+        tree_cache: RadixCache,
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
         self.local_ip = get_local_ip_auto()
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
+        self.tree_cache = tree_cache
         self.init_engine()
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
@@ -670,6 +672,8 @@ class MooncakeKVManager(BaseKVManager):
     ):
         while True:
             try:
+                if self.tree_cache.is_hiradix_cache:
+                    self.tree_cache.check_hicache_events()
                 kv_chunk: TransferKVChunk = queue.get()
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()

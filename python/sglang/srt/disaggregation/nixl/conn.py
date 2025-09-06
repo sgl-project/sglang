@@ -116,9 +116,10 @@ class NixlKVManager(CommonKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
+        tree_cache: RadixCache,
         is_mla_backend: Optional[bool] = False,
     ):
-        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        super().__init__(args, disaggregation_mode, server_args, tree_cache, is_mla_backend)
         try:
             from nixl._api import nixl_agent
         except ImportError as e:
