@@ -25,3 +25,9 @@ class SpeculativeAlgorithm(IntEnum):
         if name is not None:
             name = name.upper()
         return name_map[name]
+
+
+class SpecInfo:
+    # Hold all states for speculative decoding.
+    # Currently, it is Union[EagleDraftInput, EagleVerifyInput]
+    pass

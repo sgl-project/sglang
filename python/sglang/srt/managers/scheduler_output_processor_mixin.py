@@ -5,10 +5,13 @@ import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.utils import alloc_len_per_eagle_decode, empty_context
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -43,19 +46,24 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids,
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
+                copy_done,
             ) = (
                 result.logits_output,
                 result.next_token_ids,
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
+                result.copy_done,
             )
 
-            if self.enable_overlap:
+            if copy_done is not None:
+                copy_done.synchronize()
+
+            # Move next_token_ids and logprobs to cpu
+            if self.enable_overlap and self.spec_algorithm.is_none():
                 logits_output, next_token_ids, _ = (
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 )
             else:
-                # Move next_token_ids and logprobs to cpu
                 next_token_ids = next_token_ids.tolist()
                 if batch.return_logprob:
                     if logits_output.next_token_logprobs is not None:
@@ -199,23 +207,47 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: Optional[threading.Event] = None,
     ):
-        logits_output, next_token_ids, can_run_cuda_graph = (
+        logits_output, next_token_ids, can_run_cuda_graph, copy_done = (
             result.logits_output,
             result.next_token_ids,
             result.can_run_cuda_graph,
+            result.copy_done,
         )
         self.num_generated_tokens += len(batch.reqs)
 
-        if self.enable_overlap:
-            logits_output, next_token_ids, can_run_cuda_graph = (
-                self.tp_worker.resolve_last_batch_result(launch_done)
-            )
-            next_token_logprobs = logits_output.next_token_logprobs
-        elif batch.spec_algorithm.is_none():
-            # spec decoding handles output logprobs inside verify process.
-            next_token_ids = next_token_ids.tolist()
-            if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs.tolist()
+        if copy_done is not None:
+            ctx = torch.get_device_module(self.device).stream(self.copy_stream)
+            copy_done.synchronize()
+        else:
+            ctx = empty_context()
+
+        with ctx:
+            if self.enable_overlap and batch.spec_algorithm.is_none():
+                logits_output, next_token_ids, can_run_cuda_graph = (
+                    self.tp_worker.resolve_last_batch_result(launch_done)
+                )
+                next_token_logprobs = logits_output.next_token_logprobs
+            else:
+                next_token_ids = next_token_ids.tolist()
+                if batch.return_logprob:
+                    next_token_logprobs = logits_output.next_token_logprobs.tolist()
+
+                if batch.spec_algorithm.is_eagle():
+                    accept_length_cpu = result.accept_length.tolist()
+                    predict_cpu = next_token_ids
+                    next_token_ids = []
+                    num_draft_tokens = self.draft_worker.num_draft_tokens
+                    for i, req in enumerate(batch.reqs):
+                        next_token_ids.append(
+                            predict_cpu[
+                                i * num_draft_tokens : i * num_draft_tokens
+                                + accept_length_cpu[i]
+                            ]
+                        )
+                        req.spec_verify_ct += 1
+                        self.num_generated_tokens += accept_length_cpu[i]
+                    self.spec_num_total_accepted_tokens += sum(accept_length_cpu)
+                    self.spec_num_total_forward_ct += len(batch.reqs)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -227,12 +259,24 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if self.enable_overlap and req.finished():
-                # Free the one extra delayed token
                 if self.page_size == 1:
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+                    if batch.spec_algorithm.is_eagle():
+                        self.free_spec_dec_tokens_page_size_1(
+                            i, req, result.allocate_lens, None, overlap=True
+                        )
+                    else:
+                        # not spec dec: free the one extra delayed token
+                        self.token_to_kv_pool_allocator.free(
+                            batch.out_cache_loc[i : i + 1]
+                        )
+
                 else:
                     # Only free when the extra token is in a new page
-                    if (
+                    if batch.spec_algorithm.is_eagle():
+                        self.free_spec_dec_tokens_page_size_128(
+                            i, req, result.allocate_lens, None, overlap=True
+                        )
+                    elif (
                         len(req.origin_input_ids) + len(req.output_ids) - 1
                     ) % self.page_size == 0:
                         self.token_to_kv_pool_allocator.free(
@@ -243,9 +287,42 @@ class SchedulerOutputProcessorMixin:
             if batch.spec_algorithm.is_none():
                 # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
+            else:
+                req.output_ids.extend(next_token_id)
 
             req.check_finished()
             if req.finished():
+                if (
+                    not self.enable_overlap
+                    and batch.spec_algorithm.is_eagle()
+                    and self.page_size == 1
+                ):
+                    self.free_spec_dec_tokens_page_size_1(
+                        i, req, result.allocate_lens, result.new_seq_lens, overlap=False
+                    )
+
+                # tmp fix but ugly
+                if (
+                    self.cur_batch.forward_mode.is_extend()
+                    and self.enable_overlap
+                    and batch.spec_algorithm.is_eagle()
+                ):
+                    if self.page_size == 1:
+                        self.free_spec_dec_tokens_page_size_1(
+                            i,
+                            req,
+                            result.allocate_lens,
+                            result.new_seq_lens,
+                            overlap=True,
+                        )
+                    elif self.page_size == 128:
+                        self.free_spec_dec_tokens_page_size_128(
+                            i,
+                            req,
+                            result.allocate_lens,
+                            result.new_seq_lens,
+                            overlap=True,
+                        )
                 self.tree_cache.cache_finished_req(req)
                 req.time_stats.completion_time = time.time()
 
@@ -722,3 +799,53 @@ class SchedulerOutputProcessorMixin:
                 rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
             )
         )
+
+    def free_spec_dec_tokens_page_size_1(
+        self: Scheduler,
+        batch_idx: int,
+        req: Req,
+        allocate_lens: Optional[torch.Tensor],
+        new_seq_lens: Optional[torch.Tensor],
+        overlap: bool,
+    ):
+        # spec dec: free the extra allocated tokens
+        allocate_len = allocate_lens[batch_idx]
+        if new_seq_lens is None:
+            # for overlap, the last iteration's allocation is not used. It's not true if the cur batch is extend.
+            start_len = allocate_len - alloc_len_per_eagle_decode(self.draft_worker)
+        else:
+            # for non-overlap, the last iteration will accept some tokens
+            start_len = new_seq_lens[batch_idx]
+        indices_to_free = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+            start_len:allocate_len
+        ]
+        self.token_to_kv_pool_allocator.free(indices_to_free)
+
+    def free_spec_dec_tokens_page_size_128(
+        self: Scheduler,
+        batch_idx: int,
+        req: Req,
+        allocate_lens: Optional[torch.Tensor],
+        new_seq_lens: Optional[torch.Tensor],
+        overlap: bool,
+    ):
+        # spec dec: free the extra allocated tokens
+        allocate_len = allocate_lens[batch_idx]
+        if new_seq_lens is None:
+            # for overlap, the last iteration's allocation is not used. It's not true if the cur batch is extend.
+            start_len = allocate_len - alloc_len_per_eagle_decode(self.draft_worker)
+        else:
+            # for non-overlap, the last iteration will accept some tokens
+            start_len = new_seq_lens[batch_idx]
+        indices_to_free = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+            start_len:allocate_len
+        ]
+        indices_to_free_list = indices_to_free.tolist()
+        if len(indices_to_free_list) == 2:
+            if indices_to_free_list[1] % 128 == 0:
+                self.token_to_kv_pool_allocator.free(indices_to_free[1:])
+            elif indices_to_free_list[0] % 128 == 0:
+                self.token_to_kv_pool_allocator.free(indices_to_free)
+        elif len(indices_to_free_list) == 1:
+            if indices_to_free_list[0] % 128 == 0:
+                self.token_to_kv_pool_allocator.free(indices_to_free)
