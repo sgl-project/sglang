@@ -4,8 +4,10 @@ import torch
 
 from dataclasses import dataclass
 
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_int_env_var, ceil_div
 
@@ -15,11 +17,15 @@ class SboFlags:
 
     @classmethod
     def enable_combine_down_gemm_two_stream_overlap(cls):
-        return TODO
+        return (
+            global_server_args_dict["enable_single_batch_overlap"]
+            # currently only cutedsl backend supports it
+            and get_moe_runner_backend().is_flashinfer_cutedsl()
+        )
 
     @classmethod
     def enable_combine_shared_two_stream_overlap(cls):
-        return TODO
+        return global_server_args_dict["enable_single_batch_overlap"]
 
 
 @dataclass
