@@ -848,6 +848,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle required tool choice
         if tool_choice == "required":
+            if finish_reason["type"] == "stop":
+                finish_reason["type"] = "tool_calls"
+                finish_reason["matched"] = None
             try:
                 # For required tool choice, we expect a JSON array of tool calls
                 tool_call_data = json.loads(text)
@@ -865,12 +868,15 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                     )
                 return tool_calls, "", finish_reason
-            except Exception as e:
+            except json.JSONDecodeError as e:
                 logger.error(f"Tool call parsing error: {e}")
                 return None, text, finish_reason
         
         # Hande a named tool choice
         elif isinstance(tool_choice, ToolChoice) and tool_choice.type == "function":
+            if finish_reason["type"] == "stop":
+                finish_reason["type"] = "tool_calls"
+                finish_reason["matched"] = None
             try:
                 # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
                 if tool_call_parser == "kimi_k2" and tool_choice.function.name is not None:
@@ -890,7 +896,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 ]
                 return tool_calls, "", finish_reason
-            except Exception as e:
+            except json.JSONDecodeError as e:
                 logger.error(f"Tool call parsing error: {e}")
                 return None, text, finish_reason
         parser = FunctionCallParser(tools, tool_call_parser, tool_choice)
