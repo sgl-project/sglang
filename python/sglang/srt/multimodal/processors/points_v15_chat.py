@@ -4,8 +4,12 @@ import asyncio
 from typing import List, Union
 
 from PIL import Image
+
 from sglang.srt.models.points_v15_chat import POINTSV15ChatModel
-from sglang.srt.multimodal.processors.qwen_vl import Qwen2_5VLImageProcessor, resize_image_async
+from sglang.srt.multimodal.processors.qwen_vl import (
+    Qwen2_5VLImageProcessor,
+    resize_image_async,
+)
 
 
 class POINTSV15ChatProcessor(Qwen2_5VLImageProcessor):
@@ -16,7 +20,7 @@ class POINTSV15ChatProcessor(Qwen2_5VLImageProcessor):
         hf_config.vision_start_token_id = None
         hf_config.vision_end_token_id = None
         hf_config.video_token_id = None
-        
+
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
     async def process_mm_data_async(

@@ -102,7 +102,7 @@ def get_hf_text_config(config: PretrainedConfig):
     if hasattr(config, "llm_config"):
         assert hasattr(config.llm_config, "num_attention_heads")
         return config.llm_config
-    
+
     if hasattr(config, "language_config"):
         return config.language_config
     if hasattr(config, "thinker_config"):
