@@ -558,7 +558,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
-        packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
+        packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_idx,
@@ -573,10 +573,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
         )
-        # TODO unconditionally execute this
-        if ENABLE_DEEPEP_COMBINE_OVERLAP:
-            self.packed_recv_count = packed_recv_count
-        return packed_recv_hidden, packed_recv_count, event, hook
+        return packed_recv_hidden, self.packed_recv_count, event, hook
 
     def combine_a(
         self,
@@ -630,7 +627,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     async_finish=not self.return_recv_hook,
                     return_recv_hook=self.return_recv_hook,
                 )
-            self.packed_recv_count = None
         else:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 hidden_states,
@@ -640,7 +636,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
             )
-        self.handle = None
+        self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
