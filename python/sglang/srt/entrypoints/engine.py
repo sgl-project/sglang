@@ -60,7 +60,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
+from sglang.srt.managers.multi_http_wroker_mixin import MultiHttpWorkerCollector
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -704,6 +704,33 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+def _init_tokenizer_manager(
+    server_args: ServerArgs, port_args: PortArgs, scheduler_info: Dict
+) -> Tuple[TokenizerManager, TemplateManager]:
+    # Launch tokenizer process
+    if server_args.num_http_workers == 1:
+        tokenizer_manager = TokenizerManager(server_args, port_args)
+
+        # Initialize templates
+        template_manager = TemplateManager()
+        template_manager.initialize_templates(
+            tokenizer_manager=tokenizer_manager,
+            model_path=server_args.model_path,
+            chat_template=server_args.chat_template,
+            completion_template=server_args.completion_template,
+        )
+    else:
+        # NOTE: only collector would be launched here
+        # and the tokenizer manager instances would be launched with uvicorn http server
+        # TODO(lsyin): fix the template initialization for multi http workers
+        tokenizer_manager = MultiHttpWorkerCollector(server_args, port_args)
+        template_manager = None
+
+    # override the tokenizer manager with the scheduler info, which maybe updated in the scheduler process
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    return tokenizer_manager, template_manager
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
 ) -> Tuple[TokenizerManager, TemplateManager, Dict]:
@@ -816,24 +843,6 @@ def _launch_subprocesses(
         ),
     )
     detoken_proc.start()
-    if server_args.tokenizer_worker_num > 1:
-        # Launch multi-tokenizer router
-        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-
-        # Initialize templates
-        template_manager = None
-    else:
-        # Launch tokenizer process
-        tokenizer_manager = TokenizerManager(server_args, port_args)
-
-        # Initialize templates
-        template_manager = TemplateManager()
-        template_manager.initialize_templates(
-            tokenizer_manager=tokenizer_manager,
-            model_path=server_args.model_path,
-            chat_template=server_args.chat_template,
-            completion_template=server_args.completion_template,
-        )
 
     # Wait for the model to finish loading
     scheduler_infos = []
@@ -856,5 +865,9 @@ def _launch_subprocesses(
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
-    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
+    tokenizer_manager, template_manager = _init_tokenizer_manager(
+        server_args, port_args, scheduler_info
+    )
+
     return tokenizer_manager, template_manager, scheduler_info

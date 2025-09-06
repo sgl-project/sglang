@@ -96,7 +96,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateResult,
-    MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -123,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
+from sglang.srt.managers.multi_http_wroker_mixin import MultiHttpWorkerTokenizerMixin
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -134,7 +134,6 @@ from sglang.srt.utils import (
     dataclass_to_string_truncated,
     freeze_gc,
     get_bool_env_var,
-    get_origin_rid,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -182,7 +181,7 @@ class ReqState:
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
 
-class TokenizerManager:
+class TokenizerManager(MultiHttpWorkerTokenizerMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
     def __init__(
@@ -192,6 +191,7 @@ class TokenizerManager:
     ):
         # Parse args
         self.server_args = server_args
+        self.port_args = port_args
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
@@ -266,19 +266,13 @@ class TokenizerManager:
                 )
 
         # Init inter-process communication
-        context = zmq.asyncio.Context(2)
+        self.context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_ipc_name, True
+            self.context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        if self.server_args.tokenizer_worker_num > 1:
-            # Use tokenizer_worker_ipc_name in multi-tokenizer mode
-            self.send_to_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
-            )
-        else:
-            self.send_to_scheduler = get_zmq_socket(
-                context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
-            )
+        self.send_to_scheduler = get_zmq_socket(
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+        )
 
         # Request states
         self.no_create_loop = False
@@ -321,7 +315,7 @@ class TokenizerManager:
         # LoRA updates and inference to overlap.
         self.lora_update_lock = asyncio.Lock()
 
-        # For PD disaggregtion
+        self.maybe_init_multi_http_worker()
         self.init_disaggregation()
 
         # For load balancing
@@ -472,21 +466,26 @@ class TokenizerManager:
         )
 
     def init_disaggregation(self):
+        # For PD disaggregtion
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
         self.disaggregation_transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
+
+        if self.is_sub_tokenizer:
+            # NOTE: we only start one bootstrap server
+            return
+
         # Start kv boostrap server on prefill
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # only start bootstrap server on prefill tm
-            kv_bootstrap_server_class: Type[BaseKVBootstrapServer] = get_kv_class(
+            kv_bootstrap_server_class = get_kv_class(
                 self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
             )
-            self.bootstrap_server: BaseKVBootstrapServer = kv_bootstrap_server_class(
-                host=self.server_args.host,
-                port=self.server_args.disaggregation_bootstrap_port,
+            self.bootstrap_server = kv_bootstrap_server_class(
+                self.server_args.disaggregation_bootstrap_port
             )
             is_create_store = (
                 self.server_args.node_rank == 0
@@ -511,15 +510,6 @@ class TokenizerManager:
         created_time = time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
-
-        if self.server_args.tokenizer_worker_num > 1:
-            # Modify rid, add worker_id
-            if isinstance(obj.rid, list):
-                # If it's an array, add worker_id prefix to each element
-                obj.rid = [f"{self.worker_id}_{rid}" for rid in obj.rid]
-            else:
-                # If it's a single value, add worker_id prefix
-                obj.rid = f"{self.worker_id}_{obj.rid}"
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -1120,8 +1110,6 @@ class TokenizerManager:
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        if self.server_args.tokenizer_worker_num > 1:
-            obj = MultiTokenizerWrapper(self.worker_id, obj)
         self.send_to_scheduler.send_pyobj(obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
@@ -1341,8 +1329,6 @@ class TokenizerManager:
         elif obj.session_id in self.session_futures:
             return None
 
-        if self.server_args.tokenizer_worker_num > 1:
-            obj = MultiTokenizerWrapper(self.worker_id, obj)
         self.send_to_scheduler.send_pyobj(obj)
 
         self.session_futures[obj.session_id] = asyncio.Future()
@@ -1618,6 +1604,7 @@ class TokenizerManager:
 
     async def handle_loop(self):
         """The event loop that handles requests"""
+
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
@@ -1637,12 +1624,9 @@ class TokenizerManager:
                 )
                 continue
 
-            origin_rid = rid
-            if self.server_args.tokenizer_worker_num > 1:
-                origin_rid = get_origin_rid(rid)
             # Build meta_info and return value
             meta_info = {
-                "id": origin_rid,
+                "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
@@ -1948,9 +1932,6 @@ class TokenizerManager:
         if is_health_check_generate_req(recv_obj):
             return
         state = self.rid_to_state[recv_obj.rid]
-        origin_rid = recv_obj.rid
-        if self.server_args.tokenizer_worker_num > 1:
-            origin_rid = get_origin_rid(origin_rid)
         state.finished = True
         if recv_obj.finished_reason:
             out = {
@@ -1963,7 +1944,7 @@ class TokenizerManager:
             out = {
                 "text": "",
                 "meta_info": {
-                    "id": origin_rid,
+                    "id": recv_obj.rid,
                     "finish_reason": {
                         "type": "abort",
                         "message": "Abort before prefill",
@@ -2149,8 +2130,6 @@ T = TypeVar("T")
 class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
 
-    enable_multi_tokenizer = False
-
     def __init__(self, sender, fan_out: int):
         self._sender = sender
         self._fan_out = fan_out
@@ -2167,8 +2146,6 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
-            if _Communicator.enable_multi_tokenizer:
-                obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
