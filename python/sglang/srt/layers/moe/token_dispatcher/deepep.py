@@ -5,13 +5,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled
-from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
+from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
+    CombineInput,
+    CombineInputFormat,
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -56,6 +58,7 @@ class DeepEPNormalOutput(NamedTuple):
     """DeepEP normal dispatch output."""
 
     hidden_states: torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
+    # hidden_states_scale
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
@@ -97,6 +100,30 @@ class AscendDeepEPLLOutput(NamedTuple):
 assert isinstance(DeepEPNormalOutput, DispatchOutput)
 assert isinstance(DeepEPLLOutput, DispatchOutput)
 assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
+
+
+class DeepEPNormalCombineInput(NamedTuple):
+    """DeepEP normal combine input."""
+
+    pass
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_NORMAL
+
+
+class DeepEPLLCombineInput(NamedTuple):
+    """DeepEP low latency combine input."""
+
+    pass
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_LL
+
+
+assert isinstance(DeepEPNormalCombineInput, CombineInput)
+assert isinstance(DeepEPLLCombineInput, CombineInput)
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -272,6 +299,9 @@ class _DeepEPDispatcherImplBase:
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
         )
+        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
+        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
+        assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.handle = None
 
