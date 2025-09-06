@@ -285,7 +285,17 @@ class ModelConfig:
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
-        self.vocab_size = self.hf_text_config.vocab_size
+
+        # For multi-channel models
+        # A model can define C (channels) parallel token channels, each with its own
+        # vocabulary (vocab_size_list) and optional paddings.
+        self.channels = getattr(self.hf_text_config, "channels", None)
+        if self.channels is not None:
+            self.vocab_size = self.hf_text_config.vocab_size
+            self.vocab_size_list = getattr(self.hf_text_config, "vocab_size_list", None)
+            self.pad_token = getattr(self.hf_text_config, "pad_token", None)
+        else:
+            self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization
         self._verify_quantization()
@@ -415,6 +425,17 @@ class ModelConfig:
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
+            if is_local is not True:
+                from huggingface_hub import snapshot_download
+
+                try:
+                    self.model_path = snapshot_download(
+                        self.model_path, local_files_only=True
+                    )
+                    is_local = True
+                except Exception:
+                    is_local = False
+
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
                 from huggingface_hub import HfApi
