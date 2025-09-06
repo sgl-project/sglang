@@ -317,6 +317,9 @@ class ServerArgs:
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
+    enable_prefill_cuda_graph: bool = False
+    cuda_graph_prefill_max_seqlen: Optional[int] = None
+    cuda_graph_prefill_max_bs: Optional[int] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
@@ -588,6 +591,13 @@ class ServerArgs:
                     f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
+
+        if self.enable_prefill_cuda_graph:
+            logger.warning(
+                f"self.disable_radix_cache will be assigned as true and self.attention_backend will be assigned as flashinfer when you turn on --enable-prefill-cuda-graph"
+            )
+            self.disable_radix_cache = True
+            self.attention_backend = "flashinfer"
 
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
@@ -1816,6 +1826,21 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the list of batch sizes for cuda graph.",
+        )
+        parser.add_argument(
+            "--enable-prefill-cuda-graph",
+            action="store_true",
+            help="Enable cuda graph for prefill.",
+        )
+        parser.add_argument(
+            "--cuda-graph-prefill-max-seqlen",
+            type=int,
+            help="Set the prefill seqlen range(32, cuda_graph_prefill_max_seqlen + 1, 32) for cuda graph.",
+        )
+        parser.add_argument(
+            "--cuda-graph-prefill-max-bs",
+            type=int,
+            help="Set the prefill bs range(1, cuda_graph_prefill_max_bs + 1, 1) for cuda graph.",
         )
         parser.add_argument(
             "--disable-cuda-graph",
