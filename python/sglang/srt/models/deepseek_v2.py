@@ -656,7 +656,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device
             )
 
-        final_hidden_states, shared_output = single_batch_overlap.execute_sbo(
+        final_hidden_states, sbo_shared_output = single_batch_overlap.execute_sbo(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
@@ -666,6 +666,8 @@ class DeepseekV2MoE(nn.Module):
             experts=self.experts,
             alt_stream=self.alt_stream,
         )
+        if sbo_shared_output is not None:
+            shared_output = sbo_shared_output
 
         if shared_output is not None:
             x = shared_output
