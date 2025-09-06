@@ -48,6 +48,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+from sglang.srt.entrypoints.anthropic.serving_messages import AnthropicServingMessages
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -224,6 +226,9 @@ async def lifespan(fast_api_app: FastAPI):
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager
+    )
+    fast_api_app.state.anthropic_serving_messages = AnthropicServingMessages(
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
 
     server_args: ServerArgs = fast_api_app.server_args
@@ -1129,6 +1134,17 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     if isinstance(ret, Response):
         return ret
     return ORJSONResponse({"predictions": ret})
+
+
+## Anthropic API
+@app.post("/v1/messages", dependencies=[Depends(validate_json_request)])
+async def anthropic_v1_messages(
+    request: AnthropicMessagesRequest, raw_request: Request
+):
+    """Anthropic-compatible messages endpoint."""
+    return await raw_request.app.state.anthropic_serving_messages.handle_request(
+        request, raw_request
+    )
 
 
 def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
