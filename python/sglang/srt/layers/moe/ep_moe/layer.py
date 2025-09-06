@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu, get_int_env_var
 
 if TYPE_CHECKING:
@@ -527,7 +528,7 @@ class DeepEPMoE(EPMoE):
             forward_batch=forward_batch,
         )
 
-    def moe_impl(self, dispatch_output: DispatchOutput, down_gemm_overlap_args: Optional[Dict[str, Any]],):
+    def moe_impl(self, dispatch_output: DispatchOutput, down_gemm_overlap_args: Optional[DownGemmOverlapArgs],):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         if _use_aiter:
@@ -730,7 +731,7 @@ class DeepEPMoE(EPMoE):
     def forward_flashinfer_cutedsl(
         self,
         dispatch_output: DeepEPLLOutput,
-        down_gemm_overlap_args: Optional[Dict[str, Any]],
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
     ):
         hidden_states, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
