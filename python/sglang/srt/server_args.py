@@ -2515,8 +2515,8 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
-    # The ipc filename for Tokenizer and worker tokenizer
-    tokenizer_worker_ipc_name: Optional[str]
+    # The ipc filename for multi tokenizer collector
+    multi_tokenizer_ipc_name: Optional[str]
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
@@ -2541,7 +2541,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                tokenizer_worker_ipc_name=None,
+                multi_tokenizer_ipc_name=None,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -2575,7 +2575,7 @@ class PortArgs:
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
-                tokenizer_worker_ipc_name=None,
+                multi_tokenizer_ipc_name=None,
             )
 
 

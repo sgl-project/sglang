@@ -44,7 +44,17 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-class MultiTokenizerMixin:
+class MultiTokenizerSender:
+    def __init__(self, worker_id: int, sender: zmq.Socket):
+        self.worker_id = worker_id
+        self.sender = sender
+
+    def send_pyobj(self, obj):
+        obj = MultiTokenizerWrapper(self.worker_id, obj)
+        self.sender.send_pyobj(obj)
+
+
+class MultiHttpWorkerTokenizerMixin:
     """Mixin class for MultiTokenizerManager and DetokenizerManager"""
 
     def create_sockets_mapping(self):
@@ -350,7 +360,18 @@ class MultiTokenizerMixin:
             worker_ids = []
         return worker_ids
 
-    def multi_tokenizer_manager_event_loop(self):
+    def clear_tokenizer_mapping(self):
+        if hasattr(self, "tokenizer_mapping"):
+            for socket in self.tokenizer_mapping.values():
+                try:
+                    socket.close()
+                except Exception as e:
+                    logger.warning(f"Failed to close socket: {e}")
+            self.tokenizer_mapping.clear()
+
+
+class MultiHttpWorkerDetokenizerMixin:
+    def multi_http_worker_event_loop(self):
         """The event loop that handles requests, for multi tokenizer manager mode only"""
         self.create_sockets_mapping()
         while True:
@@ -383,17 +404,8 @@ class MultiTokenizerMixin:
                     new_output = self._handle_output_by_index(output, i)
                     self.tokenizer_mapping[worker_id].send_pyobj(new_output)
 
-    def clear_tokenizer_mapping(self):
-        if hasattr(self, "tokenizer_mapping"):
-            for socket in self.tokenizer_mapping.values():
-                try:
-                    socket.close()
-                except Exception as e:
-                    logger.warning(f"Failed to close socket: {e}")
-            self.tokenizer_mapping.clear()
 
-
-class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
+class MultiTokenizerRouter(TokenizerManager, MultiHttpWorkerTokenizerMixin):
     """A router to receive requests from MultiTokenizerManager"""
 
     def __init__(
@@ -410,7 +422,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
         self.receive_from_worker = get_zmq_socket(
-            context, zmq.PULL, port_args.tokenizer_worker_ipc_name, True
+            context, zmq.PULL, port_args.multi_tokenizer_ipc_name, True
         )
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -469,7 +481,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
                 self.tokenizer_mapping[worker_id].send_pyobj(new_recv_obj)
 
 
-class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
+class MultiTokenizerManager(TokenizerManager, MultiHttpWorkerTokenizerMixin):
     """Multi Process Tokenizer Manager that tokenizes the text."""
 
     def __init__(
@@ -544,7 +556,7 @@ def serialize_port_args(port_args: PortArgs) -> dict:
         "nccl_port": port_args.nccl_port,
         "rpc_ipc_name": port_args.rpc_ipc_name,
         "metrics_ipc_name": port_args.metrics_ipc_name,
-        "tokenizer_worker_ipc_name": port_args.tokenizer_worker_ipc_name,
+        "multi_tokenizer_ipc_name": port_args.multi_tokenizer_ipc_name,
     }
 
 
@@ -556,16 +568,6 @@ def deserialize_data(port_args: dict, server_args: dict):
 def serialize_server_args(server_args: ServerArgs) -> dict:
     """Serialize ServerArgs into a shareable dictionary"""
     return dataclasses.asdict(server_args)
-
-
-def serialize_scheduler_info(scheduler_info: Dict) -> dict:
-    """Serialize scheduler_info into a shareable dictionary"""
-    return scheduler_info
-
-
-def deserialize_scheduler_info(data: dict) -> Dict:
-    """Deserialize scheduler_info from a shared dictionary"""
-    return data
 
 
 def write_to_shared_memory(data: dict, name: str) -> shared_memory.SharedMemory:
@@ -623,7 +625,7 @@ def write_data_for_multi_tokenizer(
     )
     # Write scheduler_info to shared memory
     scheduler_info_shm = write_to_shared_memory(
-        serialize_scheduler_info(scheduler_info), f"scheduler_info_{current_pid}"
+        scheduler_info, f"scheduler_info_{current_pid}"
     )
 
     port_args_shm.close()

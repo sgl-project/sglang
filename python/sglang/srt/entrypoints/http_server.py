@@ -1166,7 +1166,7 @@ def launch_server(
     if server_args.tokenizer_worker_num > 1:
         setproctitle.setproctitle(f"sglang::http_server/multi_tokenizer_router")
         port_args = PortArgs.init_new(server_args)
-        port_args.tokenizer_worker_ipc_name = (
+        port_args.multi_tokenizer_ipc_name = (
             f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
         )
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
