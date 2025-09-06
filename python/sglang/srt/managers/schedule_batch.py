@@ -622,6 +622,11 @@ class Req:
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
 
+    @property
+    def is_prefill_only(self) -> bool:
+        """Check if this request is prefill-only (no token generation needed)."""
+        return self.sampling_params.max_new_tokens == 0
+
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs
@@ -953,9 +958,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
-            is_prefill_only=all(
-                req.sampling_params.max_new_tokens == 0 for req in reqs
-            ),
+            is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
         )
 
@@ -1210,21 +1213,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.is_retracted = False
 
             # Compute the relative logprob_start_len in an extend batch
+            #
+            # Key variables:
+            # - logprob_start_len: Absolute position in full sequence where logprob computation begins
+            # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
+            # - extend_input_len: Number of tokens that need to be processed in this extend batch
+            #   (= len(fill_ids) - len(prefix_indices), where fill_ids = origin_input_ids + output_ids
+            #    and prefix_indices are the cached/shared prefix tokens)
+            #
             if req.logprob_start_len >= pre_len:
-                # For prefill-only requests that doesn't require input logprobs,
-                # skip input logprob computation entirely by setting extend_logprob_start_len to extend_input_len.
-                if (
-                    self.is_prefill_only
-                    and req.logprob_start_len == len(req.origin_input_ids) - 1
+                # Optimization for prefill-only requests: When we only need logprobs at
+                # positions beyond the input sequence (to score next-token likelihood), skip all
+                # input logprob computation during prefill since no generation will occur.
+                if self.is_prefill_only and req.logprob_start_len == len(
+                    req.origin_input_ids
                 ):
+                    # Skip ALL input logprobs: set extend_logprob_start_len = extend_input_len
                     req.extend_logprob_start_len = req.extend_input_len
                 else:
+                    # Convert absolute logprob_start_len to relative extend_logprob_start_len
+                    #
+                    # Example: origin_input_ids=[1,2,3,4,5] (5 tokens, positions 0-4), logprob_start_len=3
+                    # Regular logic: min(3-0, 5, 5-1) = min(3,5,4) = 3
+                    # This means: "compute logprobs from position 3 onwards in extend batch"
                     req.extend_logprob_start_len = min(
                         req.logprob_start_len - pre_len,
                         req.extend_input_len,
                         req.seqlen - 1,
                     )
             else:
+                # logprob_start_len is before the current extend batch, so start from beginning
                 req.extend_logprob_start_len = 0
 
             if self.return_logprob:
