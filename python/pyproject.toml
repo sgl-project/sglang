@@ -63,7 +63,7 @@ srt = [
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "flashinfer_python==0.3.0",
+    "flashinfer_python==0.3.1",
 ]
 
 blackwell = [
@@ -73,7 +73,7 @@ blackwell = [
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "flashinfer_python==0.3.0",
+    "flashinfer_python==0.3.1",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -82,7 +82,7 @@ srt_hip = [
     "sglang[runtime_common]",
     "torch",
     "petit_kernel==0.0.2",
-    "wave-lang==1.0.1",
+    "wave-lang==3.7.0",
 ]
 
 # https://docs.sglang.ai/platforms/cpu_server.html
