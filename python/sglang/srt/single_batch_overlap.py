@@ -27,6 +27,11 @@ class SboFlags:
     def enable_combine_shared_two_stream_overlap(cls):
         return global_server_args_dict["enable_single_batch_overlap"]
 
+    @classmethod
+    def fuse_shared_experts_inside_sbo(cls):
+        # TODO after antgroup's PR, should be `... or cls.enable_dispatch_shared_one_stream_overlap()`
+        return cls.enable_combine_shared_two_stream_overlap()
+
 
 @dataclass
 class CombineOverlapArgs:
