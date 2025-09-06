@@ -17,7 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -60,6 +60,7 @@ class ModelConfig:
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        modelopt_quant: Optional[Union[str, Dict]] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
@@ -70,6 +71,7 @@ class ModelConfig:
         self.revision = revision
         self.quantization = quantization
         self.model_impl = model_impl
+        self.modelopt_quant = modelopt_quant
 
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
@@ -320,6 +322,7 @@ class ModelConfig:
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
+            modelopt_quant=server_args.modelopt_quant,
             **kwargs,
         )
 
@@ -415,13 +418,13 @@ class ModelConfig:
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
-            modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
                 from huggingface_hub import HfApi
 
                 hf_api = HfApi()
                 if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
-                    quant_cfg = modelopt_quant_config
+                    # Default to FP8 for remote models if we can't inspect the config
+                    quant_cfg = {"quant_method": "modelopt_fp8"}
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
                     self.model_path, "hf_quant_config.json"
@@ -432,8 +435,13 @@ class ModelConfig:
                 quant_algo = json_quant_configs.get("quant_algo", None)
                 if quant_algo == "MIXED_PRECISION":
                     quant_cfg = {"quant_method": "w4afp8"}
+                elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
+                    quant_cfg = {"quant_method": "modelopt_fp4"}
+                elif quant_algo and "FP8" in quant_algo:
+                    quant_cfg = {"quant_method": "modelopt_fp8"}
                 else:
-                    quant_cfg = modelopt_quant_config
+                    # Default to FP8 for backward compatibility
+                    quant_cfg = {"quant_method": "modelopt_fp8"}
         return quant_cfg
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
@@ -454,7 +462,8 @@ class ModelConfig:
         optimized_quantization_methods = [
             "fp8",
             "marlin",
-            "modelopt",
+            "modelopt_fp8",
+            "modelopt_fp4",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",

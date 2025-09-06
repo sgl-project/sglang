@@ -21,7 +21,7 @@ import os
 import random
 import sys
 import tempfile
-from typing import List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
@@ -133,6 +133,11 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
+    dtype: str = "auto"
+    kv_cache_dtype: str = "auto"
+    quantization: Optional[str] = None
+    modelopt_quant: Optional[Union[str, Dict]] = None
+    quantization_param_path: Optional[str] = None
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -985,6 +990,14 @@ class ServerArgs:
             "scaling factors. This should generally be supplied, when "
             "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
             "default to 1.0, which may cause accuracy issues. ",
+        )
+        parser.add_argument(
+            "--modelopt-quant",
+            type=str,
+            default=ServerArgs.modelopt_quant,
+            help="The ModelOpt quantization configuration. "
+            "Supported values: 'fp8', 'nvfp4'. "
+            "This requires the NVIDIA Model Optimizer library to be installed.",
         )
         parser.add_argument(
             "--kv-cache-dtype",
