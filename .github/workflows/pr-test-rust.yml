@@ -68,7 +68,7 @@ jobs:
   e2e-python:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: BM.A10.4
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
