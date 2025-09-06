@@ -120,15 +120,13 @@ def _compute_overlap_args(dispatch_output, alt_stream):
         down_gemm_block_m, down_gemm_block_n = 128, 128
         MIN_BLOCK_M = 64
 
-        # TODO use zero_allocator
+        # TODO use zero_allocator to remove this `torch.zeros` call
         combine_signal = torch.zeros(
-            # TODO should we use (num_local_experts, ceil_div(num_tokens_static, down_gemm_block_m))
             num_local_experts * ceil_div(num_tokens_static, MIN_BLOCK_M),
             dtype=torch.int32,
             device=hidden_states.device,
         )
         down_gemm_overlap_args = DownGemmOverlapArgs(
-            # TODO after improving DeepEP's `combine_signal`, simplify this
             signal=combine_signal[:num_local_experts * ceil_div(num_tokens_static, down_gemm_block_m)].view(
                 num_local_experts, ceil_div(num_tokens_static, down_gemm_block_m)),
             start_event=combine_wait_event,
