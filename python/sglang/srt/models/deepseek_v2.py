@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
+from sglang.srt import single_batch_overlap
 from sglang.srt.single_batch_overlap import SboFlags
 from transformers import PretrainedConfig
 
@@ -655,23 +656,21 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device
             )
 
-        # TODO shared can be overlapped in dispatch/combine/dispatch-and-combine
-        hook_overlap_on_combine = None
         if SboFlags.enable_combine_shared_overlap():
-            def hook_overlap_on_combine():
-                nonlocal shared_output
-                # TODO maybe put the `if shape>0` into `_forward_shared_experts`
-                if hidden_states.shape[0] > 0:
-                    shared_output = self._forward_shared_experts(hidden_states)
-
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            forward_batch=forward_batch,
-            alt_stream=self.alt_stream,
-            hook_overlap_on_combine=hook_overlap_on_combine,
-        )
+            final_hidden_states, shared_output = single_batch_overlap.execute_sbo(
+                forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
+                experts=self.experts,
+                alt_stream=self.alt_stream,
+                # standard args
+                TODO=TODO,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                forward_batch=forward_batch,
+            )
 
         if shared_output is not None:
             x = shared_output
@@ -685,7 +684,7 @@ class DeepseekV2MoE(nn.Module):
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
     ):
-        if self.num_fused_shared_experts == 0:
+        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             return self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
