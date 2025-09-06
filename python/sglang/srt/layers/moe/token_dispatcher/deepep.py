@@ -105,16 +105,6 @@ assert isinstance(DeepEPLLOutput, DispatchOutput)
 assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
 
 
-@dataclass
-class DeepEPCombineOverlapArgs:
-    overlap: bool
-    stream: torch.cuda.Stream
-    wait_event: torch.cuda.Event
-    num_sms: int
-    signal: Optional[torch.Tensor] = None
-    block_m: int = -1
-    threshold: int = -1
-
 
 class DeepEPDispatchMode(IntEnum):
     NORMAL = auto()
@@ -308,7 +298,7 @@ class _DeepEPDispatcherImplBase:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[DeepEPCombineOverlapArgs],
+        overlap_args: Optional[CombineOverlapArgs],
     ):
         raise NotImplementedError
 
@@ -426,7 +416,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[DeepEPCombineOverlapArgs],
+        overlap_args: Optional[CombineOverlapArgs],
     ):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
             output = hidden_states
@@ -592,7 +582,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[DeepEPCombineOverlapArgs],
+        overlap_args: Optional[CombineOverlapArgs],
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
@@ -615,7 +605,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[DeepEPCombineOverlapArgs],
+        overlap_args: Optional[CombineOverlapArgs],
     ):
         buffer = self._get_buffer()
 
@@ -746,7 +736,7 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
-        overlap_args: Optional[DeepEPCombineOverlapArgs] = None,
+        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl(forward_batch).combine_a(
