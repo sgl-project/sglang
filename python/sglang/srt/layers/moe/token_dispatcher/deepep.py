@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union, Any, Dict
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled
@@ -48,6 +48,11 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+# TODO may improve flags
+ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP = get_bool_env_var("SGLANG_ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP")
+ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP = get_bool_env_var("SGLANG_ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP")
+ENABLE_DEEPEP_COMBINE_OVERLAP = ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP or ENABLE_DEEPEP_COMBINE_SHARED_OVERLAP
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +299,7 @@ class _DeepEPDispatcherImplBase:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_args: Optional[Dict[str, Any]],
     ):
         raise NotImplementedError
 
@@ -411,6 +417,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_args: Optional[Dict[str, Any]],
     ):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
             output = hidden_states
@@ -482,6 +489,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         """
         self.return_recv_hook = return_recv_hook
+        self.device_module = torch.get_device_module()
 
     def dispatch_a(
         self,
@@ -498,7 +506,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=True,
+            # TODO(shuw): pending https://github.com/deepseek-ai/DeepEP/pull/341
+            use_fp8=not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"),
         )
         return (
             hidden_states,
@@ -567,6 +576,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
         )
+        # TODO unconditionally execute this
+        if ENABLE_DEEPEP_COMBINE_OVERLAP:
+            self.packed_recv_count = packed_recv_count
         return packed_recv_hidden, packed_recv_count, event, hook
 
     def combine_a(
@@ -574,16 +586,23 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_args: Optional[Dict[str, Any]],
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_idx,
             topk_weights,
+            overlap_args=overlap_args,
         )
-        return hidden_states, event, hook
+        return hidden_states, event, hook, overlap_args
 
-    def combine_b(self, hidden_states, event, hook):
+    def combine_b(self, hidden_states, event, hook, overlap_args):
         hook() if self.return_recv_hook else event.current_stream_wait()
+
+        # TODO refactor and improve the whole logic
+        if overlap_args is not None:
+            self.device_module.current_stream().wait_stream(overlap_args["stream"])
+
         return hidden_states
 
     def _combine_core(
@@ -591,16 +610,39 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        overlap_args: Optional[Dict[str, Any]],
     ):
         buffer = self._get_buffer()
-        combined_hidden_states, event, hook = buffer.low_latency_combine(
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            self.handle,
-            async_finish=not self.return_recv_hook,
-            return_recv_hook=self.return_recv_hook,
-        )
+        if overlap_args is not None:
+            # TODO refactor and improve the whole logic, e.g. move to save level
+            overlap_args["stream"].wait_event(overlap_args["wait_event"])
+            with torch.cuda.stream(overlap_args["stream"]):
+                # TODO let ant change DeepEP to unify the two APIs?
+                combined_hidden_states, event, hook = buffer.ll_overlap_combine(
+                    x=hidden_states,
+                    topk_idx=topk_idx,
+                    topk_weights=topk_weights,
+                    handle=self.handle,
+                    packed_recv_count=self.packed_recv_count,
+                    # TODO overlap_args may use stronger typing
+                    overlap=overlap_args["overlap"],
+                    comp_signal=overlap_args.get("signal"),
+                    block_m=overlap_args.get("block_m", -1),
+                    threshold=overlap_args.get("threshold", -1),
+                    num_sms=overlap_args["num_sms"],
+                    async_finish=not self.return_recv_hook,
+                    return_recv_hook=self.return_recv_hook,
+                )
+            self.packed_recv_count = None
+        else:
+            combined_hidden_states, event, hook = buffer.low_latency_combine(
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                self.handle,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+            )
         self.handle = None
         return combined_hidden_states, event, hook
 
@@ -701,12 +743,14 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        overlap_args: Optional[Dict[str, Any]] = None,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl(forward_batch).combine_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
+            overlap_args=overlap_args,
         )
         self._combine_intermediate_state = forward_batch, inner_state
 

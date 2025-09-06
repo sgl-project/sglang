@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Union
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Optional, Union, Dict, Any, Callable
 
 import torch
 
@@ -21,6 +22,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
+from sglang.srt.layers.moe.token_dispatcher.deepep import ENABLE_DEEPEP_COMBINE_OVERLAP, ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -31,7 +33,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -419,18 +421,97 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        hook_overlap_on_combine: Optional[Callable] = None,
+        alt_stream: Optional = None,
     ):
         dispatch_output = self.dispatch(
             hidden_states, topk_idx, topk_weights, forward_batch
         )
-        hidden_states = self.moe_impl(dispatch_output)
+
+        combine_overlap_args, down_overlap_args, meta_overlap_args = (
+            self._compute_overlap_args(dispatch_output, alt_stream)
+        )
+
+        hidden_states = self.moe_impl(dispatch_output, down_overlap_args=down_overlap_args)
+        if (e := meta_overlap_args.get("record_event_after_down")) is not None:
+            e.record()
+
+        if hook_overlap_on_combine is not None:
+            with deep_gemm_wrapper.configure_deep_gemm_num_sms(meta_overlap_args["compute_num_sms"]):
+                hook_overlap_on_combine()
+
         hidden_states = self.combine(
             hidden_states,
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
             forward_batch,
+            overlap_args=combine_overlap_args,
         )
+
         return hidden_states
+
+    # TODO refactor and improve the whole logic
+    # TODO shall we move it to a separate file
+    @staticmethod
+    def _compute_overlap_args(dispatch_output, alt_stream):
+        if not ENABLE_DEEPEP_COMBINE_OVERLAP:
+            return None, None, {}
+
+        hidden_states = dispatch_output.hidden_states_fp8
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
+        num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
+        # TODO do not hardcode
+        block_m, block_n = 128, 128
+
+        total_num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+        communicate_num_sms = get_int_env_var("SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32)
+        compute_num_sms = total_num_sms - communicate_num_sms
+
+        assert alt_stream is not None
+        combine_wait_event = torch.cuda.Event()
+        combine_overlap_args = dict(
+            # this "overlap" flag means overlapping with down gemm, not the general two-stream overlap
+            overlap=False,
+            num_sms=communicate_num_sms,
+            stream=alt_stream,
+            wait_event=combine_wait_event,
+        )
+        meta_overlap_args = dict(
+            compute_num_sms=compute_num_sms,
+        )
+        down_overlap_args = None
+
+        if ENABLE_DEEPEP_COMBINE_DOWN_GEMM_OVERLAP:
+            # TODO use zero_allocator
+            combine_signal = torch.zeros(
+                # TODO their deepep requires the size to be this large, temp use theirs to avoid changing their code
+                #      but should optimize later
+                #      this may be better: (num_local_experts, ceil_div(num_tokens_static, block_m)),
+                num_local_experts * ceil_div(num_tokens_static, 64),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            down_overlap_args = dict(
+                # TODO after improving DeepEP's `combine_signal`, simplify this
+                down_signals=combine_signal[:num_local_experts * ceil_div(num_tokens_static, block_m)].view(
+                    num_local_experts, ceil_div(num_tokens_static, block_m)),
+                down_start_event=combine_wait_event,
+                down_sm_count=compute_num_sms,
+            )
+            combine_overlap_args |= dict(
+                overlap=True,
+                signal=combine_signal,
+                block_m=block_m,
+                threshold=ceil_div(hidden_dim, block_n),
+            )
+        else:
+            meta_overlap_args |= dict(
+                record_event_after_down=combine_wait_event,
+            )
+
+        return combine_overlap_args, down_overlap_args, meta_overlap_args
 
     def dispatch(
         self,
@@ -446,7 +527,7 @@ class DeepEPMoE(EPMoE):
             forward_batch=forward_batch,
         )
 
-    def moe_impl(self, dispatch_output: DispatchOutput):
+    def moe_impl(self, dispatch_output: DispatchOutput, down_overlap_args: Optional[Dict[str, Any]],):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         if _use_aiter:
@@ -460,6 +541,11 @@ class DeepEPMoE(EPMoE):
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            enable_flashinfer_cutedsl_moe = (
+                get_moe_runner_backend().is_flashinfer_cutedsl()
+            )
+            if enable_flashinfer_cutedsl_moe:
+                return self.forward_flashinfer_cutedsl(dispatch_output, down_overlap_args=down_overlap_args)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -473,12 +559,14 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        overlap_args: Optional[Dict[str, Any]],
     ):
         return self.deepep_dispatcher.combine(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
+            overlap_args=overlap_args,
         )
 
     def forward_aiter(
@@ -638,6 +726,24 @@ class DeepEPMoE(EPMoE):
         ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
 
         return gather_out
+
+    def forward_flashinfer_cutedsl(
+        self,
+        dispatch_output: DeepEPLLOutput,
+        down_overlap_args: Optional[Dict[str, Any]],
+    ):
+        hidden_states, _, _, masked_m, expected_m = dispatch_output
+        assert self.quant_method is not None
+        assert self.moe_runner_config.activation == "silu"
+
+        output = self.quant_method.apply_without_routing_weights(
+            layer=self,
+            x=hidden_states,
+            masked_m=masked_m,
+            moe_runner_config=self.moe_runner_config,
+            down_overlap_args=down_overlap_args,
+        )
+        return output
 
     def forward_deepgemm_masked(
         self,
