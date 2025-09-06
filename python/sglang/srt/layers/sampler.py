@@ -39,6 +39,25 @@ class Sampler(nn.Module):
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
 
+    def _preprocess_logits(
+        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
+    ) -> torch.Tensor:
+        """Apply custom logit processors and handle NaN detection."""
+        # Apply the custom logit processors if registered in the sampling info
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(logits, sampling_info)
+
+        # Detect and handle NaN values in logits
+        if self.use_nan_detection and torch.any(torch.isnan(logits)):
+            logger.warning("Detected errors during sampling! NaN in the logits.")
+            logits = torch.where(
+                torch.isnan(logits), torch.full_like(logits, -1e5), logits
+            )
+            if crash_on_warnings():
+                raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+        return logits
+
     def forward(
         self,
         logits_output: LogitsProcessorOutput,
@@ -61,17 +80,8 @@ class Sampler(nn.Module):
         """
         logits = logits_output.next_token_logits
 
-        # Apply the custom logit processors if registered in the sampling info.
-        if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(logits, sampling_info)
-
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning("Detected errors during sampling! NaN in the logits.")
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
-            )
-            if crash_on_warnings():
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
+        # Preprocess logits (custom processors and NaN handling)
+        logits = self._preprocess_logits(logits, sampling_info)
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
@@ -190,38 +200,15 @@ class Sampler(nn.Module):
         if not needs_computation:
             return
 
-        logits = logits_output.next_token_logits
+        # Preprocess logits (custom processors and NaN handling)
+        logits = self._preprocess_logits(logits_output.next_token_logits, sampling_info)
 
-        # Apply custom logit processors if configured
-        if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(logits, sampling_info)
-
-        # Detect and handle NaN values in logits
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning(
-                "Detected errors during logprob computation! NaN in the logits."
-            )
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
-            )
-            if crash_on_warnings():
-                raise ValueError(
-                    "Detected errors during logprob computation! NaN in the logits."
-                )
-
-        # Compute logprobs for token_ids_logprobs if requested
-        if any(x is not None for x in token_ids_logprobs):
-            # Convert logits to logprobs
-            logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-
-        # Extract requested token logprobs using optimized batch processing
-        # Use delayed CPU copy to improve GPU-CPU overlap
+        # Compute logprobs and extract token_ids_logprobs using optimized batch processing
+        logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         (
             logits_output.next_token_token_ids_logprobs_val,
             logits_output.next_token_token_ids_logprobs_idx,
-        ) = get_token_ids_logprobs_batch_optimized(
-            logprobs, token_ids_logprobs, delay_cpu_copy=True
-        )
+        ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
@@ -295,7 +282,6 @@ def get_top_logprobs(
 def get_token_ids_logprobs_batch_optimized(
     logprobs: torch.Tensor,
     token_ids_logprobs: List[List[int]],
-    delay_cpu_copy: bool = False,
 ) -> Tuple[List, List]:
     """
     Vectorized batch processing for token ID logprobs extraction.
@@ -306,7 +292,6 @@ def get_token_ids_logprobs_batch_optimized(
     Args:
         logprobs: Log probabilities tensor [batch_size, vocab_size]
         token_ids_logprobs: List of token IDs to extract logprobs for
-        delay_cpu_copy: If True, keep results on GPU for later CPU transfer
     """
     batch_size = len(token_ids_logprobs)
     output_token_ids_logprobs_val = [None] * batch_size
@@ -346,13 +331,8 @@ def get_token_ids_logprobs_batch_optimized(
             end_pos = start_pos + num_tokens
             request_logprobs = batch_logprobs[start_pos:end_pos]
 
-            # Handle delayed vs immediate CPU copy
-            if delay_cpu_copy:
-                # Keep GPU tensor for later conversion during output processing
-                output_token_ids_logprobs_val[original_idx] = request_logprobs
-            else:
-                # Immediate CPU copy
-                output_token_ids_logprobs_val[original_idx] = request_logprobs.tolist()
+            # Keep GPU tensor for later CPU conversion (better GPU-CPU overlap)
+            output_token_ids_logprobs_val[original_idx] = request_logprobs
 
             output_token_ids_logprobs_idx[original_idx] = token_ids_logprobs[
                 original_idx
