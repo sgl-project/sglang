@@ -217,8 +217,7 @@ class TestKimiVLServer(ImageOpenAITestMixin):
         pass
 
 
-# TODO: Add video test
-class TestGLM41VServer(ImageOpenAITestMixin):
+class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "zai-org/GLM-4.1V-9B-Thinking"
