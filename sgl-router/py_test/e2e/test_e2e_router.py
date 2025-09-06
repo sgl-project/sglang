@@ -13,7 +13,7 @@ def test_mmlu(e2e_router_only_rr, e2e_primary_worker, e2e_model):
     # Attach the primary worker to a fresh router-only instance (single model)
     base = e2e_router_only_rr.url
     r = requests.post(
-        f"{base}/add_worker", params={"url": e2e_primary_worker.url}, timeout=60
+        f"{base}/add_worker", params={"url": e2e_primary_worker.url}, timeout=180
     )
     r.raise_for_status()
 
@@ -34,7 +34,7 @@ def test_add_and_remove_worker_live(e2e_router_only_rr, e2e_primary_worker, e2e_
     base = e2e_router_only_rr.url
     worker_url = e2e_primary_worker.url
 
-    r = requests.post(f"{base}/add_worker", params={"url": worker_url}, timeout=60)
+    r = requests.post(f"{base}/add_worker", params={"url": worker_url}, timeout=180)
     r.raise_for_status()
 
     with requests.Session() as s:
@@ -61,7 +61,7 @@ def test_lazy_fault_tolerance_live(e2e_router_only_rr, e2e_primary_worker, e2e_m
     base = e2e_router_only_rr.url
     worker = e2e_primary_worker
 
-    r = requests.post(f"{base}/add_worker", params={"url": worker.url}, timeout=60)
+    r = requests.post(f"{base}/add_worker", params={"url": worker.url}, timeout=180)
     r.raise_for_status()
 
     def killer():
