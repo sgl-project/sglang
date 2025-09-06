@@ -6,12 +6,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, TypeGuard
 
 import torch
 
-from sglang.srt.layers.moe.token_dispatcher import (
-    CombineInput,
-    CombineInputFormat,
-    DispatchOutput,
-    DispatchOutputFormat,
-)
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 
 if TYPE_CHECKING:
@@ -19,6 +13,12 @@ if TYPE_CHECKING:
         TritonRunnerCore,
         TritonRunnerInput,
         TritonRunnerOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        CombineInputFormat,
+        DispatchOutput,
+        DispatchOutputFormat,
     )
 
 
@@ -143,17 +143,12 @@ class PermuteMethodPool:
         :param runner_backend_name: The MoeRunnerBackend name.
         :param permute_func: The permute function to register.
         """
+        # TODO: check if registration is valid
         key = (dispatch_output_name, runner_backend_name)
         if key in cls._pre_permute_methods:
             raise ValueError(
                 f"Pre-permute method for {dispatch_output_name} to {runner_backend_name} is already registered."
             )
-        assert DispatchOutputFormat(
-            dispatch_output_name
-        ), f"Invalid dispatch output name: {dispatch_output_name}"
-        assert MoeRunnerBackend(
-            runner_backend_name
-        ), f"Invalid runner backend name: {runner_backend_name}"
         cls._pre_permute_methods[key] = permute_func
 
     @classmethod
@@ -170,17 +165,12 @@ class PermuteMethodPool:
         :param combine_input_name: The CombineInputFormat name.
         :param permute_func: The permute function to register.
         """
+        # TODO: check if registration is valid
         key = (runner_backend_name, combine_input_name)
         if key in cls._post_permute_methods:
             raise ValueError(
                 f"Post-permute method for {runner_backend_name} to {combine_input_name} is already registered."
             )
-        assert MoeRunnerBackend(
-            runner_backend_name
-        ), f"Invalid runner backend name: {runner_backend_name}"
-        assert CombineInputFormat(
-            combine_input_name
-        ), f"Invalid combine input name: {combine_input_name}"
         cls._post_permute_methods[key] = permute_func
 
     @classmethod

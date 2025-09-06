@@ -1074,16 +1074,3 @@ class FlashInferFP4MoE(FusedMoE):
         )[0]
 
         return result
-
-
-def get_fused_moe_impl_class():
-    """Factory function to get the appropriate FusedMoE implementation class."""
-    if should_use_flashinfer_trtllm_moe() and _is_fp4_quantization_enabled():
-        # Use FP4 variant when FP4 quantization is enabled
-        return FlashInferFP4MoE
-    elif should_use_flashinfer_trtllm_moe():
-        # Use regular FlashInfer variant for non-FP4 FlashInfer cases
-        return FlashInferFusedMoE
-    else:
-        # Default case
-        return FusedMoE

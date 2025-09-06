@@ -9,7 +9,6 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
-from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -297,6 +296,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states

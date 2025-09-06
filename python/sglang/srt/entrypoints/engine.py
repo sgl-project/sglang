@@ -655,7 +655,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
     # flashinfer uses this environment variable for various kernels from MoE to quant kernels
-    os.environ["TRTLLM_ENABLE_PDL"] = "1"
+    if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
+        os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
     # Can also be passed as argument
     os.environ["SGLANG_RUN_ID"] = (

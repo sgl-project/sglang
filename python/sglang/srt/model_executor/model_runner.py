@@ -32,6 +32,7 @@ from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
+    get_pp_group,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
@@ -525,6 +526,17 @@ class ModelRunner:
 
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
+        # TODO(kaixih@nvidia): remove this once we have a better solution for DP attention.
+        #  For more details, see: https://github.com/sgl-project/sglang/issues/8616
+        elif (
+            self.dp_size > 1
+            and is_sm100_supported()
+            and server_args.attention_backend != "triton"
+        ):
+            logger.info(
+                "Disable chunked prefix cache when dp size > 1 and attention backend is not triton."
+            )
+            server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
@@ -628,6 +640,7 @@ class ModelRunner:
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()
+        self.pp_group = get_pp_group()
         self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
@@ -1814,7 +1827,10 @@ class ModelRunner:
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
-        if forward_batch.global_num_tokens_cpu is not None:
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and self.pp_group.is_last_rank
+        ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
         return ret, can_run_cuda_graph
