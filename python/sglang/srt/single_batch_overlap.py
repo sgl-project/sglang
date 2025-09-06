@@ -69,6 +69,7 @@ def execute_sbo(
         e.record()
 
     if SboFlags.enable_combine_shared_two_stream_overlap():
+        # TODO reduce sm for non-deepgemm
         with deep_gemm_wrapper.configure_deep_gemm_num_sms(meta_overlap_args["compute_num_sms"]):
             forward_shared_experts()
 
