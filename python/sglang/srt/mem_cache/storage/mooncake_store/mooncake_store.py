@@ -264,9 +264,6 @@ class MooncakeStore(HiCacheStorage):
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
 
-    def delete(self, key) -> None:
-        raise (NotImplementedError)
-
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.

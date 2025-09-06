@@ -499,7 +499,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self.lora_pattern.match(module_name))
 
-    def get_hidden_dim(self, module_name):
+    def get_hidden_dim(self, module_name, layer_idx):
         # return input_dim, output_dim
         if module_name == "qkv_proj":
             return (

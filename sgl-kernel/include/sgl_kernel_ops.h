@@ -325,35 +325,6 @@ void prepare_moe_input(
     const int64_t n,
     const int64_t k);
 
-void ep_moe_pre_reorder(
-    torch::Tensor input,
-    torch::Tensor gateup_input,
-    torch::Tensor src2dst,
-    torch::Tensor topk_ids,
-    torch::Tensor a1_scales,
-    int64_t start_expert_id,
-    int64_t end_expert_id,
-    int64_t topk,
-    bool use_per_token_if_dynamic);
-
-void ep_moe_silu_and_mul(
-    torch::Tensor gateup_output,
-    torch::Tensor down_input,
-    torch::Tensor reorder_topk_ids,
-    torch::Tensor scales,
-    int64_t start_expert_id,
-    int64_t end_expert_id);
-
-void ep_moe_post_reorder(
-    torch::Tensor down_output,
-    torch::Tensor output,
-    torch::Tensor src2dst,
-    torch::Tensor topk_ids,
-    torch::Tensor topk_weights,
-    int64_t start_expert_id,
-    int64_t end_expert_id,
-    int64_t topk);
-
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
 
 void apply_shuffle_mul_sum(

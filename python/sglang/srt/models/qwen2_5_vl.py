@@ -113,12 +113,13 @@ class Qwen2_5_VisionBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         num_dummy_heads: int = 0,
+        rms_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm1 = RMSNorm(dim, eps=1e-6)
-        self.norm2 = RMSNorm(dim, eps=1e-6)
+        self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
+        self.norm2 = RMSNorm(dim, eps=rms_norm_eps)
 
         if attn_implementation is None:
             softmax_in_single_precision = False
