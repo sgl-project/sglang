@@ -10,6 +10,7 @@ if _is_cuda:
     from sgl_kernel import (
         apply_shuffle_mul_sum,
         cutlass_fp4_group_mm,
+        cutlass_fp4_group_mm_with_bias,
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
         scaled_fp4_experts_quant,
@@ -358,6 +359,199 @@ def cutlass_moe_fp4(
         params.to_gemm2_args(),
     )
     del int_fp4, int_blockscale
+    c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
+    c2 = c2.view(m_a, num_topk, params.hidden_size)
+    if not apply_router_weight_on_input:
+        c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)
+    return c2.sum(dim=1).to(out_dtype)
+
+
+def cutlass_moe_fp4_with_bias(
+    a: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    bias1: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    bias2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    params: CutlassMoEParams,
+    apply_router_weight_on_input: bool = False,
+    activation_type: str = "silu",
+    activation_alpha: Optional[float] = None,
+    swiglu_limit: Optional[int] = None,
+):
+    """
+    MoE implementation for FP4 Inputs with bias
+
+    # Gemm 1
+    a: Input tensor: [m, k] (half/bfloat16)
+    a1_gscale: Activation scale per expert: [e]  (float32)
+    w1(gate up) (not an argument to cutlass_moe_fp4): [e, 2 * n, k]
+    w1_fp4: [e, 2 * n, k // 2], dtype: torch.uint8 (stacked fp4: E2M1)
+    (Note: `n` is the up projection output dim, `k` is the input dim in
+     full precision)
+    w1_blockscale: [e, 2 * n, k // block_size] (float8_e4m3)
+                   (Block size = 16 for NVFP4)
+    bias1: [e, 2 * n] dtype: bfloat16
+
+    # Gemm 2
+    a2_gscale: Activation scale per expert: [e]
+    w2(down projection) (not an argument to cutlass_moe_fp4): [e, k, n]
+    w2_fp4: [e, k, n // 2], dtype: torch.uint8 (stacked E2M1)
+    w2_blockscale: [e, k, n // block_size], dtype: float8_e4m3
+    bias2: [e, k] dtype: bfloat16
+
+    Strides for activations, weights and output in logical number of elements.
+    The activations & output stride is the number of elements to the next row.
+    The weights stride is the number of elements to the next row per expert.
+    For example, if the weight is [e, n, k], then the b_stride is a tensor of
+    shape [e] with each element being k. Similarly for activations, if the
+    shape is [m, k], then the a_stride has shape [e] with each value k.
+    Similarly for output, if the output is [m, n], then the c_stride is a
+    tensor of shape [e] with each element being k.
+
+    Note: cutlass_fp4_group_mm is designed to accept the strides of
+    activations and weights to be the same, so it is passed in as a single
+    tensor.
+    ab_strides_13: [e] dtype: int64 [Gemm 1: Activation / Weight strides]
+    ab_strides_2: [e] dtype: int64 [Gemm 2: Activation / Weight strides]
+    c_strides_13: [e] dtype: int64 [Gemm 1: Output Strides]
+    c_strides_2: [e] dtype: int64 [Gemm 1: Output Strides]
+
+    topk_weights: [m, topk] dtype: float8
+    topk_ids: [m, topk] dtype: float8
+
+    m, n, k: Unquantized weight shapes, dtype: int
+    e: number of experts for the current rank, dtype: int
+    assumes that topk < k < n to satisfy - up/down projection expectations.
+    """
+    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    assert w1_fp4.dtype == torch.uint8, "weight 1 must be uint8"
+    assert w2_fp4.dtype == torch.uint8, "weight 2 must be uint8"
+    assert (
+        w1_fp4.ndim == 3
+        and w2_fp4.ndim == 3
+        and w1_blockscale.ndim == 3
+        and w2_blockscale.ndim == 3
+    ), "All Weights must be of rank 3 for cutlass_moe_fp4"
+    m_a, k_a = a.shape
+    e_w1, nx2_w1, half_k_w1 = w1_fp4.shape
+    e_w2, k_w2, half_n_w2 = w2_fp4.shape
+
+    assert e_w1 == e_w2 and e_w1 == params.num_experts, (
+        "Number of experts must match",
+        " between weights.",
+    )
+    assert (
+        k_a // 2 == half_k_w1 and params.hidden_size == k_w2
+    ), "Hidden size mismatch between a, w1 and w2"
+    assert (
+        nx2_w1 == params.intermediate_size_per_partition * 2
+        and half_n_w2 == params.intermediate_size_per_partition // 2
+    ), ("mismatch in " "expected `n`")
+    assert 2 * half_k_w1 == k_w2, "Hidden size mismatch w2 and w1"
+    assert a.dtype in [torch.half, torch.bfloat16], "Invalid input dtype"
+
+    out_dtype = a.dtype
+    num_topk = topk_ids.shape[1]
+    device = a.device
+    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    prepare_moe_input(
+        topk_ids,
+        params.expert_offsets,
+        params.problem_sizes1,
+        params.problem_sizes2,
+        a_map,
+        c_map,
+        params.num_experts,
+        params.intermediate_size_per_partition,
+        params.hidden_size,
+        params.blockscale_offsets,
+    )
+
+    rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
+        a,
+        a1_gscale,
+        params.expert_offsets,
+        params.blockscale_offsets,
+        num_topk,
+        expert_map=a_map,
+    )
+    # print(params.to_gemm1_args().keys())
+    # print(params.to_gemm1_args()["c_strides"])
+    problem_sizes1_temp = params.to_gemm1_args()["problem_sizes"].transpose(0, 1)[0]
+    repeated_bias1 = torch.repeat_interleave(bias1, problem_sizes1_temp, dim=0)
+    # gemm1_args = params.to_gemm1_args()
+    # gemm1_args["bias_strides"] = torch.zeros_like(gemm1_args["c_strides"])
+    # gemm1_args["bias"] = bias1
+    # gemm1_args["bias_strides"] = gemm1_args["c_strides"].clone()
+    c1 = cutlass_fp4_group_mm(
+        rep_a_fp4,
+        w1_fp4,
+        rep_a_blockscale,
+        w1_blockscale,
+        w1_alphas,
+        out_dtype,
+        device,
+        params.to_gemm1_args(),
+    )
+    del rep_a_fp4, rep_a_blockscale
+    c1 = c1 + repeated_bias1
+
+    # hidden size dimension is split to one halfpytho sized tensor.
+    intermediate = torch.empty(
+        (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
+    )
+    ## [J G]: switch to different activation functions
+    if activation_type == "silu":
+        silu_and_mul(c1, intermediate)
+    elif activation_type == "gelu":
+        gelu_and_mul(c1, intermediate)
+    elif activation_type == "gelu_tanh":
+        gelu_tanh_and_mul(c1, intermediate)
+    elif activation_type == "swiglu":
+        from triton_kernels.swiglu import PrecisionConfig, swiglu
+
+        precision_config = PrecisionConfig(limit=swiglu_limit)
+        intermediate = swiglu(c1, activation_alpha, precision_config)
+
+    else:
+        raise ValueError(
+            f"Unsupported activation type in cutlass_moe_fp4: {activation_type}"
+        )
+
+    int_fp4, int_blockscale = scaled_fp4_experts_quant(
+        intermediate,
+        a2_gscale,
+        params.expert_offsets,
+        params.blockscale_offsets,
+        num_topk,
+    )
+    # gemm2_args = params.to_gemm2_args()
+    # gemm2_args["bias"] = bias2
+    # gemm2_args["bias_strides"] = torch.zeros_like(gemm2_args["c_strides"])
+    # gemm2_args["bias_strides"] = gemm2_args["c_strides"].clone()
+    problem_sizes2_temp = params.to_gemm2_args()["problem_sizes"].transpose(0, 1)[0]
+    repeated_bias2 = torch.repeat_interleave(bias2, problem_sizes2_temp, dim=0)
+    c2 = cutlass_fp4_group_mm(
+        int_fp4,
+        w2_fp4,
+        int_blockscale,
+        w2_blockscale,
+        w2_alphas,
+        out_dtype,
+        device,
+        params.to_gemm2_args(),
+    )
+    del int_fp4, int_blockscale
+    c2 = c2 + repeated_bias2
     c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
     c2 = c2.view(m_a, num_topk, params.hidden_size)
     if not apply_router_weight_on_input:
