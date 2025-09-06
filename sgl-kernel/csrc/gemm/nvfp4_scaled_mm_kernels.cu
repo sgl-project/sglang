@@ -310,7 +310,7 @@ void cutlassFp4GemmDispatch<float>(
 
 #else
 template <typename T>
-void runGemm(
+void cutlassFp4GemmDispatch(
     at::Tensor& D,
     at::Tensor const& A,
     at::Tensor const& B,
