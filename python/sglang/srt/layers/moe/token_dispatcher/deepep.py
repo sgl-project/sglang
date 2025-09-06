@@ -14,7 +14,6 @@ from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.single_batch_overlap import CombineOverlapArgs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -24,6 +23,9 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+
+if TYPE_CHECKING:
+    from sglang.srt.single_batch_overlap import CombineOverlapArgs
 
 try:
     from deep_ep import Buffer, Config
@@ -293,7 +295,7 @@ class _DeepEPDispatcherImplBase:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs],
+        overlap_args: Optional["CombineOverlapArgs"],
     ):
         raise NotImplementedError
 
@@ -411,7 +413,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs],
+        overlap_args: Optional["CombineOverlapArgs"],
     ):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
             output = hidden_states
@@ -577,7 +579,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs],
+        overlap_args: Optional["CombineOverlapArgs"],
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
@@ -600,7 +602,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional[CombineOverlapArgs],
+        overlap_args: Optional["CombineOverlapArgs"],
     ):
         buffer = self._get_buffer()
 
@@ -731,7 +733,7 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
-        overlap_args: Optional[CombineOverlapArgs] = None,
+        overlap_args: Optional["CombineOverlapArgs"] = None,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl(forward_batch).combine_a(

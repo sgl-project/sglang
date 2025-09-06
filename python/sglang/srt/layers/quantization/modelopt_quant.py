@@ -35,13 +35,13 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
 if is_cuda():
     from sgl_kernel import scaled_fp4_quant
@@ -1388,7 +1388,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
-        down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
+        down_gemm_overlap_args: Optional["DownGemmOverlapArgs"],
     ) -> torch.Tensor:
         assert (
             moe_runner_config.activation == "silu"
