@@ -15,6 +15,11 @@ on:
 concurrency:
   group: pr-benchmark-rust-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
 permissions:
   contents: read
   pull-requests: write
@@ -33,9 +38,10 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.3
-        continue-on-error: true
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -45,28 +51,18 @@ jobs:
           shared-key: "rust-cache"
           # Save cache even on failure
           save-if: true
+          cache-all-crates: true
+          cache-on-failure: true
 
       - name: Check benchmarks compile
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          # Try to use sccache, but disable if it fails
-          if command -v sccache &> /dev/null; then
-            echo "Testing sccache availability..."
-            # Try to start sccache and check if it works
-            export RUSTC_WRAPPER=sccache
-            export SCCACHE_GHA_ENABLED="true"
-            if sccache --start-server 2>/dev/null && sccache --show-stats 2>/dev/null; then
-              echo "sccache is working, using it for compilation"
-            else
-              echo "sccache failed to start, falling back to regular cargo"
-              unset RUSTC_WRAPPER
-              unset SCCACHE_GHA_ENABLED
-            fi
-          else
-            echo "sccache not available, using regular cargo"
-          fi
           cargo check --benches
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # Full benchmark jobs that only run with label or on main branch
   benchmark-request-processing:
@@ -88,9 +84,10 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.3
-        continue-on-error: true
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -98,6 +95,8 @@ jobs:
           workspaces: sgl-router
           # Share cache across all benchmark jobs
           shared-key: "rust-cache"
+          cache-all-crates: true
+          cache-on-failure: true
           # Save cache even on failure
           save-if: true
 
@@ -134,6 +133,10 @@ jobs:
             sgl-router/target/criterion/benchmark_summary/
           retention-days: 30
 
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   benchmark-tokenizer:
     name: Tokenizer Benchmark
     if: |
@@ -152,9 +155,10 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.3
-        continue-on-error: true
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -162,6 +166,8 @@ jobs:
           workspaces: sgl-router
           # Share cache across all benchmark jobs
           shared-key: "rust-cache"
+          cache-all-crates: true
+          cache-on-failure: true
           # Save cache even on failure
           save-if: true
 
@@ -215,9 +221,10 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.3
-        continue-on-error: true
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -225,6 +232,8 @@ jobs:
           workspaces: sgl-router
           # Share cache across all benchmark jobs
           shared-key: "rust-cache"
+          cache-all-crates: true
+          cache-on-failure: true
           # Save cache even on failure
           save-if: true
 
@@ -259,6 +268,10 @@ jobs:
           path: |
             sgl-router/target/criterion/tool_parser*/
           retention-days: 30
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
 
   benchmark-summary:
     name: Benchmark Summary
