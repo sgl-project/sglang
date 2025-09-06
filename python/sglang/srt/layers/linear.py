@@ -625,9 +625,38 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 # bitsandbytes loads the weights of the specific portion
                 # no need to narrow here
                 if not use_bitsandbytes_4bit and not self.use_presharded_weights:
-                    loaded_weight = loaded_weight.narrow(
-                        output_dim, start_idx, shard_size
-                    )
+                    # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
+                    end_idx = start_idx + shard_size
+                    if end_idx > loaded_weight.shape[output_dim]:
+                        # Need to pad with zeros
+                        valid_size = max(loaded_weight.shape[output_dim] - start_idx, 0)
+                        if valid_size > 0:
+                            loaded_slice = loaded_weight.narrow(
+                                output_dim, start_idx, valid_size
+                            )
+                            pad_shape = list(loaded_weight.shape)
+                            pad_shape[output_dim] = shard_size - valid_size
+                            pad = torch.zeros(
+                                pad_shape,
+                                dtype=loaded_weight.dtype,
+                                device=loaded_weight.device,
+                            )
+                            loaded_weight = torch.cat(
+                                [loaded_slice, pad], dim=output_dim
+                            )
+                        else:
+                            # All padding
+                            pad_shape = list(loaded_weight.shape)
+                            pad_shape[output_dim] = shard_size
+                            loaded_weight = torch.zeros(
+                                pad_shape,
+                                dtype=loaded_weight.dtype,
+                                device=loaded_weight.device,
+                            )
+                    else:
+                        loaded_weight = loaded_weight.narrow(
+                            output_dim, start_idx, shard_size
+                        )
 
         # Special case for AQLM codebooks.
         elif is_metadata:
@@ -1302,7 +1331,36 @@ class RowParallelLinear(LinearBase):
                     shard_size,
                 )
             else:
-                loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+                # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
+                end_idx = start_idx + shard_size
+                if end_idx > loaded_weight.shape[input_dim]:
+                    # Need to pad with zeros
+                    valid_size = max(loaded_weight.shape[input_dim] - start_idx, 0)
+                    if valid_size > 0:
+                        loaded_slice = loaded_weight.narrow(
+                            input_dim, start_idx, valid_size
+                        )
+                        pad_shape = list(loaded_weight.shape)
+                        pad_shape[input_dim] = shard_size - valid_size
+                        pad = torch.zeros(
+                            pad_shape,
+                            dtype=loaded_weight.dtype,
+                            device=loaded_weight.device,
+                        )
+                        loaded_weight = torch.cat([loaded_slice, pad], dim=input_dim)
+                    else:
+                        # All padding
+                        pad_shape = list(loaded_weight.shape)
+                        pad_shape[input_dim] = shard_size
+                        loaded_weight = torch.zeros(
+                            pad_shape,
+                            dtype=loaded_weight.dtype,
+                            device=loaded_weight.device,
+                        )
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        input_dim, start_idx, shard_size
+                    )
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
