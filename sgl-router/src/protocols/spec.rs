@@ -337,6 +337,11 @@ pub struct ChatCompletionRequest {
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,
+
+    /// Enable parallel batch processing (SGLang extension)
+    /// When true and batch detected, distribute items across multiple workers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_batch: Option<bool>,
 }
 
 impl GenerationRequest for ChatCompletionRequest {
@@ -577,6 +582,11 @@ pub struct CompletionRequest {
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,
+
+    /// Enable parallel batch processing (SGLang extension)
+    /// When true and batch detected, distribute items across multiple workers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_batch: Option<bool>,
 
     /// Additional fields including bootstrap info for PD routing
     #[serde(flatten)]
@@ -1767,6 +1777,11 @@ pub struct GenerateRequest {
     /// Request ID for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
+
+    /// Enable parallel batch processing (SGLang extension)
+    /// When true and batch detected, distribute items across multiple workers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_batch: Option<bool>,
 }
 
 impl GenerationRequest for GenerateRequest {
