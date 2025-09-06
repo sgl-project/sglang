@@ -10,6 +10,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_int_env_var, ceil_div
 
 
+# TODO there may be "shared-dispatch" overlap, "dispatch-gateup" overlap, etc
 class SboFlags:
     @classmethod
     def enable_combine_down_gemm_overlap(cls):
