@@ -23,6 +23,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     LogProbs,
     MessageProcessingResult,
     ToolCall,
+    ToolChoice,
     TopLogprob,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -70,10 +71,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return "Tools cannot be empty if tool choice is set to required."
 
         if (
-            not isinstance(request.tool_choice, str)
-            and request.tool_choice is not None
-            and request.tools
+            request.tool_choice is not None
+            and not isinstance(request.tool_choice, str)
         ):
+            if not request.tools:
+                return "Tools cannot be empty if tool choice is set to a specific tool."
             tool_name = request.tool_choice.function.name
             tool_exists = any(tool.function.name == tool_name for tool in request.tools)
             if not tool_exists:
@@ -840,11 +842,14 @@ class OpenAIServingChat(OpenAIServingBase):
         tools: List[Any],
         tool_call_parser: Optional[str],
         finish_reason: Dict[str, Any],
-        tool_choice: Optional[Union[str, Any]] = None,
+        tool_choice: Optional[Union[str, ToolChoice]] = None,
     ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
         """Process tool calls in the response"""
+
+        # Handle required tool choice
         if tool_choice == "required":
             try:
+                # For required tool choice, we expect a JSON array of tool calls
                 tool_call_data = json.loads(text)
                 tool_calls = []
                 for i, call_info in enumerate(tool_call_data):
@@ -864,16 +869,23 @@ class OpenAIServingChat(OpenAIServingBase):
                 logger.error(f"Tool call parsing error: {e}")
                 return None, text, finish_reason
         
-        if isinstance(tool_choice, dict) and "function" in tool_choice:
+        # Hande a named tool choice
+        elif isinstance(tool_choice, ToolChoice) and tool_choice.type == "function":
             try:
-                tool_id = f"call_{uuid.uuid4().hex[:24]}"
+                # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
+                if tool_call_parser == "kimi_k2" and tool_choice.function.name is not None:
+                    tool_id = f"functions.{tool_choice.function.name}:0"
+                else:
+                    tool_id = f"call_{uuid.uuid4().hex[:24]}"
+
+                call_info = json.loads(text)
                 tool_calls = [
                     ToolCall(
                         id=tool_id,
-                        index=0,
+                        index=0, # only one tool call when a specific function is chosen
                         function=FunctionResponse(
-                            name=tool_choice["function"]["name"],
-                            arguments=text,
+                            name=tool_choice.function.name,
+                            arguments=json.dumps(call_info['parameters']),
                         ),
                     )
                 ]
