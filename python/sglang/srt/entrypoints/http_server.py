@@ -429,6 +429,8 @@ async def get_model_info():
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "has_image_understanding": _global_state.tokenizer_manager.model_config.is_image_understandable_model,
+        "has_audio_understanding": _global_state.tokenizer_manager.model_config.is_audio_understandable_model,
     }
     return result
 
@@ -1257,6 +1259,10 @@ def launch_server(
             warmup_thread.join()
 
 
+# Minimal 1x1 black PNG (base64)
+MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+
+
 def _execute_server_warmup(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
@@ -1288,8 +1294,16 @@ def _execute_server_warmup(
 
     model_info = res.json()
 
+    is_vlm = bool(model_info.get("has_image_understanding", False))
+
     # Send a warmup request
-    request_name = "/generate" if model_info["is_generation"] else "/encode"
+    if model_info["is_generation"]:
+        if is_vlm:
+            request_name = "/v1/chat/completions"
+        else:
+            request_name = "/generate"
+    else:
+        request_name = "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
@@ -1302,6 +1316,31 @@ def _execute_server_warmup(
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
+    elif is_vlm and server_args.disaggregation_mode == "null":
+        # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
+        json_data = {
+            "model": _global_state.tokenizer_manager.served_model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the image.",
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": max_new_tokens,
+            "stream": False,
+            "temperature": 0.0,
+        }
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
