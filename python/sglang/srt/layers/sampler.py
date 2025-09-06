@@ -292,51 +292,77 @@ def get_token_ids_logprobs_batch_optimized(
     Args:
         logprobs: Log probabilities tensor [batch_size, vocab_size]
         token_ids_logprobs: List of token IDs to extract logprobs for
+
+    Example:
+        # Input: batch_size=3, vocab_size=5
+        logprobs = torch.tensor([
+            [-1.2, -2.1, -0.8, -3.0, -1.5],  # batch 0
+            [-0.5, -1.8, -2.2, -1.1, -2.7],  # batch 1
+            [-2.0, -0.9, -1.4, -2.8, -1.6],  # batch 2
+        ])
+        token_ids_logprobs = [[1, 3], [2], [0, 2, 4]]
+
+        # Output:
+        # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
+        # indices = [[1, 3], [2], [0, 2, 4]]
     """
     batch_size = len(token_ids_logprobs)
-    output_token_ids_logprobs_val = [None] * batch_size
-    output_token_ids_logprobs_idx = [None] * batch_size
+    device = logprobs.device
 
-    # Collect all valid requests for vectorized batch processing
-    batch_row_indices = []
-    batch_col_indices = []
-    request_info = []  # (original_index, start_pos, num_tokens)
+    # Step 1: Calculate lengths for each request, treating None as empty list
+    # Example: [[1, 3], [2], [0, 2, 4]] -> token_lengths = tensor([2, 1, 3])
+    token_lengths = torch.tensor(
+        [len(token_ids or []) for token_ids in token_ids_logprobs], device=device
+    )
+    total_tokens = int(token_lengths.sum().item())  # 2 + 1 + 3 = 6
 
-    current_pos = 0
+    # Handle edge case where no tokens are requested
+    if total_tokens == 0:
+        return [logprobs.new_empty(0) for _ in token_ids_logprobs], [
+            [] for _ in token_ids_logprobs
+        ]
+
+    # Step 2: Build flattened indices using torch operations
+    # Example: row_indices = [0, 0, 1, 2, 2, 2] (batch indices repeated by their lengths)
+    row_indices = torch.repeat_interleave(
+        torch.arange(batch_size, device=device), token_lengths
+    )
+    # Example: col_indices = [1, 3, 2, 0, 2, 4] (flattened token IDs from all requests)
+    col_indices = torch.tensor(
+        [
+            token_id
+            for token_ids in token_ids_logprobs
+            for token_id in (token_ids or [])
+        ],
+        device=device,
+        dtype=torch.long,
+    )
+
+    # Step 3: Single vectorized gather operation
+    # Example: logprobs[row_indices, col_indices] -> [-2.1, -3.0, -2.2, -2.0, -1.4, -1.6]
+    gathered_logprobs = logprobs[row_indices, col_indices]
+
+    # Step 4: Split results back per request using torch operations
+    # Example: split tensor [6] into chunks of sizes [2, 1, 3] -> [tensor(2), tensor(1), tensor(3)]
+    split_logprobs = torch.split_with_sizes(
+        gathered_logprobs, token_lengths.tolist(), dim=0
+    )
+
+    # Step 5: Format output to match expected return structure
+    # Example: Convert split tensors back to list format with proper empty handling
+    # i=0: [1,3] -> append split_logprobs[0] and [1,3]
+    # i=1: [2] -> append split_logprobs[1] and [2]
+    # i=2: [0,2,4] -> append split_logprobs[2] and [0,2,4]
+    output_token_ids_logprobs_val = []
+    output_token_ids_logprobs_idx = []
+
     for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None:
-            num_tokens = len(token_ids)
-            # Add row indices (batch dimension) - repeat for each token
-            batch_row_indices.extend([i] * num_tokens)
-            # Add column indices (token dimension)
-            batch_col_indices.extend(token_ids)
-            # Record info for splitting results back
-            request_info.append((i, current_pos, num_tokens))
-            current_pos += num_tokens
-
-    if batch_row_indices:
-        # Single vectorized indexing operation
-        batch_row_tensor = torch.tensor(
-            batch_row_indices, device=logprobs.device, dtype=torch.long
-        )
-        batch_col_tensor = torch.tensor(
-            batch_col_indices, device=logprobs.device, dtype=torch.long
-        )
-
-        # Extract all required logprobs in one kernel call
-        batch_logprobs = logprobs[batch_row_tensor, batch_col_tensor]
-
-        # Split results back into per-request format
-        for original_idx, start_pos, num_tokens in request_info:
-            end_pos = start_pos + num_tokens
-            request_logprobs = batch_logprobs[start_pos:end_pos]
-
-            # Keep GPU tensor for later CPU conversion (better GPU-CPU overlap)
-            output_token_ids_logprobs_val[original_idx] = request_logprobs
-
-            output_token_ids_logprobs_idx[original_idx] = token_ids_logprobs[
-                original_idx
-            ]
+        if token_ids is not None and len(token_ids) > 0:
+            output_token_ids_logprobs_val.append(split_logprobs[i])
+            output_token_ids_logprobs_idx.append(token_ids)
+        else:
+            output_token_ids_logprobs_val.append(logprobs.new_empty(0))
+            output_token_ids_logprobs_idx.append([])
 
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
 
