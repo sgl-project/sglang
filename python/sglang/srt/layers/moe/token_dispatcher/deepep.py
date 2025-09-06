@@ -105,6 +105,17 @@ assert isinstance(DeepEPLLOutput, DispatchOutput)
 assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
 
 
+@dataclass
+class DeepEPLLCombineOverlapArgs:
+    overlap: bool
+    stream: torch.cuda.Stream
+    wait_event: torch.cuda.Event
+    num_sms: int
+    signal: Optional[torch.Tensor] = None
+    block_m: int = -1
+    threshold: int = -1
+
+
 class DeepEPDispatchMode(IntEnum):
     NORMAL = auto()
     LOW_LATENCY = auto()
@@ -595,19 +606,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         if overlap_args is not None:
-            self.device_module.current_stream().wait_stream(overlap_args["stream"])
+            self.device_module.current_stream().wait_stream(overlap_args.stream)
 
         return hidden_states
-
-    @dataclass
-    class DeepEPLLCombineOverlapArgs:
-        overlap: bool
-        stream: torch.cuda.Stream
-        wait_event: torch.cuda.Event
-        num_sms: int
-        signal: Optional[torch.Tensor] = None
-        block_m: int = -1
-        threshold: int = -1
 
     def _combine_core(
         self,
