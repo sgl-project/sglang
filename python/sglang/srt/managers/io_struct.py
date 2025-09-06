@@ -1195,7 +1195,7 @@ class MultiTokenizerRegisterReq:
 
 
 @dataclass
-class MultiTokenizerWarpper:
+class MultiTokenizerWrapper:
     worker_id: int
     obj: Optional[Any] = None
 

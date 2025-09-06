@@ -341,6 +341,14 @@ class ModelRunner:
         if server_args.enable_lora:
             self.init_lora_manager()
 
+        # Init Double Sparsity
+        if server_args.enable_double_sparsity:
+            if server_args.ds_heavy_channel_type is None:
+                raise ValueError(
+                    "Please specify the heavy channel type for double sparsity optimization."
+                )
+            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -506,11 +514,6 @@ class ModelRunner:
             )
             server_args.attention_backend = "triton"
             server_args.disable_cuda_graph = True
-            if server_args.ds_heavy_channel_type is None:
-                raise ValueError(
-                    "Please specify the heavy channel type for double sparsity optimization."
-                )
-            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
@@ -521,6 +524,17 @@ class ModelRunner:
                 )
 
         if not self.use_mla_backend:
+            server_args.disable_chunked_prefix_cache = True
+        # TODO(kaixih@nvidia): remove this once we have a better solution for DP attention.
+        #  For more details, see: https://github.com/sgl-project/sglang/issues/8616
+        elif (
+            self.dp_size > 1
+            and is_sm100_supported()
+            and server_args.attention_backend != "triton"
+        ):
+            logger.info(
+                "Disable chunked prefix cache when dp size > 1 and attention backend is not triton."
+            )
             server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
@@ -1655,7 +1669,7 @@ class ModelRunner:
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
-        from sglang.srt.model_parallel import tensor_parallel
+        from sglang.srt.layers.model_parallel import tensor_parallel
 
         device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
         tensor_parallel(self.model, device_mesh)

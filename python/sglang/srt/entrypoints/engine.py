@@ -655,7 +655,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
     # flashinfer uses this environment variable for various kernels from MoE to quant kernels
-    os.environ["TRTLLM_ENABLE_PDL"] = "1"
+    if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
+        os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
     # Can also be passed as argument
     os.environ["SGLANG_RUN_ID"] = (
@@ -673,7 +674,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.3.0",
+            "0.3.1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -681,7 +682,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.7.post1",
+            "0.3.8",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
