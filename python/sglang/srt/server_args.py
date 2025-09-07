@@ -465,9 +465,14 @@ class ServerArgs:
                     # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
                     reserved_mem = 32 * 1024
 
+                # draft model and larger cuda graph buffers
                 if self.speculative_algorithm is not None:
-                    # draft model and larger cuda graph buffers
-                    reserved_mem += 2 * 1024
+                    if self.speculative_algorithm == "STANDALONE":
+                        # Standalone speculative decoding needs more memory than other speculative
+                        # decoding algorithms since the draft model is typically larger.
+                        reserved_mem += 6 * 1024
+                    else:
+                        reserved_mem += 2 * 1024
                 if self.enable_dp_attention:
                     reserved_mem += 4 * 1024
 
@@ -697,6 +702,11 @@ class ServerArgs:
             self.speculative_algorithm = "EAGLE"
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+            if self.speculative_algorithm == "STANDALONE":
+                # TODO: support dp attention for standalone speculative decoding
+                assert (
+                    self.enable_dp_attention is False
+                ), "Currently standalone speculative decoding does not support dp attention."
             if self.max_running_requests is None:
                 self.max_running_requests = 48
             self.disable_overlap_schedule = True
