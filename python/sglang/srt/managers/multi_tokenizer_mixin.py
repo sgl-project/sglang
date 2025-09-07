@@ -43,34 +43,43 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-class MultiTokenizerMixin:
-    """Mixin class for MultiTokenizerManager and DetokenizerManager"""
+class SocketMapping:
+    def __init__(self):
+        self._zmq_context = zmq.Context()
+        self._mapping: Dict[str, zmq.Socket] = {}
 
-    def create_sockets_mapping(self):
-        if not hasattr(self, "tokenizer_mapping"):
-            self.tokenizer_mapping = {}
-        # Create ZMQ context if needed
-        if not hasattr(self, "_zmq_context"):
-            self._zmq_context = zmq.Context()
+    def clear_all_sockets(self):
+        for socket in self._mapping.values():
+            socket.close()
+        self._mapping.clear()
 
     def register_ipc_mapping(
         self, recv_obj: MultiTokenizerRegisterReq, worker_id: str, is_tokenizer: bool
     ):
-        """register ipc mapping from register request"""
         type_str = "tokenizer" if is_tokenizer else "detokenizer"
-        if worker_id in self.tokenizer_mapping:
+        if worker_id in self._mapping:
             logger.warning(
                 f"{type_str} already registered with worker {worker_id}, skipping..."
             )
             return
-
         logger.info(
             f"{type_str} not registered with worker {worker_id}, registering..."
         )
-
         socket = get_zmq_socket(self._zmq_context, zmq.PUSH, recv_obj.ipc_name, False)
-        self.tokenizer_mapping[worker_id] = socket
-        self.tokenizer_mapping[worker_id].send_pyobj(recv_obj)
+        self._mapping[worker_id] = socket
+        self._mapping[worker_id].send_pyobj(recv_obj)
+
+    def send_output(self, worker_id: str, output: Any):
+        if worker_id not in self._mapping:
+            logger.error(
+                f"worker ID {worker_id} not registered. Check if the server Process is alive"
+            )
+            return
+        self._mapping[worker_id].send_pyobj(output)
+
+
+class MultiTokenizerMixin:
+    """Mixin class for MultiTokenizerManager and DetokenizerManager"""
 
     def _handle_output_by_index(self, output, i):
         """NOTE: A maintainable method is better here."""
@@ -343,7 +352,7 @@ class MultiTokenizerMixin:
 
     def multi_tokenizer_manager_event_loop(self):
         """The event loop that handles requests, for multi tokenizer manager mode only"""
-        self.create_sockets_mapping()
+        self.socket_mapping = SocketMapping()
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
@@ -360,24 +369,12 @@ class MultiTokenizerMixin:
             # Send data using the corresponding socket
             for i, worker_id in enumerate(worker_ids):
                 if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                    self.register_ipc_mapping(recv_obj, worker_id, is_tokenizer=False)
+                    self.socket_mapping.register_ipc_mapping(
+                        recv_obj, worker_id, is_tokenizer=False
+                    )
                 else:
-                    if worker_id not in self.tokenizer_mapping:
-                        logger.error(
-                            f"Tokenizer Worker ID {worker_id} not registered. Check if the server Process {worker_id} is alive"
-                        )
-                        continue
                     new_output = self._handle_output_by_index(output, i)
-                    self.tokenizer_mapping[worker_id].send_pyobj(new_output)
-
-    def clear_tokenizer_mapping(self):
-        if hasattr(self, "tokenizer_mapping"):
-            for socket in self.tokenizer_mapping.values():
-                try:
-                    socket.close()
-                except Exception as e:
-                    logger.warning(f"Failed to close socket: {e}")
-            self.tokenizer_mapping.clear()
+                    self.socket_mapping.send_output(worker_id, new_output)
 
 
 class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
@@ -421,7 +418,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
 
     async def handle_loop(self):
         # special reqs will recv from scheduler, need to route to right worker
-        self.create_sockets_mapping()
+        self.socket_mapping = SocketMapping()
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             await self._distribute_result_to_workers(recv_obj)
@@ -441,15 +438,12 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
         # Distribute result to each worker
         for i, worker_id in enumerate(worker_ids):
             if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                self.register_ipc_mapping(recv_obj, worker_id, is_tokenizer=True)
+                self.socket_mapping.register_ipc_mapping(
+                    recv_obj, worker_id, is_tokenizer=True
+                )
             else:
-                if worker_id not in self.tokenizer_mapping:
-                    logger.error(
-                        f"Tokenizer Worker ID {worker_id} not registered. Check if the server Process {worker_id} is alive"
-                    )
-                    continue
                 new_recv_obj = self._handle_output_by_index(recv_obj, i)
-                self.tokenizer_mapping[worker_id].send_pyobj(new_recv_obj)
+                self.socket_mapping.send_output(worker_id, new_recv_obj)
 
 
 class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
