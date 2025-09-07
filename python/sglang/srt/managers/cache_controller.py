@@ -18,7 +18,7 @@ import math
 import threading
 import time
 from queue import Empty, Full, PriorityQueue, Queue
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Set, Tuple
 
 import torch
 
@@ -133,6 +133,9 @@ class CacheOperation:
     @staticmethod
     def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
         assert len(ops) > 0
+        if len(ops) == 1:
+            return ops[0]
+
         host_indices = torch.cat([op.host_indices for op in ops])
         device_indices = torch.cat([op.device_indices for op in ops])
         node_ids = []
@@ -166,6 +169,12 @@ class CacheOperation:
 
     def __lt__(self, other: CacheOperation):
         return self.priority < other.priority
+
+
+class HiCacheAck(NamedTuple):
+    start_event: torch.cuda.Event
+    finish_event: torch.cuda.Event
+    node_ids: List[int]
 
 
 class TransferBuffer:
@@ -390,11 +399,11 @@ class HiCacheController:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
-        self.write_queue = PriorityQueue[CacheOperation]()
+        # self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue: List[CacheOperation] = []
-
-        self.ack_write_queue = Queue()
-        self.ack_load_queue: List[Tuple[torch.cuda.Event, List[int]]] = []
+        self.write_queue: List[CacheOperation] = []
+        self.ack_load_queue: List[HiCacheAck] = []
+        self.ack_write_queue: List[HiCacheAck] = []
 
         self.stop_event = threading.Event()
         self.write_buffer = TransferBuffer(self.stop_event)
@@ -404,12 +413,6 @@ class HiCacheController:
 
         self.write_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
-
-        self.write_thread = threading.Thread(
-            target=self.write_thread_func_direct, daemon=True
-        )
-
-        self.write_thread.start()
 
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
@@ -467,13 +470,12 @@ class HiCacheController:
 
     def reset(self):
         self.stop_event.set()
-        self.write_thread.join()
 
-        self.write_queue.queue.clear()
+        self.write_queue.clear()
         self.load_queue.clear()
         self.write_buffer.clear()
         self.load_buffer.clear()
-        self.ack_write_queue.queue.clear()
+        self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
             self.prefetch_thread.join()
@@ -483,11 +485,7 @@ class HiCacheController:
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
 
-        self.write_thread = threading.Thread(
-            target=self.write_thread_func_direct, daemon=True
-        )
         self.stop_event.clear()
-        self.write_thread.start()
 
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
@@ -512,11 +510,38 @@ class HiCacheController:
         if host_indices is None:
             return None
         self.mem_pool_host.protect_write(host_indices)
-        torch.cuda.current_stream().synchronize()
-        self.write_queue.put(
+        self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
+        self.start_writing()
         return host_indices
+
+    def start_writing(self) -> None:
+        if len(self.write_queue) == 0:
+            return
+
+        op = CacheOperation.merge_ops(self.write_queue)
+        host_indices, device_indices = self.move_indices(op)
+        self.write_queue.clear()
+
+        start_event = torch.cuda.Event()
+        finish_event = torch.cuda.Event()
+
+        start_event.record()
+        with torch.cuda.stream(self.write_stream):
+            start_event.wait(self.write_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device, host_indices, device_indices, self.io_backend
+            )
+            self.mem_pool_host.complete_io(op.host_indices)
+            finish_event.record()
+            # NOTE: We must save the host indices and device indices here,
+            # this is because we need to guarantee that these tensors are
+            # still alive when the write stream is executing.
+            host_indices.record_stream(self.write_stream)
+            device_indices.record_stream(self.write_stream)
+
+        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def load(
         self,
@@ -552,28 +577,6 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
-    def write_thread_func_direct(self):
-        """
-        Directly write through KV caches to host memory without buffering.
-        """
-        torch.cuda.set_stream(self.write_stream)
-        while not self.stop_event.is_set():
-            try:
-                operation = self.write_queue.get(block=True, timeout=1)
-                host_indices, device_indices = self.move_indices(operation)
-                self.mem_pool_host.backup_from_device_all_layer(
-                    self.mem_pool_device, host_indices, device_indices, self.io_backend
-                )
-                self.write_stream.synchronize()
-                self.mem_pool_host.complete_io(operation.host_indices)
-                for node_id in operation.node_ids:
-                    if node_id != -1:
-                        self.ack_write_queue.put(node_id)
-            except Empty:
-                continue
-            except Exception as e:
-                logger.error(e)
-
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
@@ -604,7 +607,13 @@ class HiCacheController:
             host_indices.record_stream(self.load_stream)
             device_indices.record_stream(self.load_stream)
 
-        self.ack_load_queue.append((producer_event.finish_event, op.node_ids))
+        self.ack_load_queue.append(
+            HiCacheAck(
+                start_event=producer_event.start_event,
+                finish_event=producer_event.finish_event,
+                node_ids=op.node_ids,
+            )
+        )
         return producer_id
 
     def evict_device(

@@ -201,33 +201,53 @@ class HiRadixCache(RadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                ack_id = self.cache_controller.ack_write_queue.get()
-                del self.ongoing_write_through[ack_id]
+                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                    finish_event.synchronize()
+                    for ack_id in ack_list:
+                        del self.ongoing_write_through[ack_id]
             return
-        queue_size = torch.tensor(
-            self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
-        )
+
+        # NOTE: all ranks has the same ongoing_write_through
+        # as a result, if one rankd does not have ongoing write through,
+        # we can skip the check directly, and we can return safely
+        if len(self.ongoing_write_through) == 0:
+            return
+
+        finish_count = 0
+        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         if self.tp_world_size > 1:
-            # synchrnoize TP workers to make the same update to radix cache
+            # synchronize TP workers to make the same update to radix cache
             torch.distributed.all_reduce(
                 queue_size,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
-        for _ in range(queue_size.item()):
-            ack_id = self.cache_controller.ack_write_queue.get()
-            backuped_node = self.ongoing_write_through[ack_id]
-            self.dec_lock_ref(backuped_node)
-            del self.ongoing_write_through[ack_id]
-            if self.enable_storage:
-                self.write_backup_storage(backuped_node)
+
+        finish_count = int(queue_size.item())  # to help typing, cast to int manually
+
+        common_ack_queue = self.cache_controller.ack_write_queue[:finish_count]
+        for _, finish_event, ack_list in common_ack_queue:
+            finish_event.synchronize()
+            for ack_id in ack_list:
+                backuped_node = self.ongoing_write_through[ack_id]
+                self.dec_lock_ref(backuped_node)
+                del self.ongoing_write_through[ack_id]
+                if self.enable_storage:
+                    self.write_backup_storage(backuped_node)
+
+        # ACK until all events are processed
+        del self.cache_controller.ack_write_queue[:finish_count]
 
     def loading_check(self):
-        remove_count = 0
-        for event, ack_list in self.cache_controller.ack_load_queue:
-            if not event.query():
+        finish_count = 0
+        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
+            if not finish_event.query():
                 break
-            remove_count += 1
+            finish_count += 1
             for ack_id in ack_list:
                 start_node, end_node = self.ongoing_load_back[ack_id]
                 self.dec_lock_ref(end_node)
@@ -239,7 +259,7 @@ class HiRadixCache(RadixCache):
                 del self.ongoing_load_back[ack_id]
 
         # ACK until all events are processed
-        del self.cache_controller.ack_load_queue[:remove_count]
+        del self.cache_controller.ack_load_queue[:finish_count]
 
     def evictable_size(self):
         return self.evictable_size_
