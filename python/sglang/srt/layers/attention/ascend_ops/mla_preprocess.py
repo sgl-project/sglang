@@ -294,4 +294,5 @@ class AscendFusedMLAPreprocess(torch.nn.Module):
             self.k_cache,
             forward_batch,
             zero_allocator,
+            positions,
         )
