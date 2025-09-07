@@ -1178,7 +1178,7 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
 
 
 @dataclass
-class MultiTokenizerRegisterReq(BaseReq):
+class MultiTokenizerRegisterReq(BaseBatchReq):
     ipc_name: Optional[str] = None
 
 
