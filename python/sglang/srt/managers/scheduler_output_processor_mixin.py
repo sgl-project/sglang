@@ -674,7 +674,6 @@ class SchedulerOutputProcessorMixin:
 
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
-                    rids,
                     finished_reasons,
                     decoded_texts,
                     decode_ids_list,
@@ -700,6 +699,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx,
                     output_hidden_states,
+                    rids=rids,
                 )
             )
 
