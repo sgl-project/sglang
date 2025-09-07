@@ -52,22 +52,16 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
-from python.sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.base import BaseKVBootstrapServer
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    KVClassType,
-    TransferBackend,
-    get_kv_class,
-)
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
