@@ -4,7 +4,7 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::config::{
-    CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
@@ -46,6 +46,9 @@ impl TestContext {
             disable_circuit_breaker: false,
             health_check: sglang_router_rs::config::HealthCheckConfig::default(),
             enable_igw: false,
+            connection_mode: ConnectionMode::Http,
+            model_path: None,
+            tokenizer_path: None,
         };
 
         let mut workers = Vec::new();
