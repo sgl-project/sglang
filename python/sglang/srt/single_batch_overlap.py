@@ -129,7 +129,8 @@ def _compute_overlap_args(dispatch_output, alt_stream):
         #     dtype=torch.int32,
         #     device=hidden_states.device,
         # )
-        combine_signal = torch.zeros(num_local_experts, dtype=torch.int32, device=hidden_states.device)
+        # NOTE ours v2 use uint32 not int32 currently
+        combine_signal = torch.zeros(num_local_experts, dtype=torch.uint32, device=hidden_states.device)
 
         # num_signal_per_expert = ceil_div(num_tokens_static, down_gemm_block_m)
         down_gemm_overlap_args = DownGemmOverlapArgs(
