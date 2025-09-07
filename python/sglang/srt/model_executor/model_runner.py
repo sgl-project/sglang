@@ -206,8 +206,7 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = model_config.is_hybrid
-        # Use environment variable to enable elastic memory
-        self.is_elastic = get_bool_env_var("ENABLE_KVCACHED", "false")
+        self.is_elastic = server_args.enable_elastic_memory
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0

@@ -1413,7 +1413,7 @@ class Scheduler(
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
         # disable memory leak check for elastic allocator, since the available size changes dynamically.
-        enable_elastic_memory = get_bool_env_var("ENABLE_KVCACHED", "false")
+        enable_elastic_memory = self.server_args.enable_elastic_memory
 
         if memory_leak and not enable_elastic_memory:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"

@@ -30,11 +30,10 @@ try:
     from kvcached.kv_cache_manager import KVCacheManager
     from kvcached.tp_ipc_util import start_worker_listener_thread
     from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger
-    from kvcached.vmm_ops import (
-        create_kv_tensors,
-        init_kvcached as _init_kvcached_impl,
-        shutdown_kvcached as _shutdown_kvcached_impl,
-    )
+    from kvcached.vmm_ops import create_kv_tensors
+    from kvcached.vmm_ops import init_kvcached as _init_kvcached_impl
+    from kvcached.vmm_ops import shutdown_kvcached as _shutdown_kvcached_impl
+
     KVCACHED_AVAILABLE = True
 except ImportError:
     KVCACHED_AVAILABLE = False
@@ -43,6 +42,7 @@ if KVCACHED_AVAILABLE:
     logger = get_kvcached_logger()
 else:
     import logging
+
     logger = logging.getLogger(__name__)
 
 # Global state for elasticmem
@@ -54,7 +54,7 @@ _contiguous_layout = CONTIGUOUS_LAYOUT if KVCACHED_AVAILABLE else True
 
 def is_elasticmem_available() -> bool:
     """Check if elasticmem (kvcached) backend is available."""
-    return KVCACHED_AVAILABLE and get_bool_env_var("ENABLE_KVCACHED", False)
+    return KVCACHED_AVAILABLE
 
 
 def init_elasticmem(
@@ -69,7 +69,7 @@ def init_elasticmem(
             "kvcached is not available. Please install kvcached with "
             "`pip install kvcached --no-build-isolation` to use elastic KV cache."
         )
-    
+
     global _elasticmem_initialized, _elasticmem_device, _async_sched
     if _elasticmem_initialized:
         return
@@ -93,7 +93,7 @@ def shutdown_elasticmem() -> None:
     """Shutdown elasticmem backend."""
     if not KVCACHED_AVAILABLE:
         return
-        
+
     global _elasticmem_initialized, _elasticmem_device, _async_sched
     if not _elasticmem_initialized:
         return
@@ -102,7 +102,7 @@ def shutdown_elasticmem() -> None:
     _elasticmem_initialized = False
     _elasticmem_device = None
     _async_sched = False
-    
+
     logger.info("ElasticMem shutdown completed")
 
 
@@ -118,7 +118,7 @@ def create_elastic_kv_tensors(
     """Create elastic KV cache tensors."""
     if not KVCACHED_AVAILABLE:
         raise ImportError("kvcached is not available")
-        
+
     if not _elasticmem_initialized:
         raise RuntimeError(
             "ElasticMem is not initialized. Please call init_elasticmem() first."
@@ -151,21 +151,26 @@ def create_elastic_kv_tensors(
     num_pages = gpu_mem_size // num_layers // 2 // PAGE_SIZE
     virtual_mem_size = num_pages * PAGE_SIZE * 2
 
-    raw_kv_tensors = create_kv_tensors(virtual_mem_size, dtype.itemsize,
-                                       device, num_layers)
+    raw_kv_tensors = create_kv_tensors(
+        virtual_mem_size, dtype.itemsize, device, num_layers
+    )
 
     # Fix: Derive num_tokens from actual tensor capacity instead of GPU memory estimation
     raw_tensor = raw_kv_tensors[0]
     elem_per_token = num_layers * 2 * math.prod(kvcache_shape[1:])  # 2 for K/V
     actual_num_tokens = raw_tensor.numel() // elem_per_token
-    
+
     # Align to page boundaries to avoid partial pages
     tokens_per_page = block_size * blocks_per_page
     actual_num_tokens = (actual_num_tokens // tokens_per_page) * tokens_per_page
-    
-    logger.info(f"[ElasticMem] Actual allocated tensor size: {raw_tensor.numel() * raw_tensor.element_size()} bytes")
-    logger.info(f"[ElasticMem] Derived actual_num_tokens: {actual_num_tokens} (original estimate: {block_size * blocks_per_page * num_pages})")
-    
+
+    logger.info(
+        f"[ElasticMem] Actual allocated tensor size: {raw_tensor.numel() * raw_tensor.element_size()} bytes"
+    )
+    logger.info(
+        f"[ElasticMem] Derived actual_num_tokens: {actual_num_tokens} (original estimate: {block_size * blocks_per_page * num_pages})"
+    )
+
     actual_kvcache_shape: List[int] = list(kvcache_shape)
     actual_kvcache_shape[0] = actual_num_tokens
 
@@ -177,9 +182,11 @@ def create_elastic_kv_tensors(
             k_tensors.append(t.narrow(0, 0, 1).view(actual_kvcache_shape))
             v_tensors.append(t.narrow(0, 1, 1).view(actual_kvcache_shape))
     else:
-        contiguous_tensor = raw_kv_tensors[0].view(
-            actual_num_tokens, num_layers, 2,
-            *actual_kvcache_shape[1:]).view(dtype=dtype)
+        contiguous_tensor = (
+            raw_kv_tensors[0]
+            .view(actual_num_tokens, num_layers, 2, *actual_kvcache_shape[1:])
+            .view(dtype=dtype)
+        )
         for i in range(num_layers):
             k_tensors.append(contiguous_tensor[:, i, 0, :, :])
             v_tensors.append(contiguous_tensor[:, i, 1, :, :])
@@ -192,12 +199,12 @@ def get_elasticmem_cache_manager(
     block_size: int,
     cell_size: int,
     num_layers: int,
-    reserve_null_block: bool = True
+    reserve_null_block: bool = True,
 ) -> "KVCacheManager":
     """Get elastic memory cache manager."""
     if not KVCACHED_AVAILABLE:
         raise ImportError("kvcached is not available")
-        
+
     if not _elasticmem_initialized:
         raise RuntimeError(
             "ElasticMem is not initialized. Please call init_elasticmem() first."
@@ -210,4 +217,4 @@ def get_elasticmem_cache_manager(
         num_layers,
         async_sched=_async_sched,
         reserve_null_block=reserve_null_block,
-    ) 
+    )
