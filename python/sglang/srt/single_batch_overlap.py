@@ -121,25 +121,29 @@ def _compute_overlap_args(dispatch_output, alt_stream):
 
     if SboFlags.enable_combine_down_gemm_two_stream_overlap():
         down_gemm_block_m, down_gemm_block_n = 128, 128
-        MIN_BLOCK_M = 64
+        # MIN_BLOCK_M = 64
 
         # TODO use zero_allocator to remove this `torch.zeros` call
-        combine_signal = torch.zeros(
-            num_local_experts * ceil_div(num_tokens_static, MIN_BLOCK_M),
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
-        num_signal_per_expert = ceil_div(num_tokens_static, down_gemm_block_m)
+        # combine_signal = torch.zeros(
+        #     num_local_experts * ceil_div(num_tokens_static, MIN_BLOCK_M),
+        #     dtype=torch.int32,
+        #     device=hidden_states.device,
+        # )
+        combine_signal = torch.zeros(num_local_experts, dtype=torch.int32, device=hidden_states.device)
+
+        # num_signal_per_expert = ceil_div(num_tokens_static, down_gemm_block_m)
         down_gemm_overlap_args = DownGemmOverlapArgs(
-            signal=combine_signal[:num_local_experts * num_signal_per_expert].view(
-                num_local_experts, num_signal_per_expert),
+            # signal=combine_signal[:num_local_experts * num_signal_per_expert].view(
+            #     num_local_experts, num_signal_per_expert),
+            signal=combine_signal,
             start_event=combine_wait_event,
             num_sms=compute_num_sms,
         )
         combine_overlap_args.overlap = True
         combine_overlap_args.signal = combine_signal
         combine_overlap_args.block_m = down_gemm_block_m
-        combine_overlap_args.threshold = ceil_div(hidden_dim, down_gemm_block_n)
+        # combine_overlap_args.threshold = ceil_div(hidden_dim, down_gemm_block_n)
+        combine_overlap_args.threshold = compute_num_sms
     else:
         meta_overlap_args |= dict(
             record_event_after_down=combine_wait_event,
