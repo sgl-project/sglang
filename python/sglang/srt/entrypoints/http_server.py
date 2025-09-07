@@ -135,21 +135,6 @@ def set_global_state(global_state: _GlobalState):
     _global_state = global_state
 
 
-# Function to set up all middlewares for multi-tokenizer compatibility
-def setup_middlewares(api_key: Optional[str], enable_metrics: bool):
-    """Setup all middlewares for both single and multi-process modes"""
-    worker_pid = os.getpid()
-
-    if api_key:
-        add_api_key_middleware(app, api_key)
-        logger.info(f"Worker {worker_pid} added API key middleware")
-
-    if enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
-        logger.info(f"Worker {worker_pid} added prometheus middleware")
-
-
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
     pid = os.getpid()
@@ -161,6 +146,11 @@ async def init_multi_tokenizer() -> ServerArgs:
         f"multi_tokenizer_args_{main_pid}"
     )
     server_args: ServerArgs
+
+    # API key authentication is not supported in multi-tokenizer mode
+    assert (
+        server_args.api_key is None
+    ), "API key is not supported in multi-tokenizer mode"
 
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -194,10 +184,15 @@ async def lifespan(fast_api_app: FastAPI):
     server_args = getattr(fast_api_app, "server_args", None)
     if server_args is None:
         # Initialize multi-tokenizer support for worker processes
-        fast_api_app.server_args = await init_multi_tokenizer()
-        setup_middlewares(
-            fast_api_app.server_args.api_key, fast_api_app.server_args.enable_metrics
-        )
+        fast_api_app.server_args: ServerArgs = await init_multi_tokenizer()
+
+        # only metrics middleware is supported in multi-tokenizer mode
+        worker_pid = os.getpid()
+        if fast_api_app.server_args.enable_metrics:
+            add_prometheus_middleware(app)
+            enable_func_timer()
+
+        logger.info(f"Worker {worker_pid} added prometheus middleware")
         fast_api_app.warmup_thread = threading.Thread(
             target=_wait_and_warmup,
             args=(
