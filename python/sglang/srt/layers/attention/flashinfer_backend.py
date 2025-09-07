@@ -46,8 +46,6 @@ if is_flashinfer_available():
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
 
-paged_debug_wrapper = None
-
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
@@ -259,8 +257,6 @@ class FlashInferAttnBackend(AttentionBackend):
             elif forward_batch.forward_mode.is_mixed():
                 use_ragged = True  # still use ragged kernel for non-prefix part because TMA is fast
                 wrappers = self.prefill_wrappers_mixed
-                global paged_debug_wrapper
-                paged_debug_wrapper = self.prefill_wrappers_paged[0]
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             else:
                 use_ragged = True
@@ -574,19 +570,6 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer,
                         logits_soft_cap,
                     )
-                    # o2_ref, s2_ref = paged_debug_wrapper.forward_return_lse(
-                    #     q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    #     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    #     causal=False,
-                    #     sm_scale=layer.scaling,
-                    #     logits_soft_cap=logits_soft_cap,
-                    # )
-                    # try:
-                    #     torch.testing.assert_close(o2, o2_ref, atol=1e-2, rtol=1e-2)
-                    #     torch.testing.assert_close(s2, s2_ref, atol=1e-2, rtol=1e-2)
-                    # except Exception as e:
-                    #     torch.distributed.breakpoint()
-                    #     raise e
                 else:
                     o2, s2 = prefill_wrapper_paged.forward_return_lse(
                         q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1090,21 +1073,6 @@ class FlashInferIndicesUpdaterPrefill:
 
         # cached part
         if isinstance(wrapper_paged, BatchAttention):
-            # global paged_debug_wrapper
-            # paged_debug_wrapper.plan(
-            #     qo_indptr,
-            #     kv_indptr,
-            #     kv_indices,
-            #     self.kv_last_page_len[:bs],
-            #     self.num_qo_heads,
-            #     self.num_kv_heads,
-            #     self.head_dim,
-            #     page_size=1,
-            #     q_data_type=self.q_data_type,
-            #     kv_data_type=self.data_type,
-            #     custom_mask=custom_mask,
-            #     non_blocking=True,
-            # )
             wrapper_paged.plan(
                 qo_indptr,
                 kv_indptr,
@@ -1117,7 +1085,7 @@ class FlashInferIndicesUpdaterPrefill:
                 page_size=1,
                 q_data_type=self.q_data_type,
                 kv_data_type=self.data_type,
-                causal=False,  # prefix should be attended to by all queries
+                causal=causal,
             )
         else:
             wrapper_paged.plan(
