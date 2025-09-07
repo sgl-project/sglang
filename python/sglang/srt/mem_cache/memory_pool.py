@@ -564,15 +564,25 @@ class SWAKVPool(KVCache):
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
 
-        self.swa_kv_pool = token_to_kv_pool_class(
+        # Allow overriding pool classes separately for full and swa
+        full_pool_class = kwargs.pop("full_pool_class", token_to_kv_pool_class)
+        swa_pool_class = kwargs.pop("swa_pool_class", token_to_kv_pool_class)
+
+        # Prepare kwargs per pool: full(static) does not take enable_overlap_schedule
+        swa_kwargs = dict(kwargs)
+        full_kwargs = dict(kwargs)
+        # remove elastic-only arg for static full pool
+        full_kwargs.pop("enable_overlap_schedule", None)
+
+        self.swa_kv_pool = swa_pool_class(
             size=size_swa,
             layer_num=self.swa_layer_nums,
-            **kwargs,
+            **swa_kwargs,
         )
-        self.full_kv_pool = token_to_kv_pool_class(
+        self.full_kv_pool = full_pool_class(
             size=size,
             layer_num=self.full_layer_nums,
-            **kwargs,
+            **full_kwargs,
         )
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):

@@ -1377,6 +1377,12 @@ class ModelRunner:
             "enable_kvcache_transpose": False,
             "token_to_kv_pool_class": token_to_kv_pool_class,
         }
+        # Allow swa-only elastic via env: full static, swa elastic
+        import os
+        if os.environ.get("KVCACHED_SWA_ONLY", "").lower() in ("1", "true", "yes"): 
+            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ElasticMHATokenToKVPool
+            args_to_update["full_pool_class"] = MHATokenToKVPool
+            args_to_update["swa_pool_class"] = ElasticMHATokenToKVPool
         base_args.update(args_to_update)
         base_args.pop("layer_num")
         return base_args
@@ -1401,6 +1407,11 @@ class ModelRunner:
                     "size_swa": self.swa_max_total_num_tokens,
                     "allocator_class": allocator_cls,
                 }
+                # Support different allocator classes for full vs swa
+                import os
+                if os.environ.get("KVCACHED_SWA_ONLY", "").lower() in ("1", "true", "yes"):
+                    args_to_update["full_allocator_class"] = TokenToKVPoolAllocator
+                    args_to_update["swa_allocator_class"] = ElasticTokenToKVPoolAllocator
                 allocator_args.update(args_to_update)
                 return SWATokenToKVPoolAllocator(**allocator_args)
             else:
