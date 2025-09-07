@@ -620,13 +620,18 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **(
+                    # dict(
+                    #     packed_recv_count=self.packed_recv_count,
+                    #     overlap=overlap_args.overlap,
+                    #     comp_signal=overlap_args.signal,
+                    #     block_m=overlap_args.block_m,
+                    #     threshold=overlap_args.threshold,
+                    #     num_sms=overlap_args.num_sms,
+                    # )
                     dict(
-                        packed_recv_count=self.packed_recv_count,
-                        overlap=overlap_args.overlap,
-                        comp_signal=overlap_args.signal,
-                        block_m=overlap_args.block_m,
-                        threshold=overlap_args.threshold,
-                        num_sms=overlap_args.num_sms,
+                        enable_v2=True,
+                        src_signals=overlap_args.signal,
+                        src_signal_expect_value=overlap_args.threshold,
                     )
                     if overlap_args is not None
                     else {}
