@@ -12,13 +12,14 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
+from __future__ import annotations
 
 import dataclasses
 import logging
 import signal
 import threading
 from queue import Queue
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import psutil
 import torch
@@ -37,6 +38,9 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import DynamicGradMode, get_compiler_backend
 from sglang.utils import get_exception_traceback
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +83,7 @@ class TpModelWorkerClient:
         )
 
         # Launch threads
-        self.input_queue = Queue()
+        self.input_queue = Queue[Tuple[ModelWorkerBatch, int, torch.Event]]()
         self.output_queue = Queue()
         self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
@@ -93,10 +97,10 @@ class TpModelWorkerClient:
 
         self.hicache_layer_transfer_counter = None
 
-    def register_hicache_layer_transfer_counter(self, counter):
+    def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
 
-    def set_hicache_consumer(self, consumer_index):
+    def set_hicache_consumer(self, consumer_index: int):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
@@ -147,7 +151,7 @@ class TpModelWorkerClient:
     @DynamicGradMode()
     def forward_thread_func_(self):
         batch_pt = 0
-        batch_lists = [None] * 2
+        batch_lists: List = [None] * 2
 
         while True:
             model_worker_batch, future_token_ids_ct, sync_event = self.input_queue.get()
