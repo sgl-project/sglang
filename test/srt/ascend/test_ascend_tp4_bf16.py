@@ -33,8 +33,12 @@ class TestAscendTp4Bf16(CustomTestCase):
             "--trust-remote-code",
             "--mem-fraction-static",
             0.7,
+            "--max-running-requests",
+            32,
             "--attention-backend",
             "ascend",
+            "--cuda-graph-max-bs",
+            32,
             "--tp-size",
             4,
         ]
