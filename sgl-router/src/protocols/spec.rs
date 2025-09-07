@@ -26,22 +26,27 @@ use std::collections::HashMap;
 //    - Service Tier & Tool Choice
 //    - Request/Response structures
 //
-// 4. **OPENAI SPEC - Common**
+// 4. **OPENAI SPEC - Embeddings API**
+//    - Embedding Input Types
+//    - Request/Response structures
+//    - Validation and Helpers
+//
+// 5. **OPENAI SPEC - Common**
 //    - Shared Request Components
 //    - Tool Choice Types
 //    - Usage Tracking
 //    - Logprobs Types
 //    - Error Response Types
 //
-// 5. **SGLANG SPEC - GENERATE API**
+// 6. **SGLANG SPEC - GENERATE API**
 //    - Generate Parameters
 //    - Sampling Parameters
 //    - Request/Response structures
 //
-// 6. **SGLANG SPEC - RERANK API**
+// 7. **SGLANG SPEC - RERANK API**
 //    - Request/Response structures
 //
-// 7. **COMMON**
+// 8. **COMMON**
 //    - GenerationRequest trait
 //    - StringOrArray & LoRAPath types
 //    - Helper functions
@@ -1492,6 +1497,145 @@ impl UsageInfo {
 }
 
 // ==================================================================
+// =            OPENAI SPEC - Embeddings API                       =
+// ==================================================================
+
+// ============= Embedding Input Types =============
+
+/// Multimodal embedding input support
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultimodalEmbeddingInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// Union type for embedding input
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    IntegerTokens(Vec<i32>),
+    NestedIntegerTokens(Vec<Vec<i32>>),
+    Text(String),
+    TextArray(Vec<String>),
+    Multimodal(Vec<MultimodalEmbeddingInput>),
+}
+
+// ============= Embedding Request =============
+
+/// OpenAI-compatible embedding request
+/// Spec: https://platform.openai.com/docs/api-reference/embeddings/create
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    /// The input text to embed
+    pub input: EmbeddingInput,
+
+    /// ID of the model to use
+    #[serde(default = "default_model_name")]
+    pub model: String,
+
+    /// The format of the embedding output: "float" or "base64"
+    #[serde(default = "default_encoding_format")]
+    pub encoding_format: String,
+
+    /// The number of dimensions the resulting output embeddings should have
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<i32>,
+
+    /// A unique identifier representing your end-user
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    // SGLang specific extensions
+    /// Request ID for tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rid: Option<StringOrArray>,
+}
+
+fn default_encoding_format() -> String {
+    "float".to_string()
+}
+
+// ============= Embedding Response =============
+
+/// Individual embedding object
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingObject {
+    pub embedding: Vec<f32>,
+    pub index: usize,
+    #[serde(default = "default_embedding_object")]
+    pub object: String,
+}
+
+fn default_embedding_object() -> String {
+    "embedding".to_string()
+}
+
+/// Embedding response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    pub data: Vec<EmbeddingObject>,
+    pub model: String,
+    #[serde(default = "default_list_object")]
+    pub object: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageInfo>,
+}
+
+fn default_list_object() -> String {
+    "list".to_string()
+}
+
+// ============= Trait Implementation =============
+
+impl GenerationRequest for EmbeddingRequest {
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn is_stream(&self) -> bool {
+        false // Embeddings don't support streaming
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        self.normalize_input().join(" ")
+    }
+}
+
+// ============= Validation and Helpers =============
+
+impl EmbeddingRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate encoding format
+        if !["float", "base64"].contains(&self.encoding_format.as_str()) {
+            return Err(format!("Invalid encoding format: {}", self.encoding_format));
+        }
+
+        // Validate dimensions if specified
+        if let Some(dims) = self.dimensions {
+            if dims <= 0 {
+                return Err("Dimensions must be positive".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convert input to appropriate format for processing
+    pub fn normalize_input(&self) -> Vec<String> {
+        match &self.input {
+            EmbeddingInput::Text(s) => vec![s.clone()],
+            EmbeddingInput::TextArray(arr) => arr.clone(),
+            EmbeddingInput::Multimodal(items) => {
+                items.iter().filter_map(|item| item.text.clone()).collect()
+            }
+            _ => vec![], // Token inputs need tokenizer handling
+        }
+    }
+}
+
+// ==================================================================
 // =            OPENAI SPEC - Common                                =
 // ==================================================================
 
@@ -1620,6 +1764,44 @@ pub struct TopLogProb {
     pub token: String,
     pub logprob: f32,
     pub bytes: Option<Vec<u8>>,
+}
+
+// ============= OpenAI Request Union =============
+
+/// Union type for all OpenAI-compatible requests
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAIServingRequest {
+    ChatCompletion(ChatCompletionRequest),
+    Completion(CompletionRequest),
+    Embedding(EmbeddingRequest),
+    // Add other types as they're implemented
+}
+
+impl GenerationRequest for OpenAIServingRequest {
+    fn get_model(&self) -> Option<&str> {
+        match self {
+            OpenAIServingRequest::ChatCompletion(req) => req.get_model(),
+            OpenAIServingRequest::Completion(req) => req.get_model(),
+            OpenAIServingRequest::Embedding(req) => req.get_model(),
+        }
+    }
+
+    fn is_stream(&self) -> bool {
+        match self {
+            OpenAIServingRequest::ChatCompletion(req) => req.is_stream(),
+            OpenAIServingRequest::Completion(req) => req.is_stream(),
+            OpenAIServingRequest::Embedding(req) => req.is_stream(),
+        }
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        match self {
+            OpenAIServingRequest::ChatCompletion(req) => req.extract_text_for_routing(),
+            OpenAIServingRequest::Completion(req) => req.extract_text_for_routing(),
+            OpenAIServingRequest::Embedding(req) => req.extract_text_for_routing(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2677,5 +2859,380 @@ mod tests {
         let deserialized: RerankResponse = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.results.len(), 2);
         assert_eq!(deserialized.model, response.model);
+    }
+
+    // ==================================================================
+    // =            EMBEDDING REQUEST TESTS                             =
+    // ==================================================================
+
+    #[test]
+    fn test_embedding_request_serialization() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Text("test text".to_string()),
+            model: "text-embedding-ada-002".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: Some(1536),
+            user: Some("user-123".to_string()),
+            rid: Some(StringOrArray::String("req-456".to_string())),
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let deserialized: EmbeddingRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.model, request.model);
+        assert_eq!(deserialized.encoding_format, request.encoding_format);
+        assert_eq!(deserialized.dimensions, request.dimensions);
+        assert_eq!(deserialized.user, request.user);
+        assert_eq!(deserialized.rid, request.rid);
+    }
+
+    #[test]
+    fn test_embedding_request_deserialization_with_defaults() {
+        let json = r#"{
+            "input": "test text"
+        }"#;
+
+        let request: EmbeddingRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(request.model, default_model_name());
+        assert_eq!(request.encoding_format, "float");
+        assert_eq!(request.dimensions, None);
+        assert_eq!(request.user, None);
+        assert_eq!(request.rid, None);
+    }
+
+    #[test]
+    fn test_embedding_input_text() {
+        let input = EmbeddingInput::Text("hello world".to_string());
+        let json = serde_json::to_string(&input).unwrap();
+        let deserialized: EmbeddingInput = serde_json::from_str(&json).unwrap();
+
+        match deserialized {
+            EmbeddingInput::Text(text) => assert_eq!(text, "hello world"),
+            _ => panic!("Expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_text_array() {
+        let input = EmbeddingInput::TextArray(vec!["hello".to_string(), "world".to_string()]);
+        let json = serde_json::to_string(&input).unwrap();
+        let deserialized: EmbeddingInput = serde_json::from_str(&json).unwrap();
+
+        match deserialized {
+            EmbeddingInput::TextArray(arr) => assert_eq!(arr, vec!["hello", "world"]),
+            _ => panic!("Expected TextArray variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_integer_tokens() {
+        let input = EmbeddingInput::IntegerTokens(vec![1, 2, 3, 4]);
+        let json = serde_json::to_string(&input).unwrap();
+        let deserialized: EmbeddingInput = serde_json::from_str(&json).unwrap();
+
+        match deserialized {
+            EmbeddingInput::IntegerTokens(tokens) => assert_eq!(tokens, vec![1, 2, 3, 4]),
+            _ => panic!("Expected IntegerTokens variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_nested_integer_tokens() {
+        let input = EmbeddingInput::NestedIntegerTokens(vec![vec![1, 2], vec![3, 4]]);
+        let json = serde_json::to_string(&input).unwrap();
+        let deserialized: EmbeddingInput = serde_json::from_str(&json).unwrap();
+
+        match deserialized {
+            EmbeddingInput::NestedIntegerTokens(nested) => {
+                assert_eq!(nested, vec![vec![1, 2], vec![3, 4]])
+            }
+            _ => panic!("Expected NestedIntegerTokens variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_input_multimodal() {
+        let input = EmbeddingInput::Multimodal(vec![
+            MultimodalEmbeddingInput {
+                text: Some("hello".to_string()),
+                image: Some("base64_image_data".to_string()),
+            },
+            MultimodalEmbeddingInput {
+                text: Some("world".to_string()),
+                image: None,
+            },
+        ]);
+        let json = serde_json::to_string(&input).unwrap();
+        let deserialized: EmbeddingInput = serde_json::from_str(&json).unwrap();
+
+        match deserialized {
+            EmbeddingInput::Multimodal(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].text, Some("hello".to_string()));
+                assert_eq!(items[0].image, Some("base64_image_data".to_string()));
+                assert_eq!(items[1].text, Some("world".to_string()));
+                assert_eq!(items[1].image, None);
+            }
+            _ => panic!("Expected Multimodal variant"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_request_validation_success() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Text("test".to_string()),
+            model: "test-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: Some(512),
+            user: None,
+            rid: None,
+        };
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_embedding_request_validation_invalid_encoding_format() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Text("test".to_string()),
+            model: "test-model".to_string(),
+            encoding_format: "invalid".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+
+        let result = request.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid encoding format"));
+    }
+
+    #[test]
+    fn test_embedding_request_validation_negative_dimensions() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Text("test".to_string()),
+            model: "test-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: Some(-1),
+            user: None,
+            rid: None,
+        };
+
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Dimensions must be positive");
+    }
+
+    #[test]
+    fn test_embedding_request_validation_zero_dimensions() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Text("test".to_string()),
+            model: "test-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: Some(0),
+            user: None,
+            rid: None,
+        };
+
+        let result = request.validate();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Dimensions must be positive");
+    }
+
+    #[test]
+    fn test_embedding_request_normalize_input_text() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Text("hello world".to_string()),
+            model: "test-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+
+        let normalized = request.normalize_input();
+        assert_eq!(normalized, vec!["hello world"]);
+    }
+
+    #[test]
+    fn test_embedding_request_normalize_input_text_array() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::TextArray(vec!["hello".to_string(), "world".to_string()]),
+            model: "test-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+
+        let normalized = request.normalize_input();
+        assert_eq!(normalized, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_embedding_request_normalize_input_multimodal() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Multimodal(vec![
+                MultimodalEmbeddingInput {
+                    text: Some("hello".to_string()),
+                    image: Some("image1".to_string()),
+                },
+                MultimodalEmbeddingInput {
+                    text: None,
+                    image: Some("image2".to_string()),
+                },
+                MultimodalEmbeddingInput {
+                    text: Some("world".to_string()),
+                    image: None,
+                },
+            ]),
+            model: "test-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+
+        let normalized = request.normalize_input();
+        assert_eq!(normalized, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_embedding_request_normalize_input_tokens() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::IntegerTokens(vec![1, 2, 3]),
+            model: "test-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+
+        let normalized = request.normalize_input();
+        assert_eq!(normalized, Vec::<String>::new()); // Token inputs return empty vec
+    }
+
+    // ==================================================================
+    // =            EMBEDDING RESPONSE TESTS                            =
+    // ==================================================================
+
+    #[test]
+    fn test_embedding_response_serialization() {
+        let response = EmbeddingResponse {
+            data: vec![
+                EmbeddingObject {
+                    embedding: vec![0.1, 0.2, 0.3],
+                    index: 0,
+                    object: "embedding".to_string(),
+                },
+                EmbeddingObject {
+                    embedding: vec![0.4, 0.5, 0.6],
+                    index: 1,
+                    object: "embedding".to_string(),
+                },
+            ],
+            model: "text-embedding-ada-002".to_string(),
+            object: "list".to_string(),
+            usage: Some(UsageInfo {
+                prompt_tokens: 10,
+                completion_tokens: 0,
+                total_tokens: 10,
+                reasoning_tokens: None,
+                prompt_tokens_details: None,
+            }),
+        };
+
+        let serialized = serde_json::to_string(&response).unwrap();
+        let deserialized: EmbeddingResponse = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.data.len(), 2);
+        assert_eq!(deserialized.data[0].embedding, vec![0.1, 0.2, 0.3]);
+        assert_eq!(deserialized.data[0].index, 0);
+        assert_eq!(deserialized.data[1].embedding, vec![0.4, 0.5, 0.6]);
+        assert_eq!(deserialized.data[1].index, 1);
+        assert_eq!(deserialized.model, "text-embedding-ada-002");
+        assert_eq!(deserialized.object, "list");
+        assert!(deserialized.usage.is_some());
+    }
+
+    #[test]
+    fn test_embedding_object_defaults() {
+        let obj = EmbeddingObject {
+            embedding: vec![1.0, 2.0],
+            index: 0,
+            object: default_embedding_object(),
+        };
+
+        assert_eq!(obj.object, "embedding");
+    }
+
+    // ==================================================================
+    // =            GENERATION REQUEST TRAIT TESTS                      =
+    // ==================================================================
+
+    #[test]
+    fn test_embedding_request_generation_request_trait() {
+        let request = EmbeddingRequest {
+            input: EmbeddingInput::Text("test query".to_string()),
+            model: "test-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+
+        assert_eq!(request.get_model(), Some("test-model"));
+        assert!(!request.is_stream());
+        assert_eq!(request.extract_text_for_routing(), "test query");
+    }
+
+    // ==================================================================
+    // =            OPENAI SERVING REQUEST UNION TESTS                  =
+    // ==================================================================
+
+    #[test]
+    fn test_openai_serving_request_embedding() {
+        let embedding_req = EmbeddingRequest {
+            input: EmbeddingInput::Text("test".to_string()),
+            model: "test-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+
+        let serving_req = OpenAIServingRequest::Embedding(embedding_req);
+
+        assert_eq!(serving_req.get_model(), Some("test-model"));
+        assert!(!serving_req.is_stream());
+        assert_eq!(serving_req.extract_text_for_routing(), "test");
+    }
+
+    #[test]
+    fn test_openai_serving_request_serialization() {
+        let embedding_req = EmbeddingRequest {
+            input: EmbeddingInput::Text("test".to_string()),
+            model: "test-model".to_string(),
+            encoding_format: "float".to_string(),
+            dimensions: None,
+            user: None,
+            rid: None,
+        };
+
+        let serving_req = OpenAIServingRequest::Embedding(embedding_req);
+        let serialized = serde_json::to_string(&serving_req).unwrap();
+        let deserialized: OpenAIServingRequest = serde_json::from_str(&serialized).unwrap();
+
+        match deserialized {
+            OpenAIServingRequest::Embedding(req) => {
+                assert_eq!(req.model, "test-model");
+                match req.input {
+                    EmbeddingInput::Text(text) => assert_eq!(text, "test"),
+                    _ => panic!("Expected Text input"),
+                }
+            }
+            _ => panic!("Expected Embedding variant"),
+        }
     }
 }
