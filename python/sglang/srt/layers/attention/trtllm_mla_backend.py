@@ -588,55 +588,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
         return output
 
-    def forward_extend(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
-        q_rope: Optional[torch.Tensor] = None,
-        k_rope: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
-        ):
-            return super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
-            )
-
-        if not forward_batch.attn_attend_prefix_cache:
-            q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-            k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-            v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
-            output = flashinfer.prefill.trtllm_ragged_attention_deepseek(
-                query=q,
-                key=k,
-                value=v,
-                workspace_buffer=self.workspace_buffer,
-                seq_lens=self.forward_prefill_metadata.seq_lens,
-                max_q_len=self.forward_prefill_metadata.max_seq_len,
-                max_kv_len=self.forward_prefill_metadata.max_seq_len,
-                bmm1_scale=layer.scaling,
-                bmm2_scale=1.0,
-                o_sf_scale=1.0,
-                batch_size=forward_batch.batch_size,
-                window_left=-1,
-                cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
-                cum_seq_lens_kv=self.forward_prefill_metadata.cum_seq_lens,
-                enable_pdl=False,
-                is_causal=True,
-                return_lse=forward_batch.mha_return_lse,
-            )
-        else:
-            # replace with trtllm ragged attention once accuracy is resolved.
-            output = super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
-            )
-        return output
-
 class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
 
