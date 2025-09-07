@@ -235,11 +235,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
-        
+
         # Use specific allocator classes if provided, otherwise fallback to allocator_class
         full_alloc_class = full_allocator_class or allocator_class
         swa_alloc_class = swa_allocator_class or allocator_class
-        
+
         self.full_attn_allocator = full_alloc_class(
             size,
             dtype,
@@ -303,9 +303,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices.to(torch.int64)
+        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices.to(
+            torch.int64
+        )
         return alloc_full_indices
-    
+
     def _is_elastic(self, alloc):
         return hasattr(alloc, "kvcached_allocator")
 
@@ -323,10 +325,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if not self._is_elastic(self.full_attn_allocator):
             assert (
-                self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+                self.full_attn_allocator.available_size()
+                <= self.full_attn_allocator.size
             )
         if not self._is_elastic(self.swa_attn_allocator):
-            assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+            assert (
+                self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+            )
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]

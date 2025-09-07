@@ -454,13 +454,13 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
     ):
         # Import the interface locally to avoid circular imports
         from .elastic_mem_interface import (
-            is_elasticmem_available,
-            init_elasticmem,
             create_elastic_kv_tensors,
             get_elasticmem_cache_manager,
+            init_elasticmem,
+            is_elasticmem_available,
             shutdown_elasticmem,
         )
-        
+
         if not is_elasticmem_available():
             raise ImportError(
                 "ElasticMem is not available. Please install kvcached with "
@@ -480,7 +480,7 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
         )
-        
+
         self.head_num = head_num
         self.head_dim = head_dim
         self.custom_mem_pool = None
@@ -516,6 +516,7 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
         """Best-effort cleanup when object is destroyed."""
         try:
             from .elastic_mem_interface import shutdown_elasticmem
+
             shutdown_elasticmem()
         except Exception:
             pass
@@ -523,7 +524,7 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool):
     def _create_buffers(self):
         """Create KV buffers using elasticmem interface."""
         from .elastic_mem_interface import create_elastic_kv_tensors
-        
+
         if "cuda" not in self.device:
             raise ValueError("ElasticMHATokenToKVPool only supports cuda device")
 

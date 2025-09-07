@@ -1379,7 +1379,11 @@ class ModelRunner:
         }
         # In elastic mode: force full static, swa elastic
         if self.is_elastic:
-            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ElasticMHATokenToKVPool
+            from sglang.srt.mem_cache.memory_pool import (
+                ElasticMHATokenToKVPool,
+                MHATokenToKVPool,
+            )
+
             args_to_update["full_pool_class"] = MHATokenToKVPool
             args_to_update["swa_pool_class"] = ElasticMHATokenToKVPool
         base_args.update(args_to_update)
@@ -1409,7 +1413,9 @@ class ModelRunner:
                 # In elastic mode: force full static allocator, swa elastic allocator
                 if self.is_elastic:
                     args_to_update["full_allocator_class"] = TokenToKVPoolAllocator
-                    args_to_update["swa_allocator_class"] = ElasticTokenToKVPoolAllocator
+                    args_to_update["swa_allocator_class"] = (
+                        ElasticTokenToKVPoolAllocator
+                    )
                 allocator_args.update(args_to_update)
                 return SWATokenToKVPoolAllocator(**allocator_args)
             else:
