@@ -861,12 +861,7 @@ def _launch_subprocesses(
     if server_args.tokenizer_worker_num > 1:
         # Launch multi-tokenizer router
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-
-        # Initialize templates
         template_manager = None
-
-        # Assume all schedulers have the same scheduler_info
-        tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     else:
         tokenizer_manager, template_manager = _init_tokenizer_manager(
             server_args, port_args, scheduler_info
