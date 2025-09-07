@@ -437,8 +437,8 @@ void transfer_kv_all_layer_mla_lf_pf(
 }
 
 inline void transfer_page_direct(
-    const at::Tensor src_buffer,
-    at::Tensor dst_buffer,
+    const at::Tensor& src_buffer,
+    at::Tensor& dst_buffer,
     int64_t src_page_index,
     int64_t dst_page_index,
     int64_t page_size) {
@@ -506,7 +506,6 @@ inline void transfer_kv_page_first_direct_impl(
   TORCH_CHECK(page_size > 0, "Page size must be positive");
   TORCH_CHECK(src_indices.numel() % page_size == 0, "Source indices size must be divisible by page size");
 
-
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
   const int64_t num_pages = src_indices_cpu.size(0) / page_size;
@@ -515,16 +514,19 @@ inline void transfer_kv_page_first_direct_impl(
     const bool is_mla = dst_ptrs.size() == 1;
     const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
 
-    for (int64_t j = 0; j < num_layers; ++j) {
-      for (const auto i : c10::irange(num_pages)) {
-        auto s_index = src_indices_cpu[i * page_size].item<int64_t>();
-        auto d_index = dst_indices_cpu[i * page_size].item<int64_t>() / page_size;
-
-        if (is_mla) {
-          transfer_page_direct(src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
-        } else {
-          transfer_page_direct(src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
-          transfer_page_direct(src_ptrs[j + num_layers], dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+    for (const auto i : c10::irange(num_pages)) {
+      auto s_index = src_indices_cpu[i * page_size].item<int64_t>();
+      auto d_index = dst_indices_cpu[i * page_size].item<int64_t>() / page_size;
+      for (int64_t j = 0; j < num_layers; ++j) {
+        transfer_page_direct(
+            src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+        if (!is_mla) {
+          transfer_page_direct(
+              src_ptrs[j + num_layers],
+              dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
+              s_index,
+              0,
+              page_size);
         }
       }
     }
@@ -532,16 +534,19 @@ inline void transfer_kv_page_first_direct_impl(
     const bool is_mla = src_ptrs.size() == 1;
     const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
 
-    for (int64_t j = 0; j < num_layers; ++j) {
-      for (const auto i : c10::irange(num_pages)) {
-        auto s_index = src_indices_cpu[i * page_size].item<int64_t>() / page_size;
-        auto d_index = dst_indices_cpu[i * page_size].item<int64_t>();
-
-        if (is_mla) {
-          transfer_page_direct(src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
-        } else {
-          transfer_page_direct(src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
-          transfer_page_direct(src_ptrs[1].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j + num_layers], 0, d_index, page_size);
+    for (const auto i : c10::irange(num_pages)) {
+      auto s_index = src_indices_cpu[i * page_size].item<int64_t>() / page_size;
+      auto d_index = dst_indices_cpu[i * page_size].item<int64_t>();
+      for (int64_t j = 0; j < num_layers; ++j) {
+        transfer_page_direct(
+            src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+        if (!is_mla) {
+          transfer_page_direct(
+              src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
+              dst_ptrs[j + num_layers],
+              0,
+              d_index,
+              page_size);
         }
       }
     }
@@ -555,13 +560,7 @@ void transfer_kv_per_layer_direct_pf_lf(
     const at::Tensor& dst_indices,
     int64_t layer_id,
     int64_t page_size) {
-  transfer_kv_page_first_direct_impl<false>(
-      src_ptrs,
-      dst_ptrs,
-      src_indices,
-      dst_indices,
-      layer_id,
-      page_size);
+  transfer_kv_page_first_direct_impl<false>(src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size);
 }
 
 void transfer_kv_all_layer_direct_lf_pf(
@@ -570,11 +569,5 @@ void transfer_kv_all_layer_direct_lf_pf(
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
     int64_t page_size) {
-  transfer_kv_page_first_direct_impl<true>(
-      src_ptrs,
-      dst_ptrs,
-      src_indices,
-      dst_indices,
-      0,
-      page_size);
+  transfer_kv_page_first_direct_impl<true>(src_ptrs, dst_ptrs, src_indices, dst_indices, 0, page_size);
 }
