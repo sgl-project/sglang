@@ -45,6 +45,8 @@ from sglang.srt.utils import (
     nullable_str,
 )
 
+from sglang.srt.model_executor.compilation.config import CompilationConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -327,6 +329,7 @@ class ServerArgs:
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    enable_piecewise_graph: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
@@ -377,6 +380,8 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
+
+    compilation_config: Optional[CompilationConfig] = None
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -536,6 +541,7 @@ class ServerArgs:
                 "Cuda graph is disabled because of using torch native attention backend"
             )
             self.disable_cuda_graph = True
+            self.enable_piecewise_graph = False
 
         if self.attention_backend == "ascend":
             logger.warning(
@@ -603,6 +609,7 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_cuda_graph = True
+            self.enable_piecewise_graph = False
             self.disable_radix_cache = True
 
         # Set page size
@@ -656,6 +663,7 @@ class ServerArgs:
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
+                self.enable_piecewise_graph = False
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -807,6 +815,8 @@ class ServerArgs:
 
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
+            self.enable_piecewise_graph = False
+            logger.warning("Piecewise graph is disabled for prefill server")
 
         # Propagate env vars
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
@@ -816,6 +826,10 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        if not self.compilation_config:
+            self.compilation_config = CompilationConfig()
+            self.compilation_config.splitting_ops = ["atb._npu_paged_attention"]
 
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
@@ -1495,6 +1509,13 @@ class ServerArgs:
             help="Set multimodal attention backend.",
         )
 
+        parser.add_argument(
+            "--compilation-config",
+            type=CompilationConfig.from_cli,
+            default=None,
+            help="Compilation config.",
+        )
+
         # Speculative decoding
         parser.add_argument(
             "--speculative-algorithm",
@@ -1835,6 +1856,11 @@ class ServerArgs:
             "--disable-cuda-graph",
             action="store_true",
             help="Disable cuda graph.",
+        )
+        parser.add_argument(
+            "--enable-piecewise-graph",
+            action="store_true",
+            help="Enable piecewise graph.",
         )
         parser.add_argument(
             "--disable-cuda-graph-padding",
