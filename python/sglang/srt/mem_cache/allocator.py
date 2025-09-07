@@ -192,28 +192,28 @@ class ElasticTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 f"ElasticTokenToKVPoolAllocator requires kvcache to be an ElasticMHATokenToKVPool, but got {type(kvcache)}"
             )
 
-        self.kvcached_allocator = kvcache.kvcached_allocator
+        self.elasticmem_allocator = kvcache.elasticmem_allocator
 
         if "cuda" not in device:
             raise ValueError("ElasticTokenToKVPoolAllocator only supports cuda device")
 
     def available_size(self):
-        return self.kvcached_allocator.available_size()
+        return self.elasticmem_allocator.available_size()
 
     def alloc(self, need_size: int):
-        indices: List[int] = self.kvcached_allocator.alloc(need_size)
+        indices: List[int] = self.elasticmem_allocator.alloc(need_size)
         indices = torch.tensor(indices, dtype=torch.int32, device="cuda")
         return indices
 
     def free(self, free_index: torch.Tensor):
         if self.is_not_in_free_group:
-            return self.kvcached_allocator.free(free_index.cpu().numpy().tolist())
+            return self.elasticmem_allocator.free(free_index.cpu().numpy().tolist())
         else:
             self.free_group.append(free_index)
 
     def clear(self):
-        if hasattr(self, "kvcached_allocator"):
-            self.kvcached_allocator.clear()
+        if hasattr(self, "elasticmem_allocator"):
+            self.elasticmem_allocator.clear()
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -299,6 +299,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices.to(torch.int64)
         return alloc_full_indices
 
+    def _is_elastic(self, alloc):
+        return hasattr(alloc, "elasticmem_allocator")
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
@@ -307,9 +310,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
-
-        def _is_elastic(self, alloc):
-            return hasattr(alloc, "kvcached_allocator")
 
         if not self._is_elastic(self.full_attn_allocator):
             assert (
