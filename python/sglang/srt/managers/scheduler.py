@@ -1103,7 +1103,7 @@ class Scheduler(
             if is_work_request(recv_req):
                 if len(self.waiting_queue) + 1 > self.max_queued_requests:
                     abort_req = AbortReq(
-                        recv_req.rid,
+                        rid=recv_req.rid,
                         finished_reason={
                             "type": "abort",
                             "status_code": HTTPStatus.SERVICE_UNAVAILABLE,

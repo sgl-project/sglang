@@ -38,7 +38,7 @@ else:
 
 @dataclass
 class BaseReq(ABC):
-    rid: Optional[Union[str, List[str]]] = None
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -51,7 +51,7 @@ class BaseReq(ABC):
 
 @dataclass
 class BaseBatchReq(ABC):
-    rids: Optional[List[str]] = None
+    rids: Optional[List[str]] = field(default=None, kw_only=True)
 
     def regenerate_rids(self):
         """Generate new request IDs and return them."""

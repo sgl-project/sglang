@@ -719,6 +719,10 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens.append(req.cached_tokens)
         self.send_to_detokenizer.send_pyobj(
             BatchEmbeddingOut(
-                rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
+                finished_reasons,
+                embeddings,
+                prompt_tokens,
+                cached_tokens,
+                rids=rids,
             )
         )
