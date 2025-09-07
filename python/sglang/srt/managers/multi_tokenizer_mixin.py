@@ -53,32 +53,24 @@ class MultiTokenizerMixin:
         if not hasattr(self, "_zmq_context"):
             self._zmq_context = zmq.Context()
 
-    def init_tokenizer_mapping(
-        self, recv_obj: MultiTokenizerRegisterReq, worker_id: str
+    def register_ipc_mapping(
+        self, recv_obj: MultiTokenizerRegisterReq, worker_id: str, is_tokenizer: bool
     ):
-        """init tokenizer mapping from register request"""
-        ipc_name = recv_obj.ipc_name
-        worker_id_int = int(worker_id)
+        """register ipc mapping from register request"""
+        type_str = "tokenizer" if is_tokenizer else "detokenizer"
+        if worker_id in self.tokenizer_mapping:
+            logger.warning(
+                f"{type_str} already registered with worker {worker_id}, skipping..."
+            )
+            return
 
-        if worker_id_int not in self.tokenizer_mapping:
-            socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
-            self.tokenizer_mapping[worker_id_int] = socket
-            self.tokenizer_mapping[worker_id_int].send_pyobj(recv_obj)
-            return True
-        else:
-            return False
+        logger.info(
+            f"{type_str} not registered with worker {worker_id}, registering..."
+        )
 
-    def register_tokenizer_ipc(self, recv_obj, worker_id):
-        if worker_id not in self.tokenizer_mapping:
-            # register the worker if not already done
-            if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                return self.init_tokenizer_mapping(recv_obj, worker_id)
-            else:
-                logger.error(
-                    f"Worker {worker_id} not registered and not found in tokenizer mapping . "
-                    "Please ensure the worker is registered correctly."
-                )
-        return False
+        socket = get_zmq_socket(self._zmq_context, zmq.PUSH, recv_obj.ipc_name, False)
+        self.tokenizer_mapping[worker_id] = socket
+        self.tokenizer_mapping[worker_id].send_pyobj(recv_obj)
 
     def _handle_output_by_index(self, output, i):
         """NOTE: A maintainable method is better here."""
@@ -368,11 +360,7 @@ class MultiTokenizerMixin:
             # Send data using the corresponding socket
             for i, worker_id in enumerate(worker_ids):
                 if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                    if self.register_tokenizer_ipc(recv_obj, worker_id):
-                        logger.info(
-                            f"DetokenizerManager Created ZMQ socket for worker {worker_id}"
-                        )
-                    continue
+                    self.register_ipc_mapping(recv_obj, worker_id, is_tokenizer=False)
                 else:
                     if worker_id not in self.tokenizer_mapping:
                         logger.error(
@@ -453,11 +441,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
         # Distribute result to each worker
         for i, worker_id in enumerate(worker_ids):
             if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                if self.register_tokenizer_ipc(recv_obj, worker_id):
-                    logger.info(
-                        f"MultiTokenizerRouter Created ZMQ socket for worker {worker_id}"
-                    )
-                continue
+                self.register_ipc_mapping(recv_obj, worker_id, is_tokenizer=True)
             else:
                 if worker_id not in self.tokenizer_mapping:
                     logger.error(
