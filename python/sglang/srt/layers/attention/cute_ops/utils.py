@@ -1,15 +1,14 @@
 # Copyright (c) 2025, Tri Dao.
 
 import math
-from typing import Type, Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
-
 from cutlass import Float32, Int32
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import nvvm, llvm, arith, vector
+from cutlass._mlir.dialects import arith, llvm, nvvm, vector
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:

@@ -1,10 +1,11 @@
 # Copyright (c) 2025, Tri Dao.
 from typing import Optional, Tuple
+
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cutlass_dsl import T
-from cutlass._mlir.dialects import llvm
 
 import sglang.srt.layers.attention.cute_ops.mma_sm100_desc as sm100_desc
 

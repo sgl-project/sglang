@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional
 from dataclasses import dataclass
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute

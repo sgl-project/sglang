@@ -16,8 +16,8 @@ from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 def _green(x: str) -> str:
@@ -75,11 +75,16 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
             cu_seqlens_q = cu_seqlens_k
 
         if self.page_size > 1:
-            strided_indices = torch.arange(0, page_table.shape[1], self.page_size, device=self.device)
+            strided_indices = torch.arange(
+                0, page_table.shape[1], self.page_size, device=self.device
+            )
             page_table = page_table[:, strided_indices] // self.page_size
 
         self.forward_metadata = ForwardMetaData(
-            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, page_table=page_table, seqlens_k=seqlens_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            page_table=page_table,
+            seqlens_k=seqlens_k,
         )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -141,7 +146,12 @@ class BlackwellPrefillAttentionBackend(AttentionBackend):
             page_table=metadata.page_table,
             softcap=layer.logit_cap,
             softmax_scale=layer.scaling,
-            window_size=(layer.sliding_window_size, 0) if layer.sliding_window_size is not None and layer.sliding_window_size > 0 else (None, None),
+            window_size=(
+                (layer.sliding_window_size, 0)
+                if layer.sliding_window_size is not None
+                and layer.sliding_window_size > 0
+                else (None, None)
+            ),
             causal=True,
             learnable_sink=sinks.to(torch.bfloat16) if sinks is not None else None,
         )[0]

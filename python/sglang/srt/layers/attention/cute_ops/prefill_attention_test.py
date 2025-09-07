@@ -1,6 +1,7 @@
 """Tests for prefill_attention."""
 
 from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -47,8 +48,6 @@ def _ref_impl(
     if v.shape[1] != q.shape[1]:
         v = torch.repeat_interleave(v, repeats=q.shape[1] // v.shape[1], dim=1)
 
-    print(f"---> DEBUG: {q.shape=} {k.shape=} {v.shape=}", flush=True)
-
     num_seqs = cu_seqlens_q.shape[0] - 1 if cu_seqlens_q is not None else 1
 
     out = torch.empty_like(q)
@@ -89,9 +88,6 @@ def _ref_impl(
                     None, :
                 ]
             )
-
-            # TODO(hieu): continue here. why is the result wrong whenever qo_len, kv_len are not all the same number??
-            # print(_green("--> DEBUG:"), f"{i=} {kv_start=:<4d} {kv_final=} {qo_len=} {kv_len=} {curr_q.shape=} {curr_k.shape=} {mask[:, None, :].shape=} {logits.shape=} {cu_seqlens_k=}")
 
             logits = torch.where(
                 mask[:, None, :],
@@ -166,11 +162,6 @@ def test_ragged(
     )
     diff = (out - ref).abs_().max().item()
 
-    print(
-        _green(f"--> {q.shape=} {k.shape=} {v.shape=}"),
-        f"{ref.shape=}",
-        f"{out.shape=}",
-    )
     print(_green("max_diff: "), f"{diff:<.5f}", flush=True)
 
 
@@ -190,91 +181,57 @@ def test_paged(
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    init_range = 1.0
-
     assert len(qo_lens) == len(kv_lens)
     assert all(qo_len <= kv_len for qo_len, kv_len in zip(qo_lens, kv_lens))
 
-    # num_pages = 22412
+    num_seqs = len(qo_lens)
+    qo_len = sum(qo_lens)
+    max_num_pages = (max(kv_lens) + page_size - 1) // page_size
 
-    # qo_len = sum(qo_lens)
-    # max_num_pages = (max(kv_lens) + page_size - 1) // page_size
+    seqlens_q = torch.tensor(list(qo_lens), dtype=torch.int32, device="cuda")
+    seqlens_k = torch.tensor(list(kv_lens), dtype=torch.int32, device="cuda")
+    cu_seqlens_q = F.pad(
+        torch.cumsum(seqlens_q, dim=0, dtype=torch.int32),
+        pad=(1, 0),
+        mode="constant",
+        value=0,
+    )
+    cu_seqlens_k = F.pad(
+        torch.cumsum(seqlens_k, dim=0, dtype=torch.int32),
+        pad=(1, 0),
+        mode="constant",
+        value=0,
+    )
 
-    # seqlens_q = torch.tensor(list(qo_lens), dtype=torch.int32, device="cuda")
-    # seqlens_k = torch.tensor(list(kv_lens), dtype=torch.int32, device="cuda")
-    # cu_seqlens_q = F.pad(
-    #     torch.cumsum(seqlens_q, dim=0, dtype=torch.int32),
-    #     pad=(1, 0),
-    #     mode="constant",
-    #     value=0,
-    # )
-    # cu_seqlens_k = F.pad(
-    #     torch.cumsum(seqlens_k, dim=0, dtype=torch.int32),
-    #     pad=(1, 0),
-    #     mode="constant",
-    #     value=0,
-    # )
+    q = torch.empty(
+        size=(qo_len, num_qo_heads, head_dim), dtype=dtype, device="cuda"
+    ).uniform_(-init_range, init_range)
+    k_cache = torch.empty(
+        size=(num_pages + 1, page_size, num_kv_heads, head_dim),
+        dtype=dtype,
+        device="cuda",
+    ).uniform_(-init_range, init_range)
+    v_cache = torch.empty(
+        size=(num_pages + 1, page_size, num_kv_heads, head_dim),
+        dtype=dtype,
+        device="cuda",
+    ).uniform_(-init_range, init_range)
 
-    print("loading...", flush=True)
-    from pathlib import Path
-    out_path = Path("/sgl-workspace/debug_output")
-    q = torch.load(str((out_path / "q.pt").absolute())).reshape(-1, num_qo_heads, head_dim)
-    k = torch.load(str((out_path / "k.pt").absolute()))
-    v = torch.load(str((out_path / "v.pt").absolute()))
-    k_cache = torch.load(str((out_path / "k_cache.pt").absolute()))
-    v_cache = torch.load(str((out_path / "v_cache.pt").absolute()))
-    cu_seqlens_q = torch.load(str((out_path / "cu_seqlens_q.pt").absolute()))
-    cu_seqlens_k = torch.load(str((out_path / "cu_seqlens_k.pt").absolute()))
-    page_table = torch.load(str((out_path / "page_table.pt").absolute()))
-    out_backend = torch.load(str((out_path / "out_backend.pt").absolute()))
-    ref_backend = torch.load(str((out_path / "ref_backend.pt").absolute()))
-
-    # cu_seqlens_q = torch.tensor([   0,  730, 1432, 2149, 2924, 3644, 4351, 5084, 5853, 6578], dtype=torch.int32, device="cuda")
-    # cu_seqlens_k = torch.tensor([   0,  730, 1432, 2149, 2924, 3644, 4351, 5084, 5853, 6578], dtype=torch.int32, device="cuda")
-    kv_lens =  cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-    qo_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-    # qo_len = cu_seqlens_q[-1].item()
-    seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-
-    # page_table = torch.tensor([[ 7,  8,  9, 10, 11, 12,  0],
-    #                            [13, 14, 15, 16, 17, 18,  0],
-    #                            [19, 20, 21, 22, 23, 24,  0],
-    #                            [25, 26, 27, 28, 29, 30, 31],
-    #                            [32, 33, 34, 35, 36, 37,  0],
-    #                            [38, 39, 40, 41, 42, 43,  0],
-    #                            [44, 45, 46, 47, 48, 49,  0],
-    #                            [50, 51, 52, 53, 54, 55, 56],
-    #                            [57, 58, 59, 60, 61, 62,  0]], dtype=torch.int32, device="cuda")
-
-    # q = torch.empty(
-    #     size=(qo_len, num_qo_heads, head_dim), dtype=dtype, device="cuda"
-    # ).uniform_(-init_range, init_range)
-    # k_cache = torch.empty(
-    #     size=(num_pages + 1, page_size, num_kv_heads, head_dim),
-    #     dtype=dtype,
-    #     device="cuda",
-    # ).uniform_(-init_range, init_range)
-    # v_cache = torch.empty(
-    #     size=(num_pages + 1, page_size, num_kv_heads, head_dim),
-    #     dtype=dtype,
-    #     device="cuda",
-    # ).uniform_(-init_range, init_range)
-
-    # page_table = np.random.randint(
-    #     size=[num_seqs, max_num_pages], low=1, high=num_pages + 1, dtype=np.int32
-    # )
-    # page_table = torch.tensor(page_table, dtype=torch.int32, device="cuda")
-    # page_table = torch.where(
-    #     torch.arange(max_num_pages, dtype=torch.int32, device="cuda")[None, :]
-    #     < (
-    #         torch.tensor(list(kv_lens), dtype=torch.int32, device="cuda")[:, None]
-    #         + page_size
-    #         - 1
-    #     )
-    #     // page_size,
-    #     page_table,
-    #     0,
-    # )
+    page_table = np.random.randint(
+        size=[num_seqs, max_num_pages], low=1, high=num_pages + 1, dtype=np.int32
+    )
+    page_table = torch.tensor(page_table, dtype=torch.int32, device="cuda")
+    page_table = torch.where(
+        torch.arange(max_num_pages, dtype=torch.int32, device="cuda")[None, :]
+        < (
+            torch.tensor(list(kv_lens), dtype=torch.int32, device="cuda")[:, None]
+            + page_size
+            - 1
+        )
+        // page_size,
+        page_table,
+        0,
+    )
 
     out = flash_attn_varlen_func(
         q=q,
@@ -286,7 +243,7 @@ def test_paged(
         causal=True,
     )[0]
 
-    def _extract_kv(cache: torch.Tensor, should_print: bool = False):
+    def _extract_kv(cache: torch.Tensor):
         out = []
         for i, kv_len in enumerate(kv_lens):
             out.append(
@@ -294,8 +251,6 @@ def test_paged(
                     :kv_len
                 ]
             )
-            if should_print:
-                print(_red(f"--> DEBUG: {i=} "), page_table[i], flush=True)
         return torch.concat(out, axis=0)
 
     k = _extract_kv(k_cache)
@@ -309,8 +264,6 @@ def test_paged(
         softmax_scale=softmax_scale,
         causal=True,
     )
-
-    breakpoint()
 
     out = torch.split(out, list(qo_lens), dim=0)
     ref = torch.split(ref, list(qo_lens), dim=0)
@@ -326,40 +279,40 @@ def test_paged(
 
 
 if __name__ == "__main__":
-    # test_ragged(
-    #     qo_lens=(8,),
-    #     kv_lens=(8,),
-    #     num_qo_heads=1,
-    #     num_kv_heads=1,
-    #     head_dim=128,
-    #     softmax_scale=None,
-    # )
+    test_ragged(
+        qo_lens=(8,),
+        kv_lens=(8,),
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim=128,
+        softmax_scale=None,
+    )
 
-    # test_ragged(
-    #     qo_lens=(11, 12, 32),
-    #     kv_lens=(256, 128, 64),
-    #     num_qo_heads=4,
-    #     num_kv_heads=4,
-    #     head_dim=128,
-    #     softmax_scale=None,
-    # )
-
-    # test_paged(
-    #     qo_lens=(8, 17),
-    #     kv_lens=(11, 19),
-    #     num_qo_heads=2,
-    #     num_kv_heads=2,
-    #     num_pages=32,
-    #     page_size=128,
-    #     head_dim=128,
-    #     softmax_scale=None,
-    # )
+    test_ragged(
+        qo_lens=(11, 12, 32),
+        kv_lens=(256, 128, 64),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=128,
+        softmax_scale=None,
+    )
 
     test_paged(
-        qo_lens=(),
-        kv_lens=(),
-        num_qo_heads=64,
-        num_kv_heads=8,
+        qo_lens=(8, 17),
+        kv_lens=(11, 19),
+        num_qo_heads=2,
+        num_kv_heads=2,
+        num_pages=32,
+        page_size=128,
+        head_dim=128,
+        softmax_scale=None,
+    )
+
+    test_paged(
+        qo_lens=(11, 43, 16, 71),
+        kv_lens=(31, 70, 31, 81),
+        num_qo_heads=16,
+        num_kv_heads=2,
         num_pages=32,
         page_size=128,
         head_dim=64,
