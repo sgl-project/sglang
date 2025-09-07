@@ -55,6 +55,15 @@ tiktoken-rs = { version = "0.7.0" }
 minijinja = { version = "2.0" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 hf-hub = { version = "0.4.3", features = ["tokio"] }
+rmcp = { version = "0.6.3", features = ["client", "server",
+    "transport-child-process",
+    "transport-sse-client-reqwest",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
+    "transport-streamable-http-server-session",
+    "reqwest",
+    "auth"] }
+serde_yaml = "0.9"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.12", features = ["tls", "gzip", "transport"] }
